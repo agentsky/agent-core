@@ -1,0 +1,10 @@
+[package]
+name = "agent-core"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust core for @mentionable Claude Code agents in Slack and Rocket.Chat."
+readme = "README.md"
+license-file = "LICENSE"
+rust-version = "1.98.1"
+
+[dependencies]

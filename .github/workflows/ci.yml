@@ -1,0 +1,272 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Decides whether this change needs the build and test jobs. When every
+  # changed file is documentation (scripts/ci/docs-only.sh), they are
+  # skipped and the `docs` job runs instead. Manual dispatches, and pushes
+  # whose previous tip cannot be fetched, run everything.
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A pull request is checked out as its merge commit, whose first
+          # parent is the tip of the base branch.
+          fetch-depth: 2
+
+      - name: Classify
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=
+          case "$EVENT" in
+            pull_request) base=HEAD^1 ;;
+            push) if git fetch -q --depth=1 origin "$BEFORE"; then base=$BEFORE; fi ;;
+          esac
+          if [ -n "$base" ] && sh scripts/ci/docs-only.sh "$base" HEAD; then
+            echo "Only documentation changed; skipping the build and test jobs."
+            echo code=false >> "$GITHUB_OUTPUT"
+          else
+            echo code=true >> "$GITHUB_OUTPUT"
+          fi
+
+  rust:
+    name: Format, lint, test, docs (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add --toolchain stable rustfmt clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --all-features
+
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Runs instead of the build and test jobs when only documentation
+  # changed. The README is the crate's rustdoc (src/lib.rs includes it),
+  # so its doctests and links are still checked, and on main so are its
+  # badges.
+  docs:
+    name: Doctests and docs
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # A docs-only push to main publishes no badges but may have changed
+      # the README that embeds them, so check that it still renders the
+      # badges already published for main.
+      - name: Verify the README badges render
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/ci/verify-badges-render.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+
+  # Line coverage gate. The threshold lives in the `coverage` alias in
+  # .cargo/config.toml. Reports are uploaded even when the gate fails. The
+  # job has read-only access; badge publication is a separate job. Runs on
+  # x86_64 only, so the coverage badge has one figure.
+  coverage:
+    name: Coverage
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      report: ${{ steps.report.outputs.complete }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add --toolchain stable llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Check coverage threshold
+        run: |
+          set -o pipefail
+          mkdir -p target/coverage
+          cargo coverage --json --summary-only --output-path target/coverage/coverage.json 2>&1 \
+            | tee target/coverage/coverage.log
+
+      - name: Coverage summary
+        if: always()
+        run: cargo llvm-cov report --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: target/coverage/
+          if-no-files-found: error
+
+      # Tells publish-badges whether there are figures to publish: a
+      # coverage report from a run whose tests all passed. That holds when
+      # only the threshold was missed, but not when the tests failed.
+      - name: Check for a complete coverage report
+        id: report
+        if: always()
+        run: |
+          if [ -s target/coverage/coverage.json ] &&
+            ! grep -q '^test result: FAILED' target/coverage/coverage.log; then
+            echo complete=true >> "$GITHUB_OUTPUT"
+          fi
+
+  # Publishes the coverage and test-count badges for the pushed branch to
+  # the `badges` branch (path `<branch>/`) as SVG files; the README embeds
+  # `main/` through github.com, so the badges also render in a private
+  # repository and need no external service. A separate job so that only
+  # this step, which runs no project code, holds a write-capable token.
+  # Runs on pushes to main and on manual dispatch (any branch, so the
+  # mechanism can be exercised before merge). scripts/ci/publish-badges.sh
+  # skips figures for a commit that is no longer its branch's tip. Also
+  # runs when the coverage job failed only on its threshold, so the badge
+  # shows the below-threshold figure instead of the last passing one. A
+  # docs-only change skips coverage and publishes nothing; the script
+  # keeps publishing for a commit that only such changes followed.
+  publish-badges:
+    name: Publish badges
+    if: >-
+      !cancelled() && needs.coverage.outputs.report == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    needs: coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: badges-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: coverage
+          path: target/coverage
+
+      - name: Publish
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: sh scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" target/coverage/coverage.json target/coverage/coverage.log
+
+      # Fetches the README as GitHub renders it and checks that it embeds
+      # the tests and coverage badges once each and that GitHub serves the
+      # files just published as SVG images.
+      - name: Verify the README badges render
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/ci/verify-badges-render.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+
+  msrv:
+    name: Minimum supported Rust version
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the `rust-version` toolchain from Cargo.toml
+        run: |
+          msrv="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+
+      - name: Check
+        run: cargo check --all-targets --all-features
+
+  # The one check to require in branch protection. A job skipped for a
+  # docs-only change satisfies a required check, except a matrix job: it
+  # reports under its unexpanded name, so a required `Format, lint, test,
+  # docs (x86_64)` would never arrive. This job passes when every job it
+  # needs passed or was skipped.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [changes, rust, docs, coverage, msrv]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check job results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
