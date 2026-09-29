@@ -214,18 +214,29 @@ So a turn always runs on the credential of the person who caused it.
 
 | Who starts the turn | Where | Runs on | What the agent can touch |
 | --- | --- | --- | --- |
-| The owner | DM or channel | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
+| The owner, in a DM | DM | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
+| The owner, in a channel | Channel thread | Owner's credential | Public side. Work that needs private resources runs in the owner's private sandbox without a consent card, and only the result returns to the thread |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
-| Anyone, when the task needs the owner's private resources | Channel thread | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task |
+| Anyone, when the task needs the owner's private resources | Channel thread | Owner's credential in the owner's private sandbox, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
 | Unlinked member | Channel | Community API key if configured, otherwise a "link your account" reply | Public side only |
 | Agent to agent | Thread | The human who started the thread | Public side only, hop-capped |
+
+Private resources never enter a channel sandbox. Channel volumes persist and
+every later turn in that channel can read them with the CLI's built-in tools,
+so a checked-out private repository or generated file left there would outlive
+the consent it was granted under. Work on private resources always runs in the
+owner's private-scope sandbox, the same way qm-core runs an approved
+ask-agent request as a DM-scoped turn[^qm-askagent], and only the reply and
+explicitly attached files are posted back to the thread.
 
 ```mermaid
 flowchart TD
     E["InboundEvent"] --> G{"Mentioned, reply to agent,<br/>or DM?"}
     G -- no --> X["Ignore"]
     G -- yes --> O{"Requester is owner?"}
-    O -- yes --> OW["Owner credential,<br/>owner scope"]
+    O -- yes --> OP{"Needs private<br/>resources?"}
+    OP -- no --> OC["Owner credential,<br/>conversation's scope"]
+    OP -- yes --> OW["Owner credential,<br/>owner's private sandbox,<br/>result posted back"]
     O -- no --> P{"Needs owner's<br/>private resources?"}
     P -- yes --> CN["Consent card to owner"]
     CN -- approved --> OW
@@ -250,6 +261,11 @@ CLI run per message, so agent-core does not do it.
   a channel's disk.
 - Session id: `UUIDv5(agent, surface, team, conversation, thread root)`. DMs use
   one continuous session. Channels use one session per thread.
+- Working directory: one per session, `work/<session id>` on the scope's volume.
+  Different threads in the same channel can run concurrently in one sandbox, so
+  they must not share a checkout or a Git index. Anything shared across the
+  scope's sessions lives under `shared/` and is guarded by a sandbox-level lock
+  that `agentctl` takes for writes.
 - The surface and team are part of every key, so the same agent on two
   platforms, or in a Slack Connect channel seen from two workspaces, keeps
   separate sessions.
@@ -275,9 +291,9 @@ runs of one session would fork the transcript.
 
 ### Persistence
 
-- `CLAUDE_CONFIG_DIR` and the working directory are fixed paths on the volume.
-  The transcript folder name is derived from the working directory, so a
-  different path breaks `--resume`.
+- `CLAUDE_CONFIG_DIR` is a fixed path on the volume, and each session always
+  starts in its own working directory. The transcript folder name is derived
+  from the working directory, so a different path breaks `--resume`.
 - `cleanupPeriodDays` is raised in the volume's `settings.json` so idle threads
   keep their transcripts.
 - Each turn's user message carries only what the transcript lacks: thread
@@ -301,7 +317,7 @@ sequenceDiagram
 
     CC->>PX: POST /v1/messages, Bearer placeholder
     PX->>PX: authenticate source sandbox
-    PX->>ST: lookup (sandbox, placeholder)
+    PX->>ST: lookup (sandbox, per-process placeholder)
     ST-->>PX: real access token (refreshed if stale)
     PX->>AN: same request, Bearer real token
     AN-->>PX: streamed response
@@ -332,8 +348,14 @@ Proxy rules:
    Never substitute in bodies or for other hosts. Otherwise the model could send
    the placeholder to an attacker's host and the proxy would attach the real
    token.
-2. Bind placeholders to the source sandbox identity. One placeholder per agent
-   and scope.
+2. Mint one placeholder per `claude` process, never per sandbox. Several
+   sessions in one channel sandbox can run at the same time for different
+   requesters, and a shared placeholder would give the proxy no way to tell
+   which member's credential a request belongs to. The runner points the
+   process's placeholder at the current turn's credential when the turn starts.
+   Turns within a process are serialized, so the mapping cannot change under a
+   request in flight. The mapping is also bound to the source sandbox identity
+   and is revoked when the process is reaped.
 3. Sandbox egress goes through the proxy and an allowlist only. Block cloud
    metadata endpoints. Direct `api.anthropic.com` is blocked so new side traffic
    fails loudly.
@@ -453,6 +475,7 @@ erDiagram
         uuid id
         text scope_key
         text thread_key
+        text workdir
         timestamp last_turn_at
     }
     MESSAGE_REF {
@@ -462,7 +485,6 @@ erDiagram
     SANDBOX {
         text scope_key
         text volume
-        text placeholder
     }
     USAGE {
         date day
@@ -482,8 +504,11 @@ can link several surface identities to one Claude login.
 
 | Threat | Mitigation |
 | --- | --- |
-| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Owner resources need a consent card. Persona prompt treats others' text as data. |
-| Leaked placeholder token | Bound to the source sandbox, swapped only for the configured upstream header. |
+| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and for non-owners only after a consent card. Persona prompt treats others' text as data. |
+| Leaked placeholder token | One per CLI process, bound to the source sandbox, revoked when the process ends, swapped only for the configured upstream header. |
+| One member's request billed to another in a shared sandbox | Placeholders are per process, and each process's mapping follows the current turn's requester. |
+| Private files left behind for later channel turns | Private resources only run in the owner's private sandbox. Channel sandboxes never mount them. |
+| Concurrent threads corrupt a shared checkout | One working directory per session, a lock for the scope's shared paths. |
 | Model exfiltrates the real token | The real token never enters the sandbox. |
 | Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
@@ -601,6 +626,7 @@ Direct calls would also need our own agent loop.
 [^qm-harness]: qm-core `src/harness/claude-harness.ts`: `tools: ["Agent"]`, `settingSources: []`, bridged tools through `createSdkMcpServer`.
 [^qm-oauth]: qm-core `src/model/subscription-oauth.ts`, `startClaudeLogin`.
 [^qm-mrkdwn]: qm-core `src/slack/mrkdwn.ts` and `src/slack/safe-cut.ts`.
+[^qm-askagent]: qm-core `src/slack/agent-requests.ts`: an approved request runs as a DM-scoped turn for the target member and the result is posted back to the thread.
 [^terms]: [Anthropic Consumer Terms](https://www.anthropic.com/legal/consumer-terms), sections 2 and 3.
 [^sdk-credit]: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 [^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
