@@ -1,0 +1,619 @@
+# agent-core design
+
+Status: draft for review
+
+## Context
+
+A small community wants personal AI agents that live in its chat. Each member
+runs one or more agents on their own Claude subscription. Anyone in a shared
+channel can address an agent with `@name`, and agents can address each other
+the same way. The community uses Slack (mostly one workspace per member or
+small group) and Rocket.Chat (large shared workspaces).
+
+The reference point is qm-core[^qm], a TypeScript agent platform with a mature
+Slack surface. It runs one core deployment per organization, spawns a Claude
+Code CLI process per turn on the core host, and bridges its tools to the CLI
+through an in-process MCP server. That shape is heavy per agent: one
+separately mentionable agent means one full core deployment. agent-core keeps
+the parts of qm-core that work well (mention gating, scope separation, consent
+flows, Markdown rendering, credential swapping at egress) and changes the shape
+so that one small Rust process serves many agents.
+
+## Goals
+
+- Many separately `@mentionable` agents per community, owned by individual
+  members.
+- Members link their own Claude subscription with a PKCE login done entirely
+  in chat.
+- Manage agents with chat commands (`/agent ...`) instead of a web UI.
+- Pure Rust core. No Node.js or npm dependencies in anything we build. The
+  Claude Code CLI runs inside the sandbox as a separate executable.
+- Slack and Rocket.Chat behind one platform-neutral core.
+- Per agent and scope sessions that survive restarts, using Claude Code's own
+  session persistence (`--session-id` / `--resume`).
+- Requests are billed to the person who made them.
+
+## Non-goals
+
+- A web dashboard. A small HTTPS endpoint for OAuth callbacks and platform
+  events is fine.
+- Driving claude.ai through a browser or any other automated consumer UI.
+  Consumer Terms section 3 prohibits automated access except through an API key
+  or where explicitly permitted[^terms].
+- Calling the Messages API directly with subscription OAuth tokens. Subscription
+  tokens are only used by the Claude Code CLI.
+- Slack Connect in the first releases. The design keeps it possible (see
+  [Slack Connect](#slack-connect)).
+- Microsoft Teams, Discord, email.
+
+## Terminology
+
+| Term | Meaning |
+| --- | --- |
+| Member | A person in a chat workspace. Identified by `(surface, team, user)`. |
+| Linked member | A member who completed the Claude PKCE login. |
+| Agent | A persona (prompt, skills, sandbox image) owned by one member, with one chat identity per surface binding. |
+| Surface | A chat platform adapter: Slack or Rocket.Chat. |
+| Scope | Where a conversation happens: a DM, a channel, or a group DM. Scopes decide sandboxes and what an agent may touch. |
+| Session | One Claude Code conversation, resumed across turns. |
+| Manager bot | The one bot per workspace that owns `/agent` commands, login DMs and consent cards. |
+
+## Architecture
+
+```mermaid
+graph LR
+    subgraph Chat
+        SL["Slack workspaces"]
+        RC["Rocket.Chat servers"]
+    end
+    subgraph agentd["agentd (one Rust binary)"]
+        AD["Surface adapters"]
+        CMD["Command handler"]
+        RT["Router and turn policy"]
+        AU["Auth: PKCE, token store, refresh"]
+        RUN["Runner: per-session queue"]
+        API["agentctl API"]
+        PX["Credential proxy"]
+        DB[("Store: SQLite, later Postgres")]
+    end
+    subgraph Sandboxes["Sandbox per agent and scope"]
+        CC["claude CLI"]
+        CTL["agentctl"]
+        VOL[("Persistent volume")]
+    end
+    ANT["api.anthropic.com"]
+
+    SL <--> AD
+    RC <--> AD
+    AD --> CMD
+    AD --> RT
+    RT --> RUN
+    RUN --> CC
+    CC --> PX
+    PX --> ANT
+    CTL --> API
+    CMD --> AU
+    AU --> DB
+    RT --> DB
+    CC --- VOL
+```
+
+agentd is a single process. Each surface adapter turns platform events into a
+neutral `InboundEvent`. The router decides which agent, session and credential
+a turn uses. The runner serializes turns per session and runs `claude -p` in the
+right sandbox. Agents act on the world with ordinary CLIs and skills inside the
+sandbox. The only core-facing CLI is `agentctl`, which calls back into agentd
+with a short-lived token scoped to one turn.
+
+### Why the CLI runs inside the sandbox
+
+qm-core runs the CLI on the core host with every built-in tool disabled and
+routes all execution through MCP tools into the sandbox[^qm-harness]. agent-core
+wants Claude Code's built-in tools (Bash, Read, Edit) and skills instead of an
+MCP schema. Those tools act on the machine the CLI runs on, so the CLI has to
+run where the work happens. The sandbox becomes the security boundary, which
+also makes `--permission-mode bypassPermissions` acceptable.
+
+## Chat identities and mentions
+
+On both platforms only a real account can be mentioned: a user or a bot user.
+A mentionable agent therefore needs its own bot identity.
+
+| | Slack | Rocket.Chat |
+| --- | --- | --- |
+| Mention in the message | `<@U…>` user id token, produced by autocomplete | `@username` text, parsed by the server into `mentions[]` |
+| Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
+| How the bot hears it | `app_mention` event, bot must be a channel member[^slack-mention] | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
+| Bot-to-bot mentions | Delivered (`app_mention` with `bot_message` subtype)[^slack-botmention] | Delivered |
+| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a custom role (`create-user`, `bot` role assignment, token creation)[^rc-create] |
+| Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
+
+### Slack
+
+Each agent is its own Slack app. `/agent create` calls `apps.manifest.create`
+with the member's app configuration token (these expire after 12 hours and are
+rotated with `tooling.tokens.rotate`)[^slack-manifest], then DMs the member an
+install link. The member clicks Allow and the OAuth callback delivers the bot
+token to agentd. Members can install apps without an admin by default. When the
+workspace requires app approval, the click becomes a request and agentd reports
+that the install is waiting for approval.
+
+Agent apps receive events over the HTTP Events API. Socket Mode needs an
+app-level `xapp` token, and there is no API to create one[^slack-socket]. HTTP
+events keep agent creation to one click. The manager bot can use either mode.
+
+Slash command names are workspace-wide, so only the manager bot declares
+`/agent`. Agent apps declare no commands.
+
+Loop protection is mandatory because bots hear each other: a per-thread cap on
+agent turns, a per-thread token budget, and agents ignore bot messages that do
+not mention them.
+
+### Rocket.Chat
+
+The community admin installs agentd once and gives its manager account a custom
+role. After that `/agent create` is self-service: agentd calls `users.create`
+with the `bot` role, obtains a token for the new user, sets its name and avatar,
+and joins the rooms the owner allows. Bot users bypass the REST rate limiter by
+default[^rc-perms].
+
+Custom slash commands on Rocket.Chat require an Apps-Engine app written in
+TypeScript[^rc-slash]. agent-core instead takes commands as DMs to the manager
+bot or with a `!agent` prefix. Both feed the same parser, so the command set is
+identical on both platforms.
+
+## Account linking
+
+Members link their Claude subscription with the OAuth PKCE flow that Claude Code
+uses. The authorize page redirects to Anthropic's own callback page, which shows
+a `code#state` string for the user to paste back. That fits chat and needs no
+public callback URL.
+
+```mermaid
+sequenceDiagram
+    participant M as Member
+    participant B as Manager bot
+    participant A as agentd auth
+    participant C as claude.ai
+    participant T as Token endpoint
+
+    M->>B: /agent login
+    B->>A: start_login(member)
+    A->>A: random verifier, separate random state, expiry 10 min
+    A-->>M: private link to authorize URL (S256 challenge)
+    M->>C: sign in and approve
+    C-->>M: page shows code and state
+    M->>B: /agent login with pasted code (private)
+    B->>A: complete_login(member, code, state)
+    A->>A: match state, load verifier
+    A->>T: authorization_code grant with verifier
+    T-->>A: access token, refresh token, expiry
+    A->>A: encrypt and store, delete pending login
+    A-->>M: linked
+```
+
+Rules:
+
+- The verifier never leaves agentd. `state` is a separate random value. qm-core
+  sends the verifier as `state`[^qm-oauth], which puts the PKCE secret in the
+  authorize URL. We do not copy that.
+- Codes are only accepted in private channels: Slack slash command text is not
+  posted to the channel, and on Rocket.Chat the manager bot deletes the DM
+  message after reading it.
+- Tokens are encrypted at rest (ChaCha20-Poly1305, key from the environment or a
+  KMS). Refresh is single-flight per member. A failed refresh DMs the member.
+- Endpoint URLs, client id and scopes come from configuration. They are Claude
+  Code's OAuth parameters, not a published API contract, and can change.
+
+## Turn routing and billing
+
+A member's Claude usage through Claude Code counts against a per-user monthly
+Agent SDK credit that cannot be pooled or shared[^sdk-credit]. Consumer Terms
+section 2 also prohibits making an account available to anyone else[^terms].
+So a turn always runs on the credential of the person who caused it.
+
+| Who starts the turn | Where | Runs on | What the agent can touch |
+| --- | --- | --- | --- |
+| The owner | DM or channel | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
+| Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
+| Anyone, when the task needs the owner's private resources | Channel thread | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task |
+| Unlinked member | Channel | Community API key if configured, otherwise a "link your account" reply | Public side only |
+| Agent to agent | Thread | The human who started the thread | Public side only, hop-capped |
+
+```mermaid
+flowchart TD
+    E["InboundEvent"] --> G{"Mentioned, reply to agent,<br/>or DM?"}
+    G -- no --> X["Ignore"]
+    G -- yes --> O{"Requester is owner?"}
+    O -- yes --> OW["Owner credential,<br/>owner scope"]
+    O -- no --> P{"Needs owner's<br/>private resources?"}
+    P -- yes --> CN["Consent card to owner"]
+    CN -- approved --> OW
+    CN -- declined --> DN["Reply: declined"]
+    P -- no --> L{"Requester linked?"}
+    L -- yes --> RQ["Requester credential,<br/>channel scope"]
+    L -- no --> K{"Community API key?"}
+    K -- yes --> CK["Community key,<br/>channel scope"]
+    K -- no --> LK["Reply: link your account"]
+```
+
+Response gating is deterministic: an explicit mention, a reply to the agent's
+own message, or a DM. qm-core runs a model call to decide whether to chime in on
+unaddressed thread messages. With subscription credentials that would cost a
+CLI run per message, so agent-core does not do it.
+
+## Sessions and sandboxes
+
+### Keys
+
+- Sandbox and volume: one per `(agent, scope)`. A DM transcript never lands on
+  a channel's disk.
+- Session id: `UUIDv5(agent, surface, team, conversation, thread root)`. DMs use
+  one continuous session. Channels use one session per thread.
+- The surface and team are part of every key, so the same agent on two
+  platforms, or in a Slack Connect channel seen from two workspaces, keeps
+  separate sessions.
+
+### Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Cold
+    Cold --> Starting: first message
+    Starting --> Running: start claude with session id or resume
+    Running --> Warm: turn result
+    Warm --> Running: next message (stdin, stream-json)
+    Running --> Running: message during turn is queued or steered
+    Warm --> Cold: idle timeout, process reaped
+    Cold --> Starting: next message resumes from transcript
+```
+
+The runner keeps a warm `claude` process per active session in stream-json mode
+and reaps it after an idle timeout. The next message resumes from the transcript.
+Turns are serialized per session with a keyed queue. Two concurrent `--resume`
+runs of one session would fork the transcript.
+
+### Persistence
+
+- `CLAUDE_CONFIG_DIR` and the working directory are fixed paths on the volume.
+  The transcript folder name is derived from the working directory, so a
+  different path breaks `--resume`.
+- `cleanupPeriodDays` is raised in the volume's `settings.json` so idle threads
+  keep their transcripts.
+- Each turn's user message carries only what the transcript lacks: thread
+  messages the agent did not answer, who is present, and surface hints. The
+  system prompt stays byte-identical across turns so prompt caching keeps
+  working.
+- Volumes are snapshotted. Mirroring transcripts to the store is a later option
+  for multi-host deployments.
+
+## Credential proxy
+
+The sandbox never holds a real Claude credential. It gets a placeholder token,
+and the proxy swaps it for the real one.
+
+```mermaid
+sequenceDiagram
+    participant CC as claude CLI in sandbox
+    participant PX as Credential proxy
+    participant ST as Token store
+    participant AN as api.anthropic.com
+
+    CC->>PX: POST /v1/messages, Bearer placeholder
+    PX->>PX: authenticate source sandbox
+    PX->>ST: lookup (sandbox, placeholder)
+    ST-->>PX: real access token (refreshed if stale)
+    PX->>AN: same request, Bearer real token
+    AN-->>PX: streamed response
+    PX-->>CC: streamed response
+```
+
+Sandbox environment:
+
+```text
+CLAUDE_CODE_OAUTH_TOKEN=<placeholder>
+ANTHROPIC_BASE_URL=http://cred-proxy.internal:8080
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+DISABLE_AUTOUPDATER=1
+```
+
+Tested against Claude Code 2.1.283 with a local capture server:
+
+- The CLI sends the subscription token to a custom `ANTHROPIC_BASE_URL` over
+  plain HTTP, as `Authorization: Bearer` with the `oauth-2025-04-20` beta.
+- By default it also opens direct connections to `api.anthropic.com` that
+  bypass the base URL. With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and
+  `DISABLE_AUTOUPDATER=1` there were none.
+- It may send `HEAD /api/hello` to the base URL as a connectivity check.
+
+Proxy rules:
+
+1. Swap only the `Authorization` header, only for the configured upstream.
+   Never substitute in bodies or for other hosts. Otherwise the model could send
+   the placeholder to an attacker's host and the proxy would attach the real
+   token.
+2. Bind placeholders to the source sandbox identity. One placeholder per agent
+   and scope.
+3. Sandbox egress goes through the proxy and an allowlist only. Block cloud
+   metadata endpoints. Direct `api.anthropic.com` is blocked so new side traffic
+   fails loudly.
+4. The same mechanism serves bearer-token CLIs in skills, for example
+   `GH_TOKEN`. Signed-request schemes such as AWS SigV4 cannot be swapped and
+   need short-lived credentials instead.
+
+## Tools and skills
+
+There is no MCP server. Agents use Claude Code's built-in tools plus skills in
+`$CLAUDE_CONFIG_DIR/skills/`, loaded with `--setting-sources user`. Skills cost
+only their name and description in context until used.
+
+Core-facing actions go through `agentctl`, a small static Rust binary:
+
+| Command | Effect |
+| --- | --- |
+| `agentctl attach <path>` | Stage a file to upload with this turn's reply |
+| `agentctl post --to <target> <text>` | Post somewhere else the agent is allowed to post |
+| `agentctl react <emoji> [message id]` | Add a reaction |
+| `agentctl history [--before id]` | Pull more thread context than the turn included |
+| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine |
+
+One bundled skill documents `agentctl`. Its token is scoped to one agent, scope,
+session and turn, and expires with the turn.
+
+Launch flags:
+
+```text
+claude -p --input-format stream-json --output-format stream-json --verbose \
+  --tools "Bash,Read,Edit,Write,Glob,Grep" --strict-mcp-config \
+  --setting-sources user --permission-mode bypassPermissions \
+  --append-system-prompt-file /agent/persona.md \
+  --session-id <uuid> | --resume <uuid>
+```
+
+## Rendering and delivery
+
+The agent writes standard Markdown. Each surface renders it with a converter
+built on a Markdown parse tree (`pulldown-cmark`), not regexes:
+
+- Slack: mrkdwn. Tables become aligned text in a code block, `**bold**` becomes
+  `*bold*`, links become `<url|label>`, and `@Name` becomes a real mention
+  through the member directory. Mass mentions (`<!here>`, `<!channel>`) are
+  neutralized. qm-core's `toSlackMrkdwn` is the behavioral reference[^qm-mrkdwn].
+- Rocket.Chat: mostly pass-through Markdown. `@all` and `@here` are
+  neutralized.
+- Splitting respects each surface's message limit, never cuts inside a link,
+  mention or surrogate pair, and closes and reopens code fences across chunks.
+- Files staged with `agentctl attach` upload before the text reply.
+- Text directives such as `[[react: eyes]]` are parsed and stripped before
+  rendering. Short message ids shown to the model come from a per-session table
+  in the store, not from encoding platform timestamps.
+
+## Commands
+
+| Command | Who | What it does |
+| --- | --- | --- |
+| `/agent login`, `/agent login <code>`, `/agent logout` | Anyone | Link or unlink a Claude account |
+| `/agent me` | Anyone | Link status, usage meter, own agents |
+| `/agent create <name> [persona]` | Linked member | Create the identity and a default persona |
+| `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
+| `/agent skill add\|rm <name> <source>` | Owner | Manage skills |
+| `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where |
+| `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits |
+| `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
+| `/agent sessions <name>`, `/agent reset <name> [here]` | Owner | Inspect or reset sessions |
+| `/agent list [@user]` | Anyone | Agent directory |
+| `/agent admin ...` | Community admin | Community API key, bans, Slack configuration |
+
+Command replies are always private: Slack ephemeral responses through
+`response_url`, and the manager bot's DM on Rocket.Chat. Slack slash commands
+arrive over Socket Mode without a request URL[^slack-socket] and must be
+acknowledged within three seconds.
+
+## Data model
+
+```mermaid
+erDiagram
+    MEMBER ||--o{ SURFACE_IDENTITY : has
+    MEMBER ||--o| CLAUDE_LINK : owns
+    MEMBER ||--o{ AGENT : owns
+    AGENT ||--o{ AGENT_BINDING : "exposed as"
+    AGENT ||--o{ SESSION : runs
+    SESSION ||--o{ MESSAGE_REF : shows
+    AGENT ||--o{ SANDBOX : uses
+    MEMBER ||--o{ USAGE : accrues
+    PENDING_LOGIN }o--|| MEMBER : for
+
+    MEMBER {
+        uuid id
+        text display_name
+    }
+    SURFACE_IDENTITY {
+        text surface
+        text team_id
+        text user_id
+    }
+    CLAUDE_LINK {
+        bytes access_token_enc
+        bytes refresh_token_enc
+        timestamp expires_at
+    }
+    AGENT {
+        uuid id
+        text name
+        text persona
+        text visibility
+    }
+    AGENT_BINDING {
+        text surface
+        text team_id
+        text bot_user_id
+        bytes bot_token_enc
+    }
+    SESSION {
+        uuid id
+        text scope_key
+        text thread_key
+        timestamp last_turn_at
+    }
+    MESSAGE_REF {
+        int short_id
+        text platform_ref
+    }
+    SANDBOX {
+        text scope_key
+        text volume
+        text placeholder
+    }
+    USAGE {
+        date day
+        int turns
+    }
+    PENDING_LOGIN {
+        text state
+        bytes verifier_enc
+        timestamp expires_at
+    }
+```
+
+Identities are `(surface, team_id, user_id)`, never a bare user id. One member
+can link several surface identities to one Claude login.
+
+## Security
+
+| Threat | Mitigation |
+| --- | --- |
+| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Owner resources need a consent card. Persona prompt treats others' text as data. |
+| Leaked placeholder token | Bound to the source sandbox, swapped only for the configured upstream header. |
+| Model exfiltrates the real token | The real token never enters the sandbox. |
+| Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
+| PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
+| Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
+| One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
+
+## Crate layout
+
+| Crate | Purpose | Main dependencies |
+| --- | --- | --- |
+| `agentd` | Binary and wiring | `tokio`, `tracing` |
+| `core-types` | IDs, events, keys, policy types | `serde`, `uuid` |
+| `store` | Persistence | `sqlx` |
+| `auth` | PKCE, exchange, refresh, encryption | `reqwest` (rustls), `sha2`, `base64`, `rand`, `chacha20poly1305` |
+| `surface-slack` | Socket Mode and Events API, Web API | `tokio-tungstenite`, `reqwest`, `axum` |
+| `surface-rocketchat` | DDP realtime, REST | `tokio-tungstenite`, `reqwest` |
+| `render` | Markdown conversion and splitting | `pulldown-cmark` |
+| `commands` | `/agent` parsing and handlers | `clap` |
+| `runner` | Session queue, stream-json, resume | `tokio` |
+| `sandbox` | Provision, exec, teardown | `bollard` |
+| `cred-proxy` | Header swap | `hyper`, `axum` |
+| `agentctl` | In-sandbox CLI, static musl build | `clap`, `reqwest` |
+
+The core surface trait:
+
+```rust
+#[async_trait::async_trait]
+pub trait Surface: Send + Sync {
+    async fn events(&self, binding: &Binding, tx: Sender<InboundEvent>) -> Result<()>;
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef>;
+    async fn edit(&self, msg: &MsgRef, text: &str) -> Result<()>;
+    async fn react(&self, msg: &MsgRef, emoji: &str) -> Result<()>;
+    async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()>;
+    async fn history(&self, conv: &ConvRef, before: Option<Cursor>, limit: usize) -> Result<Vec<Msg>>;
+    fn render(&self, markdown: &str) -> Vec<String>;
+    fn caps(&self) -> Caps;
+}
+```
+
+Everything after `InboundEvent` is shared. Behavior differences go through
+`caps()` (buttons, edits, message size), never through surface-name checks in
+shared code. A `MockSurface` drives the shared core in tests.
+
+## Milestones
+
+1. Rocket.Chat adapter, manager bot DM commands (`login`, `create`, `persona`,
+   `list`), PKCE linking.
+2. One bot per agent, mention gating, Docker sandbox per agent and scope,
+   `--session-id` / `--resume` through the credential proxy.
+3. Requester-pays routing and the usage meter.
+4. Slack adapter: manifest-based agent apps with one-click install, HTTP
+   events, manager bot with `/agent`.
+5. Consent cards, agent-to-agent hand-off, hop caps.
+6. Owner-initiated cloud hand-off (`claude --cloud`) for long PR work.
+7. Slack Connect.
+
+## Slack Connect
+
+Every organization in a Slack Connect channel must be on a paid plan[^slack-connect].
+Bot users work there, but a custom app's slash commands only work for its own
+organization. The design keeps this possible by keying identities and sessions by
+team, deduplicating events that arrive once per workspace, and routing consent
+cards to the owner's own workspace. The audience policy is configurable rather
+than refusing external members as qm-core does by default.
+
+## Alternatives considered
+
+**Keep qm-core's shape (CLI on the host, MCP tool bridge).** Rejected. Every tool
+needs an MCP schema in context, and every mentionable agent needs its own core
+deployment because qm-core supports one Slack installation per organization.
+
+**One community bot that posts as each agent.** Slack's `chat:write.customize`
+can change the display name and icon per message. It needs one app in total and
+has no app limit, but agents are not separately mentionable. Kept as a fallback
+for workspaces that cannot install more apps.
+
+**Claude Managed Agents.** Anthropic hosts the loop and a per-session container,
+with vault credentials substituted at egress, skills, custom tools and memory
+stores[^cma]. It fits shared automation well and would remove the sandbox,
+runner and proxy. It bills by API key, not subscription. Kept as an option for
+channel agents funded by a community API key.
+
+**Claude Code cloud sessions.** `claude --cloud` creates a session and
+`claude -p "msg" --cloud <id>` queues a message, but there is no documented way
+to read replies, and sessions are tied to a GitHub repository[^cloud]. Used only
+for owner-initiated PR work, not as the chat backend.
+
+**Browser automation of claude.ai.** Rejected. It violates Consumer Terms
+section 3, and one suspension would take down every agent.
+
+**Calling the Messages API from Rust with subscription tokens.** Rejected.
+Subscription tokens are covered for use through Claude Code and the Agent SDK.
+Direct calls would also need our own agent loop.
+
+## Open questions and risks
+
+- Claude Code's OAuth client id, scopes and endpoints are not a public contract.
+  A change breaks linking until configuration is updated.
+- Whether a Rocket.Chat custom role with only `create-user`, role assignment
+  and token creation can create bot users. An old issue reports that
+  `users.create` also needed edit-user permissions[^rc-7351]. Needs a test on
+  the target server version.
+- Whether Rocket.Chat's `__my_messages__` subscription delivers every joined
+  room. Until confirmed, subscribe per room.
+- The Agent SDK credit is per user and monthly. Agents need clear messages when
+  a requester's credit runs out.
+- Long-term transcript retention on volumes. Snapshots cover single-host
+  deployments. Multi-host needs transcript mirroring.
+- Terms interpretation for requester-pays in shared channels is a design
+  judgment, not legal advice. Larger communities should confirm with Anthropic.
+
+## References
+
+[^qm]: qm-core, the reference TypeScript implementation (`agentsky/qm-core`). Slack surface in `src/slack/`, installation store in `src/surfaces/slack-installation.ts`.
+[^qm-harness]: qm-core `src/harness/claude-harness.ts`: `tools: ["Agent"]`, `settingSources: []`, bridged tools through `createSdkMcpServer`.
+[^qm-oauth]: qm-core `src/model/subscription-oauth.ts`, `startClaudeLogin`.
+[^qm-mrkdwn]: qm-core `src/slack/mrkdwn.ts` and `src/slack/safe-cut.ts`.
+[^terms]: [Anthropic Consumer Terms](https://www.anthropic.com/legal/consumer-terms), sections 2 and 3.
+[^sdk-credit]: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+[^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
+[^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
+[^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/).
+[^slack-botmention]: [slackapi/java-slack-sdk#1279](https://github.com/slackapi/java-slack-sdk/issues/1279) shows `app_mention` events with the `bot_message` subtype.
+[^slack-approval]: [Manage app approval for your workspace](https://slack.com/help/articles/222386767-Manage-app-approval-for-your-workspace).
+[^slack-free]: [Feature limitations on the free version of Slack](https://slack.com/help/articles/27204752526611-Feature-limitations-on-the-free-version-of-Slack).
+[^slack-manifest]: [Configuring apps with app manifests](https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/).
+[^slack-socket]: [Using Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/). App-level tokens are generated in the app settings UI.
+[^slack-connect]: [Slack Connect guide](https://slack.com/help/articles/115004151203-Slack-Connect-guide--Work-with-external-organizations).
+[^rc-stream]: [stream-room-messages](https://developer.rocket.chat/api/realtime-api/subscriptions/stream-room-messages).
+[^rc-create]: [Rocket.Chat Create User](https://developer.rocket.chat/reference/api/rest-api/endpoints/user-management/users-endpoints/create-user).
+[^rc-perms]: [Rocket.Chat permissions](https://docs.rocket.chat/docs/permissions): `api-bypass-rate-limit` defaults to the admin, bot and app roles.
+[^rc-slash]: [Rocket.Chat slash commands](https://docs.rocket.chat/docs/slash-command) are registered by Apps-Engine apps.
+[^rc-7351]: [RocketChat/Rocket.Chat#7351](https://github.com/RocketChat/Rocket.Chat/issues/7351).
