@@ -76,7 +76,7 @@ graph LR
         PX["Credential proxy"]
         DB[("Store: SQLite, later Postgres")]
     end
-    subgraph Sandboxes["Sandbox per agent and scope"]
+    subgraph Sandboxes["Container per session, volume per agent and scope"]
         CC["claude CLI"]
         CTL["agentctl"]
         VOL[("Persistent volume")]
@@ -124,30 +124,51 @@ A mentionable agent therefore needs its own bot identity.
 | Mention in the message | `<@U…>` user id token, produced by autocomplete | `@username` text, parsed by the server into `mentions[]` |
 | Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
 | How the bot hears it | `app_mention` event, bot must be a channel member[^slack-mention] | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
-| Bot-to-bot mentions | Delivered (`app_mention` with `bot_message` subtype)[^slack-botmention] | Delivered |
-| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a custom role (`create-user`, `bot` role assignment, token creation)[^rc-create] |
+| Bot-to-bot mentions | Expected but not yet verified for one app's bot user mentioning another's[^slack-botmention]. `app_mention` is never sent for DMs, which arrive as `message.im` | Delivered |
+| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a custom role (`create-user` and token creation)[^rc-create] |
 | Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
 
 ### Slack
 
-Each agent is its own Slack app. `/agent create` calls `apps.manifest.create`
-with the member's app configuration token (these expire after 12 hours and are
-rotated with `tooling.tokens.rotate`)[^slack-manifest], then DMs the member an
-install link. The member clicks Allow and the OAuth callback delivers the bot
-token to agentd. Members can install apps without an admin by default. When the
-workspace requires app approval, the click becomes a request and agentd reports
-that the install is waiting for approval.
+Each agent is its own Slack app, created from a manifest.
 
-Agent apps receive events over the HTTP Events API. Socket Mode needs an
-app-level `xapp` token, and there is no API to create one[^slack-socket]. HTTP
-events keep agent creation to one click. The manager bot can use either mode.
+- **One-time setup per member.** App configuration tokens are only issued in
+  the api.slack.com UI[^slack-manifest]. The member generates one there and
+  hands the token and its refresh token to agentd with `/agent slack-token`
+  (slash command text is not posted to the channel). agentd stores both
+  encrypted and rotates them with `tooling.tokens.rotate` before the 12-hour
+  expiry. Holding a member's configuration refresh token lets agentd create and
+  edit apps as that member, so it is listed in the threat table.
+- **Per agent.** `/agent create` calls `apps.manifest.create`. The response
+  carries the new app's `app_id`, `client_id`, `client_secret` and
+  `signing_secret`, which agentd stores with the binding. agentd DMs the member
+  an install link. The member clicks Allow and the OAuth callback, using
+  `client_id` and `client_secret`, delivers the bot token. Members can install
+  apps without an admin by default. When the workspace requires app approval,
+  the click becomes a request and agentd reports that the install is waiting for
+  approval.
+- **Transport.** All Slack apps, the manager bot included, use HTTPS: the
+  Events API, interactivity and slash commands. Socket Mode needs an app-level
+  `xapp` token that no API can create[^slack-socket], so it cannot be automated
+  for agent apps, and one transport is simpler. agentd's public HTTPS endpoint is
+  therefore a prerequisite for `/agent create` on Slack: the manifest's
+  `request_url` must answer Slack's `url_verification` challenge when the app is
+  created. Each app's requests are verified with its own `signing_secret`.
+- **Acknowledge first.** Slack expects an acknowledgement within three seconds
+  and retries otherwise. Turns take minutes, so agentd acknowledges every event,
+  command and interaction immediately, processes it asynchronously, and drops
+  retried deliveries by `event_id`.
 
-Slash command names are workspace-wide, so only the manager bot declares
-`/agent`. Agent apps declare no commands.
+Slash commands are neither namespaced nor unique. Two apps can both register
+`/agent`, and Slack routes it to whichever was installed most recently, so a
+later-installed app can silently take over the command. Only the manager bot
+declares `/agent`, agent apps declare no commands, and `/agent me` shows the
+manager app's name so members can notice a hijack.
 
 Loop protection is mandatory because bots hear each other: a per-thread cap on
-agent turns, a per-thread token budget, and agents ignore bot messages that do
-not mention them.
+agent turns, a per-thread token budget, agents ignore bot messages that do not
+mention them, and only mentions from agentd-managed agents are honored (see
+[Agent-to-agent attribution](#agent-to-agent-attribution)).
 
 ### Rocket.Chat
 
@@ -156,6 +177,12 @@ role. After that `/agent create` is self-service: agentd calls `users.create`
 with the `bot` role, obtains a token for the new user, sets its name and avatar,
 and joins the rooms the owner allows. Bot users bypass the REST rate limiter by
 default[^rc-perms].
+
+The custom role needs `create-user`, plus `edit-other-user-active-status` if
+agentd passes `active` on create, and the permission for creating the bot's
+token. A reviewer's reading of the current server source is that `users.create`
+with `roles: ["bot"]` checks only those, and that `assign-roles` is checked on
+update only. That needs a test on the target server version.
 
 Custom slash commands on Rocket.Chat require an Apps-Engine app written in
 TypeScript[^rc-slash]. agent-core instead takes commands as DMs to the manager
@@ -198,8 +225,11 @@ Rules:
   sends the verifier as `state`[^qm-oauth], which puts the PKCE secret in the
   authorize URL. We do not copy that.
 - Codes are only accepted in private channels: Slack slash command text is not
-  posted to the channel, and on Rocket.Chat the manager bot deletes the DM
-  message after reading it.
+  posted to the channel, and on Rocket.Chat the code goes in a DM to the manager
+  bot, which is already private. `!agent login <code>` in a channel is refused,
+  the pending login is invalidated because the code is now public, and the member
+  is told to start again. agentd does not delete members' messages. That would
+  need `delete-message` or `force-delete-message`, which the `bot` role lacks.
 - Tokens are encrypted at rest (ChaCha20-Poly1305, key from the environment or a
   KMS). Refresh is single-flight per member. A failed refresh DMs the member.
 - Endpoint URLs, client id and scopes come from configuration. They are Claude
@@ -215,33 +245,68 @@ So a turn always runs on the credential of the person who caused it.
 | Who starts the turn | Where | Runs on | What the agent can touch |
 | --- | --- | --- | --- |
 | The owner, in a DM | DM | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
-| The owner, in a channel | Channel thread | Owner's credential | Public side. Work that needs private resources runs in the owner's private sandbox without a consent card, and only the result returns to the thread |
+| The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests runs without a consent card (see below) |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
-| Anyone, when the task needs the owner's private resources | Channel thread | Owner's credential in the owner's private sandbox, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
+| A private task requested during a non-owner's turn | Owner's private sandbox | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
 | Unlinked member | Channel | Community API key if configured, otherwise a "link your account" reply | Public side only |
-| Agent to agent | Thread | The human who started the thread | Public side only, hop-capped |
+| Agent to agent | Thread | The requester of the turn whose message mentioned the agent | Public side only, hop-capped |
+
+### Agent-to-agent attribution
+
+A hop is billed to the requester of the turn that produced the mention, never to
+whoever started the thread. agentd posts every agent message itself, so it
+records `(platform message ref, turn, requester)` for each one. When an agent
+message mentions another agent, the new turn inherits that requester and the hop
+count. `agentctl ask-agent` carries the same information in its turn-scoped
+token. Mentions from bot users that agentd does not manage are ignored. That
+keeps an unmanaged or prompt-injected bot from spending anyone's subscription,
+and the hop cap bounds what one request can cost its requester.
+
+### Private tasks
 
 Private resources never enter a channel sandbox. Channel volumes persist and
 every later turn in that channel can read them with the CLI's built-in tools,
 so a checked-out private repository or generated file left there would outlive
-the consent it was granted under. Work on private resources always runs in the
-owner's private-scope sandbox, the same way qm-core runs an approved
-ask-agent request as a DM-scoped turn[^qm-askagent], and only the reply and
-explicitly attached files are posted back to the thread.
+the consent it was granted under.
+
+The router cannot tell from message text whether a task needs private
+resources, so the agent asks during its turn, the same way qm-core's agents
+issue ask-agent requests mid-turn[^qm-askagent]. The flow:
 
 ```mermaid
 flowchart TD
-    E["InboundEvent"] --> G{"Mentioned, reply to agent,<br/>or DM?"}
-    G -- no --> X["Ignore"]
+    T["Channel turn running"] --> R["Agent runs agentctl private 'task text'"]
+    R --> O{"Turn requester<br/>is the owner?"}
+    O -- yes --> RUN["Fresh session in the<br/>owner's private sandbox"]
+    O -- no --> CN["Consent card to owner<br/>shows the exact task text"]
+    CN -- approved --> RUN
+    CN -- declined --> DN["agentctl returns: declined"]
+    RUN --> RES["Reply and attached files<br/>posted to the thread"]
+```
+
+- Each private task gets a fresh session with id `UUIDv5(agent, consent id)` on
+  the owner's private volume. It never joins the owner's DM session, so a
+  non-owner's task cannot read the owner's DM transcript and does not add to it.
+- What crosses into the private turn is only the task text shown on the consent
+  card and files the channel turn attached explicitly. The channel thread's
+  transcript does not cross.
+- What comes back is only the private turn's final reply and files it attached.
+  agentctl returns them to the waiting channel turn and posts them to the
+  thread.
+
+### Routing
+
+```mermaid
+flowchart TD
+    E["InboundEvent"] --> B{"From a bot user?"}
+    B -->|"yes, unmanaged"| X["Ignore"]
+    B -->|"yes, managed agent"| H["Inherit requester and<br/>hop count from the<br/>posting turn"]
+    B -- no --> G{"Mentioned, reply to agent,<br/>or DM?"}
+    G -- no --> X
     G -- yes --> O{"Requester is owner?"}
-    O -- yes --> OP{"Needs private<br/>resources?"}
-    OP -- no --> OC["Owner credential,<br/>conversation's scope"]
-    OP -- yes --> OW["Owner credential,<br/>owner's private sandbox,<br/>result posted back"]
-    O -- no --> P{"Needs owner's<br/>private resources?"}
-    P -- yes --> CN["Consent card to owner"]
-    CN -- approved --> OW
-    CN -- declined --> DN["Reply: declined"]
-    P -- no --> L{"Requester linked?"}
+    H --> O
+    O -- yes --> OC["Owner credential,<br/>conversation's scope"]
+    O -- no --> L{"Requester linked?"}
     L -- yes --> RQ["Requester credential,<br/>channel scope"]
     L -- no --> K{"Community API key?"}
     K -- yes --> CK["Community key,<br/>channel scope"]
@@ -257,16 +322,25 @@ CLI run per message, so agent-core does not do it.
 
 ### Keys
 
-- Sandbox and volume: one per `(agent, scope)`. A DM transcript never lands on
-  a channel's disk.
-- Session id: `UUIDv5(agent, surface, team, conversation, thread root)`. DMs use
-  one continuous session. Channels use one session per thread.
-- Working directory: one per session, `work/<session id>` on the scope's volume.
-  Different threads in the same channel can run concurrently in one sandbox, so
-  they must not share a checkout or a Git index. Anything shared across the
-  scope's sessions lives under `shared/` and is guarded by a sandbox-level lock
-  that `agentctl` takes for writes.
-- The surface and team are part of every key, so the same agent on two
+- Volume: one per `(agent, scope)`. A DM transcript never lands on a channel's
+  disk.
+- Sandbox: one container per active session, with the scope's volume mounted.
+  Sessions in one scope can run concurrently for different requesters, and a
+  shared container would let one session read another's process environment
+  (`/proc/<pid>/environ`), including its proxy placeholder and `agentctl` token.
+  With one container per session, container identity and session identity are
+  the same thing, which is what the credential proxy and `agentctl` rely on.
+- Session: one row per conversation and thread root (DMs use one continuous
+  session, channels one per thread), looked up by
+  `(agent, surface, team, conversation, thread root)`. Its id is a random UUIDv4
+  minted on create and again on `/agent reset`, because `--session-id` needs an
+  id that has not been used.
+- Directories on the volume: each session gets `sessions/<session id>/` as its
+  working directory and `CLAUDE_CONFIG_DIR`, and only that directory is mounted
+  read-write in its container. `shared/` is mounted into every session of the
+  scope and guarded by a scope-level lock that `agentctl` takes for writes.
+  Skills are mounted read-only.
+- The surface and team are part of every lookup key, so the same agent on two
   platforms, or in a Slack Connect channel seen from two workspaces, keeps
   separate sessions.
 
@@ -284,18 +358,36 @@ stateDiagram-v2
     Cold --> Starting: next message resumes from transcript
 ```
 
-The runner keeps a warm `claude` process per active session in stream-json mode
-and reaps it after an idle timeout. The next message resumes from the transcript.
-Turns are serialized per session with a keyed queue. Two concurrent `--resume`
-runs of one session would fork the transcript.
+The runner keeps a warm container and `claude` process per active session in
+stream-json mode and reaps both after an idle timeout. The next message resumes
+from the transcript. Turns are serialized per session with a keyed queue. Two
+concurrent `--resume` runs of one session would fork the transcript.
+
+A warm process cannot change credential kind or model mid-flight. A thread can
+be driven by a linked member on one turn (OAuth token, `Authorization: Bearer`
+with the `oauth-2025-04-20` beta) and an unlinked member on the next (community
+API key, sent by the CLI as `x-api-key` from `ANTHROPIC_API_KEY`). The process
+environment is fixed at start, and plans differ in model access and rate limits.
+The runner therefore restarts the process, resuming from the transcript, when
+the next turn's credential kind or model differs from the running one. The model
+is chosen per turn from what the requester's plan allows. Switching the model
+over the stream-json control channel instead of restarting is a later
+optimization.
+
+`claude` runs as a non-root user in the image. On Linux the CLI refuses
+`bypassPermissions` as root or under sudo outside a recognized
+sandbox[^cc-bypass].
 
 ### Persistence
 
-- `CLAUDE_CONFIG_DIR` is a fixed path on the volume, and each session always
-  starts in its own working directory. The transcript folder name is derived
-  from the working directory, so a different path breaks `--resume`.
-- `cleanupPeriodDays` is raised in the volume's `settings.json` so idle threads
-  keep their transcripts.
+- Each session's `CLAUDE_CONFIG_DIR` is its own `sessions/<session id>/`
+  directory, and `CLAUDE_CODE_PROJECT_DIR_NAME` is set to the session id, so the
+  transcript directory is named explicitly instead of being derived from the
+  working directory (Claude Code 2.1.234 or later)[^cc-sessions].
+  `claude --resume <id>` searches every project directory since 2.1.223, so the
+  fixed layout is for predictability and backups, not a resume requirement.
+- `cleanupPeriodDays` is raised from its 30-day default in each session's
+  `settings.json` so idle threads keep their transcripts.
 - Each turn's user message carries only what the transcript lacks: thread
   messages the agent did not answer, who is present, and surface hints. The
   system prompt stays byte-identical across turns so prompt caching keeps
@@ -316,22 +408,27 @@ sequenceDiagram
     participant AN as api.anthropic.com
 
     CC->>PX: POST /v1/messages, Bearer placeholder
-    PX->>PX: authenticate source sandbox
-    PX->>ST: lookup (sandbox, per-process placeholder)
+    PX->>PX: authenticate source container
+    PX->>ST: lookup (container, placeholder)
     ST-->>PX: real access token (refreshed if stale)
     PX->>AN: same request, Bearer real token
     AN-->>PX: streamed response
     PX-->>CC: streamed response
 ```
 
-Sandbox environment:
+Sandbox environment for a subscription credential:
 
 ```text
 CLAUDE_CODE_OAUTH_TOKEN=<placeholder>
 ANTHROPIC_BASE_URL=http://cred-proxy.internal:8080
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 DISABLE_AUTOUPDATER=1
+CLAUDE_CONFIG_DIR=/volume/sessions/<session id>
+CLAUDE_CODE_PROJECT_DIR_NAME=<session id>
 ```
+
+For the community API key, `ANTHROPIC_API_KEY=<placeholder>` replaces
+`CLAUDE_CODE_OAUTH_TOKEN`, and the CLI sends it as `x-api-key`.
 
 Tested against Claude Code 2.1.283 with a local capture server:
 
@@ -344,18 +441,21 @@ Tested against Claude Code 2.1.283 with a local capture server:
 
 Proxy rules:
 
-1. Swap only the `Authorization` header, only for the configured upstream.
-   Never substitute in bodies or for other hosts. Otherwise the model could send
-   the placeholder to an attacker's host and the proxy would attach the real
-   token.
-2. Mint one placeholder per `claude` process, never per sandbox. Several
-   sessions in one channel sandbox can run at the same time for different
-   requesters, and a shared placeholder would give the proxy no way to tell
-   which member's credential a request belongs to. The runner points the
+1. Swap only the credential header, only for the configured upstream:
+   `Authorization: Bearer` for a subscription placeholder, `x-api-key` for an
+   API-key placeholder. A placeholder of one kind never receives a credential of
+   the other kind. Never substitute in bodies or for other hosts. Otherwise the
+   model could send the placeholder to an attacker's host and the proxy would
+   attach the real token.
+2. Mint one placeholder per `claude` process, which is also one per container
+   and session. Several sessions in one scope can run at the same time for
+   different requesters, and a shared placeholder would give the proxy no way to
+   tell which member's credential a request belongs to. The runner points the
    process's placeholder at the current turn's credential when the turn starts.
    Turns within a process are serialized, so the mapping cannot change under a
-   request in flight. The mapping is also bound to the source sandbox identity
-   and is revoked when the process is reaped.
+   request in flight. The mapping is bound to the container's network identity,
+   and is revoked when the container is reaped. Another session cannot read the
+   placeholder because it runs in a different container.
 3. Sandbox egress goes through the proxy and an allowlist only. Block cloud
    metadata endpoints. Direct `api.anthropic.com` is blocked so new side traffic
    fails loudly.
@@ -377,10 +477,12 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl post --to <target> <text>` | Post somewhere else the agent is allowed to post |
 | `agentctl react <emoji> [message id]` | Add a reaction |
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
-| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine |
+| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester |
+| `agentctl private <task>` | Run a task on the owner's private resources. Needs the owner's consent unless the owner is this turn's requester. Returns the result |
 
 One bundled skill documents `agentctl`. Its token is scoped to one agent, scope,
-session and turn, and expires with the turn.
+session, turn and requester, is bound to the session's container, and expires
+with the turn.
 
 Launch flags:
 
@@ -415,7 +517,8 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | Command | Who | What it does |
 | --- | --- | --- |
 | `/agent login`, `/agent login <code>`, `/agent logout` | Anyone | Link or unlink a Claude account |
-| `/agent me` | Anyone | Link status, usage meter, own agents |
+| `/agent me` | Anyone | Link status, usage meter, own agents, manager app name |
+| `/agent slack-token <token> <refresh token>` | Linked member on Slack | Register the app configuration token used to create agent apps |
 | `/agent create <name> [persona]` | Linked member | Create the identity and a default persona |
 | `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
 | `/agent skill add\|rm <name> <source>` | Owner | Manage skills |
@@ -428,8 +531,8 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 
 Command replies are always private: Slack ephemeral responses through
 `response_url`, and the manager bot's DM on Rocket.Chat. Slack slash commands
-arrive over Socket Mode without a request URL[^slack-socket] and must be
-acknowledged within three seconds.
+arrive over HTTPS like every other Slack request and are acknowledged within
+three seconds, with the real reply sent later through `response_url`.
 
 ## Data model
 
@@ -441,9 +544,11 @@ erDiagram
     AGENT ||--o{ AGENT_BINDING : "exposed as"
     AGENT ||--o{ SESSION : runs
     SESSION ||--o{ MESSAGE_REF : shows
-    AGENT ||--o{ SANDBOX : uses
+    AGENT ||--o{ VOLUME : uses
     MEMBER ||--o{ USAGE : accrues
+    MEMBER ||--o{ SLACK_CONFIG_TOKEN : registers
     PENDING_LOGIN }o--|| MEMBER : for
+    AGENT ||--o{ CONSENT : requests
 
     MEMBER {
         uuid id
@@ -468,23 +573,41 @@ erDiagram
     AGENT_BINDING {
         text surface
         text team_id
+        text app_id
+        text client_id
+        bytes client_secret_enc
+        bytes signing_secret_enc
         text bot_user_id
         bytes bot_token_enc
+    }
+    SLACK_CONFIG_TOKEN {
+        text team_id
+        bytes token_enc
+        bytes refresh_token_enc
+        timestamp expires_at
     }
     SESSION {
         uuid id
         text scope_key
         text thread_key
-        text workdir
         timestamp last_turn_at
     }
     MESSAGE_REF {
         int short_id
         text platform_ref
+        uuid turn_id
+        uuid requester_id
+        int hop
     }
-    SANDBOX {
+    CONSENT {
+        uuid id
+        uuid requester_id
+        text task_text
+        text state
+    }
+    VOLUME {
         text scope_key
-        text volume
+        text path
     }
     USAGE {
         date day
@@ -498,21 +621,30 @@ erDiagram
 ```
 
 Identities are `(surface, team_id, user_id)`, never a bare user id. One member
-can link several surface identities to one Claude login.
+can link several surface identities to one Claude login. `MESSAGE_REF` records
+the turn and requester of every message agentd posts, which is what
+agent-to-agent attribution reads. The Slack columns of `AGENT_BINDING` are empty
+for Rocket.Chat bindings.
 
 ## Security
 
 | Threat | Mitigation |
 | --- | --- |
 | Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and for non-owners only after a consent card. Persona prompt treats others' text as data. |
-| Leaked placeholder token | One per CLI process, bound to the source sandbox, revoked when the process ends, swapped only for the configured upstream header. |
-| One member's request billed to another in a shared sandbox | Placeholders are per process, and each process's mapping follows the current turn's requester. |
+| Leaked placeholder token | One per CLI process and container, bound to the container's network identity, revoked when the container is reaped, swapped only for the configured upstream header of its own kind. |
+| One session reads another session's placeholder or `agentctl` token | One container per session, so sessions share neither a PID namespace nor process environments. Tokens are bound to their container. |
+| One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. |
+| Agent-to-agent hops billed to the wrong person | A hop inherits the requester of the turn that posted the mention. Mentions from unmanaged bots are ignored. |
+| Private task leaks the owner's DM context to a non-owner | Each private task runs in a fresh session. Only the consented task text and explicit attachments cross in, only the reply and attachments cross out. |
 | Private files left behind for later channel turns | Private resources only run in the owner's private sandbox. Channel sandboxes never mount them. |
 | Concurrent threads corrupt a shared checkout | One working directory per session, a lock for the scope's shared paths. |
 | Model exfiltrates the real token | The real token never enters the sandbox. |
 | Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
+| agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
+| A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
+| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret`. Retried events are deduplicated by `event_id`. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 
 ## Crate layout
@@ -523,12 +655,12 @@ can link several surface identities to one Claude login.
 | `core-types` | IDs, events, keys, policy types | `serde`, `uuid` |
 | `store` | Persistence | `sqlx` |
 | `auth` | PKCE, exchange, refresh, encryption | `reqwest` (rustls), `sha2`, `base64`, `rand`, `chacha20poly1305` |
-| `surface-slack` | Socket Mode and Events API, Web API | `tokio-tungstenite`, `reqwest`, `axum` |
+| `surface-slack` | Events API, interactivity, slash commands, Web API, manifest API | `reqwest`, `axum`, `hmac` |
 | `surface-rocketchat` | DDP realtime, REST | `tokio-tungstenite`, `reqwest` |
 | `render` | Markdown conversion and splitting | `pulldown-cmark` |
 | `commands` | `/agent` parsing and handlers | `clap` |
 | `runner` | Session queue, stream-json, resume | `tokio` |
-| `sandbox` | Provision, exec, teardown | `bollard` |
+| `sandbox` | Container per session: provision, exec, teardown | `bollard` |
 | `cred-proxy` | Header swap | `hyper`, `axum` |
 | `agentctl` | In-sandbox CLI, static musl build | `clap`, `reqwest` |
 
@@ -556,12 +688,15 @@ shared code. A `MockSurface` drives the shared core in tests.
 
 1. Rocket.Chat adapter, manager bot DM commands (`login`, `create`, `persona`,
    `list`), PKCE linking.
-2. One bot per agent, mention gating, Docker sandbox per agent and scope,
-   `--session-id` / `--resume` through the credential proxy.
+2. One bot per agent, mention gating, a Docker container per session on a
+   volume per agent and scope, non-root `claude`, `--session-id` / `--resume`
+   through the credential proxy.
 3. Requester-pays routing and the usage meter.
-4. Slack adapter: manifest-based agent apps with one-click install, HTTP
-   events, manager bot with `/agent`.
-5. Consent cards, agent-to-agent hand-off, hop caps.
+4. Slack adapter: public HTTPS endpoint, `/agent slack-token`, manifest-based
+   agent apps with a one-click install, manager bot with `/agent`.
+5. Consent cards and `agentctl private`, agent-to-agent hand-off with requester
+   attribution, hop caps. Before this milestone, verify on a real workspace that
+   one app's bot user mentioning another app's bot user produces `app_mention`.
 6. Owner-initiated cloud hand-off (`claude --cloud`) for long PR work.
 7. Slack Connect.
 
@@ -607,10 +742,15 @@ Direct calls would also need our own agent loop.
 
 - Claude Code's OAuth client id, scopes and endpoints are not a public contract.
   A change breaks linking until configuration is updated.
-- Whether a Rocket.Chat custom role with only `create-user`, role assignment
-  and token creation can create bot users. An old issue reports that
-  `users.create` also needed edit-user permissions[^rc-7351]. Needs a test on
-  the target server version.
+- The exact Rocket.Chat custom role. The current reading is `create-user`,
+  `edit-other-user-active-status` when passing `active`, and token creation.
+  An issue from 2017 reported that `users.create` also needed edit-user
+  permissions[^rc-7351]. Needs a test on the target server version.
+- Whether Slack delivers `app_mention` when one app's bot user mentions
+  another's. Agent-to-agent turns on Slack depend on it.
+- One container per active session costs more than one per scope. Idle reaping
+  bounds it, but a busy channel with many threads needs a per-scope container
+  cap and a queue.
 - Whether Rocket.Chat's `__my_messages__` subscription delivers every joined
   room. Until confirmed, subscribe per room.
 - The Agent SDK credit is per user and monthly. Agents need clear messages when
@@ -632,7 +772,9 @@ Direct calls would also need our own agent loop.
 [^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
 [^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/).
-[^slack-botmention]: [slackapi/java-slack-sdk#1279](https://github.com/slackapi/java-slack-sdk/issues/1279) shows `app_mention` events with the `bot_message` subtype.
+[^slack-botmention]: [slackapi/java-slack-sdk#1279](https://github.com/slackapi/java-slack-sdk/issues/1279) shows `app_mention` with the `bot_message` subtype for a message posted by a workflow, not for one app's bot user mentioning another's. To be verified on a real workspace.
+[^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
+[^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.
 [^slack-approval]: [Manage app approval for your workspace](https://slack.com/help/articles/222386767-Manage-app-approval-for-your-workspace).
 [^slack-free]: [Feature limitations on the free version of Slack](https://slack.com/help/articles/27204752526611-Feature-limitations-on-the-free-version-of-Slack).
 [^slack-manifest]: [Configuring apps with app manifests](https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/).
