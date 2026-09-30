@@ -3985,6 +3985,25 @@ hanging when the request never comes. The logout test only waits for its
 refresh to arrive: logout queues behind that refresh on the member's lock,
 so holding the response would deadlock, and either order ends the same.
 
+`concurrent_callers_share_a_failed_refresh_of_an_expired_token` needed more
+than a hold. Its five callers must all join the refresh before the 503
+lands; one that joins later finds no refresh in flight and starts its own,
+which sends a second request. That is the intended behaviour, not a
+bug: T09's notes say an expired token is always retried because there is
+nothing to hand out instead, and the backoff only covers a still-valid
+token. `Auth` had no observable point where every caller had joined, so the
+200 ms response delay was the only margin, and 300 ms added before callers
+2 to 5 start failed the test 10 of 10 runs. The in-flight map now holds the
+refresh's `watch::Sender` rather than a receiver, and a doc-hidden
+`Auth::refresh_waiters(member)` returns its receiver count, which is the
+number of callers waiting. The test holds the 503, waits until that count
+reaches 5, then releases it. It passes 10 of 10 runs with the 300 ms added
+and 200 of 200 with 8 busy loops. The map's sender would keep the channel
+open if the refresh task were dropped before it first ran, so the guard that
+removes the map entry now goes into the task when it is spawned, not on its
+first poll. Waiters of such a task get `RefreshInterrupted`, and the next
+caller starts a new refresh.
+
 ### Before turns, a bot reacts instead of replying
 
 **Issue.** The plan allows a fixed acknowledgement before T23, and the live

@@ -1245,9 +1245,10 @@ async fn ten_concurrent_calls_during_a_failing_refresh_send_one_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_callers_share_a_failed_refresh_of_an_expired_token() {
     let h = harness().await;
+    let (held, mut hold) = Held::new(ResponseTemplate::new(503));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(200)))
+        .respond_with(held)
         .expect(1)
         .mount(&h.server)
         .await;
@@ -1257,6 +1258,12 @@ async fn concurrent_callers_share_a_failed_refresh_of_an_expired_token() {
         let (auth, member) = (h.auth.clone(), h.member);
         tasks.spawn(async move { auth.access_token(member).await });
     }
+    hold.arrived().await;
+    eventually("all five callers wait for the refresh", || async {
+        h.auth.refresh_waiters(h.member) == 5
+    })
+    .await;
+    hold.release();
     while let Some(result) = tasks.join_next().await {
         let err = result.unwrap().unwrap_err();
         assert!(
