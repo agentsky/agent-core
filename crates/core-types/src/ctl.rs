@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::{ConsentId, Msg};
+use crate::{ConsentId, LeaseId, Msg};
 
 /// A request to the agentctl API.
 pub trait CtlRequest: Serialize + DeserializeOwned {
@@ -107,13 +107,29 @@ pub struct HistoryResponse {
 /// `agentctl lock -- <command>`: one step of holding the scope's `shared/`
 /// lock while a command runs.
 ///
-/// The lock is a lease held by the calling session. agentctl acquires it,
-/// renews it while the command runs, and releases it when the command exits.
-/// A holder that dies stops renewing, and the lease expires.
+/// The lock is a lease. [`LockRequest::Acquire`] grants a new lease with its
+/// own [`LeaseId`] when the lock is free; agentctl renews that lease while
+/// the command runs and releases it when the command exits. Renew and
+/// release name the lease, and only the current lease matches, so a second
+/// `agentctl lock` in the same session (Claude Code runs tool calls in
+/// parallel) waits like any other holder, and a stale release never frees
+/// the lock under someone else. A holder that dies stops renewing, and the
+/// lease expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LockRequest {
-    /// What to do with the lease.
-    pub op: LockOp,
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum LockRequest {
+    /// Take the lock if it is free, under a new lease.
+    Acquire,
+    /// Extend a lease.
+    Renew {
+        /// The lease from [`LockResponse::Held`].
+        lease: LeaseId,
+    },
+    /// Give a lease up.
+    Release {
+        /// The lease from [`LockResponse::Held`].
+        lease: LeaseId,
+    },
 }
 
 impl CtlRequest for LockRequest {
@@ -121,31 +137,25 @@ impl CtlRequest for LockRequest {
     type Response = LockResponse;
 }
 
-/// An operation on the scope lock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LockOp {
-    /// Take the lease if it is free.
-    Acquire,
-    /// Extend a lease this session holds.
-    Renew,
-    /// Give the lease up.
-    Release,
-}
-
-/// The state of the scope lock after a [`LockRequest`].
+/// The state of a lease after a [`LockRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LockResponse {
-    /// This session holds the lease until `expires_at`.
+    /// The caller holds the lock under `lease` until `expires_at`. Answers
+    /// an acquire that got the lock and a renew of the current lease.
     Held {
+        /// The lease to renew and release.
+        lease: LeaseId,
         /// When the lease runs out unless renewed.
         #[serde(with = "time::serde::rfc3339")]
         expires_at: OffsetDateTime,
     },
-    /// Another session holds the lease. Try again later.
+    /// Another lease holds the lock, possibly one of the same session's.
+    /// Answers an acquire. Try again later.
     Busy,
-    /// This session doesn't hold the lease.
+    /// The named lease doesn't hold the lock: it was released, it expired,
+    /// or it never existed. Answers every release, and a renew of any lease
+    /// but the current one.
     Released,
 }
 
@@ -341,20 +351,29 @@ mod tests {
 
     #[test]
     fn lock_round_trips() {
-        for op in [LockOp::Acquire, LockOp::Renew, LockOp::Release] {
-            json_round_trip(&LockRequest { op });
-        }
+        let lease: LeaseId = "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap();
         assert_eq!(
-            json_round_trip(&LockRequest {
-                op: LockOp::Acquire
-            }),
+            json_round_trip(&LockRequest::Acquire),
             json!({"op": "acquire"})
         );
         assert_eq!(
+            json_round_trip(&LockRequest::Renew { lease }),
+            json!({"op": "renew", "lease": lease.to_string()})
+        );
+        assert_eq!(
+            json_round_trip(&LockRequest::Release { lease }),
+            json!({"op": "release", "lease": lease.to_string()})
+        );
+        assert_eq!(
             json_round_trip(&LockResponse::Held {
+                lease,
                 expires_at: datetime!(2026-09-30 12:00 UTC),
             }),
-            json!({"state": "held", "expires_at": "2026-09-30T12:00:00Z"})
+            json!({
+                "state": "held",
+                "lease": lease.to_string(),
+                "expires_at": "2026-09-30T12:00:00Z",
+            })
         );
         assert_eq!(
             json_round_trip(&LockResponse::Busy),
@@ -364,7 +383,17 @@ mod tests {
             json_round_trip(&LockResponse::Released),
             json!({"state": "released"})
         );
+    }
+
+    #[test]
+    fn lock_renew_and_release_require_a_lease() {
         assert_rejects::<LockRequest>(json!({"op": "steal"}));
+        assert_rejects::<LockRequest>(json!({"op": "renew"}));
+        assert_rejects::<LockRequest>(json!({"op": "release"}));
+        assert_rejects::<LockRequest>(json!({"op": "release", "lease": "nope"}));
+        assert_rejects::<LockResponse>(
+            json!({"state": "held", "expires_at": "2026-09-30T12:00:00Z"}),
+        );
     }
 
     #[test]

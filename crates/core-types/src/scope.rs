@@ -37,9 +37,16 @@ pub enum ScopeKind {
 /// | `Private` | `private` |
 ///
 /// Team and conversation ids are escaped as the [`surface`](crate::surface)
-/// module describes, so the string never contains `/` and is safe as one
-/// path segment. `FromStr` accepts only what `Display` writes, so the two
-/// round-trip both ways. The serde form is the string form.
+/// module describes, so the string never contains `/`. `FromStr` accepts
+/// only what `Display` writes, so the two round-trip both ways. The serde
+/// form is the string form.
+///
+/// The string is a key for database columns, labels and logs, not a name
+/// for a file or a Docker object. It always contains `:`, which splits a
+/// bollard `binds` entry (`src:dst:ro`) and is not allowed in a Docker
+/// volume name, and it may contain `%` and any other character a platform
+/// id holds. The sandbox derives filesystem-safe directory names from it
+/// instead (T17 in `docs/tasks-plan.md`).
 ///
 /// A `Private` scope names no conversation. It is the same for every agent,
 /// and a [`VolumeKey`] tells agents apart.
@@ -144,7 +151,8 @@ crate::serde_as_string!(ScopeKey);
 /// Its string form is `<agent>/<scope>`, for example
 /// `67e55044-10b1-426f-9247-bb680e5fe0c8/ch:slack:T012:C345`. It has exactly
 /// one `/`, since a [`ScopeKey`] never contains one. `FromStr` accepts only
-/// what `Display` writes. The serde form is the string form.
+/// what `Display` writes. The serde form is the string form. Like a
+/// [`ScopeKey`], it is not a file or Docker object name.
 ///
 /// ```
 /// use core_types::{AgentId, ScopeKey, VolumeKey};

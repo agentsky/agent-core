@@ -36,10 +36,25 @@ unused-allowed-license = "allow"
 
 [licenses.private]
 # The workspace crates carry only `license-file` and are never published.
+# This skips every `publish = false` crate, not only ours, so
+# scripts/ci/check-path-deps.sh (run by the same CI job) fails when a path
+# package other than the root package or a crate in crates/ is in the
+# graph.
 ignore = true
 
 [bans]
 multiple-versions = "warn"
+# Older versions that sqlx 0.9.0 (the latest release) pins, next to the newer
+# ones the rest of the workspace uses. Each entry skips only that version, so
+# any other duplicate still warns. Remove them when sqlx catches up.
+skip = [
+    { crate = "base64@0.22.1", reason = "sqlx-core 0.9.0 depends on base64 0.22" },
+    { crate = "block-buffer@0.10.4", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
+    { crate = "cpufeatures@0.2.17", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
+    { crate = "crypto-common@0.1.6", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
+    { crate = "hashbrown@0.16.1", reason = "sqlx-core 0.9.0 depends on hashlink 0.11" },
+    { crate = "syn@2.0.119", reason = "sqlx-macros 0.9.0 and tracing-attributes depend on syn 2" },
+]
 deny = [
     { crate = "openssl", reason = "use rustls on aws-lc-rs" },
     { crate = "openssl-sys", reason = "use rustls on aws-lc-rs" },

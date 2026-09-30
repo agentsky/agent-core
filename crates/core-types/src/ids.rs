@@ -1,5 +1,5 @@
 //! UUID newtypes for the things agentd mints: members, agents, sessions,
-//! turns, consents and bindings.
+//! turns, consents, bindings and scope-lock leases.
 //!
 //! Each type has one string form, the lowercase hyphenated UUID
 //! (`67e55044-10b1-426f-9247-bb680e5fe0c8`). `Display` writes it, and
@@ -108,6 +108,13 @@ uuid_id!(
     BindingId,
     "binding id"
 );
+uuid_id!(
+    /// One grant of a scope's `shared/` lock, minted on each acquire. Renew
+    /// and release name it, so two `agentctl lock` runs in one session never
+    /// share a lease.
+    LeaseId,
+    "lease id"
+);
 
 #[cfg(test)]
 mod tests {
@@ -191,6 +198,11 @@ mod tests {
         assert_eq!(
             json_round_trip(&binding),
             serde_json::json!(binding.to_string())
+        );
+        let lease = LeaseId::new_v4();
+        assert_eq!(
+            json_round_trip(&lease),
+            serde_json::json!(lease.to_string())
         );
     }
 

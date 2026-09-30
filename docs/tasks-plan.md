@@ -222,8 +222,8 @@ description, and must pass T02's policy.
   a build argument (2.1.285 when this plan was written). It uses the native
   installer, not npm, so the image has no Node.js.
 - The stream-json output shapes the runner relies on, observed on 2.1.285:
-  - `{"type":"system","subtype":"init",…}` at start, with `session_id`,
-    `model` and `tools`.
+  - `{"type":"system","subtype":"init",…}` at the start of every turn, not
+    only once per process, with `session_id`, `model` and `tools`.
   - `{"type":"assistant","message":{…}}` and `{"type":"user",…}` during the
     turn.
   - A final `{"type":"result",…}` line with `subtype`, `is_error`, `result`,
@@ -232,13 +232,18 @@ description, and must pass T02's policy.
     `is_error` decides failure, not `subtype`. An unreachable upstream produced
     `subtype: "success"` with `is_error: true` and
     `terminal_reason: "api_error"`.
-  - Other line types, such as `active_goal`, `autocompact_state` and
-    `system/commands_changed`, appear too and must be ignored. Parse every line
+  - Other line types, such as `rate_limit_event`, `system/api_retry`,
+    `active_goal`, `autocompact_state` and `system/commands_changed`, appear
+    too and must be ignored. Parse every line
     leniently: unknown `type` values are skipped, and unknown fields are
     allowed.
 - The transcript lands at
   `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<session id>.jsonl`
-  (verified on 2.1.285).
+  (verified on 2.1.285). It is created by the first user message, not when
+  the process starts, so a process stopped before its first turn leaves no
+  transcript to `--resume` ([impl-notes](impl-notes.md#t04-testkit)).
+- With both `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` set, the CLI
+  sends the API key. The runner sets exactly one of them.
 - Input is one JSON object per line:
   `{"type":"user","message":{"role":"user","content":"…"}}`.
 
@@ -261,8 +266,10 @@ description, and must pass T02's policy.
   sets `CARGO_BIN_EXE_<name>` for a package's own integration tests. The helper
   runs `$CARGO build -p testkit --bin fake-claude --message-format=json` once
   per test process and reads the executable path from the artifact message.
-  That respects whatever target directory is in effect, including
-  `cargo llvm-cov`'s.
+  It passes `--target-dir` with the directory the running test executable
+  was built in, because `cargo llvm-cov` names its target directory on the
+  command line, where a nested cargo can't see it
+  ([impl-notes](impl-notes.md#fake_claude_path-built-outside-cargo-llvm-covs-target-directory)).
 - Tests that need Docker are named `docker_*` and marked
   `#[ignore = "needs docker"]`. CI runs them with
   `cargo test --workspace -- --ignored docker_` in a separate job (added in
@@ -525,7 +532,11 @@ Deliverables:
     GPL, LGPL and AGPL are denied. A weak-copyleft license such as MPL-2.0 is
     allowed only as a per-crate exception with a reason.
     `[licenses.private] ignore = true`, because the workspace crates carry
-    only `license-file`.
+    only `license-file`. That exempts every `publish = false` crate, so
+    `scripts/ci/check-path-deps.sh` fails when any path package other than
+    the root package or a crate directly under `crates/` is in the graph
+    (see
+    [impl-notes](impl-notes.md#licensesprivate-exempts-any-unpublished-crate)).
   - `[advisories]` denies vulnerabilities and warns on unmaintained crates
     (the latter through `-W unmaintained` on the command line; see
     [impl-notes](impl-notes.md#cargo-deny-020-has-no-warning-level-for-unmaintained-crates)).
@@ -534,11 +545,15 @@ Deliverables:
   `EmbarkStudios/cargo-deny-action` pinned to a major version, run with
   `--workspace` (see
   [impl-notes](impl-notes.md#cargo-deny-checks-only-the-root-package-by-default)).
-  It runs when code changed and is added to `ci-passed`'s `needs`.
+  It runs `check-path-deps.sh` before cargo-deny, runs when code changed and
+  on a weekly `schedule` (which runs every job but `publish-badges`; see
+  [impl-notes](impl-notes.md#the-deny-job-ran-only-when-code-changed)),
+  and is added to `ci-passed`'s `needs`.
 - A README line naming the policy.
 
 Acceptance: the job passes on `main`'s lockfile. A throwaway local commit that
-adds `native-tls` fails it; say so in the PR.
+adds `native-tls` fails it, and so does one that adds a GPL crate with
+`publish = false` as a path dependency; say so in the PR.
 
 ### T03
 
@@ -552,7 +567,7 @@ Design: [Terminology](design.md#terminology),
 Deliverables in `crates/core-types/src/`:
 
 - `ids.rs`: newtypes over `Uuid` for `MemberId`, `AgentId`, `SessionId`,
-  `TurnId`, `ConsentId`, and `BindingId`, each with `new_v4()`, `Display`,
+  `TurnId`, `ConsentId`, `BindingId` and `LeaseId`, each with `new_v4()`, `Display`,
   `FromStr` and serde.
 - `surface.rs`:
   - `SurfaceKind` (`Slack`, `RocketChat`).
@@ -575,7 +590,10 @@ Deliverables in `crates/core-types/src/`:
     volumes (see [Volumes and scopes](#volumes-and-scopes)).
 - `event.rs`: `InboundEvent` with:
   - `event_id` for deduplication, `binding`, `sender: MemberKey`.
-  - `sender_is_bot: bool` and `sender_bot_user: Option<UserId>`.
+  - `sender_is_bot: bool` and `sender_bot_user: Option<UserId>`. For a bot,
+    `sender.user` holds its user id when known and its bot id otherwise, and
+    `sender_bot_user` is that user id or `None` (see
+    [impl-notes](impl-notes.md#a-slack-bot-message-may-name-no-user)).
   - `conv`, `thread_root`, `message: MsgRef`, `text`.
   - `mentions: Vec<UserId>`, `conv_kind: ConvKind` (with an `is_dm()`
     helper), `reply_to: Option<MsgRef>`, `files: Vec<InFile>`, and
@@ -633,9 +651,10 @@ Deliverables:
   - With `--session-id`, fails if the transcript already exists. With
     `--resume`, fails if it doesn't.
   - Reads stream-json user lines from stdin. For each, it sends
-    `POST $ANTHROPIC_BASE_URL/v1/messages` with `Authorization: Bearer
-    $CLAUDE_CODE_OAUTH_TOKEN`, or `x-api-key: $ANTHROPIC_API_KEY` when only
-    that is set, and expects a 200.
+    `POST $ANTHROPIC_BASE_URL/v1/messages` with `x-api-key:
+    $ANTHROPIC_API_KEY` when that is set, and `Authorization: Bearer
+    $CLAUDE_CODE_OAUTH_TOKEN` otherwise, as the real CLI does, and expects
+    a 200.
   - Emits the `init`, `assistant` and `result` lines from the script file named
     by `FAKE_CLAUDE_SCRIPT` (JSON: a list of turns, each with reply text,
     `is_error`, optional delay, optional crash).
@@ -676,9 +695,11 @@ Design: [Data model](design.md#data-model),
 
 Deliverables:
 
-- `Store::open(url)`, which sets `journal_mode=WAL`, `foreign_keys=ON` and
-  `busy_timeout`, and runs migrations.
-- `Store::open_in_memory()` for tests.
+- `Store::open(url, sealer)`, which sets `journal_mode=WAL`,
+  `foreign_keys=ON` and `busy_timeout`, and runs migrations. The `Sealer`
+  carries the master key
+  ([impl-notes](impl-notes.md#the-key-reaches-the-store-through-open)).
+- `Store::open_in_memory(sealer)` for tests.
 - `Sealer`: ChaCha20-Poly1305 with a random 96-bit nonce per value. The stored
   layout is `version(1) || nonce(12) || ciphertext`. Associated data is
   `table/column/primary key`. The key is loaded from a `SecretString`
@@ -698,7 +719,9 @@ Deliverables:
     Rocket.Chat redeliveries.
 - Repository methods, each a small async function with a test:
   - `member_for_identity`, `ensure_member(MemberKey, display_name)`.
-  - `put_claude_link`, `get_claude_link`, `delete_claude_link`.
+  - `put_claude_link`, `get_claude_link`, `delete_claude_link`, and
+    `mark_claude_link_broken(member, at) -> bool`, true only when it set
+    `broken_at` (T09 marks the link, T13 sends one notice per failure).
   - `put_pending_login`, `take_pending_login(state)` (atomic: delete and
     return), `invalidate_pending_logins(member)`.
   - `mark_event_processed(source, id) -> bool`, which returns false when the
@@ -737,10 +760,15 @@ Deliverables:
   - `**bold**` to `*bold*`, `*em*` and `_em_` to `_em_`, and `~~strike~~` to
     `~strike~`.
   - Inline and fenced code are preserved, and their contents are never
-    rewritten.
-  - Links to `<url|label>`. Bare `http(s)` URLs get explicit `<url>`
-    bounds, as in qm-core, so Slack doesn't pull neighboring marks into them
-    (see [impl-notes](impl-notes.md#bare-urls-get-explicit-bounds)).
+    rewritten, except that a run of three backticks inside a fenced block
+    gets a zero-width space so it can't close the block (see
+    [impl-notes](impl-notes.md#backtick-runs-close-a-slack-code-block)).
+  - Links to `<url|label>`, except that a label naming another host goes
+    next to the link (see
+    [impl-notes](impl-notes.md#a-link-label-can-disguise-its-destination)).
+    Bare `http(s)` URLs get explicit `<url>` bounds, as in qm-core, so Slack
+    doesn't pull neighboring marks into them (see
+    [impl-notes](impl-notes.md#bare-urls-get-explicit-bounds)).
   - Lists to `•` and `1.` lines, with two spaces of indent per nesting level.
   - Blockquotes to `>`.
   - Tables to aligned plain text inside a fenced code block.
@@ -785,7 +813,9 @@ Deliverables:
   `[[react: <emoji>]]` (the only directive for now). Directives inside code are
   not parsed.
 - `render::rocketchat::to_markdown(md, directory)`: pass-through, neutralizing
-  `@all` and `@here` outside code, with the same `@Name` resolution as Slack.
+  `@all` and `@here` outside code, with the same `@Name` resolution as Slack
+  (the directory returns usernames there; see
+  [impl-notes](impl-notes.md#rocketchat-mentions-need-a-username-not-an-id)).
 - Per-surface limits as constants: Slack 3,000 characters per `text` chunk
   (under the 4,000 hard limit, leaving room for rendering growth), and
   Rocket.Chat 5,000 UTF-16 units (the server default `Message_MaxAllowedSize`).
@@ -813,10 +843,12 @@ Deliverables:
   text of a DM to the manager bot, or the text after `!agent`. A
   `strip_prefix` helper covers the last two.
 - A `Command` enum covering every row of the design's command table:
-  - `Login { code: Option<String> }`, `Logout`, `Me`.
-  - `SlackToken { token, refresh }`.
+  - `Login { code: Option<SecretString> }`, `Logout`, `Me`.
+  - `SlackToken { token, refresh }`, both `SecretString`.
   - `Create { name, persona }`, `Persona { name, text }`.
-  - `Skill { add|rm, name, source }`.
+  - `Skill(Add { name, source } | Rm { name, skill })`. `name` is the agent;
+    `skill rm` names the skill, since an owner may have several agents
+    ([impl-notes](impl-notes.md#skill-rm-needs-the-agent-and-the-skill)).
   - `Allow` and `Deny { name, target }`.
   - `Limits { name, turns_per_day, hops }`.
   - `Pause`, `Resume` and `Delete { name }`.
@@ -1003,7 +1035,8 @@ Deliverables:
     decides whether the thread root is the agent's own message.
   - Room type `d` sets `conv_kind` to `Dm`, or `GroupDm` when the room has
     more than two members.
-  - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`.
+  - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`,
+    and then `sender_bot_user` is `u._id`, the same id as `sender.user`.
   - Edits (`editedAt`) are ignored.
   - `event_id` is the message `_id`.
   - A bot's own messages are not dropped here. Every connection in a room
@@ -1140,10 +1173,18 @@ Deliverables:
     `private [--file <path>]… <task>`.
   - `lock` acquires the scope's `shared/` lock through the API, runs the
     command, and releases the lock when it exits. The lock is a lease in a
-    `scope_locks` table (`volume_key`, `holder_session`, `expires_at`),
-    renewed while the command runs, so a crashed holder frees it. This is the
-    lock the design says `agentctl` takes for writes; the PR adds the command
-    to the design's table.
+    `scope_locks` table (`lease_id` as the primary key, `volume_key` unique,
+    `holder_session`, `expires_at`), renewed while the command runs, so a
+    crashed holder frees it. Each acquire mints a new `LeaseId`, which
+    `LockResponse::Held` returns; renew and release carry it and act only
+    when it matches the current lease of the token's `volume_key`. The lock is exclusive per lease, not
+    per session: Claude Code runs tool calls in parallel, so one session can
+    run two `agentctl lock` at once, and the second must wait rather than
+    share the first's lease (see
+    [impl-notes](impl-notes.md#the-scope-lock-had-no-lease-id)).
+    `holder_session` records which session holds the lease. This is the
+    lock the design says `agentctl` takes for writes; the PR adds the
+    command to the design's table.
   - Reads `AGENTCTL_URL` (default `http://agentctl.internal:8081`) and
     `AGENTCTL_TOKEN` from the environment.
   - Prints results as plain text for the model, and exits non-zero with a
@@ -1193,8 +1234,10 @@ Deliverables:
 Acceptance:
 
 - Tests for token hashing, IP binding, refusal between turns, the startup purge,
-  refusal inside private tasks, each target rule, and a `lock` lease that a
-  second session waits for and that expires when its holder dies.
+  refusal inside private tasks, each target rule, and the `lock` lease: a
+  second session waits for it, so does a second `lock` in the same session, a
+  renew or release naming an expired or earlier lease leaves the current one
+  alone, and it expires when its holder dies.
 - `agentctl` against the server for each subcommand, through the `fake-claude`
   script path from T04.
 
@@ -1280,9 +1323,26 @@ Deliverables:
     so the runner can revoke their mappings at once (T21).
 - A migration `…_volumes.sql` for the `volumes` table (`agent_id`,
   `scope_key`, `path`, `created_at`), keyed by `(agent_id, scope_key)`.
+- Volumes are host directories under `volumes/` in the agentd data
+  directory, at `volumes/<agent id>/<scope dir>`. `<scope dir>` is the
+  lowercase hex SHA-256 of the scope key's string form: 64 characters from
+  `[0-9a-f]` for every key, so no key makes a name too long, and none differ
+  only by case. It is a digest rather than a reversible encoding (hex or
+  base32 of the key) because those grow with the key, and a long
+  Rocket.Chat team id could pass the 255-byte file-name limit. The `volumes`
+  row records which key a directory holds, and `ensure_volume` derives the
+  same path again if the row is lost. Scope and volume key strings contain
+  `:` and may contain `%` (see
+  [impl-notes](impl-notes.md#scope-keys-are-not-file-or-docker-names)), so
+  neither is ever used as a path segment or a Docker name.
 - `DockerSandbox` (bollard). `container_config(&SessionSpec) -> bollard
   config` is a pure function with unit tests, and the rest is a thin sender:
   - The pinned image, as user 10001.
+  - Every directory below is a bind mount through bollard's `Mounts` API
+    (`HostConfig::mounts`, type `bind`, `read_only` per mount). Never
+    `HostConfig::binds` strings, whose `src:dst:ro` form a `:` in a path
+    breaks, and never named Docker volumes, whose names allow only
+    `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
   - `sessions/<id>/` mounted read-write at `/volume/sessions/<id>`, `shared/`
     at `/volume/shared` (read-write or read-only, per `SessionSpec`),
     `memory/` at `/volume/memory` when `SessionSpec` asks for it (see
@@ -1320,7 +1380,9 @@ Acceptance:
 - Unit tests with `ProcessSandbox` for the directory layout and the contents of
   `settings.json`.
 - Unit tests of `container_config`: mounts, read-only flags, user,
-  environment, network, limits, capabilities, labels.
+  environment, network, limits, capabilities, labels. A scope key with `:`
+  and `%` in its ids yields `Mounts` entries with the expected source paths
+  and no `binds`.
 - Two agents in one channel get two volumes.
 - Docker tests:
   - A session can't see another session's directory.
@@ -1564,7 +1626,10 @@ Deliverables:
   `RouterView` answers:
   - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
     and user as every identity is, so a matching user id from another team or
-    server is never taken for a managed agent.
+    server is never taken for a managed agent. The router asks it for
+    `event.sender` when `sender_is_bot` is true. Surfaces put the bot's user
+    id in both `sender.user` and `sender_bot_user`, so the router needs only
+    `sender`; a bot known only by its bot id matches no binding.
   - `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`.
   - `member_for(MemberKey)`, `is_linked(member)`.
   - `community_key_configured()`.
@@ -1581,7 +1646,8 @@ Deliverables:
   - `Refuse(reason)`, used for paused agents, bans, deny rules and the hop
     cap.
 - The flowchart from the design, each branch a named test:
-  - Unmanaged bot, ignored.
+  - Unmanaged bot, ignored, including one known only by its bot id
+    (`sender_bot_user: None`).
   - Managed bot that doesn't mention the agent, ignored.
   - Managed bot that mentions the agent inherits requester and hop plus one.
   - Managed bot that mentions the agent but has no `message_ref`,
@@ -1742,7 +1808,7 @@ Deliverables:
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
-- `/agent skill rm <name>`.
+- `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
 - Skills may declare extra egress hosts in front matter (`allowed-hosts:`). The
   owner confirms them when adding, and they extend T19's allowlist for that
   agent's sandboxes.
@@ -1889,9 +1955,11 @@ Deliverables:
   - `thread_ts` becomes `thread_root` and `reply_to`.
   - `channel_type` sets `conv_kind`: `im` is `Dm`, `mpim` is `GroupDm`, and
     the rest are `Channel`.
-  - `bot_id` or `bot_profile` sets `sender_is_bot`. `sender_bot_user` comes
-    from the event's `user` field when present. T29 adds the `bots.info`
-    lookup for events without one.
+  - `bot_id` or `bot_profile` sets `sender_is_bot`. When the event has a
+    `user` field, it is `sender.user` and `sender_bot_user`. A bot event
+    without one has its `bot_id` as `sender.user` and no `sender_bot_user`
+    until T29's `bots.info` lookup fills both with the bot's user id (see
+    `InboundEvent`'s "Bot senders" rustdoc).
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
@@ -1917,6 +1985,10 @@ Deliverables:
 
 - A Web API client with a bot token per binding:
   - `chat.postMessage` with `thread_ts`, `unfurl_links: false` and mrkdwn text.
+    Posts and updates never set `link_names` or `parse: full`: `render`
+    leaves unresolved `@names` and code as written, and either flag would let
+    them ping (see
+    [impl-notes](impl-notes.md#typed-broadcasts-get-a-zero-width-space)).
   - `chat.update`, `chat.postEphemeral`, `reactions.add` and
     `reactions.remove`.
   - `conversations.replies` and `conversations.history`, `conversations.info`
@@ -1936,13 +2008,17 @@ Deliverables:
   TTL, mapping display and real names to user ids. The pipeline's
   `MentionDirectory` snapshot (T23) reads it together with agent bindings.
   `users.info` can't look a user up by name.
-- `bots.info` fills `sender_bot_user` for bot events that lack a `user`
-  field, cached per bot id.
+- `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
+  `user_id` for bot events that lack a `user` field, cached per bot id. A bot
+  id that maps to no user keeps the `bot_id` as `sender.user` and no
+  `sender_bot_user`, so the router ignores it as an unmanaged bot.
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `render` converts and splits through `render`, so that
-`post` sends one chunk as T23 expects. Slack returns HTTP 200 with
-`ok: false` on errors; test that mapping.
+`post` sends one chunk as T23 expects. A test asserts that the
+`chat.postMessage` and `chat.update` request bodies carry neither `link_names`
+nor `parse: full`. Slack returns HTTP 200 with `ok: false` on errors; test
+that mapping.
 
 ### T30
 
