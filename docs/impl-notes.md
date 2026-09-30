@@ -3810,3 +3810,137 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
 - `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
+
+## T21: runner sessions, queue and warm pool
+
+### The hooks name the process, not only the session
+
+**Issue.** The plan's `process_stopping(session)` and `turn_finished(session,
+turn)` name only the session. The pool calls `process_stopping` from the
+sandbox's event stream when a container dies, without the session's lock,
+since a turn may be running for many minutes. A death reported for a
+session's old container could then land after the session had stopped it
+and started a new process, and revoke the new process's placeholder and
+agentctl token. T23 would also have had to keep a map from session to
+token to hand the turn's outbox back.
+
+**Solution.** `TurnHooks` has two associated types. `process_starting`
+returns `(ProcessEnv, Self::Process)`, and every later call for that
+process gets the `Process` back, so agentd can keep the placeholder's id
+and the agentctl token in it and a late call for an old process never
+touches a new one. `turn_finished` returns `Self::Finished`, which
+`run_turn` hands to the caller in `TurnReport::finished`: T23 returns the
+turn's `Outbox` there. `SessionManager` is generic over its hooks rather
+than holding a `dyn TurnHooks`.
+
+### A turn cut off before its outcome was recorded
+
+**Issue.** A session is marked started after a turn whose `init_seen` is
+true. If agentd dies after the CLI read an unstarted session's first
+message but before that was recorded, the next process starts with
+`--session-id`, which the CLI refuses because the transcript exists, and
+every later turn fails the same way: nothing would ever mark it started.
+
+**Solution.** `sessions` has a `maybe_started` column. It is set in the
+store before a turn goes to an unstarted session's CLI, and cleared when
+the turn's outcome says what happened (`init_seen`, or a refused
+`--resume`). A session with it set starts its next process with
+`--resume`; if there is no transcript after all the CLI refuses, and the
+plan's rerun with `--session-id` takes over. A `--session-id` start that
+crashes without `init_seen` leaves it set too, so a transcript that
+existed after all is resumed next time.
+
+### `lookup_or_create` needs the scope
+
+**Issue.** `lookup_or_create(agent, thread_key)` has no scope to record,
+and a `ThreadKey` can't give one: the router decides that the owner's DM is
+`Private` and another member's is `Dm`. If a thread's session were found
+whatever scope it was made on, a DM that stopped being the owner's (the
+agent changed hands) would keep running on the agent's `Private` volume.
+
+**Solution.** `lookup_or_create(agent, thread, scope)`. A thread's live
+session on another scope is reset and replaced in the same transaction,
+and its warm container stopped in the background, so a session never
+changes volume.
+
+### `create_private` needs the thread
+
+**Issue.** `create_private(agent, consent)` names no thread, but the row's
+thread columns are not null, and T33 posts the task's result to the thread
+recorded with the consent, whose table doesn't exist yet.
+
+**Solution.** `create_private(agent, consent, thread)`, and a `consent_id`
+column, set exactly for `private` rows. The thread columns of a private
+row hold where its result goes; the partial unique index covers normal
+rows only, so they never collide with the thread's own session. A private
+session takes only `TurnKind::PrivateTask` with its own consent, and a
+normal session only `TurnKind::Normal`.
+
+### Idle containers hold places under the caps
+
+**Issue.** With one warm container per active session, idle containers
+fill a scope's cap, and a new session would wait up to the idle timeout
+for the reaper.
+
+**Solution.** A session that needs a container when a cap is full first
+stops an idle one under that cap (a dead one first, then the one idle
+longest), and otherwise waits on the cap's semaphore until a place frees
+up or a turn ends and a container becomes idle. A container is idle when
+its session's lock is free; the pool takes it with `try_lock`, so it never
+waits on another session. The scope cap is per volume, `(agent, scope)`,
+so two agents in one channel don't share one. The global cap defaults to
+32; the Compose sandbox network leaves about 126 addresses.
+
+### Mounts come from the turn's side
+
+**Issue.** A container's mounts are fixed when it starts, and the plan
+doesn't say what decides them: `shared/` read-write or read-only, and
+whether `memory/` is mounted.
+
+**Solution.** The turn's `Side`, on the agent's `Private` volume: the
+owner's side gets `shared/` read-write and `memory/`, the public side (a
+private task a non-owner asked for) `shared/` read-only and no `memory/`.
+Every other volume mounts `shared/` read-write and no `memory/`. A turn
+whose mounts differ from the warm container's stops the container, like a
+credential kind or model change stops the process.
+
+### How turns queue and survive their caller
+
+**Issue.** The plan asks for a keyed queue in arrival order, and for
+`turn_finished` to finish before the slot is released even when the caller
+is cancelled. A task spawned per turn and then queued would queue in
+whatever order tokio runs the tasks.
+
+**Solution.** Each session's slot is a tokio mutex, which hands the lock
+out in the order it was asked for. `run_turn` asks for it in the caller's
+future, as its first await, and once it has it runs the turn in a spawned
+task that owns the lock guard, so dropping the caller no longer cancels
+anything; the lock is released only after `turn_finished` returns. A
+caller that stops waiting while its turn is still queued leaves the queue
+and its turn never runs. `reset` and `stop` queue the same way, so a reset
+runs after the turns queued before it; turns queued after it fail with
+`RunnerError::SessionReset`.
+
+### Hook failures
+
+**Issue.** The plan doesn't say what a failing hook does.
+
+**Solution.** A failed `process_starting` fails the turn. A failed
+`turn_starting` fails it without sending it, and `turn_finished` is still
+called, since the placeholder may have been pointed. A failed
+`turn_finished` is logged and returned in `TurnReport::finished`, and the
+process is stopped (with `process_stopping`), since the runner can't tell
+whether the placeholder is still pointed. A failed `process_stopping` is
+logged and the stop goes ahead.
+
+### What is durable
+
+**Issue.** Queued and in-flight state must survive a restart if anything
+reads it back.
+
+**Solution.** What the runner reads back lives in `sessions`: the ids,
+`started`, `maybe_started`, `last_turn_at` and `reset_at`. The queue of
+waiting turns belongs to its callers' futures, and the warm pool to
+running processes and containers, neither of which survives a restart:
+agentd reaps every sandbox at startup (T17) and purges agentctl tokens
+(T15), and placeholders live in memory (T18). They stay in memory.

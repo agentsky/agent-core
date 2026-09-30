@@ -20,8 +20,9 @@
 //! [`pending_logins`](Store::put_pending_login),
 //! [`processed_events`](Store::mark_event_processed),
 //! [`ctl_tokens`](Store::put_ctl_token),
-//! [`scope_locks`](Store::acquire_scope_lock) and
-//! [`volumes`](Store::put_volume).
+//! [`scope_locks`](Store::acquire_scope_lock),
+//! [`volumes`](Store::put_volume) and
+//! [`sessions`](Store::session_for_thread).
 
 #![warn(missing_docs)]
 
@@ -40,6 +41,7 @@ mod members;
 mod pending_logins;
 mod relink_notices;
 mod seal;
+mod sessions;
 mod volumes;
 
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
@@ -48,6 +50,7 @@ pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
+pub use sessions::{Session, SessionKind, ThreadSession};
 pub use volumes::Volume;
 
 use seal::Aad;
@@ -344,6 +347,7 @@ mod tests {
                 "pending_logins",
                 "processed_events",
                 "scope_locks",
+                "sessions",
                 "surface_identities",
                 "volumes",
             ]

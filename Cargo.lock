@@ -1885,7 +1885,9 @@ dependencies = [
 name = "runner"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "core-types",
+ "futures",
  "sandbox",
  "secrecy",
  "serde",
@@ -1893,6 +1895,7 @@ dependencies = [
  "store",
  "testkit",
  "thiserror",
+ "time",
  "tokio",
  "toml",
  "tracing",
