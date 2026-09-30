@@ -5,12 +5,19 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Weekly, so a new advisory against an unchanged lockfile fails a run of
+  # its own instead of the next unrelated pull request. GitHub runs
+  # schedules on the default branch only.
+  schedule:
+    - cron: '23 4 * * 1'
 
 permissions:
   contents: read
 
+# A scheduled run gets a group of its own: sharing main's group, it could
+# replace a pending push run whose badges would then not be published.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'schedule' || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -19,8 +26,8 @@ env:
 jobs:
   # Decides whether this change needs the build and test jobs. When every
   # changed file is documentation (scripts/ci/docs-only.sh), they are
-  # skipped and the `docs` job runs instead. Manual dispatches, and pushes
-  # whose previous tip cannot be fetched, run everything.
+  # skipped and the `docs` job runs instead. Manual dispatches, scheduled
+  # runs, and pushes whose previous tip cannot be fetched, run everything.
   changes:
     name: Classify changes
     runs-on: ubuntu-24.04
@@ -255,7 +262,11 @@ jobs:
   # Cargo.lock instead of a re-resolved one. `-W unmaintained` reports
   # unmaintained crates as warnings; vulnerabilities fail the job. The
   # action's image ships an old Rust, so it switches to the current stable
-  # like the other jobs.
+  # like the other jobs. deny.toml exempts every `publish = false` crate
+  # from the license check so that our own crates pass, so
+  # check-path-deps.sh first fails the job when any other path package is
+  # in the graph. The job also runs weekly on main, through the `schedule`
+  # trigger, to catch advisories published since the last change.
   deny:
     name: Dependency policy
     needs: changes
@@ -265,6 +276,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Check that path dependencies are workspace crates
+        run: sh scripts/ci/check-path-deps.sh
 
       - name: Check dependencies
         uses: EmbarkStudios/cargo-deny-action@v2

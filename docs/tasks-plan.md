@@ -525,7 +525,11 @@ Deliverables:
     GPL, LGPL and AGPL are denied. A weak-copyleft license such as MPL-2.0 is
     allowed only as a per-crate exception with a reason.
     `[licenses.private] ignore = true`, because the workspace crates carry
-    only `license-file`.
+    only `license-file`. That exempts every `publish = false` crate, so
+    `scripts/ci/check-path-deps.sh` fails when any path package other than
+    the root package or a crate directly under `crates/` is in the graph
+    (see
+    [impl-notes](impl-notes.md#licensesprivate-exempts-any-unpublished-crate)).
   - `[advisories]` denies vulnerabilities and warns on unmaintained crates
     (the latter through `-W unmaintained` on the command line; see
     [impl-notes](impl-notes.md#cargo-deny-020-has-no-warning-level-for-unmaintained-crates)).
@@ -534,11 +538,15 @@ Deliverables:
   `EmbarkStudios/cargo-deny-action` pinned to a major version, run with
   `--workspace` (see
   [impl-notes](impl-notes.md#cargo-deny-checks-only-the-root-package-by-default)).
-  It runs when code changed and is added to `ci-passed`'s `needs`.
+  It runs `check-path-deps.sh` before cargo-deny, runs when code changed and
+  on a weekly `schedule` (which runs every job but `publish-badges`; see
+  [impl-notes](impl-notes.md#the-deny-job-ran-only-when-code-changed)),
+  and is added to `ci-passed`'s `needs`.
 - A README line naming the policy.
 
 Acceptance: the job passes on `main`'s lockfile. A throwaway local commit that
-adds `native-tls` fails it; say so in the PR.
+adds `native-tls` fails it, and so does one that adds a GPL crate with
+`publish = false` as a path dependency; say so in the PR.
 
 ### T03
 
@@ -552,7 +560,7 @@ Design: [Terminology](design.md#terminology),
 Deliverables in `crates/core-types/src/`:
 
 - `ids.rs`: newtypes over `Uuid` for `MemberId`, `AgentId`, `SessionId`,
-  `TurnId`, `ConsentId`, and `BindingId`, each with `new_v4()`, `Display`,
+  `TurnId`, `ConsentId`, `BindingId` and `LeaseId`, each with `new_v4()`, `Display`,
   `FromStr` and serde.
 - `surface.rs`:
   - `SurfaceKind` (`Slack`, `RocketChat`).
@@ -575,7 +583,10 @@ Deliverables in `crates/core-types/src/`:
     volumes (see [Volumes and scopes](#volumes-and-scopes)).
 - `event.rs`: `InboundEvent` with:
   - `event_id` for deduplication, `binding`, `sender: MemberKey`.
-  - `sender_is_bot: bool` and `sender_bot_user: Option<UserId>`.
+  - `sender_is_bot: bool` and `sender_bot_user: Option<UserId>`. For a bot,
+    `sender.user` holds its user id when known and its bot id otherwise, and
+    `sender_bot_user` is that user id or `None` (see
+    [impl-notes](impl-notes.md#a-slack-bot-message-may-name-no-user)).
   - `conv`, `thread_root`, `message: MsgRef`, `text`.
   - `mentions: Vec<UserId>`, `conv_kind: ConvKind` (with an `is_dm()`
     helper), `reply_to: Option<MsgRef>`, `files: Vec<InFile>`, and
@@ -1004,7 +1015,8 @@ Deliverables:
     decides whether the thread root is the agent's own message.
   - Room type `d` sets `conv_kind` to `Dm`, or `GroupDm` when the room has
     more than two members.
-  - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`.
+  - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`,
+    and then `sender_bot_user` is `u._id`, the same id as `sender.user`.
   - Edits (`editedAt`) are ignored.
   - `event_id` is the message `_id`.
   - A bot's own messages are not dropped here. Every connection in a room
@@ -1141,10 +1153,18 @@ Deliverables:
     `private [--file <path>]… <task>`.
   - `lock` acquires the scope's `shared/` lock through the API, runs the
     command, and releases the lock when it exits. The lock is a lease in a
-    `scope_locks` table (`volume_key`, `holder_session`, `expires_at`),
-    renewed while the command runs, so a crashed holder frees it. This is the
-    lock the design says `agentctl` takes for writes; the PR adds the command
-    to the design's table.
+    `scope_locks` table (`lease_id` as the primary key, `volume_key` unique,
+    `holder_session`, `expires_at`), renewed while the command runs, so a
+    crashed holder frees it. Each acquire mints a new `LeaseId`, which
+    `LockResponse::Held` returns; renew and release carry it and act only
+    when it matches the current lease of the token's `volume_key`. The lock is exclusive per lease, not
+    per session: Claude Code runs tool calls in parallel, so one session can
+    run two `agentctl lock` at once, and the second must wait rather than
+    share the first's lease (see
+    [impl-notes](impl-notes.md#the-scope-lock-had-no-lease-id)).
+    `holder_session` records which session holds the lease. This is the
+    lock the design says `agentctl` takes for writes; the PR adds the
+    command to the design's table.
   - Reads `AGENTCTL_URL` (default `http://agentctl.internal:8081`) and
     `AGENTCTL_TOKEN` from the environment.
   - Prints results as plain text for the model, and exits non-zero with a
@@ -1194,8 +1214,10 @@ Deliverables:
 Acceptance:
 
 - Tests for token hashing, IP binding, refusal between turns, the startup purge,
-  refusal inside private tasks, each target rule, and a `lock` lease that a
-  second session waits for and that expires when its holder dies.
+  refusal inside private tasks, each target rule, and the `lock` lease: a
+  second session waits for it, so does a second `lock` in the same session, a
+  renew or release naming an expired or earlier lease leaves the current one
+  alone, and it expires when its holder dies.
 - `agentctl` against the server for each subcommand, through the `fake-claude`
   script path from T04.
 
@@ -1281,9 +1303,26 @@ Deliverables:
     so the runner can revoke their mappings at once (T21).
 - A migration `…_volumes.sql` for the `volumes` table (`agent_id`,
   `scope_key`, `path`, `created_at`), keyed by `(agent_id, scope_key)`.
+- Volumes are host directories under `volumes/` in the agentd data
+  directory, at `volumes/<agent id>/<scope dir>`. `<scope dir>` is the
+  lowercase hex SHA-256 of the scope key's string form: 64 characters from
+  `[0-9a-f]` for every key, so no key makes a name too long, and none differ
+  only by case. It is a digest rather than a reversible encoding (hex or
+  base32 of the key) because those grow with the key, and a long
+  Rocket.Chat team id could pass the 255-byte file-name limit. The `volumes`
+  row records which key a directory holds, and `ensure_volume` derives the
+  same path again if the row is lost. Scope and volume key strings contain
+  `:` and may contain `%` (see
+  [impl-notes](impl-notes.md#scope-keys-are-not-file-or-docker-names)), so
+  neither is ever used as a path segment or a Docker name.
 - `DockerSandbox` (bollard). `container_config(&SessionSpec) -> bollard
   config` is a pure function with unit tests, and the rest is a thin sender:
   - The pinned image, as user 10001.
+  - Every directory below is a bind mount through bollard's `Mounts` API
+    (`HostConfig::mounts`, type `bind`, `read_only` per mount). Never
+    `HostConfig::binds` strings, whose `src:dst:ro` form a `:` in a path
+    breaks, and never named Docker volumes, whose names allow only
+    `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
   - `sessions/<id>/` mounted read-write at `/volume/sessions/<id>`, `shared/`
     at `/volume/shared` (read-write or read-only, per `SessionSpec`),
     `memory/` at `/volume/memory` when `SessionSpec` asks for it (see
@@ -1321,7 +1360,9 @@ Acceptance:
 - Unit tests with `ProcessSandbox` for the directory layout and the contents of
   `settings.json`.
 - Unit tests of `container_config`: mounts, read-only flags, user,
-  environment, network, limits, capabilities, labels.
+  environment, network, limits, capabilities, labels. A scope key with `:`
+  and `%` in its ids yields `Mounts` entries with the expected source paths
+  and no `binds`.
 - Two agents in one channel get two volumes.
 - Docker tests:
   - A session can't see another session's directory.
@@ -1565,7 +1606,10 @@ Deliverables:
   `RouterView` answers:
   - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
     and user as every identity is, so a matching user id from another team or
-    server is never taken for a managed agent.
+    server is never taken for a managed agent. The router asks it for
+    `event.sender` when `sender_is_bot` is true. Surfaces put the bot's user
+    id in both `sender.user` and `sender_bot_user`, so the router needs only
+    `sender`; a bot known only by its bot id matches no binding.
   - `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`.
   - `member_for(MemberKey)`, `is_linked(member)`.
   - `community_key_configured()`.
@@ -1582,7 +1626,8 @@ Deliverables:
   - `Refuse(reason)`, used for paused agents, bans, deny rules and the hop
     cap.
 - The flowchart from the design, each branch a named test:
-  - Unmanaged bot, ignored.
+  - Unmanaged bot, ignored, including one known only by its bot id
+    (`sender_bot_user: None`).
   - Managed bot that doesn't mention the agent, ignored.
   - Managed bot that mentions the agent inherits requester and hop plus one.
   - Managed bot that mentions the agent but has no `message_ref`,
@@ -1890,9 +1935,11 @@ Deliverables:
   - `thread_ts` becomes `thread_root` and `reply_to`.
   - `channel_type` sets `conv_kind`: `im` is `Dm`, `mpim` is `GroupDm`, and
     the rest are `Channel`.
-  - `bot_id` or `bot_profile` sets `sender_is_bot`. `sender_bot_user` comes
-    from the event's `user` field when present. T29 adds the `bots.info`
-    lookup for events without one.
+  - `bot_id` or `bot_profile` sets `sender_is_bot`. When the event has a
+    `user` field, it is `sender.user` and `sender_bot_user`. A bot event
+    without one has its `bot_id` as `sender.user` and no `sender_bot_user`
+    until T29's `bots.info` lookup fills both with the bot's user id (see
+    `InboundEvent`'s "Bot senders" rustdoc).
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
@@ -1941,8 +1988,10 @@ Deliverables:
   TTL, mapping display and real names to user ids. The pipeline's
   `MentionDirectory` snapshot (T23) reads it together with agent bindings.
   `users.info` can't look a user up by name.
-- `bots.info` fills `sender_bot_user` for bot events that lack a `user`
-  field, cached per bot id.
+- `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
+  `user_id` for bot events that lack a `user` field, cached per bot id. A bot
+  id that maps to no user keeps the `bot_id` as `sender.user` and no
+  `sender_bot_user`, so the router ignores it as an unmanaged bot.
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `render` converts and splits through `render`, so that

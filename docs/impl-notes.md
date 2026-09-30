@@ -123,6 +123,52 @@ dependency that uses a newer manifest feature or edition.
 switches to the current stable toolchain before running cargo-deny, like the
 other jobs.
 
+### `[licenses.private]` exempts any unpublished crate
+
+**Issue.** `[licenses.private] ignore = true` is meant to exempt our own
+crates, which carry only `license-file`. cargo-deny applies it to every crate
+with `publish = false`, wherever it comes from. A scratch copy of the
+workspace in which `agentd` depends on `vendor/gpl`, a path crate with
+`license = "GPL-3.0-only"` and `publish = false`, printed `licenses ok`.
+cargo-deny has no setting that limits the exemption to workspace members:
+`[licenses.private]` only adds private registries, `[sources]` does not see
+path dependencies, and a `[[licenses.clarify]]` entry per workspace crate
+would have to be added for every new crate and pinned to the hash of
+`LICENSE`.
+
+**Solution.** Keep `private.ignore` and add `scripts/ci/check-path-deps.sh`,
+which the `deny` job runs before cargo-deny. It reads
+`cargo metadata --locked --all-features --format-version 1` and fails when a
+package with no source (a path package) has a manifest other than the root
+`Cargo.toml` or `crates/<name>/Cargo.toml`. Matching the manifest path, not
+the `workspace_members` list, also rejects a vendored crate added to
+`[workspace] members` outside `crates/`. The same scratch case fails the
+script, as do a path dependency outside the repository, an optional one
+behind a feature, a Windows-only one, one nested under
+`crates/agentd/vendor/`, and a `[patch.crates-io]` entry pointing at a local
+copy; with a stale lockfile, `--locked` makes it fail too. A crate placed
+directly in `crates/` is a workspace crate by the layout rules in
+`AGENTS.md`, so it is reviewed as our code.
+
+### The `deny` job ran only when code changed
+
+**Issue.** The `deny` job runs only when the `changes` job classifies a
+change as code. An advisory published against a crate already in
+`Cargo.lock` therefore surfaced on the next code pull request, unrelated to
+it, rather than when it was published.
+
+**Solution.** The workflow gains a weekly `schedule` trigger (Mondays at
+04:23 UTC). The `changes` job sets a base commit only for `pull_request` and
+`push` events, so a scheduled run is classified as code and runs every job,
+which also catches breakage from a new stable toolchain. `publish-badges`
+still runs only on pushes to `main` and manual dispatches, and the `docs`
+job's badge check only on pushes to `main`. Scheduled runs take a
+concurrency group of their own: in `main`'s group, where
+`cancel-in-progress` is false, a scheduled run arriving while a push run is
+pending would cancel that pending run, and its badges would not be
+published. GitHub runs schedules on the default branch only, so the trigger
+takes effect once this workflow is on `main`.
+
 ## T03: core-types
 
 ### The `Surface` trait's `Sender` has no runtime to come from
@@ -179,8 +225,9 @@ Rocket.Chat produce today, appear unchanged. Parsing accepts only what
 `Display` writes (no lowercase or other escapes, and no raw `/`), and IDs
 parse only in lowercase hyphenated form, so a key string that parses always
 renders back to itself and one key never has two spellings in a database
-column. A scope key never contains `/`, so it is safe as one path segment.
-`MemberKey` and `ConvRef` have the same `<surface>:<team>:<id>` string form,
+column. A scope key never contains `/`, which keeps `VolumeKey`'s single
+separator unambiguous; it is still not a safe file name (see
+[below](#scope-keys-are-not-file-or-docker-names)). `MemberKey` and `ConvRef` have the same `<surface>:<team>:<id>` string form,
 for columns such as T23's `requester_key`.
 
 ### `post` returns one `MsgRef`
@@ -417,3 +464,58 @@ limit.
 closing inline code, and replacing the backtick with a look-alike would change
 the code's text. Agents rarely put backticks in inline code; a fenced block
 shows them correctly.
+
+### The scope lock had no lease id
+
+**Issue.** `LockResponse::Held` carried only an expiry, and renew and
+release named no lease: the server could match them only by session. Claude
+Code runs Bash tool calls in parallel, so one session can run two
+`agentctl lock -- …` at once. Both would get `Held`, and when the first
+command exited its `Release` would free the lock while the second command
+was still writing to `shared/`.
+
+**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
+on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
+`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
+`Release { lease }`, so a renew or release without a lease fails to
+deserialize. The lock is exclusive per lease, not per session: a second
+acquire, from any session, gets `Busy`, and a renew or release naming any
+lease but the current one answers `Released` and changes nothing. T15's
+`scope_locks` table takes `lease_id` as its primary key next to
+`holder_session`, and its acceptance tests the same-session case.
+
+### Scope keys are not file or Docker names
+
+**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
+segment" because it never contains `/`. It always contains `:`, and may
+contain `%` and any other character a platform id holds. A `:` splits a
+bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
+`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
+Docker volume after the key would break or be refused.
+
+**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
+is a key for columns, labels and logs, not a file or Docker object name. T17
+in the plan fixes how volumes are named and mounted: host directories at
+`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
+data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
+type `bind`), never `binds` strings or named Docker volumes. A digest was
+chosen over a reversible encoding of the key (hex or base32), which grows
+with the key and could pass the 255-byte file-name limit for a long
+Rocket.Chat team id; the `volumes` table records which key a directory holds.
+
+### A Slack bot message may name no user
+
+**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
+message may carry only a `bot_id` and no `user`, and the router's
+managed-bot lookup (T22) needs one key to look up. The plan did not say what
+`sender.user` holds then, or whether the router keys on `sender` or on
+`sender_bot_user`.
+
+**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
+surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
+so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
+`user`, or the `user_id` from `bots.info` (T29) when the event has only a
+`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
+has `sender_bot_user: None`; no binding has that id, so the router ignores
+it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
+section saying this, and T12, T22, T28 and T29 in the plan match it.
