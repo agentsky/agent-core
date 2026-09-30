@@ -156,6 +156,24 @@ impl Store {
         })
     }
 
+    /// Checks that the database answers a trivial query, for health checks.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if no connection can be had or the query
+    /// fails, including after [`close`](Self::close).
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Closes the pool: waits for connections in use to be returned, then
+    /// closes every connection. Later calls on this store or its clones fail
+    /// with [`StoreError::Database`].
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     fn seal(&self, aad: Aad<'_>, value: &secrecy::SecretString) -> Result<Vec<u8>> {
         self.sealer
             .seal(aad, value)
@@ -380,6 +398,16 @@ mod tests {
             store.member_for_identity(&member_key("u1")).await.unwrap(),
             Some(member)
         );
+    }
+
+    #[tokio::test]
+    async fn ping_succeeds_until_the_store_is_closed() {
+        let store = memory_store().await;
+        store.ping().await.unwrap();
+        let clone = store.clone();
+        store.close().await;
+        let err = clone.ping().await.unwrap_err();
+        assert!(matches!(err, StoreError::Database(_)), "{err:?}");
     }
 
     #[test]

@@ -408,3 +408,83 @@ if the OS generator fails.
 **Solution.** `store` doesn't depend on `rand`. It enables chacha20poly1305's
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
+
+## T10: agentd skeleton
+
+### axum's connections outlive an aborted `axum::serve`
+
+**Issue.** The plan asks shutdown to stop accepting, then drain for a
+configurable timeout. `axum::serve(…).with_graceful_shutdown(…)` does the
+first part, but it runs each connection in its own `tokio::spawn`ed task.
+Dropping or aborting the serve future when the timeout elapses leaves those
+tasks running: a test with a handler that never returns got no connection
+close, and the handler kept running after the store was closed. Only the
+runtime shutting down at the end of `main` would stop them, which doesn't
+hold for an in-process `Server`.
+
+**Solution.** `server::serve_listener` is agentd's own accept loop over
+axum's `Listener` trait (so axum's accept-error handling is kept), serving
+the `Router` with `hyper-util`'s `auto::Builder` and upgrades, as
+`axum::serve` does. Each connection is watched by a `GracefulShutdown` and
+spawned into a `JoinSet` that the listener's task owns. On shutdown the loop
+stops accepting, drops the listener and waits for the graceful shutdown;
+when the drain timeout aborts the listener's task, its `JoinSet` is dropped
+and every connection with it. Each request carries `ConnectInfo<SocketAddr>`,
+which the proxy and ctl listeners need. The HTTP/1 side gets a `TokioTimer`,
+which turns on hyper's 30-second header read timeout.
+
+### Redaction can't wrap the stock `tracing-subscriber` formatters
+
+**Issue.** The backstop has to replace a field's value in every line, but a
+`Layer` can't change an event for the layers after it, and
+`tracing_subscriber::field::RecordFields` is sealed, so the fields can't be
+wrapped before the stock `DefaultFields` sees them. The stock JSON formatter
+also records event fields with its own visitor, not through `FormatFields`.
+
+**Solution.** `telemetry` has its own field formatters: `HumanFields` (used
+by the stock human event format, which also formats span fields through it)
+and `JsonFields` plus a `JsonEvents` event formatter for JSON lines. Both
+visitors check the field's whole name against `REDACTED_FIELDS`. The human
+formatter escapes control characters in values and messages, so a logged
+value can't forge a line or send terminal sequences. Tests capture both formats
+and check every listed name in events and spans, and that `scope_key` and
+`token_count` still appear.
+
+### Configuration errors name the key with `serde_path_to_error`
+
+**Issue.** `toml`'s errors carry a byte span but not the key path, and serde
+reports a missing field at its parent table.
+
+**Solution.** The file is deserialized through `serde_path_to_error`, a new
+dependency (MIT or Apache-2.0; axum's `json`, `form` and `query` features
+already pull it in). A missing field's name, which serde's message quotes, is
+appended to its parent's path, so the key reads `server.listen`. The line
+from `toml`'s span is added to the message. Checks serde can't do (an
+unspecified listen address, a public address inside the sandbox subnet, the
+drain timeout bound, the log filter, a non-SQLite URL, every environment
+variable) produce the same `key: message` form. Values are never repeated,
+except the offending value of a known, non-secret key in a type error.
+
+### The public listener's subnet guard needed a key
+
+**Issue.** The plan's network section says the public listener also refuses
+connections from the sandbox subnet, but no key said what that subnet is, and
+no task was named for it.
+
+**Solution.** T10 builds the public listener, so it adds
+`internal.sandbox_subnet` (CIDR, required) and `net::RefuseSubnet`, which
+closes such connections as soon as they are accepted, before any byte is
+read. Validation refuses a `server.listen` inside the subnet. A Linux-only
+test binds the public listener to `127.0.0.2`, sets the subnet to
+`127.0.0.1/32`, and checks that a client bound to `127.0.0.1` gets no answer
+while one bound to `127.0.0.3` gets 200.
+
+### `migrate` needs the master key
+
+**Issue.** `agentd migrate` only needs the database, but `Store::open` takes
+a `Sealer`, so the key has to be present.
+
+**Solution.** `migrate` loads the full configuration, key included, like
+`serve`. That also means a migration job checks the configuration it will be
+served with. The store gained `ping` (for `/healthz`) and `close` (so
+shutdown closes the pool after the drain instead of leaving it to drop).

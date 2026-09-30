@@ -114,7 +114,7 @@ associated data, so a ciphertext copied into another row fails to decrypt.
 | Errors | `thiserror` in libraries, `anyhow` in the two binaries |
 | Logging | `tracing`, `tracing-subscriber` with JSON output in production |
 | Secrets | `secrecy` for every token, key and secret in memory. `Debug` never prints them. |
-| Serialization | `serde`, `serde_json`, `toml` |
+| Serialization | `serde`, `serde_json`, `toml`, and `serde_path_to_error` so configuration errors name the key |
 | IDs | `uuid` with `v4` and `serde` |
 | Time | `time` with `serde` and `formatting` (not `chrono`) |
 | Crypto | `chacha20poly1305`, `sha2`, `hmac`, `base64`, `rand`, `subtle` for constant-time compares |

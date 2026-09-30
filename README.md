@@ -26,6 +26,27 @@ that fails if line coverage is below 85%. Change `--fail-under-lines` there to
 move the threshold. It needs `cargo install cargo-llvm-cov` and
 `rustup component add llvm-tools-preview`.
 
+## Running agentd
+
+agentd reads one TOML file, documented key by key in
+[`config/agentd.example.toml`](config/agentd.example.toml), and takes its
+secrets from the environment only:
+
+```bash
+export AGENTD_MASTER_KEY="$(agentd gen-key)"   # keep it: it decrypts stored secrets
+agentd migrate --config /etc/agentd/agentd.toml
+agentd serve --config /etc/agentd/agentd.toml
+```
+
+`serve` also applies pending migrations when it starts; `migrate` is for
+running them as a separate step. Configuration errors name the key or
+variable at fault, and any other variable starting with `AGENTD_` is refused.
+Each listener binds agentd's own address on its network, never `0.0.0.0`.
+`GET /healthz` on the public listener answers 200 while the database does.
+On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
+requests `server.drain_timeout_secs` to finish. Logs go to standard error,
+human-readable on a terminal and one JSON object per line otherwise.
+
 ## CI
 
 GitHub Actions runs the same formatting, lint, test, doc, and coverage checks
