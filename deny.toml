@@ -1,0 +1,52 @@
+# Dependency policy, checked by `cargo deny` in CI (the `deny` job in
+# .github/workflows/ci.yml). Run it locally with
+#
+#   cargo deny --workspace --locked check -W unmaintained
+#
+# `--workspace` is required: the root manifest is a package, not a virtual
+# manifest, so without it cargo-deny checks only the root package's graph.
+
+[graph]
+all-features = true
+
+[advisories]
+# Vulnerability advisories always fail the check. cargo-deny reports
+# unmaintained advisories as errors too; the `-W unmaintained` above turns
+# them into warnings.
+unmaintained = "all"
+yanked = "warn"
+
+[licenses]
+# Every license a crate in the graph uses must be listed here or in an
+# exception; anything else, including GPL, LGPL and AGPL, is rejected. This
+# list covers the whole of `[workspace.dependencies]`, not only what the
+# lockfile uses today. A weak-copyleft license such as MPL-2.0 is allowed
+# only as a per-crate exception, with a comment giving the reason.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+exceptions = []
+unused-allowed-license = "allow"
+
+[licenses.private]
+# The workspace crates carry only `license-file` and are never published.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+deny = [
+    { crate = "openssl", reason = "use rustls on aws-lc-rs" },
+    { crate = "openssl-sys", reason = "use rustls on aws-lc-rs" },
+    { crate = "native-tls", reason = "use rustls on aws-lc-rs" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

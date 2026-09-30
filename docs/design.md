@@ -706,11 +706,15 @@ pub trait Surface: Send + Sync {
     async fn edit(&self, msg: &MsgRef, text: &str) -> Result<()>;
     async fn react(&self, msg: &MsgRef, emoji: &str) -> Result<()>;
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()>;
-    async fn history(&self, conv: &ConvRef, before: Option<Cursor>, limit: usize) -> Result<Vec<Msg>>;
+    async fn history(&self, thread: &ThreadKey, before: Option<Cursor>, limit: usize) -> Result<Vec<Msg>>;
     fn render(&self, markdown: &str) -> Vec<String>;
     fn caps(&self) -> Caps;
 }
 ```
+
+`history` reads one thread (or a DM's top level), because both of its
+callers, the per-turn message and `agentctl history`, need a thread's
+messages, and neither platform can list a thread's replies without its root.
 
 Everything after `InboundEvent` is shared. Behavior differences go through
 `caps()` (buttons, edits, message size), never through surface-name checks in
