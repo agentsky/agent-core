@@ -381,18 +381,24 @@ pub trait Sandbox: Send + Sync {
     /// It creates `sessions/<session>/` with `work/`, `claude/`, `home/`
     /// and `tmp/`, and writes `claude/settings.json` with
     /// `cleanupPeriodDays`. An entry the agent replaced with a symlink or a
-    /// file is replaced with a directory again, and `settings.json` is
-    /// rewritten every time, so earlier runs of the agent can't change
-    /// either.
+    /// file is replaced with a directory again, the session directory and
+    /// those in it get mode `0755` again, and `settings.json` is rewritten
+    /// every time, so earlier runs of the agent can't change any of them.
     ///
-    /// The session must have no running container: that repair is safe
-    /// only while nothing in the session directory runs. Stop the old
+    /// The session must have no running container: that repair is meant to
+    /// run while nothing in the session directory runs. Stop the old
     /// container first.
+    ///
+    /// [`DockerSandbox`] checks here, on every start, that
+    /// [`SandboxConfig::network`] names an existing `internal` network by
+    /// its name.
     ///
     /// # Errors
     ///
     /// [`SandboxError::InvalidSpec`] for a spec that breaks a rule on
-    /// [`SessionSpec`], [`SandboxError::Io`] or [`SandboxError::Docker`].
+    /// [`SessionSpec`], [`SandboxError::Config`] for a network that isn't
+    /// an internal network's name, [`SandboxError::Io`] or
+    /// [`SandboxError::Docker`].
     async fn start(&self, spec: &SessionSpec) -> Result<Container>;
 
     /// Runs `argv` in the container, in [`SessionPaths::work`], with

@@ -2303,11 +2303,34 @@ closed port.
 one-second lease can end almost at once.
 
 **Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`). agentctl
-relies on it only until one second before its expiry, since another command
-may take the lock at the expiry itself, and renews it when a third of that
-remaining time has passed, at least every 200 ms. A `ttl` below one second
-counts as one, and agentctl needs a lease of at least two seconds. Tests
-that renew use a 3-second lease.
+relies on it only until two seconds before its `seconds_left` (below) have
+passed: one for the rounding, and one because another command may take the
+lock at the expiry itself. It renews it when a third of that remaining time
+has passed, at least every 200 ms. A `ttl` below one second counts as one.
+agentctl needs a lease of at least three seconds: a new lease that leaves
+less than half a second before that point, enough to wait 200 ms and renew,
+is released at once, and `lock` fails with "the shared/ lock's lease is too
+short to hold". With a two-second lease the deadline came at the grant, and
+a first renewal lost the race about one run in five. Tests that renew use a
+3-second lease.
+
+### The lease is timed on agentctl's clock
+
+**Issue.** agentctl compared the lease's `expires_at`, from agentd's wall
+clock, with the sandbox's clock. Probes against the binary showed a server
+40 seconds behind made every lease look expired, so `lock` killed its
+command at once, and one 5 seconds ahead let the command run 5 seconds past
+the real expiry, under the next holder.
+
+**Solution.** `LockResponse::Held` also carries `seconds_left`, which agentd
+computes from the same clock and second it stored the lease with
+(`expires_at` minus now, in whole seconds; the lease really lasts between
+`seconds_left - 1` and `seconds_left`). agentctl times the lease on its
+monotonic clock from when it sent the request: its deadline is the send
+instant plus `seconds_left`, minus a second for rounding and a second of
+margin. agentd measured no earlier than the send, so a slow answer only
+makes the deadline earlier. `expires_at` stays in the response for logs and
+other readers.
 
 ### What agentctl does when it loses the lock
 
@@ -2319,16 +2342,35 @@ timeout, so a renewal agentd never answered let the command keep writing
 past the lease's expiry, and delayed `SIGTERM` by as long.
 
 **Solution.** The renewal runs in the same `select!` as the command's exit,
-the stop signals and a deadline one second before the lease's expiry, and
-its request timeout is capped at the time left until that deadline. A
-refused renewal, or no successful renewal by the deadline, means another
-command may soon hold the lock, so agentctl kills its command and exits 1
-with "lost the shared/ lock (…); stopped the command". On `SIGTERM`,
-`SIGINT` or `SIGHUP` it kills the command, releases the lease and exits
-with 128 plus the signal. The signal handlers are installed before the
-lease is acquired and kept until the release is sent, so a signal is never
-lost in between, and the release waits at most two seconds, after which the
-lease expires on its own. agentctl waits at most 100 seconds for the lock
+the stop signals and the lease's deadline, and its request timeout is capped
+at the time left until that deadline. A renewal agentd refused (the lease
+expired or was released, no turn, a revoked token), or no successful
+renewal by the deadline, means another command may soon hold the lock, so
+agentctl kills its command's process group with `SIGKILL` at once and exits
+1 with "lost the shared/ lock (…); stopped the command". A renewal that
+failed in transit, or that agentd answered with its internal error ("agentd
+failed; try again", say a busy SQLite database), is retried until the
+deadline: a probe that returned one 500 during a 30-second lease had killed
+the command with 19 seconds of the lease left. The signal handlers are
+installed before the lease is acquired and kept until the release is sent,
+so a signal is never lost in between, and the release waits at most two
+seconds, after which the lease expires on its own.
+
+On `SIGTERM`, `SIGINT` or `SIGHUP` while the command runs, agentctl passes
+the same signal on to the command's process group, which being its own
+group no longer gets a terminal's signals, waits up to two seconds for the
+command to exit (never past the lease's deadline), and then kills the group
+with `SIGKILL`. A `SIGKILL` at once had left `git` no chance to remove its
+`index.lock`. The command is left unreaped while agentctl waits
+(`waitid` with `WNOWAIT`), so the group's id can't be reused before the
+kill. agentctl then releases the lease and exits with 128 plus the signal.
+
+A signal while an acquire is in flight used to drop the request, and a
+lease agentd granted for it held the lock with nobody renewing it, for up
+to 30 seconds. agentctl now lets a request already sent finish, for up to
+two seconds, releases the lease if it was granted, and exits with 128 plus
+the signal without running the command. A signal between attempts exits at
+once. agentctl waits at most 100 seconds for the lock
 by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
 a command by default, so the model sees why it failed rather than a killed
 command.
@@ -2350,7 +2392,11 @@ while the command hasn't been reaped, so its id can't have been reused. A
 process that leaves the group (`setsid`, say) escapes, processes the
 command leaves running when it exits on its own are not stopped, and an
 agentctl killed with `SIGKILL` leaves its command running once the lease
-expires. Being in its own group, the command is not in the terminal's
+expires. So does a caller that kills agentctl alone: if Claude Code's Bash
+tool kills a command that runs past its timeout through the command's
+process group, agentctl's command is no longer in that group and survives
+it. Whether the CLI kills the group or the process, and with which signal,
+has to be checked against the real CLI; T23's live check does. Being in its own group, the command is not in the terminal's
 foreground group, so it can't read from a terminal; agentctl runs under the
 model's Bash tool, which gives it none. The lock is a guard for cooperating
 commands, as the design's "scope-level lock that `agentctl` takes for
@@ -2368,8 +2414,18 @@ transaction that records or clears a token's turn (`set_ctl_turn`), deletes
 the token (`delete_ctl_token`), or replaces it with a new token for the
 session (`put_ctl_token`). A lease lasts no longer than the turn that took
 it, and the lock is free as soon as `end_turn` or `revoke_process_token`
-returns. An acquire authorized just before the turn ended can still land
-after the delete; that lease can't be renewed, and expires on its own.
+returns.
+
+That alone didn't hold when `begin_turn` replaced a turn still recorded on
+the token: an acquire authorized under the first turn could land after the
+second turn's delete, and its lease was then renewed under the second turn.
+So acquire and renew name the token's digest and the turn they were
+authorized under, and each is one statement that takes the volume and
+session from the token's row only while it still records that turn
+(`INSERT … SELECT … FROM ctl_tokens WHERE hash = ? AND turn_id = ?`, and
+`… (volume_key, holder_session) IN (SELECT …)` for renew). A request
+authorized under a replaced or ended turn grants and renews nothing. Release
+names only the token, since giving a lease back is always safe.
 
 ### `lock` is refused inside private tasks
 
@@ -2431,10 +2487,12 @@ started are reparented to the container's init and end when the container
 stops. If the pid line hasn't arrived within 2 seconds, `kill` returns an
 error instead of `Ok`: nothing was signalled, so `wait` could hang, and the
 caller must stop the container. `ProcessSandbox` kills the child's whole
-process group instead, through the `kill` command, since a direct
-`kill(2)` would need `unsafe`; it runs the command with `tokio::process`,
-and from `Drop`, which can't wait, in a spawned task (or blocking, off a
-runtime).
+process group instead, with rustix's safe `kill_process_group`, as
+agentctl does. It used to run the `kill` command, from `Drop` in a
+spawned task, which a current-thread runtime whose `block_on` returned,
+or any runtime shutting down, dropped unpolled, so the process group
+lived on. `kill(2)` returns at once, so `Drop` now sends the signal
+itself.
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -2444,7 +2502,8 @@ writable in the container.
 
 **Solution.** `shared/`, `memory/`, each session's `work/`, `claude/`,
 `home/` and `tmp/`, and `settings.json` are given to the configured
-`uid:gid` with `lchown` when their owner differs. That works when agentd
+`uid:gid` when their owner differs, through handles that follow no
+symlink (below). That works when agentd
 runs as root or as the sandbox user itself, and fails with an error naming
 the cause otherwise. T16's agentd image should therefore run as uid 10001
 (the plan's T16 says so).
@@ -2471,11 +2530,10 @@ root) would write through it.
 
 **Solution.** Nothing on the host follows a symlink inside an
 agent-writable tree. Before each start, each of `work/`, `claude/`,
-`home/` and `tmp/` that isn't a real directory (checked with
-`symlink_metadata`) is removed and created again, as is `claude/skills`
-when there are skills to mount there. It is rewritten on every start, so
-an agent can't lower `cleanupPeriodDays` and lose its transcripts.
-Ownership changes use `lchown`.
+`home/` and `tmp/` that isn't a real directory is removed and created
+again, as is `claude/skills` when there are skills to mount there. It is
+rewritten on every start, so an agent can't lower `cleanupPeriodDays` and
+lose its transcripts.
 
 The plan made this step a public `prepare_session_dirs` on the trait. Run
 while the session's container was up, the agent could swap `claude` for a
@@ -2485,14 +2543,34 @@ crate-private and runs only in `start`, before the container is created;
 `start`'s rustdoc says the session must have no running container, and the
 runner never runs two containers of one session.
 
-`settings.json` doesn't rely on that. std has no `openat` (`std::fs::Dir`
-is unstable), so the sandbox crate adds `rustix`, whose `openat` and
-`renameat` are safe functions. `claude/` is opened with `O_NOFOLLOW |
-O_DIRECTORY`, its owner checked on the handle, and the new file is created
-relative to that handle with `O_EXCL | O_NOFOLLOW`, given away with
-`fchown`, and renamed over `settings.json` within the same directory,
-which replaces a symlink instead of following it. A directory in its place
-is renamed aside to a random name first, then removed.
+The steps don't rely on that either. std has no `openat` (`std::fs::Dir`
+is unstable), so the sandbox crate adds `rustix`, whose `*at` functions
+are safe. The session directory, whose parent no sandbox reaches, is
+opened by path; every entry in it is inspected (`statat` without
+following), removed (`unlinkat`), created (`mkdirat`) and opened relative
+to that handle, with `O_NOFOLLOW | O_DIRECTORY`. `settings.json` and
+`claude/skills` are then written relative to the `claude/` handle, not
+its path: a new file is created with `O_EXCL | O_NOFOLLOW`, given away
+with `fchown`, and renamed over `settings.json` within the same
+directory, which replaces a symlink instead of following it. A directory
+in its place is renamed aside to a random name first, then removed. So a
+`claude` swapped after its repair only means agentd writes into the
+directory it repaired.
+
+The agent can also `chmod` what it owns. With `claude` at `555`, or the
+session directory at `0`, agentd running as the sandbox user (without
+root's `CAP_DAC_OVERRIDE`) failed every later start with `EACCES`, so the
+agent could break its own session for good. The session directory,
+`shared/`, `memory/` and each directory repaired above therefore get mode
+`0755` again, after their owner. A directory at mode `0` can't be opened
+for reading, so the handles are opened with `O_PATH`, which needs no
+permission on the directory itself. Linux has no `fchmod` on an
+`O_PATH` handle (`fchmodat2` with `AT_EMPTY_PATH` needs Linux 6.6), so
+modes are set through `/proc/self/fd/<handle>`, which the kernel
+resolves to the handle's directory, not to what its path names now;
+owners are changed, and the aside directory removed, the same way. agentd therefore needs
+`/proc`, which every container has. `ProcessSandbox` links `claude/skills`
+through the same handle.
 
 ### Several agentd, or test runs, on one Docker host
 
@@ -2574,7 +2652,28 @@ network, but `[sandbox] network` now refuses `bridge`, along with `host`,
 `none`, `default` and anything with a `:` (`container:<id>`): those are
 Docker network modes, not the internal sandbox network, and `validate`
 had only checked that the name wasn't empty. `container_config`, which is
-public, validates the configuration too.
+public, validates the configuration too. The control's network isn't
+internal, so its sandbox opts in (next entry).
+
+### `[sandbox] network` by ID, or not internal
+
+**Issue.** Docker finds a network by name, by ID and by ID prefix, so
+`validate` refusing the name `bridge` didn't keep out the default
+bridge's ID, which attaches the sandbox with a route out. Nothing checked
+that the network was `internal` at all, and with an ID, `ip` (which looks
+the container's address up under the configured name) returned
+`NoAddress`.
+
+**Solution.** `DockerSandbox::start` inspects the network before it
+touches the disk and refuses, with `SandboxError::Config` for the
+`network` key, unless Docker's name for it equals the configured value
+and it is `internal`. It does so on every start, so a network that was
+recreated without `internal` is caught too, for one request per start.
+The Docker tests' control, which needs a route out, calls
+`DockerSandbox::allowing_an_open_network_for_tests`, which skips only the
+`internal` check; agentd never calls it and no configuration key reaches
+it. A Docker test checks that the bridge's ID and ID prefix, an internal
+network's ID, an open network and a missing one are all refused.
 
 ### A `ChildStdin` closes only when dropped
 
@@ -2726,6 +2825,12 @@ a request that arrived during the turn and was still waiting on a refresh
 when it ended; since `turn_finished` runs once the turn's result is in, such
 a request is the model's own last call or a leftover process's, and the
 window is one token lookup long.
+
+`unpoint` returns whether the placeholder was live, like `revoke`, rather
+than an error for a revoked one. A container that dies mid-turn has its
+placeholder revoked by `process_stopping` before the turn's `turn_finished`
+runs, so a revoked placeholder is a normal case at turn end, with nothing
+left to clear.
 
 What remains: a background process left from turn N can still spend turn
 N+1's credential while N+1 runs, whoever its requester is. Only killing the

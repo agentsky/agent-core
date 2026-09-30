@@ -29,12 +29,14 @@ pub const DEFAULT_SANDBOX_UID: u32 = 10001;
 pub struct SandboxConfig {
     /// The pinned sandbox image that agentd starts sessions from.
     pub image: String,
-    /// The Docker network sandboxes attach to, and the only one. It is
-    /// `internal`, so it has no route out. This is Docker's name for it:
-    /// Compose prefixes the project name unless the network sets `name:`.
-    /// Docker's own modes are refused: `host`, `none`, `default` and
-    /// `bridge` (which has a route out), and anything with a `:`, such as
-    /// `container:<id>`.
+    /// The Docker network sandboxes attach to, and the only one. It must
+    /// be `internal`, so it has no route out, and this must be Docker's
+    /// name for it, not its ID: Compose prefixes the project name unless
+    /// the network sets `name:`. Docker's own modes are refused here:
+    /// `host`, `none`, `default` and `bridge` (which has a route out), and
+    /// anything with a `:`, such as `container:<id>`. Whether the network
+    /// exists under this name and is `internal` is checked by
+    /// [`DockerSandbox`](crate::DockerSandbox) on every start.
     #[serde(default = "default_network")]
     pub network: String,
     /// agentd's data directory as the Docker daemon sees it, when agentd

@@ -634,7 +634,7 @@ async fn unpointed_placeholder_is_refused() {
             .send()
     };
     assert_eq!(send().await.unwrap().status(), 200);
-    proxy.registry.unpoint(placeholder.id()).unwrap();
+    assert!(proxy.registry.unpoint(placeholder.id()));
     let idle = send().await.unwrap();
     assert_eq!(idle.status(), 403);
     let body: serde_json::Value = idle.json().await.unwrap();
@@ -645,10 +645,7 @@ async fn unpointed_placeholder_is_refused() {
     );
     assert_eq!(fake.requests().await.len(), 1);
     assert!(proxy.registry.revoke(placeholder.id()));
-    assert_eq!(
-        proxy.registry.unpoint(placeholder.id()),
-        Err(cred_proxy::RegistryError::Unknown)
-    );
+    assert!(!proxy.registry.unpoint(placeholder.id()));
 }
 
 #[tokio::test]
