@@ -279,7 +279,9 @@ pub struct SlackApp {
     pub signing_secret: Option<SecretString>,
     /// The app's bot user, once known. A message outside a one-to-one DM
     /// is kept when it mentions the bot user or replies in a thread under
-    /// the bot user's root (see [`normalize`]).
+    /// the bot user's root, and in any conversation the bot user's own
+    /// posts are dropped, and so is another bot's message that doesn't
+    /// mention it (see [`normalize`]).
     pub bot_user: Option<UserId>,
 }
 

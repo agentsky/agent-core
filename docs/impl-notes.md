@@ -6702,6 +6702,17 @@ roots with none, such as incoming webhooks', Workflow Builder's and
 `bot_message` posts. That hasn't been checked against live Slack; it
 belongs in T32's live pass.
 
+Two more gaps are left open, since the router ignores what they let
+through or nothing makes them happen today:
+
+- An own post that carries a `bot_id` and no `user` isn't recognized as
+  the bot's own, since `normalize` compares the sender with the bot user,
+  and is kept if it mentions the bot user. The router ignores it anyway.
+- `normalize` matches only the current binding's bot user, while the
+  router's `agent_of_bot_user` knows the bot users of an agent's bindings
+  in any state. If an agent ever got a second Slack binding in the same
+  team, mentions of its old bot user would be dropped at ingress.
+
 ### Bots don't join channels by posting
 
 Slack refuses a post to a conversation the bot isn't in (T23b), and the

@@ -764,6 +764,8 @@ mod tests {
             json!({"parent_user_id": "B0HUMAN"}),
             json!({"parent_user_id": format!("U{}", "A".repeat(MAX_ID_TAIL + 1))}),
             json!({"parent_user_id": 7}),
+            json!({"parent_user_id": true}),
+            json!({"parent_user_id": ["U0HUMAN"]}),
             json!({"parent_user_id": {"id": "U0HUMAN"}}),
         ] {
             let kept = normalize(reply(unknown.clone()));
@@ -912,6 +914,17 @@ mod tests {
             let calling = with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER"}));
             assert!(normalize(calling.clone()).is_ok(), "{channel_type}");
             assert!(read(kind, calling).is_ok(), "{channel_type}");
+            let calling_in_blocks = with(json!({
+                "user": "U0OTHERBOT",
+                "bot_id": "B0OTHER",
+                "text": "have a look",
+                "blocks": [{"type": "rich_text", "elements": [
+                    {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]},
+                ]}],
+            }));
+            let kept = normalize(calling_in_blocks.clone()).unwrap();
+            assert_eq!(kept.mentions, [UserId::from(BOT)], "{channel_type}");
+            assert!(read(kind, calling_in_blocks).is_ok(), "{channel_type}");
             let person = with(json!({"text": "hi"}));
             assert!(normalize(person).is_ok(), "{channel_type}");
         }

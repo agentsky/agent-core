@@ -1601,6 +1601,75 @@ async fn a_reply_under_a_members_root_is_neither_looked_up_nor_answered() {
     );
     assert_eq!(turned.confirmations(AGENT_TOKEN).await.len(), 1);
     assert_eq!(turned.fake.message_requests().await.len(), 1);
+    assert!(
+        !turned.never_kept(&asked).await,
+        "the mention was kept, with a deduplication row"
+    );
+    assert!(
+        turned.never_kept(&reply).await,
+        "the reply under a member's root was dropped before its deduplication row"
+    );
+    turned.stop().await;
+}
+
+impl Turned {
+    /// Whether helper's app had no deduplication row for the channel
+    /// message at `ts`, which the ingress writes for each message it keeps.
+    /// Records one.
+    async fn never_kept(&self, ts: &str) -> bool {
+        self.store
+            .mark_event_processed(
+                &format!("slack:{}:message", self.bindings[0]),
+                &format!("{}:{ts}", fixtures::CHANNEL),
+                OffsetDateTime::now_utc(),
+                surface_slack::ingress::DEDUP_RETENTION,
+            )
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hop_from_another_agents_post_mentioning_the_agent_bills_the_inherited_requester() {
+    let turned = Turned::start(&[HELPER, SCOUT]).await;
+    let asked = recent_ts(10, 100);
+    let reply = recent_ts(5, 300);
+    turned.posts_at(SCOUT.token, &reply).await;
+    let text = format!("<@{}> summarize the release", SCOUT.bot);
+    turned
+        .slack_has(
+            &asked,
+            json!({"ts": asked, "user": fixtures::OTHER_USER, "text": text}),
+        )
+        .await;
+    let question = channel_message(fixtures::OTHER_USER, &asked, "Ev0ASKSCOUT", &text);
+    assert_eq!(turned.post(1, SCOUT.secret, question).await, 200);
+    turned.wait_for_posts(SCOUT.token, 1).await;
+    let scouts = turned.posted(&reply).await;
+    assert_eq!(scouts.requester.member, Some(turned.bob), "bob asked scout");
+
+    let handoff = format!("<@{}> can you check the changelog?", HELPER.bot);
+    let scouts_post = json!({
+        "ts": reply,
+        "user": SCOUT.bot,
+        "bot_id": "B0SCOUT01",
+        "bot_profile": {"id": "B0SCOUT01", "app_id": SCOUT.app_id},
+        "text": handoff,
+        "blocks": mention_block(HELPER.bot),
+        "thread_ts": asked,
+        "parent_user_id": fixtures::OTHER_USER,
+    });
+    turned.slack_has(&reply, scouts_post.clone()).await;
+    let hop = message_event(SCOUT.bot, &reply, "Ev0HOP", &handoff, scouts_post);
+    assert_eq!(turned.post(0, HELPER.secret, hop).await, 200);
+
+    let posts = turned.wait_for_posts(HELPER.token, 1).await;
+    assert_eq!(posts[0]["thread_ts"], asked.as_str());
+    let helpers = turned.posted(HELPER.posted_ts).await;
+    assert_eq!(helpers.requester, scouts.requester, "the hop inherits bob");
+    assert_eq!(helpers.hop, scouts.hop.next().unwrap());
+    assert_eq!(turned.confirmations(HELPER.token).await.len(), 1);
+    assert_eq!(turned.fake.message_requests().await.len(), 2);
     turned.stop().await;
 }
 
