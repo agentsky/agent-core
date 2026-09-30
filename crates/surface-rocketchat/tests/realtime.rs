@@ -894,6 +894,7 @@ async fn room_changes_while_the_rooms_are_listed_apply_on_top_of_the_list() {
         "inserted",
         &subscription_doc(&bot.id, "NEW", "c", "new"),
     );
+    settled(&h, &bot).await;
     hold.release();
     h.ddp.wait_for_room(&bot.id, "GENERAL").await;
     h.ddp.wait_for_room(&bot.id, "NEW").await;
