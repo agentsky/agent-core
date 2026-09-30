@@ -145,6 +145,9 @@ if docker run --rm --entrypoint /bin/sh "$agentd_image" \
 else
     fail "git doesn't run under ulimit -f in the agentd image"
 fi
+check_output "ulimit -f counts 512-byte blocks in the agentd image" 1024 \
+    docker run --rm --read-only --tmpfs /tmp --entrypoint /bin/sh "$agentd_image" \
+    -c 'ulimit -f 2 && { head -c 4096 /dev/zero >/tmp/f; } 2>/dev/null; wc -c </tmp/f'
 
 echo "== Compose stack"
 

@@ -23,12 +23,14 @@
 //! The row and the files can't change together, so they change in the
 //! order that never grants hosts to files the owner didn't confirm them
 //! for: `add` records the row first (a new active row carries no hosts,
-//! and replaces any that did), `confirm` moves the files before it makes
-//! the row active, and `remove` deletes the rows before the files.
-//! Whatever a failure between the two steps leaves, startup removes
-//! ([`Skills::purge`]): work directories, and skill directories no row
-//! records, once they are older than [`STALE_AFTER`], so a clone or a
-//! move another instance is still making is left alone.
+//! and replaces any that did; a new pending row first drops the pending
+//! row and files it replaces, so no older files wait under its hosts),
+//! `confirm` moves the files before it makes active only the row it read,
+//! and `remove` deletes the rows before the files. Whatever a failure
+//! between the two steps leaves, startup removes ([`Skills::purge`]): work
+//! directories, and skill directories whose name no row records, once
+//! they are older than [`STALE_AFTER`], so a clone another instance is
+//! still making is left alone.
 //!
 //! # Adding one
 //!
@@ -66,6 +68,8 @@ pub use git::{CloneError, Git};
 pub use package::{BUNDLED_NAME, Manifest, Problem};
 
 use package::CheckError;
+
+use crate::sweeper::SWEEP_INTERVAL;
 
 /// The bundled skill's `SKILL.md`, documenting `agentctl`.
 pub const BUNDLED_SKILL: &str = include_str!("../../assets/skills/agentctl/SKILL.md");
@@ -328,6 +332,14 @@ impl Skills {
         } else {
             SkillState::Pending
         };
+        let pending = self.pending_dir(agent, name);
+        if state == SkillState::Pending {
+            self.inner
+                .store
+                .delete_skill(agent, name, Some(SkillState::Pending))
+                .await?;
+            remove_dir(&pending).await?;
+        }
         let now = OffsetDateTime::now_utc();
         if !self
             .inner
@@ -337,7 +349,6 @@ impl Skills {
         {
             return Ok(Err(Refused::TooMany));
         }
-        let pending = self.pending_dir(agent, name);
         if state == SkillState::Pending {
             move_into(&dir, &pending, &work.0).await?;
             tracing::info!(%agent, skill = name, hosts = hosts.len(), "a skill waits for its hosts to be confirmed");
@@ -345,7 +356,7 @@ impl Skills {
         }
         move_into(&dir, &self.live_dir(agent, name), &work.0).await?;
         if let Err(err) = remove_dir(&pending).await {
-            tracing::warn!(%agent, skill = name, error = %err, "couldn't remove a superseded pending skill; startup will");
+            tracing::warn!(%agent, skill = name, error = %err, "couldn't remove a superseded pending skill; adding or removing it again will");
         }
         tracing::info!(%agent, skill = name, "added a skill");
         Ok(Ok(Added::Active(manifest)))
@@ -357,7 +368,9 @@ impl Skills {
     /// The files move into place before the row becomes active, so a
     /// failure between the two leaves files without their hosts, never
     /// hosts for files the owner didn't confirm; a failure moving them
-    /// leaves the skill waiting.
+    /// leaves the skill waiting. Only the pending row this reads becomes
+    /// active: if it went or was replaced meanwhile, the files are put back
+    /// and nothing is confirmed.
     ///
     /// # Errors
     ///
@@ -386,14 +399,32 @@ impl Skills {
                 Confirmed::NotPending
             });
         }
+        let moved = inode(&pending).await?;
+        let live = self.live_dir(agent, name);
         let work = self.work_dir().await?;
-        move_into(&pending, &self.live_dir(agent, name), &work.0).await?;
-        let Some(skill) = store.confirm_skill(agent, name, since).await? else {
-            self.remove(agent, name).await?;
-            return Ok(Confirmed::Expired);
+        move_into(&pending, &live, &work.0).await?;
+        let Some(skill) = store.confirm_skill(&waiting).await? else {
+            if inode(&live).await? == moved {
+                self.put_back(&live, &work.0).await?;
+            }
+            tracing::info!(%agent, skill = name, "a skill's pending row changed while it was confirmed; undid the move");
+            return Ok(Confirmed::NotPending);
         };
         tracing::info!(%agent, skill = name, hosts = skill.hosts.len(), "confirmed a skill's hosts");
         Ok(Confirmed::Active(skill))
+    }
+
+    /// Undoes [`confirm`](Self::confirm)'s move into `live` once its row is
+    /// gone: moves back the skill it set aside in `aside`, or removes the
+    /// files it moved when there was none.
+    async fn put_back(&self, live: &Path, aside: &Path) -> Result<(), SkillError> {
+        let old = aside.join("old");
+        if is_dir(&old).await? {
+            let back = self.work_dir().await?;
+            move_into(&old, live, &back.0).await
+        } else {
+            remove_dir(live).await.map(drop)
+        }
     }
 
     /// Removes `agent`'s skill `name`, in use or waiting, with its hosts.
@@ -411,13 +442,15 @@ impl Skills {
     }
 
     /// Deletes skills that waited too long for confirmation, with their
-    /// files. The sweeper calls it every minute, and startup once.
+    /// files. The sweeper calls it every [`SWEEP_INTERVAL`], and startup
+    /// once. It lets a skill wait that long past [`PENDING_TTL`], so a
+    /// confirmation that began before the deadline finds its row.
     ///
     /// # Errors
     ///
     /// If the store or the disk fails.
     pub async fn drop_expired(&self) -> Result<(), SkillError> {
-        let before = OffsetDateTime::now_utc() - PENDING_TTL;
+        let before = OffsetDateTime::now_utc() - PENDING_TTL - SWEEP_INTERVAL;
         for (agent, name) in self
             .inner
             .store
@@ -431,9 +464,10 @@ impl Skills {
 
     /// Cleans up at startup: deletes skills that waited too long for
     /// confirmation, and removes what no row records once it is older than
-    /// [`STALE_AFTER`]: work directories, waiting skills' files without a
-    /// pending row, and skills' files without an active row (the bundled
-    /// skill aside).
+    /// [`STALE_AFTER`]: work directories, and skills' files, waiting or in
+    /// use, whose name has no row in either state (the bundled skill
+    /// aside). A row of either state keeps both directories of its name,
+    /// so a move in progress between them is never taken for left over.
     ///
     /// # Errors
     ///
@@ -451,9 +485,9 @@ impl Skills {
         {
             remove_stale(&data.join(WORK_DIR).join(work), age).await?;
         }
-        for (root, state) in [
-            (data.join(PENDING_DIR), SkillState::Pending),
-            (data.join(runner::SKILLS_DIR), SkillState::Active),
+        for (root, live) in [
+            (data.join(PENDING_DIR), false),
+            (data.join(runner::SKILLS_DIR), true),
         ] {
             for agent_dir in read_dir_names(&root).await?.unwrap_or_default() {
                 let Ok(agent) = agent_dir.parse::<AgentId>() else {
@@ -466,14 +500,13 @@ impl Skills {
                     .agent_skills(agent)
                     .await?
                     .into_iter()
-                    .filter(|skill| skill.state == state)
                     .map(|skill| skill.name)
                     .collect();
                 for name in read_dir_names(&root.join(&agent_dir))
                     .await?
                     .unwrap_or_default()
                 {
-                    let bundled = state == SkillState::Active && name == BUNDLED_NAME;
+                    let bundled = live && name == BUNDLED_NAME;
                     if !bundled && !recorded.contains(&name) {
                         remove_stale(&root.join(&agent_dir).join(&name), age).await?;
                     }
@@ -531,7 +564,7 @@ async fn move_into(from: &Path, to: &Path, aside: &Path) -> Result<(), SkillErro
 }
 
 /// Removes `dir` unless it changed within `age`, going by its status
-/// change time, which renaming it, or adding or removing an entry in it,
+/// change time, which creating it, or adding or removing an entry in it,
 /// updates.
 async fn remove_stale(dir: &Path, age: Duration) -> Result<(), SkillError> {
     use std::os::unix::fs::MetadataExt as _;
@@ -563,6 +596,17 @@ async fn remove_dir(dir: &Path) -> Result<bool, SkillError> {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(io("removing a skill directory")(err)),
+    }
+}
+
+/// The inode of `dir`, which a rename keeps, or `None` if it doesn't
+/// exist.
+async fn inode(dir: &Path) -> Result<Option<u64>, SkillError> {
+    use std::os::unix::fs::MetadataExt as _;
+    match tokio::fs::symlink_metadata(dir).await {
+        Ok(meta) => Ok(Some(meta.ino())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(io("reading a skill directory")(err)),
     }
 }
 

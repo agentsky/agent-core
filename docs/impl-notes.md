@@ -5133,12 +5133,14 @@ row's hosts don't count. `skill confirm` moves the files into place, then
 makes the row active; a failed move leaves it pending, and the old skill is
 moved back. `skill rm` deletes the rows, then the directories. A failure
 between the two steps can leave directories no row records, so startup
-removes work directories, pending skills without a pending row and skills
-without an active row (the bundled one aside), but only those unchanged
-(by status change time, which a rename updates) for `STALE_AFTER`, the
-clone timeout and three minutes: in a blue-green deploy the old instance
-may still be cloning or moving one. The 32-skill cap is checked inside
-`put_skill`'s transaction.
+removes work directories and skill directories, pending or live, whose name
+has no row in either state (the bundled one aside). A row of either state
+keeps both of its name's directories, so a confirmation moving one from
+pending to live on another instance is never taken for left over. Startup
+also leaves anything changed (by status change time) within `STALE_AFTER`,
+the clone timeout and three minutes, since in a blue-green deploy the old
+instance may still be cloning into a work directory. The 32-skill cap is
+checked inside `put_skill`'s transaction.
 
 `skill rm` refuses new connections to the skill's hosts at once, but the
 egress proxy has no hook to close one agent's tunnels to one host, and
@@ -5306,6 +5308,14 @@ never appeared in the request without it. Every skill, the bundled
 `Skill`. A runner test fails if `--tools` lacks it, and the fakes and
 tests that spell the flags out follow.
 
+With `Skill` enabled, Claude Code also loads
+`$CLAUDE_CONFIG_DIR/commands/*.md` as commands, and `CLAUDE_CONFIG_DIR`
+(`sessions/<id>/claude`) is the session's to write, so an agent can plant
+commands that last for that session; that grants nothing new, since it can
+already write `CLAUDE.md` and `settings.json` there. Under
+`--setting-sources user` a project's `.claude/skills` and `CLAUDE.md` in
+the working directory are not loaded.
+
 ### Commands always have skills
 
 **Issue.** `Commands` took its `Skills` through an optional
@@ -5315,3 +5325,35 @@ tests that spell the flags out follow.
 **Solution.** `Commands::new` takes the `Skills`. Tests that never run a
 skill command pass one over a data directory that doesn't exist, which
 nothing reads until a skill command runs.
+
+### Replacing a waiting skill drops the old one first
+
+**Issue.** `skill add` of a skill with hosts upserted the pending row (the
+new hosts and source) before moving the new files into
+`skills-pending/<agent>/<name>`. If that move failed, or agentd died in
+between, the owner got an error, not a prompt naming the new hosts, and a
+later `skill confirm` meant for the first prompt made the new hosts active
+on the old files. `confirm` also made active whatever pending row of the
+name it found at the end, which another instance could have replaced since
+`confirm` read it; and when that row was gone it removed the whole skill,
+an unrelated active version included. The sweeper could drop a pending row
+in the middle of a confirmation that began just before the hour was up.
+
+**Solution.** A pending add first deletes the name's pending row and
+removes its pending directory, then records the new row and moves the new
+files in, so a failure anywhere leaves either nothing waiting or a row
+without files, which `confirm` refuses. `Store::confirm_skill` takes the
+row `confirm` read and makes it active only while its hosts and `added_at`
+are unchanged. When it isn't, `confirm` undoes only its own move: the
+active skill it set aside goes back, or, with none, the files it moved are
+removed, unless something else has taken their place since (checked by
+inode). The sweeper drops pending rows `PENDING_TTL` plus one
+`SWEEP_INTERVAL` after they were added, while `confirm` still calls a skill
+expired after `PENDING_TTL`. A test replaces a waiting skill with one
+declaring another host while the pending directory can't be written, then
+confirms: before the fix the confirmation made the new host active.
+
+Startup's purge keeps both directories of a name that has a row in either
+state, so it no longer depends on a rename updating the moved directory's
+status change time. A pending directory an active add failed to remove is
+then left until the skill is next added or removed.

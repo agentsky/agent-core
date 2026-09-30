@@ -175,42 +175,35 @@ impl Store {
         Ok(true)
     }
 
-    /// Makes the agent's pending skill `name` active, replacing its active
-    /// skill of that name, if it was added at or after `since`, and returns
-    /// it. A pending skill added before `since` is left for
-    /// [`delete_pending_skills_before`](Self::delete_pending_skills_before).
+    /// Makes the pending skill `shown` active, replacing the active skill
+    /// of that name, if its row still holds what `shown` read: the same
+    /// hosts, added at the same time. Returns it, or `None` if that row is
+    /// gone or was replaced.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
-    /// if the row doesn't parse.
-    pub async fn confirm_skill(
-        &self,
-        agent: AgentId,
-        name: &str,
-        since: OffsetDateTime,
-    ) -> Result<Option<AgentSkill>> {
-        let agent = agent.to_string();
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn confirm_skill(&self, shown: &AgentSkill) -> Result<Option<AgentSkill>> {
+        let agent = shown.agent.to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let pending: Option<Row> = sqlx::query_as(concat!(
-            "SELECT ",
-            columns!(),
-            " FROM agent_skills \
-             WHERE agent_id = ? AND name = ? AND state = 'pending' AND added_at >= ?"
-        ))
+        let matched: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM agent_skills \
+             WHERE agent_id = ? AND name = ? AND state = 'pending' AND hosts = ? AND added_at = ?",
+        )
         .bind(&agent)
-        .bind(name)
-        .bind(to_unix(since))
+        .bind(&shown.name)
+        .bind(shown.hosts.join("\n"))
+        .bind(to_unix(shown.added_at))
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(pending) = pending else {
+        if matched.is_none() {
             return Ok(None);
-        };
+        }
         sqlx::query(
             "DELETE FROM agent_skills WHERE agent_id = ? AND name = ? AND state = 'active'",
         )
         .bind(&agent)
-        .bind(name)
+        .bind(&shown.name)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -218,13 +211,14 @@ impl Store {
              WHERE agent_id = ? AND name = ? AND state = 'pending'",
         )
         .bind(&agent)
-        .bind(name)
+        .bind(&shown.name)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        let mut skill = pending.into_skill()?;
-        skill.state = SkillState::Active;
-        Ok(Some(skill))
+        Ok(Some(AgentSkill {
+            state: SkillState::Active,
+            ..shown.clone()
+        }))
     }
 
     /// Deletes the agent's skill `name` in `state`, or in both states
@@ -358,7 +352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pending_skill_waits_next_to_the_active_one_until_confirmed() {
+    async fn a_pending_skill_waits_next_to_the_active_one_until_confirmed_as_shown() {
         let store = memory_store().await;
         let owner = store
             .ensure_member(&member_key("o"), "o", at(1))
@@ -393,15 +387,28 @@ mod tests {
         assert_eq!(rows[1].hosts, hosts);
         assert_eq!(rows[1].added_at, at(20));
 
-        assert_eq!(store.confirm_skill(a, "gh", at(21)).await.unwrap(), None);
-        let confirmed = store.confirm_skill(a, "gh", at(20)).await.unwrap().unwrap();
+        let shown = rows[1].clone();
+        for replaced in [
+            AgentSkill {
+                added_at: at(19),
+                ..shown.clone()
+            },
+            AgentSkill {
+                hosts: vec!["api.github.com".to_owned()],
+                ..shown.clone()
+            },
+        ] {
+            assert_eq!(store.confirm_skill(&replaced).await.unwrap(), None);
+        }
+        assert_eq!(store.agent_skills(a).await.unwrap(), rows);
+        let confirmed = store.confirm_skill(&shown).await.unwrap().unwrap();
         assert_eq!(confirmed.state, SkillState::Active);
         assert_eq!(confirmed.hosts, hosts);
         let rows = store.agent_skills(a).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SkillState::Active);
         assert_eq!(rows[0].hosts, hosts);
-        assert_eq!(store.confirm_skill(a, "gh", at(0)).await.unwrap(), None);
+        assert_eq!(store.confirm_skill(&shown).await.unwrap(), None);
     }
 
     #[tokio::test]
