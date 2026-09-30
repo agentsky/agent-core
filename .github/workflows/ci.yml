@@ -77,16 +77,16 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
 
       - name: Run doctests
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
 
       - name: Build docs
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -108,10 +108,10 @@ jobs:
           rustup default stable
 
       - name: Run doctests
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
 
       - name: Build docs
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -155,7 +155,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p target/coverage
-          cargo coverage --json --summary-only --output-path target/coverage/coverage.json 2>&1 \
+          cargo coverage --locked --json --summary-only --output-path target/coverage/coverage.json 2>&1 \
             | tee target/coverage/coverage.log
 
       - name: Coverage summary
@@ -246,7 +246,7 @@ jobs:
           rustup default "$msrv"
 
       - name: Check
-        run: cargo check --all-targets --all-features
+        run: cargo check --locked --all-targets --all-features
 
   # The one check to require in branch protection. A job skipped for a
   # docs-only change satisfies a required check, except a matrix job: it

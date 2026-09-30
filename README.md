@@ -15,7 +15,7 @@ cargo test --all-features
 cargo coverage
 ```
 
-The repository is a Cargo workspace: the crates live in `crates/`, and plain
+It needs Rust 1.98.1 or newer (`rust-version` in `Cargo.toml`). The repository is a Cargo workspace: the crates live in `crates/`, and plain
 `cargo` commands at the root cover all of them. The work is planned in
 [`docs/tasks-plan.md`](docs/tasks-plan.md), which implements
 [`docs/design.md`](docs/design.md). Unexpected issues met along the way and
