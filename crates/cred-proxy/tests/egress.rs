@@ -716,7 +716,7 @@ async fn caps_open_tunnels_per_session_and_in_all() {
 #[tokio::test]
 async fn tunnels_close_at_their_lifetime_even_when_busy() {
     let (echo, _) = echo_server().await;
-    let lifetime = Duration::from_millis(400);
+    let lifetime = Duration::from_secs(2);
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
         egress.with_limits(limits(|l| l.tunnel_lifetime = lifetime))
     })
@@ -758,14 +758,62 @@ async fn lookups_are_capped_even_after_they_time_out() {
     })
     .await;
     proxy.sandbox(LOCAL);
+    proxy.sandbox(LOCAL_2);
     proxy.network.answer("git.example.com", &[PUBLIC]);
     let (status, body) = proxy.refused(LOCAL, &format!("{HANGS}:443")).await;
     assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
     assert_eq!(body, "The host could not be resolved.\n");
-    let (status, body) = proxy.refused(LOCAL, "git.example.com:443").await;
+    let (status, body) = proxy.refused(LOCAL_2, "git.example.com:443").await;
     assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
     assert_eq!(body, "The egress proxy is busy looking up hosts.\n");
     assert_eq!(proxy.network.resolved(), [HANGS]);
+}
+
+#[tokio::test]
+async fn hung_lookups_hold_their_own_sessions_tunnel_places() {
+    let (echo, _) = echo_server().await;
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress.with_limits(limits(|l| {
+            l.max_session_tunnels = 1;
+            l.max_lookups = 4;
+            l.resolve_timeout = Duration::from_millis(200);
+        }))
+    })
+    .await;
+    proxy.sandbox(LOCAL);
+    proxy.sandbox(LOCAL_2);
+    let (status, _) = proxy.refused(LOCAL, &format!("{HANGS}:443")).await;
+    assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
+    for _ in 0..3 {
+        let (status, body) = proxy.refused(LOCAL, &format!("{HANGS}:443")).await;
+        assert_eq!(status, "HTTP/1.1 429 Too Many Requests");
+        assert_eq!(body, "This sandbox has too many open tunnels.\n");
+    }
+    open_tunnel(&proxy, LOCAL_2, echo).await;
+    assert_eq!(proxy.network.resolved(), [HANGS, "git.example.com"]);
+}
+
+#[tokio::test]
+async fn one_session_runs_a_quarter_of_the_lookups() {
+    let (echo, _) = echo_server().await;
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress.with_limits(limits(|l| {
+            l.max_lookups = 8;
+            l.resolve_timeout = Duration::from_millis(200);
+        }))
+    })
+    .await;
+    proxy.sandbox(LOCAL);
+    proxy.sandbox(LOCAL_2);
+    for _ in 0..2 {
+        let (status, _) = proxy.refused(LOCAL, &format!("{HANGS}:443")).await;
+        assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
+    }
+    let (status, body) = proxy.refused(LOCAL, "git.example.com:443").await;
+    assert_eq!(status, "HTTP/1.1 429 Too Many Requests");
+    assert_eq!(body, "This sandbox has too many host lookups running.\n");
+    open_tunnel(&proxy, LOCAL_2, echo).await;
+    assert_eq!(proxy.network.resolved(), [HANGS, HANGS, "git.example.com"]);
 }
 
 /// An extension that never answers.

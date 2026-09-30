@@ -226,10 +226,17 @@ impl Registry {
         let id = PlaceholderId::of(&token);
         let mut entries = self.lock();
         let before = entries.len();
-        entries.retain(|_, entry| entry.ip != ip || entry.session == session);
+        let mut losers = Vec::new();
+        entries.retain(|_, entry| {
+            let keep = entry.ip != ip || entry.session == session;
+            if !keep && !losers.contains(&entry.session) {
+                losers.push(entry.session);
+            }
+            keep
+        });
         let displaced = before - entries.len();
         if displaced > 0 {
-            self.release_watchers(&entries);
+            self.release_watchers(&entries, &losers);
             tracing::warn!(
                 %session,
                 %ip,
@@ -294,11 +301,11 @@ impl Registry {
     /// session's last, the session's egress tunnels close.
     pub fn revoke(&self, id: PlaceholderId) -> bool {
         let mut entries = self.lock();
-        let live = entries.remove(&id).is_some();
-        if live {
-            self.release_watchers(&entries);
-        }
-        live
+        let Some(revoked) = entries.remove(&id) else {
+            return false;
+        };
+        self.release_watchers(&entries, &[revoked.session]);
+        true
     }
 
     /// Revokes every placeholder of `session`, before its container is
@@ -308,18 +315,21 @@ impl Registry {
         let mut entries = self.lock();
         let before = entries.len();
         entries.retain(|_, entry| entry.session != session);
-        self.release_watchers(&entries);
+        self.release_watchers(&entries, &[session]);
         before - entries.len()
     }
 
-    /// Drops the watch senders of sessions with no placeholder left in
-    /// `entries`, which ends their receivers. Called with the entries
-    /// locked, so a session can't be watched after its last revocation.
-    fn release_watchers(&self, entries: &HashMap<PlaceholderId, Entry>) {
-        self.watchers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|session, _| entries.values().any(|entry| entry.session == *session));
+    /// Drops the watch senders of those of `losers`, the sessions that just
+    /// lost placeholders, with none left in `entries`, which ends their
+    /// receivers. Called with the entries locked, so a session can't be
+    /// watched after its last revocation.
+    fn release_watchers(&self, entries: &HashMap<PlaceholderId, Entry>, losers: &[SessionId]) {
+        let mut watchers = self.watchers.lock().unwrap_or_else(PoisonError::into_inner);
+        for session in losers {
+            if !entries.values().any(|entry| entry.session == *session) {
+                watchers.remove(session);
+            }
+        }
     }
 
     /// The session whose live placeholders are bound to `ip`, and a

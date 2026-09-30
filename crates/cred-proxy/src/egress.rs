@@ -61,11 +61,14 @@ pub struct EgressLimits {
     /// The same for one session: 32. Past it, the session's `CONNECT`s
     /// are refused with 429.
     pub max_session_tunnels: usize,
-    /// Host lookups running at once: 32. A lookup holds its place until the
-    /// resolver returns, even after [`resolve_timeout`](Self::resolve_timeout)
-    /// has refused its `CONNECT`, since the system resolver blocks a thread
-    /// and can't be cancelled. A `CONNECT` that finds no place within
-    /// `resolve_timeout` is refused with 503.
+    /// Host lookups running at once: 32. One session may run a quarter of
+    /// them (at least one), so a sandbox whose lookups hang can't hold every
+    /// place. A lookup holds its places, and its `CONNECT`'s tunnel place,
+    /// until the resolver returns, even after
+    /// [`resolve_timeout`](Self::resolve_timeout) has refused its `CONNECT`,
+    /// since the system resolver blocks a thread and can't be cancelled. A
+    /// `CONNECT` that finds no place within `resolve_timeout` is refused
+    /// with 429 when its session's share is taken and 503 otherwise.
     pub max_lookups: usize,
     /// How long looking a host up may take, waiting for a place included:
     /// 5 seconds.
@@ -78,6 +81,13 @@ pub struct EgressLimits {
     pub idle_timeout: Duration,
     /// How long a tunnel may stay open, busy or not: 1 hour.
     pub tunnel_lifetime: Duration,
+}
+
+impl EgressLimits {
+    /// The host lookups one session may run at once.
+    fn max_session_lookups(&self) -> usize {
+        (self.max_lookups / 4).max(1)
+    }
 }
 
 impl Default for EgressLimits {
@@ -165,7 +175,8 @@ impl Network for SystemNetwork {
 /// 4. Refuses any host and port no rule allows: the [`EgressPolicy`]'s,
 ///    then the [`EgressExtension`]'s for the session.
 /// 5. Resolves the host, at most
-///    [`max_lookups`](EgressLimits::max_lookups) at a time, and refuses it
+///    [`max_lookups`](EgressLimits::max_lookups) at a time and a quarter of
+///    that for one session, and refuses it
 ///    if any address it resolves to is unreachable under the policy, so a
 ///    name rebound to the metadata address or a private network is
 ///    refused.
@@ -297,7 +308,7 @@ impl EgressProxy {
         }
         let slot = self.take_slot(session).map_err(refuse)?;
         self.allowed(session, &target).await.map_err(refuse)?;
-        let addresses = self.resolve(&target).await.map_err(refuse)?;
+        let (slot, addresses) = self.resolve(slot, &target).await.map_err(refuse)?;
         if let Some((address, why)) = addresses
             .iter()
             .find_map(|&ip| self.policy.unreachable(ip).map(|why| (ip, why)))
@@ -336,22 +347,30 @@ impl EgressProxy {
         Ok(StatusCode::OK.into_response())
     }
 
-    /// A tunnel place for `session`, held until the `CONNECT` is refused
-    /// or its tunnel closes.
+    /// A tunnel place for `session`, held until its tunnel closes, or until
+    /// the `CONNECT` is refused and any lookup it started has returned.
     fn take_slot(&self, session: SessionId) -> Result<Slot, Why> {
         let mut slots = lock(&self.slots);
-        let open = slots.sessions.get(&session).copied().unwrap_or(0);
+        let open = slots.sessions.get(&session).map_or(0, |s| s.tunnels);
         if open >= self.limits.max_session_tunnels {
             return Err(Why::SessionFull);
         }
         if slots.total >= self.limits.max_tunnels {
             return Err(Why::ProxyFull);
         }
-        slots.sessions.insert(session, open + 1);
         slots.total += 1;
+        let places = slots
+            .sessions
+            .entry(session)
+            .or_insert_with(|| SessionSlots {
+                tunnels: 0,
+                lookups: Arc::new(Semaphore::new(self.limits.max_session_lookups())),
+            });
+        places.tunnels += 1;
         Ok(Slot {
             slots: Arc::clone(&self.slots),
             session,
+            lookups: Arc::clone(&places.lookups),
         })
     }
 
@@ -382,25 +401,34 @@ impl EgressProxy {
     }
 
     /// The addresses `target`'s host resolves to, once a lookup place is
-    /// free. The lookup runs in a task of its own that keeps the place
-    /// until the resolver returns, so lookups the timeout gave up on still
-    /// count.
-    async fn resolve(&self, target: &Target) -> Result<Vec<IpAddr>, Why> {
+    /// free in `slot`'s session and in the proxy. The lookup runs in a task
+    /// of its own that keeps both places and `slot` until the resolver
+    /// returns, so lookups the timeout gave up on still count, against the
+    /// session's tunnels too. `slot` comes back with the addresses.
+    async fn resolve(&self, slot: Slot, target: &Target) -> Result<(Slot, Vec<IpAddr>), Why> {
         let deadline = Instant::now() + self.limits.resolve_timeout;
-        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.lookups).acquire_owned())
-            .await
-            .map_err(|_| Why::Busy)?
-            .map_err(|_| Why::Busy)?;
+        let place = |lookups: &Arc<Semaphore>, why| {
+            let acquire = Arc::clone(lookups).acquire_owned();
+            async move {
+                match tokio::time::timeout_at(deadline, acquire).await {
+                    Ok(Ok(permit)) => Ok(permit),
+                    _ => Err(why),
+                }
+            }
+        };
+        let session_place = place(&slot.lookups, Why::SessionBusy).await?;
+        let proxy_place = place(&self.lookups, Why::Busy).await?;
         let network = Arc::clone(&self.network);
         let (host, port) = (target.host.clone(), target.port);
         let lookup = tokio::spawn(async move {
-            let _permit = permit;
-            network.resolve(&host, port).await
+            let _places = (session_place, proxy_place);
+            let resolved = network.resolve(&host, port).await;
+            (slot, resolved)
         });
         match tokio::time::timeout_at(deadline, lookup).await {
-            Ok(Ok(Ok(mut addresses))) if !addresses.is_empty() => {
+            Ok(Ok((slot, Ok(mut addresses)))) if !addresses.is_empty() => {
                 addresses.dedup();
-                Ok(addresses)
+                Ok((slot, addresses))
             }
             _ => Err(Why::Resolve),
         }
@@ -496,6 +524,7 @@ enum Why {
     Extension,
     NotAllowed,
     Port,
+    SessionBusy,
     Busy,
     Address(&'static str),
     Resolve,
@@ -516,6 +545,7 @@ impl Why {
             Self::Extension => "allowlist extension timed out",
             Self::NotAllowed => "host not allowed",
             Self::Port => "port not allowed",
+            Self::SessionBusy => "session lookup cap reached",
             Self::Busy => "lookup cap reached",
             Self::Address(why) => why,
             Self::Resolve => "resolution failed",
@@ -552,6 +582,10 @@ impl Why {
             ),
             Self::NotAllowed => (forbidden, "The host is not in the egress allowlist."),
             Self::Port => (forbidden, "The port is not allowed for this host."),
+            Self::SessionBusy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "This sandbox has too many host lookups running.",
+            ),
             Self::Busy => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "The egress proxy is busy looking up hosts.",
@@ -589,22 +623,31 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[derive(Default)]
 struct Slots {
     total: usize,
-    sessions: HashMap<SessionId, usize>,
+    sessions: HashMap<SessionId, SessionSlots>,
+}
+
+/// One session's tunnel places taken, and its lookup places. It lives as
+/// long as a tunnel place is taken, and every lookup holds one, so the
+/// session's lookups always share one semaphore.
+struct SessionSlots {
+    tunnels: usize,
+    lookups: Arc<Semaphore>,
 }
 
 /// One tunnel place, given back when dropped.
 struct Slot {
     slots: Arc<Mutex<Slots>>,
     session: SessionId,
+    lookups: Arc<Semaphore>,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         let mut slots = lock(&self.slots);
         slots.total -= 1;
-        if let Some(open) = slots.sessions.get_mut(&self.session) {
-            *open -= 1;
-            if *open == 0 {
+        if let Some(places) = slots.sessions.get_mut(&self.session) {
+            places.tunnels -= 1;
+            if places.tunnels == 0 {
                 slots.sessions.remove(&self.session);
             }
         }
@@ -812,6 +855,7 @@ mod tests {
             Why::Extension,
             Why::NotAllowed,
             Why::Port,
+            Why::SessionBusy,
             Why::Busy,
             Why::Address("private address"),
             Why::Resolve,
@@ -823,7 +867,7 @@ mod tests {
             assert!(line.ends_with('.') && !line.contains('\n'), "{line}");
             let expected = match why {
                 Why::Resolve | Why::Connect => StatusCode::BAD_GATEWAY,
-                Why::SessionFull => StatusCode::TOO_MANY_REQUESTS,
+                Why::SessionFull | Why::SessionBusy => StatusCode::TOO_MANY_REQUESTS,
                 Why::ProxyFull | Why::Extension | Why::Busy => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::FORBIDDEN,
             };

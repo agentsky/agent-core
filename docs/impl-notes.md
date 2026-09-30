@@ -3927,14 +3927,24 @@ pool with lookups nobody waited for.
 **Solution.** `EgressLimits`, given to `EgressProxy::with_limits`:
 
 - A tunnel place is taken per `CONNECT` before the extension is asked or
-  the host looked up, and given back when the `CONNECT` is refused or its
-  tunnel closes: 32 per session (429 past it) and 256 in all (503).
-  agentd's `[proxy] max_session_tunnels` and `max_tunnels` set them.
-- Lookups run under a semaphore of 32 places, each in a task of its own
-  that holds its place until the resolver returns, even after the timeout
-  refused the `CONNECT`. Waiting for a place counts toward the 5-second
-  timeout, and a `CONNECT` that gets none is refused with 503. The
-  workspace has no asynchronous resolver, and the semaphore needs none.
+  the host looked up, and given back when its tunnel closes, or when the
+  `CONNECT` is refused and any lookup it started has returned: 32 per
+  session (429 past it) and 256 in all (503). agentd's
+  `[proxy] max_session_tunnels` and `max_tunnels` set them.
+- Lookups run under a semaphore of 32 places, and one session's under a
+  semaphore of its own with a quarter of that (at least one place). Each
+  runs in a task of its own that holds both places and the `CONNECT`'s
+  tunnel place until the resolver returns, even after the timeout refused
+  the `CONNECT`, and hands the tunnel place back when the lookup finishes
+  in time. A second review found that with the tunnel place dropped at
+  the 502 and a session allowed all 32 lookup places, a sandbox capped at
+  one tunnel held three lookup places, and a session capped at 32 could
+  hold them all and leave every other session with 503: now hung lookups
+  count against their own session's tunnels, and no session can hold more
+  than its share. Waiting for places counts toward the 5-second timeout;
+  a `CONNECT` that gets no session place is refused with 429, and one
+  that gets no proxy place with 503. The workspace has no asynchronous
+  resolver, and the semaphores need none.
 - The `EgressExtension` gets 2 seconds; past that the `CONNECT` is refused
   with 503, since a lookup that can't answer denies.
 - A tunnel lives an hour at most, busy or not.
