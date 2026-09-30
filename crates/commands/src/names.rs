@@ -1,0 +1,327 @@
+//! Validated names and the member, channel and audience references that
+//! commands take as arguments.
+
+use std::fmt;
+use std::str::FromStr;
+
+use crate::{ParseError, ParseErrorKind};
+
+/// Why one argument failed to parse. The text never repeats the argument,
+/// which may be anything a member typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct Reason(pub(crate) &'static str);
+
+impl From<Reason> for ParseError {
+    fn from(reason: Reason) -> Self {
+        ParseError::new(ParseErrorKind::Invalid, reason.0.to_owned(), false)
+    }
+}
+
+const AGENT_NAME_RULE: Reason = Reason("An agent name is 2 to 32 characters, each a-z, 0-9 or -.");
+const SKILL_NAME_RULE: Reason = Reason("A skill name is 1 to 64 characters, each a-z, 0-9 or -.");
+
+fn is_name_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | '0'..='9' | '-')
+}
+
+/// An agent's name: 2 to 32 characters, each `a-z`, `0-9` or `-`.
+///
+/// Names are case-sensitive and never folded, so `Bob` is refused rather
+/// than quietly becoming `bob`.
+///
+/// ```
+/// use commands::AgentName;
+///
+/// let name: AgentName = "code-helper".parse().unwrap();
+/// assert_eq!(name.as_str(), "code-helper");
+/// assert!("Bob".parse::<AgentName>().is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AgentName(String);
+
+impl AgentName {
+    /// The name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for AgentName {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(parse_agent_name(s)?)
+    }
+}
+
+impl fmt::Display for AgentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+pub(crate) fn parse_agent_name(s: &str) -> Result<AgentName, Reason> {
+    if (2..=32).contains(&s.len()) && s.chars().all(is_name_char) {
+        Ok(AgentName(s.to_owned()))
+    } else {
+        Err(AGENT_NAME_RULE)
+    }
+}
+
+/// A skill's name: 1 to 64 characters, each `a-z`, `0-9` or `-`, the rule
+/// Claude Code applies to a skill's `name`.
+///
+/// The name becomes a directory under the agent's skills, so the rule also
+/// keeps `/` and `..` out of that path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SkillName(String);
+
+impl SkillName {
+    /// The name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for SkillName {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(parse_skill_name(s)?)
+    }
+}
+
+impl fmt::Display for SkillName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+pub(crate) fn parse_skill_name(s: &str) -> Result<SkillName, Reason> {
+    if (1..=64).contains(&s.len()) && s.chars().all(is_name_char) {
+        Ok(SkillName(s.to_owned()))
+    } else {
+        Err(SKILL_NAME_RULE)
+    }
+}
+
+/// A member named in a command.
+///
+/// Members type `@name`. Slack rewrites a mention it recognizes into a
+/// `<@U123>` or `<@U123|name>` token, which becomes [`UserRef::Id`]; the
+/// label after `|` is dropped, since only the id is stable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UserRef {
+    /// A username as typed, without the `@`. The handler resolves it on the
+    /// surface the command came from.
+    Name(String),
+    /// A platform user id, from a Slack `<@…>` token.
+    Id(String),
+}
+
+/// A channel named in a command.
+///
+/// Members type `#name`. Slack rewrites a channel it recognizes into a
+/// `<#C123|name>` or `<#C123>` token, which becomes [`RoomRef::Id`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RoomRef {
+    /// A channel name as typed, without the `#`.
+    Name(String),
+    /// A platform channel id, from a Slack `<#…>` token.
+    Id(String),
+}
+
+/// Who `allow` and `deny` apply to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    /// One member: `@name` or a Slack `<@…>` token.
+    Member(UserRef),
+    /// Everyone in one channel: `#name` or a Slack `<#…>` token.
+    Room(RoomRef),
+    /// Everyone: `everyone`, `@everyone` or Slack's `<!everyone>`.
+    Everyone,
+}
+
+const TARGET_RULE: Reason = Reason("A target is @member, #channel or everyone.");
+const USER_RULE: Reason = Reason("A member is written @name.");
+
+pub(crate) fn parse_target(s: &str) -> Result<Target, Reason> {
+    if s.eq_ignore_ascii_case("everyone")
+        || s.eq_ignore_ascii_case("@everyone")
+        || s.eq_ignore_ascii_case("<!everyone>")
+    {
+        return Ok(Target::Everyone);
+    }
+    if let Some(user) = user_ref(s) {
+        return user.map(Target::Member);
+    }
+    if let Some(room) = room_ref(s) {
+        return room.map(Target::Room);
+    }
+    Err(TARGET_RULE)
+}
+
+pub(crate) fn parse_user(s: &str) -> Result<UserRef, Reason> {
+    user_ref(s).unwrap_or(Err(USER_RULE))
+}
+
+/// Parses `@name` or `<@ID>` / `<@ID|label>`. `None` means `s` isn't
+/// written as a member at all.
+fn user_ref(s: &str) -> Option<Result<UserRef, Reason>> {
+    if let Some(id) = slack_token(s, '@') {
+        return Some(id.map(UserRef::Id).ok_or(USER_RULE));
+    }
+    let name = s.strip_prefix('@')?;
+    Some(plain_name(name).map(UserRef::Name).ok_or(USER_RULE))
+}
+
+fn room_ref(s: &str) -> Option<Result<RoomRef, Reason>> {
+    const ROOM_RULE: Reason = Reason("A channel is written #name.");
+    if let Some(id) = slack_token(s, '#') {
+        return Some(id.map(RoomRef::Id).ok_or(ROOM_RULE));
+    }
+    let name = s.strip_prefix('#')?;
+    Some(plain_name(name).map(RoomRef::Name).ok_or(ROOM_RULE))
+}
+
+/// Reads a Slack `<{sigil}ID>` or `<{sigil}ID|label>` token. The outer
+/// `None` means `s` isn't such a token; the inner `None` means it is one,
+/// but its id isn't a Slack id (uppercase letters and digits).
+fn slack_token(s: &str, sigil: char) -> Option<Option<String>> {
+    let body = s
+        .strip_prefix('<')?
+        .strip_suffix('>')?
+        .strip_prefix(sigil)?;
+    let id = body.split_once('|').map_or(body, |(id, _label)| id);
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    Some(valid.then(|| id.to_owned()))
+}
+
+/// A username or channel name after its sigil: not empty, and free of the
+/// characters that mark sigils and Slack tokens.
+fn plain_name(name: &str) -> Option<String> {
+    let valid = !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| matches!(c, '@' | '#' | '<' | '>' | '|') || c.is_control());
+    valid.then(|| name.to_owned())
+}
+
+/// Unwraps a Slack link token, `<url>` or `<url|label>`, to its URL. Slack
+/// wraps links this way in message text and in slash command text. Other
+/// text is returned unchanged.
+pub(crate) fn unwrap_slack_link(s: &str) -> &str {
+    match s.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        Some(body) if !body.starts_with(['@', '#', '!']) => {
+            body.split_once('|').map_or(body, |(url, _label)| url)
+        }
+        _ => s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_names_follow_the_rule() {
+        for ok in ["ab", "code-helper", "a1", "--", &"x".repeat(32)] {
+            assert_eq!(parse_agent_name(ok).unwrap().as_str(), ok);
+        }
+        for bad in [
+            "",
+            "a",
+            &"x".repeat(33),
+            "Bob",
+            "bob_1",
+            "bob.",
+            "bø",
+            "a b",
+        ] {
+            assert_eq!(parse_agent_name(bad), Err(AGENT_NAME_RULE), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn agent_name_from_str_and_display() {
+        let name: AgentName = "helper".parse().unwrap();
+        assert_eq!(name.to_string(), "helper");
+        let err = "NO".parse::<AgentName>().unwrap_err();
+        assert_eq!(err.kind(), ParseErrorKind::Invalid);
+        assert_eq!(err.to_string(), AGENT_NAME_RULE.0);
+        assert!(!err.to_string().contains("NO"));
+    }
+
+    #[test]
+    fn skill_names_follow_the_rule() {
+        let name: SkillName = "x".parse().unwrap();
+        assert_eq!(name.as_str(), "x");
+        assert_eq!(name.to_string(), "x");
+        assert!(parse_skill_name(&"x".repeat(64)).is_ok());
+        for bad in ["", &"x".repeat(65), "..", "a/b", "A"] {
+            assert_eq!(parse_skill_name(bad), Err(SKILL_NAME_RULE), "{bad:?}");
+        }
+        assert!("../etc".parse::<SkillName>().is_err());
+    }
+
+    #[test]
+    fn targets_accept_raw_and_slack_forms() {
+        let cases = [
+            ("@bob", Target::Member(UserRef::Name("bob".into()))),
+            ("<@U123>", Target::Member(UserRef::Id("U123".into()))),
+            ("<@W9|bob>", Target::Member(UserRef::Id("W9".into()))),
+            ("#general", Target::Room(RoomRef::Name("general".into()))),
+            ("<#C42|general>", Target::Room(RoomRef::Id("C42".into()))),
+            ("<#G7|>", Target::Room(RoomRef::Id("G7".into()))),
+            ("<#C42>", Target::Room(RoomRef::Id("C42".into()))),
+            ("everyone", Target::Everyone),
+            ("Everyone", Target::Everyone),
+            ("@everyone", Target::Everyone),
+            ("<!everyone>", Target::Everyone),
+        ];
+        for (text, want) in cases {
+            assert_eq!(parse_target(text), Ok(want), "{text}");
+        }
+    }
+
+    #[test]
+    fn targets_reject_malformed_forms() {
+        for bad in ["bob", "", "<!here>", "<!channel>", "<https://x.io>", "all"] {
+            assert_eq!(parse_target(bad), Err(TARGET_RULE), "{bad:?}");
+        }
+        for bad in ["@", "@a@b", "<@>", "<@u123>", "<@U 1>", "@a|b"] {
+            assert_eq!(parse_target(bad), Err(USER_RULE), "{bad:?}");
+        }
+        for bad in ["#", "#a#b", "<#>", "<#c1|x>", "#a\u{7}"] {
+            assert!(parse_target(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn users_reject_rooms_and_everyone() {
+        assert_eq!(parse_user("@bob"), Ok(UserRef::Name("bob".into())));
+        assert_eq!(parse_user("<@U1|bob>"), Ok(UserRef::Id("U1".into())));
+        for bad in ["bob", "#general", "<#C1>", "everyone", "<@lower>"] {
+            assert_eq!(parse_user(bad), Err(USER_RULE), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn slack_links_unwrap_to_their_url() {
+        assert_eq!(
+            unwrap_slack_link("<https://g.it/a.git>"),
+            "https://g.it/a.git"
+        );
+        assert_eq!(
+            unwrap_slack_link("<https://g.it/a.git#v1|g.it/a.git#v1>"),
+            "https://g.it/a.git#v1"
+        );
+        for other in ["https://g.it/a", "<@U1>", "<#C1|x>", "<!here>", "<x", "x>"] {
+            assert_eq!(unwrap_slack_link(other), other);
+        }
+    }
+}

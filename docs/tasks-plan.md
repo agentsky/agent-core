@@ -813,10 +813,12 @@ Deliverables:
   text of a DM to the manager bot, or the text after `!agent`. A
   `strip_prefix` helper covers the last two.
 - A `Command` enum covering every row of the design's command table:
-  - `Login { code: Option<String> }`, `Logout`, `Me`.
-  - `SlackToken { token, refresh }`.
+  - `Login { code: Option<SecretString> }`, `Logout`, `Me`.
+  - `SlackToken { token, refresh }`, both `SecretString`.
   - `Create { name, persona }`, `Persona { name, text }`.
-  - `Skill { add|rm, name, source }`.
+  - `Skill(Add { name, source } | Rm { name, skill })`. `name` is the agent;
+    `skill rm` names the skill, since an owner may have several agents
+    ([impl-notes](impl-notes.md#skill-rm-needs-the-agent-and-the-skill)).
   - `Allow` and `Deny { name, target }`.
   - `Limits { name, turns_per_day, hops }`.
   - `Pause`, `Resume` and `Delete { name }`.
@@ -1738,7 +1740,7 @@ Deliverables:
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
-- `/agent skill rm <name>`.
+- `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
 - Skills may declare extra egress hosts in front matter (`allowed-hosts:`). The
   owner confirms them when adding, and they extend T19's allowlist for that
   agent's sandboxes.
