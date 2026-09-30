@@ -7,9 +7,19 @@
 
 use std::ops::Range;
 
+use core_types::{LengthUnit, Limit};
 use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag};
 
-use crate::{MentionDirectory, mention};
+use crate::{MentionDirectory, mention, url::bare_url};
+
+/// The most text one Slack message chunk holds: 3,000 characters, under
+/// Slack's 4,000-character limit for a message's `text`.
+///
+/// Split the output of [`to_mrkdwn`] with it.
+pub const MESSAGE_LIMIT: Limit = Limit {
+    max: 3_000,
+    unit: LengthUnit::Chars,
+};
 
 /// Names Slack treats as broadcasts to a whole channel or workspace.
 const BROADCASTS: &[&str] = &["here", "channel", "everyone"];
@@ -942,55 +952,6 @@ fn wire_broadcast(text: &str, at: usize) -> Option<(usize, &str)> {
         return None;
     };
     Some((at + 2 + len + close + 1, word))
-}
-
-/// Finds a bare `http://` or `https://` URL at byte offset `at`, trimmed of
-/// trailing punctuation the way qm-core's `trimUrlTail` does.
-fn bare_url(text: &str, at: usize) -> Option<&str> {
-    let rest = &text[at..];
-    let scheme = ["https://", "http://"]
-        .into_iter()
-        .find(|scheme| rest.starts_with(scheme))?;
-    if text[..at]
-        .chars()
-        .next_back()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-    let len = rest
-        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '|'))
-        .unwrap_or(rest.len());
-    let url = trim_url_tail(&rest[..len]);
-    (url.len() > scheme.len()).then_some(url)
-}
-
-/// Drops trailing punctuation, and closing brackets that have no opening
-/// partner inside the URL, so `(see https://x.io/a).` keeps `)` and `.` out.
-fn trim_url_tail(url: &str) -> &str {
-    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
-    let mut unmatched = PAIRS.map(|(open, close)| {
-        url.matches(close).count() as isize - url.matches(open).count() as isize
-    });
-    let mut end = url.len();
-    while let Some(c) = url[..end].chars().next_back() {
-        let drop = match PAIRS.iter().position(|&(_, close)| close == c) {
-            Some(pair) if unmatched[pair] > 0 => {
-                unmatched[pair] -= 1;
-                true
-            }
-            Some(_) => false,
-            None => matches!(
-                c,
-                '*' | '_' | '~' | '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"'
-            ),
-        };
-        if !drop {
-            break;
-        }
-        end -= c.len_utf8();
-    }
-    &url[..end]
 }
 
 /// Writes a formatting character the source escaped. Slack has no escape,

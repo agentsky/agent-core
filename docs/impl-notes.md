@@ -789,3 +789,200 @@ limit.
 closing inline code, and replacing the backtick with a look-alike would change
 the code's text. Agents rarely put backticks in inline code; a fenced block
 shows them correctly.
+
+## T07: splitting and directives
+
+### Split the rendered text, not the Markdown
+
+**Issue.** T07 didn't say whether `split` runs on the agent's Markdown or on
+a renderer's output. Rendering changes the length (`&` becomes `&amp;`, a link
+becomes `<url|label>`, a table grows padding), so chunks cut from Markdown
+can exceed the limit once rendered. And the renderers need whole constructs:
+a table or a list cut in two renders differently.
+
+**Solution.** The order is extract directives, render, then split, as T23's
+delivery steps already list. `split` knows both renderers' output syntax:
+it never cuts inside a Slack `<…>` token, an HTML entity such as `&amp;`, a
+Markdown link or image, an `@mention`, a fence line, or a character, and
+keeps grapheme clusters together (see [Grapheme clusters need a mark
+table](#grapheme-clusters-need-a-mark-table)). A property test renders
+generated Markdown with `to_mrkdwn` and checks that no cut lands inside a
+token or an entity. The crate docs state the order.
+
+### Chunks keep their whitespace, so they rejoin exactly
+
+**Issue.** The acceptance property says that rejoining the chunks with the
+fences removed gives the original text. Trimming the whitespace at a cut
+would break that.
+
+**Solution.** Chunks are consecutive slices of the text, plus the fence lines
+the splitter adds. A cut falls after a blank line, a line break or a run of
+spaces, and that whitespace stays at the end of the earlier chunk, so the next
+chunk doesn't start with a blank line. The tests check the property on the
+splitter's internal pieces, and check separately that each piece renders as
+reopening line, slice and closing fence.
+
+### Where the splitter cuts
+
+**Issue.** qm-core's `safeCutIndex` backs off from the limit to avoid a `<…>`
+token or an unbalanced `` ` ``, `*` or `~`, but it doesn't look for paragraph,
+line or word breaks, and it counts ```` ``` ```` anywhere in the text as a
+fence.
+
+**Solution.** A break is used when it falls in the second half of the chunk:
+a blank line outside code, or the start or end of a code block, first, then a
+line break, then a space outside code. Spaces inside a code block don't
+count, since a cut there breaks a code line in two. Otherwise the latest break
+of any kind wins, and a word is cut only as a last resort. Code spans and
+pairs of `*`, `_` or `~` on a line are kept whole only if that still leaves
+at least a quarter of the chunk, like qm-core's 25% floor, because an `_` in
+an identifier can pair with one much further along the line. The hard rules
+above give way only when one construct is longer than a chunk. Fences are
+found line by line: three or more backticks or tildes after optional spaces
+and `>` markers, and a closing line needs the same number of `>`, so a
+blockquoted fence in Slack output (`> ```sh`) is closed and reopened with its
+prefix. A cut never lands just after an opening line or just before a closing
+line, which would leave an empty code block.
+
+### Limits smaller than a fence or a character
+
+**Issue.** A continuation chunk repeats the opening fence line and adds a
+closing one. With a tiny limit, or a very long info string, those lines alone
+leave no room for content, and a limit of 1 UTF-16 unit can't hold an emoji at
+all. qm-core stops repeating fences below a 32-character budget.
+
+**Solution.** A fence is repeated only when twice its opening line plus four
+units fits the limit, which guarantees that every chunk can hold at least one
+character between them. Otherwise the block is split like plain text. A chunk
+always holds at least one character, so a limit below one character's size is
+exceeded rather than looping; the rustdoc says so. Real limits (3,000 and
+5,000) never get near either case.
+
+### Rocket.Chat mentions need a username, not an id
+
+**Issue.** `MentionDirectory::resolve` was documented as returning a platform
+user id, which is what Slack's `<@U…>` needs. Rocket.Chat mentions are written
+`@username`; a user id there is not a mention.
+
+**Solution.** The trait now returns "the handle the surface's mention syntax
+needs": a user id on Slack, a username on Rocket.Chat. The Rocket.Chat
+renderer only accepts a username made of ASCII letters and digits, `.`, `_`
+and `-` (the server's name pattern) that isn't a broadcast name, so a
+directory entry can't turn a mention into a broadcast. Name resolution
+leaves code spans, code blocks, link destinations, autolinks and bare URLs
+alone, found with the same `pulldown-cmark` parse (`render::verbatim`).
+Broadcasts are neutralized everywhere, code and URLs included (see [Code
+doesn't protect a broadcast on
+Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
+scanner moved from `slack.rs` to `render::url` to be shared.
+
+### Code doesn't protect a broadcast on Rocket.Chat
+
+**Issue.** The renderer first neutralized `@all` and `@here` only outside
+code and link targets, with the Slack renderer's word rules (Unicode letters
+and digits, not after a letter). Rocket.Chat decides who a message notifies
+from its raw text, not from rendered Markdown. `MentionsParser.getUserMentions`
+(`app/mentions/lib/MentionsParser.ts`, the same in 7.10.0 and 8.0.0) removes
+`[label](dest)` links with `/\[[^\]]*\]\([^)]+\)/g`, then matches
+`(^|\s|>)@([0-9a-zA-Z-_.]+…)` with flags `gm`, and
+`MentionsServer.getUsersByMentions` (`app/mentions/server/Mentions.ts`)
+notifies the room when the name is `all` or `here`. The name class is
+ASCII-only and code isn't special. So `@all` in a fenced, indented or inline
+code span, `@allé` and `@here٣` (the name ends at the first non-ASCII
+character), a link title spanning lines, inline HTML (`<a>@all</a>`),
+`[x](y)@all` at a line start (the link removal leaves `@all` there), and a
+directory entry resolving to `allé` all broadcast.
+
+**Solution.** After rendering, `to_markdown` makes one last pass over the
+whole output, code and link targets included, with the server's grammar: it
+inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
+precedes the `@`. The server reads no name after the zero-width space. A
+URL or a code sample containing `/@all` or `@here` gets the zero-width space
+too; that is the price of the server not knowing about code. `@allison` and
+`@all.hands` stay untouched. The pass is the only place that inserts the
+space; name resolution just skips broadcasts so they are never offered to
+the directory. Usernames from the directory must match the server's ASCII
+class. The tests port the server's regex (`rocketchat::server`, checked
+against the JavaScript regex under Node on 30,000 generated strings while
+writing it) and assert that no output, and no chunk `split` makes from it,
+yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
+pattern; a server configured with a narrower name pattern could read `@all`
+out of `@all.hands`.
+
+### A cut can create or shorten a mention
+
+**Issue.** A mention was kept whole only when its `@` followed a
+non-alphanumeric character, and a cut could fall right before any `@`. The
+server's grammar accepts an `@` at the start of the message, so a harmless
+`x@name` could become a mention at the start of the next chunk, and a forced
+cut inside an oversized construct could shorten `@herectic` to `@here`.
+
+**Solution.** `split` keeps every `@` and the name after it together,
+whatever precedes the `@`, and never cuts right before an `@` that follows
+anything but whitespace or `>`. When a single construct is longer than the
+chunk and a cut has to fall inside it, the cut still avoids the inside of a
+name: it falls right after the `@` instead, so neither chunk holds a
+shortened name. Together with the final pass above, every `@` run in a chunk
+is a run of the rendered text, and those are already neutralized.
+
+### Grapheme clusters need a mark table
+
+**Issue.** The splitter's list of characters that attach to the one before
+them covered combining diacritics, variation selectors, emoji modifiers,
+the joiner and tags, but no script-specific marks. `"कि"` repeated and split
+at 1,001 characters gave chunks starting with the vowel sign U+093F; Thai
+vowels and tone marks, Hebrew and Arabic points, and Hangul vowel and
+trailing jamo were cut the same way. The workspace has no Unicode property
+crate.
+
+**Solution.** `split::graphemes` holds a table of 336 ranges: every
+character of general category `Mn`, `Mc` or `Me`, plus everything Unicode 17
+gives `Grapheme_Cluster_Break` `Extend`, `SpacingMark`, `V`, `T` or `ZWJ`,
+generated from the `unicode-segmentation` crate's tables and Python's
+`unicodedata`. A cut also never falls after an Indic virama
+(`Indic_Conjunct_Break=Linker`) before a letter, after a zero-width joiner,
+or after a Hangul leading jamo before another leading jamo or a syllable.
+Prepend characters and the full emoji ZWJ grammar are left out; the rules
+only ever remove cut positions, so an approximation errs toward longer
+clusters.
+
+### Reference links and long entity names
+
+**Issue.** Codex's review found two cuts the splitter allowed: inside a
+reference-style link, `aaaa[label][ref]` with `[ref]: /url` below, split at
+13, and inside an HTML entity with a name longer than ten characters, such
+as `&CounterClockwiseContourIntegral;`.
+
+**Solution.** When the text defines a label (a line starting `[label]:`
+after optional spaces and `>` markers), `[text][label]`, `[label][]` and
+`[label]` on one line are kept whole like inline links, with labels matched
+case-insensitively and with whitespace collapsed, as CommonMark does. Only
+labels without brackets and up to 999 characters count, which also keeps
+the matching linear. Brackets without a definition are ordinary text. An
+entity name may now have up to 31 characters, the length of the longest
+HTML5 name.
+
+### Directive details qm-core decides and T07 doesn't
+
+**Issue.** T07 names only `[[react: <emoji>]]`. qm-core's `extractReactions`
+also accepts several names per directive, names with colons, literal emoji
+characters (through a generated table of about 1,800 entries), and a target
+message after `@`, caps a reply at five reactions, strips an unclosed
+`[[react:` running to the end of the text, and trims every line of the reply,
+code included, whenever it removed something.
+
+**Solution.** `directives::extract` accepts several names separated by spaces
+or commas, strips colons, lowercases, keeps only valid short names
+(`[a-z0-9_+'-]+` with an optional `::skin-tone-2` to `-6`, at most
+`MAX_NAME_LEN`, 64, characters in all), drops duplicates and returns at most
+`MAX_REACTIONS` (5). Literal emoji characters are dropped:
+the table would be a large data file for a case the agent's instructions can
+avoid. A directive with an `@` target is removed without effect, since
+reacting to the current message instead would be wrong and short message ids
+belong to T23's `message_refs`. An unclosed `[[react:` is removed only on the
+last line, so prose that mentions the syntax can't delete the rest of a
+reply. Whitespace is cleaned only next to removed directives: a line that
+held only directives goes, space before a directive at the end of a line
+goes, and at most one blank line is left where a line was removed. Code is
+found with the parse tree, and a directive overlapping it is left as text.
