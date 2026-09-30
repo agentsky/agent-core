@@ -460,13 +460,6 @@ pub struct CommunityConfig {
     pub admins: Vec<MemberKey>,
 }
 
-impl CommunityConfig {
-    /// Whether `member` is a community admin.
-    pub fn is_admin(&self, member: &MemberKey) -> bool {
-        self.admins.contains(member)
-    }
-}
-
 /// Reads a list of member keys in their string form.
 fn member_keys<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<MemberKey>, D::Error> {
     Vec::<String>::deserialize(de)?
@@ -1941,10 +1934,7 @@ manager_user_id = "manager-id"
         let community = with(&text, env()).unwrap().community;
         let slack: MemberKey = "slack:T0123:U0456".parse().unwrap();
         let rocket: MemberKey = "rocketchat:chat.example.com:aBcD".parse().unwrap();
-        assert_eq!(community.admins, [slack.clone(), rocket]);
-        assert!(community.is_admin(&slack));
-        assert!(!community.is_admin(&"slack:T0123:U9999".parse().unwrap()));
-        assert!(!community.is_admin(&"slack:T9999:U0456".parse().unwrap()));
+        assert_eq!(community.admins, [slack, rocket]);
 
         let err = file_err(&format!(
             "{MINIMAL}\n[community]\nadmins = [\"slack:T0123:U0456\", \"U0456\"]\n"

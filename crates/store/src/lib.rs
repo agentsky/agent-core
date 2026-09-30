@@ -25,8 +25,9 @@
 //! [`message_refs`](Store::record_message_ref),
 //! [`slack_config_tokens`](Store::put_slack_config_token),
 //! [`agents`](Store::create_agent) with their bindings and
-//! [retirements](Store::claim_retirement), and
-//! [`community_settings`](Store::set_community_api_key).
+//! [retirements](Store::claim_retirement),
+//! [`community_settings`](Store::set_community_api_key), and
+//! [`failure_notices`](Store::claim_failure_notice).
 
 #![warn(missing_docs)]
 
@@ -43,6 +44,7 @@ mod claude_links;
 mod community;
 mod ctl;
 mod events;
+mod failure_notices;
 mod members;
 mod message_refs;
 mod pending_logins;
@@ -363,6 +365,7 @@ mod tests {
                 "claude_links",
                 "community_settings",
                 "ctl_tokens",
+                "failure_notices",
                 "members",
                 "message_refs",
                 "pending_logins",

@@ -745,6 +745,23 @@ async fn a_usage_limit_or_refusal_names_whose_account_and_tells_only_the_request
     assert_eq!(text, COMMUNITY_KEY_REFUSED_TEXT);
     assert_eq!(stack.dms_to("carol").len(), 2);
 
+    let (text, _, _) = stack
+        .answer(stack.mention("bob", "GENERAL", "l4b", Some("l1")))
+        .await;
+    assert_eq!(
+        text, LOGIN_EXPIRED_TEXT,
+        "every failed turn tells its thread"
+    );
+    let (text, _, _) = stack
+        .answer(stack.mention("carol", "GENERAL", "l4c", Some("l1")))
+        .await;
+    assert_eq!(text, COMMUNITY_KEY_REFUSED_TEXT);
+    assert_eq!(
+        (stack.dms_to("bob").len(), stack.dms_to("carol").len()),
+        (2, 2),
+        "a refusal told within the hour isn't sent again"
+    );
+
     stack.every_turn(Turn::api_error(429, "You've hit your usage limit."));
     let mut dm = stack.mention("bob", "DMBOB", "l5", None);
     dm.conv_kind = ConvKind::Dm;
@@ -754,6 +771,15 @@ async fn a_usage_limit_or_refusal_names_whose_account_and_tells_only_the_request
         stack.dms_to("bob").len(),
         2,
         "in bob's own DM with the agent, the reply there is enough"
+    );
+    let (text, _, _) = stack
+        .answer(stack.mention("bob", "GENERAL", "l6", Some("l1")))
+        .await;
+    assert_eq!(text, USAGE_LIMIT_TEXT);
+    assert_eq!(
+        stack.dms_to("bob").len(),
+        2,
+        "a usage limit told within the hour isn't sent again"
     );
 
     assert!(
@@ -799,5 +825,56 @@ async fn a_login_refused_at_refresh_is_told_in_the_thread_and_left_to_the_relink
         "the relink notice tells bob, once, not the pipeline too"
     );
     assert!(stack.dms_to("alice").is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_member_whose_link_broke_is_asked_to_relink_and_never_runs_on_the_community_key() {
+    let stack = start(Duration::from_secs(86_400)).await;
+    stack
+        .command(ADMIN, &format!("admin api-key set {COMMUNITY_KEY}"))
+        .await;
+    let generation = current_generation(&stack, stack.bob).await;
+    assert!(
+        stack
+            .store()
+            .mark_claude_link_broken(stack.bob, generation, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+    );
+
+    let calls = stack.agents.calls().len();
+    for (conv_id, id, conv_kind) in [
+        ("GENERAL", "b1", ConvKind::Channel),
+        ("DMBOB", "b2", ConvKind::Dm),
+    ] {
+        let mut event = stack.mention("bob", conv_id, id, None);
+        event.conv_kind = conv_kind;
+        stack.handle(event).await;
+    }
+    assert!(stack.posts_since(calls).is_empty(), "nothing runs for bob");
+    assert!(
+        stack.fake.message_requests().await.is_empty(),
+        "no upstream request, on the community key or any other"
+    );
+    let told = stack.dms_to("bob");
+    assert_eq!(told.len(), 2, "{told:?}");
+    for text in &told {
+        assert_eq!(
+            text,
+            "helper runs on the Claude account of whoever asks it, and yours stopped working: \
+             Anthropic refused to renew the link. Send `login` to me here to link it again."
+        );
+    }
+
+    let (_, _, seen) = stack
+        .answer(stack.mention("carol", "GENERAL", "b3", None))
+        .await;
+    assert_eq!(
+        seen,
+        community(DEFAULT_MODEL),
+        "a member with no link still runs on the community key"
+    );
+    assert!(stack.dms_to("carol").is_empty());
     stack.stop().await;
 }

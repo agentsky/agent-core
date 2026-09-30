@@ -111,9 +111,11 @@ account's plan. Its bot reacts with `[runner] working_emoji` while the turn
 runs, and answers only in rooms it was added to. A member without a linked
 account runs on the community API key if a community admin set one, and
 otherwise gets a direct message from the manager bot saying how to link an
-account. When the account or key a turn ran on hits its usage limit or is
-refused, the thread is told whose it was, and the member who asked gets a
-direct message from the manager bot. Without `[sandbox]`, each agent reacts
+account; a member whose link stopped working is asked to link it again
+instead, and never runs on the community key. When the account or key a
+turn ran on hits its usage limit or is refused, the thread is told whose it
+was, and the member who asked gets a direct message from the manager bot,
+at most once an hour for each kind of failure. Without `[sandbox]`, each agent reacts
 with :eyes: to messages that mention it.
 Community admins are the member identities `[community] admins` lists, as
 `<surface>:<team>:<user>`. An admin sets the community API key with

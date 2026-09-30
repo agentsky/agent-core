@@ -6,11 +6,19 @@
 //! (see [`router`]). So when the account or key hits its usage limit or is
 //! refused, the thread is told whose it was, the requester's or the
 //! community's, and the requester, who is the one who can do something
-//! about it, is told in a direct message from the manager bot. The agent's
+//! about it, is told in a direct message from the manager bot, at most
+//! once per [`FAILURE_DM_INTERVAL`] for each kind of failure. The agent's
 //! owner is never told, unless they are the requester.
+
+use std::time::Duration;
 
 use core_types::CredentialRef;
 use runner::{ErrorKind, TurnOutcome};
+
+/// How long after the manager bot told a requester about one kind of
+/// failure, such as their own account's usage limit, it may tell them
+/// about that kind again. Every failed turn still tells its thread.
+pub const FAILURE_DM_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// What the thread is told when the requester's own Claude account has
 /// reached its usage limit.
@@ -66,6 +74,17 @@ impl CredentialFailure {
         }
     }
 
+    /// The kind of failure, and whose credential it was, that
+    /// [`FAILURE_DM_INTERVAL`] counts separately.
+    pub(super) fn notice_kind(self, credential: CredentialRef) -> &'static str {
+        match (self, credential) {
+            (Self::UsageLimit, CredentialRef::Member(_)) => "usage_limit/member",
+            (Self::Refused, CredentialRef::Member(_)) => "refused/member",
+            (Self::UsageLimit, CredentialRef::Community) => "usage_limit/community",
+            (Self::Refused, CredentialRef::Community) => "refused/community",
+        }
+    }
+
     /// What the requester is told privately about `agent`'s turn that ran
     /// on `credential`. It is sent by the manager bot, in their DM with it.
     pub(super) fn requester_text(self, credential: CredentialRef, agent: &str) -> String {
@@ -78,12 +97,12 @@ impl CredentialFailure {
                  your account again."
             }
             (Self::UsageLimit, CredentialRef::Community) => {
-                "you have no Claude account linked, so it ran on the community API key, which \
-                 has reached its usage limit. Send `login` to me here to link your own account."
+                "it ran on the community API key, which has reached its usage limit. Send \
+                 `login` to me here to link your own account."
             }
             (Self::Refused, CredentialRef::Community) => {
-                "you have no Claude account linked, so it ran on the community API key, which \
-                 was refused. Send `login` to me here to link your own account."
+                "it ran on the community API key, which was refused. Send `login` to me here to \
+                 link your own account."
             }
         };
         format!("{agent} couldn't answer your request: {why}")
@@ -152,7 +171,22 @@ mod tests {
                 failure.thread_text(CredentialRef::Community),
             ] {
                 assert!(!text.contains("owner"), "{text}");
+                assert!(!text.contains("no Claude account linked"), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn each_failure_and_credential_kind_is_rate_limited_on_its_own() {
+        let member = CredentialRef::Member(MemberId::new_v4());
+        let kinds: std::collections::HashSet<_> =
+            [CredentialFailure::UsageLimit, CredentialFailure::Refused]
+                .into_iter()
+                .flat_map(|failure| {
+                    [member, CredentialRef::Community]
+                        .map(|credential| failure.notice_kind(credential))
+                })
+                .collect();
+        assert_eq!(kinds.len(), 4);
     }
 }

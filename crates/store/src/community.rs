@@ -107,6 +107,23 @@ impl Store {
             .transpose()
     }
 
+    /// Whether the community API key is set, without reading or decrypting
+    /// it, or reading who changed it. Routing asks this for every turn, so
+    /// it depends on nothing but whether the key's column is empty.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails.
+    pub async fn community_api_key_set(&self) -> Result<bool> {
+        let set: Option<bool> = sqlx::query_scalar(
+            "SELECT api_key_enc IS NOT NULL FROM community_settings WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(set.unwrap_or(false))
+    }
+
     /// Whether the community API key is set, and who last changed it,
     /// without reading or decrypting the key.
     ///
@@ -315,6 +332,42 @@ mod tests {
             .await
             .unwrap();
         assert!(store.community_api_key_status().await.unwrap().set);
+    }
+
+    #[tokio::test]
+    async fn whether_a_key_is_set_is_read_without_the_audit_columns() {
+        let store = memory_store().await;
+        assert!(!store.community_api_key_set().await.unwrap());
+        store
+            .set_community_api_key(&SecretString::from(KEY), &member_key("root"), at(1_000))
+            .await
+            .unwrap();
+        assert!(store.community_api_key_set().await.unwrap());
+        sqlx::query(
+            "UPDATE community_settings SET api_key_changed_by = 'not a member key', \
+             api_key_changed_at = 9223372036854775807",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.community_api_key_status().await.unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
+        assert!(
+            store.community_api_key_set().await.unwrap(),
+            "corrupt audit columns don't hide the key from routing"
+        );
+        store
+            .clear_community_api_key(&member_key("root"), at(2_000))
+            .await
+            .unwrap();
+        assert!(!store.community_api_key_set().await.unwrap());
+        sqlx::query("DELETE FROM community_settings")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(!store.community_api_key_set().await.unwrap());
     }
 
     #[tokio::test]

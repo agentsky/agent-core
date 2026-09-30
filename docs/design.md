@@ -353,6 +353,7 @@ flowchart TD
     O -- yes --> OC["Owner credential,<br/>conversation's scope"]
     O -- no --> L{"Requester linked?"}
     L -- yes --> RQ["Requester credential,<br/>channel scope"]
+    L -- "broken" --> RL["Reply: link your account again"]
     L -- no --> K{"Community API key?"}
     K -- yes --> CK["Community key,<br/>channel scope"]
     K -- no --> LK["Reply: link your account"]
@@ -371,7 +372,8 @@ CLI run per message, so agent-core does not do it.
 A DM counts only for the agent whose bot received it, so another agent
 mentioned in someone's DM with a different bot never answers there. The
 owner's turns run only on the owner's credential: an owner without a linked
-account gets the link prompt, never the community key. Refusals (a paused
+account gets the link prompt, never the community key. Nor does anyone whose
+link broke: they are asked to link again, and nothing runs until they do. Refusals (a paused
 agent, a banned requester, the agent's deny rules, the hop cap) apply only to
 messages that pass the gate above, so an unaddressed message never draws a
 notice, and they come before the credential, so nobody is offered a link
@@ -711,6 +713,13 @@ erDiagram
     }
     COMMUNITY_SETTINGS {
         bytes api_key_enc
+        text api_key_changed_by
+        timestamp api_key_changed_at
+    }
+    FAILURE_NOTICE {
+        text requester
+        text kind
+        timestamp sent_at
     }
 ```
 

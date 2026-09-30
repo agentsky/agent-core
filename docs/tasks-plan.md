@@ -1921,7 +1921,9 @@ Deliverables:
   - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
     accepted only when `agent` is the agent that sent the message
     ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
-  - `member_for(MemberKey)`, `is_linked(member)`.
+  - `member_for(MemberKey)`, `link_state(member)` (unlinked, linked or
+    broken; T26 replaced `is_linked`,
+    [impl-notes](impl-notes.md#a-broken-link-asks-for-a-new-login-never-the-community-key)).
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
@@ -2246,6 +2248,10 @@ Deliverables:
   - A linked non-owner's turn runs on their own subscription.
   - An unlinked member's turn runs on the community key if one is configured.
   - Otherwise the member gets a link prompt.
+  - A member whose link is broken never runs on the community key: they get
+    a relink prompt, a private DM from the manager bot as for T13's relink
+    notice, and nothing runs
+    ([impl-notes](impl-notes.md#a-broken-link-asks-for-a-new-login-never-the-community-key)).
   - The owner's credential is used only for owner-requested turns.
 - `/agent admin api-key set <key>` and `/agent admin api-key clear` for
   community admins. A migration `…_community_settings.sql` adds a
@@ -2264,7 +2270,7 @@ Deliverables:
   owner, and name whose account hit the limit: the thread is told whether
   it was the requester's own account or the community key, and the
   requester alone also gets a DM from the manager bot, unless a relink
-  notice already tells them
+  notice already tells them, at most once an hour for each kind of failure
   ([impl-notes](impl-notes.md#whose-account-hit-the-limit-and-who-is-told)).
 - Public-side enforcement: a non-owner's turn runs on the conversation's own
   channel, group DM or DM volume, never the agent's `Private` volume. Add a

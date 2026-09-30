@@ -22,7 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use super::Turns;
-use super::billing::CredentialFailure;
+use super::billing::{CredentialFailure, FAILURE_DM_INTERVAL};
 use super::message;
 use super::view::StoreView;
 use crate::commands::Replies;
@@ -125,11 +125,15 @@ pub struct PipelineSettings {
 ///    limit or a refused login names whose account it was, the
 ///    requester's or the community key's, and the requester alone is also
 ///    told privately by the manager bot, unless the thread is their own DM
-///    with the agent; the agent's owner never is, unless they asked.
+///    with the agent or they were told about the same kind of failure
+///    within [`FAILURE_DM_INTERVAL`]; the agent's owner never is, unless
+///    they asked.
 /// 6. [`Decision::LinkPrompt`] sends the requester a DM from the manager
-///    bot saying how to link an account, when the agent's bot may post in
-///    the conversation; [`Decision::Refuse`] posts one line in the thread,
-///    and [`Decision::Ignore`] does nothing.
+///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
+///    one saying their link stopped working and how to link it again, when
+///    the agent's bot may post in the conversation; nothing runs for them.
+///    [`Decision::Refuse`] posts one line in the thread, and
+///    [`Decision::Ignore`] does nothing.
 ///
 /// Notices the pipeline posts on its own, such as refusals and failures
 /// before a turn reached the model, have no `message_refs` row.
@@ -552,7 +556,13 @@ impl Pipeline {
                 tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
                 Ok(())
             }
-            Decision::LinkPrompt { requester } => self.link_prompt(event, agent, &requester).await,
+            Decision::LinkPrompt { requester } => {
+                self.link_prompt(event, agent, &requester, link_text).await
+            }
+            Decision::RelinkPrompt { requester } => {
+                self.link_prompt(event, agent, &requester, relink_text)
+                    .await
+            }
             Decision::Refuse(reason) => self.refuse(event, agent, caps, reason).await,
             Decision::Run {
                 requester,
@@ -576,14 +586,16 @@ impl Pipeline {
         }
     }
 
-    /// Tells `requester` privately how to link an account, if `agent`'s bot
-    /// may post in `event`'s conversation: an agent that couldn't answer
-    /// there doesn't prompt either.
+    /// Tells `requester` privately how to link an account, with the text
+    /// `text` makes from the agent's name, if `agent`'s bot may post in
+    /// `event`'s conversation: an agent that couldn't answer there doesn't
+    /// prompt either.
     async fn link_prompt(
         &self,
         event: &InboundEvent,
         agent: AgentId,
         requester: &Requester,
+        text: fn(&str) -> String,
     ) -> Result<(), PipelineError> {
         let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
             return Ok(());
@@ -591,11 +603,7 @@ impl Pipeline {
         if !surface.can_post(&event.conv).await? {
             return Ok(());
         }
-        let name = self.agent_name(agent).await?;
-        let text = format!(
-            "{name} runs on the Claude account of whoever asks it. Link yours to use it: send \
-             `login` to me here."
-        );
+        let text = text(&self.agent_name(agent).await?);
         if let Err(err) = self.inner.replies.dm(&requester.key, &text).await {
             tracing::warn!(%agent, requester = %requester.key, error = %err, "couldn't send a link prompt");
         }
@@ -833,17 +841,38 @@ impl Pipeline {
     /// Tells `turn`'s requester privately, from the manager bot, that
     /// `agent`'s turn failed on their account or on the community key.
     /// A refused login whose link is already marked broken gets no message
-    /// here: the relink notice tells the member once.
+    /// here: the relink notice tells the member once. Nor does a failure of
+    /// a kind the requester was told about within [`FAILURE_DM_INTERVAL`].
     async fn tell_requester(&self, agent: AgentId, turn: &Run, failure: CredentialFailure) {
+        let store = &self.inner.store;
         if failure == CredentialFailure::Refused
             && let CredentialRef::Member(member) = turn.credential
         {
-            match self.inner.store.claude_link_status(member).await {
+            match store.claude_link_status(member).await {
                 Ok(Some(status)) if status.broken_at.is_some() => return,
                 Ok(_) => {}
                 Err(err) => {
                     tracing::warn!(%agent, %member, error = %err, "couldn't read a link's state; telling the requester anyway");
                 }
+            }
+        }
+        let kind = failure.notice_kind(turn.credential);
+        match store
+            .claim_failure_notice(
+                &turn.requester.key,
+                kind,
+                OffsetDateTime::now_utc(),
+                FAILURE_DM_INTERVAL,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(%agent, requester = %turn.requester.key, kind, "the requester was told about this failure recently");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't check when the requester was last told; telling them anyway");
             }
         }
         let name = self.agent_name(agent).await.unwrap_or_else(|err| {
@@ -900,6 +929,22 @@ impl Pipeline {
     }
 }
 
+/// The link prompt for an agent named `name`.
+fn link_text(name: &str) -> String {
+    format!(
+        "{name} runs on the Claude account of whoever asks it. Link yours to use it: send \
+         `login` to me here."
+    )
+}
+
+/// The prompt for an agent named `name` to a member whose link broke.
+fn relink_text(name: &str) -> String {
+    format!(
+        "{name} runs on the Claude account of whoever asks it, and yours stopped working: \
+         Anthropic refused to renew the link. Send `login` to me here to link it again."
+    )
+}
+
 /// A turn the router decided to run.
 struct Run {
     requester: Requester,
@@ -918,14 +963,20 @@ struct Prepared {
 
 /// The scope `turn` runs in, for an agent owned by `owner`: the agent's
 /// private one only for the owner's own turn, on the owner's side and
-/// their own credential; otherwise `event`'s conversation's own channel,
-/// group DM or DM scope. `None` for a decision that would put anyone
-/// else's turn, or a public-side turn, on the private side, or an
-/// owner-side turn anywhere else: such a turn must not run.
+/// their own credential, answering the owner's own message in a
+/// one-to-one DM; otherwise `event`'s conversation's own channel, group DM
+/// or DM scope. `None` for a decision that would put anyone else's turn, a
+/// turn on any other event (a channel message, another agent's hop), or a
+/// public-side turn on the private side, or an owner-side turn anywhere
+/// else: such a turn must not run.
 fn turn_scope(turn: &Run, owner: MemberId, event: &InboundEvent) -> Option<ScopeKey> {
     let owners_own = turn.requester.member == Some(owner)
         && turn.credential == CredentialRef::Member(owner)
-        && turn.side == Side::Owner;
+        && turn.side == Side::Owner
+        && event.is_dm()
+        && event.sender == turn.requester.key
+        && !event.sender_is_bot
+        && event.sender_bot_user.is_none();
     match turn.scope {
         ScopeKind::Private => owners_own.then_some(ScopeKey::Private),
         ScopeKind::Channel | ScopeKind::GroupDm | ScopeKind::Dm => (turn.side == Side::Public)
@@ -1202,7 +1253,8 @@ mod tests {
     use super::*;
 
     /// Whatever a decision says, only the owner's own turn, on the owner's
-    /// side and credential, resolves to the agent's private scope, and an
+    /// side and credential, answering the owner's own message in a
+    /// one-to-one DM, resolves to the agent's private scope, and an
     /// owner-side turn resolves nowhere else.
     #[test]
     fn a_non_owners_turn_never_resolves_to_the_private_scope() {
@@ -1213,7 +1265,10 @@ mod tests {
             team: "T1".into(),
             conversation: "C1".into(),
         };
+        let requester_key: MemberKey = "slack:T1:U1".parse().unwrap();
+        let someone_else: MemberKey = "slack:T1:U2".parse().unwrap();
         let mut checked = 0;
+        let mut private = 0;
         for requester in [Some(owner), Some(other), None] {
             for credential in [
                 CredentialRef::Member(owner),
@@ -1228,64 +1283,80 @@ mod tests {
                 ] {
                     for side in [Side::Owner, Side::Public] {
                         for conv_kind in [ConvKind::Dm, ConvKind::GroupDm, ConvKind::Channel] {
-                            let turn = Run {
-                                requester: Requester {
-                                    member: requester,
-                                    key: "slack:T1:U1".parse().unwrap(),
-                                },
-                                hop: Hop::ZERO,
-                                credential,
-                                scope,
-                                side,
-                            };
-                            let event = InboundEvent {
-                                event_id: "e".into(),
-                                binding: core_types::BindingId::new_v4(),
-                                sender: turn.requester.key.clone(),
-                                sender_is_bot: false,
-                                sender_bot_user: None,
-                                conv: conv.clone(),
-                                conv_kind,
-                                thread_root: None,
-                                message: MsgRef {
-                                    conv: conv.clone(),
-                                    id: "1.0".into(),
-                                },
-                                text: String::new(),
-                                mentions: Vec::new(),
-                                reply_to: None,
-                                files: Vec::new(),
-                                received_at: OffsetDateTime::UNIX_EPOCH,
-                            };
-                            let resolved = turn_scope(&turn, owner, &event);
-                            let owners_own = requester == Some(owner)
-                                && credential == CredentialRef::Member(owner)
-                                && side == Side::Owner
-                                && scope == ScopeKind::Private;
-                            assert_eq!(
-                                resolved == Some(ScopeKey::Private),
-                                owners_own,
-                                "{requester:?} {credential:?} {scope:?} {side:?} {conv_kind:?}"
-                            );
-                            if side == Side::Owner {
-                                assert!(resolved.is_none() || owners_own);
+                            for sender in [&requester_key, &someone_else] {
+                                for (sender_is_bot, bot_user) in
+                                    [(false, false), (true, false), (true, true), (false, true)]
+                                {
+                                    let turn = Run {
+                                        requester: Requester {
+                                            member: requester,
+                                            key: requester_key.clone(),
+                                        },
+                                        hop: Hop::ZERO,
+                                        credential,
+                                        scope,
+                                        side,
+                                    };
+                                    let event = InboundEvent {
+                                        event_id: "e".into(),
+                                        binding: core_types::BindingId::new_v4(),
+                                        sender: sender.clone(),
+                                        sender_is_bot,
+                                        sender_bot_user: bot_user.then(|| sender.user.clone()),
+                                        conv: conv.clone(),
+                                        conv_kind,
+                                        thread_root: None,
+                                        message: MsgRef {
+                                            conv: conv.clone(),
+                                            id: "1.0".into(),
+                                        },
+                                        text: String::new(),
+                                        mentions: Vec::new(),
+                                        reply_to: None,
+                                        files: Vec::new(),
+                                        received_at: OffsetDateTime::UNIX_EPOCH,
+                                    };
+                                    let resolved = turn_scope(&turn, owner, &event);
+                                    let owners_own = requester == Some(owner)
+                                        && credential == CredentialRef::Member(owner)
+                                        && side == Side::Owner
+                                        && scope == ScopeKind::Private
+                                        && conv_kind == ConvKind::Dm
+                                        && *sender == requester_key
+                                        && !sender_is_bot
+                                        && !bot_user;
+                                    let case = format!(
+                                        "{requester:?} {credential:?} {scope:?} {side:?} \
+                                         {conv_kind:?} {sender} bot={sender_is_bot}/{bot_user}"
+                                    );
+                                    assert_eq!(
+                                        resolved == Some(ScopeKey::Private),
+                                        owners_own,
+                                        "{case}"
+                                    );
+                                    if side == Side::Owner {
+                                        assert!(resolved.is_none() || owners_own, "{case}");
+                                    }
+                                    if let Some(resolved) = resolved
+                                        && !owners_own
+                                    {
+                                        assert_eq!(
+                                            resolved,
+                                            ScopeKey::for_conversation(conv_kind, conv.clone()),
+                                            "a public turn runs in the conversation's own scope: {case}"
+                                        );
+                                    }
+                                    private += usize::from(owners_own);
+                                    checked += 1;
+                                }
                             }
-                            if let Some(resolved) = resolved
-                                && !owners_own
-                            {
-                                assert_eq!(
-                                    resolved,
-                                    ScopeKey::for_conversation(conv_kind, conv.clone()),
-                                    "a public turn runs in the conversation's own scope"
-                                );
-                            }
-                            checked += 1;
                         }
                     }
                 }
             }
         }
-        assert_eq!(checked, 3 * 3 * 4 * 2 * 3);
+        assert_eq!(checked, 3 * 3 * 4 * 2 * 3 * 2 * 4);
+        assert_eq!(private, 1, "exactly one combination is the owner's own DM");
     }
 
     #[test]

@@ -5104,7 +5104,10 @@ inserted by the migration) with `api_key_enc`, sealed with
 them to admins. `StoreCommunityKey`, the proxy's `CommunityKey`, reads and
 opens the row on every request, with no cache, so a key set or cleared on
 one instance applies at once on every instance sharing the store. The
-router's view reads only whether the column is set, without opening it.
+router's view reads only whether the column is set
+(`community_api_key_set`), without opening it or reading who changed it,
+so a bad value in the audit columns breaks `me` for admins, not every
+turn's routing.
 The key reaches memory only in the proxy's request and in the `admin
 api-key set` command, both as `SecretString`; commands are logged by name,
 and a captured-log test at `trace` finds the key in neither the log nor
@@ -5166,6 +5169,21 @@ member once. A test refuses
 bob's refresh mid-thread and sees the thread told, the link broken and no
 message from the pipeline.
 
+The direct message is also rate-limited, since a credential that keeps
+failing without its link being marked broken (an upstream 401 on a token
+the refresh didn't reject, a usage limit that holds for hours) would
+otherwise message the requester on every turn. The thread is still told
+every time. The requester gets at most one message per
+`FAILURE_DM_INTERVAL` (an hour) for each kind of failure and whose
+credential it was: `usage_limit/member`, `refused/member`,
+`usage_limit/community` and `refused/community`. The last time is kept in
+a `failure_notices` table keyed by the requester's identity, since a
+community-key turn may have no member, and claimed with one conditional
+upsert before sending, so it holds across restarts and instances. A
+message that then fails to send isn't retried within the hour; the thread
+has the reply either way. If the claim itself fails, the requester is
+told anyway.
+
 ### The pipeline also refuses a private scope for anyone but the owner
 
 **Issue.** The router never gives a non-owner `ScopeKind::Private` (its
@@ -5176,12 +5194,16 @@ with the requester's own credential and the public side, on the agent's
 `Private` volume, where the owner's `shared/` is.
 
 **Solution.** `turn_scope` resolves the private scope only for the owner's
-own turn on the owner's side and credential, and the conversation's own
-scope only for a public-side turn; any other combination fails the turn
-before a session is looked up, logged as an error. A unit test walks every
-requester, credential, scope kind, side and conversation kind, and a
-pipeline test runs a non-owner's DM on its `Dm` scope with no private
-volume created.
+own turn on the owner's side and credential, answering the owner's own
+message in a one-to-one DM: the event is a DM, its sender is the
+requester's identity, and it isn't flagged as a bot's. A channel message
+or another agent's hop never gets it, whatever the decision says. The
+conversation's own scope is resolved only for a public-side turn; any
+other combination fails the turn before a session is looked up, logged as
+an error. A unit test walks every requester, credential, scope kind, side,
+conversation kind, sender and bot flag, and finds exactly one combination
+that resolves to the private scope. A pipeline test runs a non-owner's DM
+on its `Dm` scope with no private volume created.
 
 ### A plan read at a refresh counts from the next turn
 
@@ -5210,3 +5232,29 @@ ran each turn. A change of credential kind or model shows as a new pid,
 and a test with two linked members on one model shows the same pid for
 both turns, with each turn's own bearer token upstream: the warm process's
 placeholder follows the requester.
+
+### A broken link asks for a new login, never the community key
+
+**Issue.** The router's view counted a link as linked only when
+`claude_links.broken_at` was empty, and the router sent anyone not linked
+to the community key when one was set. So a member whose link broke was
+silently billed to the community key, on the default model, and a failure
+there told them they had no Claude account linked. The plan says only
+that an unlinked member runs on the community key.
+
+**Solution.** A member whose link broke is still a linked member, not an
+unlinked one: nothing runs for them on the community key, and they are
+asked to log in again. `RouterView::link_state` answers `Unlinked`, `Linked` or
+`Broken` in place of `is_linked`, and `route` returns
+`Decision::RelinkPrompt { requester }` for a broken link, the owner's
+included, whether or not a community key is set. The pipeline sends it
+through the same manager-bot DM as the link prompt and the relink notice
+(T13), saying the link stopped working and to send `login` again; nothing
+runs and the thread gets nothing. The community key is for a requester
+with no link at all, or no member. The requester's failure messages no
+longer say "you have no Claude account linked". Router tests, and the
+invariant grid with an owner and a member whose links may be broken, check
+that a broken link never runs, and a pipeline test sets the community key,
+marks bob's link broken, and sees bob's channel message and DM make no
+upstream request and each get the relink prompt, while carol, unlinked,
+still runs on the community key.

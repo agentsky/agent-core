@@ -1,11 +1,11 @@
 //! [`StoreView`]: the router's view of the world, loaded from the store
 //! for one event and one candidate agent.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use core_types::{AgentId, BindingId, InboundEvent, MemberId, MemberKey, MsgRef, Requester};
-use router::{AgentPolicy, AgentState, Attribution, ManagedBot, RouterView};
+use router::{AgentPolicy, AgentState, Attribution, LinkState, ManagedBot, RouterView};
 use store::{MessageRef, Store, StoreError};
 use tokio::time::Instant;
 
@@ -47,8 +47,8 @@ async fn attribution(
 /// bots included), whose binding received the event, the attribution of
 /// the event's message and whether its reply-to message is the agent's,
 /// the members of the sender and of an attributed requester, whether the
-/// owner and those members are linked, and whether a community admin has
-/// set the community API key. Until T27, `policy` answers
+/// owner and those members have a link and whether it broke, and whether a
+/// community admin has set the community API key. Until T27, `policy` answers
 /// [`AgentPolicy::default`] and `is_banned` `Some(false)`.
 ///
 /// The attribution is waited for only when the router reads it: another
@@ -63,7 +63,7 @@ pub(crate) struct StoreView {
     attribution: Option<(MsgRef, Attribution)>,
     replied: Option<(MsgRef, AgentId)>,
     members: HashMap<MemberKey, MemberId>,
-    linked: HashSet<MemberId>,
+    links: HashMap<MemberId, LinkState>,
     community_key: bool,
 }
 
@@ -136,7 +136,7 @@ impl StoreView {
             view.replied = Some((reply_to.clone(), poster));
         }
         view.member(store, &event.sender).await?;
-        view.community_key = store.community_api_key_status().await?.set;
+        view.community_key = store.community_api_key_set().await?;
         Ok(view)
     }
 
@@ -149,16 +149,14 @@ impl StoreView {
         Ok(())
     }
 
-    /// Records whether `member` has a link turns can run on: one that
-    /// isn't broken.
+    /// Records whether `member` has a link, and whether it broke.
     async fn link(&mut self, store: &Store, member: MemberId) -> Result<(), StoreError> {
-        if store
-            .claude_link_status(member)
-            .await?
-            .is_some_and(|status| status.broken_at.is_none())
-        {
-            self.linked.insert(member);
-        }
+        let state = match store.claude_link_status(member).await? {
+            None => LinkState::Unlinked,
+            Some(status) if status.broken_at.is_some() => LinkState::Broken,
+            Some(_) => LinkState::Linked,
+        };
+        self.links.insert(member, state);
         Ok(())
     }
 }
@@ -185,8 +183,11 @@ impl RouterView for StoreView {
         self.members.get(key).copied()
     }
 
-    fn is_linked(&self, member: MemberId) -> bool {
-        self.linked.contains(&member)
+    fn link_state(&self, member: MemberId) -> LinkState {
+        self.links
+            .get(&member)
+            .copied()
+            .unwrap_or(LinkState::Unlinked)
     }
 
     fn community_key_configured(&self) -> bool {
