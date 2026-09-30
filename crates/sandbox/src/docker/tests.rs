@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use bollard::models::EventActor;
 use core_types::{AgentId, ScopeKey};
+use tokio::io::AsyncReadExt;
 
 use super::*;
 use crate::test_util::{awkward_channel, volume};
@@ -434,4 +435,130 @@ async fn a_docker_sandbox_validates_its_inputs() {
 fn events_start_from_the_time_they_are_asked_for() {
     let at = std::time::UNIX_EPOCH + Duration::new(1_790_000_000, 5);
     assert_eq!(since(at), "1790000000.000000005");
+}
+
+#[test]
+fn container_config_validates_the_configuration() {
+    let mut config = SandboxConfig::new("unused");
+    config.network = "host".into();
+    assert!(matches!(
+        container_config(&config, Path::new(DATA), &spec_for(ScopeKey::Private)),
+        Err(SandboxError::Config(_))
+    ));
+}
+
+/// A Docker daemon that answers every request with `200 OK` and `body`,
+/// then closes the connection.
+async fn fake_docker(body: String) -> Docker {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Docker::connect_with_http(
+        &format!("http://{address}"),
+        5,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap()
+}
+
+async fn events_from(body: String) -> Vec<Result<ContainerEvent>> {
+    let docker = fake_docker(body).await;
+    let store = crate::test_util::memory_store().await;
+    let sandbox = DockerSandbox::new(docker, store, DATA, SandboxConfig::new("img")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), sandbox.events().collect())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_event_stream_that_ends_ends_with_events_missed() {
+    let session = SessionId::new_v4();
+    let die = |action: &str| {
+        serde_json::json!({
+            "Type": "container",
+            "Action": action,
+            "Actor": {
+                "ID": "c1",
+                "Attributes": {"agentd.instance": "agentd", "agentd.session": session.to_string()},
+            },
+        })
+    };
+    let body = format!("{}\n{}\n", die("start"), die("die"));
+    let events = events_from(body).await;
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0].as_ref().unwrap(),
+        &ContainerEvent::Died {
+            container: ContainerId("c1".into()),
+            session: Some(session),
+        }
+    );
+    assert!(matches!(events[1], Err(SandboxError::EventsMissed)));
+
+    let events = events_from(String::new()).await;
+    assert!(
+        matches!(events.as_slice(), [Err(SandboxError::EventsMissed)]),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_event_stream_ends_after_its_first_error() {
+    let events = events_from("not json\n{}\n".into()).await;
+    assert!(
+        matches!(events.as_slice(), [Err(SandboxError::EventsMissed)]),
+        "{events:?}"
+    );
+}
+
+fn child_waiting_for(pid: watch::Receiver<Option<u32>>) -> DockerChild {
+    DockerChild {
+        docker: Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+            .unwrap(),
+        exec_id: "e1".into(),
+        container: "c1".into(),
+        user: "1:1".into(),
+        pid,
+        pump: None,
+    }
+}
+
+#[tokio::test]
+async fn kill_without_a_pid_is_an_error() {
+    let (sender, pid) = watch::channel(None);
+    let started = tokio::time::Instant::now();
+    let err = child_waiting_for(pid).kill().await.unwrap_err();
+    assert!(started.elapsed() >= PID_WAIT);
+    assert!(
+        matches!(err, SandboxError::Docker { op: "kill", .. }),
+        "{err:?}"
+    );
+    drop(sender);
+
+    let (sender, pid) = watch::channel(None);
+    drop(sender);
+    let err = child_waiting_for(pid).kill().await.unwrap_err();
+    assert!(
+        matches!(err, SandboxError::Docker { op: "kill", .. }),
+        "{err:?}"
+    );
 }

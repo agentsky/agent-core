@@ -6,9 +6,8 @@
 //!
 //! 1. [`ensure_volume`](Sandbox::ensure_volume) makes the host directory for
 //!    an `(agent, scope)` pair and records it in the store's `volumes` table.
-//! 2. [`start`](Sandbox::start) prepares the session's directories (see
-//!    [`prepare_session_dirs`](Sandbox::prepare_session_dirs)) and starts a
-//!    container from a [`SessionSpec`].
+//! 2. [`start`](Sandbox::start) prepares the session's directories and
+//!    starts a container from a [`SessionSpec`].
 //! 3. [`exec`](Sandbox::exec) runs a process in it with piped stdin and
 //!    stdout, at the paths [`Container::paths`] gives.
 //! 4. [`stop`](Sandbox::stop) ends it. [`events`](Sandbox::events) reports
@@ -44,7 +43,10 @@ mod docker;
 mod layout;
 mod process;
 
-pub use config::{ConfigError, DEFAULT_CLEANUP_PERIOD_DAYS, DEFAULT_SANDBOX_UID, SandboxConfig};
+pub use config::{
+    ConfigError, DEFAULT_CLEANUP_PERIOD_DAYS, DEFAULT_SANDBOX_UID, MAX_STOP_TIMEOUT_SECS,
+    SandboxConfig,
+};
 pub use docker::{
     CONTAINER_PERSONA_DIR, CONTAINER_VOLUME_DIR, DockerSandbox, LABEL_AGENT, LABEL_INSTANCE,
     LABEL_SCOPE, LABEL_SESSION, container_config,
@@ -95,8 +97,9 @@ pub enum SandboxError {
     /// The container has no address on the sandbox network.
     #[error("the container has no address on the sandbox network")]
     NoAddress,
-    /// The event stream broke or fell behind, so deaths may have been
-    /// missed. Compare [`Sandbox::list_managed`] with what is running.
+    /// The event stream broke, fell behind or ended, so deaths may have
+    /// been missed. Subscribe again, and compare [`Sandbox::list_managed`]
+    /// with what is running.
     #[error("container events may have been missed")]
     EventsMissed,
 }
@@ -348,7 +351,10 @@ impl ChildHandle {
     ///
     /// # Errors
     ///
-    /// [`SandboxError::Docker`] if the kill can't be sent.
+    /// [`SandboxError::Docker`] if the kill can't be sent, including when
+    /// a Docker sandbox hasn't learned the process's pid within two
+    /// seconds. Nothing was signalled then, so [`wait`](Self::wait) may
+    /// not return: stop the container instead.
     pub async fn kill(&mut self) -> Result<()> {
         match &mut self.0 {
             ChildInner::Process(child) => child.kill().await,
@@ -370,22 +376,18 @@ pub trait Sandbox: Send + Sync {
     /// [`SandboxError::Io`] or [`SandboxError::Store`].
     async fn ensure_volume(&self, key: &VolumeKey) -> Result<VolumeRef>;
 
-    /// Creates `sessions/<session>/` with `work/`, `claude/`, `home/` and
-    /// `tmp/`, and writes `claude/settings.json` with `cleanupPeriodDays`.
-    /// Returns the session directory. [`start`](Self::start) does this too;
-    /// call it directly to put files there before the session starts.
-    ///
-    /// It is idempotent. An entry the agent replaced with a symlink or a
-    /// file is replaced with a directory again, and `settings.json` is
-    /// rewritten every time.
-    ///
-    /// # Errors
-    ///
-    /// [`SandboxError::Io`].
-    async fn prepare_session_dirs(&self, volume: &VolumeRef, session: SessionId)
-    -> Result<PathBuf>;
-
     /// Prepares the session's directories and starts its container.
+    ///
+    /// It creates `sessions/<session>/` with `work/`, `claude/`, `home/`
+    /// and `tmp/`, and writes `claude/settings.json` with
+    /// `cleanupPeriodDays`. An entry the agent replaced with a symlink or a
+    /// file is replaced with a directory again, and `settings.json` is
+    /// rewritten every time, so earlier runs of the agent can't change
+    /// either.
+    ///
+    /// The session must have no running container: that repair is safe
+    /// only while nothing in the session directory runs. Stop the old
+    /// container first.
     ///
     /// # Errors
     ///
@@ -395,7 +397,10 @@ pub trait Sandbox: Send + Sync {
 
     /// Runs `argv` in the container, in [`SessionPaths::work`], with
     /// `env` added to the container's environment. `env` may hold
-    /// credentials; it is never logged or put in an error.
+    /// credentials. This crate never logs it or puts it in an error, but
+    /// bollard logs every Docker request body, this one included, at debug
+    /// level under the `bollard` target: a log subscriber must cap that
+    /// target at `info`, as agentd's does.
     ///
     /// # Errors
     ///
@@ -433,8 +438,12 @@ pub trait Sandbox: Send + Sync {
     /// [`SandboxError::Docker`].
     async fn list_managed(&self) -> Result<Vec<ManagedContainer>>;
 
-    /// A stream of [`ContainerEvent`]s, from now on. An `Err` item means
-    /// events may have been missed; a Docker stream ends after one.
+    /// A stream of [`ContainerEvent`]s, from now on.
+    ///
+    /// It never ends without an `Err` item, and ends after its first one.
+    /// An `Err` means events may have been missed, including because the
+    /// stream ended: subscribe again, and compare
+    /// [`list_managed`](Self::list_managed) with what is running.
     fn events(&self) -> BoxStream<'static, Result<ContainerEvent>>;
 
     /// Stops every container [`list_managed`](Self::list_managed) finds.

@@ -2161,8 +2161,13 @@ first line from stdout, and `ChildHandle::kill` runs
 `sh -c 'kill -s KILL "$1"'` in the container as the same user. The image
 needs `/bin/sh` (Debian has it). Only the process is killed; processes it
 started are reparented to the container's init and end when the container
-stops. `ProcessSandbox` kills the child's whole process group instead,
-through the `kill` command, since a direct `kill(2)` would need `unsafe`.
+stops. If the pid line hasn't arrived within 2 seconds, `kill` returns an
+error instead of `Ok`: nothing was signalled, so `wait` could hang, and the
+caller must stop the container. `ProcessSandbox` kills the child's whole
+process group instead, through the `kill` command, since a direct
+`kill(2)` would need `unsafe`; it runs the command with `tokio::process`,
+and from `Drop`, which can't wait, in a spawned task (or blocking, off a
+runtime).
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -2175,9 +2180,14 @@ writable in the container.
 `uid:gid` with `lchown` when their owner differs. That works when agentd
 runs as root or as the sandbox user itself, and fails with an error naming
 the cause otherwise. T16's agentd image should therefore run as uid 10001
-(the plan's T16 says so). `volumes/` is `0700` and stays agentd's, and so
-does each `sessions/<id>/`: the agent can write inside `work/` and the
-others but can't rename or replace them.
+(the plan's T16 says so).
+
+That makes agentd and the agent the same user, so the agent owns its
+`sessions/<id>/` too and can rename, replace or remove `work/`, `claude/`
+and the rest. What it can't reach is everything above its mounts:
+`volumes/` (`0700`), the volume directory and its `sessions/` are mounted
+into no sandbox. Host-side code therefore treats everything inside a
+session directory as hostile (next entry).
 
 The Docker tests can't use 10001: on the CI runner the test process is not
 root, so it can't give directories away. They run the sandbox as the test
@@ -2196,13 +2206,26 @@ root) would write through it.
 agent-writable tree. Before each start, each of `work/`, `claude/`,
 `home/` and `tmp/` that isn't a real directory (checked with
 `symlink_metadata`) is removed and created again, as is `claude/skills`
-when there are skills to mount there. `settings.json` is written to a new
-file (`create_new`, so `O_EXCL`, which doesn't follow a symlink) and renamed
-over the old one, which replaces a symlink instead of following it; a
-directory in its place is removed. It is rewritten on every start, so an
-agent can't lower `cleanupPeriodDays` and lose its transcripts. Ownership
-changes use `lchown`. The runner never runs two containers of one session,
-so nothing in the container can race these steps.
+when there are skills to mount there. It is rewritten on every start, so
+an agent can't lower `cleanupPeriodDays` and lose its transcripts.
+Ownership changes use `lchown`.
+
+The plan made this step a public `prepare_session_dirs` on the trait. Run
+while the session's container was up, the agent could swap `claude` for a
+symlink between its repair and the write, and agentd would write, and
+give away, a file wherever the symlink pointed. So the step is
+crate-private and runs only in `start`, before the container is created;
+`start`'s rustdoc says the session must have no running container, and the
+runner never runs two containers of one session.
+
+`settings.json` doesn't rely on that. std has no `openat` (`std::fs::Dir`
+is unstable), so the sandbox crate adds `rustix`, whose `openat` and
+`renameat` are safe functions. `claude/` is opened with `O_NOFOLLOW |
+O_DIRECTORY`, its owner checked on the handle, and the new file is created
+relative to that handle with `O_EXCL | O_NOFOLLOW`, given away with
+`fchown`, and renamed over `settings.json` within the same directory,
+which replaces a symlink instead of following it. A directory in its place
+is renamed aside to a random name first, then removed.
 
 ### Several agentd, or test runs, on one Docker host
 
@@ -2263,6 +2286,12 @@ refuses a client version it doesn't know.
 **Solution.** `DockerSandbox::connect` calls `negotiate_version`, which
 drops to the daemon's version. bollard's 2-minute request timeout covers
 only the response headers, so long `exec` and event streams aren't cut.
+A stop request's headers, though, come only after the container stopped,
+up to `stop_timeout_secs` later, and a stop that timed out would leave the
+container stopping and not removed. `stop_timeout_secs` is therefore at
+most 60, not the 300 first allowed. That grace applies only to the init
+and its `sleep`, the processes SIGTERM reaches; processes started with
+`exec` are killed without one when the container stops.
 
 ### No curl in `debian:stable-slim`
 
@@ -2271,9 +2300,14 @@ only the response headers, so long `exec` and event streams aren't cut.
 
 **Solution.** The test opens a TCP connection with bash's `/dev/tcp`, by
 name (`example.com:443`) and by address (`1.1.1.1:443`), under `timeout`.
-As a control, the same probe must succeed from a container on Docker's
-default `bridge` network, so the test can't pass because the probe itself
-is broken.
+As a control, the same probe must succeed from a container on a network
+the test creates without `internal`, so the test can't pass because the
+probe itself is broken. The control used to run on Docker's `bridge`
+network, but `[sandbox] network` now refuses `bridge`, along with `host`,
+`none`, `default` and anything with a `:` (`container:<id>`): those are
+Docker network modes, not the internal sandbox network, and `validate`
+had only checked that the name wasn't empty. `container_config`, which is
+public, validates the configuration too.
 
 ### A `ChildStdin` closes only when dropped
 
@@ -2293,9 +2327,32 @@ first poll would be missed, and the runner would keep a mapping for a dead
 container's IP.
 
 **Solution.** `DockerSandbox::events` passes `since` with the time of the
-call, and Docker replays the buffered events from then. An error on the
-stream ends it after one `EventsMissed` item, so the runner re-subscribes
-and compares `list_managed` with what it holds.
+call, and Docker replays the buffered events from then. The stream ends
+only after one `EventsMissed` item, so the runner re-subscribes and
+compares `list_managed` with what it holds. That item comes on an error,
+and also when Docker ends the stream cleanly, as a daemon restart does:
+that used to end the stream with no item, which the runner could take for
+a quiet stream and never re-subscribe. `ProcessSandbox` keeps the same
+contract: it ends after `EventsMissed` when it lags or its sender is gone.
+
+### bollard logs request bodies at debug level
+
+**Issue.** bollard 0.21 logs every request body with `log::debug!`
+(`serialize_payload`, which `create_exec` uses), and agentd forwards
+`log` records to `tracing`. An `exec` body holds the process's
+environment: the placeholder and the agentctl token. With
+`server.log_filter` at `debug` or `trace`, both would be logged. A
+`bollard=info` directive appended to the operator's filter isn't enough:
+a more specific one such as `bollard::docker=trace`, or a span filter
+such as `[turn]=trace`, outranks it.
+
+**Solution.** `telemetry::subscriber` adds a separate `Targets` filter,
+layered next to the operator's `EnvFilter`, that caps `bollard` at `info`
+whatever that filter enables; a test feeds `log` records with target
+`bollard::docker` through the bridge under filters from `trace` to
+`bollard::docker=trace` and finds none. `Sandbox::exec`'s rustdoc says the
+environment is kept out of logs only with that cap, and the plan's T23
+says any other subscriber setup must keep it.
 
 ## T22: router
 

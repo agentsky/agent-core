@@ -32,6 +32,9 @@ pub struct SandboxConfig {
     /// The Docker network sandboxes attach to, and the only one. It is
     /// `internal`, so it has no route out. This is Docker's name for it:
     /// Compose prefixes the project name unless the network sets `name:`.
+    /// Docker's own modes are refused: `host`, `none`, `default` and
+    /// `bridge` (which has a route out), and anything with a `:`, such as
+    /// `container:<id>`.
     #[serde(default = "default_network")]
     pub network: String,
     /// agentd's data directory as the Docker daemon sees it, when agentd
@@ -59,7 +62,11 @@ pub struct SandboxConfig {
     /// memory limit.
     #[serde(default = "default_tmp_size_mb")]
     pub tmp_size_mb: u64,
-    /// How long `stop` waits after SIGTERM before killing, in seconds.
+    /// How long `stop` waits, in seconds, after sending SIGTERM to the
+    /// container's init before killing the container, at most
+    /// [`MAX_STOP_TIMEOUT_SECS`]. Only the init and its idle command get
+    /// SIGTERM; processes started with `exec` get no grace period and are
+    /// killed when the container stops.
     #[serde(default = "default_stop_timeout_secs")]
     pub stop_timeout_secs: u32,
     /// `cleanupPeriodDays` in each session's `settings.json`.
@@ -120,6 +127,14 @@ pub struct ConfigError {
     pub message: &'static str,
 }
 
+/// The largest [`SandboxConfig::stop_timeout_secs`]. A stop request waits
+/// that long before Docker answers, and bollard gives up on a request after
+/// 120 seconds, which would leave the container stopping and not removed.
+pub const MAX_STOP_TIMEOUT_SECS: u32 = 60;
+
+/// Network names that select a Docker network mode instead of a network.
+const RESERVED_NETWORKS: [&str; 4] = ["host", "none", "default", "bridge"];
+
 const MAX_MEMORY_MB: u64 = 1 << 20;
 const MAX_CPUS: f64 = 1024.0;
 
@@ -155,6 +170,16 @@ impl SandboxConfig {
         if self.network.trim().is_empty() {
             return fail("network", "must not be empty");
         }
+        if self.network.contains(':')
+            || RESERVED_NETWORKS
+                .iter()
+                .any(|mode| self.network.eq_ignore_ascii_case(mode))
+        {
+            return fail(
+                "network",
+                "must name the internal sandbox network, not host, none, default, bridge or a `:` mode",
+            );
+        }
         if let Some(dir) = &self.host_data_dir
             && !is_plain_absolute(dir)
         {
@@ -178,8 +203,8 @@ impl SandboxConfig {
         if !(1..=MAX_MEMORY_MB).contains(&self.tmp_size_mb) {
             return fail("tmp_size_mb", "must be between 1 and 1048576");
         }
-        if self.stop_timeout_secs > 300 {
-            return fail("stop_timeout_secs", "must be at most 300");
+        if self.stop_timeout_secs > MAX_STOP_TIMEOUT_SECS {
+            return fail("stop_timeout_secs", "must be at most 60");
         }
         if self.cleanup_period_days == 0 {
             return fail("cleanup_period_days", "must be at least 1");
@@ -267,9 +292,14 @@ mod tests {
     #[test]
     fn out_of_range_values_name_their_key() {
         type Change = fn(&mut SandboxConfig);
-        let cases: [(&str, Change); 16] = [
+        let cases: [(&str, Change); 21] = [
             ("image", |c| c.image = " ".into()),
             ("network", |c| c.network = String::new()),
+            ("network", |c| c.network = "host".into()),
+            ("network", |c| c.network = "none".into()),
+            ("network", |c| c.network = "default".into()),
+            ("network", |c| c.network = "Bridge".into()),
+            ("network", |c| c.network = "container:abc".into()),
             ("host_data_dir", |c| c.host_data_dir = Some("rel".into())),
             ("host_data_dir", |c| {
                 c.host_data_dir = Some("/a/../b".into())
@@ -282,7 +312,9 @@ mod tests {
             ("cpus", |c| c.cpus = f64::NAN),
             ("pids_limit", |c| c.pids_limit = 0),
             ("tmp_size_mb", |c| c.tmp_size_mb = 0),
-            ("stop_timeout_secs", |c| c.stop_timeout_secs = 301),
+            ("stop_timeout_secs", |c| {
+                c.stop_timeout_secs = MAX_STOP_TIMEOUT_SECS + 1
+            }),
             ("cleanup_period_days", |c| c.cleanup_period_days = 0),
             ("instance", |c| c.instance = "-x".into()),
             ("instance", |c| c.instance = "a:b".into()),
@@ -297,6 +329,9 @@ mod tests {
         config.instance = "x".repeat(64);
         assert_eq!(config.validate().unwrap_err().key, "instance");
         config.instance = "x".repeat(63);
+        config.validate().unwrap();
+        config.stop_timeout_secs = MAX_STOP_TIMEOUT_SECS;
+        config.network = "sandbox-bridge".into();
         config.validate().unwrap();
     }
 
