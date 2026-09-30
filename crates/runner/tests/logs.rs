@@ -1,56 +1,14 @@
 mod common;
 
-use std::io::Write;
-use std::sync::{Arc, Mutex, PoisonError};
-
 use common::{Harness, PLACEHOLDER};
 use runner::{SessionStart, TurnOutcome};
-use testkit::Turn;
-use tracing_subscriber::fmt::MakeWriter;
+use testkit::{Logs, Turn};
 
 const SECRET: &str = "sk-ant-api03-FAKE-SECRET-0123456789";
 
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
-    }
-}
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'w> MakeWriter<'w> for Captured {
-    type Writer = Self;
-
-    fn make_writer(&'w self) -> Self::Writer {
-        self.clone()
-    }
-}
-
 #[tokio::test]
 async fn a_secret_in_messages_and_tool_output_leaves_no_trace_in_logs() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
-
+    let logs = Logs::global();
     let h = Harness::new(&[
         Turn::reply(format!("The key you asked for is {SECRET}."))
             .with_command(["/bin/echo", SECRET])
@@ -90,16 +48,14 @@ async fn a_secret_in_messages_and_tool_output_leaves_no_trace_in_logs() {
         "the secret went through the turn"
     );
 
-    let logs = captured.text();
-    assert!(logs.contains("claude turn ended"), "{logs}");
-    assert!(logs.contains("started claude"), "{logs}");
-    assert!(
-        logs.contains("skipping a stdout line that isn't JSON"),
-        "{logs}"
-    );
-    assert!(logs.contains(&h.container.session().to_string()), "{logs}");
+    let logged = logs.snapshot();
+    logged
+        .assert_has("claude turn ended")
+        .assert_has("started claude")
+        .assert_has("skipping a stdout line that isn't JSON")
+        .assert_has(&h.container.session().to_string());
     for needle in [SECRET, PLACEHOLDER, "ctl-token-for-test"] {
-        assert!(!logs.contains(needle), "{needle} reached the logs:\n{logs}");
+        logged.assert_lacks(needle);
     }
     for debug in [
         format!("{outcome:?}"),

@@ -14,6 +14,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
 use surface_slack::{BindingRef, SlackClient, SlackEvent, SlackInbound, SlashCommand};
+use testkit::Logs;
 use time::OffsetDateTime;
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -27,7 +28,6 @@ use super::slack_tokens::{
 use super::*;
 use crate::slack::Inbound;
 use crate::slack::manager::{ManagerIdentity, SlackManager};
-use crate::telemetry::tests::Captured;
 use crate::telemetry::{LogFormat, subscriber};
 
 const TEAM: &str = "T0TEAM001";
@@ -262,8 +262,8 @@ async fn mount_rotation(
         .await;
 }
 
-fn capture_logs() -> (Captured, tracing::subscriber::DefaultGuard) {
-    let captured = Captured::default();
+fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
+    let captured = Logs::default();
     let logs = subscriber(
         LogFormat::Json,
         tracing_subscriber::EnvFilter::new("trace"),
@@ -325,7 +325,7 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
     let rotations = h.calls("tooling.tokens.rotate").await;
     assert!(rotations[0].headers.get("authorization").is_none());
 
-    let text = logs.text();
+    let text = logs.snapshot();
     assert!(
         text.contains("registered a Slack configuration token"),
         "{text}"
@@ -370,7 +370,7 @@ async fn a_refused_refresh_token_stores_nothing_and_says_so() {
         "{replies:?}"
     );
     assert_eq!(h.stored(alice).await, None);
-    assert!(!logs.text().contains("SECRET"));
+    assert!(!logs.snapshot().contains("SECRET"));
 }
 
 #[tokio::test]
@@ -685,7 +685,7 @@ async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
         RotationPass::default()
     );
     assert_eq!(h.posts().await.len(), 1);
-    assert!(!logs.text().contains("SECRET"));
+    assert!(!logs.snapshot().contains("SECRET"));
 }
 
 #[tokio::test]
@@ -1379,7 +1379,7 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     );
     assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
     assert_eq!(h.stored(alice).await, None);
-    assert!(!logs.text().contains("SECRET"));
+    assert!(!logs.snapshot().contains("SECRET"));
     h.store.close().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
