@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use surface_slack::normalize::{self, Context};
 use surface_slack::surface::CAPS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
+use testkit::Held;
 use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -328,25 +329,21 @@ async fn a_new_managed_bot_waits_out_a_failed_refresh() {
 #[tokio::test]
 async fn a_managed_bot_set_during_a_refresh_leaves_the_result_stale() {
     let (server, surface) = setup().await;
-    mount(
-        &server,
-        "users.list",
-        members_with_bot().set_delay(Duration::from_millis(200)),
-    )
-    .await;
+    let (held, mut hold) = Held::new(members_with_bot());
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .respond_with(held)
+        .mount(&server)
+        .await;
     let refreshing = tokio::spawn({
         let surface = surface.clone();
         async move { surface.refresh_members().await.map(drop) }
     });
-    for _ in 0..100 {
-        if users_list_calls(&server).await == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    hold.arrived().await;
     surface
         .directory()
         .set_managed_bots([UserId::from("U0NEWBOT1")]);
+    hold.release();
     refreshing.await.unwrap().unwrap();
     surface.refresh_members().await.unwrap();
     assert_eq!(users_list_calls(&server).await, 2);

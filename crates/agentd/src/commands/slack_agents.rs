@@ -25,7 +25,6 @@ impl Commands {
         origin: &Origin,
     ) -> Result<String, Failure> {
         let Some(agents) = self
-            .inner
             .slack_agents
             .as_ref()
             .filter(|agents| *agents.team() == key.team)
@@ -121,7 +120,7 @@ impl Commands {
         {
             return None;
         }
-        let Some(agents) = &self.inner.slack_agents else {
+        let Some(agents) = &self.slack_agents else {
             return Some(format!(
                 "Deleted `{name}`. Delete its Slack app yourself at {APPS_PAGE}."
             ));

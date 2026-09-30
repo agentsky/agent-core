@@ -16,6 +16,7 @@ use crate::commands::{Commands, ManagerBot, Replies};
 use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
 use crate::ctl::{Ctl, CtlSettings, SurfaceLookup};
 use crate::pipeline::StoreSurfaces;
+use crate::skills::{Git, Skills};
 use crate::slack::agents::{AgentAppSettings, SlackAgents};
 use crate::slack::bots::SlackBots;
 use crate::slack::manager::SlackManager;
@@ -35,6 +36,7 @@ pub struct App {
     registry: Registry,
     auth: Arc<Auth>,
     commands: Commands,
+    skills: Skills,
     rocketchat: Option<RocketChatManager>,
     slack: Option<SlackManager>,
     slack_agents: Option<SlackAgents>,
@@ -63,7 +65,8 @@ pub struct RocketChatManager {
 impl App {
     /// An `App` over an already open `store`, with the Slack manager app
     /// `slack` if agentd serves Slack (see [`SlackManager::from_config`]).
-    /// Agents' bots act through [`StoreSurfaces`], over their bindings.
+    /// Agents' bots act through [`StoreSurfaces`], over their bindings, and
+    /// skills are cloned with the system's `git`.
     ///
     /// # Errors
     ///
@@ -133,13 +136,17 @@ impl App {
         let agents = rocketchat
             .as_ref()
             .map(|(manager, _)| manager.agents.clone());
+        let git = Git::new(config.egress_policy().context("[proxy]")?);
+        let skills = Skills::new(store.clone(), config.store.data_dir.clone(), git);
         let mut commands = Commands::new(
             store.clone(),
             Arc::clone(&auth),
             replies,
             agents,
             slack.clone(),
-        );
+            skills.clone(),
+        )
+        .with_admins(config.community.admins.iter().cloned());
         if let Some(slack_agents) = &slack_agents {
             commands = commands.with_slack_agents(slack_agents.clone());
         }
@@ -151,6 +158,7 @@ impl App {
             registry: Registry::new(),
             auth,
             commands,
+            skills,
             rocketchat: rocketchat.map(|(manager, _)| manager),
             slack,
             slack_agents,
@@ -160,12 +168,13 @@ impl App {
     /// Opens the store at `store.url` with the master key, running pending
     /// migrations, asks Slack who the manager app is if agentd serves Slack,
     /// builds the `App`, and deletes every agentctl token, scope lock and
-    /// staged attachment left from before (see [`Ctl::purge`]).
+    /// staged attachment left from before (see [`Ctl::purge`]), and skill
+    /// work left from before (see [`Skills::purge`]).
     ///
     /// # Errors
     ///
     /// If the store can't be opened or migrated, Slack can't tell who the
-    /// manager app is, or the purge fails.
+    /// manager app is, or a purge fails.
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let store = open_store(&config).await?;
         let slack = SlackManager::from_config(&config).await?;
@@ -180,6 +189,10 @@ impl App {
             locks = purged.locks,
             "deleted agentctl tokens and scope locks from before the restart"
         );
+        app.skills
+            .purge()
+            .await
+            .context("cleaning up skill work from before the restart")?;
         Ok(app)
     }
 
@@ -217,6 +230,11 @@ impl App {
     /// Command dispatch.
     pub fn commands(&self) -> &Commands {
         &self.commands
+    }
+
+    /// Agents' skills.
+    pub fn skills(&self) -> &Skills {
+        &self.skills
     }
 
     /// The Rocket.Chat manager bot, if agentd serves Rocket.Chat.

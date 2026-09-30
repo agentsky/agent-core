@@ -138,7 +138,8 @@ description, and must pass T02's policy.
 - `agentd gen-key` prints a new master key.
 - The file's sections, each added by the task that first needs it: `[server]`,
   `[internal]`, `[store]`, `[claude_oauth]`, `[sandbox]`, `[runner]`,
-  `[proxy]`, `[rocketchat]`, `[slack]`, `[limits]`. `config/agentd.example.toml` documents
+  `[proxy]`, `[rocketchat]`, `[slack]`, `[limits]`, `[community]` (T26's
+  community admins). `config/agentd.example.toml` documents
   every key and is kept current by each task.
 - Claude OAuth defaults, observed in the Claude Code 2.1.285 binary on
   2026-09-30. Configuration, not constants, per the design's
@@ -890,9 +891,12 @@ Deliverables:
   - `Login { code: Option<SecretString> }`, `Logout`, `Me`.
   - `SlackToken { token, refresh }`, both `SecretString`.
   - `Create { name, persona }`, `Persona { name, text }`.
-  - `Skill(Add { name, source } | Rm { name, skill })`. `name` is the agent;
-    `skill rm` names the skill, since an owner may have several agents
+  - `Skill(Add { name, source } | Confirm { name, skill } | Rm { name, skill })`.
+    `name` is the agent; `skill rm` names the skill, since an owner may have
+    several agents
     ([impl-notes](impl-notes.md#skill-rm-needs-the-agent-and-the-skill)).
+    `skill confirm` came with T25
+    ([impl-notes](impl-notes.md#hosts-are-confirmed-with-a-command-of-their-own)).
   - `Allow` and `Deny { name, target }`.
   - `Limits { name, turns_per_day, hops }`.
   - `Pause`, `Resume` and `Delete { name }`.
@@ -1151,7 +1155,8 @@ Design: [Account linking](design.md#account-linking),
 Deliverables:
 
 - `crates/agentd/src/commands/`: a dispatcher from `(MemberKey, Command,
-  Origin)` to a handler. `Origin` is `SlackSlash { response_url }`,
+  Origin)` to a handler. `Origin` is `SlackSlash { response_url, conv }`
+  (T24 added the conversation, for `reset <name> here`),
   `RocketChatDm { room }` or `RocketChatChannel { room }`. The DM's room
   saves a `users.info` and `im.create` per reply
   ([impl-notes](impl-notes.md#a-dm-to-a-member-needs-their-username)).
@@ -1714,7 +1719,7 @@ Deliverables:
   launch flags:
   - `--session-id <id>` when the session has never started, `--resume <id>`
     otherwise.
-  - `--tools "Bash,Read,Edit,Write,Glob,Grep"`, `--strict-mcp-config`,
+  - `--tools "Bash,Read,Edit,Write,Glob,Grep,Skill"`, `--strict-mcp-config`,
     `--setting-sources user`, `--permission-mode bypassPermissions` and
     `--append-system-prompt-file <persona path>`.
   - `--model <m>` when the router chose one.
@@ -1920,7 +1925,9 @@ Deliverables:
   - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
     accepted only when `agent` is the agent that sent the message
     ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
-  - `member_for(MemberKey)`, `is_linked(member)`.
+  - `member_for(MemberKey)`, `link_state(member)` (unlinked, linked or
+    broken; T26 replaced `is_linked`,
+    [impl-notes](impl-notes.md#a-broken-link-asks-for-a-new-login-never-the-community-key)).
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
@@ -2183,14 +2190,29 @@ Deliverables:
 
 - `/agent sessions <name>`: the owner's view of active and recent sessions,
   with scope, thread link where the surface can build one, last turn time and
-  whether a container is warm.
+  whether a container is warm. The sessions shown are the live ones in use:
+  not reset, and with a turn finished, one going to the CLI, or a warm
+  container, most recently active first, at most 20
+  ([impl-notes](impl-notes.md#which-sessions-the-commands-act-on)). Slack
+  links go to `app.slack.com/client/<team>/<channel>`; Rocket.Chat links
+  need the room's type, and a channel's name from the manager's
+  `rooms.info`, so a private group the manager can't read has none
+  ([impl-notes](impl-notes.md#thread-links)).
 - `/agent reset <name> [here]`: without `here`, reset every session of the
-  agent. With `here`, reset only the current conversation's session. This is
-  valid only as `!agent` in a channel on Rocket.Chat or a slash command in that
-  channel on Slack.
+  agent. With `here`, reset only the current conversation's sessions: a
+  DM's one session, or every thread of a channel, since a Slack slash
+  command names no thread
+  ([impl-notes](impl-notes.md#here-is-the-conversation-not-the-thread)). This is
+  valid only as `!agent` in a room on Rocket.Chat, the agent's own room
+  without the manager bot or a DM with the agent's bot included, or a slash
+  command in that conversation on Slack; from the manager's DM it is refused
+  with how to send it.
 - Reset stops a warm process first. `SessionManager::reset` (T21) does,
-  after the turns queued before it, and `SessionManager::is_warm` answers
-  whether a container is warm.
+  after the turns queued before it, and `SessionManager::warm_sessions`
+  lists the sessions whose container is warm. They reach the commands through
+  `commands::SessionControl`, which `pipeline::Turns::start` hands to the
+  app's commands, held weakly. Without a runner a reset marks the session
+  in the store only.
 
 Acceptance: tests for both commands, owner-only enforcement, and that the next
 turn after reset uses `--session-id` with a new id.
@@ -2230,6 +2252,27 @@ Acceptance: tests for add from a local Git fixture repo, add from an uploaded
 file, validation failures, rm, mounting (the path is visible in a
 `ProcessSandbox` session), and the allowlist extension.
 
+Notes from implementing it
+([impl-notes](impl-notes.md#t25-skills-and-the-agentctl-skill)):
+
+- A skill whose `SKILL.md` declares `allowed-hosts` waits, outside what
+  sandboxes mount, until the owner sends `skill confirm <name> <skill>`
+  within an hour; only then are its files and hosts in use. The
+  `agent_skills` table records every skill with its state, source and
+  hosts, and `SkillHosts` reads a session's agent's confirmed hosts from it.
+- The bundled `agentctl` skill is written before every turn, like the
+  persona; the name `agentctl` can't be added or removed. The runner mounts
+  `<data>/skills/<agent>` when it exists.
+- The clone refuses a Git host that isn't a DNS name or resolves to an
+  address the egress proxy never reaches, and pins `git` to the addresses
+  checked, with no redirects, `https` only and a size and time cap. The
+  agentd image moves from distroless to Debian slim for `git`.
+- An upload is a `.md` (up to 256 KB) or a `.zip` (up to 10 MB, unpacked
+  too); both surfaces' manager DMs pass their files to the handlers, so a
+  `persona.md` attached on Slack works now too.
+- The launch flags enable the `Skill` tool: without it Claude Code never
+  tells the model about the mounted skills.
+
 ## Phase 3: requester-pays (design milestone 3)
 
 ### T26
@@ -2245,21 +2288,35 @@ Deliverables:
   - A linked non-owner's turn runs on their own subscription.
   - An unlinked member's turn runs on the community key if one is configured.
   - Otherwise the member gets a link prompt.
+  - A member whose link is broken never runs on the community key: they get
+    a relink prompt, a private DM from the manager bot as for T13's relink
+    notice, and nothing runs
+    ([impl-notes](impl-notes.md#a-broken-link-asks-for-a-new-login-never-the-community-key)).
   - The owner's credential is used only for owner-requested turns.
 - `/agent admin api-key set <key>` and `/agent admin api-key clear` for
   community admins. A migration `…_community_settings.sql` adds a
-  single-row `community_settings` table with `api_key_enc`. This is the only
-  source of the key. The command is secret-bearing: refused in channels
-  (T13's rule) and never logged. Admins are listed in configuration, by
-  `MemberKey`.
+  single-row `community_settings` table with `api_key_enc`, and who last
+  changed it and when, which `me` shows admins. This is the only
+  source of the key; the proxy reads it from the store on every request,
+  so a change applies at once on every instance. The command is
+  secret-bearing: refused in channels (T13's rule) and never logged.
+  Admins are listed in configuration, by `MemberKey`: `[community]
+  admins`, matched exactly
+  ([impl-notes](impl-notes.md#admins-are-identities-matched-exactly)).
 - The model is picked per requester plan through T22's `ModelPolicy`. A plan
   change after a token refresh takes effect on the next turn, and restarts the
   process when the model differs (T21's rule).
 - Usage-limit and auth errors from T20 are shown to the requester, never the
-  owner, and name whose account hit the limit.
+  owner, and name whose account hit the limit: the thread is told whether
+  it was the requester's own account or the community key, and the
+  requester alone also gets a DM from the manager bot, unless a relink
+  notice already tells them, at most once an hour for each kind of failure
+  ([impl-notes](impl-notes.md#whose-account-hit-the-limit-and-who-is-told)).
 - Public-side enforcement: a non-owner's turn runs on the conversation's own
   channel, group DM or DM volume, never the agent's `Private` volume. Add a
-  test that fails if a non-owner decision ever resolves to `Private`.
+  test that fails if a non-owner decision ever resolves to `Private`. The
+  pipeline also refuses such a decision itself
+  ([impl-notes](impl-notes.md#the-pipeline-also-refuses-a-private-scope-for-anyone-but-the-owner)).
 
 Acceptance: pipeline tests with two linked members and one unlinked member in
 one thread, each turn's credential checked through the fake Anthropic's
@@ -2314,9 +2371,9 @@ Deliverables:
   - A token budget per thread per day.
   - A global hop cap. Per-agent `hops` can only lower it.
 - `/agent admin ban @user [reason]` and `/agent admin unban @user`, for
-  community admins. The router refuses a banned member's turns through
-  `RouterView::is_banned`, and a ban also blocks their commands other than
-  `me`.
+  community admins (T26's `[community] admins`). The router refuses a
+  banned member's turns through `RouterView::is_banned`, and a ban also
+  blocks their commands other than `me`.
 
 Acceptance: router tests for each limit, rule and ban, including the hop cap,
 and command tests. The pipeline test of two agents mentioning each other
@@ -2524,7 +2581,7 @@ Notes from implementing it
   `surface_slack::normalize::unescape` before parsing.
 - Files attached to the manager DM aren't passed on yet, since `persona`
   (T14) and `skill add` (T25) aren't in place; `WebApi::download_file` is
-  the download they use.
+  the download they use. T25 passes them on, for both.
 - The manifest's tests use `serde_norway`, a dev-dependency (MIT or
   Apache-2.0).
 
@@ -2866,6 +2923,15 @@ Not scheduled. Each needs a decision before it becomes a task.
   clear of agentd's networks, the egress network's other services and the
   Docker gateway. It must never apply to `EgressExtension` rules, which
   any agent's owner can add through a skill (T25), nor to wildcards.
+- **Cloning skills in a throwaway container.** T25's `git` clone runs
+  inside agentd, whose container holds the Docker socket, so a `git` bug a
+  hostile server can reach would reach the socket too (design, Security).
+  Running each clone in a short-lived container on the egress network,
+  without the socket or agentd's data volume, writing into a volume agentd
+  then checks, would take that away.
+- **Skills of deleted agents.** T25 keeps a deleted agent's skill rows and
+  files, as the persona is kept. Deleting them with the agent, or at a
+  later purge, needs a decision on what `delete` keeps.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.

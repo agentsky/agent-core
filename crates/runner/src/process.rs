@@ -129,9 +129,12 @@ pub struct ClaudeProcess {
     credential: CredentialKind,
     model: Option<String>,
     turn_timeout: Duration,
+    /// Declared before `stdin`, so a drop kills a process still waiting
+    /// for input instead of closing its input first and killing it in the
+    /// middle of exiting.
+    child: ChildHandle,
     stdin: Pin<Box<dyn AsyncWrite + Send>>,
     stdout: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
-    child: ChildHandle,
     state: State,
     line: Vec<u8>,
     process_total_cost_usd: f64,
@@ -153,7 +156,7 @@ impl ClaudeProcess {
     /// Starts `claude` in `container` for the container's session.
     ///
     /// The argv is the design's launch flags: `-p`, stream-json input and
-    /// output, `--verbose`, `--tools "Bash,Read,Edit,Write,Glob,Grep"`,
+    /// output, `--verbose`, `--tools "Bash,Read,Edit,Write,Glob,Grep,Skill"`,
     /// `--strict-mcp-config`, `--setting-sources user`, `--permission-mode
     /// bypassPermissions`, `--append-system-prompt-file` with the persona
     /// file from [`Container::paths`], `--model` when `spec` names one, and

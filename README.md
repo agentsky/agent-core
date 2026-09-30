@@ -105,11 +105,41 @@ deactivation that fails is retried for about three days. A bot sets
 `rocketchat.avatar_url` as its own avatar, if configured. With `[sandbox]`,
 an agent answers a person who mentions it, replies in a thread it started,
 or DMs it, and another agent's message that mentions it, in the thread, as
-its own bot, on the Claude account of whoever asked (the owner's in their
-own DM). Its bot reacts with `[runner] working_emoji` while the turn runs,
-answers only in rooms it was added to, and a member without a linked account
-gets a direct message from the manager bot saying how to link one. Without
-`[sandbox]`, each agent reacts with :eyes: to messages that mention it.
+its own bot, on the Claude account of whoever asked, never the owner's
+unless the owner asked, and on the model `[runner.models]` gives that
+account's plan. Its bot reacts with `[runner] working_emoji` while the turn
+runs, and answers only in rooms it was added to. A member without a linked
+account runs on the community API key if a community admin set one, and
+otherwise gets a direct message from the manager bot saying how to link an
+account; a member whose link stopped working is asked to link it again
+instead, and never runs on the community key. When the account or key a
+turn ran on hits its usage limit or is refused, the thread is told whose it
+was, and the member who asked gets a direct message from the manager bot,
+at most once an hour for each kind of failure. Without `[sandbox]`, each agent reacts
+with :eyes: to messages that mention it.
+Every agent has a built-in `agentctl` skill, and its owner adds more with
+`skill add <name> <https Git URL>[#ref]`, or with a `SKILL.md` or `.zip`
+attached to `skill add <name>` in the manager bot's direct message, and
+removes them with `skill rm <name> <skill>`. agentd clones with the `git`
+program (2.37 or later, which the agentd image has) directly from agentd's
+own network, only over `https` and only from a host whose addresses are all
+public, and keeps skills in `skills/` under `store.data_dir`, mounted
+read-only into the agent's sandboxes. A skill whose `SKILL.md` lists
+`allowed-hosts` waits until the owner confirms them with
+`skill confirm <name> <skill>`; those hosts, each named in full (no
+wildcards), then extend `[proxy] allow` for that agent's sandboxes only.
+The owner lists an agent's sessions with `sessions <name>` (where each is,
+its last turn, and whether its container is warm), and starts them over
+with `reset <name>`, or only the ones of one conversation with
+`!agent reset <name> here` sent there; a reset stops the session's warm
+container once its running turn ends.
+Community admins are the member identities `[community] admins` lists, as
+`<surface>:<team>:<user>`. An admin sets the community API key with
+`admin api-key set <key>` in the manager bot's direct message (or with
+`/agent admin api-key set <key>` on Slack) and removes it with
+`admin api-key clear`. agentd stores it encrypted with the master key, never
+logs it, and only the credential proxy uses it: sandboxes hold a placeholder.
+`me` tells an admin whether a key is set.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask

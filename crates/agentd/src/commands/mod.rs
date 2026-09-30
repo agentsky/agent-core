@@ -1,5 +1,9 @@
-//! `/agent` command dispatch, the account commands, and the agent commands
-//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`).
+//! `/agent` command dispatch, the account commands, the agent commands
+//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), the skill
+//! commands (`skill add`, `skill confirm`, `skill rm`), the session
+//! commands (`sessions`, `reset`), and the community admins' `admin api-key
+//! set` and `clear`, which only the identities [`Commands::with_admins`]
+//! names may run.
 //!
 //! Every surface turns a command into `(MemberKey, text, Origin, files)` and hands
 //! it to [`Commands::handle_text`], which parses it with
@@ -18,6 +22,8 @@
 //! - [`relink`]: the notice a member gets, once, when their Claude link
 //!   breaks.
 //! - [`reply`]: private replies through each surface's manager bot.
+//! - `sessions`: `sessions` and `reset`, which reach the runner through a
+//!   [`SessionControl`].
 //!
 //! # Secrets
 //!
@@ -30,11 +36,14 @@
 //! secret-bearing gets the same treatment. Commands are logged by name only,
 //! never with their text or arguments.
 
+mod admin;
 mod agents;
 pub mod intake;
 pub mod relink;
 pub mod reply;
 pub mod rocketchat;
+mod sessions;
+mod skills;
 pub mod slack;
 mod slack_agents;
 pub mod slack_tokens;
@@ -45,21 +54,24 @@ mod slack_tests;
 mod tests;
 
 use std::fmt;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, Weak};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
-use core_types::{ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
+use core_types::{ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
 use store::{Store, StoreError};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::skills::Skills;
 use crate::slack::agents::SlackAgents;
 use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
 pub use reply::{ManagerBot, OpenDm, Replies, ReplyError};
+pub use sessions::{MAX_LISTED, SessionControl};
 
 /// Where a command came from. It decides where the reply goes and whether
 /// the command may carry a secret.
@@ -70,6 +82,8 @@ pub enum Origin {
         /// Where Slack takes the ephemeral reply. Anyone holding it can post
         /// there for a while, so it is kept secret.
         response_url: SecretString,
+        /// The conversation it was run in.
+        conv: ConvRef,
     },
     /// A direct message with the Slack manager app, in `channel`.
     SlackDm {
@@ -92,7 +106,10 @@ pub enum Origin {
 impl fmt::Debug for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SlackSlash { .. } => f.write_str("SlackSlash"),
+            Self::SlackSlash { conv, .. } => f
+                .debug_struct("SlackSlash")
+                .field("conv", conv)
+                .finish_non_exhaustive(),
             Self::SlackDm { channel } => {
                 f.debug_struct("SlackDm").field("channel", channel).finish()
             }
@@ -111,6 +128,22 @@ impl Origin {
     /// Whether only the member (and the manager bot) can read what they sent.
     pub fn is_private(&self) -> bool {
         !matches!(self, Self::RocketChatChannel { .. })
+    }
+
+    /// The conversation the command was sent in, where `reset <name>
+    /// here` acts, for `member`'s command: the room of an `!agent` message
+    /// or the conversation of a slash command. `None` in a direct message
+    /// with the manager bot, where no agent answers.
+    pub fn conversation(&self, member: &MemberKey) -> Option<ConvRef> {
+        match self {
+            Self::SlackSlash { conv, .. } => Some(conv.clone()),
+            Self::RocketChatChannel { room } => Some(ConvRef {
+                surface: member.surface,
+                team: member.team.clone(),
+                conversation: room.clone(),
+            }),
+            Self::SlackDm { .. } | Self::RocketChatDm { .. } => None,
+        }
     }
 
     /// A short name for logs.
@@ -145,6 +178,33 @@ impl Origin {
     }
 }
 
+/// What a command still has to do once its reply is sent. It no longer
+/// holds up the member's later commands.
+#[must_use = "a follow-up does nothing unless it is run"]
+#[derive(Default)]
+pub struct FollowUp(Option<Pin<Box<dyn Future<Output = ()> + Send>>>);
+
+impl fmt::Debug for FollowUp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FollowUp")
+            .field(&self.0.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+impl FollowUp {
+    fn new(work: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(Some(Box::pin(work)))
+    }
+
+    /// Does what is left, if anything.
+    pub async fn run(self) {
+        if let Some(work) = self.0 {
+            work.await;
+        }
+    }
+}
+
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
@@ -156,16 +216,19 @@ const FAILED: &str = "Something went wrong on my side. Please try again in a min
 #[derive(Debug, Clone)]
 pub struct Commands {
     inner: Arc<Inner>,
+    admins: Arc<[MemberKey]>,
+    slack_agents: Option<SlackAgents>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Inner {
     store: Store,
     auth: Arc<Auth>,
     replies: Replies,
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
-    slack_agents: Option<SlackAgents>,
+    skills: Skills,
+    sessions: Mutex<Option<Weak<dyn SessionControl>>>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -177,6 +240,8 @@ enum Failure {
     Auth(#[from] AuthError),
     #[error(transparent)]
     Surface(#[from] core_types::SurfaceError),
+    #[error(transparent)]
+    Skill(#[from] crate::skills::SkillError),
 }
 
 fn now() -> OffsetDateTime {
@@ -186,14 +251,15 @@ fn now() -> OffsetDateTime {
 impl Commands {
     /// Commands over `store` and `auth`, replying through `replies`,
     /// managing agents on Rocket.Chat through `rocketchat` if agentd serves
-    /// Rocket.Chat, and with the Slack manager app `slack` if agentd serves
-    /// Slack.
+    /// Rocket.Chat, with the Slack manager app `slack` if agentd serves
+    /// Slack, and managing agents' skills through `skills`.
     pub fn new(
         store: Store,
         auth: Arc<Auth>,
         replies: Replies,
         rocketchat: Option<RocketChatAgents>,
         slack: Option<SlackManager>,
+        skills: Skills,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -202,20 +268,34 @@ impl Commands {
                 replies,
                 rocketchat,
                 slack,
-                slack_agents: None,
+                skills,
+                sessions: Mutex::new(None),
             }),
+            admins: Arc::new([]),
+            slack_agents: None,
         }
     }
 
     /// These commands, creating and deleting agents on Slack through
     /// `agents`.
     #[must_use]
-    pub fn with_slack_agents(self, agents: SlackAgents) -> Self {
-        let mut inner = Arc::unwrap_or_clone(self.inner);
-        inner.slack_agents = Some(agents);
-        Self {
-            inner: Arc::new(inner),
-        }
+    pub fn with_slack_agents(mut self, agents: SlackAgents) -> Self {
+        self.slack_agents = Some(agents);
+        self
+    }
+
+    /// The same commands, with `admins` as the community admins: the only
+    /// members whose `/agent admin …` commands run. Without it nobody is an
+    /// admin.
+    #[must_use]
+    pub fn with_admins(mut self, admins: impl IntoIterator<Item = MemberKey>) -> Self {
+        self.admins = admins.into_iter().collect();
+        self
+    }
+
+    /// Whether `member` is a community admin.
+    fn is_admin(&self, member: &MemberKey) -> bool {
+        self.admins.contains(member)
     }
 
     /// The private reply plumbing.
@@ -224,8 +304,8 @@ impl Commands {
     }
 
     /// Parses `text` from `member`, sent with `files` attached, and runs
-    /// it, replying privately. Text that doesn't parse gets the parser's
-    /// message (help or usage).
+    /// it to the end, replying privately. Text that doesn't parse gets the
+    /// parser's message (help or usage).
     pub async fn handle_text(
         &self,
         member: &MemberKey,
@@ -233,8 +313,23 @@ impl Commands {
         origin: &Origin,
         files: &[InFile],
     ) {
+        self.answer_text(member, text, origin, files)
+            .await
+            .run()
+            .await;
+    }
+
+    /// As [`handle_text`](Self::handle_text), but returns once the reply
+    /// is sent, with what the command still has to do.
+    pub async fn answer_text(
+        &self,
+        member: &MemberKey,
+        text: &str,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> FollowUp {
         match commands::parse(text) {
-            Ok(command) => self.dispatch(member, command, origin, files).await,
+            Ok(command) => self.answer(member, command, origin, files).await,
             Err(err) => {
                 tracing::info!(
                     %member,
@@ -245,12 +340,13 @@ impl Commands {
                 );
                 let reply = self.unparsed(member, &err, origin).await;
                 self.reply(member, origin, &reply).await;
+                FollowUp::default()
             }
         }
     }
 
-    /// Runs `command` from `member`, sent with `files` attached, and
-    /// replies privately.
+    /// Runs `command` from `member`, sent with `files` attached, to the
+    /// end, and replies privately.
     pub async fn dispatch(
         &self,
         member: &MemberKey,
@@ -258,6 +354,21 @@ impl Commands {
         origin: &Origin,
         files: &[InFile],
     ) {
+        self.answer(member, command, origin, files)
+            .await
+            .run()
+            .await;
+    }
+
+    /// Runs `command` until its reply is sent, and returns what it still
+    /// has to do.
+    async fn answer(
+        &self,
+        member: &MemberKey,
+        command: Command,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> FollowUp {
         tracing::info!(
             %member,
             origin = origin.kind(),
@@ -265,8 +376,9 @@ impl Commands {
             files = files.len(),
             "running a command"
         );
-        let reply = self.run(member, command, origin, files).await;
+        let (reply, follow_up) = self.run(member, command, origin, files).await;
         self.reply(member, origin, &reply).await;
+        follow_up
     }
 
     async fn reply(&self, member: &MemberKey, origin: &Origin, text: &str) {
@@ -275,16 +387,38 @@ impl Commands {
         }
     }
 
-    /// The reply to `command`.
+    /// The reply to `command`, and what it still has to do after it.
     async fn run(
         &self,
         member: &MemberKey,
         command: Command,
         origin: &Origin,
         files: &[InFile],
-    ) -> String {
+    ) -> (String, FollowUp) {
         let name = command.name();
-        let result = if command.is_secret_bearing() && !origin.is_private() {
+        let result = match command {
+            Command::Reset { name, here } => self.reset(member, name.as_str(), here, origin).await,
+            command => self
+                .reply_to(member, command, origin, files)
+                .await
+                .map(|reply| (reply, FollowUp::default())),
+        };
+        result.unwrap_or_else(|err| {
+            tracing::warn!(%member, command = name, error = %err, "a command failed");
+            (FAILED.to_owned(), FollowUp::default())
+        })
+    }
+
+    /// The reply to `command`, for a command that is done once it has one.
+    async fn reply_to(
+        &self,
+        member: &MemberKey,
+        command: Command,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> Result<String, Failure> {
+        let name = command.name();
+        if command.is_secret_bearing() && !origin.is_private() {
             self.refuse_public_secret(member, &command, origin).await
         } else {
             match command {
@@ -312,13 +446,14 @@ impl Commands {
                     self.set_paused(member, name.as_str(), false, origin).await
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
+                Command::Skill(command) => self.skill(member, command, origin, files).await,
+                Command::Sessions { name } => self.sessions(member, name.as_str(), origin).await,
+                Command::Admin(AdminCommand::ApiKey(command)) => {
+                    self.api_key(member, command).await
+                }
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
-        };
-        result.unwrap_or_else(|err| {
-            tracing::warn!(%member, command = name, error = %err, "a command failed");
-            FAILED.to_owned()
-        })
+        }
     }
 
     async fn member(&self, key: &MemberKey) -> Result<Option<MemberId>, Failure> {
@@ -426,6 +561,10 @@ impl Commands {
                 None => "Claude account: linked. Plan: unknown.".to_owned(),
             },
         };
+        if self.is_admin(key) {
+            reply.push('\n');
+            reply.push_str(&self.community_key_status().await?);
+        }
         if key.surface == SurfaceKind::Slack
             && let Some(slack) = &self.inner.slack
         {
