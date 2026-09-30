@@ -20,11 +20,18 @@
 //! line is blank or a JSON object with no key written twice; every line
 //! with a `sessionId`, and every message, carries the session's own id;
 //! and every `cost-state` line is one the CLI writes (see [`cost_state`]).
-//! The total is then the last `cost-state` line's, or 0 without one. The
-//! unknown side is always the runner's: an agent can make its first turn's
-//! cost unknown, not move it. A Docker test checks the pinned CLI restores
-//! whatever total the runner reads, for the CLI's own transcripts and for
-//! the ones an agent could write to tell the two apart.
+//! The total is then the last `cost-state` line's, or 0 without one.
+//!
+//! That is the total the CLI restores only if nothing changes the file
+//! between the runner's read and the CLI's. So the session manager reads
+//! it only for a process it starts in a container it has just started,
+//! where no process of the agent's ran before the CLI; in a container an
+//! earlier process ran in, one the agent left there could rewrite the
+//! file, and the first turn's cost is unknown. With both, the unknown side
+//! is the runner's: an agent can make its first turn's cost unknown, not
+//! move it. A Docker test checks the pinned CLI restores whatever total
+//! the runner reads, for transcripts the CLI wrote itself and for the ones
+//! an agent could write to tell the two apart.
 
 use std::fmt;
 use std::fs::File;

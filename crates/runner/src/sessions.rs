@@ -701,6 +701,13 @@ impl<H: TurnHooks> Inner<H> {
     /// running process on the turn's credential kind and model. Returns how
     /// the process was started, if it was.
     ///
+    /// A `--resume`d process counts its cost from the total the CLI will
+    /// restore only in a container started by this call, where nothing of
+    /// the agent's ran before the CLI: in a container an earlier process
+    /// ran in, a process the agent left there could rewrite the transcript
+    /// between the runner's read and the CLI's, so the first turn's cost is
+    /// unknown.
+    ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
     /// makes reading the address fail.
@@ -739,6 +746,7 @@ impl<H: TurnHooks> Inner<H> {
                 self.release_container(warm).await?;
             }
         }
+        let fresh = warm.held.is_none();
         let held = match warm.held.take() {
             Some(held) => warm.held.insert(held),
             None => {
@@ -764,7 +772,13 @@ impl<H: TurnHooks> Inner<H> {
             SessionStart::New
         };
         let restored = match start {
-            SessionStart::Resume => Some(restored_cost(&held.session_dir, session.id).await),
+            SessionStart::Resume if fresh => {
+                Some(restored_cost(&held.session_dir, session.id).await)
+            }
+            SessionStart::Resume => {
+                tracing::warn!(session = %session.id, "resuming in a container an earlier process ran in, where a process it left could change the transcript; the first turn has no cost");
+                Some(None)
+            }
             SessionStart::New => None,
         };
         let (env, handle) = match self.process_starting(session, ip, kind).await {

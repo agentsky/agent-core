@@ -6529,9 +6529,27 @@ must read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
 `leaf3`, a duplicated key, a ledger-prefixed line) must be unknown. On the
 code before this, the test read 0.25 where the CLI restored 5 for
 `ledger_big` and `attr_big`, and 5 where it restored 7 for `leaf2` and
-`leaf3`. The CLI restores the same line only if nothing changes the file
-between the two reads, which only a process left running in the container
-could do (Deferred work's "Killing leftover processes at turn end").
+`leaf3`.
+
+All of that holds only if nothing changes the file between the runner's
+read and the CLI's, and a process the agent leaves running in the
+container can: when the agent kills its own CLI, the exit is confirmed
+and the container kept, so the next requester's `--resume` ran in a
+container where a background loop could wait for `resume <id>` to appear
+and append a `cost-state` line of 900 after the runner read 5, billing the
+next requester about $895. `SessionManager::ensure_process` now reads the
+restored total only when it started the container in the same call:
+nothing of the agent's runs in a fresh one before the CLI (its command is
+`sleep infinity` from the image, the exec wrapper is the image's `sh`, and
+the credential proxy and agentctl token are agentd's), and a session's
+earlier container is stopped before another starts. A `--resume` in a
+container an earlier process ran in (after a crash, a kill, or a
+credential kind or model change) counts its first turn's cost as unknown.
+A runner test resumes in such a container and gets no cost; before this
+it got the turn's cost. Stopping the container before every resume would
+keep that cost known at a container start's price, and would also end
+the agent's leftover processes (Deferred work's "Killing leftover
+processes at turn end").
 
 A turn's cost is unknown (`None`, and billed as 0) when its result or the
 process's previous one has no plausible total (so a result without one

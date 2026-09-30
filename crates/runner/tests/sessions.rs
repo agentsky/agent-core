@@ -728,6 +728,10 @@ async fn a_resumed_process_bills_its_first_turn_without_the_restored_total() {
 
     let crashed = h.run(session.id, request("three")).await;
     assert!(matches!(crashed.outcome, TurnOutcome::Crashed { .. }));
+    eventually("the idle container is reaped", || {
+        !h.manager.is_warm(session.id)
+    })
+    .await;
     let fourth = h.run(session.id, request("four")).await;
     assert_eq!(fourth.process_start, Some(SessionStart::Resume));
     let after_crash = result(&fourth);
@@ -737,6 +741,28 @@ async fn a_resumed_process_bills_its_first_turn_without_the_restored_total() {
         "a crashed process saves nothing, so the first process's total is restored again"
     );
     assert_eq!(after_crash.cost_usd, Some(REPLY_COST_USD));
+}
+
+#[tokio::test]
+async fn a_resume_in_a_container_kept_from_an_earlier_process_has_no_cost() {
+    let h = Harness::new(&[Turn::reply("first"), Turn::crash(), Turn::reply("third")]).await;
+    let session = h.thread_session("1.1").await;
+    let first = h.run(session.id, request("one")).await;
+    assert_eq!(result(&first).cost_usd, Some(REPLY_COST_USD));
+    let crashed = h.run(session.id, request("two")).await;
+    assert!(matches!(crashed.outcome, TurnOutcome::Crashed { .. }));
+    let third = h.run(session.id, request("three")).await;
+    assert_eq!(third.process_start, Some(SessionStart::Resume));
+    assert!(
+        !h.events().contains(&Event::ContainerStopped(session.id)),
+        "the container outlived the crashed process"
+    );
+    assert_eq!(
+        result(&third).cost_usd,
+        None,
+        "a process the agent left in the container could have changed the transcript after \
+         the runner read it"
+    );
 }
 
 #[tokio::test]
