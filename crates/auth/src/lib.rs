@@ -13,9 +13,14 @@
 //!    exchanges the code, reads the plan from the profile, and stores the
 //!    link.
 //! 4. [`TokenSource::access_token`] hands out the access token, refreshing
-//!    it first when it expires within [`REFRESH_MARGIN`]. Refreshes are
-//!    single-flight per member.
-//! 5. [`Auth::logout`] deletes the link and revokes the refresh token.
+//!    it first when it expires within [`REFRESH_MARGIN`]. A refresh runs in
+//!    its own task, single-flight per member, and finishes even if every
+//!    caller waiting for it goes away. When the token endpoint says a refresh
+//!    token is dead, the link is marked broken and the member is announced
+//!    once on [`Auth::take_relink_notices`].
+//! 5. [`Auth::status`] reads whether a member is linked, their plan, and
+//!    whether the link is broken, without touching the tokens.
+//! 6. [`Auth::logout`] deletes the link and revokes the refresh token.
 //!
 //! Endpoints, client ID and scopes come from [`OAuthConfig`]. Tokens, codes
 //! and verifiers are [`SecretString`]s and appear in no error message or log
@@ -23,15 +28,18 @@
 
 #![warn(missing_docs)]
 
+use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use core_types::MemberId;
 use reqwest::Client;
 use secrecy::SecretString;
-use store::{ClaudeLink, NewClaudeLink, Store, StoreError};
+use store::{ClaudeLink, ClaudeTokens, NewClaudeLink, Store, StoreError};
 use time::OffsetDateTime;
+use tokio::sync::{mpsc, watch};
 
 mod client;
 mod config;
@@ -52,6 +60,11 @@ pub const PENDING_LOGIN_TTL: Duration = Duration::from_secs(10 * 60);
 /// An access token that expires within this margin is refreshed before it
 /// is handed out, as Claude Code does.
 pub const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// After a refresh fails without the refresh token being dead, a member's
+/// token isn't refreshed again for this long while it is still valid; the
+/// current token is handed out instead.
+pub const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Which HTTP peer an error came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +95,10 @@ impl fmt::Display for Endpoint {
 /// No variant carries a token, code, verifier or anything the member pasted.
 /// Response bodies are never included; an OAuth `error` code is kept only
 /// when it looks like one (lowercase letters and underscores).
-#[derive(Debug, thiserror::Error)]
+///
+/// It is `Clone`, because every caller waiting for one refresh gets its
+/// result.
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum AuthError {
     /// The configuration is invalid.
@@ -91,14 +107,12 @@ pub enum AuthError {
     /// The member has no Claude link.
     #[error("no Claude account is linked")]
     NotLinked,
-    /// The token endpoint refused to refresh the member's token, so the
-    /// link is marked broken and the member must log in again.
+    /// The token endpoint said the member's refresh token is dead, so the
+    /// link is marked broken and the member must log in again. The member is
+    /// announced once per failure on [`Auth::take_relink_notices`], not
+    /// through this error.
     #[error("the Claude link has stopped working; log in again")]
-    RelinkRequired {
-        /// True only for the call that marked the link broken, so the member
-        /// is told once per failure.
-        newly_broken: bool,
-    },
+    RelinkRequired,
     /// The pasted text is neither `code#state` nor a callback URL.
     #[error("that is not a login code; paste the whole code#state text")]
     MalformedCode,
@@ -124,7 +138,7 @@ pub enum AuthError {
         /// The peer.
         endpoint: Endpoint,
         /// The transport error, without its URL.
-        source: reqwest::Error,
+        source: Arc<reqwest::Error>,
     },
     /// A peer answered with an unexpected HTTP status.
     #[error("{endpoint} returned HTTP {status}{}", code_suffix(.error))]
@@ -147,9 +161,19 @@ pub enum AuthError {
     /// The operating system's random number generator failed.
     #[error("the system random number generator failed")]
     Random,
+    /// The task refreshing the token stopped before it had a result, for
+    /// example because the runtime is shutting down.
+    #[error("the token refresh stopped before it finished")]
+    RefreshInterrupted,
     /// The store failed.
     #[error(transparent)]
-    Store(#[from] StoreError),
+    Store(Arc<StoreError>),
+}
+
+impl From<StoreError> for AuthError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(Arc::new(error))
+    }
 }
 
 fn code_suffix(error: &Option<String>) -> String {
@@ -157,24 +181,6 @@ fn code_suffix(error: &Option<String>) -> String {
         .as_deref()
         .map(|code| format!(", {code}"))
         .unwrap_or_default()
-}
-
-impl AuthError {
-    /// Whether a failed refresh means the refresh token is no longer
-    /// accepted: the token endpoint answered 400 (`invalid_grant` and the
-    /// like), 401 or 403. Anything else (a network failure, a timeout, a
-    /// 5xx or 429, an unreadable body) may pass, so it doesn't break the
-    /// link.
-    fn is_refusal(&self) -> bool {
-        matches!(
-            self,
-            Self::Status {
-                endpoint: Endpoint::Token,
-                status: 400 | 401 | 403,
-                ..
-            }
-        )
-    }
 }
 
 /// A started login, as [`Auth::start_login`] returns it.
@@ -195,6 +201,18 @@ pub struct Linked {
     pub plan: Option<PlanInfo>,
 }
 
+/// A member's link as [`Auth::status`] reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkStatus {
+    /// Whether the member has a link, working or broken.
+    pub linked: bool,
+    /// The plan last read from the profile. Empty when the member has no
+    /// link or the profile hasn't been read.
+    pub plan: PlanInfo,
+    /// Whether the link is broken and the member has to log in again.
+    pub broken: bool,
+}
+
 /// Hands out a member's Claude access token, for the credential proxy.
 #[async_trait]
 pub trait TokenSource: Send + Sync {
@@ -213,17 +231,44 @@ pub trait TokenSource: Send + Sync {
 /// One `Auth` should serve the whole process, since refreshes are
 /// single-flight per member only within one instance. Share it in an `Arc`.
 pub struct Auth {
+    inner: Arc<Inner>,
+}
+
+/// What a refresh hands every caller waiting for it.
+type Outcome = Result<SecretString, AuthError>;
+
+/// The refresh in flight for a member: its result, once it has one.
+type Flight = watch::Receiver<Option<Outcome>>;
+
+struct Inner {
     config: OAuthConfig,
     urls: Urls,
     store: Store,
     http: Client,
     locks: KeyedLocks<MemberId>,
+    flights: Mutex<HashMap<MemberId, Flight>>,
+    failures: Mutex<HashMap<MemberId, Instant>>,
+    relink: mpsc::UnboundedSender<MemberId>,
+    relink_notices: Mutex<Option<mpsc::UnboundedReceiver<MemberId>>>,
+}
+
+/// Work a refresh does after it released the member's lock.
+enum Afterwards {
+    Nothing,
+    /// Read the plan with the new access token and store it on the link of
+    /// that generation.
+    ReadPlan {
+        generation: i64,
+        access_token: SecretString,
+    },
+    /// Revoke a refresh token no link holds any more.
+    Revoke(SecretString),
 }
 
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Auth")
-            .field("config", &self.config)
+            .field("config", &self.inner.config)
             .finish_non_exhaustive()
     }
 }
@@ -236,6 +281,10 @@ fn needs_refresh(link: &ClaudeLink, now: OffsetDateTime) -> bool {
     link.expires_at <= now + REFRESH_MARGIN
 }
 
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl Auth {
     /// Validates `config` and builds the HTTP client.
     ///
@@ -246,13 +295,32 @@ impl Auth {
     pub fn new(config: OAuthConfig, store: Store) -> Result<Self, AuthError> {
         config.validate()?;
         let urls = config.urls()?;
+        let (relink, relink_notices) = mpsc::unbounded_channel();
         Ok(Self {
-            config,
-            urls,
-            store,
-            http: client::build_client()?,
-            locks: KeyedLocks::default(),
+            inner: Arc::new(Inner {
+                config,
+                urls,
+                store,
+                http: client::build_client()?,
+                locks: KeyedLocks::default(),
+                flights: Mutex::default(),
+                failures: Mutex::default(),
+                relink,
+                relink_notices: Mutex::new(Some(relink_notices)),
+            }),
         })
+    }
+
+    /// The members whose link a refresh marked broken, each once per
+    /// failure, in order. agentd takes this once at startup and sends each
+    /// member the relink notice.
+    ///
+    /// The refresh task sends the member right after it sets
+    /// `claude_links.broken_at`, whether or not any caller is still waiting
+    /// for it. Notices queue until they are received. Returns `None` after
+    /// the first call.
+    pub fn take_relink_notices(&self) -> Option<mpsc::UnboundedReceiver<MemberId>> {
+        locked(&self.inner.relink_notices).take()
     }
 
     /// Starts a login for `member`: stores a pending login and returns the
@@ -260,27 +328,29 @@ impl Auth {
     ///
     /// The verifier is 32 random bytes, base64url; the `state` is 32 other
     /// random bytes, so it says nothing about the verifier. A member has at
-    /// most one pending login: starting one drops any earlier one, so only
-    /// the newest link works.
+    /// most one pending login: starting one drops any earlier one in the same
+    /// store transaction, so only the newest link works, even when two logins
+    /// start at once.
     ///
     /// # Errors
     ///
     /// [`AuthError::Random`] if the random number generator fails,
     /// [`AuthError::Store`] if the store does.
     pub async fn start_login(&self, member: MemberId) -> Result<LoginStart, AuthError> {
+        let inner = &self.inner;
         let verifier = pkce::new_verifier()?;
         let state = pkce::new_state()?;
         let challenge = pkce::challenge(&verifier);
         let expires_at = (now() + PENDING_LOGIN_TTL).truncate_to_second();
-        self.store.invalidate_pending_logins(member).await?;
-        self.store
+        inner
+            .store
             .put_pending_login(&state, member, &verifier, expires_at)
             .await?;
         let url = pkce::authorize_url(
-            &self.urls.authorize,
-            &self.config.client_id,
-            &self.urls.redirect,
-            &self.config.scope_param(),
+            &inner.urls.authorize,
+            &inner.config.client_id,
+            &inner.urls.redirect,
+            &inner.config.scope_param(),
             &challenge,
             &state,
         );
@@ -312,8 +382,9 @@ impl Auth {
         member: MemberId,
         pasted: &SecretString,
     ) -> Result<Linked, AuthError> {
+        let inner = &self.inner;
         let pasted = pkce::parse_pasted(pasted)?;
-        let pending = self
+        let pending = inner
             .store
             .take_pending_login(&pasted.state)
             .await?
@@ -333,11 +404,11 @@ impl Auth {
             code: &pasted.code,
             state: &pasted.state,
             verifier: &pending.verifier,
-            redirect_uri: &self.urls.redirect,
-            client_id: &self.config.client_id,
+            redirect_uri: &inner.urls.redirect,
+            client_id: &inner.config.client_id,
         };
         let issued_at = now();
-        let tokens = client::exchange_code(&self.http, &self.urls.token, exchange)
+        let tokens = client::exchange_code(&inner.http, &inner.urls.token, exchange)
             .await
             .map_err(|err| match err {
                 AuthError::Status {
@@ -347,7 +418,7 @@ impl Auth {
                 } => AuthError::CodeRejected { status, error },
                 other => other,
             })?;
-        let plan = match self.fetch_plan(&tokens.access_token).await {
+        let plan = match inner.fetch_plan(&tokens.access_token).await {
             Ok(plan) => Some(plan),
             Err(err) => {
                 tracing::warn!(%member, error = %err, "couldn't read the plan after login");
@@ -366,10 +437,10 @@ impl Auth {
             rate_limit_tier: stored.rate_limit_tier,
         };
         {
-            let _guard = self.locks.lock(member).await;
-            self.store.put_claude_link(member, &link).await?;
+            let _guard = inner.locks.lock(member).await;
+            inner.store.put_claude_link(member, &link, now()).await?;
         }
-        if let Err(err) = self.store.invalidate_pending_logins(member).await {
+        if let Err(err) = inner.store.invalidate_pending_logins(member).await {
             tracing::warn!(%member, error = %err, "couldn't drop the member's other pending logins");
         }
         Ok(Linked { plan })
@@ -385,7 +456,24 @@ impl Auth {
     /// unknown organization type is not an error; it becomes
     /// [`Plan::Unknown`].
     pub async fn fetch_plan(&self, access_token: &SecretString) -> Result<PlanInfo, AuthError> {
-        client::fetch_profile(&self.http, &self.urls.profile, access_token).await
+        self.inner.fetch_plan(access_token).await
+    }
+
+    /// Whether `member` is linked, the plan last read from their profile,
+    /// and whether the link is broken. Reads no token.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the store fails.
+    pub async fn status(&self, member: MemberId) -> Result<LinkStatus, AuthError> {
+        let Some(status) = self.inner.store.claude_link_status(member).await? else {
+            return Ok(LinkStatus::default());
+        };
+        Ok(LinkStatus {
+            linked: true,
+            plan: PlanInfo::from_stored(status.plan.as_deref(), status.rate_limit_tier.as_deref()),
+            broken: status.broken_at.is_some(),
+        })
     }
 
     /// Deletes `member`'s link, then revokes its refresh token at Anthropic,
@@ -399,19 +487,54 @@ impl Auth {
     ///
     /// [`AuthError::Store`] if the link can't be deleted.
     pub async fn logout(&self, member: MemberId) -> Result<bool, AuthError> {
+        let inner = &self.inner;
         let (existing, deleted) = {
-            let _guard = self.locks.lock(member).await;
-            let existing = self.store.get_claude_link(member).await;
-            (existing, self.store.delete_claude_link(member).await?)
+            let _guard = inner.locks.lock(member).await;
+            let existing = inner.store.get_claude_link(member).await;
+            (existing, inner.store.delete_claude_link(member).await?)
         };
+        locked(&inner.failures).remove(&member);
         match existing {
-            Ok(Some(link)) => self.revoke(member, &link.refresh_token).await,
+            Ok(Some(link)) => inner.revoke(member, &link.refresh_token).await,
             Ok(None) => {}
             Err(err) => {
                 tracing::warn!(%member, error = %err, "deleted a link whose tokens couldn't be read; nothing revoked");
             }
         }
         Ok(deleted)
+    }
+
+    /// The refresh in flight for `member`, started now if there is none.
+    fn flight(&self, member: MemberId) -> Flight {
+        let mut flights = locked(&self.inner.flights);
+        if let Some(flight) = flights.get(&member) {
+            return flight.clone();
+        }
+        let (result, flight) = watch::channel(None);
+        flights.insert(member, flight.clone());
+        drop(flights);
+        tokio::spawn(Arc::clone(&self.inner).refresh(member, result));
+        flight
+    }
+}
+
+/// Removes a member's flight from [`Inner::flights`] when dropped, so a
+/// refresh task that ends in any way, a panic included, lets the next caller
+/// start a new one.
+struct Landing<'a> {
+    flights: &'a Mutex<HashMap<MemberId, Flight>>,
+    member: MemberId,
+}
+
+impl Drop for Landing<'_> {
+    fn drop(&mut self) {
+        locked(self.flights).remove(&self.member);
+    }
+}
+
+impl Inner {
+    async fn fetch_plan(&self, access_token: &SecretString) -> Result<PlanInfo, AuthError> {
+        client::fetch_profile(&self.http, &self.urls.profile, access_token).await
     }
 
     async fn revoke(&self, member: MemberId, refresh_token: &SecretString) {
@@ -435,20 +558,62 @@ impl Auth {
             .await?
             .ok_or(AuthError::NotLinked)?;
         if link.broken_at.is_some() {
-            return Err(AuthError::RelinkRequired {
-                newly_broken: false,
-            });
+            return Err(AuthError::RelinkRequired);
         }
         Ok(link)
     }
 
-    /// Refreshes `link`. The caller holds the member's lock.
-    async fn refresh(
-        &self,
-        member: MemberId,
-        link: ClaudeLink,
-        now: OffsetDateTime,
-    ) -> Result<SecretString, AuthError> {
+    /// Whether a refresh of `member`'s token failed within
+    /// [`REFRESH_BACKOFF`].
+    fn backing_off(&self, member: MemberId) -> bool {
+        let mut failures = locked(&self.failures);
+        match failures.get(&member) {
+            Some(failed) if failed.elapsed() < REFRESH_BACKOFF => true,
+            Some(_) => {
+                failures.remove(&member);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// The refresh task: refreshes `member`'s token under their lock, hands
+    /// the result to every waiting caller, then does what is left without the
+    /// lock. It runs to the end whether or not anyone still waits.
+    async fn refresh(self: Arc<Self>, member: MemberId, result: watch::Sender<Option<Outcome>>) {
+        let landing = Landing {
+            flights: &self.flights,
+            member,
+        };
+        let guard = self.locks.lock(member).await;
+        let (outcome, afterwards) = self.refresh_locked(member).await;
+        drop(guard);
+        drop(landing);
+        result.send_replace(Some(outcome));
+        match afterwards {
+            Afterwards::Nothing => {}
+            Afterwards::ReadPlan {
+                generation,
+                access_token,
+            } => self.store_plan(member, generation, &access_token).await,
+            Afterwards::Revoke(refresh_token) => self.revoke(member, &refresh_token).await,
+        }
+    }
+
+    /// Refreshes `member`'s token if it still needs it. The caller holds the
+    /// member's lock.
+    async fn refresh_locked(&self, member: MemberId) -> (Outcome, Afterwards) {
+        let link = match self.live_link(member).await {
+            Ok(link) => link,
+            Err(err) => return (Err(err), Afterwards::Nothing),
+        };
+        let started = now();
+        if !needs_refresh(&link, started) {
+            return (Ok(link.access_token), Afterwards::Nothing);
+        }
+        if link.expires_at > started && self.backing_off(member) {
+            return (Ok(link.access_token), Afterwards::Nothing);
+        }
         let refreshed = client::refresh(
             &self.http,
             &self.urls.token,
@@ -459,39 +624,94 @@ impl Auth {
         .await;
         let tokens = match refreshed {
             Ok(tokens) => tokens,
-            Err(err) if err.is_refusal() => {
-                let newly_broken = self.store.mark_claude_link_broken(member, now).await?;
-                tracing::warn!(%member, error = %err, "the token endpoint refused a refresh; the link is broken");
-                return Err(AuthError::RelinkRequired { newly_broken });
+            Err(failure) if failure.dead => {
+                tracing::warn!(%member, error = %failure.error, "the token endpoint says the refresh token is dead; the link is broken");
+                return (self.mark_broken(member, &link).await, Afterwards::Nothing);
             }
-            Err(err) if link.expires_at > now => {
-                tracing::warn!(%member, error = %err, "token refresh failed; using the current token until it expires");
-                return Ok(link.access_token);
-            }
-            Err(err) => {
-                tracing::warn!(%member, error = %err, "token refresh failed");
-                return Err(err);
+            Err(failure) => {
+                locked(&self.failures).insert(member, Instant::now());
+                if link.expires_at > now() {
+                    tracing::warn!(%member, error = %failure.error, "token refresh failed; using the current token until it expires");
+                    return (Ok(link.access_token), Afterwards::Nothing);
+                }
+                tracing::warn!(%member, error = %failure.error, "token refresh failed");
+                return (Err(failure.error), Afterwards::Nothing);
             }
         };
-        let plan = match self.fetch_plan(&tokens.access_token).await {
+        locked(&self.failures).remove(&member);
+        let updated = ClaudeTokens {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token.unwrap_or(link.refresh_token),
+            expires_at: started + tokens.expires_in,
+        };
+        match self
+            .store
+            .update_claude_tokens(member, link.generation, &updated, now())
+            .await
+        {
+            Ok(true) => (
+                Ok(updated.access_token.clone()),
+                Afterwards::ReadPlan {
+                    generation: link.generation,
+                    access_token: updated.access_token,
+                },
+            ),
+            Ok(false) => (
+                self.link_after_replacement(member).await,
+                Afterwards::Revoke(updated.refresh_token),
+            ),
+            Err(err) => {
+                tracing::error!(%member, error = %err, "couldn't store refreshed tokens");
+                (Err(err.into()), Afterwards::Nothing)
+            }
+        }
+    }
+
+    /// Marks `link` broken after the token endpoint said its refresh token
+    /// is dead, and announces the member if this call broke it.
+    async fn mark_broken(&self, member: MemberId, link: &ClaudeLink) -> Outcome {
+        let newly_broken = self
+            .store
+            .mark_claude_link_broken(member, link.generation, now())
+            .await?;
+        if !newly_broken {
+            return self.link_after_replacement(member).await;
+        }
+        if self.relink.send(member).is_err() {
+            tracing::warn!(%member, "nobody receives relink notices");
+        }
+        Err(AuthError::RelinkRequired)
+    }
+
+    /// What to hand out after a write found the link deleted, replaced by a
+    /// newer login, or already broken: whatever the store holds now.
+    async fn link_after_replacement(&self, member: MemberId) -> Outcome {
+        Ok(self.live_link(member).await?.access_token)
+    }
+
+    /// Reads the plan with a freshly refreshed access token and stores it on
+    /// the link of `generation`. A failure keeps the old plan.
+    async fn store_plan(&self, member: MemberId, generation: i64, access_token: &SecretString) {
+        let plan = match self.fetch_plan(access_token).await {
             Ok(plan) => plan,
             Err(err) => {
                 tracing::warn!(%member, error = %err, "couldn't read the plan after a refresh; keeping the old one");
-                PlanInfo::from_stored(link.plan.as_deref(), link.rate_limit_tier.as_deref())
+                return;
             }
         };
-        let updated = NewClaudeLink {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token.unwrap_or(link.refresh_token),
-            expires_at: now + tokens.expires_in,
-            plan: plan.stored_plan(),
-            rate_limit_tier: plan.rate_limit_tier,
-        };
-        if !self.store.update_claude_link(member, &updated).await? {
-            self.revoke(member, &updated.refresh_token).await;
-            return Err(AuthError::NotLinked);
+        let stored = plan.stored_plan();
+        if let Err(err) = self
+            .store
+            .update_claude_plan(
+                member,
+                generation,
+                stored.as_deref(),
+                plan.rate_limit_tier.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(%member, error = %err, "couldn't store the plan after a refresh");
         }
-        Ok(updated.access_token)
     }
 }
 
@@ -500,28 +720,34 @@ impl TokenSource for Auth {
     /// The member's access token, refreshed first if it expires within
     /// [`REFRESH_MARGIN`].
     ///
-    /// Concurrent calls for one member send at most one refresh: the first
-    /// takes the member's lock and refreshes, and the others wait for it and
-    /// then find the new token. After every refresh the plan is read again
-    /// from the profile and stored with the tokens (the old plan is kept if
+    /// The refresh runs in a task of its own that holds the member's lock,
+    /// so it stores the rotated refresh token (or marks the link broken)
+    /// even if this call is cancelled. Concurrent calls for one member share
+    /// one refresh and all get its result, success or failure. After a
+    /// refresh the plan is read again from the profile, after the member's
+    /// lock is released, and only the plan is stored (the old plan is kept if
     /// the profile can't be read).
     ///
-    /// If the token endpoint refuses the refresh token (HTTP 400, 401 or
-    /// 403), the link is marked broken and [`AuthError::RelinkRequired`] is
+    /// If the token endpoint says the refresh token is dead (HTTP 400 or 401
+    /// with `invalid_grant`, `invalid_client`, `invalid_scope` or
+    /// `unauthorized_client`, or an account-on-hold body on 400, 401 or 403),
+    /// the link is marked broken, the member is sent on
+    /// [`Auth::take_relink_notices`], and [`AuthError::RelinkRequired`] is
     /// returned, then and on every later call until the member logs in
     /// again. Any other refresh failure leaves the link alone: the current
     /// token is returned while it is still valid, and the error otherwise.
+    /// For [`REFRESH_BACKOFF`] after such a failure, a still-valid token is
+    /// returned without trying again.
     async fn access_token(&self, member: MemberId) -> Result<SecretString, AuthError> {
-        let link = self.live_link(member).await?;
+        let link = self.inner.live_link(member).await?;
         if !needs_refresh(&link, now()) {
             return Ok(link.access_token);
         }
-        let _guard = self.locks.lock(member).await;
-        let link = self.live_link(member).await?;
-        let now = now();
-        if !needs_refresh(&link, now) {
-            return Ok(link.access_token);
-        }
-        self.refresh(member, link, now).await
+        let mut flight = self.flight(member);
+        let outcome = match flight.wait_for(Option::is_some).await {
+            Ok(outcome) => outcome.clone(),
+            Err(_) => None,
+        };
+        outcome.unwrap_or(Err(AuthError::RefreshInterrupted))
     }
 }

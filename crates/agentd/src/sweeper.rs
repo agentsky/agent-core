@@ -64,6 +64,7 @@ mod tests {
                     user: UserId::new("u1"),
                 },
                 "Ada",
+                OffsetDateTime::from_unix_timestamp(0).unwrap(),
             )
             .await
             .unwrap();

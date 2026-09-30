@@ -151,7 +151,9 @@ impl Server {
     ///
     /// 1. Every listener stops accepting, and idle connections are closed.
     /// 2. In-flight requests and the sweeper get `server.drain_timeout_secs`
-    ///    to finish. Whatever is still running then is dropped.
+    ///    to finish. Whatever is still running then is dropped. If `abort`
+    ///    completes first, as a second shutdown signal does, it is dropped
+    ///    at once instead.
     /// 3. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`].
@@ -160,9 +162,10 @@ impl Server {
     ///
     /// If a listener or the sweeper stops before `shutdown` does. The others
     /// are still shut down gracefully first.
-    pub async fn run<F>(self, shutdown: F) -> anyhow::Result<()>
+    pub async fn run<F, G>(self, shutdown: F, abort: G) -> anyhow::Result<()>
     where
         F: Future<Output = ()> + Send,
+        G: Future<Output = ()> + Send,
     {
         let Self {
             app,
@@ -223,11 +226,14 @@ impl Server {
                 }
             }
         };
-        if tokio::time::timeout(drain_timeout, drain).await.is_err() {
-            tracing::warn!(
-                unfinished = tasks.len(),
-                "drain timeout elapsed; dropping in-flight work"
-            );
+        let cut_short = tokio::select! {
+            drained = tokio::time::timeout(drain_timeout, drain) => {
+                drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
+            }
+            () = abort => Some("shutdown forced; dropping in-flight work"),
+        };
+        if let Some(reason) = cut_short {
+            tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
         app.store().close().await;

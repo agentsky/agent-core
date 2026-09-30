@@ -182,7 +182,9 @@ description, and must pass T02's policy.
   | ctl | agentd's `sandbox` address, port 8081 | sandboxes | agentctl API |
 
 - Each listener binds its own address, never `0.0.0.0`, so a sandbox can't
-  reach the public routes. As a second guard, the public listener also refuses
+  reach the public routes. Configuration validation refuses an unspecified
+  address in any form, a public address inside the sandbox subnet, and a
+  proxy or ctl address outside it (T10). As a second guard, the public listener also refuses
   connections from the sandbox subnet. T16 has a Docker test that a sandbox
   reaches only ports 8080 and 8081.
 - A container's network identity is its IP on the `sandbox` network, read from
@@ -238,7 +240,9 @@ description, and must pass T02's policy.
     `terminal_reason: "api_error"`.
   - Other line types, such as `rate_limit_event`, `system/api_retry`,
     `active_goal`, `autocompact_state` and `system/commands_changed`, appear
-    too and must be ignored. Parse every line
+    too and must be ignored. With an OAuth token, `rate_limit_event` follows
+    the first `assistant` line of each process; with an API key it didn't
+    appear. Parse every line
     leniently: unknown `type` values are skipped, and unknown fields are
     allowed.
 - The transcript lands at
@@ -268,8 +272,10 @@ description, and must pass T02's policy.
   account.
 - Other crates find the binary with `testkit::fake_claude_path()`. Cargo only
   sets `CARGO_BIN_EXE_<name>` for a package's own integration tests. The helper
-  runs `$CARGO build -p testkit --bin fake-claude --message-format=json` once
-  per test process and reads the executable path from the artifact message.
+  runs `$CARGO build --locked -p testkit --bin fake-claude
+  --message-format=json` once per test process and reads the executable path
+  from the artifact message. That call blocks, so tests make it before
+  starting any timeout.
   It passes `--target-dir` with the directory the running test executable
   was built in, because `cargo llvm-cov` names its target directory on the
   command line, where a nested cargo can't see it
@@ -647,7 +653,10 @@ Deliverables:
 - `MockSurface`, implementing `Surface`. It records every `post`, `edit`,
   `react` and `upload` in an inspectable log, serves canned `history`, has
   configurable `Caps`, and has an `inject(InboundEvent)` helper feeding the
-  `events` channel.
+  `events` channel. It honors its `Caps` (`Unsupported` for `edit` without
+  `supports_edit` and for thread targets without `supports_threads`), and
+  `fail_next(op, error)` makes the next call of an operation fail with a
+  platform error such as `RateLimited` or `Unauthorized`.
 - A `fake-claude` binary (`src/bin/fake-claude.rs`) that:
   - Accepts the full launch flag set from the design. It fails with exit 2 on
     unknown flags, and when both `--session-id` and `--resume` are given, or
@@ -661,7 +670,11 @@ Deliverables:
     a 200.
   - Emits the `init`, `assistant` and `result` lines from the script file named
     by `FAKE_CLAUDE_SCRIPT` (JSON: a list of turns, each with reply text,
-    `is_error`, optional delay, optional crash).
+    `is_error`, optional delay, optional crash, and optional raw
+    `extra_lines`, which may be unknown line types or not JSON at all). Like
+    the real CLI with an OAuth token, it also prints a `rate_limit_event`
+    after the first reply of each process, so a runner test always sees a
+    line it must skip.
   - Appends to the transcript at
     `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<id>.jsonl`.
   - Can run `agentctl` commands listed in the script, to exercise the ctl API
@@ -809,15 +822,20 @@ Deliverables:
   JavaScript string length, so its limit counts UTF-16 code units, and an emoji
   counts as two. It:
   - Prefers paragraph breaks, then line breaks, then spaces.
-  - Never cuts inside a Slack `<…>` token, a Markdown link, a mention or a
-    multi-byte character. Cuts fall on `char` boundaries.
+  - Never cuts inside a Slack `<…>` token, an HTML entity, a Markdown link
+    (inline, or a reference with a definition in the text), a mention or a
+    grapheme cluster, nor right before an `@` that follows anything but
+    whitespace or `>`. Cuts fall on `char` boundaries.
   - Closes an open code fence at the end of a chunk and reopens it, with the
     same info string, at the start of the next.
 - `render::directives::extract(text) -> (String, Vec<Directive>)` for
   `[[react: <emoji>]]` (the only directive for now). Directives inside code are
-  not parsed.
+  not parsed. Emoji names longer than 64 characters are dropped.
 - `render::rocketchat::to_markdown(md, directory)`: pass-through, neutralizing
-  `@all` and `@here` outside code, with the same `@Name` resolution as Slack
+  `@all` and `@here` everywhere, code included, because the server finds
+  mentions in the raw text (see
+  [impl-notes](impl-notes.md#code-doesnt-protect-a-broadcast-on-rocketchat)),
+  with the same `@Name` resolution as Slack
   (the directory returns usernames there; see
   [impl-notes](impl-notes.md#rocketchat-mentions-need-a-username-not-an-id)).
 - Per-surface limits as constants: Slack 3,000 characters per `text` chunk
@@ -867,6 +885,14 @@ Deliverables:
 - `Command::is_secret_bearing()` is true for `Login { code: Some }`,
   `SlackToken` and `Admin(ApiKey { set })`, so callers can enforce
   private-channel rules and redact logs.
+- `ParseError::is_secret_bearing()` says the same of text that fails to
+  parse, including misspelt commands (`api-key set <key>` without `admin`,
+  `slack_token …`) and any word holding a known token prefix (`sk-ant-`,
+  `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`)
+  ([impl-notes](impl-notes.md#misspelt-secret-bearing-commands-arent-commands-at-all)).
+- A `skill add` source is an `https://` Git URL with an optional `#ref`, in a
+  narrow character set; anything else, including a word starting with `-`, is
+  a parse error ([impl-notes](impl-notes.md#a-skill-source-reaches-git-clone)).
 - `Command::help()` gives short usage text per command. An unknown command
   returns the help text as the error message.
 
@@ -915,15 +941,26 @@ Deliverables:
   rather than failing.
 - A `TokenSource` trait for use by the proxy:
   `async fn access_token(&self, member) -> Result<SecretString>`. It refreshes
-  when the token expires within 5 minutes, single-flight per member with a keyed
-  async mutex, re-reads the plan after every refresh, and stores both.
-- A refresh the token endpoint refuses (HTTP 400, 401 or 403) returns
-  `AuthError::RelinkRequired { newly_broken }` and marks the link broken;
-  `newly_broken` is true only for the call that set `broken_at`. Other
-  failures (network, timeout, 5xx, 429, an unreadable body) leave the link
-  alone and serve the current token while it is valid
-  ([impl-notes](impl-notes.md#a-refresh-failure-is-not-always-a-dead-link)).
+  when the token expires within 5 minutes. The refresh runs in a spawned task
+  that holds the member's keyed async mutex and finishes even if every caller
+  is dropped; concurrent callers share its result, success or failure
+  ([impl-notes](impl-notes.md#a-cancelled-caller-lost-the-refresh)). After a
+  failure that doesn't break the link, a still-valid token is served without
+  retrying for 30 s. The tokens are stored first; the plan is re-read after
+  the lock is released and stored on its own.
+- A refresh whose response says the refresh token is dead (HTTP 400 or 401
+  with `invalid_grant`, `invalid_client`, `invalid_scope` or
+  `unauthorized_client`, or an account-on-hold body on 400, 401 or 403, as
+  Claude Code 2.1.285 reads them) returns `AuthError::RelinkRequired` and
+  marks the link broken. The member is sent once per failure, by the refresh
+  task, on the channel `Auth::take_relink_notices()` returns. Other failures
+  (network, timeout, 5xx, 429, any other 4xx such as a proxy's HTML 403, an
+  unreadable body) leave the link alone and serve the current token while it
+  is valid
+  ([impl-notes](impl-notes.md#a-4xx-from-the-token-endpoint-is-not-always-a-dead-token)).
   The DM to the member is sent by agentd (T13), not here.
+- `status(member) -> LinkStatus { linked, plan, broken }`, read without the
+  tokens, for T13's `me`.
 - `logout(member)`: deletes the link, then revokes the refresh token at
   `revoke_url`, best effort, as Claude Code 2.1.285's logout does.
 
@@ -959,7 +996,7 @@ Deliverables:
 - An axum public listener with `GET /healthz`, which checks the store. The
   internal listeners are placeholders that later tasks fill.
 - Graceful shutdown on SIGTERM: stop accepting, then drain for a configurable
-  timeout.
+  timeout. A second SIGTERM or SIGINT drops in-flight work at once.
 - An `App` struct holding the shared state (config, store, later the surfaces,
   runner and proxy) that later tasks extend. Keep it in
   `crates/agentd/src/app.rs`.
@@ -1002,10 +1039,15 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
   - `rooms.media/{rid}` (multipart) then `rooms.mediaConfirm/{rid}/{fileId}`
     with `tmid`. `rooms.upload/{rid}` was removed in Rocket.Chat 8.0
     ([impl-notes](impl-notes.md#roomsupload-is-gone-in-rocketchat-80)).
+    Files over a configurable size (100 MiB by default, Rocket.Chat's
+    default `FileUpload_MaxFileSize`) are refused before they are read
+    ([impl-notes](impl-notes.md#uploads-are-capped-and-read-once)).
   - `channels.history`, `groups.history`, `im.history` and
     `chat.getThreadMessages` for `history`.
-- Handles the rate limiter: honor `x-ratelimit-reset` on 429, and retry at most
-  once.
+- Handles the rate limiter: honor `x-ratelimit-reset` on 429, measured
+  against the response's `Date` header rather than the local clock
+  ([impl-notes](impl-notes.md#clock-skew-defeated-the-429-retry)), and retry
+  at most once.
 - `testkit::rocketchat::FakeRest`: wiremock routes for the above.
 
 Acceptance: a wiremock test per method, including error mapping to
@@ -1104,12 +1146,14 @@ Deliverables:
     told to revoke that key at Anthropic.
   - `logout`: delete the link (and, later, the Slack configuration token; T30
     adds that).
-  - `me`: link status and plan. The usage line is added in T27, the manager app
-    name in T30.
-- Relink notice: when `TokenSource` reports `RelinkRequired`, DM the member.
-  Send it only when `claude_links.broken_at` goes from empty to set
-  (`RelinkRequired { newly_broken: true }`), so there is one notice per
-  failure.
+  - `me`: link status and plan, from `Auth::status`. The usage line is added in
+    T27, the manager app name in T30.
+- Relink notice: at startup, take the receiver from
+  `Auth::take_relink_notices()` and DM each member it yields. `auth`'s refresh
+  task sends a member exactly when it sets `claude_links.broken_at`, whoever
+  asked for the token (a command, or T18's proxy on a session's behalf), so
+  there is one notice per failure and none is lost when the caller goes away.
+  Callers that get `RelinkRequired` send nothing themselves.
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
@@ -1157,6 +1201,10 @@ Deliverables:
   the manager invites it where the manager is a member. `allow` and `deny` come
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
+- A realtime connection is `RocketChatSurface::events` (T12). agentd builds
+  each surface with a store-backed `Dedup` and one `BotRoles` over the
+  manager's client, shared by every surface
+  ([impl-notes](impl-notes.md#messages-dont-carry-the-senders-roles)).
 
 Acceptance: tests with `FakeRest` and `FakeDdp` for create, a name collision,
 persona edit by a non-owner (refused), pause (events ignored), delete, and
@@ -1444,6 +1492,10 @@ Deliverables:
   - Replaces only that header's value: a subscription credential from
     `TokenSource`, or the community API key from a `CommunityKey` trait.
     T26 implements it over the store; until then tests use a fixed key.
+  - When `TokenSource` returns `RelinkRequired` or `NotLinked`, answers the
+    client with an error and does nothing else: the relink DM comes from
+    `auth`'s relink notices, which agentd forwards (T13). Dropping a request
+    mid-refresh is safe; the refresh finishes in its own task.
   - Leaves the body and every other header untouched, and streams request and
     response bodies (SSE) without buffering.
   - Answers `HEAD /api/hello` locally with 200.
@@ -1644,27 +1696,48 @@ Deliverables:
 
 - A pure function `route(event, agent, view: &dyn RouterView) -> Decision`.
   `RouterView` answers:
-  - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
-    and user as every identity is, so a matching user id from another team or
-    server is never taken for a managed agent. The router asks it for
-    `event.sender` when `sender_is_bot` is true. Surfaces put the bot's user
-    id in both `sender.user` and `sender_bot_user`, so the router needs only
-    `sender`; a bot known only by its bot id matches no binding.
-  - `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`.
+  - `managed_bot(MemberKey) -> Option<ManagedBot>`, where `ManagedBot` is
+    `Agent(AgentId)` or `Manager`, keyed by surface, team and user as every
+    identity is, so a matching user id from another team or server is never
+    taken for a managed bot. The router asks it for `event.sender`, and for
+    every sender, whatever `sender_is_bot` says, so a managed agent's post is
+    never routed as a person's
+    ([impl-notes](impl-notes.md#surface-flags-arent-trusted-for-managed-agents)),
+    and the manager bot's posts are ignored
+    ([impl-notes](impl-notes.md#the-manager-bot-had-no-identity-in-the-view)).
+    Surfaces put the bot's user id in both `sender.user` and
+    `sender_bot_user`, so the router needs only `sender`; a bot known only by
+    its bot id is an unmanaged bot without a lookup. Mentions are looked up
+    the same way, in the conversation's surface and team.
+  - `binding_agent(BindingId) -> Option<AgentId>`, so a one-to-one DM counts
+    only for the agent whose binding received it
+    ([impl-notes](impl-notes.md#a-dm-didnt-say-whose-dm-it-is)).
+  - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
+    accepted only when `agent` is the agent that sent the message
+    ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
   - `member_for(MemberKey)`, `is_linked(member)`.
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
-  - `policy(agent)`, which returns allow and deny (T27 fills it; the default
-    allows).
-  - `is_banned(member)` (T27 fills it; the default is false).
+  - `policy(agent) -> Option<AgentPolicy>`, which returns allow and deny and
+    the effective hop cap (T27 fills it; an agent with no rules has
+    `AgentPolicy::default()`, which allows, with a cap of 3).
+  - `is_banned(requester) -> Option<bool>` (T27 fills it).
+  - `policy` and `is_banned` fail closed: `None` means the view doesn't
+    know, and the router refuses with `RefuseReason::PolicyUnavailable`. The
+    trait's rustdoc lists every lookup `route` may make for an event, in
+    order
+    ([impl-notes](impl-notes.md#a-synchronous-view-over-an-asynchronous-store-failed-open)).
 - `Decision` is one of:
   - `Ignore(reason)`.
-  - `LinkPrompt`.
+  - `LinkPrompt { requester }`, naming who should link: the sender, or a
+    hop's inherited requester.
   - `Run { requester, hop, credential: CredentialRef, scope: ScopeKind,
     side: Owner | Public }`.
   - `Refuse(reason)`, used for paused agents, bans, deny rules and the hop
     cap.
+  - Reasons are enums, not strings. The order of the checks is in the
+    crate rustdoc ([impl-notes](impl-notes.md#the-plan-and-the-design-name-no-order-for-the-checks)).
 - The flowchart from the design, each branch a named test:
   - Unmanaged bot, ignored, including one known only by its bot id
     (`sender_bot_user: None`).
@@ -1682,7 +1755,9 @@ Deliverables:
   - Unlinked with the community key, community credential.
   - Unlinked without it, a link prompt.
   - A thread reply that doesn't mention the agent and isn't a reply to it,
-    ignored.
+    ignored. A reply to the agent that mentions only another managed agent,
+    ignored too
+    ([impl-notes](impl-notes.md#a-reply-naming-another-agent-ran-two-turns)).
   - Over the hop cap, refused.
 - The model is chosen from the requester's plan by a `ModelPolicy`
   (configuration maps a plan to a model, with a default).
@@ -1724,8 +1799,14 @@ Deliverables:
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
-     `RouterView`. The candidates are every managed agent mentioned, the
-     agent whose DM it is, and the agent that posted the thread root
+     `RouterView`. The store is asynchronous and the view is not, so first
+     load everything the lookups listed in `RouterView`'s rustdoc need for
+     the event and every candidate, the manager bot's identities included.
+     Until T27, `policy` answers `AgentPolicy::default()` and `is_banned`
+     answers `Some(false)`. A lookup the view can't answer withholds the
+     turn: `None` from `is_banned` or `policy` is refused as
+     `PolicyUnavailable`. The candidates are every managed agent mentioned,
+     the agent whose DM it is, and the agent that posted the thread root
      (`reply_to`, looked up in `message_refs`). When the surface has
      `per_binding_delivery`, only the receiving binding's agent is a
      candidate, since each other agent gets its own copy.
@@ -1742,8 +1823,8 @@ Deliverables:
         hop.
      6. Apply reactions, and send the `agentctl post` messages the turn queued
         (T15 already checked their targets).
-  5. On `LinkPrompt`, reply in the thread with a private-link instruction
-     (manager bot DM or ephemeral where the surface allows).
+  5. On `LinkPrompt`, send the decision's `requester` a private-link
+     instruction (manager bot DM or ephemeral where the surface allows).
 - Turn message builder:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
@@ -1828,8 +1909,10 @@ Deliverables:
 - Skill storage per agent: `<data>/skills/<agent>/<name>/`, mounted read-only
   into every session of that agent. The bundled skill is always present.
 - `/agent skill add <name> <source>`, where `source` is one of:
-  - a Git URL with an optional `#ref`, cloned by agentd on the egress network,
-    shallow, with no submodules;
+  - an `https://` Git URL with an optional `#ref`, in the form T08's parser
+    accepts, cloned by agentd on the egress network, shallow, with no
+    submodules, passing the URL after `--` and the ref only inside an
+    `--opt=value` word, so neither can be read as an option;
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
@@ -1901,8 +1984,16 @@ Deliverables:
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
+  `AgentPolicy::max_hops` is the effective cap, the global one lowered by the
+  agent's, and allow and deny follow `AgentPolicy::permits` (T22). This task
+  extends T22's `AgentPolicy` with the daily turn cap and `RefuseReason`
+  with a variant for it, and fills `policy` and `is_banned` from these
+  tables, returning `None` only when a lookup fails, never for an agent or
+  member with no rows.
 - `/agent allow|deny <name> <target>`. A target is a member (`@user`), a
-  channel (`#room`), or `everyone`. Deny wins, and the default allows
+  channel (`#room`), or `everyone`. A member rule stores the identity and
+  the member it belongs to, as `PolicyTarget::Member { key, member }`, so it
+  covers the member on every surface. Deny wins, and the default allows
   everyone.
 - Thread caps from `[limits]`:
   - Agent turns per thread per hour.
@@ -2358,3 +2449,8 @@ Not scheduled. Each needs a decision before it becomes a task.
   [Alternatives considered](design.md#alternatives-considered)).
 - **Managed Agents backend** for channel agents funded by a community API key
   (design, same section).
+- **Backfill after a Rocket.Chat reconnect.** A realtime connection that
+  drops misses what was posted until it is back (T12). Every bot in a room
+  would need to miss it for a message to be lost, but a lone agent in a room,
+  or an agentd restart, loses it. Fetching each room's history since the last
+  message seen, through the same deduplication, would close the gap.

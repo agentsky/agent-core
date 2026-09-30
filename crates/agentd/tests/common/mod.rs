@@ -14,9 +14,9 @@ listen = "127.0.0.1:0"
 drain_timeout_secs = 5
 
 [internal]
-proxy_listen = "127.0.0.1:0"
-ctl_listen = "127.0.0.1:0"
-sandbox_subnet = "172.30.0.0/24"
+proxy_listen = "127.0.0.2:0"
+ctl_listen = "127.0.0.2:0"
+sandbox_subnet = "127.0.0.2/32"
 
 [store]
 url = "sqlite::memory:"
