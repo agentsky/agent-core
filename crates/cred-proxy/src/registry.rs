@@ -268,6 +268,21 @@ impl Registry {
         Ok(())
     }
 
+    /// Clears the placeholder's pointer, for the turn that ended, however
+    /// it ended. Until the next [`point`](Self::point), requests carrying it
+    /// are refused. A request authorized before the call keeps its
+    /// credential.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Unknown`] if the placeholder was revoked.
+    pub fn unpoint(&self, id: PlaceholderId) -> Result<(), RegistryError> {
+        let mut entries = self.lock();
+        let entry = entries.get_mut(&id).ok_or(RegistryError::Unknown)?;
+        entry.credential = None;
+        Ok(())
+    }
+
     /// Revokes the placeholder. Returns whether it was live.
     pub fn revoke(&self, id: PlaceholderId) -> bool {
         self.lock().remove(&id).is_some()
@@ -431,6 +446,34 @@ mod tests {
         assert_eq!(
             registry.authorize(sub.expose_secret(), IP, CredentialKind::Subscription),
             Err(Denial::NotPointed(session))
+        );
+    }
+
+    #[test]
+    fn unpoint_clears_the_pointer_until_the_next_point() {
+        let registry = Registry::new();
+        let session = SessionId::new_v4();
+        let placeholder = registry.mint(session, IP, CredentialKind::ApiKey).unwrap();
+        let token = placeholder.expose_secret();
+        let key = CredentialKind::ApiKey;
+        registry.unpoint(placeholder.id()).unwrap();
+        registry
+            .point(placeholder.id(), CredentialRef::Community)
+            .unwrap();
+        assert!(registry.authorize(token, IP, key).is_ok());
+        registry.unpoint(placeholder.id()).unwrap();
+        assert_eq!(
+            registry.authorize(token, IP, key),
+            Err(Denial::NotPointed(session))
+        );
+        registry
+            .point(placeholder.id(), CredentialRef::Community)
+            .unwrap();
+        assert!(registry.authorize(token, IP, key).is_ok());
+        assert!(registry.revoke(placeholder.id()));
+        assert_eq!(
+            registry.unpoint(placeholder.id()),
+            Err(RegistryError::Unknown)
         );
     }
 

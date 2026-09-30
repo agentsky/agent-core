@@ -622,6 +622,100 @@ async fn revoked_placeholder_is_refused() {
 }
 
 #[tokio::test]
+async fn unpointed_placeholder_is_refused() {
+    let fake = fake_anthropic().await;
+    let proxy = Proxy::start(&fake.uri()).await;
+    let (_, placeholder) = proxy.linked(LOCAL, "real-oauth-token");
+    let send = || {
+        client()
+            .post(proxy.url("/v1/messages"))
+            .header("authorization", bearer(&placeholder))
+            .body(MESSAGE)
+            .send()
+    };
+    assert_eq!(send().await.unwrap().status(), 200);
+    proxy.registry.unpoint(placeholder.id()).unwrap();
+    let idle = send().await.unwrap();
+    assert_eq!(idle.status(), 403);
+    let body: serde_json::Value = idle.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "permission_error");
+    assert_eq!(
+        body["error"]["message"],
+        "No turn is running for this placeholder."
+    );
+    assert_eq!(fake.requests().await.len(), 1);
+    assert!(proxy.registry.revoke(placeholder.id()));
+    assert_eq!(
+        proxy.registry.unpoint(placeholder.id()),
+        Err(cred_proxy::RegistryError::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn refuses_methods_outside_the_allowlist() {
+    let listener = TcpListener::bind((LOCAL, 0)).await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let reached = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&reached);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            *lock(&counter) += 1;
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).await.is_ok() {
+                head.push(byte[0]);
+            }
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: message/http\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                head.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.write_all(&head).await;
+        }
+    });
+    let proxy = Proxy::start(&upstream).await;
+    let (_, placeholder) = proxy.linked(LOCAL, "real-oauth-token");
+    let track = reqwest::Method::from_bytes(b"TRACK").unwrap();
+    let propfind = reqwest::Method::from_bytes(b"PROPFIND").unwrap();
+    for method in [reqwest::Method::TRACE, track, propfind] {
+        let response = client()
+            .request(method.clone(), proxy.url("/v1/messages"))
+            .header("authorization", bearer(&placeholder))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 405, "{method}");
+        assert_eq!(
+            response.headers()["allow"],
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
+        );
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("real-oauth-token"), "{method}: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    }
+    assert_eq!(*lock(&reached), 0, "a refused method reached the upstream");
+
+    let echoed = client()
+        .get(proxy.url("/v1/models"))
+        .header("authorization", bearer(&placeholder))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(echoed.status(), 200);
+    assert!(
+        echoed
+            .text()
+            .await
+            .unwrap()
+            .to_ascii_lowercase()
+            .starts_with("get /v1/models http/1.1\r\n")
+    );
+    assert_eq!(*lock(&reached), 1);
+}
+
+#[tokio::test]
 async fn answers_hello_locally() {
     let fake = fake_anthropic().await;
     let proxy = Proxy::start(&fake.uri()).await;

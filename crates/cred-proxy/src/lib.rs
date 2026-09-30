@@ -9,8 +9,9 @@
 //! - [`Registry`] holds the live placeholders. agentd's turn hooks
 //!   [`mint`](Registry::mint) one per `claude` process, bound to the
 //!   session and its container's address, [`point`](Registry::point) it at
-//!   each turn's credential, and [`revoke`](Registry::revoke_session) it
-//!   before the container stops and again when it dies.
+//!   each turn's credential, [`unpoint`](Registry::unpoint) it when the turn
+//!   ends, and [`revoke`](Registry::revoke_session) it before the container
+//!   stops and again when it dies.
 //! - [`CredProxy`] is the reverse proxy. agentd serves
 //!   [`CredProxy::into_router`] on the proxy listener. Its rustdoc lists the
 //!   rules it enforces.
@@ -26,7 +27,8 @@
 //!    never receives a credential of the other kind, and nothing is
 //!    substituted in bodies or other headers.
 //! 2. One placeholder per `claude` process, bound to its container's
-//!    address and pointed at the current turn's credential.
+//!    address and pointed at the current turn's credential only while that
+//!    turn runs.
 
 #![warn(missing_docs)]
 

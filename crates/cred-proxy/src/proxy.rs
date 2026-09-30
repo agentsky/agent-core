@@ -10,8 +10,8 @@ use axum::Router;
 use axum::body::{Body, HttpBody as _};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, HOST, PROXY_AUTHENTICATE,
-    PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
+    ALLOW, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, EXPECT, HOST,
+    PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
@@ -30,6 +30,23 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The header an API key travels in.
 const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+
+/// The methods the proxy forwards. Every other one is refused before any
+/// credential is looked up: `TRACE` would echo the real credential back,
+/// `CONNECT` would open a tunnel, and an extension method has no known
+/// meaning to the upstream.
+const FORWARDED_METHODS: [Method; 7] = [
+    Method::GET,
+    Method::HEAD,
+    Method::POST,
+    Method::PUT,
+    Method::PATCH,
+    Method::DELETE,
+    Method::OPTIONS,
+];
+
+/// The `Allow` header of a refused method's answer: the forwarded methods.
+const ALLOWED: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
 
 /// Headers that describe one connection, never forwarded in either
 /// direction (RFC 9110 section 7.6.1), next to any header `Connection`
@@ -68,9 +85,11 @@ pub enum ProxyError {
 ///    address no live placeholder is bound to.
 /// 2. Answers `HEAD /api/hello`, the CLI's connectivity check, with 200
 ///    itself.
-/// 3. Refuses `CONNECT` and absolute-form requests, so nothing the client
-///    sends can name another host. The `Host` header is dropped; the
-///    upstream's own is sent.
+/// 3. Refuses every method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
+///    `DELETE` and `OPTIONS`, so `TRACE` can't echo the real credential and
+///    `CONNECT` can't open a tunnel, and refuses absolute-form requests, so
+///    nothing the client sends can name another host. The `Host` header is
+///    dropped; the upstream's own is sent.
 /// 4. Takes the placeholder from `Authorization: Bearer` or `x-api-key`,
 ///    exactly one of them, and refuses it unless it is live, bound to that
 ///    address, of the kind its header carries, and pointed at a credential.
@@ -157,8 +176,8 @@ impl CredProxy {
         if !self.registry.knows(peer) {
             return Err(refuse(Refusal::UnknownSource, None));
         }
-        if request.method() == Method::CONNECT {
-            return Err(refuse(Refusal::Connect, None));
+        if !FORWARDED_METHODS.contains(request.method()) {
+            return Err(refuse(Refusal::Method, None));
         }
         let uri = request.uri();
         if request.version() < Version::HTTP_2
@@ -432,7 +451,7 @@ struct Rejected {
 enum Refusal {
     NoPeer,
     UnknownSource,
-    Connect,
+    Method,
     AbsoluteForm,
     MissingCredential,
     BothCredentials,
@@ -456,7 +475,7 @@ impl Refusal {
         match self {
             Self::NoPeer => "no peer address",
             Self::UnknownSource => "unknown source address",
-            Self::Connect => "CONNECT",
+            Self::Method => "method not forwarded",
             Self::AbsoluteForm => "absolute-form target",
             Self::MissingCredential => "no credential header",
             Self::BothCredentials => "both credential headers",
@@ -490,10 +509,10 @@ impl Refusal {
                 "permission_error",
                 "This address has no credential placeholder.",
             ),
-            Self::Connect => (
+            Self::Method => (
                 StatusCode::METHOD_NOT_ALLOWED,
                 "invalid_request_error",
-                "CONNECT is not supported here.",
+                "Only GET, HEAD, POST, PUT, PATCH, DELETE and OPTIONS are forwarded.",
             ),
             Self::AbsoluteForm => (
                 StatusCode::FORBIDDEN,
@@ -576,12 +595,18 @@ impl IntoResponse for Refusal {
             "type": "error",
             "error": {"type": kind, "message": message},
         });
-        (
+        let mut response = (
             status,
             [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
             body.to_string(),
         )
-            .into_response()
+            .into_response();
+        if self == Self::Method {
+            response
+                .headers_mut()
+                .insert(ALLOW, HeaderValue::from_static(ALLOWED));
+        }
+        response
     }
 }
 
@@ -698,11 +723,25 @@ mod tests {
     }
 
     #[test]
+    fn the_allow_header_lists_the_forwarded_methods() {
+        let listed: Vec<&str> = FORWARDED_METHODS.iter().map(Method::as_str).collect();
+        assert_eq!(listed.join(", "), ALLOWED);
+        let response = Refusal::Method.into_response();
+        assert_eq!(response.headers()[ALLOW], ALLOWED);
+        assert!(
+            !Refusal::NotPointed
+                .into_response()
+                .headers()
+                .contains_key(ALLOW)
+        );
+    }
+
+    #[test]
     fn every_refusal_has_a_reason_and_a_json_answer() {
         let all = [
             Refusal::NoPeer,
             Refusal::UnknownSource,
-            Refusal::Connect,
+            Refusal::Method,
             Refusal::AbsoluteForm,
             Refusal::MissingCredential,
             Refusal::BothCredentials,

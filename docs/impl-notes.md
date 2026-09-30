@@ -2349,14 +2349,14 @@ headers of each refusal against the token presented. In order of checking:
 | --- | --- |
 | No `ConnectInfo` on the request (a wiring bug) | 500 |
 | Peer address with no live placeholder, `HEAD /api/hello` included | 403 |
-| `CONNECT` (until T19) | 405 |
+| Any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` (`TRACE`, `TRACK`, `CONNECT` until T19, extension methods) | 405, with `Allow` |
 | Absolute-form target on HTTP/1 | 403 |
 | `HEAD /api/hello` from a known address | 200, answered locally |
 | No credential header, or `Authorization` that isn't `Bearer` | 401 |
 | Both `Authorization` and `x-api-key`, or either one repeated | 400 |
 | Unknown or revoked placeholder, or one bound to another address | 401 |
 | Placeholder in the header of the other kind | 401 |
-| Placeholder not pointed at a credential | 403 |
+| Placeholder not pointed at a credential: before its first turn or between turns | 403 |
 | `NotLinked` or `RelinkRequired` from `TokenSource`, or no community key | 401 |
 | Any other credential error | 503 |
 | Upstream unreachable | 502 |
@@ -2365,6 +2365,11 @@ A placeholder bound to another address gets exactly the answer of an unknown
 one, so the answer doesn't confirm that a stolen token exists; the log line
 tells them apart. An end-to-end test shows `fake-claude` reporting
 `api_error_status: 401` for a revoked placeholder.
+
+The method check is an allowlist, not a refusal of `CONNECT` alone: a
+`TRACE` forwarded with the swapped header would have an echoing upstream
+send the real credential back into the sandbox, and an extension method
+means nothing the CLI needs. It runs before any credential lookup.
 
 HTTP/2 requests always carry `:authority`, so the absolute-form check applies
 to HTTP/1 only; for HTTP/2 the authority is ignored like `Host`. Every
@@ -2387,10 +2392,21 @@ refuses with 401 if it was revoked meanwhile, since revocation means the
 container is going away. A request already forwarded is not cut off by
 revocation; stopping the container ends it.
 
-The pointer stays set between turns: the plan points it at each turn's start
-and never clears it, so a background process the model left running in the
-container can still spend the last requester's credential until the next
-turn re-points it or the container is reaped.
+`unpoint` clears the pointer at turn end (T21's `turn_finished`, on every
+exit), so between turns every request is refused with 403 "No turn is
+running for this placeholder." Like re-pointing, it changes only later
+requests: a request authorized before the turn ended keeps its credential,
+through its token lookup and its whole response. That is a choice. Checking
+the pointer again after the token lookup, as liveness is, would also refuse
+a request that arrived during the turn and was still waiting on a refresh
+when it ended; since `turn_finished` runs once the turn's result is in, such
+a request is the model's own last call or a leftover process's, and the
+window is one token lookup long.
+
+What remains: a background process left from turn N can still spend turn
+N+1's credential while N+1 runs, whoever its requester is. Only killing the
+processes a turn leaves behind when it ends removes that; the plan's
+Deferred work has an entry.
 
 ### Headers the proxy changes besides the credential
 
@@ -2455,7 +2471,8 @@ members' turns on that key share.
 
 **Solution.** Not restricted in T18: which paths the real CLI needs isn't
 known without a live capture, and refusing one it needs would break turns.
-The plan's Deferred work has an entry for a path allowlist.
+The plan's Deferred work has an entry for a path allowlist. Methods are
+limited already (see the refusal table).
 
 ## T22: router
 

@@ -1501,6 +1501,8 @@ Deliverables:
     credential of the other kind. Callers hold the placeholder's non-secret
     `PlaceholderId` for this and for revoking
     ([impl-notes](impl-notes.md#t18-credential-proxy)).
+  - `unpoint(placeholder_id)`, called at turn end, however the turn ended.
+    Until the next `point`, requests carrying the placeholder are refused.
   - `revoke(placeholder_id)` and `revoke_session(session)`.
   - An address belongs to one session: minting for an address revokes other
     sessions' placeholders bound to it.
@@ -1525,8 +1527,11 @@ Deliverables:
   - Answers `HEAD /api/hello` locally with 200.
   - Strips hop-by-hop headers.
   - Upstream is the one configured host. No `Host` header or absolute URI from
-    the client can redirect it: absolute-form requests get 403 and `CONNECT`
-    gets 405 until T19 takes it over.
+    the client can redirect it: absolute-form requests get 403.
+  - Forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and
+    `OPTIONS`. Every other method, `TRACE` and `CONNECT` included, gets 405
+    before any credential is looked up, until T19 takes `CONNECT` over on the
+    same listener.
 - Metrics hook: a `ProxyObserver` trait called with `(session, status, usage
   headers)`, and the credential the request used, since the session's
   pointer changes from turn to turn. T27 uses it for the meter.
@@ -1543,6 +1548,9 @@ Acceptance, as tests named after the rules:
 - `streams_sse_without_buffering`: the first event arrives before the upstream
   finishes.
 - `revoked_placeholder_is_refused`.
+- `unpointed_placeholder_is_refused`: after the turn ends, nothing reaches
+  the upstream.
+- `refuses_methods_outside_the_allowlist`: `TRACE` and an extension method.
 - An end-to-end test with `fake-claude` and `fake_anthropic()`.
 
 Out of scope: egress for other hosts (T19), bearer swap for other CLIs
@@ -1668,7 +1676,9 @@ Deliverables:
     `LaunchSpec.env`.
   - `turn_starting(session, &TurnRequest)`, which points the placeholder at
     the turn's credential and records the turn on the agentctl token.
-  - `turn_finished(session, turn)`, which clears the turn from the token.
+  - `turn_finished(session, turn)`, which clears the turn from the token and
+    unpoints the placeholder. It is called on every exit from the turn:
+    success, error, timeout, interrupt and cancellation.
   - `process_stopping(session)`, which revokes the placeholder and the token. It
     is called before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.
@@ -1821,13 +1831,18 @@ Deliverables:
   `reap_orphans` at startup, and documents the section in
   `config/agentd.example.toml`.
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
-  placeholders with T18's `Registry`, sets the egress proxy variables from
+  placeholders with T18's `Registry`, and `turn_finished` calls
+  `Registry::unpoint`. It sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
   turn's outbox, and `revoke_process_token`). It builds `App` with a
   `SurfaceLookup` for `agentctl history`, and resolves the short message ids
   it shows the model where agentctl takes a message id
   ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
+- agentd serves T18's `CredProxy` on `Routers.proxy`, with the `Registry`
+  shared with its `TurnHooks`. A `[proxy] upstream` key, default
+  `https://api.anthropic.com`, sets the upstream, and
+  `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
@@ -2491,7 +2506,15 @@ Not scheduled. Each needs a decision before it becomes a task.
   Limiting it to the paths the CLI uses (`/v1/messages`,
   `/v1/messages/count_tokens`, and whatever else a live capture with
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` shows) needs that capture
-  first, since refusing a path the CLI needs breaks turns.
+  first, since refusing a path the CLI needs breaks turns. Methods are
+  already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
+  `DELETE` and `OPTIONS`.
+- **Killing leftover processes at turn end.** T18 unpoints the placeholder
+  when a turn ends, so a background process the model left running can't
+  spend credentials between turns. It can still spend turn N+1's
+  credential while turn N+1 runs, whoever its requester is. Only killing
+  the processes a turn leaves behind in the container when it ends removes
+  that.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.
