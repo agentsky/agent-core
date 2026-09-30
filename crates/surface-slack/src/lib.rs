@@ -45,7 +45,7 @@ pub mod web;
 pub use directory::{MemberDirectory, TeamDirectory};
 pub use inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
 pub use ingress::{
-    BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, ingress,
+    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, ingress,
 };
 pub use surface::SlackSurface;
 pub use web::{ConfigToken, CreatedApp, Installation, SlackClient, WebApi};

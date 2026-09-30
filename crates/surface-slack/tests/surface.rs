@@ -11,7 +11,7 @@ use core_types::{
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::normalize::{self, Context};
+use surface_slack::normalize::{self, Context, MAX_ID_TAIL};
 use surface_slack::surface::CAPS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
@@ -1281,7 +1281,7 @@ async fn a_bot_id_not_shaped_like_slacks_is_never_looked_up() {
     .await;
     for bot_id in [
         format!("B{}", "A".repeat(900_000)),
-        format!("B{}", "A".repeat(21)),
+        format!("B{}", "A".repeat(MAX_ID_TAIL + 1)),
         "B".to_owned(),
         "b0lower".to_owned(),
         "U0HUMAN01".to_owned(),

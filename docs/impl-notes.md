@@ -5815,6 +5815,88 @@ The ingress's burst test still runs on the clock, with bounds that allow
 for the refill while it runs; the buckets' own tests take the time as an
 argument, and one checks an owner's bucket at a fixed time.
 
+### Real traffic meets no refusal of its own
+
+**Issue.** Slack turns off an app's event subscriptions when its request
+URL keeps failing, so a 400 or 503 for a real delivery costs far more than
+a 200 that drops it: only forged bodies should meet a refusal the ingress
+adds. A seventh review found three that real traffic could meet:
+
+- The owner's bucket (`OWNER_BURST`, `OWNER_REQUESTS_PER_SECOND`) was
+  charged at admission, for every request. Each agent's app gets every
+  message in every channel it is in, so ten agents in busy channels at 1.6
+  messages a second each make 16 deliveries a second; past the burst of
+  200, a real mention got 503, and so did Slack's retries of it, and it
+  was lost. Yet the bucket exists to bound deduplication rows, and only a
+  kept message writes one. A new test, one owner's ten agents taking 40
+  unaddressed channel messages each and then a mention, got 503 at round
+  20 of 40 before the change.
+- The ingress refused with 400 a message whose `user` or `bot_id` wasn't
+  shaped like Slack's, the manager app's included. That bounded nothing,
+  since `normalize` drops such a message as `Skip::Malformed` before any
+  row, cache or lookup, and Slack says its ids "could grow longer in the
+  future", so a longer real id would have turned the app off. The ids that
+  make up a deduplication key had the same risk, at 20 characters after
+  the prefix (32 for an `event_id`).
+- A message to an agent's app older than the confirmation window was
+  dropped with a debug line. While agentd's clock runs more than 15
+  minutes fast, or Slack delivers a backlog late, every message is, and
+  nothing said so.
+
+**Solution.**
+
+- The owner's bucket is charged where the row is written: in
+  `process_event`, once `normalize` has kept a message and before its
+  deduplication write (`InFlight::keep`, which knows the place's owner).
+  A message past it is dropped after its 200, with no row, and a warning
+  once a minute per binding (`Note::OwnerRate`). Admission keeps only each
+  app's own bucket: Slack itself delivers at most 30,000 events an hour to
+  one app, about 8.3 a second, and that bucket allows a burst of 100 then
+  8 a second, so real traffic to one app meets it only in a burst of more
+  than 100 events within a few seconds, which Slack's retries then
+  deliver; moving it too would leave a forger's flood bound only by
+  places, each request costing an HMAC and a parse before the ack. One
+  owner's agents' apps together can now take `AGENT_REQUESTS_PER_SECOND`
+  for each agent at admission, all of it CPU, since unaddressed messages
+  write nothing and their places are given back as soon as the queue
+  reaches them.
+- The ingress no longer checks a message's sender, and `MessageIds` no
+  longer reads it; `normalize` drops one not shaped like Slack's after the
+  200. The shapes that make up a key, and `normalize`'s, allow up to 64
+  uppercase letters or digits after the prefix (`normalize::MAX_ID_TAIL`,
+  now for `event_id` too), and a `ts` of 10 to 20 digits, the first not a
+  zero, a dot and 6 digits, so a message still has one spelling: a key is
+  at most about a hundred bytes, and a mention at most 65. Rows are about
+  twice as large as the 20-character bound allowed, so one owner's hour of
+  rows is about 20 MB rather than 15.
+- A message dropped for its age goes through the ingress's throttle as
+  `Note::Stale`: a warning once a minute per binding, counting those
+  dropped since, that asks whether agentd's clock is right. `confirm`'s
+  own check stays at debug: an event reaches it only through the ingress,
+  which has applied the same check to the same `ts` and arrival time.
+- `text` is cut to 160,000 bytes (`MAX_TEXT_BYTES`) at a character
+  boundary rather than to 40,000 characters. Slack sends text escaped, `&`
+  as `&amp;`, so a character cap cut real messages of mostly `&` or `<` to
+  a fifth of their length, while the byte cap is the same bound on memory.
+  A mention past the cut is still read from `blocks`, where Slack's
+  clients put each one too.
+- `SigningSecrets` has a method for each kind of binding, `manager` and
+  `agent`, and an agent's app (`AgentApp`) always carries its owner, so
+  the seat of a request follows from the lookup and `Busy::Ownerless`,
+  which guarded a case the store never produced, is gone.
+- The test that a full bucket with nothing in flight is forgotten gives
+  each place back at a time it chooses, not when the place is dropped, so
+  it no longer reads the clock.
+
+T31's migration (`20260930230000_slack_agent_apps.sql`) was edited in
+place during review to add `processed_events.expires_at`. A database that
+already ran an earlier version of it must be recreated: sqlx refuses a
+migration whose checksum changed. `expires_at` keeps its `DEFAULT 0`,
+backfilled at once from `seen_at`: SQLite refuses to add a `NOT NULL`
+column without a default to a table that has rows, and rebuilding
+`processed_events` for it isn't worth it, since every writer goes through
+`mark_event_processed`, which always sets it.
+
 ### Bots don't join channels by posting
 
 Slack refuses a post to a conversation the bot isn't in (T23b), and the

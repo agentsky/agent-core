@@ -14,9 +14,13 @@ use futures::StreamExt as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use surface_slack::ingress::{
     AGENT_BURST, AGENT_REQUESTS_PER_SECOND, MAX_IN_FLIGHT_PER_AGENT, MAX_IN_FLIGHT_PER_OWNER,
-    PRE_ACK_TIMEOUT,
+    OWNER_BURST, OWNER_REQUESTS_PER_SECOND, PRE_ACK_TIMEOUT,
 };
-use surface_slack::{BindingRef, BoxError, Dedup, SigningSecrets, SlackApp, SlackInbound, ingress};
+use surface_slack::normalize::{MAX_ID_TAIL, MAX_TEXT_BYTES};
+use surface_slack::{
+    AgentApp, BindingRef, BoxError, Dedup, SigningSecrets, SlackApp, SlackInbound, ingress,
+};
+use testkit::Logs;
 use testkit::slack::{self as fixtures, BOT_USER, CHALLENGE, TEAM};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -30,19 +34,32 @@ const FOURTH_SECRET: &str = "fourth-agent-signing-secret";
 
 #[derive(Default)]
 struct Secrets {
-    apps: HashMap<BindingRef, SlackApp>,
+    manager: Option<SlackApp>,
+    agents: HashMap<BindingId, AgentApp>,
     failing: bool,
     delay: Duration,
 }
 
-#[async_trait::async_trait]
-impl SigningSecrets for Secrets {
-    async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
+impl Secrets {
+    async fn looked_up(&self) -> Result<(), BoxError> {
         tokio::time::sleep(self.delay).await;
         if self.failing {
             return Err("the store is down".into());
         }
-        Ok(self.apps.get(&binding).cloned())
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl SigningSecrets for Secrets {
+    async fn manager(&self) -> Result<Option<SlackApp>, BoxError> {
+        self.looked_up().await?;
+        Ok(self.manager.clone())
+    }
+
+    async fn agent(&self, binding: BindingId) -> Result<Option<AgentApp>, BoxError> {
+        self.looked_up().await?;
+        Ok(self.agents.get(&binding).cloned())
     }
 }
 
@@ -119,14 +136,13 @@ fn app(secret: Option<&str>, bot_user: Option<&str>) -> SlackApp {
     SlackApp {
         signing_secret: secret.map(SecretString::from),
         bot_user: bot_user.map(UserId::from),
-        owner: None,
     }
 }
 
-fn agent_app(secret: &str, bot_user: &str, owner: MemberId) -> SlackApp {
-    SlackApp {
-        owner: Some(owner),
-        ..app(Some(secret), Some(bot_user))
+fn agent_app(secret: &str, bot_user: &str, owner: MemberId) -> AgentApp {
+    AgentApp {
+        app: app(Some(secret), Some(bot_user)),
+        owner,
     }
 }
 
@@ -135,25 +151,22 @@ fn agent_app(secret: &str, bot_user: &str, owner: MemberId) -> SlackApp {
 fn secrets_owned_by(owners: [MemberId; 4]) -> Secrets {
     let [first, second, third, fourth] = owners;
     Secrets {
-        apps: HashMap::from([
-            (BindingRef::Manager, app(Some(MANAGER_SECRET), None)),
+        manager: Some(app(Some(MANAGER_SECRET), None)),
+        agents: HashMap::from([
+            (agent(), agent_app(AGENT_SECRET, BOT_USER, first)),
+            (other_agent(), agent_app(OTHER_SECRET, "U0BOT0002", second)),
+            (third_agent(), agent_app(THIRD_SECRET, "U0BOT0003", third)),
             (
-                BindingRef::Agent(agent()),
-                agent_app(AGENT_SECRET, BOT_USER, first),
-            ),
-            (
-                BindingRef::Agent(other_agent()),
-                agent_app(OTHER_SECRET, "U0BOT0002", second),
-            ),
-            (
-                BindingRef::Agent(third_agent()),
-                agent_app(THIRD_SECRET, "U0BOT0003", third),
-            ),
-            (
-                BindingRef::Agent(fourth_agent()),
+                fourth_agent(),
                 agent_app(FOURTH_SECRET, "U0BOT0004", fourth),
             ),
-            (BindingRef::Agent(creating_agent()), app(None, None)),
+            (
+                creating_agent(),
+                AgentApp {
+                    app: app(None, None),
+                    owner: first,
+                },
+            ),
         ]),
         ..Secrets::default()
     }
@@ -1289,7 +1302,7 @@ async fn ids_not_shaped_like_slacks_are_refused_and_nothing_is_written() {
     let mut bodies = Vec::new();
     for event_id in [
         format!("Ev{huge}"),
-        format!("Ev{}", "A".repeat(33)),
+        format!("Ev{}", "A".repeat(MAX_ID_TAIL + 1)),
         "Ev".to_owned(),
         "Ev0lower".to_owned(),
         "EV0UPPER".to_owned(),
@@ -1303,7 +1316,7 @@ async fn ids_not_shaped_like_slacks_are_refused_and_nothing_is_written() {
     }));
     for channel in [
         format!("D{huge}"),
-        format!("C{}", "A".repeat(21)),
+        format!("C{}", "A".repeat(MAX_ID_TAIL + 1)),
         "C".to_owned(),
         "c0chan001".to_owned(),
         "X0CHAN001".to_owned(),
@@ -1317,6 +1330,7 @@ async fn ids_not_shaped_like_slacks_are_refused_and_nothing_is_written() {
         format!("1727697900.{}", "0".repeat(900_000)),
         "1727697900.0005001".to_owned(),
         "172769790.000500".to_owned(),
+        "01727697900.000500".to_owned(),
         "1727697900000500".to_owned(),
         "1727697900.00050a".to_owned(),
         "1.2".to_owned(),
@@ -1426,13 +1440,13 @@ fn fresh_dm(event_id: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String
 }
 
 #[tokio::test]
-async fn a_sender_not_shaped_like_slacks_is_refused_and_nothing_is_written() {
+async fn a_sender_not_shaped_like_slacks_is_acked_and_dropped_with_nothing_written() {
     let mut harness = Harness::start();
     let huge = "A".repeat(900_000);
     let mut bodies = Vec::new();
     for bot_id in [
         format!("B{huge}"),
-        format!("B{}", "A".repeat(21)),
+        format!("B{}", "A".repeat(MAX_ID_TAIL + 1)),
         "B".to_owned(),
         "b0lower".to_owned(),
         "U0HUMAN01".to_owned(),
@@ -1448,7 +1462,7 @@ async fn a_sender_not_shaped_like_slacks_is_refused_and_nothing_is_written() {
     }
     for user in [
         format!("U{huge}"),
-        format!("W{}", "A".repeat(21)),
+        format!("W{}", "A".repeat(MAX_ID_TAIL + 1)),
         "U".to_owned(),
         "u0lower".to_owned(),
         "B0LEGACY1".to_owned(),
@@ -1461,27 +1475,36 @@ async fn a_sender_not_shaped_like_slacks_is_refused_and_nothing_is_written() {
         let (status, _) = harness
             .send(signed_events(agent(), AGENT_SECRET, body))
             .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{:.200}", body);
+        assert_eq!(status, StatusCode::OK, "{:.200}", body);
+        let (status, _) = harness
+            .send(signed(
+                &path(BindingRef::Manager, "events"),
+                MANAGER_SECRET,
+                body,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::OK, "manager: {:.200}", body);
     }
     harness.assert_nothing_delivered().await;
     assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
 
+    let longer = format!("B0{}", "A".repeat(MAX_ID_TAIL - 1));
     let bot = fresh_dm("Ev0GOODBOT", |body| {
         let event = body["event"].as_object_mut().unwrap();
         event.remove("user");
-        event.insert("bot_id".into(), "B0LEGACY1".into());
+        event.insert("bot_id".into(), longer.clone().into());
     });
     let (status, _) = harness
         .send(signed_events(agent(), AGENT_SECRET, &bot))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(harness.message().await.sender.user.as_str(), "B0LEGACY1");
+    assert_eq!(harness.message().await.sender.user.as_str(), longer);
 }
 
 #[tokio::test]
-async fn a_message_keeps_ten_files_40000_characters_and_short_mention_ids() {
+async fn a_message_keeps_ten_files_160_kb_of_text_and_short_mention_ids() {
     let mut harness = Harness::start();
-    let long_user = format!("U{}", "A".repeat(21));
+    let long_user = format!("U{}", "A".repeat(MAX_ID_TAIL + 1));
     let body = fresh_dm("Ev0BIG", |body| {
         let files: Vec<serde_json::Value> = (0..5_000)
             .map(|n| {
@@ -1493,7 +1516,8 @@ async fn a_message_keeps_ten_files_40000_characters_and_short_mention_ids() {
             .collect();
         body["event"]["files"] = files.into();
         body["event"]["subtype"] = "file_share".into();
-        body["event"]["text"] = format!("<@{long_user}> <@U0SHORT1> {}", "é".repeat(50_000)).into();
+        body["event"]["text"] =
+            format!("<@{long_user}> <@U0SHORT1> {}", "é".repeat(100_000)).into();
     });
     let (status, _) = harness
         .send(signed_events(agent(), AGENT_SECRET, &body))
@@ -1502,7 +1526,9 @@ async fn a_message_keeps_ten_files_40000_characters_and_short_mention_ids() {
     let event = harness.message().await;
     assert_eq!(event.files.len(), 10);
     assert_eq!(event.files[9].id, "F0FILE9");
-    assert_eq!(event.text.chars().count(), 40_000);
+    assert!(event.text.len() <= MAX_TEXT_BYTES);
+    assert!(event.text.len() > MAX_TEXT_BYTES - 2);
+    assert!(event.text.ends_with('é'));
     assert_eq!(event.mentions, [UserId::from("U0SHORT1")]);
 }
 
@@ -1534,18 +1560,33 @@ async fn an_agents_apps_other_requests_are_acked_and_write_nothing() {
 }
 
 #[tokio::test]
-async fn an_agents_message_older_than_the_window_is_acked_and_writes_nothing() {
+async fn an_agents_message_older_than_the_window_is_acked_writes_nothing_and_is_warned_of() {
+    let logs = Logs::global();
     let mut harness = Harness::start();
-    let stale = format!("{}.000100", fixtures::now() - 16 * 60);
-    let body = fresh_dm("Ev0STALE", |body| {
-        body["event"]["ts"] = stale.into();
-    });
-    let (status, _) = harness
-        .send(signed_events(agent(), AGENT_SECRET, &body))
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    for n in 0..3 {
+        let stale = format!("{}.{n:06}", fixtures::now() - 16 * 60);
+        let body = fresh_dm(&format!("Ev0STALE{n}"), |body| {
+            body["event"]["ts"] = stale.into();
+        });
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, &body))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
     harness.assert_nothing_delivered().await;
     assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+    let stale = logs
+        .snapshot()
+        .matching("older than the confirmation window")
+        .matching(&format!("binding={}", agent()));
+    stale.assert_has("WARN");
+    let lines = stale.to_string();
+    let count = |level: &str| lines.lines().filter(|line| line.contains(level)).count();
+    assert_eq!(
+        (count("WARN"), count("DEBUG")),
+        (1, 2),
+        "one warning, the rest throttled:\n{lines}"
+    );
 
     let recent = format!("{}.000100", fixtures::now() - 10 * 60);
     let body = fresh_dm("Ev0RECENT", |body| {
@@ -1556,4 +1597,113 @@ async fn an_agents_message_older_than_the_window_is_acked_and_writes_nothing() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(harness.message().await.event_id, "Ev0RECENT");
+}
+
+#[tokio::test]
+async fn one_owners_agents_in_busy_channels_miss_no_mention() {
+    let ada = owner(1);
+    let mut agents = vec![(agent(), AGENT_SECRET.to_owned())];
+    let mut secrets = Secrets::default();
+    secrets
+        .agents
+        .insert(agent(), agent_app(AGENT_SECRET, BOT_USER, ada));
+    for n in 1..10_u128 {
+        let binding = BindingId::from_uuid(uuid::Uuid::from_u128(0xB05E_0000 + n));
+        let secret = format!("busy-agent-signing-secret-{n}");
+        secrets
+            .agents
+            .insert(binding, agent_app(&secret, &format!("U0BUSY{n:03}"), ada));
+        agents.push((binding, secret));
+    }
+    let mut harness = Harness::with(secrets, MemoryDedup::default());
+    let rounds = 40;
+    let mut markers = 0;
+    for round in 0..rounds {
+        for (binding, secret) in &agents {
+            let (status, _) = harness
+                .send(signed_events(*binding, secret, fixtures::MESSAGE_PLAIN))
+                .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round {round}: {binding}'s unaddressed channel message"
+            );
+        }
+        if round % 5 == 4 {
+            harness.assert_nothing_delivered().await;
+            markers += 1;
+        }
+    }
+    assert!(agents.len() * rounds >= 2 * usize::try_from(OWNER_BURST).unwrap());
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_MENTION,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the mention");
+    assert_eq!(harness.message().await.event_id, "Ev0MENTION1");
+    assert_eq!(harness.recorded_anywhere(), markers + 1);
+}
+
+#[tokio::test]
+async fn messages_one_owner_keeps_past_their_rate_are_acked_and_dropped_without_a_row() {
+    let logs = Logs::global();
+    let ada = owner(1);
+    let secrets = secrets_owned_by([ada, ada, ada, owner(2)]);
+    let mut harness = Harness::with_capacity(secrets, MemoryDedup::default(), 1024);
+    let adas = [
+        (agent(), AGENT_SECRET),
+        (other_agent(), OTHER_SECRET),
+        (third_agent(), THIRD_SECRET),
+    ];
+    let started = Instant::now();
+    let rounds = 90;
+    let mut kept = 0;
+    for n in 0..rounds {
+        for (binding, secret) in adas {
+            let (status, _) = harness
+                .send(signed_events(binding, secret, &nth_dm(n)))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{binding}'s message {n}");
+        }
+        let (status, _) = harness
+            .send(signed_events(fourth_agent(), FOURTH_SECRET, &nth_dm(n)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "another owner's message {n}");
+        loop {
+            let event = harness.message().await;
+            if event.binding == fourth_agent() {
+                break;
+            }
+            kept += 1;
+        }
+    }
+    let refilled = started.elapsed().as_secs_f64() * f64::from(OWNER_REQUESTS_PER_SECOND);
+    let sent = adas.len() * rounds;
+    assert!(sent as f64 > f64::from(OWNER_BURST) + refilled + 1.0);
+    assert!(kept >= usize::try_from(OWNER_BURST).unwrap(), "{kept}");
+    assert!(
+        (kept as f64) <= f64::from(OWNER_BURST) + refilled + 1.0,
+        "{kept}"
+    );
+    let rows: usize = adas
+        .iter()
+        .map(|(binding, _)| harness.recorded(&format!("slack:{binding}:message")).len())
+        .sum();
+    assert_eq!(
+        rows, kept,
+        "a message dropped for its owner's rate writes no row"
+    );
+    assert_eq!(
+        harness
+            .recorded(&format!("slack:{}:message", fourth_agent()))
+            .len(),
+        rounds,
+        "another owner's messages are all kept"
+    );
+    logs.snapshot()
+        .matching("keeping messages faster than their rate")
+        .assert_has("WARN");
 }

@@ -41,11 +41,20 @@
 //! Every id a message is kept with must be shaped like Slack's, or the
 //! message is [`Skip::Malformed`]: its `channel` ([`is_channel_id`]), its
 //! `ts` and `thread_ts` ([`is_ts`]), its `user` ([`is_user_id`]) and its
-//! `bot_id` ([`is_bot_id`]). The ingress refuses an event whose ids aren't
-//! with 400 before it is acknowledged, so this only drops what the Web API
-//! answered. The rest is cut to Slack's own limits:
+//! `bot_id` ([`is_bot_id`]). Each shape leaves room for Slack's ids to
+//! grow, up to [`MAX_ID_TAIL`] characters after the prefix. The ingress
+//! refuses an event whose `channel`, `ts` or `thread_ts` isn't shaped so
+//! with 400 before it is acknowledged, since they make up its
+//! deduplication key; a sender that isn't is dropped here, after the 200,
+//! before any row. The rest is cut to Slack's own limits:
 //!
-//! - `text` to its first [`MAX_TEXT_CHARS`] characters.
+//! - `text` to at most [`MAX_TEXT_BYTES`], at a character boundary: as
+//!   many bytes as Slack's limit of 40,000 characters can take. Slack's
+//!   escaping of `&`, `<` and `>` lengthens the text a member typed, `&`
+//!   to five characters, so a cut in characters of the escaped text could
+//!   cut a real message short; a cut in bytes keeps the same bound and
+//!   more of the message. A mention past the cut is still read from
+//!   `blocks`, where Slack's clients put each one too.
 //! - Mentions to the first [`MAX_MENTIONS`] different users, each an id
 //!   [`is_user_id`] accepts; the router looks each one up.
 //! - Files to the first [`MAX_FILES`] the bot can download, each with an id
@@ -53,8 +62,8 @@
 //!   its name cut to [`MAX_FILE_NAME_CHARS`] characters and a MIME type
 //!   longer than [`MAX_MIME_TYPE_BYTES`] left out.
 //!
-//! So a kept message is at most about 220 KB, whatever the event held:
-//! 160 KB of text, 55 KB of files and 2 KB of mentions.
+//! So a kept message is at most about 225 KB, whatever the event held:
+//! 160 KB of text, 55 KB of files and 7 KB of mentions.
 
 use std::collections::HashSet;
 
@@ -71,8 +80,9 @@ use time::OffsetDateTime;
 /// too.
 pub const KEPT_SUBTYPES: [&str; 2] = ["file_share", "thread_broadcast"];
 
-/// The most characters of a message's `text` kept: Slack's own limit.
-pub const MAX_TEXT_CHARS: usize = 40_000;
+/// The most bytes of a message's `text` kept: Slack's own limit of 40,000
+/// characters, at the 4 bytes each that UTF-8 takes at most.
+pub const MAX_TEXT_BYTES: usize = 4 * 40_000;
 
 /// The most files a message is kept with: Slack's own limit.
 pub const MAX_FILES: usize = 10;
@@ -232,7 +242,7 @@ fn normalized(
         (None, None) => return Err(Skip::NoSender),
     };
     let mut text = event.text.unwrap_or_default();
-    text.truncate(char_boundary(&text, MAX_TEXT_CHARS));
+    text.truncate(truncated(&text, MAX_TEXT_BYTES).len());
     let mentions = mentions(&text, event.blocks.as_ref());
     let thread_root = event.thread_ts.filter(|root| *root != ts);
     if conv_kind == ConvKind::Channel
@@ -420,8 +430,8 @@ fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
 }
 
 /// The most characters a Slack id has after its prefix, as this crate
-/// checks them. Slack's are about ten.
-pub const MAX_ID_TAIL: usize = 20;
+/// checks them. Slack's are about ten now, and Slack says they may grow.
+pub const MAX_ID_TAIL: usize = 64;
 
 /// Whether `id` is one of `prefixes` and then 1 to `max` uppercase ASCII
 /// letters or digits, as Slack's ids are.
@@ -467,17 +477,20 @@ pub fn is_channel_id(id: &str) -> bool {
     is_slack_id(id, &["C", "D", "G"], MAX_ID_TAIL)
 }
 
-/// Whether `id` is shaped like a Slack `event_id`: `Ev`, then 1 to 32
-/// uppercase letters or digits.
+/// Whether `id` is shaped like a Slack `event_id`: `Ev`, then 1 to
+/// [`MAX_ID_TAIL`] uppercase letters or digits.
 pub fn is_event_id(id: &str) -> bool {
-    is_slack_id(id, &["Ev"], 32)
+    is_slack_id(id, &["Ev"], MAX_ID_TAIL)
 }
 
-/// Whether `ts` is a message timestamp as Slack writes one: 10 digits of
-/// seconds, a dot and 6 of microseconds.
+/// Whether `ts` is a message timestamp as Slack writes one: seconds, a dot
+/// and 6 digits of microseconds. The seconds are 10 digits now; up to 20
+/// are accepted, the first not a zero, so each message still has one
+/// spelling to be deduplicated by.
 pub fn is_ts(ts: &str) -> bool {
     ts.split_once('.').is_some_and(|(seconds, micros)| {
-        seconds.len() == 10
+        (10..=20).contains(&seconds.len())
+            && !seconds.starts_with('0')
             && micros.len() == 6
             && seconds
                 .bytes()
@@ -742,7 +755,7 @@ mod tests {
 
     #[test]
     fn ids_not_shaped_like_slacks_make_a_message_malformed() {
-        let long = "A".repeat(21);
+        let long = "A".repeat(MAX_ID_TAIL + 1);
         for extra in [
             json!({"user": format!("U{long}")}),
             json!({"user": "u0lower"}),
@@ -765,7 +778,7 @@ mod tests {
         assert_eq!(normalize(userless), Err(Skip::Malformed));
         assert!(
             normalize(channel_message(
-                json!({"user": format!("W{}", "A".repeat(20))})
+                json!({"user": format!("W{}", "A".repeat(MAX_ID_TAIL))})
             ))
             .is_ok()
         );
@@ -773,24 +786,47 @@ mod tests {
 
     #[test]
     fn text_files_and_mentions_are_cut_to_slacks_limits() {
-        let long_user = format!("U{}", "A".repeat(21));
+        let long_user = format!("U{}", "A".repeat(MAX_ID_TAIL + 1));
         let files: Vec<Value> = (0..MAX_FILES + 5)
             .map(|n| json!({"id": format!("F{n}"), "url_private": format!("https://files.slack.com/F{n}")}))
             .collect();
+        let head = format!("<@{long_user}> <@U0BOT> ");
         let event = normalize(channel_message(json!({
-            "text": format!("<@{long_user}> <@U0BOT> {}", "é".repeat(MAX_TEXT_CHARS)),
+            "text": format!("{head}{} <@U0PASTCUT>", "é".repeat(MAX_TEXT_BYTES)),
             "files": files,
         })))
         .unwrap();
-        assert_eq!(event.text.chars().count(), MAX_TEXT_CHARS);
-        assert!(
-            event
-                .text
-                .starts_with(&format!("<@{long_user}> <@U0BOT> é"))
-        );
+        assert_eq!(event.text.len(), MAX_TEXT_BYTES - head.len() % 2);
+        assert!(event.text.starts_with(&format!("{head}é")));
+        assert!(event.text.ends_with('é'));
         assert_eq!(event.mentions, [UserId::from(BOT)]);
         assert_eq!(event.files.len(), MAX_FILES);
         assert_eq!(event.files[MAX_FILES - 1].id, format!("F{}", MAX_FILES - 1));
+    }
+
+    #[test]
+    fn escaped_text_is_cut_in_bytes_and_a_mention_past_the_cut_comes_from_blocks() {
+        let typed = "&".repeat(40_000);
+        let escaped = "&amp;".repeat(40_000);
+        let blocks = json!([{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [
+                {"type": "text", "text": typed},
+                {"type": "user", "user_id": BOT},
+            ]},
+        ]}]);
+        let event = normalize(channel_message(json!({
+            "text": format!("{escaped} <@{BOT}>"),
+            "blocks": blocks,
+        })))
+        .unwrap();
+        assert_eq!(event.text, escaped[..MAX_TEXT_BYTES]);
+        assert_eq!(event.mentions, [UserId::from(BOT)]);
+        let whole = "&amp;".repeat(20_000);
+        let event = normalize(channel_message(
+            json!({"text": format!("{whole} <@{BOT}>")}),
+        ))
+        .unwrap();
+        assert_eq!(event.text, format!("{whole} <@{BOT}>"));
     }
 
     #[test]
@@ -798,7 +834,7 @@ mod tests {
         let url = "https://files.slack.com/F1";
         let event = normalize(channel_message(json!({
             "files": [
-                {"id": format!("F{}", "A".repeat(21)), "url_private": url},
+                {"id": format!("F{}", "A".repeat(MAX_ID_TAIL + 1)), "url_private": url},
                 {"id": "f0lower", "url_private": url},
                 {"id": "F2", "url_private": format!("{url}/{}", "x".repeat(MAX_FILE_URL_BYTES))},
                 {

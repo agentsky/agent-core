@@ -43,7 +43,7 @@ use store::Store;
 use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
-    BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
+    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
     SlackInbound, ingress,
 };
 use time::OffsetDateTime;
@@ -120,15 +120,15 @@ impl ConfigSigningSecrets {
 
 #[async_trait::async_trait]
 impl SigningSecrets for ConfigSigningSecrets {
-    async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
-        Ok(match binding {
-            BindingRef::Manager => self.manager.clone().map(|secret| SlackApp {
-                signing_secret: Some(secret),
-                bot_user: self.bot_user.clone(),
-                owner: None,
-            }),
-            BindingRef::Agent(_) => None,
-        })
+    async fn manager(&self) -> Result<Option<SlackApp>, BoxError> {
+        Ok(self.manager.clone().map(|secret| SlackApp {
+            signing_secret: Some(secret),
+            bot_user: self.bot_user.clone(),
+        }))
+    }
+
+    async fn agent(&self, _: BindingId) -> Result<Option<AgentApp>, BoxError> {
+        Ok(None)
     }
 }
 
@@ -154,15 +154,24 @@ impl StoreSigningSecrets {
 
 #[async_trait::async_trait]
 impl SigningSecrets for StoreSigningSecrets {
-    async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
-        let (BindingRef::Agent(id), Some((store, team))) = (binding, &self.agents) else {
-            return self.config.lookup(binding).await;
+    async fn manager(&self) -> Result<Option<SlackApp>, BoxError> {
+        self.config.manager().await
+    }
+
+    async fn agent(&self, binding: BindingId) -> Result<Option<AgentApp>, BoxError> {
+        let Some((store, team)) = &self.agents else {
+            return Ok(None);
         };
-        Ok(store.slack_app_keys(id, team).await?.map(|keys| SlackApp {
-            signing_secret: keys.signing_secret,
-            bot_user: keys.bot_user,
-            owner: Some(keys.owner),
-        }))
+        Ok(store
+            .slack_app_keys(binding, team)
+            .await?
+            .map(|keys| AgentApp {
+                app: SlackApp {
+                    signing_secret: keys.signing_secret,
+                    bot_user: keys.bot_user,
+                },
+                owner: keys.owner,
+            }))
     }
 }
 
@@ -499,17 +508,17 @@ mod tests {
     async fn only_the_manager_is_known_and_only_with_a_secret() {
         let secret = SecretString::from("manager-secret");
         let secrets = ConfigSigningSecrets::new(Some(&secret), Some(UserId::new("U0MANAGER")));
-        let manager = secrets.lookup(BindingRef::Manager).await.unwrap().unwrap();
+        let manager = secrets.manager().await.unwrap().unwrap();
         assert_eq!(
             manager.signing_secret.unwrap().expose_secret(),
             "manager-secret"
         );
         assert_eq!(manager.bot_user, Some(UserId::new("U0MANAGER")));
-        let agent = BindingRef::Agent(core_types::BindingId::new_v4());
-        assert!(secrets.lookup(agent).await.unwrap().is_none());
+        let agent = core_types::BindingId::new_v4();
+        assert!(secrets.agent(agent).await.unwrap().is_none());
 
         let none = ConfigSigningSecrets::new(None, None);
-        assert!(none.lookup(BindingRef::Manager).await.unwrap().is_none());
+        assert!(none.manager().await.unwrap().is_none());
         assert!(!format!("{secrets:?}").contains("manager-secret"));
     }
 

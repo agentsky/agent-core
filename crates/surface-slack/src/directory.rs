@@ -258,7 +258,7 @@ impl TeamDirectory {
     /// is cached too, apart from the bots that have a user, so bot ids made
     /// up in forged events never push those out. `None` at once, without a
     /// call and without caching it, for an id not shaped like a bot id
-    /// ([`is_bot_id`]), so each cached id is a few bytes.
+    /// ([`is_bot_id`]), so each cached id is at most a few dozen bytes.
     ///
     /// # Errors
     ///
