@@ -545,20 +545,26 @@ Deliverables in `crates/core-types/src/`:
     `ConvRef { surface, team, conversation }`.
   - `ThreadKey { conv, root: Option<MessageId> }`, where `None` means a DM's
     continuous session.
+  - `ConvKind` (`Dm`, `GroupDm`, `Channel`), what the platform says the
+    conversation is.
   - `ReplyTarget { conv, thread_root }`, `MsgRef`, `Cursor`.
 - `scope.rs`:
   - `ScopeKind` (`Dm`, `Channel`, `GroupDm`, `Private`).
   - `ScopeKey`, which renders to a stable string such as
-    `dm:<surface>:<team>:<conv>`, `ch:<surface>:<team>:<conv>` or
-    `private`. Its parse and display round-trip.
+    `dm:<surface>:<team>:<conv>`, `ch:<surface>:<team>:<conv>`,
+    `gdm:<surface>:<team>:<conv>` or `private`. Its parse and display
+    round-trip. `%`, `:` and `/` inside ids are percent-escaped, so a
+    Rocket.Chat team named after a `host:port` stays unambiguous.
   - `VolumeKey { agent, scope }`, rendered as `<agent>/<scope>`, which names
     volumes (see [Volumes and scopes](#volumes-and-scopes)).
 - `event.rs`: `InboundEvent` with:
   - `event_id` for deduplication, `binding`, `sender: MemberKey`.
   - `sender_is_bot: bool` and `sender_bot_user: Option<UserId>`.
   - `conv`, `thread_root`, `message: MsgRef`, `text`.
-  - `mentions: Vec<UserId>`, `is_dm`, `reply_to: Option<MsgRef>`,
-    `files: Vec<InFile>`, and `received_at`.
+  - `mentions: Vec<UserId>`, `conv_kind: ConvKind` (with an `is_dm()`
+    helper), `reply_to: Option<MsgRef>`, `files: Vec<InFile>`, and
+    `received_at`. A bare `is_dm` couldn't tell a group DM from a channel,
+    and the router needs that for `ScopeKind::GroupDm`.
 - `turn.rs`:
   - `CredentialKind` (`Subscription`, `ApiKey`).
   - `CredentialRef` (`Member(MemberId)`, `Community`).
@@ -569,8 +575,11 @@ Deliverables in `crates/core-types/src/`:
     agentctl target rules (T15).
 - `surface_trait.rs`: the design's `Surface` trait verbatim, with
   `#[async_trait]`, plus the `Binding`, `OutFile`, `InFile`, `Msg` and `Caps`
-  types. `Caps` has `message_limit`, `supports_edit`, `supports_buttons`,
-  `supports_threads` and `per_binding_delivery`. The last is true where every
+  types. `history` takes a `ThreadKey`, and `Sender` is core-types' own
+  handle over a `Sink` trait, since the crate has no async runtime (see
+  [impl-notes](impl-notes.md#t03-core-types)). `Caps` has `message_limit`,
+  `supports_edit`, `supports_buttons`, `supports_threads` and
+  `per_binding_delivery`. The last is true where every
   agent's app receives its own copy of an event (Slack), and false where
   agentd deduplicates one copy per message (Rocket.Chat). `message_limit` is
   a `Limit { max: usize, unit: LengthUnit }`, with `LengthUnit` `Chars` or
@@ -968,7 +977,8 @@ Deliverables:
   - `t` system messages are ignored.
   - `tmid` becomes `thread_root`, and also `reply_to`, since the router
     decides whether the thread root is the agent's own message.
-  - Room type `d` sets `is_dm`.
+  - Room type `d` sets `conv_kind` to `Dm`, or `GroupDm` when the room has
+    more than two members.
   - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`.
   - Edits (`editedAt`) are ignored.
   - `event_id` is the message `_id`.
@@ -1853,6 +1863,8 @@ Deliverables:
   - `message` subtypes other than none, `file_share` and `thread_broadcast`
     are ignored.
   - `thread_ts` becomes `thread_root` and `reply_to`.
+  - `channel_type` sets `conv_kind`: `im` is `Dm`, `mpim` is `GroupDm`, and
+    the rest are `Channel`.
   - `bot_id` or `bot_profile` sets `sender_is_bot`. `sender_bot_user` comes
     from the event's `user` field when present. T29 adds the `bots.info`
     lookup for events without one.
@@ -1904,8 +1916,9 @@ Deliverables:
   field, cached per bot id.
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
-handling, and that `post` renders and splits through `render`. Slack returns
-HTTP 200 with `ok: false` on errors; test that mapping.
+handling, and that `render` converts and splits through `render`, so that
+`post` sends one chunk as T23 expects. Slack returns HTTP 200 with
+`ok: false` on errors; test that mapping.
 
 ### T30
 
