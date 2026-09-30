@@ -38,25 +38,23 @@ impl TurnUsage {
     }
 }
 
-/// A member's usage over some days, from
-/// [`member_usage_since`](Store::member_usage_since).
+/// What was billed to a member over some days: turns, and what they used.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UsageTotals {
     /// Turns billed to them.
     pub turns: u64,
-    /// Input tokens, as [`TurnUsage::input_tokens`] counts them.
-    pub input_tokens: u64,
-    /// Output tokens.
-    pub output_tokens: u64,
-    /// Cost in US dollars.
-    pub cost_usd: f64,
+    /// Their tokens and cost, added up.
+    pub used: TurnUsage,
 }
 
-impl UsageTotals {
-    /// Input and output tokens together.
-    pub fn tokens(&self) -> u64 {
-        self.input_tokens.saturating_add(self.output_tokens)
-    }
+/// What was billed to a member today and this month, from
+/// [`member_usage`](Store::member_usage).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MemberUsage {
+    /// Today's, UTC.
+    pub today: UsageTotals,
+    /// This month's, UTC, today's included.
+    pub month: UsageTotals,
 }
 
 /// What agents spent in one thread, from
@@ -67,6 +65,26 @@ pub struct ThreadSpend {
     pub turns_this_hour: u32,
     /// Tokens their turns used there in the day.
     pub tokens_today: u64,
+}
+
+/// The window a limit counts turns or tokens in, UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitWindow {
+    /// The day.
+    Day,
+    /// The hour.
+    Hour,
+}
+
+impl LimitWindow {
+    /// When the window `at` falls in starts, in Unix seconds.
+    fn start(self, at: OffsetDateTime) -> i64 {
+        let day = day_of(at) * SECONDS_PER_DAY;
+        match self {
+            Self::Day => day,
+            Self::Hour => day + hour_of(at) * SECONDS_PER_HOUR,
+        }
+    }
 }
 
 /// The day `at` falls on, in days since 1970-01-01, UTC.
@@ -167,32 +185,42 @@ impl Store {
         Ok(())
     }
 
-    /// What was billed to `member` from the day `since` falls on through
-    /// today: pass the start of today, or of this month.
+    /// What was billed to `member` on the day `now` falls on, and in its
+    /// month.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if the query
     /// fails.
-    pub async fn member_usage_since(
-        &self,
-        member: MemberId,
-        since: OffsetDateTime,
-    ) -> Result<UsageTotals> {
-        let (turns, input, output, cost): (i64, i64, i64, f64) = sqlx::query_as(
-            "SELECT COALESCE(SUM(turns), 0), COALESCE(SUM(input_tokens), 0), \
+    pub async fn member_usage(&self, member: MemberId, now: OffsetDateTime) -> Result<MemberUsage> {
+        let today = day_of(now);
+        let month = day_of(now.replace_day(1).unwrap_or(now));
+        let row: (i64, i64, i64, f64, i64, i64, i64, f64) = sqlx::query_as(
+            "SELECT COALESCE(SUM(CASE WHEN day = ?1 THEN turns END), 0), \
+             COALESCE(SUM(CASE WHEN day = ?1 THEN input_tokens END), 0), \
+             COALESCE(SUM(CASE WHEN day = ?1 THEN output_tokens END), 0), \
+             COALESCE(SUM(CASE WHEN day = ?1 THEN cost_usd END), 0.0), \
+             COALESCE(SUM(turns), 0), COALESCE(SUM(input_tokens), 0), \
              COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0.0) \
-             FROM usage WHERE member_id = ? AND day >= ?",
+             FROM usage WHERE member_id = ?2 AND day BETWEEN ?3 AND ?1",
         )
+        .bind(today)
         .bind(member.to_string())
-        .bind(day_of(since))
+        .bind(month)
         .fetch_one(&self.pool)
         .await?;
-        Ok(UsageTotals {
+        let totals = |turns, input, output, cost| UsageTotals {
             turns: unsigned(turns),
-            input_tokens: unsigned(input),
-            output_tokens: unsigned(output),
-            cost_usd: cost,
+            used: TurnUsage {
+                input_tokens: unsigned(input),
+                output_tokens: unsigned(output),
+                cost_usd: cost,
+            },
+        };
+        let (turns, input, output, cost, month_turns, month_input, month_output, month_cost) = row;
+        Ok(MemberUsage {
+            today: totals(turns, input, output, cost),
+            month: totals(month_turns, month_input, month_output, month_cost),
         })
     }
 
@@ -248,8 +276,8 @@ impl Store {
     }
 
     /// Claims the one notice `agent` posts in `thread` that it reached the
-    /// limit `kind` in the window starting at `window_start`: true the
-    /// first time, false after. One caller gets it.
+    /// limit `kind`, which counts over `window`, in the window `at` falls
+    /// in: true the first time, false after. One caller gets it.
     ///
     /// Claim before posting, and [release](Self::release_limit_notice) the
     /// claim if the post fails.
@@ -263,7 +291,8 @@ impl Store {
         agent: AgentId,
         thread: &ThreadKey,
         kind: &str,
-        window_start: OffsetDateTime,
+        window: LimitWindow,
+        at: OffsetDateTime,
     ) -> Result<bool> {
         let [surface, team, conversation, root] = thread_columns(thread);
         let result = sqlx::query(
@@ -276,7 +305,7 @@ impl Store {
         .bind(conversation)
         .bind(root)
         .bind(kind)
-        .bind(to_unix(window_start))
+        .bind(window.start(at))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -294,7 +323,8 @@ impl Store {
         agent: AgentId,
         thread: &ThreadKey,
         kind: &str,
-        window_start: OffsetDateTime,
+        window: LimitWindow,
+        at: OffsetDateTime,
     ) -> Result<()> {
         let [surface, team, conversation, root] = thread_columns(thread);
         sqlx::query(
@@ -307,7 +337,7 @@ impl Store {
         .bind(conversation)
         .bind(root)
         .bind(kind)
-        .bind(to_unix(window_start))
+        .bind(window.start(at))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -399,22 +429,38 @@ mod tests {
             .await
             .unwrap();
 
-        let today = store.member_usage_since(alice, at(11 * DAY)).await.unwrap();
+        let billed = store.member_usage(alice, at(11 * DAY)).await.unwrap();
         assert_eq!(
-            today,
+            billed.today,
             UsageTotals {
                 turns: 1,
-                input_tokens: 1,
-                output_tokens: 2,
-                cost_usd: 1.0
+                used: usage(1, 2, 1.0),
             }
         );
-        let both = store.member_usage_since(alice, at(10 * DAY)).await.unwrap();
-        assert_eq!((both.turns, both.tokens(), both.cost_usd), (3, 333, 1.75));
+        let month = billed.month;
         assert_eq!(
-            store.member_usage_since(alice, at(12 * DAY)).await.unwrap(),
+            (month.turns, month.used.tokens(), month.used.cost_usd),
+            (3, 333, 1.75)
+        );
+        assert_eq!(
+            store.member_usage(alice, at(12 * DAY)).await.unwrap().today,
             UsageTotals::default(),
             "nothing yet on a later day"
+        );
+        assert_eq!(
+            store.member_usage(alice, at(31 * DAY)).await.unwrap(),
+            MemberUsage::default(),
+            "nor in a later month: 1970-02-01"
+        );
+        assert_eq!(
+            store
+                .member_usage(alice, at(10 * DAY))
+                .await
+                .unwrap()
+                .month
+                .turns,
+            2,
+            "a month counts up to the day asked about"
         );
     }
 
@@ -437,10 +483,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let totals = store.member_usage_since(alice, at(0)).await.unwrap();
+        let totals = store.member_usage(alice, at(5)).await.unwrap().today;
         assert_eq!(totals.turns, 3);
-        assert_eq!(totals.cost_usd, 0.0);
-        assert_eq!(totals.input_tokens, 3 * MAX_TOKENS_PER_TURN);
+        assert_eq!(totals.used.cost_usd, 0.0);
+        assert_eq!(totals.used.input_tokens, 3 * MAX_TOKENS_PER_TURN);
         assert_eq!(
             store.thread_spend(&t, at(5)).await.unwrap().tokens_today,
             6 * MAX_TOKENS_PER_TURN
@@ -514,46 +560,59 @@ mod tests {
         let t = thread(Some("1.0"));
         assert!(
             store
-                .claim_limit_notice(helper, &t, "daily", at(DAY))
+                .claim_limit_notice(helper, &t, "daily", LimitWindow::Day, at(DAY))
                 .await
                 .unwrap()
         );
         assert!(
             !store
-                .claim_limit_notice(helper, &t, "daily", at(DAY))
+                .claim_limit_notice(helper, &t, "daily", LimitWindow::Day, at(DAY))
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .claim_limit_notice(helper, &t, "daily", at(2 * DAY))
+                .claim_limit_notice(helper, &t, "daily", LimitWindow::Day, at(2 * DAY))
                 .await
                 .unwrap(),
             "a new window"
         );
         assert!(
             store
-                .claim_limit_notice(helper, &t, "thread_turns", at(DAY))
+                .claim_limit_notice(helper, &t, "thread_turns", LimitWindow::Day, at(DAY))
                 .await
                 .unwrap(),
             "another limit"
         );
         assert!(
             store
-                .claim_limit_notice(helper, &thread(None), "daily", at(DAY))
+                .claim_limit_notice(helper, &thread(None), "daily", LimitWindow::Day, at(DAY))
                 .await
                 .unwrap(),
             "another thread"
         );
         store
-            .release_limit_notice(helper, &t, "daily", at(DAY))
+            .release_limit_notice(helper, &t, "daily", LimitWindow::Day, at(DAY))
             .await
             .unwrap();
         assert!(
             store
-                .claim_limit_notice(helper, &t, "daily", at(DAY))
+                .claim_limit_notice(helper, &t, "daily", LimitWindow::Day, at(DAY))
                 .await
                 .unwrap()
+        );
+        let hourly = |seconds| {
+            store.claim_limit_notice(helper, &t, "hourly", LimitWindow::Hour, at(seconds))
+        };
+        assert!(hourly(DAY + 60).await.unwrap());
+        assert!(!hourly(DAY + 3_000).await.unwrap(), "the same hour");
+        assert!(hourly(DAY + HOUR).await.unwrap(), "the next hour");
+        assert!(
+            !store
+                .claim_limit_notice(helper, &t, "daily", LimitWindow::Day, at(DAY + 20 * HOUR))
+                .await
+                .unwrap(),
+            "the same day"
         );
     }
 
@@ -570,7 +629,7 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .claim_limit_notice(helper, &t, "daily", at(day * DAY))
+                .claim_limit_notice(helper, &t, "daily", LimitWindow::Day, at(day * DAY))
                 .await
                 .unwrap();
         }
@@ -581,7 +640,12 @@ mod tests {
             1
         );
         assert_eq!(
-            store.member_usage_since(alice, at(0)).await.unwrap().turns,
+            store
+                .member_usage(alice, at(100 * DAY))
+                .await
+                .unwrap()
+                .month
+                .turns,
             4,
             "the meter itself is kept"
         );

@@ -62,7 +62,7 @@ use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
 use core_types::{ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
-use store::{Store, StoreError, UsageTotals};
+use store::{MemberUsage, Store, StoreError, UsageTotals};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
@@ -674,31 +674,22 @@ impl Commands {
     /// `member`'s usage line for `me`: the turns and tokens billed to them
     /// today and this month, UTC.
     async fn usage(&self, member: Option<MemberId>) -> Result<String, Failure> {
-        let (today, month) = match member {
-            Some(member) => {
-                let now = now();
-                let today = now.replace_time(time::Time::MIDNIGHT);
-                let month = today.replace_day(1).unwrap_or(today);
-                let store = &self.inner.store;
-                (
-                    store.member_usage_since(member, today).await?,
-                    store.member_usage_since(member, month).await?,
-                )
-            }
-            None => Default::default(),
+        let billed = match member {
+            Some(member) => self.inner.store.member_usage(member, now()).await?,
+            None => MemberUsage::default(),
         };
         let describe = |usage: UsageTotals| {
             format!(
                 "{} {}, {} tokens",
                 usage.turns,
                 if usage.turns == 1 { "turn" } else { "turns" },
-                usage.tokens()
+                usage.used.tokens()
             )
         };
         Ok(format!(
             "Usage billed to you today: {}. This month: {} (days start at midnight UTC).",
-            describe(today),
-            describe(month)
+            describe(billed.today),
+            describe(billed.month)
         ))
     }
 

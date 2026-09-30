@@ -16,7 +16,7 @@ use futures::FutureExt as _;
 use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
-use store::{Agent, NewMessageRef, Store, StoreError, TurnUsage};
+use store::{Agent, LimitWindow, NewMessageRef, Store, StoreError, TurnUsage};
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -662,6 +662,10 @@ impl Pipeline {
 
     /// Routes `job`'s message for `agent`, and unless the decision is to
     /// ignore it, routes the platform's copy again and acts on the copy.
+    /// The copy's decision must be the event's, unless either is a limit's
+    /// refusal ([`limited`]): the counts a limit reads can change between
+    /// the two, as a turn ends or an hour or a day turns, and the copy is
+    /// the message as the platform has it.
     async fn candidate(&self, job: &Job, agent: AgentId) {
         let (event, caps) = (job.event.as_ref(), job.caps);
         let Some(decision) = self.decide(event, agent, caps).await else {
@@ -681,7 +685,7 @@ impl Pipeline {
         let Some(confirmed) = self.decide(&copy, agent, caps).await else {
             return;
         };
-        if confirmed != decision {
+        if confirmed != decision && !limited(&decision) && !limited(&confirmed) {
             tracing::warn!(%agent, message = %event.message.id, "the platform's copy of a message routes differently from its event; dropped it");
             return;
         }
@@ -835,14 +839,18 @@ impl Pipeline {
             return Ok(());
         }
         let target = reply_target(event, caps);
-        let Some((kind, window)) = limit_window(reason, (self.inner.settings.now)()) else {
+        let Some((kind, window)) = limit_window(reason) else {
             say(surface.as_ref(), &target, &text).await?;
             tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
             return Ok(());
         };
         let store = &self.inner.store;
         let thread = thread_of(event, caps);
-        match store.claim_limit_notice(agent, &thread, kind, window).await {
+        let now = (self.inner.settings.now)();
+        match store
+            .claim_limit_notice(agent, &thread, kind, window, now)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 tracing::debug!(%agent, message = %event.message.id, %reason, "refused a message; the thread was told already");
@@ -854,7 +862,7 @@ impl Pipeline {
         }
         if let Err(err) = say(surface.as_ref(), &target, &text).await {
             if let Err(err) = store
-                .release_limit_notice(agent, &thread, kind, window)
+                .release_limit_notice(agent, &thread, kind, window, now)
                 .await
             {
                 tracing::warn!(%agent, error = %err, "couldn't release a limit notice's claim");
@@ -1301,25 +1309,34 @@ fn refusal_text(name: &str, reason: RefuseReason) -> String {
     }
 }
 
+/// Whether `decision` is a refusal by a limit that counts turns or tokens
+/// over a day or an hour, which the same message can meet or not from one
+/// moment to the next.
+fn limited(decision: &Decision) -> bool {
+    matches!(
+        decision,
+        Decision::Refuse {
+            reason: RefuseReason::DailyCap { .. }
+                | RefuseReason::ThreadTurns { .. }
+                | RefuseReason::ThreadTokens { .. },
+            ..
+        }
+    )
+}
+
 /// For a refusal a limit over a day or an hour gives, the kind of notice
-/// and the start of the window it counts in, which `now` falls in.
-fn limit_window(
-    reason: RefuseReason,
-    now: OffsetDateTime,
-) -> Option<(&'static str, OffsetDateTime)> {
-    let (kind, seconds) = match reason {
-        RefuseReason::DailyCap { .. } => ("daily_cap", 86_400),
-        RefuseReason::ThreadTurns { .. } => ("thread_turns", 3_600),
-        RefuseReason::ThreadTokens { .. } => ("thread_tokens", 86_400),
+/// and the window it counts in.
+fn limit_window(reason: RefuseReason) -> Option<(&'static str, LimitWindow)> {
+    match reason {
+        RefuseReason::DailyCap { .. } => Some(("daily_cap", LimitWindow::Day)),
+        RefuseReason::ThreadTurns { .. } => Some(("thread_turns", LimitWindow::Hour)),
+        RefuseReason::ThreadTokens { .. } => Some(("thread_tokens", LimitWindow::Day)),
         RefuseReason::Paused
         | RefuseReason::Banned
         | RefuseReason::Denied
         | RefuseReason::HopCap { .. }
-        | RefuseReason::PolicyUnavailable => return None,
-    };
-    let now = now.unix_timestamp();
-    let start = OffsetDateTime::from_unix_timestamp(now - now.rem_euclid(seconds)).ok()?;
-    Some((kind, start))
+        | RefuseReason::PolicyUnavailable => None,
+    }
 }
 
 /// What the meter bills for a turn that ended as `outcome`: the input the

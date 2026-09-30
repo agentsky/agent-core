@@ -83,7 +83,9 @@ pub use slack_apps::{InstallReminder, NewSlackApp, SlackAppBinding, SlackAppKeys
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
-pub use usage::{THREAD_USAGE_RETENTION, ThreadSpend, TurnUsage, UsageTotals};
+pub use usage::{
+    LimitWindow, MemberUsage, THREAD_USAGE_RETENTION, ThreadSpend, TurnUsage, UsageTotals,
+};
 pub use volumes::Volume;
 
 use seal::Aad;

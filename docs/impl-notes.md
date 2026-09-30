@@ -6571,9 +6571,37 @@ it, before delivering the reply, in one transaction (`usage` and
 their counts are exact; turns running at once elsewhere (other threads,
 or other agents in the same thread) can each pass a cap the others are
 about to reach, so a cap can be passed by the turns in flight when it is
-reached. A turn is billed to its requester's member, created from the
-identity if the store has none yet (a community-key turn of someone never
-seen before). A failure to meter is logged; the turn has run.
+reached. The overshoot is bounded: one turn per agent in a thread at a
+time, at most the pipeline's 64 places (16 for one owner's agents) in
+all, and no more than the runner's container cap can run. A turn is billed
+to its requester's member, created from the identity if the store has
+none yet (a community-key turn of someone never seen before). A failure to
+meter is logged; the turn has run.
+
+### What the caps count, and what they don't promise
+
+**Issue.** Several edges of the caps follow from counting per UTC calendar
+day and hour, per thread, and per member, and the plan doesn't settle them.
+
+**Solution.** They are kept, and written down here:
+
+- Windows are calendar hours and days (UTC), not sliding ones, so a thread
+  can take up to twice `thread_turns_per_hour` across an hour's boundary,
+  and an agent twice its `turns=N/day` across midnight.
+- The thread caps count every turn in the thread, whoever asked, so any
+  member who may use an agent there can use up the thread's hour for
+  everyone, the owner included. A new thread starts afresh; a one-to-one
+  DM isn't capped.
+- A turn that ends with an error result (a credential at its usage limit,
+  an unreachable API) counts: it is a turn agentd started, and a loop of
+  failing turns has to stop as well. A turn that crashed or timed out
+  counts too, with what its messages used. Only a message the router
+  refuses, or a turn that never reached the CLI, counts nothing.
+- A limit's refusal can change between the event's routing and the
+  platform's copy's (T31's confirmation), as a turn ends or a window turns.
+  The pipeline used to drop such a message silently; it now acts on the
+  copy's decision when either is a limit's refusal (`limited`), since the
+  copy is the message as the platform has it.
 
 ### The owner is never capped by their own agent's limit
 

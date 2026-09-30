@@ -1018,24 +1018,28 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         .await
         .unwrap()
         .unwrap();
-    let today = pinned_now().replace_time(time::Time::MIDNIGHT);
 
     stack.next_turn(Turn::reply("Done."));
     stack
         .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "m1", None, &[BOT]))
         .await;
-    let billed = store.member_usage_since(bob, today).await.unwrap();
+    let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
     assert_eq!(
-        (billed.turns, billed.input_tokens, billed.output_tokens),
+        (
+            billed.turns,
+            billed.used.input_tokens,
+            billed.used.output_tokens
+        ),
         (1, 10, 1),
         "fake-claude's usage for one reply"
     );
-    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(billed.used.cost_usd, testkit::claude::REPLY_COST_USD);
     assert_eq!(
         store
-            .member_usage_since(stack.alice, today)
+            .member_usage(stack.alice, pinned_now())
             .await
             .unwrap()
+            .today
             .turns,
         0,
         "the owner pays nothing for bob's turn"
@@ -1073,9 +1077,13 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
     stack
         .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "k1", None, &[BOT]))
         .await;
-    let billed = store.member_usage_since(bob, today).await.unwrap();
+    let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
     assert_eq!(
-        (billed.turns, billed.input_tokens, billed.output_tokens),
+        (
+            billed.turns,
+            billed.used.input_tokens,
+            billed.used.output_tokens
+        ),
         (2, 20, 2),
         "a turn whose CLI the agent killed is billed what its messages used"
     );
