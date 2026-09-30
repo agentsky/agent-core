@@ -42,9 +42,10 @@ use crate::{
 ///   process group, and passes `LLVM_PROFILE_FILE` through from agentd's
 ///   environment (unless `exec`'s `env` sets it), so instrumented test
 ///   binaries keep their coverage. No `PATH` is set unless given.
-/// - Spawns are serialized across all process sandboxes, so a child's
-///   pipes are open only in the child and in agentd: once its stdin is
-///   closed, a write to it fails.
+/// - Spawns are serialized across all process sandboxes. As long as
+///   nothing else in agentd forks outside that lock, a child's pipes are
+///   open only in the child (and whatever it starts) and in agentd: once
+///   its stdin is closed, a write to it fails.
 /// - [`ip`](Sandbox::ip) is `127.0.0.1` while the container runs.
 /// - [`stop`](Sandbox::stop) kills each process group it started whose
 ///   leader hasn't been reaped, and reports the container

@@ -2990,7 +2990,10 @@ the precondition.
 spawn. A spawn returns only once its child has exec'd, so with one spawn at
 a time no child is left holding another's pipes, or a file written before
 the spawn. After the change: 0 failures in 300 runs with the busy loops,
-and 0 in 150 under `cargo llvm-cov` with them.
+and 0 in 150 under `cargo llvm-cov` with them. testkit's `fake_claude` test
+binary spawns `fake-claude` directly, and one test writes a script for it
+to run, so it holds its own lock, for the same reason, around its spawns
+and that write.
 
 ### Codes and tool names can carry text
 
