@@ -102,6 +102,8 @@ pub const DEFAULT_LOG_FILTER: &str = "info";
 pub const DEFAULT_ATTACH_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// The default for `slack.api_url`.
 pub const DEFAULT_SLACK_API_URL: &str = surface_slack::web::DEFAULT_BASE_URL;
+/// The default for `slack.install_reminder_secs`: an hour.
+pub const DEFAULT_INSTALL_REMINDER_SECS: u64 = 60 * 60;
 
 /// agentd's configuration, validated.
 #[derive(Debug)]
@@ -265,13 +267,68 @@ pub struct SlackConfig {
     /// `api_url`: the Web API's base URL, [`DEFAULT_SLACK_API_URL`] unless
     /// a test points it at a fake.
     pub api_url: String,
+    /// `public_url`: agentd's public HTTPS URL as Slack reaches the public
+    /// listener, such as `https://agentd.example.com`. Agent apps' request
+    /// URLs and their OAuth redirect URL are built from it. Without it,
+    /// `/agent create` on Slack is refused.
+    pub public_url: Option<String>,
+    /// `public_posting`: whether agent apps ask for `chat:write.public`,
+    /// which lets them post in public channels they aren't in. Off by
+    /// default. It applies to apps created after it changes.
+    pub public_posting: bool,
+    /// `install_reminder_secs`: how long an agent's app may wait to be
+    /// installed before its owner is reminded, once, from 60 to 604800.
+    /// Default 3600.
+    pub install_reminder_secs: u64,
 }
 
 impl Default for SlackConfig {
     fn default() -> Self {
         Self {
             api_url: DEFAULT_SLACK_API_URL.to_owned(),
+            public_url: None,
+            public_posting: false,
+            install_reminder_secs: DEFAULT_INSTALL_REMINDER_SECS,
         }
+    }
+}
+
+impl SlackConfig {
+    /// [`public_url`](Self::public_url) without trailing slashes, if set.
+    pub fn public_url(&self) -> Option<String> {
+        self.public_url
+            .as_deref()
+            .and_then(surface_slack::manifest::public_url)
+    }
+
+    /// [`install_reminder_secs`](Self::install_reminder_secs) as a
+    /// [`Duration`].
+    pub fn install_reminder(&self) -> Duration {
+        Duration::from_secs(self.install_reminder_secs)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        surface_slack::SlackClient::new(&self.api_url).map_err(|_| {
+            invalid(
+                "slack.api_url",
+                "must be an http:// or https:// URL without user info, query or fragment",
+            )
+        })?;
+        if let Some(url) = &self.public_url
+            && surface_slack::manifest::public_url(url).is_none()
+        {
+            return Err(invalid(
+                "slack.public_url",
+                "must be an https:// URL without user info, query or fragment",
+            ));
+        }
+        if !(60..=604_800).contains(&self.install_reminder_secs) {
+            return Err(invalid(
+                "slack.install_reminder_secs",
+                "must be from 60 to 604800",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -811,13 +868,7 @@ impl File {
         if let Some(rocketchat) = &self.rocketchat {
             rocketchat.validate()?;
         }
-        surface_slack::SlackClient::new(&self.slack.api_url).map_err(|_| {
-            invalid(
-                "slack.api_url",
-                "must be an http:// or https:// URL without user info, query or fragment",
-            )
-        })?;
-        Ok(())
+        self.slack.validate()
     }
 }
 
@@ -1597,6 +1648,35 @@ manager_user_id = "manager-id"
         }
         let err = file_err(&format!("{MINIMAL}\n[slack]\nbogus = 1\n"));
         assert!(err.key().unwrap().starts_with("slack"), "{err}");
+    }
+
+    #[test]
+    fn slack_agent_app_keys_default_and_are_checked() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert_eq!(config.slack.public_url(), None);
+        assert!(!config.slack.public_posting);
+        assert_eq!(config.slack.install_reminder(), Duration::from_secs(3600));
+        let text = format!(
+            "{MINIMAL}\n[slack]\npublic_url = \"https://agentd.example.com/\"\n\
+             public_posting = true\ninstall_reminder_secs = 60\n"
+        );
+        let config = with(&text, env()).unwrap();
+        assert_eq!(
+            config.slack.public_url().as_deref(),
+            Some("https://agentd.example.com")
+        );
+        assert!(config.slack.public_posting);
+        assert_eq!(config.slack.install_reminder(), Duration::from_secs(60));
+        for (key, value) in [
+            ("public_url", "\"http://agentd.example.com\""),
+            ("public_url", "\"https://agentd.example.com/?x=1\""),
+            ("install_reminder_secs", "59"),
+            ("install_reminder_secs", "604801"),
+        ] {
+            let text = format!("{MINIMAL}\n[slack]\n{key} = {value}\n");
+            let err = with(&text, env()).unwrap_err();
+            assert_eq!(err.key(), Some(format!("slack.{key}").as_str()), "{err}");
+        }
     }
 
     #[test]

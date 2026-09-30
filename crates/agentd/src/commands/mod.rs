@@ -36,6 +36,7 @@ pub mod relink;
 pub mod reply;
 pub mod rocketchat;
 pub mod slack;
+mod slack_agents;
 pub mod slack_tokens;
 
 #[cfg(test)]
@@ -54,6 +55,7 @@ use store::{Store, StoreError};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::slack::agents::SlackAgents;
 use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
@@ -146,7 +148,9 @@ impl Origin {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
-/// Runs `/agent` commands and sends their replies.
+/// Runs `/agent` commands and sends their replies. Agents are created on
+/// Rocket.Chat through [`RocketChatAgents`], and on Slack, as apps, through
+/// [`SlackAgents`] ([`with_slack_agents`](Self::with_slack_agents)).
 ///
 /// Cloning is cheap and shares everything.
 #[derive(Debug, Clone)]
@@ -154,13 +158,14 @@ pub struct Commands {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Inner {
     store: Store,
     auth: Arc<Auth>,
     replies: Replies,
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
+    slack_agents: Option<SlackAgents>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -197,7 +202,19 @@ impl Commands {
                 replies,
                 rocketchat,
                 slack,
+                slack_agents: None,
             }),
+        }
+    }
+
+    /// These commands, creating and deleting agents on Slack through
+    /// `agents`.
+    #[must_use]
+    pub fn with_slack_agents(self, agents: SlackAgents) -> Self {
+        let mut inner = Arc::unwrap_or_clone(self.inner);
+        inner.slack_agents = Some(agents);
+        Self {
+            inner: Arc::new(inner),
         }
     }
 

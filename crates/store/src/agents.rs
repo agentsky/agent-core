@@ -111,7 +111,7 @@ impl BindingState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "creating" => Ok(Self::Creating),
             "pending_install" => Ok(Self::PendingInstall),
@@ -515,7 +515,8 @@ impl Store {
 
     /// Deletes `agent` at `now`: its state becomes `deleted`, and each of
     /// its bindings that isn't disabled yet is disabled and forgets its bot
-    /// token, in one transaction. The bindings then owe retirement. Returns
+    /// token and its Slack app's client and signing secrets, in one
+    /// transaction. The bindings then owe retirement. Returns
     /// false if the agent doesn't exist or was deleted already.
     ///
     /// # Errors
@@ -976,7 +977,8 @@ async fn delete_agent(
         return Ok(false);
     }
     sqlx::query(
-        "UPDATE agent_bindings SET state = 'disabled', state_changed_at = ?, bot_token_enc = NULL \
+        "UPDATE agent_bindings SET state = 'disabled', state_changed_at = ?, bot_token_enc = NULL, \
+         client_secret_enc = NULL, signing_secret_enc = NULL \
          WHERE agent_id = ? AND state <> 'disabled'",
     )
     .bind(to_unix(now))

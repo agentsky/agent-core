@@ -53,6 +53,7 @@ use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
 use crate::pipeline::{NoCommunityKey, Pipeline};
 use crate::slack;
+use crate::slack::agents::INSTALL_SWEEP_INTERVAL;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
 /// How long `/healthz` waits for the store before reporting it unavailable.
@@ -77,12 +78,16 @@ pub struct Routers {
     /// manager bot's connection. [`Server::run`] holds it until shutdown,
     /// so the intake runs as long as the listeners.
     pub commands: CommandSubmitter,
+    /// Where the Slack queue sends agents' messages.
+    /// [`Server::with_pipeline`] connects it to the turn pipeline.
+    pub slack_messages: slack::Messages,
 }
 
 impl Routers {
-    /// The routes agentd serves: `/healthz` and the Slack request URLs on
-    /// the public listener, with the Slack queue as a worker handing
-    /// commands to the command intake; the credential proxy on the proxy
+    /// The routes agentd serves: `/healthz`, the Slack request URLs and
+    /// agent apps' OAuth callback on the public listener, with the Slack
+    /// queue as a worker handing commands to the command intake and agents'
+    /// messages to [`slack_messages`](Self::slack_messages); the credential proxy on the proxy
     /// listener, forwarding to `proxy.upstream` with the placeholders in
     /// [`App::registry`] and answering `CONNECT` with the egress proxy
     /// `[proxy]` describes; and the agentctl API on the ctl listener.
@@ -93,11 +98,15 @@ impl Routers {
     pub fn new(app: &App) -> anyhow::Result<Self> {
         let (slack_routes, slack_queue) = slack::routes(app);
         let (intake, commands) = CommandIntake::new(app.commands().clone());
-        let inbound = slack::Inbound::new(
+        let slack_messages = slack::Messages::default();
+        let mut inbound = slack::Inbound::new(
             app.store().clone(),
             app.slack().map(|slack| slack.identity().clone()),
             commands.clone(),
         );
+        if let Some(agents) = app.slack_agents() {
+            inbound = inbound.with_agents(agents.bots().clone(), slack_messages.clone());
+        }
         let tokens: Arc<dyn TokenSource> = app.auth().clone();
         let upstream = &app.config().proxy.upstream;
         if upstream != cred_proxy::DEFAULT_UPSTREAM {
@@ -125,6 +134,7 @@ impl Routers {
             )],
             intake,
             commands,
+            slack_messages,
         })
     }
 }
@@ -242,9 +252,13 @@ impl Server {
         self.addrs
     }
 
-    /// Passes the connections' messages to `pipeline`, which runs turns,
-    /// while serving. Without it agentd runs none.
+    /// Passes the connections' messages, and those agents' Slack apps
+    /// receive, to `pipeline`, which runs turns, while serving. Without it
+    /// agentd runs none.
     pub fn with_pipeline(mut self, pipeline: Pipeline) -> Self {
+        self.routers
+            .slack_messages
+            .connect(pipeline.sink(surface_slack::surface::CAPS));
         self.pipeline = Some(pipeline);
         self
     }
@@ -269,7 +283,8 @@ impl Server {
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
-    /// with the Slack manager app the configuration token rotator, and with
+    /// with the Slack manager app the configuration token rotator and the
+    /// sweeper of agents' apps (install reminders, stale creations), and with
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
     /// the agents' connections. Every connection feeds the commands it hears
     /// to the intake like the Slack queue does, and passes other messages to
@@ -344,6 +359,14 @@ impl Server {
         });
         let commands = routers.commands;
         let holding = stopping.clone();
+        if let Some(agents) = app.slack_agents() {
+            let agents = agents.clone();
+            let sweeping = stopping.clone();
+            tasks.spawn(async move {
+                agents.run(INSTALL_SWEEP_INTERVAL, sweeping).await;
+                "Slack agent app sweeper"
+            });
+        }
         if let Some(slack) = app.slack() {
             let rotator = ConfigTokenRotator::new(
                 app.store().clone(),

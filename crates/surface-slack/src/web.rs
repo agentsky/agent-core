@@ -26,6 +26,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use core_types::{ConversationId, InFile, MessageId, OutFile, SurfaceError, TeamId, UserId};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{StatusCode, Url, redirect};
@@ -132,6 +134,8 @@ const RATE_LIMITED_CODES: &[&str] = &["ratelimited", "rate_limited"];
 /// A Web API method this client calls, with its rate-limit tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
+    AppsManifestCreate,
+    AppsManifestDelete,
     AuthTest,
     BotsInfo,
     ChatPostEphemeral,
@@ -144,6 +148,7 @@ enum Method {
     ConversationsReplies,
     FilesCompleteUploadExternal,
     FilesGetUploadUrlExternal,
+    OauthV2Access,
     ReactionsAdd,
     ReactionsRemove,
     ToolingTokensRotate,
@@ -154,6 +159,8 @@ enum Method {
 impl Method {
     const fn name(self) -> &'static str {
         match self {
+            Self::AppsManifestCreate => "apps.manifest.create",
+            Self::AppsManifestDelete => "apps.manifest.delete",
             Self::AuthTest => "auth.test",
             Self::BotsInfo => "bots.info",
             Self::ChatPostEphemeral => "chat.postEphemeral",
@@ -166,6 +173,7 @@ impl Method {
             Self::ConversationsReplies => "conversations.replies",
             Self::FilesCompleteUploadExternal => "files.completeUploadExternal",
             Self::FilesGetUploadUrlExternal => "files.getUploadURLExternal",
+            Self::OauthV2Access => "oauth.v2.access",
             Self::ReactionsAdd => "reactions.add",
             Self::ReactionsRemove => "reactions.remove",
             Self::ToolingTokensRotate => "tooling.tokens.rotate",
@@ -180,7 +188,9 @@ impl Method {
         match self {
             Self::AuthTest => Tier::AuthTest,
             Self::ChatPostMessage => Tier::PostMessage,
-            Self::ToolingTokensRotate => Tier::Tier1,
+            Self::AppsManifestCreate | Self::AppsManifestDelete | Self::ToolingTokensRotate => {
+                Tier::Tier1
+            }
             Self::UsersList | Self::ReactionsRemove => Tier::Tier2,
             Self::BotsInfo
             | Self::ChatUpdate
@@ -193,6 +203,7 @@ impl Method {
             Self::ChatPostEphemeral
             | Self::FilesCompleteUploadExternal
             | Self::FilesGetUploadUrlExternal
+            | Self::OauthV2Access
             | Self::UsersInfo => Tier::Tier4,
         }
     }
@@ -312,7 +323,7 @@ impl SlackClient {
         WebApi {
             client: self.clone(),
             key: TokenKey::of(&token),
-            token: Some(token),
+            auth: Auth::Bearer(token),
         }
     }
 
@@ -333,7 +344,7 @@ impl SlackClient {
         let api = WebApi {
             client: self.clone(),
             key: TokenKey::of(refresh_token),
-            token: None,
+            auth: Auth::None,
         };
         let form = vec![("refresh_token", refresh_token.expose_secret().to_owned())];
         let rotated: RotateResponse = api
@@ -349,6 +360,119 @@ impl SlackClient {
             user: rotated.user_id,
             expires_at,
         })
+    }
+
+    /// `apps.manifest.create`: creates an app from `manifest`, acting as the
+    /// member whose app configuration token `config_token` is. Slack
+    /// verifies the manifest's events URL with a `url_verification`
+    /// challenge while the call runs.
+    ///
+    /// The token goes only in `Authorization: Bearer`, and the manifest as
+    /// JSON in the form body.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Unauthorized`] when Slack refuses the token (it
+    /// expired, or was revoked); [`SurfaceError::Api`] with Slack's code,
+    /// such as `invalid_manifest`, for a manifest it refuses; otherwise see
+    /// [`map_error`].
+    pub async fn create_app(
+        &self,
+        config_token: &SecretString,
+        manifest: &Value,
+    ) -> Result<CreatedApp> {
+        let form = vec![("manifest", manifest.to_string())];
+        let created: CreateAppResponse = self
+            .config_api(config_token)
+            .call(Method::AppsManifestCreate, Body::Form(form), None)
+            .await?;
+        if created.app_id.is_empty() || created.credentials.client_id.is_empty() {
+            return Err(SurfaceError::Transport(
+                "apps.manifest.create returned no app id or client id".into(),
+            ));
+        }
+        Ok(CreatedApp {
+            app_id: created.app_id,
+            client_id: created.credentials.client_id,
+            client_secret: created.credentials.client_secret,
+            signing_secret: created.credentials.signing_secret,
+        })
+    }
+
+    /// `apps.manifest.delete`: deletes the app `app_id`, its bot user and
+    /// its installations, acting as the member whose app configuration
+    /// token `config_token` is.
+    ///
+    /// # Errors
+    ///
+    /// As for [`create_app`](Self::create_app).
+    pub async fn delete_app(&self, config_token: &SecretString, app_id: &str) -> Result<()> {
+        let form = vec![("app_id", app_id.to_owned())];
+        self.config_api(config_token)
+            .call::<IgnoredAny>(Method::AppsManifestDelete, Body::Form(form), None)
+            .await
+            .map(drop)
+    }
+
+    /// `oauth.v2.access`: exchanges the `code` an install's OAuth redirect
+    /// carried for the app's bot token. `client_id` and `client_secret` are
+    /// the app's, sent in `Authorization: Basic`; `redirect_url` must be the
+    /// one the install link named.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Api`] with Slack's code (`invalid_code`,
+    /// `bad_redirect_uri`, …) for a refused exchange, and
+    /// [`SurfaceError::Transport`] when the answer carries no bot token.
+    pub async fn install_app(
+        &self,
+        client_id: &str,
+        client_secret: &SecretString,
+        code: &SecretString,
+        redirect_url: &str,
+    ) -> Result<Installation> {
+        let api = WebApi {
+            client: self.clone(),
+            key: TokenKey::of(client_secret),
+            auth: Auth::Basic {
+                client_id: client_id.to_owned(),
+                client_secret: client_secret.clone(),
+            },
+        };
+        let form = vec![
+            ("code", code.expose_secret().to_owned()),
+            ("redirect_uri", redirect_url.to_owned()),
+        ];
+        let installed: InstallResponse = api
+            .call(Method::OauthV2Access, Body::Form(form), None)
+            .await?;
+        if installed
+            .token_type
+            .as_deref()
+            .is_some_and(|kind| kind != "bot")
+            || installed.access_token.expose_secret().is_empty()
+            || installed.bot_user_id.as_str().is_empty()
+        {
+            return Err(SurfaceError::Transport(
+                "oauth.v2.access returned no bot token".into(),
+            ));
+        }
+        Ok(Installation {
+            app_id: installed.app_id,
+            team: installed.team.id,
+            bot_user: installed.bot_user_id,
+            bot_token: installed.access_token,
+            installer: installed.authed_user.map(|user| user.id),
+        })
+    }
+
+    /// A client acting with a member's app configuration token.
+    fn config_api(&self, config_token: &SecretString) -> WebApi {
+        WebApi {
+            client: self.clone(),
+            key: TokenKey::of(config_token),
+            auth: Auth::Bearer(config_token.clone()),
+        }
     }
 
     /// Replies privately to a slash command or an interaction through its
@@ -417,8 +541,24 @@ impl SlackClient {
 #[derive(Clone)]
 pub struct WebApi {
     client: SlackClient,
-    token: Option<SecretString>,
+    auth: Auth,
     key: TokenKey,
+}
+
+/// How a [`WebApi`] authenticates its calls.
+#[derive(Clone)]
+enum Auth {
+    /// Not at all, as `tooling.tokens.rotate` does.
+    None,
+    /// With a token in `Authorization: Bearer`: a bot token, or a member's
+    /// configuration token.
+    Bearer(SecretString),
+    /// With an app's client id and secret in `Authorization: Basic`, as
+    /// `oauth.v2.access` does.
+    Basic {
+        client_id: String,
+        client_secret: SecretString,
+    },
 }
 
 impl fmt::Debug for WebApi {
@@ -464,6 +604,36 @@ pub struct ConfigToken {
     pub user: UserId,
     /// When `token` stops working. Configuration tokens last 12 hours.
     pub expires_at: OffsetDateTime,
+}
+
+/// An app `apps.manifest.create` created, from
+/// [`SlackClient::create_app`]. `Debug` redacts both secrets.
+#[derive(Debug)]
+pub struct CreatedApp {
+    /// The app's id (`A…`).
+    pub app_id: String,
+    /// The app's OAuth client id.
+    pub client_id: String,
+    /// The app's OAuth client secret, which `oauth.v2.access` needs.
+    pub client_secret: SecretString,
+    /// The secret the app's requests are signed with.
+    pub signing_secret: SecretString,
+}
+
+/// An app's installation in a workspace, from `oauth.v2.access`
+/// ([`SlackClient::install_app`]). `Debug` redacts the token.
+#[derive(Debug)]
+pub struct Installation {
+    /// The app that was installed.
+    pub app_id: String,
+    /// The workspace it was installed in.
+    pub team: TeamId,
+    /// The app's bot user.
+    pub bot_user: UserId,
+    /// The bot token (`xoxb-…`).
+    pub bot_token: SecretString,
+    /// The member who installed it.
+    pub installer: Option<UserId>,
 }
 
 /// A conversation, from `conversations.info`, `conversations.join` or
@@ -668,6 +838,36 @@ struct UsersResponse {
     members: Vec<User>,
     #[serde(default)]
     response_metadata: ResponseMetadata,
+}
+
+#[derive(Deserialize)]
+struct CreateAppResponse {
+    app_id: String,
+    credentials: AppCredentials,
+}
+
+#[derive(Deserialize)]
+struct AppCredentials {
+    client_id: String,
+    client_secret: SecretString,
+    signing_secret: SecretString,
+}
+
+#[derive(Deserialize)]
+struct InstallResponse {
+    app_id: String,
+    #[serde(default)]
+    token_type: Option<String>,
+    access_token: SecretString,
+    bot_user_id: UserId,
+    team: IdObject<TeamId>,
+    #[serde(default)]
+    authed_user: Option<IdObject<UserId>>,
+}
+
+#[derive(Deserialize)]
+struct IdObject<T> {
+    id: T,
 }
 
 #[derive(Deserialize)]
@@ -1225,11 +1425,20 @@ impl WebApi {
     /// `request` with the bot token in `Authorization`, if this client has
     /// one.
     fn authorized(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        let Some(token) = &self.token else {
-            return Ok(request);
+        let value = match &self.auth {
+            Auth::None => return Ok(request),
+            Auth::Bearer(token) => format!("Bearer {}", token.expose_secret()),
+            Auth::Basic {
+                client_id,
+                client_secret,
+            } => format!(
+                "Basic {}",
+                BASE64.encode(format!("{client_id}:{}", client_secret.expose_secret()))
+            ),
         };
-        let mut auth = HeaderValue::try_from(format!("Bearer {}", token.expose_secret()))
-            .map_err(|_| SurfaceError::Api("the bot token has invalid header characters".into()))?;
+        let mut auth = HeaderValue::try_from(value).map_err(|_| {
+            SurfaceError::Api("the credential has invalid header characters".into())
+        })?;
         auth.set_sensitive(true);
         Ok(request.header(AUTHORIZATION, auth))
     }
@@ -1413,6 +1622,8 @@ mod tests {
     #[test]
     fn every_method_has_a_tier() {
         let cases = [
+            (Method::AppsManifestCreate, Tier::Tier1),
+            (Method::AppsManifestDelete, Tier::Tier1),
             (Method::AuthTest, Tier::AuthTest),
             (Method::BotsInfo, Tier::Tier3),
             (Method::ChatPostEphemeral, Tier::Tier4),
@@ -1425,6 +1636,7 @@ mod tests {
             (Method::ConversationsReplies, Tier::Tier3),
             (Method::FilesCompleteUploadExternal, Tier::Tier4),
             (Method::FilesGetUploadUrlExternal, Tier::Tier4),
+            (Method::OauthV2Access, Tier::Tier4),
             (Method::ReactionsAdd, Tier::Tier3),
             (Method::ReactionsRemove, Tier::Tier2),
             (Method::ToolingTokensRotate, Tier::Tier1),

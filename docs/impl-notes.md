@@ -5085,3 +5085,170 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
+
+## T31: Slack agent apps from manifests
+
+Slack's documentation site wasn't reachable, so the API shapes below were
+read from Slack's SDKs: `apps.manifest.create` and `apps.manifest.delete`
+from `slackapi/python-slack-sdk` (`slack_sdk/web/client.py`, whose
+`params` end up in the form body, per `base_client.py`) and
+`slackapi/java-slack-sdk` (`AppsManifestCreateResponse`, `AppCredentials`,
+`MethodsRateLimits`), and `oauth.v2.access` from the same two
+(`OAuthV2AccessResponse`, and the Python client's Basic authentication).
+None of it has run against real Slack yet.
+
+### What the app calls send
+
+**Issue.** The plan names the methods but not how they authenticate or what
+they return.
+
+**Solution.** `SlackClient::create_app` and `delete_app` send a form, the
+manifest as a JSON string in `manifest`, with the member's configuration
+token only in `Authorization: Bearer`. `create_app` returns the `app_id`
+and the `credentials` object's `client_id`, `client_secret` and
+`signing_secret` (the legacy `verification_token` is ignored), with both
+secrets as `SecretString`. `install_app` (`oauth.v2.access`) sends `code`
+and `redirect_uri` in the form and the app's `client_id:client_secret` in
+`Authorization: Basic`, as the Python SDK does, never in the body; it
+refuses an answer whose `token_type` isn't `bot` or that lacks the token or
+the bot user. `WebApi` now holds an `Auth` (none, bearer or basic) instead
+of an optional bearer token. The Java SDK tags both manifest methods Tier 1
+and `oauth.v2.access` Tier 4. What `apps.manifest.delete` answers for an app
+that is already gone isn't in the SDKs; any `NotFound` code counts as
+deleted.
+
+### The install link's `state` is sealed, and used once through the binding
+
+**Issue.** The plan asks for a signed `state` naming the binding, and for a
+forged or replayed one to be refused, without saying with which key or how
+a replay is noticed.
+
+**Solution.** `Store::install_state` is `<binding id>.<base64url>`, where the
+second part is a constant sealed with the master key (ChaCha20-Poly1305)
+with the binding id in the associated data, so it can't be made without the
+key or moved to another binding. The store already owns the key, so there
+is no new key material. A replay is refused by the binding's state: the
+callback acts only on a `pending_install` binding and makes it `active`,
+conditionally, so a second callback, or two at once, installs once (409).
+The answer of `oauth.v2.access` must also name the binding's app and the
+workspace agentd serves. The state doesn't expire: the link stays good for
+as long as the app waits, which an approval can make days. Anyone in the
+workspace who has the link can complete the install, which gives agentd the
+same bot token the owner's click would; the owner is told either way. The
+installer (`authed_user`) isn't compared with the owner, since an admin may
+install the app after approving it.
+
+### The install link asks for the scopes the app was made with
+
+**Issue.** `[slack] public_posting` adds `chat:write.public` to new apps. A
+reminder built from the current configuration would ask for a scope the
+app's manifest lacks once the switch changed.
+
+**Solution.** A migration adds `agent_bindings.app_scopes`, the scopes the
+manifest asked for, and every link for the app (the first and the
+reminder) asks for exactly those.
+
+### A creation that stops halfway
+
+**Issue.** Creating an agent app is a store write, a call to Slack, then
+another store write; any of them can fail, or agentd can die in between.
+
+**Solution.** As on Rocket.Chat (T14), the agent and its `creating` binding
+are stored first, which reserves the name and lets the ingress answer
+Slack's challenge. If `apps.manifest.create` fails, the creation is
+abandoned: the binding is disabled and the agent deleted, which frees the
+name, rather than deleting the rows. If the app was created but can't be
+stored, because the store failed or the creation was abandoned meanwhile
+(`/agent delete`, or the sweeper), the app is deleted again with the same
+token. `apps.manifest.create` gets `APP_CALL_TIMEOUT` (2 minutes), well
+within `CREATION_LEASE` (10 minutes), after which a new Slack sweeper
+abandons a `creating` Slack binding. A crash after Slack created the app
+and before it was stored leaves an app at Slack that agentd doesn't know;
+it is listed under the member's apps at api.slack.com.
+
+### Deleting a Slack agent keeps its binding row
+
+**Issue.** The plan says `/agent delete` deletes the binding. T23's router
+recognizes every bot user agentd ever made through the bindings
+(`Store::agent_of_bot_user`), so deleting the row would make the deleted
+agent's old posts look like a stranger's.
+
+**Solution.** `delete_agent` disables the binding, as for Rocket.Chat, and
+now also forgets its Slack client and signing secrets with its bot token,
+so the ingress no longer knows it (404). Then `apps.manifest.delete` runs
+with the owner's configuration token, and the binding is marked retired.
+Without a token that works (none, refused or expired), the app is left at
+Slack and the owner is told to delete it at
+`https://api.slack.com/apps/<app id>`; nothing retries it later
+([Deferred work](tasks-plan.md#deferred-work)).
+
+### Agents' messages reach the pipeline built after the queue
+
+**Issue.** `Routers::new` builds the Slack queue and its `slack::Inbound`
+sink, but the pipeline is built later, from `Turns` (which needs the bound
+listeners), and handed to `Server::with_pipeline`.
+
+**Solution.** `Inbound` sends agents' messages to `slack::Messages`, which
+`Routers` holds and `Server::with_pipeline` connects to the pipeline's sink
+(with Slack's `Caps`, so `per_binding_delivery` makes the receiving
+binding's agent the one candidate). Until then, and in an agentd without
+`[sandbox]`, they are dropped with a debug line. Before handing a message
+on, `Inbound` looks its bot sender up with the receiving binding's
+`SlackSurface::fill_bot_sender`. A message to a binding that isn't active
+(still waiting for its install, or deleted) is dropped.
+
+### One workspace for agent apps too
+
+**Issue.** T30 serves the manager's workspace only. An agent binding's URL
+is reachable from anywhere, and apps can be installed in other workspaces
+when someone has the link.
+
+**Solution.** `StoreSigningSecrets` knows an agent binding only in the
+manager's workspace, `Inbound` drops a request to any binding whose
+workspace isn't the manager's (the check T30 made for the manager), and the
+OAuth callback refuses an install whose `team` isn't it, storing nothing.
+
+### When a binding's first reply reads the member list
+
+**Issue.** The plan has agentd await `refresh_members` when a binding
+starts. The Slack queue handles requests one at a time, and a large
+workspace's `users.list` can take minutes (T29).
+
+**Solution.** `SlackBots` builds each binding's surface once. The queue uses
+it without waiting (for `fill_bot_sender`); the first reply of a binding in
+a process awaits `refresh_members`, in the pipeline's lane, so it resolves
+names while no other request waits. `StoreSurfaces` takes Slack surfaces
+from `SlackBots` and still gives the directory the workspace's agents' bot
+users on every lookup, which also picks up agents another instance
+installed; an install and a deletion do it too.
+
+### Bots don't join channels by posting
+
+Slack refuses a post to a conversation the bot isn't in (T23b), and the
+`message.*` events come only from conversations the bot is in, so a reply
+always goes where the bot heard the message. `chat:write.public`, which
+would let a bot post in any public channel, is off unless
+`[slack] public_posting` is set. The manifest has the plan's
+`channels:join`, but agentd never calls `conversations.join` for an agent.
+
+### Smaller choices
+
+- The app's name and its bot user's display name are the agent's name
+  (names are 2 to 32 characters, within Slack's limits); the description is
+  fixed. The messages tab is on and not read-only, so members can DM the
+  agent. A name Slack refuses is reported with Slack's code.
+- `[slack] public_url` must be `https`, since Slack takes nothing else as a
+  request URL; its trailing slashes are dropped. Without it, `/agent create`
+  on Slack says to set it.
+- The install link carries `redirect_uri`, and `oauth.v2.access` repeats it.
+- The owner's display name, for the default persona and `list`, comes from
+  `users.info` through the manager app. `list` shows the agent's name as the
+  bot's `@name`, since `oauth.v2.access` doesn't return the bot's handle.
+- The callback answers in plain text with `nosniff`, `no-store` and
+  `no-referrer`, and never repeats what the query held. A cancelled install
+  (`error=access_denied`) changes nothing, and the link still works.
+- The reminder is claimed with a 10-minute lease and tried at most five
+  times, like the relink notice; an owner no manager DM reaches waits.
+- Client and signing secrets, bot tokens, configuration tokens and OAuth
+  codes are `SecretString`s; a captured-log test at `trace` through a whole
+  create, install and delete finds none of them.

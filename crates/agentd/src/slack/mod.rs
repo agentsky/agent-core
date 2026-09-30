@@ -5,24 +5,36 @@
 //!
 //! - [`ConfigSigningSecrets`]: the manager app's signing secret, from
 //!   [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](crate::config::SLACK_MANAGER_SIGNING_SECRET_VAR),
-//!   and its bot user. Agent bindings' secrets come from the store once
-//!   agent apps exist.
+//!   and its bot user; [`StoreSigningSecrets`] adds agent bindings' from the
+//!   store in front of it.
 //! - [`StoreDedup`]: deduplication in the store's `processed_events`.
 //! - [`Inbound`]: where verified requests go. Commands to the manager app
 //!   go to the [`CommandIntake`](crate::commands::intake::CommandIntake),
 //!   and a `user_change` saying a member left deletes their configuration
-//!   token; the rest is logged by kind and dropped until the turn pipeline
-//!   takes agents' messages.
+//!   token. Messages to agents' apps go to the turn pipeline, through
+//!   [`Messages`], once their bot senders are looked up. The rest is logged
+//!   by kind and dropped.
 //! - [`manager`]: the manager app itself.
+//! - [`agents`]: agents' apps, created from manifests and installed through
+//!   `GET /slack/oauth/callback`.
+//! - [`bots`]: the surfaces agents' bots act through.
+//!
+//! agentd serves one workspace, the manager app's. Requests to any app from
+//! another workspace, or naming none, are dropped, and agent bindings in
+//! another workspace are unknown to the ingress.
 
+pub mod agents;
+pub mod bots;
 pub mod manager;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::Router;
-use core_types::{SendError, Sender, Sink, UserId};
+use axum::routing::get;
+use core_types::{InboundEvent, SendError, Sender, Sink, TeamId, UserId};
 use secrecy::SecretString;
 use store::Store;
+use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
     BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, SlackEvent, SlackInbound, ingress,
 };
@@ -31,6 +43,7 @@ use time::OffsetDateTime;
 use crate::app::App;
 use crate::commands::intake::CommandSubmitter;
 use crate::commands::slack::{dm_command, member_who_left, slash_command};
+use bots::SlackBots;
 use manager::ManagerIdentity;
 
 /// How many acknowledged Slack requests may wait to be handled. Beyond
@@ -38,8 +51,9 @@ use manager::ManagerIdentity;
 /// interactions.
 pub const QUEUE_CAPACITY: usize = 1024;
 
-/// The router serving the Slack request URLs, and the queue behind it. Run
-/// the queue with [`run_queue`].
+/// The router serving the Slack request URLs, and the queue behind it, and
+/// with agent apps, their OAuth callback. Run the queue with
+/// [`run_queue`].
 pub fn routes(app: &App) -> (Router, Queue) {
     let secrets = ConfigSigningSecrets::new(
         app.config().secrets.slack_manager_signing_secret(),
@@ -50,7 +64,21 @@ pub fn routes(app: &App) -> (Router, Queue) {
     } else {
         tracing::info!("Slack manager app: not configured; /slack/b/manager/ answers 404");
     }
-    ingress(Arc::new(secrets), QUEUE_CAPACITY)
+    let secrets = StoreSigningSecrets::new(
+        secrets,
+        app.slack()
+            .map(|slack| (app.store().clone(), slack.identity().team.clone())),
+    );
+    let (router, queue) = ingress(Arc::new(secrets), QUEUE_CAPACITY);
+    let router = match app.slack_agents() {
+        Some(agents) => router.merge(
+            Router::new()
+                .route(OAUTH_CALLBACK_PATH, get(agents::oauth_callback))
+                .with_state(agents.clone()),
+        ),
+        None => router,
+    };
+    (router, queue)
 }
 
 /// Handles the queue until it closes: deduplicates through the store and
@@ -90,6 +118,60 @@ impl SigningSecrets for ConfigSigningSecrets {
     }
 }
 
+/// Signing secrets for every binding: agent bindings' from the store, in the
+/// workspace agentd serves, while they are `creating` (known, but without a
+/// secret yet), `pending_install` or `active`; the manager app's from
+/// [`ConfigSigningSecrets`]. Disabled bindings, those of deleted agents,
+/// are unknown, so their requests get 404.
+#[derive(Debug, Clone)]
+pub struct StoreSigningSecrets {
+    config: ConfigSigningSecrets,
+    agents: Option<(Store, TeamId)>,
+}
+
+impl StoreSigningSecrets {
+    /// The manager's secret from `config`, and agent bindings' from the
+    /// store in the workspace given with it; without one, only the manager
+    /// is known.
+    pub fn new(config: ConfigSigningSecrets, agents: Option<(Store, TeamId)>) -> Self {
+        Self { config, agents }
+    }
+}
+
+#[async_trait::async_trait]
+impl SigningSecrets for StoreSigningSecrets {
+    async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
+        let (BindingRef::Agent(id), Some((store, team))) = (binding, &self.agents) else {
+            return self.config.lookup(binding).await;
+        };
+        Ok(store.slack_app_keys(id, team).await?.map(|keys| SlackApp {
+            signing_secret: keys.signing_secret,
+            bot_user: keys.bot_user,
+        }))
+    }
+}
+
+/// Where the Slack queue sends agents' messages: the turn pipeline, once
+/// [`connect`](Self::connect)ed. Until then, and in an agentd that runs no
+/// turns, they are dropped.
+///
+/// Cloning is cheap and shares the connection.
+#[derive(Debug, Clone, Default)]
+pub struct Messages(Arc<OnceLock<Sender<InboundEvent>>>);
+
+impl Messages {
+    /// Sends messages to `onward` from now on. Only the first call counts.
+    pub fn connect(&self, onward: Sender<InboundEvent>) {
+        if self.0.set(onward).is_err() {
+            tracing::warn!("Slack messages are connected already; ignored another connection");
+        }
+    }
+
+    fn onward(&self) -> Option<&Sender<InboundEvent>> {
+        self.0.get()
+    }
+}
+
 /// Deduplication in the store's `processed_events`, which the sweeper
 /// empties after [`store::PROCESSED_EVENT_RETENTION`].
 #[derive(Debug, Clone)]
@@ -107,17 +189,24 @@ impl Dedup for StoreDedup {
 
 /// Where the Slack queue hands verified requests.
 ///
-/// Requests to the manager app from the workspace agentd serves: an
-/// `/agent` slash command or a DM to the app goes to the command intake,
-/// and a `user_change` whose user is `deleted` deletes that member's
-/// configuration token for the workspace. A request from any other
-/// workspace, or one that names none, is dropped.
-/// Everything else, agents' messages included, is logged by binding and
-/// kind and dropped until the turn pipeline (T31) takes it.
+/// Requests from any workspace but the one agentd serves, or naming none,
+/// are dropped. Then:
+///
+/// - To the manager app: an `/agent` slash command or a DM to the app goes
+///   to the command intake, and a `user_change` whose user is `deleted`
+///   deletes that member's configuration token for the workspace.
+/// - To an agent's app, whose binding is active: a message goes to
+///   [`Messages`], after [`SlackSurface::fill_bot_sender`] of the binding
+///   looked its bot sender up.
+///
+/// Everything else is logged by binding and kind and dropped.
+///
+/// [`SlackSurface::fill_bot_sender`]: surface_slack::SlackSurface::fill_bot_sender
 #[derive(Debug, Clone)]
 pub struct Inbound {
     store: Store,
     manager: Option<(ManagerIdentity, CommandSubmitter)>,
+    agents: Option<(SlackBots, Messages)>,
 }
 
 impl Inbound {
@@ -128,6 +217,46 @@ impl Inbound {
         Self {
             store,
             manager: manager.map(|identity| (identity, commands)),
+            agents: None,
+        }
+    }
+
+    /// Also hands messages to agents' apps, whose bots are `bots`, to
+    /// `messages`.
+    pub fn with_agents(mut self, bots: SlackBots, messages: Messages) -> Self {
+        self.agents = Some((bots, messages));
+        self
+    }
+
+    /// Hands a message an agent's app received on.
+    async fn agent_message(&self, mut event: InboundEvent) {
+        let Some((bots, messages)) = &self.agents else {
+            return;
+        };
+        let binding = event.binding;
+        let surface = match bots.surface(binding).await {
+            Ok(Some(surface)) => surface,
+            Ok(None) => {
+                tracing::debug!(%binding, "a message to an agent's app that isn't active; dropped it");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(%binding, error = %err, "couldn't look an agent's binding up; dropped its message");
+                return;
+            }
+        };
+        if let Err(err) = surface.fill_bot_sender(&mut event).await {
+            tracing::warn!(%binding, error = %err, "couldn't look a bot sender up; its message goes on as it is");
+        }
+        match messages.onward() {
+            Some(onward) => {
+                if onward.send(event).await.is_err() {
+                    tracing::warn!(%binding, "the turn pipeline is gone; dropped a message");
+                }
+            }
+            None => {
+                tracing::debug!(%binding, "agentd runs no turns; dropped a message to an agent")
+            }
         }
     }
 
@@ -160,14 +289,23 @@ impl Inbound {
 impl Sink<SlackInbound> for Inbound {
     async fn send(&self, item: SlackInbound) -> Result<(), SendError> {
         let (binding, kind) = (item.binding(), item.kind());
-        let manager = self
-            .manager
-            .as_ref()
-            .filter(|_| binding == BindingRef::MANAGER_ID);
-        let Some((identity, commands)) = manager else {
-            tracing::debug!(%binding, kind, "no handler for this Slack request yet; dropped it");
+        let Some((identity, commands)) = &self.manager else {
+            tracing::debug!(%binding, kind, "agentd doesn't serve Slack; dropped a request");
             return Ok(());
         };
+        if binding != BindingRef::MANAGER_ID {
+            if item.team() != Some(&identity.team) {
+                tracing::debug!(%binding, kind, team = ?item.team(), "a request to an agent's app from another workspace; dropped it");
+                return Ok(());
+            }
+            match item {
+                SlackInbound::Message(event) => self.agent_message(*event).await,
+                _ => {
+                    tracing::debug!(%binding, kind, "a request to an agent's app that isn't a message; dropped it")
+                }
+            }
+            return Ok(());
+        }
         if item.team() != Some(&identity.team) {
             tracing::debug!(
                 kind,

@@ -3,11 +3,11 @@
 //!
 //! An agent is addressed by its name among its owner's agents, so a member
 //! can only ever change their own: someone else's agent of that name is
-//! "no agent of yours". Agents live on Rocket.Chat until the Slack agent
-//! apps (T31).
+//! "no agent of yours". On Rocket.Chat an agent is a bot user; on Slack it
+//! is an app of its own (see [`slack_agents`](super::slack_agents)).
 
 use commands::UserRef;
-use core_types::{AgentId, InFile, MemberKey, SurfaceError, SurfaceKind, UserId};
+use core_types::{AgentId, InFile, MemberId, MemberKey, SurfaceError, SurfaceKind, UserId};
 use store::{Agent, AgentCreation, AgentState, BindingState, NewAgent, StoreError, Visibility};
 use time::OffsetDateTime;
 
@@ -21,14 +21,14 @@ pub const PERSONA_MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_PERSONA: &str = include_str!("../../assets/persona.md");
 
 /// The default persona of the agent `name`, owned by `owner`.
-fn default_persona(name: &str, owner: &str) -> String {
+pub(super) fn default_persona(name: &str, owner: &str) -> String {
     DEFAULT_PERSONA
         .replace("{name}", name)
         .replace("{owner}", owner)
 }
 
 /// Why a persona can't be used, or `None` if it can.
-fn persona_problem(persona: &str) -> Option<String> {
+pub(super) fn persona_problem(persona: &str) -> Option<String> {
     if persona.trim().is_empty() {
         Some("A persona can't be empty.".to_owned())
     } else if persona.len() > PERSONA_MAX_BYTES {
@@ -42,7 +42,7 @@ fn persona_problem(persona: &str) -> Option<String> {
     }
 }
 
-fn no_such_agent(name: &str) -> String {
+pub(super) fn no_such_agent(name: &str) -> String {
     format!("You have no agent named `{name}`. Only an agent's owner can change it.")
 }
 
@@ -63,16 +63,13 @@ impl Commands {
         Ok(self.inner.store.agent_by_name(owner, name).await?)
     }
 
-    pub(super) async fn create(
+    /// `key`'s member, if their Claude account is linked, or else the reply
+    /// that asks them to link one.
+    pub(super) async fn linked_owner(
         &self,
         key: &MemberKey,
-        name: &str,
-        persona: Option<String>,
         origin: &Origin,
-    ) -> Result<String, Failure> {
-        let Some(agents) = self.agents_for(key) else {
-            return Ok("Creating agents here isn't available yet.".to_owned());
-        };
+    ) -> Result<Result<MemberId, String>, Failure> {
         let linked = match self.member(key).await? {
             Some(member) => self
                 .inner
@@ -83,11 +80,30 @@ impl Commands {
                 .then_some(member),
             None => None,
         };
-        let Some(member) = linked else {
-            return Ok(format!(
+        Ok(linked.ok_or_else(|| {
+            format!(
                 "Link your Claude account first: send {}. Your agents run on it.",
                 origin.command("login")
-            ));
+            )
+        }))
+    }
+
+    pub(super) async fn create(
+        &self,
+        key: &MemberKey,
+        name: &str,
+        persona: Option<String>,
+        origin: &Origin,
+    ) -> Result<String, Failure> {
+        if key.surface == SurfaceKind::Slack {
+            return self.create_on_slack(key, name, persona, origin).await;
+        }
+        let Some(agents) = self.agents_for(key) else {
+            return Ok("Creating agents here isn't available yet.".to_owned());
+        };
+        let member = match self.linked_owner(key, origin).await? {
+            Ok(member) => member,
+            Err(reply) => return Ok(reply),
         };
         if let Some(problem) = persona.as_deref().and_then(persona_problem) {
             return Ok(problem);
@@ -356,6 +372,9 @@ impl Commands {
             return Ok(no_such_agent(name));
         }
         tracing::info!(agent = %agent.id, "deleted an agent");
+        if let Some(reply) = self.delete_on_slack(&agent, name).await? {
+            return Ok(reply);
+        }
         let Some(agents) = self.agents_for(key) else {
             return Ok(format!("Deleted `{name}`."));
         };

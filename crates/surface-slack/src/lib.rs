@@ -20,6 +20,10 @@
 //!   `bots.info`.
 //! - [`surface`](mod@surface): [`SlackSurface`], the
 //!   [`Surface`](core_types::Surface) for one binding.
+//! - [`manifest`]: agent apps, created from [`manifest::agent_manifest`]
+//!   with [`SlackClient::create_app`], installed through
+//!   [`manifest::install_url`] and [`SlackClient::install_app`], and
+//!   deleted with [`SlackClient::delete_app`].
 //!
 //! A normalized bot message that carried only a `bot_id` names its sender
 //! by that id. Before routing it, the receiver of [`SlackInbound`] passes it
@@ -32,6 +36,7 @@ pub mod directory;
 pub mod inbound;
 pub mod ingress;
 mod limit;
+pub mod manifest;
 pub mod normalize;
 pub mod surface;
 pub mod verify;
@@ -41,4 +46,4 @@ pub use directory::{MemberDirectory, TeamDirectory};
 pub use inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
 pub use ingress::{BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, ingress};
 pub use surface::SlackSurface;
-pub use web::{ConfigToken, SlackClient, WebApi};
+pub use web::{ConfigToken, CreatedApp, Installation, SlackClient, WebApi};
