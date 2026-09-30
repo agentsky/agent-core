@@ -5347,7 +5347,14 @@ row `confirm` read and makes it active only while its hosts and `added_at`
 are unchanged. When it isn't, `confirm` undoes only its own move: the
 active skill it set aside goes back, or, with none, the files it moved are
 removed, unless something else has taken their place since (checked by
-inode). The sweeper drops pending rows `PENDING_TTL` plus one
+inode). `confirm` first renames the pending directory into its own work
+directory, where no concurrent add can replace it, and takes the inode
+there. It also reads the moved `SKILL.md` again and confirms only when its
+hosts are the row's: two adds of one name racing can leave one's row with
+the other's files, and those go back to wait, unconfirmable, until the
+skill is added again or expires. A test confirms a stale copy of the row
+(`added_at` a second earlier) while an active version exists: reverting
+the undo to removing the skill by name fails it. The sweeper drops pending rows `PENDING_TTL` plus one
 `SWEEP_INTERVAL` after they were added, while `confirm` still calls a skill
 expired after `PENDING_TTL`. A test replaces a waiting skill with one
 declaring another host while the pending directory can't be written, then
@@ -5357,3 +5364,36 @@ Startup's purge keeps both directories of a name that has a row in either
 state, so it no longer depends on a rename updating the moved directory's
 status change time. A pending directory an active add failed to remove is
 then left until the skill is next added or removed.
+
+### Tests stop the processes they hold
+
+**Issue.** Declaring `child` before `stdin` in `ClaudeProcess` and
+`ChildIo` stopped a drop from closing a process's input before killing
+it, but a drop still sends `SIGKILL` to a child `try_wait` reports as
+running. A child that is already exiting, as `fake-claude` is while it
+writes its coverage profile, can still be cut short and leave a truncated
+`.profraw`. Two runner tests dropped a warm `ClaudeProcess` at their end.
+
+**Solution.** Every test that holds a `ClaudeProcess` stops it before
+dropping it: `stop()` closes its stdin and waits up to `EXIT_GRACE`, so
+`fake-claude` exits on end of input and writes its whole profile. The
+runner reaps every exit it sees, a crash, a refused resume or a failed
+write, before the turn returns. What is left for a drop to kill is a
+warm process a `SessionManager` holds when a test ends, which waits for
+input and has nothing to write; the tests wait for the stops they start,
+and agentd's drain for the turns in flight. `ProcessChild::drop` keeps
+killing at once: waiting there would block a runtime thread.
+
+### A stand-in `git` is written by a child process
+
+**Issue.** A `git` stand-in test wrote an executable script with
+`std::fs::write` and then ran it, while other tests in the agentd library
+binary spawn processes (`git` for fixture repositories, clones). A
+process forked during the write inherits the descriptor open for writing
+until it runs its own program, and running the script meanwhile fails with
+`ETXTBSY`, as the runner's tests did on aarch64.
+
+**Solution.** `stand_in` has `/bin/sh` write the script, so this binary
+never holds a descriptor open for writing it and none can be inherited.
+No lock is needed, in the tests or around production spawns. It is the
+agentd tests' only file written and then run.

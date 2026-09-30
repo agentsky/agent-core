@@ -318,7 +318,7 @@ impl Skills {
             Err(err) => return refused(err),
         };
         let name = manifest.name.as_str();
-        let hosts: Vec<String> = manifest.hosts.iter().map(ToString::to_string).collect();
+        let hosts = host_names(&manifest);
         let recorded = source.recorded();
         let new = NewSkill {
             agent,
@@ -369,25 +369,36 @@ impl Skills {
     /// failure between the two leaves files without their hosts, never
     /// hosts for files the owner didn't confirm; a failure moving them
     /// leaves the skill waiting. Only the pending row this reads becomes
-    /// active: if it went or was replaced meanwhile, the files are put back
-    /// and nothing is confirmed.
+    /// active, and only for files declaring its hosts: if the files declare
+    /// others, they are left waiting, and if the row went or was replaced
+    /// meanwhile, the files are put back; either way nothing is confirmed.
     ///
     /// # Errors
     ///
     /// If the store or the disk fails.
     pub async fn confirm(&self, agent: AgentId, name: &str) -> Result<Confirmed, SkillError> {
-        let store = &self.inner.store;
-        let since = OffsetDateTime::now_utc() - PENDING_TTL;
-        let waiting = store
+        let waiting = self
+            .inner
+            .store
             .agent_skills(agent)
             .await?
             .into_iter()
             .find(|skill| skill.name == name && skill.state == SkillState::Pending);
-        let Some(waiting) = waiting else {
-            return Ok(Confirmed::NotPending);
-        };
+        match waiting {
+            Some(waiting) => self.confirm_row(&waiting).await,
+            None => Ok(Confirmed::NotPending),
+        }
+    }
+
+    /// Confirms the pending row `waiting` as [`confirm`](Self::confirm)
+    /// read it. The files are first moved into a work directory, where
+    /// nothing else replaces them, so their inode and hosts are those of
+    /// the files that move into place.
+    async fn confirm_row(&self, waiting: &AgentSkill) -> Result<Confirmed, SkillError> {
+        let store = &self.inner.store;
+        let (agent, name) = (waiting.agent, waiting.name.as_str());
         let pending = self.pending_dir(agent, name);
-        let expired = waiting.added_at < since;
+        let expired = waiting.added_at < OffsetDateTime::now_utc() - PENDING_TTL;
         if expired || !is_dir(&pending).await? {
             store
                 .delete_skill(agent, name, Some(SkillState::Pending))
@@ -399,14 +410,24 @@ impl Skills {
                 Confirmed::NotPending
             });
         }
-        let moved = inode(&pending).await?;
-        let live = self.live_dir(agent, name);
         let work = self.work_dir().await?;
-        move_into(&pending, &live, &work.0).await?;
-        let Some(skill) = store.confirm_skill(&waiting).await? else {
-            if inode(&live).await? == moved {
-                self.put_back(&live, &work.0).await?;
-            }
+        let new = work.0.join("new");
+        tokio::fs::rename(&pending, &new)
+            .await
+            .map_err(io("moving a skill aside"))?;
+        let moved = inode(&new).await?;
+        if declared_hosts(&new).await.as_ref() != Some(&waiting.hosts) {
+            wait_again(&new, &pending).await;
+            tracing::info!(%agent, skill = name, "a skill's files don't declare its pending row's hosts; left it waiting");
+            return Ok(Confirmed::NotPending);
+        }
+        let live = self.live_dir(agent, name);
+        if let Err(err) = move_into(&new, &live, &work.0).await {
+            wait_again(&new, &pending).await;
+            return Err(err);
+        }
+        let Some(skill) = store.confirm_skill(waiting).await? else {
+            self.put_back(&live, moved, &work.0).await?;
             tracing::info!(%agent, skill = name, "a skill's pending row changed while it was confirmed; undid the move");
             return Ok(Confirmed::NotPending);
         };
@@ -414,10 +435,19 @@ impl Skills {
         Ok(Confirmed::Active(skill))
     }
 
-    /// Undoes [`confirm`](Self::confirm)'s move into `live` once its row is
-    /// gone: moves back the skill it set aside in `aside`, or removes the
-    /// files it moved when there was none.
-    async fn put_back(&self, live: &Path, aside: &Path) -> Result<(), SkillError> {
+    /// Undoes [`confirm_row`](Self::confirm_row)'s move into `live` once
+    /// its row is gone, unless something else has taken the place of the
+    /// files it moved, `moved` by inode: moves back the skill it set aside
+    /// in `aside`, or removes the files it moved when there was none.
+    async fn put_back(
+        &self,
+        live: &Path,
+        moved: Option<u64>,
+        aside: &Path,
+    ) -> Result<(), SkillError> {
+        if inode(live).await? != moved {
+            return Ok(());
+        }
         let old = aside.join("old");
         if is_dir(&old).await? {
             let back = self.work_dir().await?;
@@ -536,6 +566,30 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|err| SkillError::Task(err.to_string()))
+}
+
+/// The hosts `manifest` declares, as a row records them.
+fn host_names(manifest: &Manifest) -> Vec<String> {
+    manifest.hosts.iter().map(ToString::to_string).collect()
+}
+
+/// The hosts the `SKILL.md` in the skill directory `dir` declares, or
+/// `None` if it can't be read as one.
+async fn declared_hosts(dir: &Path) -> Option<Vec<String>> {
+    let text = tokio::fs::read_to_string(dir.join(package::SKILL_FILE))
+        .await
+        .ok()?;
+    package::parse_skill_file(&text)
+        .ok()
+        .map(|manifest| host_names(&manifest))
+}
+
+/// Moves a skill [`Skills::confirm_row`] took from `pending` back from
+/// `new`, unless another has taken its place since.
+async fn wait_again(new: &Path, pending: &Path) {
+    if let Err(err) = tokio::fs::rename(new, pending).await {
+        tracing::warn!(dir = %pending.display(), error = %err, "couldn't put a skill back to wait for confirmation");
+    }
 }
 
 /// Moves the directory `from` to `to`, replacing what is there: the old

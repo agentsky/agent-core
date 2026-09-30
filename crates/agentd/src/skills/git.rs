@@ -574,14 +574,20 @@ mod tests {
     }
 
     /// A stand-in for `git` at `dir/git` running `body`, with `$dest` set
-    /// to the clone's directory.
+    /// to the clone's directory. A child process writes it, so no process
+    /// this binary forks meanwhile inherits a descriptor open for writing
+    /// it, which would make running it fail with `ETXTBSY`.
     fn stand_in(dir: &Path, body: &str) -> PathBuf {
         let script = dir.join("git");
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\n{body}\n"),
-        )
-        .unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf '%s' \"$1\" > \"$2\"", "sh"])
+            .arg(format!(
+                "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\n{body}\n"
+            ))
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(status.success());
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         script
