@@ -2379,8 +2379,9 @@ before it.
 **Solution.** Each command runs in its own task inside the connection's
 task, and waits for the previous command of the same member to finish
 first (a `oneshot` per member, pruned once finished). On shutdown the
-connection stops listening and waits for the commands already running,
-within the drain timeout.
+connection stops listening, runs the commands it already received (the
+store has recorded them as processed, so no other instance would), and
+waits for them within the drain timeout.
 
 ### Secret-looking text that doesn't parse, in a channel
 
@@ -2416,6 +2417,10 @@ of them is used. agentd can't delete the message (the `bot` role lacks
   `AGENTD_RC_MANAGER_TOKEN` is required with it. `team` has no default,
   because deriving it from the URL would change every stored identity when
   the URL changes.
+- The manager bot now posts every command reply, and `users.info` plus
+  `im.create` for a channel command, so its custom role should include
+  `api-bypass-rate-limit`, as the T11 note on the role expected; the
+  README says so.
 - The captured-log test logs at `trace` for every crate through a whole
   DM login, exchange included, and finds neither the code nor the pasted
   text, so reqwest, hyper and sqlx don't log request bodies either.

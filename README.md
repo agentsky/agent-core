@@ -57,7 +57,9 @@ a message in any other room that starts with `!agent` is one too. Replies
 always come as a direct message from the manager bot. A login code or API key
 posted outside that direct message is refused and the member is told to start
 again or revoke the key. Members whose Claude link breaks get one direct
-message saying so.
+message saying so. The manager posts every reply, so give its role
+`api-bypass-rate-limit`, or Rocket.Chat's REST rate limiter will delay
+replies when many members use commands at once.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish; a second signal drops them at
 once. Logs go to standard error,

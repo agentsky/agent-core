@@ -47,8 +47,9 @@ pub fn command_in<'e>(event: &'e InboundEvent, manager: &Binding) -> Option<(Ori
 }
 
 /// Listens as the manager bot's `binding` on `surface` and runs every
-/// command it hears, until `stopping` becomes true. Then it stops listening
-/// and waits for the commands already running.
+/// command it hears, until `stopping` becomes true. Then it stops listening,
+/// runs the commands already received (they are recorded as processed, so no
+/// other instance would), and waits for them.
 ///
 /// Each command runs in its own task, so a slow one (a code exchange can
 /// take 30 seconds) holds up nobody else, but one member's commands run one
@@ -97,15 +98,13 @@ pub async fn serve(
             _ = stopping.wait_for(|stop| *stop) => break Ok(()),
             Some(event) = rx.recv() => run(&mut running, event),
             Some(joined) = running.join_next() => log_panic(joined),
-            ended = &mut events => {
-                while let Ok(event) = rx.try_recv() {
-                    run(&mut running, event);
-                }
-                break ended;
-            }
+            ended = &mut events => break ended,
         }
     };
     drop(events);
+    while let Ok(event) = rx.try_recv() {
+        run(&mut running, event);
+    }
     while let Some(joined) = running.join_next().await {
         log_panic(joined);
     }
