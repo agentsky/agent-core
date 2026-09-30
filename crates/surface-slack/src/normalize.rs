@@ -92,7 +92,7 @@ struct MessageEvent {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct SlackFile {
+pub(crate) struct SlackFile {
     id: Option<String>,
     name: Option<String>,
     title: Option<String>,
@@ -184,7 +184,7 @@ pub fn message(context: &Context<'_>, event: &Value) -> Result<InboundEvent, Ski
 /// A file the bot can download: one with an id and a private URL. Files
 /// Slack withholds (`hidden_by_limit`, or Slack Connect files that need
 /// `files.info` first) carry neither and are left out.
-fn in_file(file: SlackFile) -> Option<InFile> {
+pub(crate) fn in_file(file: SlackFile) -> Option<InFile> {
     let id = file.id?;
     let url = file.url_private_download.or(file.url_private)?;
     let name = file.name.or(file.title).unwrap_or_else(|| id.clone());
@@ -264,7 +264,7 @@ fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
 
 /// Whether `id` looks like a Slack user id: `U` or `W`, then uppercase
 /// letters and digits.
-fn is_user_id(id: &str) -> bool {
+pub(crate) fn is_user_id(id: &str) -> bool {
     let mut chars = id.chars();
     matches!(chars.next(), Some('U' | 'W'))
         && id.len() >= 2
