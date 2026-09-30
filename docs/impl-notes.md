@@ -6703,9 +6703,21 @@ pipeline sends the line to the requester from the manager bot, like a link
 prompt, and only if the agent's bot could have answered there. It claims a
 `failure_notices` row first, so the requester is told at most once per
 `REFUSAL_DM_INTERVAL` (a day): about a ban once for all agents
-(`refused/banned`), and about each agent's rules once for that agent
-(`refused/<agent id>`); a DM that fails releases the claim. Those rows
-are kept like the other failure notices, one per requester and kind.
+(`refusal/banned`), and about each agent's rules once for that agent
+(`refusal/denied/<agent id>`); a DM that fails releases the claim. The
+kinds don't start with T26's `refused/`, which names a refused
+credential. Those rows are kept like the other failure notices, one per
+requester and kind, and T26's failure DMs now read the pipeline's clock
+too, so the table sees one clock.
+
+Only a requester who sent the message is told. On a hop the requester is
+inherited from the turn whose post named the agent, and they never
+addressed it: a first version sent them the DM anyway, so an attacker's
+agent naming k agents that deny everyone had the manager send its
+requester k messages about agents they never asked. A hop's refusal of
+its requester is logged and told to no one; the thread isn't told either,
+since that would say who is banned or denied, and would give a spamming
+agent a line per agent it names.
 
 ### Allow and deny undo each other
 

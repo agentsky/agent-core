@@ -1282,6 +1282,70 @@ async fn bans_and_deny_rules_refuse_a_requester_privately_once_a_day() {
 }
 
 #[tokio::test]
+async fn a_hop_refused_for_its_requester_tells_no_one() {
+    let stack = start().await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let mut rules = agentd::policy::Rules::default();
+    rules.deny(agentd::policy::Rule::Member {
+        key: key("bob"),
+        member: Some(bob),
+        label: "@bob".into(),
+    });
+    store
+        .update_agent_settings(stack.agent, |settings| rules.write(settings))
+        .await
+        .unwrap();
+    let hop = |id: &str| {
+        let mut hop = stack.event("UWRITER", "GENERAL", ConvKind::Channel, id, None, &[BOT]);
+        hop.sender_is_bot = true;
+        hop.sender_bot_user = Some(UserId::new("UWRITER"));
+        hop
+    };
+    for id in ["w1", "w2"] {
+        store
+            .record_message_ref(
+                &store::NewMessageRef {
+                    session: SessionId::new_v4(),
+                    msg: &msg("GENERAL", id),
+                    thread_root: None,
+                    agent: Some(writer),
+                    turn: None,
+                    requester: &core_types::Requester {
+                        member: Some(bob),
+                        key: key("bob"),
+                    },
+                    hop: core_types::Hop(1),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+    stack.handle(hop("w1")).await;
+    store
+        .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    stack.handle(hop("w2")).await;
+    assert!(
+        posts(&stack.calls_since(0)).is_empty(),
+        "nothing is said in the thread"
+    );
+    assert_eq!(
+        stack.dms_to("bob"),
+        Vec::<String>::new(),
+        "bob never addressed the agent that refused him"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn the_thread_turn_cap_stops_a_thread_but_not_a_dm() {
     let stack = start_with(Setup {
         pipeline: |settings| settings.limits.thread_turns_per_hour = Some(1),

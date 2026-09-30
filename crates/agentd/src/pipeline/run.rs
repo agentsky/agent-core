@@ -98,8 +98,9 @@ pub struct PipelineSettings {
     pub max_pending_per_owner: usize,
     /// The community's caps on threads and hops, from `[limits]`.
     pub limits: Limits,
-    /// The clock the limits and the meter read: which day and hour a turn
-    /// counts in, and which window a limit's notice is for.
+    /// The clock the limits, the meter and the notices read: which day and
+    /// hour a turn counts in, which window a limit's notice is for, and
+    /// when a requester was last told of a failure or a refusal.
     pub now: fn() -> OffsetDateTime,
 }
 
@@ -816,6 +817,13 @@ impl Pipeline {
     /// one line in the thread. A limit that counts turns or tokens over a
     /// day or an hour says so once per thread in that window, so a capped
     /// agent doesn't answer every message with the same line.
+    ///
+    /// A refusal of them on a hop, where another agent's post named
+    /// `agent` for them, is only logged: they never addressed `agent`, so
+    /// a message about it would puzzle them, and an agent naming many
+    /// agents that refuse its requester would have the manager send them
+    /// one each; the thread isn't told either, since that would say who is
+    /// banned or denied.
     async fn refuse(
         &self,
         event: &InboundEvent,
@@ -824,6 +832,10 @@ impl Pipeline {
         reason: RefuseReason,
         requester: &Requester,
     ) -> Result<(), PipelineError> {
+        if reason.is_personal() && requester.key != event.sender {
+            tracing::info!(%agent, message = %event.message.id, %reason, "refused a hop for its requester; told no one");
+            return Ok(());
+        }
         let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
             return Ok(());
         };
@@ -883,8 +895,8 @@ impl Pipeline {
     ) {
         let store = &self.inner.store;
         let kind = match reason {
-            RefuseReason::Banned => "refused/banned".to_owned(),
-            _ => format!("refused/{agent}"),
+            RefuseReason::Banned => "refusal/banned".to_owned(),
+            _ => format!("refusal/denied/{agent}"),
         };
         let now = (self.inner.settings.now)();
         let claimed = match store
@@ -1178,7 +1190,7 @@ impl Pipeline {
             }
         }
         let kind = failure.notice_kind(turn.credential);
-        let now = OffsetDateTime::now_utc();
+        let now = (self.inner.settings.now)();
         let claimed = match store
             .claim_failure_notice(&turn.requester.key, kind, now, FAILURE_DM_INTERVAL)
             .await

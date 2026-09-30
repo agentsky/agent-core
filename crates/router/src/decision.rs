@@ -48,7 +48,8 @@ pub enum Decision {
         side: Side,
     },
     /// Don't run, and say why: to `requester` privately when the refusal
-    /// is of them ([`RefuseReason::Banned`] and [`RefuseReason::Denied`]),
+    /// is of them ([`RefuseReason::Banned`] and [`RefuseReason::Denied`])
+    /// and they sent the message, to no one for such a refusal on a hop,
     /// and otherwise to the thread, in one line.
     Refuse {
         /// Why.
