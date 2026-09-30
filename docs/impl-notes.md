@@ -2596,8 +2596,10 @@ names resolve without the bindings. `render` never blocks: when the cache is
 older than its TTL (15 minutes by default) it starts a refresh on the
 current Tokio runtime for the next call. agentd (T31) awaits
 `SlackSurface::refresh_members` when it starts a binding, so the first reply
-already has names. `render_with` takes an explicit directory for callers
-that have one. T23's delivery step and T29's member-cache bullet say so.
+already has names, and gives each team's `TeamDirectory` its agents' bot
+user ids with `set_managed_bots` (see below). `render_with` takes an
+explicit directory for callers that have one. T23's delivery step, T29's
+member-cache bullet and T31's receiver bullet say so.
 
 ### The ingress can't look bots up
 
@@ -2685,12 +2687,42 @@ the request URL, so a `response_url` or upload URL can't leak through one.
 **Issue.** Display names aren't unique in Slack, and the plan didn't say
 what an `@Name` shared by two members resolves to.
 
-**Solution.** The member directory maps each active member's display name,
-full name and username, compared ignoring case and runs of white space. A
-name that belongs to more than one member resolves to no one, so it stays
-text: a missed mention is better than pinging the wrong person. Deactivated
-members are left out. If a refresh fails while an older list exists, the
-older list is kept and the next attempt waits a minute.
+**Solution.** The member directory maps each active member's display name
+and full name, compared ignoring case and runs of white space, and a bot
+user's username too. A human's username is left out: it is often the local
+part of their email address, and would let a human shadow an agent called
+the same. A name that belongs to more than one member resolves to no one,
+so it stays text: a missed mention is better than pinging the wrong person.
+The exception is agents: agentd knows its agents' bot user ids from the
+bindings and passes each team's to `TeamDirectory::set_managed_bots`, and a
+shared name with exactly one managed agent among its members resolves to
+that agent. The directory keeps every member id per name, so a new managed
+set applies to the current list at once, without reading `users.list`
+again. Deactivated members are left out.
+
+If a refresh fails, the next attempt waits a minute (or the TTL, if
+shorter). Meanwhile an older list is kept; with none, `refresh_members`
+returns the same error without calling Slack and `render` starts no
+refresh, so a workspace whose `users.list` fails doesn't get one call per
+rendered reply. `Debug` on `SlackSurface`, `TeamDirectory` and
+`MemberDirectory` shows the team and counts, never member names or ids.
+
+### Refresh cost in large workspaces
+
+**Issue.** `users.list` is Tier 2 (20 calls a minute per token), and a
+refresh reads every page, so a large workspace's refresh is slow.
+
+**Solution.** `users.list` asks for 999 members a page, the largest size the
+client asks any list method for; Slack's spec gives `users.list` no maximum
+and says it may return fewer than asked. At a full 999 a page a refresh of
+N members takes about N / 20,000 minutes of that token's `users.list` quota:
+a 10,000-member workspace needs 11 calls, and 100,000 members about 101
+calls, five minutes of waiting in the limiter. That stays well inside the
+default 15-minute TTL, runs in the background after the first load, and
+uses one binding's token per team, so other bindings' quotas are
+untouched. If Slack returns much smaller pages, the refresh takes
+proportionally longer; a very large workspace should raise the TTL with
+`TeamDirectory::with_ttl`.
 
 ### Reading a thread's newest messages
 
@@ -2700,8 +2732,11 @@ cursor, but `conversations.replies` pages from the thread's oldest message
 
 **Solution.** A thread read follows every page (with `latest` set to the
 cursor and `inclusive=false`) and keeps only the last `limit` content
-messages, filtering by `ts` on the client too. `conversations.history`
-pages from the newest, so a top-level read stops once it has `limit`.
+messages, filtering by `ts` on the client too, and skipping a `ts` it has
+already kept, in case a later page repeats the root. `conversations.history`
+pages from the newest, so a top-level read stops once it has `limit`. Both
+always ask for 200 a page, never just the count still missing: skipped
+joins and edits would otherwise cost a call each.
 Content means no subtype, or `file_share`, `thread_broadcast` or
 `bot_message`; joins, edits and tombstones are skipped.
 

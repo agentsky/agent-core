@@ -1,6 +1,7 @@
 //! [`SlackSurface`]: the [`Surface`] for one Slack binding.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 
 use core_types::{
@@ -43,7 +44,10 @@ pub const CAPS: Caps = Caps {
 ///   at [`MESSAGE_LIMIT`]. A stale cache is refreshed in the background for
 ///   the next render; await [`refresh_members`](Self::refresh_members) to
 ///   have it current now, as agentd does when it starts a binding, or pass a
-///   directory of your own to [`render_with`](Self::render_with).
+///   directory of your own to [`render_with`](Self::render_with). agentd
+///   names its agents' bot users with
+///   [`TeamDirectory::set_managed_bots`], so an agent keeps a name a human
+///   shares.
 /// - [`post`](Surface::post) sends one chunk with `chat.postMessage`.
 /// - A bot message without a `user` names its sender by bot id until
 ///   [`fill_bot_sender`](Self::fill_bot_sender) looks the bot up.
@@ -51,7 +55,9 @@ pub const CAPS: Caps = Caps {
 /// Every conversation it is given must be a Slack conversation in its
 /// workspace; any other is refused with [`SurfaceError::Api`] before
 /// anything is sent.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows the workspace and cache sizes, never member names.
+#[derive(Clone)]
 pub struct SlackSurface {
     api: WebApi,
     directory: Arc<TeamDirectory>,
@@ -199,7 +205,8 @@ impl SlackSurface {
 
     /// The newest `limit` messages of a thread older than `before`, oldest
     /// first. `conversations.replies` pages from the oldest message, so
-    /// every page is read and only the last `limit` kept.
+    /// every page is read and only the last `limit` kept. A `ts` seen
+    /// before, such as the root repeated on a later page, is skipped.
     async fn thread_history(
         &self,
         channel: &ConversationId,
@@ -208,6 +215,7 @@ impl SlackSurface {
         limit: usize,
     ) -> Result<Vec<Msg>> {
         let mut kept: VecDeque<Message> = VecDeque::new();
+        let mut seen = HashSet::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
             let page = PageRequest {
@@ -219,6 +227,7 @@ impl SlackSurface {
             for message in page.messages {
                 if is_content(&message)
                     && before.is_none_or(|before| ts_before(message.ts.as_str(), before))
+                    && seen.insert(message.ts.clone())
                 {
                     kept.push_back(message);
                     if kept.len() > limit {
@@ -250,7 +259,7 @@ impl SlackSurface {
             let page = PageRequest {
                 latest: before,
                 cursor: cursor.as_deref(),
-                limit: PAGE_SIZE.min(limit - newest_first.len()),
+                limit: PAGE_SIZE,
             };
             let page = self.api.history(channel, page).await?;
             for message in page.messages {
@@ -282,6 +291,14 @@ impl SlackSurface {
             }
         }
         out
+    }
+}
+
+impl fmt::Debug for SlackSurface {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackSurface")
+            .field("directory", &self.directory)
+            .finish_non_exhaustive()
     }
 }
 

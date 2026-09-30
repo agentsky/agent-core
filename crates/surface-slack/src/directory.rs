@@ -6,8 +6,8 @@
 //! caches are rebuilt from Slack after a restart; nothing here needs to be
 //! durable.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -24,27 +24,36 @@ pub const DEFAULT_MEMBER_TTL: Duration = Duration::from_secs(15 * 60);
 /// The longest TTL [`TeamDirectory::with_ttl`] accepts.
 pub const MAX_MEMBER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How long a stale member list is kept after a refresh fails, before the
-/// next attempt.
+/// How long after a failed refresh the next attempt waits.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
 /// The most bot ids remembered before the cache starts over.
 const MAX_BOTS: usize = 10_000;
 
 /// A workspace's caches, shared by every binding in it.
-#[derive(Debug)]
+///
+/// `Debug` shows the team and how much is cached, never names.
 pub struct TeamDirectory {
     team: TeamId,
     ttl: Duration,
-    members: RwLock<Option<Loaded>>,
+    members: RwLock<Members>,
     refreshing: tokio::sync::Mutex<()>,
     bots: Mutex<HashMap<String, Option<UserId>>>,
 }
 
-#[derive(Debug, Clone)]
-struct Loaded {
-    next_refresh: Instant,
+/// The member list, and when `users.list` may be read again.
+#[derive(Default)]
+struct Members {
     directory: Arc<MemberDirectory>,
+    loaded: bool,
+    next_attempt: Option<Instant>,
+    failure: Option<SurfaceError>,
+}
+
+impl Members {
+    fn waiting(&self, now: Instant) -> bool {
+        self.next_attempt.is_some_and(|next| next > now)
+    }
 }
 
 impl TeamDirectory {
@@ -54,7 +63,7 @@ impl TeamDirectory {
         Self {
             team,
             ttl: DEFAULT_MEMBER_TTL,
-            members: RwLock::new(None),
+            members: RwLock::new(Members::default()),
             refreshing: tokio::sync::Mutex::new(()),
             bots: Mutex::new(HashMap::new()),
         }
@@ -72,71 +81,103 @@ impl TeamDirectory {
         &self.team
     }
 
+    /// Sets the bot users of the agents agentd manages in this workspace,
+    /// replacing any set before. A name one of them shares with other
+    /// members resolves to that agent (see [`MemberDirectory`]). It applies
+    /// to the current member list and every later one.
+    pub fn set_managed_bots(&self, bots: impl IntoIterator<Item = UserId>) {
+        let managed = Arc::new(bots.into_iter().collect::<HashSet<_>>());
+        let mut members = self.write_members();
+        members.directory = Arc::new(members.directory.with_managed(managed));
+    }
+
     /// The member list as last read: empty until the first
     /// [`refresh_members`](Self::refresh_members).
     pub fn members(&self) -> Arc<MemberDirectory> {
-        self.members
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .map_or_else(Arc::default, |loaded| Arc::clone(&loaded.directory))
+        Arc::clone(&self.read_members().directory)
     }
 
     /// The member list, read again with `users.list` through `api` when it
     /// is older than the TTL. Concurrent callers share one refresh.
     ///
-    /// When a refresh fails and an older list exists, the older list is
-    /// returned and the next attempt waits a minute.
+    /// After a failed refresh, the next attempt waits a minute (or the TTL,
+    /// if shorter). Meanwhile the older list is returned, or, when there is
+    /// none, the same error.
     ///
     /// # Errors
     ///
     /// The `users.list` error, when there is no older list to fall back on.
     pub async fn refresh_members(&self, api: &WebApi) -> Result<Arc<MemberDirectory>> {
         if let Some(fresh) = self.fresh() {
-            return Ok(fresh);
+            return fresh;
         }
         let _refreshing = self.refreshing.lock().await;
         if let Some(fresh) = self.fresh() {
-            return Ok(fresh);
+            return fresh;
         }
-        let result = api.all_users().await;
+        let names = api
+            .all_users()
+            .await
+            .map(|users| Arc::new(names_from_users(&users)));
         let now = Instant::now();
-        let mut members = self.members.write().unwrap_or_else(PoisonError::into_inner);
-        match result {
-            Ok(users) => {
-                let directory = Arc::new(MemberDirectory::from_users(&users));
-                tracing::debug!(team = %self.team, names = directory.len(), "refreshed the Slack member cache");
-                *members = Some(Loaded {
-                    next_refresh: now + self.ttl,
-                    directory: Arc::clone(&directory),
+        let mut members = self.write_members();
+        match names {
+            Ok(names) => {
+                let directory = Arc::new(MemberDirectory {
+                    names,
+                    managed: Arc::clone(&members.directory.managed),
                 });
+                *members = Members {
+                    directory: Arc::clone(&directory),
+                    loaded: true,
+                    next_attempt: Some(now + self.ttl),
+                    failure: None,
+                };
+                drop(members);
+                tracing::debug!(team = %self.team, names = directory.len(), "refreshed the Slack member cache");
                 Ok(directory)
             }
-            Err(err) => match members.as_mut() {
-                Some(stale) => {
+            Err(err) => {
+                members.next_attempt = Some(now + RETRY_AFTER_FAILURE.min(self.ttl));
+                if members.loaded {
+                    let stale = Arc::clone(&members.directory);
+                    drop(members);
                     tracing::warn!(team = %self.team, error = %err, "refreshing the Slack member cache failed; keeping the old list");
-                    stale.next_refresh = now + RETRY_AFTER_FAILURE.min(self.ttl);
-                    Ok(Arc::clone(&stale.directory))
+                    Ok(stale)
+                } else {
+                    members.failure = Some(err.clone());
+                    Err(err)
                 }
-                None => Err(err),
-            },
+            }
         }
     }
 
-    /// Whether the member list is missing or older than its TTL, with no
-    /// refresh running.
+    /// Whether the member list is missing or older than its TTL, no refresh
+    /// is running, and no failed one asks to wait.
     pub(crate) fn needs_refresh(&self) -> bool {
-        self.fresh().is_none() && self.refreshing.try_lock().is_ok()
+        let waiting = self.read_members().waiting(Instant::now());
+        !waiting && self.refreshing.try_lock().is_ok()
     }
 
-    fn fresh(&self) -> Option<Arc<MemberDirectory>> {
-        let now = Instant::now();
-        self.members
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .filter(|loaded| loaded.next_refresh > now)
-            .map(|loaded| Arc::clone(&loaded.directory))
+    /// The answer to give without reading `users.list`, while the list is
+    /// fresh or a failed refresh asks to wait.
+    fn fresh(&self) -> Option<Result<Arc<MemberDirectory>>> {
+        let members = self.read_members();
+        if !members.waiting(Instant::now()) {
+            return None;
+        }
+        Some(match &members.failure {
+            Some(err) => Err(err.clone()),
+            None => Ok(Arc::clone(&members.directory)),
+        })
+    }
+
+    fn read_members(&self) -> std::sync::RwLockReadGuard<'_, Members> {
+        self.members.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_members(&self) -> std::sync::RwLockWriteGuard<'_, Members> {
+        self.members.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The bot user of the bot `bot_id`, from `bots.info` through `api`,
@@ -169,52 +210,68 @@ impl TeamDirectory {
     }
 }
 
+impl fmt::Debug for TeamDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let directory = self.members();
+        f.debug_struct("TeamDirectory")
+            .field("team", &self.team)
+            .field("ttl", &self.ttl)
+            .field("names", &directory.len())
+            .field("managed_bots", &directory.managed.len())
+            .field("bots", &self.lock_bots().len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// A snapshot of a workspace's members by name, for rendering `@Name`
 /// mentions.
 ///
 /// Each active member (bot users included, so agents resolve too) is known
-/// by their display name, their full name and their username. Names match
-/// ignoring case and runs of white space. A name two members share resolves
-/// to no one: a missed mention is better than pinging the wrong person.
-#[derive(Debug, Default)]
+/// by their display name and their full name; bot users also by their
+/// username. A human's username is left out: it is often the local part of
+/// their email address, which could shadow an agent's name. Names match
+/// ignoring case and runs of white space.
+///
+/// A name two members share resolves to no one, since a missed mention is
+/// better than pinging the wrong person, unless exactly one of them is a
+/// managed agent's bot user ([`TeamDirectory::set_managed_bots`]): then it
+/// resolves to that agent, so a human can't take an agent's name.
+///
+/// `Debug` shows counts, never names.
+#[derive(Default)]
 pub struct MemberDirectory {
-    names: HashMap<String, Option<UserId>>,
+    names: Arc<HashMap<String, Vec<UserId>>>,
+    managed: Arc<HashSet<UserId>>,
 }
 
 impl MemberDirectory {
-    /// Builds a snapshot from `users.list` members. Deactivated members are
-    /// left out.
+    /// Builds a snapshot from `users.list` members, with no managed agents.
+    /// Deactivated members are left out.
     pub fn from_users(users: &[User]) -> Self {
-        let mut names: HashMap<String, Option<UserId>> = HashMap::new();
-        for user in users.iter().filter(|user| !user.deleted) {
-            let candidates = [
-                user.profile.display_name.as_deref(),
-                user.profile.real_name.as_deref(),
-                user.real_name.as_deref(),
-                user.name.as_deref(),
-            ];
-            for name in candidates.into_iter().flatten().map(fold) {
-                if name.is_empty() {
-                    continue;
-                }
-                match names.entry(name) {
-                    Entry::Vacant(slot) => {
-                        slot.insert(Some(user.id.clone()));
-                    }
-                    Entry::Occupied(mut slot) => {
-                        if slot.get().as_ref() != Some(&user.id) {
-                            slot.insert(None);
-                        }
-                    }
-                }
-            }
+        Self {
+            names: Arc::new(names_from_users(users)),
+            managed: Arc::default(),
         }
-        Self { names }
     }
 
-    /// The one member called `name`, if exactly one is.
+    /// The same names, with `managed` as the managed agents' bot users.
+    fn with_managed(&self, managed: Arc<HashSet<UserId>>) -> Self {
+        Self {
+            names: Arc::clone(&self.names),
+            managed,
+        }
+    }
+
+    /// The member called `name`: the only one, or the only managed agent
+    /// among several.
     pub fn lookup(&self, name: &str) -> Option<&UserId> {
-        self.names.get(&fold(name)).and_then(Option::as_ref)
+        let ids = self.names.get(&fold(name))?;
+        let mut agents = ids.iter().filter(|id| self.managed.contains(*id));
+        match (agents.next(), agents.next()) {
+            (Some(agent), None) => Some(agent),
+            (None, _) if ids.len() == 1 => ids.first(),
+            _ => None,
+        }
     }
 
     /// How many distinct names the snapshot knows.
@@ -228,10 +285,43 @@ impl MemberDirectory {
     }
 }
 
+impl fmt::Debug for MemberDirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemberDirectory")
+            .field("names", &self.names.len())
+            .field("managed_bots", &self.managed.len())
+            .finish()
+    }
+}
+
 impl MentionDirectory for MemberDirectory {
     fn resolve(&self, name: &str) -> Option<String> {
         self.lookup(name).map(ToString::to_string)
     }
+}
+
+/// Every active member's names, folded, each with the distinct ids of the
+/// members it names.
+fn names_from_users(users: &[User]) -> HashMap<String, Vec<UserId>> {
+    let mut names: HashMap<String, Vec<UserId>> = HashMap::new();
+    for user in users.iter().filter(|user| !user.deleted) {
+        let candidates = [
+            user.profile.display_name.as_deref(),
+            user.profile.real_name.as_deref(),
+            user.real_name.as_deref(),
+            user.name.as_deref().filter(|_| user.is_bot),
+        ];
+        for name in candidates.into_iter().flatten().map(fold) {
+            if !name.is_empty() {
+                names.entry(name).or_default().push(user.id.clone());
+            }
+        }
+    }
+    for ids in names.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    names
 }
 
 /// Lowercases and collapses white space.
@@ -262,19 +352,96 @@ mod tests {
         }
     }
 
+    fn bot(id: &str, name: &str) -> User {
+        User {
+            is_bot: true,
+            ..user(id, "", name, name)
+        }
+    }
+
     #[test]
-    fn members_resolve_by_display_real_and_user_name_ignoring_case_and_spacing() {
+    fn members_resolve_by_display_and_real_name_ignoring_case_and_spacing() {
         let directory = MemberDirectory::from_users(&[
             user("U1", "Ada", "Ada Lovelace", "ada.l"),
             user("U2", "", "Grace  Hopper", "grace"),
+            bot("U3", "helper"),
         ]);
-        for name in ["ada", "ADA", "Ada Lovelace", "ada   lovelace", "ada.l"] {
+        for name in ["ada", "ADA", "Ada Lovelace", "ada   lovelace"] {
             assert_eq!(directory.resolve(name).as_deref(), Some("U1"), "{name}");
         }
         assert_eq!(directory.resolve("Grace Hopper").as_deref(), Some("U2"));
-        assert_eq!(directory.resolve("grace").as_deref(), Some("U2"));
+        assert_eq!(directory.resolve("helper").as_deref(), Some("U3"));
         assert_eq!(directory.resolve("nobody"), None);
         assert_eq!(directory.resolve(""), None);
+    }
+
+    #[test]
+    fn a_humans_username_is_not_a_name_but_a_bots_is() {
+        let mut named_bot = bot("U3", "Helper Bot");
+        named_bot.name = Some("helper".into());
+        let directory = MemberDirectory::from_users(&[
+            user("U1", "Ada", "Ada Lovelace", "ada.l"),
+            user("U2", "Grace", "Grace Hopper", "helper"),
+            named_bot,
+        ]);
+        assert_eq!(directory.resolve("ada.l"), None);
+        assert_eq!(directory.resolve("helper").as_deref(), Some("U3"));
+        assert_eq!(directory.resolve("Helper Bot").as_deref(), Some("U3"));
+    }
+
+    #[test]
+    fn a_managed_agent_wins_a_name_it_shares() {
+        let users = [
+            user("U1", "Helper", "Helper Person", "h1"),
+            bot("U2", "helper"),
+            bot("U3", "helper"),
+            bot("U4", "scout"),
+            user("U5", "Scout", "Scout Person", "s1"),
+            user("U6", "Sam", "Sam One", "sam1"),
+            user("U7", "Sam", "Sam Two", "sam2"),
+        ];
+        let plain = MemberDirectory::from_users(&users);
+        assert_eq!(plain.resolve("helper"), None);
+        assert_eq!(plain.resolve("scout"), None);
+
+        let one = plain.with_managed(Arc::new(HashSet::from(["U2".into(), "U4".into()])));
+        assert_eq!(one.resolve("helper").as_deref(), Some("U2"));
+        assert_eq!(one.resolve("scout").as_deref(), Some("U4"));
+        assert_eq!(one.resolve("Helper Person").as_deref(), Some("U1"));
+        assert_eq!(one.resolve("sam"), None);
+
+        let two = plain.with_managed(Arc::new(HashSet::from(["U2".into(), "U3".into()])));
+        assert_eq!(two.resolve("helper"), None);
+
+        let absent = plain.with_managed(Arc::new(HashSet::from(["U9".into()])));
+        assert_eq!(absent.resolve("helper"), None);
+        assert_eq!(absent.resolve("Helper Person").as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn a_member_listed_twice_is_one_member() {
+        let ada = user("U1", "Ada", "Ada Lovelace", "ada");
+        let directory = MemberDirectory::from_users(&[
+            ada.clone(),
+            user("U2", "Grace", "Grace Hopper", "grace"),
+            ada,
+        ]);
+        assert_eq!(directory.resolve("ada").as_deref(), Some("U1"));
+    }
+
+    #[test]
+    fn debug_shows_counts_not_names() {
+        let team = TeamDirectory::new("T1".into());
+        team.set_managed_bots(["U2".into()]);
+        let debug = format!("{team:?}");
+        assert!(debug.contains("T1"), "{debug}");
+        assert!(debug.contains("managed_bots: 1"), "{debug}");
+        assert!(!debug.contains("U2"), "{debug}");
+
+        let members = MemberDirectory::from_users(&[user("U1", "Ada", "Ada Lovelace", "ada")]);
+        let debug = format!("{members:?}");
+        assert!(!debug.contains("ada") && !debug.contains("U1"), "{debug}");
+        assert!(debug.contains("names: 2"), "{debug}");
     }
 
     #[test]

@@ -1842,7 +1842,9 @@ Deliverables:
      3. Render and split with `Surface::render`. The trait takes no
         `MentionDirectory`, so each surface resolves `@Name` from its own
         member list; on Slack that is T29's per-team member cache, which
-        includes the agents' bot users
+        includes the agents' bot users. agentd passes each team's managed
+        agents' bot user ids to `TeamDirectory::set_managed_bots`, so an
+        agent keeps a name a human shares
         ([impl-notes](impl-notes.md#t29-slack-web-api)).
      4. Post as the agent's bot identity in the thread.
      5. Record `message_refs` for every chunk with the turn's requester and
@@ -2153,9 +2155,11 @@ Deliverables:
   of 3,000 chars, and `supports_edit`, `supports_buttons`, `supports_threads`
   and `per_binding_delivery` all true.
 - A member cache per team, filled from `users.list` and refreshed on a
-  TTL, mapping display and real names to user ids. `SlackSurface::render`
-  reads it; bot users are listed too, so agents' names resolve without the
-  bindings. `users.info` can't look a user up by name.
+  TTL, mapping display and real names (and bot users' usernames) to user
+  ids. `SlackSurface::render` reads it; bot users are listed too, so agents'
+  names resolve without the bindings, and the managed agents' bot users
+  given to `TeamDirectory::set_managed_bots` win names they share with
+  others. `users.info` can't look a user up by name.
 - `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
   `user_id` for bot events that lack a `user` field, cached per bot id. A bot
   id that maps to no user keeps the `bot_id` as `sender.user` and no
@@ -2270,9 +2274,11 @@ Deliverables:
   to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
 - agentd's receiver of T28's `SlackInbound` builds a T29 `SlackSurface` per
-  active binding, with one `TeamDirectory` per team, awaits
-  `refresh_members` when a binding starts, and passes each message through
-  `fill_bot_sender` before routing it.
+  active binding, with one `TeamDirectory` per team. Whenever a team's
+  active agent bindings change, it passes their `bot_user_id`s to
+  `TeamDirectory::set_managed_bots`, so agents win names humans share. It
+  awaits `refresh_members` when a binding starts, and passes each message
+  through `fill_bot_sender` before routing it.
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 
