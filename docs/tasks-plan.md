@@ -1627,24 +1627,36 @@ Deliverables:
   - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
     and user as every identity is, so a matching user id from another team or
     server is never taken for a managed agent. The router asks it for
-    `event.sender` when `sender_is_bot` is true. Surfaces put the bot's user
-    id in both `sender.user` and `sender_bot_user`, so the router needs only
-    `sender`; a bot known only by its bot id matches no binding.
-  - `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`.
+    `event.sender`, and for every sender, whatever `sender_is_bot` says, so a
+    managed agent's post is never routed as a person's
+    ([impl-notes](impl-notes.md#surface-flags-arent-trusted-for-managed-agents)).
+    Surfaces put the bot's user id in both `sender.user` and
+    `sender_bot_user`, so the router needs only `sender`; a bot known only by
+    its bot id is an unmanaged bot without a lookup. Mentions are looked up
+    the same way, in the conversation's surface and team.
+  - `binding_agent(BindingId) -> Option<AgentId>`, so a one-to-one DM counts
+    only for the agent whose binding received it
+    ([impl-notes](impl-notes.md#a-dm-didnt-say-whose-dm-it-is)).
+  - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
+    accepted only when `agent` is the agent that sent the message
+    ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
   - `member_for(MemberKey)`, `is_linked(member)`.
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
-  - `policy(agent)`, which returns allow and deny (T27 fills it; the default
-    allows).
-  - `is_banned(member)` (T27 fills it; the default is false).
+  - `policy(agent)`, which returns allow and deny and the effective hop cap
+    (T27 fills it; the default allows, with a cap of 3).
+  - `is_banned(requester)` (T27 fills it; the default is false).
 - `Decision` is one of:
   - `Ignore(reason)`.
-  - `LinkPrompt`.
+  - `LinkPrompt { requester }`, naming who should link: the sender, or a
+    hop's inherited requester.
   - `Run { requester, hop, credential: CredentialRef, scope: ScopeKind,
     side: Owner | Public }`.
   - `Refuse(reason)`, used for paused agents, bans, deny rules and the hop
     cap.
+  - Reasons are enums, not strings. The order of the checks is in the
+    crate rustdoc ([impl-notes](impl-notes.md#the-plan-and-the-design-name-no-order-for-the-checks)).
 - The flowchart from the design, each branch a named test:
   - Unmanaged bot, ignored, including one known only by its bot id
     (`sender_bot_user: None`).
@@ -1717,8 +1729,8 @@ Deliverables:
         hop.
      6. Apply reactions, and send the `agentctl post` messages the turn queued
         (T15 already checked their targets).
-  5. On `LinkPrompt`, reply in the thread with a private-link instruction
-     (manager bot DM or ephemeral where the surface allows).
+  5. On `LinkPrompt`, send the decision's `requester` a private-link
+     instruction (manager bot DM or ephemeral where the surface allows).
 - Turn message builder:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
@@ -1876,6 +1888,8 @@ Deliverables:
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
+  `AgentPolicy::max_hops` is the effective cap, the global one lowered by the
+  agent's, and allow and deny follow `AgentPolicy::permits` (T22).
 - `/agent allow|deny <name> <target>`. A target is a member (`@user`), a
   channel (`#room`), or `everyone`. Deny wins, and the default allows
   everyone.

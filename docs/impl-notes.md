@@ -1109,3 +1109,107 @@ can't leak into the error.
   servers. To turn a `Cursor` (a message id) into a `latest` time for the
   top level, the client also has `chat.getMessage`, which the plan didn't
   list.
+
+## T22: router
+
+### The plan and the design name no order for the checks
+
+**Issue.** The design's flowchart has only the ignore and credential branches,
+and T22 lists the refusals (paused, bans, deny rules, hop cap) without saying
+where they fall, or how they rank against gating and linking. A refusal
+placed before gating would make a paused or restricted agent answer every
+channel message with a notice; a link prompt or community-key turn placed
+before a refusal would be offered to someone who is banned.
+
+**Solution.** The two documents don't disagree, so `route` takes the order
+that is safe on both counts and documents it in the crate rustdoc: the
+agent (unknown, deleted), the sender (unmanaged bot, own message), whose DM
+it is, gating, attribution, then paused, banned, allow and deny, hop cap,
+and last the credential. Every ignore precedes every refusal and every
+refusal precedes the credential. The refusals keep the plan's listing order;
+none spends anything, so it only picks the notice. `precedence_*` tests pin
+each boundary.
+
+### A DM didn't say whose DM it is
+
+**Issue.** "Or DM" in the gating rule, and "owner in a DM" for the
+`Private` scope, assumed the DM is with the agent being routed. Nothing in
+`RouterView` could check that. If the pipeline made a mentioned agent a
+candidate for the owner's DM with another bot, the manager bot included,
+the router would have run it on the owner's side in a conversation that
+isn't its own.
+
+**Solution.** `RouterView::binding_agent(BindingId)` names the agent whose
+binding received the event. A one-to-one DM has exactly one bot in it and
+only that bot's binding receives it, on Slack (`message.im` to that app) and
+on Rocket.Chat (one connection per bot, and only the agent's is in the
+room). A DM that came in through any other binding is
+`Ignore(NotThisAgentsDm)`, even if it mentions the agent. The plan's T22
+list gains the query.
+
+### `message_ref` needed the posting agent, and the requester's member may be stale
+
+**Issue.** T22's `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`
+couldn't tell which agent agentd posted the message as, so a row recorded
+for one agent would attribute another agent's message. The router doesn't
+use the turn id. And the requester's `member` is recorded at posting time:
+`None` for someone unlinked then, which would let a later ban by member be
+sidestepped through a hop.
+
+**Solution.** `message_ref` returns an `Attribution { agent, requester,
+hop }`, and the router accepts it only when `agent` is the agent that sent
+the message; otherwise the message is unattributed. A recorded member wins,
+since it names who was billed; when none was recorded the router resolves
+the key with `member_for`. `is_banned` takes the whole `Requester`, so the
+view checks the member it names and the member its key belongs to.
+
+### `LinkPrompt` didn't say whom to prompt
+
+**Issue.** For a hop, the event's sender is a bot, so a bare `LinkPrompt`
+left the pipeline to guess who should link. That happens when the inherited
+requester unlinked, or the community key was cleared, mid-chain.
+
+**Solution.** `Decision::LinkPrompt { requester }`. For a person's message it
+is the sender; for a hop it is the inherited requester.
+
+### The owner without a linked account
+
+**Issue.** The flowchart sends the owner straight to "owner credential",
+without asking whether the owner still has one. `/agent logout` can leave
+an owner unlinked. Falling through to the community key would put the
+community's key behind the owner's `Private` side in a DM.
+
+**Solution.** The owner's turns run only on the owner's credential. An
+unlinked owner gets a link prompt, in a DM and in a channel, and the
+community key is never used for them. `design.md`'s Routing section says so.
+
+### What allow and deny rules mean
+
+**Issue.** T27 says "deny wins, and the default allows everyone". With a
+default of allow, an allow rule could never change anything unless a
+non-empty allow list restricts. T27 fills the rules, but T22 evaluates
+them.
+
+**Solution.** `AgentPolicy::permits`: a requester any deny rule covers is
+refused. Otherwise an empty allow list allows everyone, and a non-empty one
+allows only requesters one of its rules covers, by member key or by room.
+Rules apply to the requester, so a hop is checked against the inherited
+requester. The owner is exempt, so `deny everyone` can't lock the owner out
+of their own agent. `AgentPolicy` also carries `max_hops`, since T27's
+per-agent `hops` limit lives in the same row; the view returns the effective
+cap, the global one lowered by the agent's. Until T27, the default is
+`DEFAULT_MAX_HOPS`, 3.
+
+### Surface flags aren't trusted for managed agents
+
+**Issue.** The router asks `is_managed_bot` only when `sender_is_bot` is
+true, per T22. A surface that failed to flag a managed agent's post as a bot
+would have had it routed as a person's message: billed to the bot's own key,
+most likely on the community key, and able to loop.
+
+**Solution.** The router asks `is_managed_bot(sender)` for every sender, and
+a managed agent's post takes the agent path whatever the flags say. A sender
+flagged as a bot whose `sender_bot_user` isn't `sender.user` (a Slack bot
+known only by its bot id, or a surface bug) is an unmanaged bot without any
+lookup, so a bot id never matches a binding even by accident. A
+`sender_bot_user` alone marks the sender as a bot.
