@@ -222,8 +222,8 @@ description, and must pass T02's policy.
   a build argument (2.1.285 when this plan was written). It uses the native
   installer, not npm, so the image has no Node.js.
 - The stream-json output shapes the runner relies on, observed on 2.1.285:
-  - `{"type":"system","subtype":"init",…}` at start, with `session_id`,
-    `model` and `tools`.
+  - `{"type":"system","subtype":"init",…}` at the start of every turn, not
+    only once per process, with `session_id`, `model` and `tools`.
   - `{"type":"assistant","message":{…}}` and `{"type":"user",…}` during the
     turn.
   - A final `{"type":"result",…}` line with `subtype`, `is_error`, `result`,
@@ -232,13 +232,20 @@ description, and must pass T02's policy.
     `is_error` decides failure, not `subtype`. An unreachable upstream produced
     `subtype: "success"` with `is_error: true` and
     `terminal_reason: "api_error"`.
-  - Other line types, such as `active_goal`, `autocompact_state` and
-    `system/commands_changed`, appear too and must be ignored. Parse every line
+  - Other line types, such as `rate_limit_event`, `system/api_retry`,
+    `active_goal`, `autocompact_state` and `system/commands_changed`, appear
+    too and must be ignored. With an OAuth token, `rate_limit_event` follows
+    the first `assistant` line of each process; with an API key it didn't
+    appear. Parse every line
     leniently: unknown `type` values are skipped, and unknown fields are
     allowed.
 - The transcript lands at
   `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<session id>.jsonl`
-  (verified on 2.1.285).
+  (verified on 2.1.285). It is created by the first user message, not when
+  the process starts, so a process stopped before its first turn leaves no
+  transcript to `--resume` ([impl-notes](impl-notes.md#t04-testkit)).
+- With both `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` set, the CLI
+  sends the API key. The runner sets exactly one of them.
 - Input is one JSON object per line:
   `{"type":"user","message":{"role":"user","content":"…"}}`.
 
@@ -259,10 +266,14 @@ description, and must pass T02's policy.
   account.
 - Other crates find the binary with `testkit::fake_claude_path()`. Cargo only
   sets `CARGO_BIN_EXE_<name>` for a package's own integration tests. The helper
-  runs `$CARGO build -p testkit --bin fake-claude --message-format=json` once
-  per test process and reads the executable path from the artifact message.
-  That respects whatever target directory is in effect, including
-  `cargo llvm-cov`'s.
+  runs `$CARGO build --locked -p testkit --bin fake-claude
+  --message-format=json` once per test process and reads the executable path
+  from the artifact message. That call blocks, so tests make it before
+  starting any timeout.
+  It passes `--target-dir` with the directory the running test executable
+  was built in, because `cargo llvm-cov` names its target directory on the
+  command line, where a nested cargo can't see it
+  ([impl-notes](impl-notes.md#fake_claude_path-built-outside-cargo-llvm-covs-target-directory)).
 - Tests that need Docker are named `docker_*` and marked
   `#[ignore = "needs docker"]`. CI runs them with
   `cargo test --workspace -- --ignored docker_` in a separate job (added in
@@ -636,7 +647,10 @@ Deliverables:
 - `MockSurface`, implementing `Surface`. It records every `post`, `edit`,
   `react` and `upload` in an inspectable log, serves canned `history`, has
   configurable `Caps`, and has an `inject(InboundEvent)` helper feeding the
-  `events` channel.
+  `events` channel. It honors its `Caps` (`Unsupported` for `edit` without
+  `supports_edit` and for thread targets without `supports_threads`), and
+  `fail_next(op, error)` makes the next call of an operation fail with a
+  platform error such as `RateLimited` or `Unauthorized`.
 - A `fake-claude` binary (`src/bin/fake-claude.rs`) that:
   - Accepts the full launch flag set from the design. It fails with exit 2 on
     unknown flags, and when both `--session-id` and `--resume` are given, or
@@ -644,12 +658,17 @@ Deliverables:
   - With `--session-id`, fails if the transcript already exists. With
     `--resume`, fails if it doesn't.
   - Reads stream-json user lines from stdin. For each, it sends
-    `POST $ANTHROPIC_BASE_URL/v1/messages` with `Authorization: Bearer
-    $CLAUDE_CODE_OAUTH_TOKEN`, or `x-api-key: $ANTHROPIC_API_KEY` when only
-    that is set, and expects a 200.
+    `POST $ANTHROPIC_BASE_URL/v1/messages` with `x-api-key:
+    $ANTHROPIC_API_KEY` when that is set, and `Authorization: Bearer
+    $CLAUDE_CODE_OAUTH_TOKEN` otherwise, as the real CLI does, and expects
+    a 200.
   - Emits the `init`, `assistant` and `result` lines from the script file named
     by `FAKE_CLAUDE_SCRIPT` (JSON: a list of turns, each with reply text,
-    `is_error`, optional delay, optional crash).
+    `is_error`, optional delay, optional crash, and optional raw
+    `extra_lines`, which may be unknown line types or not JSON at all). Like
+    the real CLI with an OAuth token, it also prints a `rate_limit_event`
+    after the first reply of each process, so a runner test always sees a
+    line it must skip.
   - Appends to the transcript at
     `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<id>.jsonl`.
   - Can run `agentctl` commands listed in the script, to exercise the ctl API

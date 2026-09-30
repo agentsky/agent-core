@@ -293,6 +293,167 @@ has `sender_bot_user: None`; no binding has that id, so the router ignores
 it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
 section saying this, and T12, T22, T28 and T29 in the plan match it.
 
+## T04: testkit
+
+### `fake_claude_path` built outside `cargo llvm-cov`'s target directory
+
+**Issue.** The plan expected a nested `$CARGO build` to respect "whatever
+target directory is in effect, including `cargo llvm-cov`'s". It doesn't.
+`cargo llvm-cov` passes `--target-dir target/llvm-cov-target` on cargo's
+command line, and a test process sees only the environment, which does carry
+`cargo llvm-cov`'s `RUSTC_WRAPPER`. The nested build therefore went to
+`target/debug`, instrumented, where no coverage report looks and where it
+disturbs the next plain build. `fake-claude.rs` showed 3.7% line coverage and
+pulled the workspace under the 85% gate.
+
+**Solution.** `fake_claude_path()` finds the directory the running test
+executable was built in (its nearest ancestor with cargo's `CACHEDIR.TAG`)
+and passes it as `--target-dir`. With the inherited wrapper environment the
+nested build then matches the outer one: a workspace run reuses the binary
+it already built, and a run that didn't build it builds it instrumented in
+the same place. `fake-claude.rs` is now at 96% line coverage. The plan's
+Testing section says so.
+
+### Clearing the environment loses `fake-claude`'s coverage
+
+**Issue.** Under `cargo llvm-cov`, `fake-claude` is instrumented and writes
+its profile where `LLVM_PROFILE_FILE` says. A test that starts it with
+`env_clear()`, as a runner passing an explicit launch environment would,
+drops that variable: the counts are lost and `default.profraw` lands in the
+child's working directory.
+
+**Solution.** testkit's own tests pass `LLVM_PROFILE_FILE` through when it is
+set, and `fake_claude_path()`'s rustdoc tells other crates to do the same
+(T17's `ProcessSandbox`, T20, T21).
+
+### The real CLI prefers `ANTHROPIC_API_KEY`
+
+**Issue.** T04 said `fake-claude` sends `Authorization: Bearer` from
+`CLAUDE_CODE_OAUTH_TOKEN`, and `x-api-key` only when the API key is the only
+credential. Against a local capture server, Claude Code 2.1.285 with both
+variables set sent only `x-api-key` and reported `apiKeySource:
+"ANTHROPIC_API_KEY"`.
+
+**Solution.** `fake-claude` does the same, and its `init` line reports
+`apiKeySource` like the real one. The T04 bullet and the plan's Claude Code
+CLI section say so, and note that the runner sets exactly one of the two.
+
+### What capturing the fixtures showed
+
+**Issue.** Capturing with an unreachable `ANTHROPIC_BASE_URL`, as the plan
+describes, gave ten `system/api_retry` lines and no result within two
+minutes: the CLI retries with backoff. It also left open how the CLI behaves
+on the paths `fake-claude` imitates.
+
+**Solution.** The captures set `CLAUDE_CODE_MAX_RETRIES=0` (and `IS_SANDBOX=1`,
+since the capture ran as root and `bypassPermissions` refuses root otherwise).
+Two captures ran against a local server that answers with the same SSE
+stream as `fake_anthropic()`, which the CLI accepted, with `--session-id`
+and then `--resume`. `fake-claude` follows what they showed:
+
+- `system/init` starts every turn, not only the process. The plan's Claude
+  Code CLI section now says so.
+- The transcript appears with the first user message, not at start. A
+  process reaped before its first turn leaves nothing to `--resume`, so T21
+  should mark a session started only after a turn.
+- `--session-id` with an existing transcript prints `Error: Session ID … is
+  already in use.` to stderr and exits 1. `--resume` without one prints `No
+  conversation found with session ID: …` and a `result` line with `subtype:
+  "error_during_execution"` and an `errors` list, but no `result`,
+  `terminal_reason` or `api_error_status`, then exits 1. Unknown flags and
+  both session flags also exit 1 on the real CLI; `fake-claude` keeps the
+  plan's status 2 for them so tests can tell usage errors apart.
+- Requests go to `/v1/messages?beta=true`, so T18's proxy must forward the
+  query string. The CLI also sends `HEAD /api/hello` before the first
+  request of each process, and an `x-claude-code-session-id` header.
+- A 401 gives `api_error_status: 401` and a synthetic assistant message with
+  `error: "authentication_failed"`. The CLI exits 1 when its last result was
+  an error and 0 otherwise.
+- `rate_limit_event` lines appear after a streamed reply. The
+  `active_goal`, `autocompact_state` and `system/commands_changed` lines the
+  plan lists didn't appear in these short runs; the fixtures hold only what
+  was captured.
+
+Absolute paths in the captures are rewritten to the sandbox layout
+(`/volume/sessions/<id>/work` and `…/claude`).
+
+### `rate_limit_event` comes once per process, and only with OAuth
+
+**Issue.** Review asked for `fake-claude` to print a `rate_limit_event`
+after every successful API call, so runner tests always meet a line they
+must skip. The capture in `tool-turns.jsonl` has one such line for three
+API calls, and the CLI's own schema describes the line as "emitted when rate
+limit info changes". Re-running Claude Code 2.1.285 against a local
+streaming server showed that with `CLAUDE_CODE_OAUTH_TOKEN` it prints one
+right after the first `assistant` line of each process, a `--resume`d
+process included, and with `ANTHROPIC_API_KEY` it prints none.
+
+**Solution.** `fake-claude` does the same: with the OAuth token, the first
+successful turn of each process prints `{"type":"rate_limit_event",
+"rate_limit_info":{"status":"allowed","isUsingOverage":false},…}` after its
+first `assistant` line. A test checks a tool turn and a reply against the
+capture's line sequence. For anything else a parser must skip, including
+lines that aren't JSON, a script turn lists raw `extra_lines`, printed after
+its commands and before its reply.
+
+### The real CLI's `anthropic-beta` header
+
+**Issue.** `fake-claude` sent `anthropic-beta: oauth-2025-04-20` with the
+OAuth token and nothing with an API key. The same capture showed Claude Code
+2.1.285 sending a comma list with either credential: ten betas with the
+OAuth token, starting `claude-code-20250219,oauth-2025-04-20,…`, and nine
+with an API key, without `oauth-2025-04-20` and
+`extended-cache-ttl-2025-04-11` but with
+`mid-conversation-tool-changes-2026-07-01`. It also sends `x-app: cli`.
+
+**Solution.** `fake-claude` sends the captured lists, exported as
+`testkit::claude::OAUTH_BETA` and `API_KEY_BETA` so T18 can check the proxy
+forwards them untouched, and `x-app: cli`. `fake_anthropic()` still records
+every header.
+
+### `MockSurface` lost an event when its loop ended mid-delivery
+
+**Issue.** The `events` loop took each event off its channel and then sent
+it. When the receiver was gone, or the loop was cancelled while the send
+waited for room, that event was dropped, although the docs promise that
+queued events stay for the next loop. The mock also ignored its own `Caps`
+and could not fail, so tests could not drive the core's handling of
+`Unsupported`, `RateLimited` or `Unauthorized`.
+
+**Solution.** Each binding's events are a queue under the mock's lock,
+with a `Notify` for new events. The loop sends a copy of the front event and
+removes it only once the sender has taken it, so neither a closed receiver
+nor a cancellation loses it. Calls check the `Caps` first (`edit` without
+`supports_edit`, a thread root without `supports_threads`), then a
+per-operation queue filled by `fail_next(op, error)`. Failed calls are not
+recorded, as a failed upload already wasn't.
+
+### A refused port the test keeps
+
+**Issue.** The unreachable-upstream test bound a port, dropped the
+listener and used the port. A server started by a parallel test could take
+the port in between, and the request would succeed or hang.
+
+**Solution.** The test binds a `tokio::net::TcpSocket` and never calls
+`listen`. The port stays taken for the whole test, so nothing else can get
+it, and a connection to a bound socket that isn't listening is refused at
+once.
+
+### `fake_claude_path()`'s nested build
+
+**Issue.** Review found the first call blocking the test thread for about
+20 seconds on a second dependency build, without `--locked`.
+
+**Solution.** The nested build passes `--locked`, and the rustdoc says the
+first call blocks and should come before any timeout. After a workspace
+`cargo test`, the nested build finds everything fresh and takes about
+0.2 seconds, and under `cargo coverage` the target directory holds a single
+build of each dependency. It builds again only when the caller's package selection
+resolved testkit's dependencies with other features, which a test process
+can't see. A `--profile` flag doesn't change feature resolution: it would
+only help under `cargo test --release`, which nothing here runs, so it isn't
+passed.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
