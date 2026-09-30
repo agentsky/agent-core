@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,11 +17,10 @@ use cred_proxy::{
     HostRule, Network, Registry,
 };
 use secrecy::{ExposeSecret as _, SecretString};
-use testkit::fake_anthropic;
+use testkit::{Logs, fake_anthropic};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
-use tracing_subscriber::fmt::MakeWriter;
 
 const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const LOCAL_2: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
@@ -880,52 +879,11 @@ fn the_sandbox_environment_points_every_proxy_variable_at_the_proxy() {
     assert_eq!(env.len(), 6);
 }
 
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl io::Write for Capture {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        lock(&self.0).extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = Self;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// Every log line of this test binary from the first call on, at every
-/// level. The subscriber is global: a scoped one misses events whose
-/// callsites other tests' threads registered first.
-fn captured_logs() -> Capture {
-    static CAPTURE: OnceLock<Capture> = OnceLock::new();
-    CAPTURE
-        .get_or_init(|| {
-            let capture = Capture::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).unwrap();
-            capture
-        })
-        .clone()
-}
-
 #[tokio::test]
 async fn refusals_are_logged_with_the_session_and_never_the_request() {
     const SANDBOX: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5));
     const UNKNOWN: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 4));
-    let capture = captured_logs();
+    let logs = Logs::global();
     let (echo, _) = echo_server().await;
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| egress).await;
     let session = proxy.sandbox(SANDBOX);
@@ -961,7 +919,7 @@ async fn refusals_are_logged_with_the_session_and_never_the_request() {
     drop(stream);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let logs = String::from_utf8_lossy(&lock(&capture.0)).into_owned();
+    let logs = logs.snapshot();
     let mine = |line: &&str| line.contains("peer=127.0.0.5") || line.contains("peer=127.0.0.4");
     assert!(
         logs.lines()
@@ -1001,6 +959,6 @@ async fn refusals_are_logged_with_the_session_and_never_the_request() {
         "query-secret",
         "secret-looking_host",
     ] {
-        assert!(!logs.contains(secret), "{secret} reached the log:\n{logs}");
+        logs.assert_lacks(secret);
     }
 }
