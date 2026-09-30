@@ -157,14 +157,14 @@ pub struct Commands {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Inner {
     store: Store,
     auth: Arc<Auth>,
     replies: Replies,
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
-    skills: Option<Skills>,
+    skills: Skills,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -187,14 +187,15 @@ fn now() -> OffsetDateTime {
 impl Commands {
     /// Commands over `store` and `auth`, replying through `replies`,
     /// managing agents on Rocket.Chat through `rocketchat` if agentd serves
-    /// Rocket.Chat, and with the Slack manager app `slack` if agentd serves
-    /// Slack.
+    /// Rocket.Chat, with the Slack manager app `slack` if agentd serves
+    /// Slack, and managing agents' skills through `skills`.
     pub fn new(
         store: Store,
         auth: Arc<Auth>,
         replies: Replies,
         rocketchat: Option<RocketChatAgents>,
         slack: Option<SlackManager>,
+        skills: Skills,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -203,17 +204,9 @@ impl Commands {
                 replies,
                 rocketchat,
                 slack,
-                skills: None,
+                skills,
             }),
         }
-    }
-
-    /// Runs the skill commands with `skills`; without it they answer that
-    /// they aren't available.
-    #[must_use]
-    pub fn with_skills(mut self, skills: Skills) -> Self {
-        Arc::make_mut(&mut self.inner).skills = Some(skills);
-        self
     }
 
     /// The private reply plumbing.
@@ -310,10 +303,7 @@ impl Commands {
                     self.set_paused(member, name.as_str(), false, origin).await
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
-                Command::Skill(command) => match &self.inner.skills {
-                    Some(skills) => self.skill(skills, member, command, origin, files).await,
-                    None => Ok(format!("`{name}` isn't available yet.")),
-                },
+                Command::Skill(command) => self.skill(member, command, origin, files).await,
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         };

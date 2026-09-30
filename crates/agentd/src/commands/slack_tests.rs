@@ -62,6 +62,7 @@ fn ok(body: Value) -> ResponseTemplate {
 
 struct SlackHarness {
     store: Store,
+    data: TempDir,
     commands: Commands,
     slack: MockServer,
     manager: SlackManager,
@@ -114,15 +115,20 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         identity(),
     );
     let replies = Replies::new(None).with_slack(Arc::new(manager.manager_bot()), client);
+    let data = TempDir::new();
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(store.clone(), data.0.clone(), git);
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
         replies,
         None,
         Some(manager.clone()),
+        skills,
     );
     SlackHarness {
         store,
+        data,
         commands,
         slack,
         manager,
@@ -478,7 +484,9 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
             .await
             .unwrap();
     let auth = Arc::new(Auth::new(OAuthConfig::default(), store.clone()).unwrap());
-    let commands = Commands::new(store, auth, Replies::default(), None, None);
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(store.clone(), "/nonexistent/agentd".into(), git);
+    let commands = Commands::new(store, auth, Replies::default(), None, None, skills);
     let reply = commands
         .run(
             &slack_key("U0HUMAN01"),
@@ -1411,13 +1419,8 @@ impl Drop for TempDir {
 #[tokio::test]
 async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
     let h = slack_harness().await;
-    let data = TempDir::new();
-    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
-    let commands = h.commands.clone().with_skills(crate::skills::Skills::new(
-        h.store.clone(),
-        data.0.clone(),
-        git,
-    ));
+    let data = &h.data;
+    let commands = h.commands.clone();
     let alice = h.linked("U0HUMAN01").await;
     let team = TeamId::new(TEAM);
     let store::AgentCreation::Created(agent, _) = h

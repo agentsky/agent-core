@@ -133,8 +133,8 @@ impl App {
             replies,
             agents,
             slack.clone(),
-        )
-        .with_skills(skills.clone());
+            skills.clone(),
+        );
         Ok(Self {
             config: Arc::new(config),
             store,

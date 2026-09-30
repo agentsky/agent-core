@@ -546,7 +546,16 @@ fn new_supervisor(
     onward: Option<Sender<InboundEvent>>,
 ) -> (Supervisor, CommandIntake) {
     let auth = Arc::new(auth::Auth::new(auth::OAuthConfig::default(), h.store.clone()).unwrap());
-    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None, None);
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(h.store.clone(), "/nonexistent/agentd".into(), git);
+    let commands = Commands::new(
+        h.store.clone(),
+        auth,
+        Replies::default(),
+        None,
+        None,
+        skills,
+    );
     let manager = core_types::Binding {
         id: BindingId::new_v4(),
         agent: None,

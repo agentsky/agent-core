@@ -73,6 +73,7 @@ struct Harness {
     mock: Arc<MockSurface>,
     oauth: MockServer,
     manager: Binding,
+    root: std::path::PathBuf,
 }
 
 async fn harness() -> Harness {
@@ -99,12 +100,17 @@ async fn harness() -> Harness {
         mock.clone(),
         Arc::new(Dms),
     ));
+    let root = std::env::temp_dir().join(format!("agentd-cmd-skills-{}", uuid::Uuid::new_v4()));
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()))
+        .serving_prefix_from_directory_for_tests("https://git.test/", &root.join("repos"));
+    let skills = crate::skills::Skills::new(store.clone(), root.join("data"), git);
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
         Replies::new(Some(bot)),
         None,
         None,
+        skills,
     );
     Harness {
         store,
@@ -113,6 +119,7 @@ async fn harness() -> Harness {
         mock,
         oauth,
         manager,
+        root,
     }
 }
 
@@ -604,8 +611,6 @@ async fn a_failed_exchange_and_a_failed_store_get_generic_replies() {
 #[tokio::test]
 async fn commands_that_come_later_say_so() {
     let h = harness().await;
-    h.dm("alice", "skill rm helper tool").await;
-    assert_eq!(h.last_reply("alice"), "`skill rm` isn't available yet.");
     h.dm("root", &format!("admin api-key set {API_KEY}")).await;
     assert_eq!(
         h.last_reply("root"),
@@ -1048,7 +1053,7 @@ fn skill_repo(dir: &std::path::Path, text: &str) {
 #[tokio::test]
 async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     let h = harness().await;
-    let root = std::env::temp_dir().join(format!("agentd-cmd-skills-{}", uuid::Uuid::new_v4()));
+    let root = h.root.clone();
     let repos = root.join("repos");
     skill_repo(
         &repos.join("gh.git"),
@@ -1058,14 +1063,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         &repos.join("notes.git"),
         "---\nname: notes\ndescription: Keep notes.\n---\n",
     );
-    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()))
-        .serving_prefix_from_directory_for_tests("https://git.test/", &repos);
     let data = root.join("data");
-    let commands = h.commands.clone().with_skills(crate::skills::Skills::new(
-        h.store.clone(),
-        data.clone(),
-        git,
-    ));
+    let commands = h.commands.clone();
     let (alice, _) = h.linked_member("alice", "claude_pro").await;
     let team = TeamId::new(TEAM);
     let store::AgentCreation::Created(agent, _) = h

@@ -8,12 +8,11 @@ use store::SkillState;
 use super::agents::{Download, no_such_agent};
 use super::{Commands, Failure, Origin};
 use crate::skills::package::{MAX_SKILL_BYTES, MAX_SKILL_MD_BYTES};
-use crate::skills::{Added, BUNDLED_NAME, Confirmed, Manifest, PENDING_TTL, Skills, Source};
+use crate::skills::{Added, BUNDLED_NAME, Confirmed, Manifest, PENDING_TTL, Source};
 
 impl Commands {
     pub(super) async fn skill(
         &self,
-        skills: &Skills,
         key: &MemberKey,
         command: SkillCommand,
         origin: &Origin,
@@ -23,6 +22,7 @@ impl Commands {
         | SkillCommand::Confirm { name, .. }
         | SkillCommand::Rm { name, .. }) = &command;
         let name = name.as_str();
+        let skills = &self.inner.skills;
         let Some(agent) = self.own_agent(key, name).await? else {
             return Ok(no_such_agent(name));
         };
@@ -78,8 +78,10 @@ impl Commands {
                 }
                 if skills.remove(agent.id, skill.as_str()).await? {
                     return Ok(format!(
-                        "Removed the skill `{skill}` from `{name}`, with any hosts it let the \
-                         agent reach. Conversations running now keep it until they next start."
+                        "Removed the skill `{skill}` from `{name}`. Its sandboxes can't open new \
+                         connections to the hosts it let them reach, and connections already \
+                         open close within the hour. Conversations running now keep the skill \
+                         until they next start."
                     ));
                 }
                 let names: Vec<String> = skills
@@ -132,13 +134,28 @@ impl Commands {
     }
 }
 
-/// The reply to a skill held back for its hosts.
+/// The reply to a skill held back for its hosts. Hosts on a port other
+/// than 443 are named again, since they needn't speak HTTPS.
 fn pending_reply(agent: &str, manifest: &Manifest, origin: &Origin) -> String {
     let hosts: Vec<String> = manifest.hosts.iter().map(ToString::to_string).collect();
+    let other_ports: Vec<String> = hosts.iter().filter(|h| h.contains(':')).cloned().collect();
+    let ports = if other_ports.is_empty() {
+        String::new()
+    } else {
+        let verb = if other_ports.len() == 1 {
+            "uses"
+        } else {
+            "use"
+        };
+        format!(
+            " Note the ports: {} {verb} a port other than 443, HTTPS's.",
+            list(&other_ports)
+        )
+    };
     format!(
-        "The skill `{skill}` asks that `{agent}`'s sandboxes may reach {hosts}. Anything the \
-         agent can read could be sent there, so I haven't added it yet. To add it with those \
-         hosts, send {confirm} within {minutes} minutes.",
+        "The skill `{skill}` asks that `{agent}`'s sandboxes may reach {hosts}.{ports} Anything \
+         the agent can read could be sent there, so I haven't added it yet. To add it with \
+         those hosts, send {confirm} within {minutes} minutes.",
         skill = manifest.name,
         hosts = list(&hosts),
         confirm = origin.command(&format!("skill confirm {agent} {}", manifest.name)),
@@ -177,6 +194,29 @@ mod tests {
     fn sizes_read_in_mb_or_kb() {
         assert_eq!(size(10 * 1024 * 1024), "10 MB");
         assert_eq!(size(256 * 1024), "256 KB");
+    }
+
+    #[test]
+    fn hosts_on_other_ports_are_named_again() {
+        let manifest = crate::skills::package::parse_skill_file(
+            "---\nname: db\ndescription: d\nallowed-hosts: [db.example.org, ssh.example.org:22]\n---\n",
+        )
+        .unwrap();
+        let origin = Origin::RocketChatDm { room: "D1".into() };
+        let reply = pending_reply("helper", &manifest, &origin);
+        assert!(
+            reply.starts_with(
+                "The skill `db` asks that `helper`'s sandboxes may reach `db.example.org` and \
+                 `ssh.example.org:22`. Note the ports: `ssh.example.org:22` uses a port other \
+                 than 443, HTTPS's. Anything"
+            ),
+            "{reply}"
+        );
+        let plain = crate::skills::package::parse_skill_file(
+            "---\nname: db\ndescription: d\nallowed-hosts: [db.example.org]\n---\n",
+        )
+        .unwrap();
+        assert!(!pending_reply("helper", &plain, &origin).contains("port"));
     }
 
     #[test]
