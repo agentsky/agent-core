@@ -13,8 +13,8 @@ use core_types::{
 };
 use futures::stream::{BoxStream, StreamExt};
 use runner::{
-    HookError, PoolConfig, ProcessConfig, ProcessEnv, RunnerError, Session, SessionConfig,
-    SessionManager, SessionStart, TurnHooks, TurnOutcome, TurnReport, TurnRequest,
+    CostUnknown, HookError, PoolConfig, ProcessConfig, ProcessEnv, RunnerError, Session,
+    SessionConfig, SessionManager, SessionStart, TurnHooks, TurnOutcome, TurnReport, TurnRequest,
 };
 use sandbox::{
     ChildIo, Container, ContainerEvent, ContainerId, ManagedContainer, ProcessSandbox, Sandbox,
@@ -706,7 +706,7 @@ async fn a_resumed_process_bills_its_first_turn_without_the_restored_total() {
     .await;
     let session = h.thread_session("1.1").await;
     let first = h.run(session.id, request("one")).await;
-    assert_eq!(result(&first).cost_usd, Some(REPLY_COST_USD));
+    assert_eq!(result(&first).cost_usd, Ok(REPLY_COST_USD));
     eventually("the idle container is reaped", || {
         !h.manager.is_warm(session.id)
     })
@@ -722,7 +722,7 @@ async fn a_resumed_process_bills_its_first_turn_without_the_restored_total() {
     );
     assert_eq!(
         resumed.cost_usd,
-        Some(REPLY_COST_USD),
+        Ok(REPLY_COST_USD),
         "the turn is billed only its own cost"
     );
 
@@ -740,7 +740,7 @@ async fn a_resumed_process_bills_its_first_turn_without_the_restored_total() {
         Some(2.0 * REPLY_COST_USD),
         "a crashed process saves nothing, so the first process's total is restored again"
     );
-    assert_eq!(after_crash.cost_usd, Some(REPLY_COST_USD));
+    assert_eq!(after_crash.cost_usd, Ok(REPLY_COST_USD));
 }
 
 #[tokio::test]
@@ -748,7 +748,7 @@ async fn a_resume_in_a_container_kept_from_an_earlier_process_has_no_cost() {
     let h = Harness::new(&[Turn::reply("first"), Turn::crash(), Turn::reply("third")]).await;
     let session = h.thread_session("1.1").await;
     let first = h.run(session.id, request("one")).await;
-    assert_eq!(result(&first).cost_usd, Some(REPLY_COST_USD));
+    assert_eq!(result(&first).cost_usd, Ok(REPLY_COST_USD));
     let crashed = h.run(session.id, request("two")).await;
     assert!(matches!(crashed.outcome, TurnOutcome::Crashed { .. }));
     let third = h.run(session.id, request("three")).await;
@@ -759,7 +759,7 @@ async fn a_resume_in_a_container_kept_from_an_earlier_process_has_no_cost() {
     );
     assert_eq!(
         result(&third).cost_usd,
-        None,
+        Err(CostUnknown::ReusedContainer),
         "a process the agent left in the container could have changed the transcript after \
          the runner read it"
     );

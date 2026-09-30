@@ -42,6 +42,7 @@ use core_types::SessionId;
 use rustix::fs::{Mode, OFlags};
 use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
+use store::CostUnknown;
 
 use crate::stream::MAX_PROCESS_TOTAL_USD;
 
@@ -59,14 +60,16 @@ const MESSAGE_TYPES: [&str; 5] = ["user", "assistant", "system", "attachment", "
 /// What the CLI will restore for `session`, as
 /// [`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from)
 /// takes it: [`restored_total`], read off the async runtime.
-pub(crate) async fn restored_cost(session_dir: &Path, session: SessionId) -> Option<f64> {
+pub(crate) async fn restored_cost(
+    session_dir: &Path,
+    session: SessionId,
+) -> Result<f64, CostUnknown> {
     let dir = session_dir.to_owned();
     let restored = tokio::task::spawn_blocking(move || restored_total(&dir, session))
         .await
-        .ok()
-        .flatten();
-    if restored.is_none() {
-        tracing::warn!(%session, "the total a resumed process restores isn't known; its first turn has no cost");
+        .unwrap_or(Err(CostUnknown::TranscriptUnreadable));
+    if let Err(reason) = restored {
+        tracing::warn!(%session, %reason, "the total a resumed process restores isn't known; its first turn has no cost");
     }
     restored
 }
@@ -74,25 +77,28 @@ pub(crate) async fn restored_cost(session_dir: &Path, session: SessionId) -> Opt
 /// What the CLI will restore, in US dollars, for `session`, whose
 /// directory is `session_dir` (`sessions/<id>/` on its volume, as agentd
 /// sees it): the last `cost-state` line's total, or 0 when the transcript
-/// has none. `None` when that isn't known: the transcript is missing (the
-/// CLI then refuses the `--resume`) or can't be read, or it isn't one the
-/// [module docs](self) say the runner is sure of. The transcript is
-/// `claude/projects/<id>/<id>.jsonl` there, since the runner names the
-/// project directory after the session.
-pub(crate) fn restored_total(session_dir: &Path, session: SessionId) -> Option<f64> {
+/// has none. Why not, when that isn't known: the transcript is missing
+/// (the CLI then refuses the `--resume`) or can't be read, it is past
+/// [`CLI_INDEX_BYTES`], or it isn't one the [module docs](self) say the
+/// runner is sure of. The transcript is `claude/projects/<id>/<id>.jsonl`
+/// there, since the runner names the project directory after the session.
+pub(crate) fn restored_total(session_dir: &Path, session: SessionId) -> Result<f64, CostUnknown> {
     let id = session.to_string();
     let file = match open_transcript(session_dir, &id) {
         Ok(file) => file,
         Err(err) => {
             tracing::warn!(%session, error = %err, "couldn't open the transcript to read its restored cost");
-            return None;
+            return Err(CostUnknown::TranscriptUnreadable);
         }
     };
     let mut bytes = Vec::new();
     file.take(CLI_INDEX_BYTES + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
-    last_cost_state(&bytes, &id)
+        .map_err(|_| CostUnknown::TranscriptUnreadable)?;
+    if u64::try_from(bytes.len()).is_ok_and(|len| len > CLI_INDEX_BYTES) {
+        return Err(CostUnknown::TranscriptTooLarge);
+    }
+    last_cost_state(&bytes, &id).ok_or(CostUnknown::TranscriptUnrecognized)
 }
 
 /// Opens the transcript without following a symlink anywhere below
@@ -118,12 +124,12 @@ fn open_transcript(session_dir: &Path, id: &str) -> rustix::io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// The total the CLI restores from `transcript`, the session `id`'s, as
-/// the [module docs](self) give it: the last `cost-state` line's, 0
-/// without one, and `None` unless the runner is sure.
+/// The total the CLI restores from `transcript`, the session `id`'s, of
+/// at most [`CLI_INDEX_BYTES`], as the [module docs](self) give it: the
+/// last `cost-state` line's, 0 without one, and `None` unless the runner
+/// is sure.
 fn last_cost_state(transcript: &[u8], id: &str) -> Option<f64> {
-    let fits = u64::try_from(transcript.len()).is_ok_and(|len| len <= CLI_INDEX_BYTES);
-    if !fits || transcript.last().is_some_and(|last| *last != b'\n') {
+    if transcript.last().is_some_and(|last| *last != b'\n') {
         return None;
     }
     let mut total = 0.0;
@@ -519,6 +525,10 @@ mod tests {
     }
 
     fn restored(lines: &[String]) -> Option<f64> {
+        restored_or_why(lines).ok()
+    }
+
+    fn restored_or_why(lines: &[String]) -> Result<f64, CostUnknown> {
         let dir = Dir::new();
         write(&dir.transcript(session()), lines);
         restored_total(&dir.0, session())
@@ -548,20 +558,21 @@ mod tests {
     fn without_a_cost_line_the_total_is_zero_and_without_a_transcript_unknown() {
         let dir = Dir::new();
         let session = session();
-        assert_eq!(restored_total(&dir.0, session), None);
-        assert_eq!(restored_total(&dir.0.join("missing"), session), None);
+        let unreadable = Err(CostUnknown::TranscriptUnreadable);
+        assert_eq!(restored_total(&dir.0, session), unreadable);
+        assert_eq!(restored_total(&dir.0.join("missing"), session), unreadable);
         let path = dir.transcript(session);
         assert_eq!(
             restored_total(&dir.0, session),
-            None,
+            unreadable,
             "the CLI refuses to resume without a transcript"
         );
         write(&path, &exchange(ID));
-        assert_eq!(restored_total(&dir.0, session), Some(0.0));
+        assert_eq!(restored_total(&dir.0, session), Ok(0.0));
         std::fs::write(&path, b"").unwrap();
-        assert_eq!(restored_total(&dir.0, session), Some(0.0));
+        assert_eq!(restored_total(&dir.0, session), Ok(0.0));
         std::fs::write(&path, b"\n\n").unwrap();
-        assert_eq!(restored_total(&dir.0, session), Some(0.0));
+        assert_eq!(restored_total(&dir.0, session), Ok(0.0));
     }
 
     #[test]
@@ -583,7 +594,7 @@ mod tests {
             ),
         ]);
         write(&path, &lines);
-        assert_eq!(restored_total(&dir.0, session), Some(0.75));
+        assert_eq!(restored_total(&dir.0, session), Ok(0.75));
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -592,7 +603,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             restored_total(&dir.0, session),
-            None,
+            Err(CostUnknown::TranscriptUnrecognized),
             "the CLI ends every line it writes, so a last line without its newline is unknown"
         );
     }
@@ -606,7 +617,10 @@ mod tests {
         assert_eq!(restored(&lines), Some(0.0112));
         let mut appended = lines.clone();
         appended.push(written(cost_value(900.0, OTHER)));
-        assert_eq!(restored(&appended), None);
+        assert_eq!(
+            restored_or_why(&appended),
+            Err(CostUnknown::TranscriptUnrecognized)
+        );
     }
 
     #[test]
@@ -618,8 +632,8 @@ mod tests {
             Some(0.5)
         );
         assert_eq!(
-            restored(&padded_to(CLI_INDEX_BYTES + 1, lines)),
-            None,
+            restored_or_why(&padded_to(CLI_INDEX_BYTES + 1, lines)),
+            Err(CostUnknown::TranscriptTooLarge),
             "past 5 MiB the CLI files lines by their first bytes before it parses them"
         );
     }
@@ -846,19 +860,20 @@ mod tests {
 
         let path = dir.transcript(session);
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert_eq!(restored_total(&dir.0, session), None);
+        let unreadable = Err(CostUnknown::TranscriptUnreadable);
+        assert_eq!(restored_total(&dir.0, session), unreadable);
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir_all(dir.0.join("claude")).unwrap();
         std::os::unix::fs::symlink(elsewhere.0.join("claude"), dir.0.join("claude")).unwrap();
-        assert_eq!(restored_total(&dir.0, session), None);
+        assert_eq!(restored_total(&dir.0, session), unreadable);
 
         std::fs::remove_file(dir.0.join("claude")).unwrap();
         let path = dir.transcript(session);
         std::fs::create_dir(&path).unwrap();
         assert_eq!(
             restored_total(&dir.0, session),
-            None,
+            unreadable,
             "a directory isn't a transcript"
         );
     }
@@ -1154,7 +1169,7 @@ mod tests {
             "the CLI ran the tool"
         );
         assert!(reported.is_some_and(|total| total > 0.0));
-        let runner = restored_total(&tool_turn.0, session());
+        let runner = restored_total(&tool_turn.0, session()).ok();
         let cli = cli_restored(&image, &tool_turn.0, port);
         eprintln!("tool turn: the runner reads {runner:?}, the CLI restored {cli:?}");
         assert_eq!(runner, reported, "the runner reads the CLI's own tool turn");
@@ -1163,7 +1178,7 @@ mod tests {
         for (case, lines) in cli_cases() {
             let dir = Dir::new();
             write(&dir.transcript(session()), &lines);
-            let runner = restored_total(&dir.0, session());
+            let runner = restored_total(&dir.0, session()).ok();
             let cli = cli_restored(&image, &dir.0, port);
             eprintln!("{case}: the runner reads {runner:?}, the CLI restored {cli:?}");
             read.push((case, runner, cli));

@@ -2568,6 +2568,7 @@ async fn me_shows_what_was_billed_today_and_this_month() {
                     input_tokens: input,
                     output_tokens: 1,
                     cost_usd: 0.5,
+                    cost_unknown: None,
                 },
                 false,
                 at,

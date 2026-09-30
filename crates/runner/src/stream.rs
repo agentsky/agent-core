@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use core_types::SessionId;
 use serde_json::Value;
+use store::CostUnknown;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::launch::TOOLS;
@@ -163,15 +164,17 @@ pub struct TurnResult {
     /// with `--resume` rises from the total the CLI restored, when the
     /// process was told it
     /// ([`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from)).
-    /// `None` when the turn's cost isn't known: either total is missing or
-    /// out of range, the total fell, or it rose by more than
-    /// [`MAX_TURN_COST_USD`]. So a result without a total leaves the next
-    /// turn's cost unknown too.
+    /// Why not, when the turn's cost isn't known: either total is missing
+    /// or out of range ([`CostUnknown::NoTotal`]), the total fell or rose
+    /// by more than [`MAX_TURN_COST_USD`]
+    /// ([`CostUnknown::TotalOutOfRange`]), or the restored total isn't
+    /// known (the reason the process was given). So a result without a
+    /// total leaves the next turn's cost unknown too.
     ///
     /// The agent can write the transcript the restored total comes from,
     /// and the CLI's stdout, so this is a figure for the meter's record,
     /// never one to enforce a limit with.
-    pub cost_usd: Option<f64>,
+    pub cost_usd: Result<f64, CostUnknown>,
     /// The line's `total_cost_usd`: the CLI's running total for its
     /// process, not the turn's cost. A process started with `--session-id`
     /// counts from 0. One started with `--resume` counts from the total
@@ -382,20 +385,27 @@ pub(crate) struct ResultLine {
 impl ResultLine {
     /// The result, with its cost the rise of the line's total over
     /// `process_total`, the process's previous total, which becomes the
-    /// line's. The cost is `None` when either total is unknown or not
-    /// [plausible](plausible_total), or when the rise is below 0 or above
+    /// line's. The cost is unknown when the line's total is missing or not
+    /// [plausible](plausible_total), for the previous total's reason when
+    /// that is unknown, and when the rise is below 0 or above
     /// [`MAX_TURN_COST_USD`].
     pub(crate) fn into_result(
         self,
         stats: TurnStats,
-        process_total: &mut Option<f64>,
+        process_total: &mut Result<f64, CostUnknown>,
     ) -> TurnResult {
-        let total = self.total_cost_usd.filter(|total| plausible_total(*total));
+        let total = self
+            .total_cost_usd
+            .filter(|total| plausible_total(*total))
+            .ok_or(CostUnknown::NoTotal);
         let previous = std::mem::replace(process_total, total);
-        let cost_usd = total
-            .zip(previous)
-            .map(|(total, previous)| total - previous)
-            .filter(|cost| (0.0..=MAX_TURN_COST_USD).contains(cost));
+        let cost_usd = total.and_then(|total| {
+            let cost = total - previous?;
+            (0.0..=MAX_TURN_COST_USD)
+                .contains(&cost)
+                .then_some(cost)
+                .ok_or(CostUnknown::TotalOutOfRange)
+        });
         let error_kind = self.is_error.then(|| {
             ErrorKind::classify(
                 self.api_error_status,
@@ -647,7 +657,7 @@ mod tests {
         let mut reader = capture.as_bytes();
         let mut buf = Vec::new();
         let mut results = Vec::new();
-        let mut process_total = Some(0.0);
+        let mut process_total = Ok(0.0);
         loop {
             let mut stats = TurnStats::default();
             match read_turn(&mut reader, &mut buf, &mut stats).await {
@@ -684,7 +694,7 @@ mod tests {
             })
         );
         assert!((first.cost_usd.unwrap() - 0.00014).abs() < 1e-12);
-        assert_eq!(first.cost_usd, first.process_total_cost_usd);
+        assert_eq!(first.cost_usd.ok(), first.process_total_cost_usd);
         assert_eq!(first.session_id, Some(session));
         assert_eq!(
             first.stats,
@@ -800,7 +810,7 @@ mod tests {
         let line = br#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
         let mut read = note_line(line, &mut stats)
             .unwrap()
-            .into_result(stats, &mut Some(0.0));
+            .into_result(stats, &mut Ok(0.0));
         assert!(TurnOutcome::Finished(read.clone()).resume_refused());
         read.stats.init_seen = true;
         assert!(
@@ -816,54 +826,72 @@ mod tests {
 
     #[test]
     fn a_turn_costs_what_it_adds_to_the_process_total() {
-        let result = |total: &str, process_total: &mut Option<f64>| {
+        use CostUnknown::{NoTotal, TotalOutOfRange, TranscriptTooLarge};
+        let result = |total: &str, process_total: &mut Result<f64, CostUnknown>| {
             let line = format!(r#"{{"type":"result","subtype":"success"{total}}}"#);
             let mut stats = TurnStats::default();
             note_line(line.as_bytes(), &mut stats)
                 .unwrap()
                 .into_result(stats, process_total)
         };
-        let mut process_total = Some(0.0);
+        let mut process_total = Ok(0.0);
         let first = result(r#","total_cost_usd":0.5"#, &mut process_total);
-        assert_eq!(first.cost_usd, Some(0.5));
+        assert_eq!(first.cost_usd, Ok(0.5));
         assert_eq!(first.process_total_cost_usd, Some(0.5));
         let second = result(r#","total_cost_usd":0.75"#, &mut process_total);
-        assert_eq!(second.cost_usd, Some(0.25));
+        assert_eq!(second.cost_usd, Ok(0.25));
         assert_eq!(second.process_total_cost_usd, Some(0.75));
         let lower = result(r#","total_cost_usd":0.125"#, &mut process_total);
-        assert_eq!(lower.cost_usd, None, "a falling total isn't the CLI's");
-        assert_eq!(process_total, Some(0.125));
+        assert_eq!(
+            lower.cost_usd,
+            Err(TotalOutOfRange),
+            "a falling total isn't the CLI's"
+        );
+        assert_eq!(process_total, Ok(0.125));
         let third = result(r#","total_cost_usd":0.25"#, &mut process_total);
-        assert_eq!(third.cost_usd, Some(0.125));
+        assert_eq!(third.cost_usd, Ok(0.125));
         let none = result("", &mut process_total);
-        assert_eq!(none.cost_usd, None);
-        assert_eq!(process_total, None, "a result without a total forgets it");
+        assert_eq!(none.cost_usd, Err(NoTotal));
+        assert_eq!(
+            process_total,
+            Err(NoTotal),
+            "a result without a total forgets it"
+        );
         let after = result(r#","total_cost_usd":0.5"#, &mut process_total);
-        assert_eq!(after.cost_usd, None, "so the next turn's cost is unknown");
+        assert_eq!(
+            after.cost_usd,
+            Err(NoTotal),
+            "so the next turn's cost is unknown"
+        );
         let known = result(r#","total_cost_usd":0.75"#, &mut process_total);
-        assert_eq!(known.cost_usd, Some(0.25), "and the one after is known");
+        assert_eq!(known.cost_usd, Ok(0.25), "and the one after is known");
 
-        let mut process_total = Some(0.0);
+        let mut process_total = Ok(0.0);
         let huge = result(r#","total_cost_usd":1000000.5"#, &mut process_total);
-        assert_eq!(huge.cost_usd, None, "a turn can't cost that much");
+        assert_eq!(
+            huge.cost_usd,
+            Err(TotalOutOfRange),
+            "a turn can't cost that much"
+        );
         let most = result(r#","total_cost_usd":1001000.5"#, &mut process_total);
-        assert_eq!(most.cost_usd, Some(MAX_TURN_COST_USD));
+        assert_eq!(most.cost_usd, Ok(MAX_TURN_COST_USD));
         for total in ["-1", "1e17", "\"1\""] {
-            let mut process_total = Some(0.0);
+            let mut process_total = Ok(0.0);
             let bad = result(&format!(r#","total_cost_usd":{total}"#), &mut process_total);
-            assert_eq!(bad.cost_usd, None, "{total}");
-            assert_eq!(process_total, None, "{total}");
+            assert_eq!(bad.cost_usd, Err(NoTotal), "{total}");
+            assert_eq!(process_total, Err(NoTotal), "{total}");
         }
 
-        let mut unknown = None;
+        let mut unknown = Err(TranscriptTooLarge);
         let first = result(r#","total_cost_usd":3.5"#, &mut unknown);
         assert_eq!(
-            first.cost_usd, None,
-            "without the total it started from, the first cost is unknown"
+            first.cost_usd,
+            Err(TranscriptTooLarge),
+            "without the total it started from, the first cost is unknown for its reason"
         );
         assert_eq!(first.process_total_cost_usd, Some(3.5));
         let next = result(r#","total_cost_usd":4.0"#, &mut unknown);
-        assert_eq!(next.cost_usd, Some(0.5), "and the next one is known again");
+        assert_eq!(next.cost_usd, Ok(0.5), "and the next one is known again");
     }
 
     #[test]
@@ -904,7 +932,7 @@ mod tests {
         let line = br#"{"type":"result","subtype":"error_max_turns","api_error_status":"x","usage":{"input_tokens":"n","output_tokens":3},"total_cost_usd":"free","session_id":"not-a-uuid","terminal_reason":"has space","extra":{"nested":[1]}}"#;
         let result = note_line(line, &mut stats)
             .unwrap()
-            .into_result(stats, &mut Some(0.0));
+            .into_result(stats, &mut Ok(0.0));
         assert!(result.is_error, "no is_error and not success");
         assert_eq!(result.subtype.as_deref(), Some("error_max_turns"));
         assert_eq!(result.api_error_status, None);
@@ -915,7 +943,7 @@ mod tests {
                 ..Usage::default()
             })
         );
-        assert_eq!(result.cost_usd, None);
+        assert_eq!(result.cost_usd, Err(CostUnknown::NoTotal));
         assert_eq!(result.process_total_cost_usd, None);
         assert_eq!(result.session_id, None);
         assert_eq!(result.terminal_reason, None);
@@ -923,7 +951,7 @@ mod tests {
 
         let mut stats = TurnStats::default();
         let ok = note_line(br#"{"type":"result","subtype":"success"}"#, &mut stats).unwrap();
-        let ok = ok.into_result(stats, &mut Some(0.0));
+        let ok = ok.into_result(stats, &mut Ok(0.0));
         assert!(!ok.is_error);
         assert_eq!(ok.error_kind, None);
         assert_eq!(ok.usage, None);
@@ -1018,7 +1046,7 @@ mod tests {
         let finished = TurnOutcome::Finished(
             note_line(low, &mut stats.clone())
                 .unwrap()
-                .into_result(stats.clone(), &mut Some(0.0)),
+                .into_result(stats.clone(), &mut Ok(0.0)),
         );
         assert_eq!(
             finished.usage(),
@@ -1104,7 +1132,7 @@ mod tests {
         let finished = TurnOutcome::Finished(
             note_line(result, &mut stats.clone())
                 .unwrap()
-                .into_result(stats, &mut Some(0.0)),
+                .into_result(stats, &mut Ok(0.0)),
         );
         assert_eq!(
             finished.usage(),
@@ -1177,7 +1205,7 @@ mod tests {
         let result = read_turn(&mut reader, &mut Vec::new(), &mut stats)
             .await
             .unwrap()
-            .into_result(stats, &mut Some(0.0));
+            .into_result(stats, &mut Ok(0.0));
         assert_eq!(result.result.as_deref(), Some("ok"));
         assert_eq!(result.stats.malformed_lines, 1);
     }
@@ -1209,7 +1237,7 @@ mod tests {
         let line = br#"{"type":"result","is_error":false,"result":"the password is hunter2"}"#;
         let result = note_line(line, &mut stats)
             .unwrap()
-            .into_result(stats, &mut Some(0.0));
+            .into_result(stats, &mut Ok(0.0));
         let outcome = TurnOutcome::Finished(result);
         let debug = format!("{outcome:?}");
         assert!(!debug.contains("hunter2"), "{debug}");
