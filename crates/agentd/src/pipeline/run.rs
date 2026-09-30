@@ -98,6 +98,9 @@ pub struct PipelineSettings {
     pub max_pending_per_owner: usize,
     /// The community's caps on threads and hops, from `[limits]`.
     pub limits: Limits,
+    /// The clock the limits and the meter read: which day and hour a turn
+    /// counts in, and which window a limit's notice is for.
+    pub now: fn() -> OffsetDateTime,
 }
 
 /// Takes every surface's messages that aren't commands, decides which
@@ -695,7 +698,7 @@ impl Pipeline {
             managers: &settings.managers,
             thread: &thread,
             limits: &settings.limits,
-            now: OffsetDateTime::now_utc(),
+            now: (settings.now)(),
         };
         let view = match StoreView::load(store, event, agent, context).await {
             Ok(view) => view,
@@ -832,7 +835,7 @@ impl Pipeline {
             return Ok(());
         }
         let target = reply_target(event, caps);
-        let Some((kind, window)) = limit_window(reason, OffsetDateTime::now_utc()) else {
+        let Some((kind, window)) = limit_window(reason, (self.inner.settings.now)()) else {
             say(surface.as_ref(), &target, &text).await?;
             tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
             return Ok(());
@@ -878,7 +881,7 @@ impl Pipeline {
             RefuseReason::Banned => "refused/banned".to_owned(),
             _ => format!("refused/{agent}"),
         };
-        let now = OffsetDateTime::now_utc();
+        let now = (self.inner.settings.now)();
         let claimed = match store
             .claim_failure_notice(&requester.key, &kind, now, REFUSAL_DM_INTERVAL)
             .await
@@ -920,7 +923,7 @@ impl Pipeline {
         outcome: &TurnOutcome,
     ) {
         let store = &self.inner.store;
-        let now = OffsetDateTime::now_utc();
+        let now = (self.inner.settings.now)();
         let key = &turn.requester.key;
         let member = match turn.requester.member {
             Some(member) => member,

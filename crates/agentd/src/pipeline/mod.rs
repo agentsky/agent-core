@@ -29,6 +29,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use runner::{PoolConfig, ProcessConfig, SessionConfig, SessionManager};
 use sandbox::{DockerSandbox, Sandbox};
+use time::OffsetDateTime;
 
 use crate::app::App;
 use crate::commands::SessionControl;
@@ -149,7 +150,7 @@ impl Turns {
 impl PipelineSettings {
     /// The settings `app` gives: its data directory, its manager bots,
     /// `[runner]`'s working emoji and models, and `[limits]`' caps, with the
-    /// default queue bounds.
+    /// default queue bounds and the system clock.
     pub fn from_app(app: &App) -> Self {
         let managers = app
             .rocketchat()
@@ -167,6 +168,7 @@ impl PipelineSettings {
             max_pending: DEFAULT_MAX_PENDING,
             max_pending_per_owner: DEFAULT_MAX_PENDING_PER_OWNER,
             limits: Limits::from_config(&app.config().limits),
+            now: OffsetDateTime::now_utc,
         }
     }
 }

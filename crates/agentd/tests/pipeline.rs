@@ -40,6 +40,12 @@ use common::{TempDir, env};
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
 
+/// The pipeline's clock in these tests: one instant, so a test's turns and
+/// counts never fall in two hours or days.
+fn pinned_now() -> OffsetDateTime {
+    time::macros::datetime!(2030-06-15 12:30 UTC)
+}
+
 /// Every agent's bot acts through the one mock, past the [`Holds`].
 #[derive(Debug)]
 struct Mocks {
@@ -391,6 +397,7 @@ async fn start_with(setup: Setup) -> Stack {
     let sandbox = ProcessSandbox::new(store.clone(), dir.path()).unwrap();
     let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
     let mut pipeline_settings = PipelineSettings::from_app(&app);
+    pipeline_settings.now = pinned_now;
     (setup.pipeline)(&mut pipeline_settings);
     let manager = Arc::new(MockSurface::new());
     let replies = Replies::new(Some(Arc::new(ManagerBot::new(
@@ -1011,7 +1018,7 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         .await
         .unwrap()
         .unwrap();
-    let today = OffsetDateTime::now_utc().replace_time(time::Time::MIDNIGHT);
+    let today = pinned_now().replace_time(time::Time::MIDNIGHT);
 
     stack.next_turn(Turn::reply("Done."));
     stack
@@ -1034,13 +1041,13 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         "the owner pays nothing for bob's turn"
     );
     let spend = store
-        .thread_spend(&thread("GENERAL", "m1"), OffsetDateTime::now_utc())
+        .thread_spend(&thread("GENERAL", "m1"), pinned_now())
         .await
         .unwrap();
     assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
     assert_eq!(
         store
-            .capped_turns_on(stack.agent, OffsetDateTime::now_utc())
+            .capped_turns_on(stack.agent, pinned_now())
             .await
             .unwrap(),
         1
@@ -1073,7 +1080,7 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         "a turn whose CLI the agent killed is billed what its messages used"
     );
     let spend = store
-        .thread_spend(&thread("GENERAL", "k1"), OffsetDateTime::now_utc())
+        .thread_spend(&thread("GENERAL", "k1"), pinned_now())
         .await
         .unwrap();
     assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
