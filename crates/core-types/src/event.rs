@@ -10,6 +10,22 @@ use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, 
 ///
 /// Surfaces don't decide whether an agent answers. They fill in what the
 /// platform said, and the router gates on it.
+///
+/// # Bot senders
+///
+/// When `sender_is_bot` is true, the router looks the sender up as a
+/// managed agent by [`sender`](Self::sender), the same [`MemberKey`] every
+/// binding is keyed by. So a surface puts the bot's user id in
+/// `sender.user` whenever it knows one, and the same id in
+/// `sender_bot_user`; the two never disagree. On Rocket.Chat that is the
+/// message's `u._id`. On Slack it is the event's `user` field, or, for a
+/// bot message that carries only a `bot_id`, the `user_id` that `bots.info`
+/// returns for it.
+///
+/// A bot with no known user id (a Slack `bot_id` that `bots.info` maps to
+/// no user, as for legacy integrations) has `sender_bot_user: None` and its
+/// bot id (`B…`) in `sender.user`. No binding has that id, so the router
+/// treats the sender as an unmanaged bot and ignores it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundEvent {
     /// The platform's id for this delivery, used to drop duplicates: a Slack
@@ -17,13 +33,14 @@ pub struct InboundEvent {
     pub event_id: String,
     /// The binding whose connection or app received the event.
     pub binding: BindingId,
-    /// Who sent the message.
+    /// Who sent the message. For a bot, its user id when known, or else its
+    /// bot id; see [Bot senders](#bot-senders).
     pub sender: MemberKey,
-    /// Whether the sender is a bot user, managed by agentd or not.
+    /// Whether the sender is a bot, managed by agentd or not.
     pub sender_is_bot: bool,
-    /// The sender's bot user id, when the sender is a bot and the platform
-    /// named one. On Slack a bot message may carry only a `bot_id`, and
-    /// this is filled from `bots.info`.
+    /// The sender's bot user id, when the sender is a bot and its user id is
+    /// known: the same id as `sender.user`. `None` for a human, and for a
+    /// bot known only by its bot id.
     pub sender_bot_user: Option<UserId>,
     /// The conversation the message is in.
     pub conv: ConvRef,

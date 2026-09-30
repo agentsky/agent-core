@@ -124,11 +124,6 @@ fn plain_text() {
                 "one\r\ntwo\r\n\r\n- a\r\n- b",
                 "one\ntwo\n\n• a\n• b",
             ),
-            (
-                "backslash escapes are unescaped",
-                "\\*not em\\*",
-                "*not em*",
-            ),
         ],
     );
 }
@@ -274,9 +269,9 @@ fn code_is_untouched_except_for_escaping() {
                 "```python\nprint('hi')\n```",
             ),
             (
-                "qm-core: a tilde fence quoting backtick fences stays verbatim",
+                "qm-core adapted: backtick runs in a code body are broken, not tilde-fenced",
                 "~~~\nUse ```bash\nls\n``` to fence\n~~~",
-                "~~~\nUse ```bash\nls\n``` to fence\n~~~",
+                "```\nUse ``\u{200B}`bash\nls\n``\u{200B}` to fence\n```",
             ),
             (
                 "qm-core: an unclosed backtick run after a tilde fence",
@@ -409,9 +404,9 @@ fn links_and_images() {
                 "<https://x.io/i.png|a b c>",
             ),
             (
-                "a bare URL in a label is not wrapped",
+                "a URL in a label naming another host goes next to the link",
                 "[see https://y.io](https://x.io)",
-                "<https://x.io|see https://y.io>",
+                "see https://y.io (<https://x.io>)",
             ),
         ],
     );
@@ -726,9 +721,9 @@ fn tables() {
                 "```\na\n-----\nx | y\n```",
             ),
             (
-                "a table holding a backtick fence uses tildes",
+                "a table holding a backtick fence breaks the run",
                 "| a |\n|---|\n| ```` ``` ```` |",
-                "~~~\na\n---\n```\n~~~",
+                "```\na\n---\n``\u{200B}`\n```",
             ),
             (
                 "a table between paragraphs",
@@ -1057,4 +1052,341 @@ fn line_breaks_inside_labels_and_headings_become_spaces() {
             ),
         ],
     );
+}
+
+#[test]
+fn a_label_naming_another_host_goes_next_to_the_link() {
+    check(
+        &NOBODY,
+        &[
+            (
+                "a URL label",
+                "[https://good.com](https://evil.com)",
+                "https://good.com (<https://evil.com>)",
+            ),
+            (
+                "a domain label",
+                "[good.com](https://evil.com)",
+                "good.com (<https://evil.com>)",
+            ),
+            (
+                "a www label with a path",
+                "[www.good.com/x](https://evil.com/x)",
+                "www.good.com/x (<https://evil.com/x>)",
+            ),
+            (
+                "a domain in a longer label",
+                "[Log in at good.com now](https://evil.com)",
+                "Log in at good.com now (<https://evil.com>)",
+            ),
+            (
+                "a bracketed domain",
+                "[(good.com)](https://evil.com)",
+                "(good.com) (<https://evil.com>)",
+            ),
+            (
+                "a domain with a port",
+                "[good.com:8080](https://evil.com)",
+                "good.com:8080 (<https://evil.com>)",
+            ),
+            (
+                "the label's host as a subdomain of another",
+                "[good.com](https://good.com.evil.io)",
+                "good.com (<https://good.com.evil.io>)",
+            ),
+            (
+                "the label's host as user info",
+                "[good.com](https://good.com@evil.io)",
+                "good.com (<https://good.com@evil.io>)",
+            ),
+            (
+                "the label's host in the path",
+                "[good.com](https://evil.io/good.com)",
+                "good.com (<https://evil.io/good.com>)",
+            ),
+            (
+                "a punycode lookalike URL",
+                "[apple.com](https://xn--pple-43d.com)",
+                "apple.com (<https://xn--pple-43d.com>)",
+            ),
+            (
+                "a Cyrillic lookalike label",
+                "[\u{0430}pple.com](https://apple.com)",
+                "\u{0430}pple.com (<https://apple.com>)",
+            ),
+            (
+                "a Cyrillic lookalike URL",
+                "[apple.com](https://\u{0430}pple.com)",
+                "apple.com (<https://\u{0430}pple.com>)",
+            ),
+            (
+                "an ideographic full stop",
+                "[good\u{3002}com](https://evil.com)",
+                "good\u{3002}com (<https://evil.com>)",
+            ),
+            (
+                "a one-dot leader",
+                "[good\u{2024}com](https://evil.com)",
+                "good\u{2024}com (<https://evil.com>)",
+            ),
+            (
+                "a zero-width space inside a domain",
+                "[good\u{200B}.com](https://evil.com)",
+                "good\u{200B}.com (<https://evil.com>)",
+            ),
+            (
+                "a right-to-left override",
+                "[\u{202E}moc.doog](https://good.com)",
+                "\u{202E}moc.doog (<https://good.com>)",
+            ),
+            (
+                "same host: an invisible character in the label",
+                "[good\u{00AD}.com](https://good.com)",
+                "<https://good.com|good\u{00AD}.com>",
+            ),
+            (
+                "an IPv4 label",
+                "[10.0.0.1](https://10.6.6.6)",
+                "10.0.0.1 (<https://10.6.6.6>)",
+            ),
+            (
+                "an email label for another address's domain",
+                "[ada@good.com](mailto:ada@evil.com)",
+                "ada@good.com (<mailto:ada@evil.com>)",
+            ),
+            (
+                "a URL without a scheme",
+                "[good.com](evil.com)",
+                "good.com (<evil.com>)",
+            ),
+            (
+                "a formatted label",
+                "[**good.com**](https://evil.com)",
+                "*good.com* (<https://evil.com>)",
+            ),
+            (
+                "an image's alt text",
+                "![good.com](https://evil.com/i.png)",
+                "good.com (<https://evil.com/i.png>)",
+            ),
+            (
+                "an image inside a link",
+                "[![good.com](https://good.com/l.png)](https://evil.com)",
+                "good.com (<https://evil.com>)",
+            ),
+            (
+                "same host: a word label",
+                "[docs](https://good.com/a)",
+                "<https://good.com/a|docs>",
+            ),
+            (
+                "same host: a domain label",
+                "[good.com](https://good.com)",
+                "<https://good.com|good.com>",
+            ),
+            (
+                "same host: case and www differ",
+                "[GOOD.com](https://www.Good.COM/x)",
+                "<https://www.Good.COM/x|GOOD.com>",
+            ),
+            (
+                "same host: a www label with a path",
+                "[www.good.com/a](https://good.com/a)",
+                "<https://good.com/a|www.good.com/a>",
+            ),
+            (
+                "same host: a port and a trailing dot",
+                "[good.com.](https://good.com:443/)",
+                "<https://good.com:443/|good.com.>",
+            ),
+            (
+                "same host: an email address",
+                "[ada@good.com](mailto:ada@good.com)",
+                "<mailto:ada@good.com|ada@good.com>",
+            ),
+            (
+                "same host: a backslash ends the host, as in browsers",
+                "[good.com](https://good.com\\\\@evil.io)",
+                "<https://good.com\\@evil.io|good.com>",
+            ),
+            (
+                "words with dots that aren't domains",
+                "[e.g. v1.2 of @ankit](https://x.io)",
+                "<https://x.io|e.g. v1.2 of @ankit>",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_link_without_a_url_shows_only_its_label() {
+    check(
+        &NOBODY,
+        &[
+            ("an empty URL", "a [x]() b", "a x b"),
+            ("an empty bracketed URL", "[**x**](<>)", "*x*"),
+            ("an image with an empty URL", "![alt]()", "alt"),
+            ("an empty label and URL", "a []() b", "a  b"),
+            (
+                "a table cell",
+                "| a |\n|---|\n| [x]() |",
+                "```\na\n-\nx\n```",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn emphasis_inside_a_word_keeps_its_delimiter() {
+    check(
+        &NOBODY,
+        &[
+            ("digits", "5*3*2", "5*3*2"),
+            ("letters", "a*b*c", "a*b*c"),
+            ("bold inside a word", "foo**bar**baz", "foo*bar*baz"),
+            ("strike inside a word", "a~~b~~c", "a~b~c"),
+            ("only the start touches a word", "foo*bar*", "foo*bar*"),
+            ("only the end touches a word", "*foo*bar", "*foo*bar"),
+            (
+                "underscores inside a word",
+                "snake_case_name",
+                "snake_case_name",
+            ),
+            ("emphasis still converts", "*x*", "_x_"),
+            ("bold still converts", "**x**", "*x*"),
+            ("inside bold", "**5*3*2**", "*5*3*2*"),
+            ("in a heading", "# 5*3*2", "*5*3*2*"),
+            (
+                "in a table cell",
+                "| a |\n|---|\n| 5*3*2 |",
+                "```\na\n-----\n5*3*2\n```",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn escaped_formatting_characters_stay_literal() {
+    check(
+        &TEAM,
+        &[
+            (
+                "asterisks",
+                "\\*not bold\\*",
+                "\u{200B}*\u{200B}not bold\u{200B}*\u{200B}",
+            ),
+            (
+                "underscores",
+                "\\_x\\_",
+                "\u{200B}_\u{200B}x\u{200B}_\u{200B}",
+            ),
+            ("tildes", "\\~x\\~", "\u{200B}~\u{200B}x\u{200B}~\u{200B}"),
+            (
+                "backticks",
+                "\\`x\\`",
+                "\u{200B}`\u{200B}x\u{200B}`\u{200B}",
+            ),
+            (
+                "character references",
+                "&ast;x&#95;",
+                "\u{200B}*\u{200B}x\u{200B}_\u{200B}",
+            ),
+            (
+                "inside a word nothing is added",
+                "snake\\_case\\_name",
+                "snake_case_name",
+            ),
+            ("an escaped backslash before emphasis", "\\\\*x*", "\\_x_"),
+            (
+                "a literal star after an escaped backslash",
+                "\\\\* x",
+                "\\\u{200B}*\u{200B} x",
+            ),
+            (
+                "in a link label",
+                "[\\*x\\*](https://x.io)",
+                "<https://x.io|\u{200B}*\u{200B}x\u{200B}*\u{200B}>",
+            ),
+            (
+                "in a heading",
+                "# \\*x\\*",
+                "*\u{200B}*\u{200B}x\u{200B}*\u{200B}*",
+            ),
+            (
+                "next to a mention",
+                "\\*@ankit\\*",
+                "\u{200B}*\u{200B}<@U111>\u{200B}*\u{200B}",
+            ),
+            (
+                "in alt text",
+                "![\\*x\\*](https://x.io/i.png)",
+                "<https://x.io/i.png|\u{200B}*\u{200B}x\u{200B}*\u{200B}>",
+            ),
+            (
+                "code in alt text",
+                "![`*x*`](https://x.io/i.png)",
+                "<https://x.io/i.png|\u{200B}*\u{200B}x\u{200B}*\u{200B}>",
+            ),
+            (
+                "in a URL nothing is added",
+                "https://x.io/a\\_b",
+                "<https://x.io/a_b>",
+            ),
+            (
+                "in a table cell nothing is added",
+                "| a |\n|---|\n| \\*x\\* |",
+                "```\na\n---\n*x*\n```",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn backtick_runs_cant_close_a_code_block() {
+    check(
+        &NOBODY,
+        &[
+            (
+                "three backticks",
+                "````\n```\n````",
+                "```\n``\u{200B}`\n```",
+            ),
+            (
+                "six backticks",
+                "~~~\n``````\n~~~",
+                "```\n``\u{200B}``\u{200B}``\n```",
+            ),
+            ("two backticks stay", "~~~\n``\n~~~", "```\n``\n```"),
+            (
+                "an info string starting with a backtick",
+                "~~~`x\ny\n~~~",
+                "```\u{200B}`x\ny\n```",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn a_wire_broadcast_label_is_searched_only_briefly() {
+    let long = format!("<!here|{}>", "x".repeat(MAX_WIRE_LABEL));
+    assert_eq!(to_mrkdwn(&long, &NOBODY), escape(&long));
+    let short = format!("<!here|{}>", "x".repeat(MAX_WIRE_LABEL - 2));
+    assert_eq!(to_mrkdwn(&short, &NOBODY), "@\u{200B}here");
+    check(
+        &NOBODY,
+        &[(
+            "a label doesn't run past a line break",
+            "a <!here|x\nb> c",
+            "a &lt;!here|x\nb&gt; c",
+        )],
+    );
+}
+
+#[test]
+fn many_unclosed_wire_broadcasts_stay_linear() {
+    let md = "<!here|".repeat(300_000);
+    let started = std::time::Instant::now();
+    let out = to_mrkdwn(&md, &NOBODY);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(out, escape(&md));
 }

@@ -36,6 +36,10 @@ unused-allowed-license = "allow"
 
 [licenses.private]
 # The workspace crates carry only `license-file` and are never published.
+# This skips every `publish = false` crate, not only ours, so
+# scripts/ci/check-path-deps.sh (run by the same CI job) fails when a path
+# package other than the root package or a crate in crates/ is in the
+# graph.
 ignore = true
 
 [bans]
@@ -48,7 +52,9 @@ skip = [
     { crate = "block-buffer@0.10.4", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
     { crate = "cpufeatures@0.2.17", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
     { crate = "crypto-common@0.1.6", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
+    { crate = "digest@0.10.7", reason = "sqlx-core 0.9.0 depends on sha2 0.10" },
     { crate = "hashbrown@0.16.1", reason = "sqlx-core 0.9.0 depends on hashlink 0.11" },
+    { crate = "sha2@0.10.9", reason = "sqlx-core 0.9.0 depends on sha2 0.10; auth uses 0.11" },
     { crate = "syn@2.0.119", reason = "sqlx-macros 0.9.0 and tracing-attributes depend on syn 2" },
 ]
 deny = [

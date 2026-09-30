@@ -59,8 +59,12 @@ The `deny` job enforces the dependency policy in `deny.toml` with
 [cargo-deny](https://github.com/EmbarkStudios/cargo-deny): no OpenSSL or
 `native-tls`, only the permissive licenses listed there, no crate with a
 known vulnerability (unmaintained crates only warn), and crates.io as the only
-source. Run it locally with `cargo install cargo-deny --locked` and
-`cargo deny --workspace --locked check -W unmaintained`.
+source; `scripts/ci/check-path-deps.sh` also rejects path dependencies other
+than the workspace's own crates. The job runs weekly on `main` as well, so a
+newly published advisory fails a run of its own. Run it locally with
+`cargo install cargo-deny --locked`,
+`cargo deny --workspace --locked check -W unmaintained` and
+`sh scripts/ci/check-path-deps.sh`.
 
 A change that touches only documentation (Markdown files and `LICENSE`, as
 decided by `scripts/ci/docs-only.sh`) skips the build and test jobs and runs
