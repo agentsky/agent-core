@@ -1481,7 +1481,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
     let dm = Origin::SlackDm {
         channel: "D0DM00001".into(),
     };
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse("skill add helper").unwrap(),
@@ -1497,7 +1497,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
     assert_eq!(std::fs::read_to_string(installed).unwrap(), skill);
 
     let too_big = file("F3", "SKILL.md", 10 * 1024 * 1024);
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse("skill add helper").unwrap(),
@@ -1507,7 +1507,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
         .await;
     assert_eq!(reply, "That file is over the 256 KB limit.");
 
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse("persona helper").unwrap(),
@@ -1520,11 +1520,14 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
     assert_eq!(row.persona, "You are brief.\n");
 
     let (response_url, _) = h.response_url();
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse("skill add helper").unwrap(),
-            &Origin::SlackSlash { response_url },
+            &Origin::SlackSlash {
+                response_url,
+                conv: slack_channel("C0CHAN001"),
+            },
             &[file("F1", "SKILL.md", skill.len())],
         )
         .await;
