@@ -6467,54 +6467,71 @@ cleanly. The second can't see what the CLI will actually restore: a
 leftover process in the container can append its own `cost-state` line
 after a clean exit, and the CLI restores that one.
 
-**Solution.** The first. `SessionManager` reads the line before it starts a
-`--resume`d process, off the async runtime, and hands it to
+**Solution.** The first. `SessionManager` reads the total before it
+starts a `--resume`d process, off the async runtime, and hands it to
 `ClaudeProcess::count_cost_from`; `TurnResult::cost_usd` is then the turn's
 own on every turn. The transcript is agent-writable, so the read opens
 `claude/projects/<id>/<id>.jsonl` below the session's directory one
 component at a time with `O_NOFOLLOW` (rustix `openat`, a runner
 dependency now), accepts only a regular file, opened `O_NONBLOCK` so a
-FIFO can't hang it, and searches back from its end in 64 KiB chunks, at
-most 32 MiB, for the last line whose `type` is `cost-state`, as the CLI
-does. No line in the whole file means 0, as the CLI restores then.
+FIFO can't hang it.
 
-The runner must take the line the CLI takes, never an earlier one: an
-agent that appends a `cost-state` line the runner passes over (padded past
-a length cap, say) would otherwise have the CLI restore a total the runner
-doesn't take off, and bill it as the turn's cost; and a line the runner
-takes but the CLI skips does the same the other way. The pinned CLI
-(2.1.285's bundled source, read from the npm package) parses each line with
-`JSON.parse`, where a key written twice holds its last value, and restores
-the last line whose `type` is exactly the string `cost-state`, whose
-`sessionId` is the session's, and which passes a zod schema: every field
-it writes present (`totalCostUSD`, five durations and line counts,
-`startTime`, `modelUsage`; `hasUnknownModelCost` optional), each a finite
-number from 0 (`totalCostUSD` at most 1e9, the rest 1e15), and each
-model's counts likewise. It skips any other such line and restores an
-earlier one. An earlier version of the runner read a line with a derived
-serde struct, which accepts a JSON array as the struct's fields in order,
-so `["cost-state", 0]`, or `{"type":"cost-state","totalCostUSD":0}`
-without the schema's other fields, was read as a total of 0 where the CLI
-skipped it and restored the real one: up to `MAX_TURN_COST_USD` shifted
-onto the next requester per forced resume.
+The runner must read the total the CLI restores, or none: a total it
+reads but the CLI doesn't restore is billed, the difference up to
+`MAX_TURN_COST_USD`, to the next requester per forced crash and resume.
+Two versions tried to mirror the pinned CLI's loader and missed. The
+first read a line with a derived serde struct, which accepts a JSON array
+as the struct's fields in order, so `["cost-state", 0]` read as 0. The
+second parsed lines as `JSON.parse` does and checked the CLI's zod schema
+(read from 2.1.285's bundled source), and a review with the real CLI
+against a stub API found two more paths: past 5,242,880 bytes (`gue` in
+the source) the loader indexes lines by their first bytes before parsing
+them, so `{"type":"artifact-autoreact-ledger","type":"cost-state",…}` is a
+ledger line to the CLI and a `cost-state` line to `JSON.parse`; and the CLI
+restores the `cost-state` line of the session its last message names,
+so an appended message and `cost-state` line of another session id
+restored that session's total.
 
-So the runner parses a line into a `serde_json::Map` (last key wins, as in
-`JSON.parse`, and anything but an object fails), passes over a line whose
-`type` is missing or another string, and takes a `cost-state` line only
-where it is sure the CLI does: the session's id, only the keys the CLI
-writes, every amount at most half the CLI's bound (so the two parsers'
-rounding can't fall on different sides of it), model names printable
-ASCII, and the token sums in bounds. Whatever it can't be sure the CLI
-skips makes the total unknown instead: a line longer than 64 KiB, one that
-isn't a JSON object, one whose `type` isn't a string, any other
-`cost-state` line, a start of the file past the 32 MiB, a missing
-transcript (the CLI then refuses the `--resume`), or one it can't open
-this way. So the unknown side is always the runner's: an agent can make
-its first turn's cost unknown, never move it. The type is parsed, not
-searched for, since `cost\u002dstate` is the same type. The CLI restores
-the same line only if nothing changes it between the two reads, which
-only a process left running in the container could do (Deferred work's
-"Killing leftover processes at turn end").
+So the runner no longer mirrors the loader; it fails closed. It reads a
+total only when all of these hold, and otherwise the total is unknown:
+
+- the file is at most 5,242,880 bytes, and ends its last line (the CLI
+  ends every line it writes, and the size keeps the CLI off its index
+  pass and its compaction, both only past that size);
+- every line is blank or a JSON object with no key written twice at any
+  depth (the CLI never writes one twice);
+- every line with a `sessionId` carries the session's own id, and every
+  message (a `user`, `assistant`, `system`, `attachment` or `progress`
+  line, or any with a `uuid` or `parentUuid`) carries one, so the last
+  message names this session;
+- a `type` that is present is a string, and every `cost-state` line
+  starts with the bytes the CLI writes,
+  `{"type":"cost-state","sessionId":"<id>",`, holds only the keys the CLI
+  writes, and passes its schema with a margin: every amount at most half
+  the CLI's bound (so the two parsers' rounding can't fall on different
+  sides of it), model names printable ASCII, the token sums in bounds.
+
+The total is then the last `cost-state` line's, or 0 without one. The
+unknown side is always the runner's: an agent can make its first turn's
+cost unknown, never move it. The file is read whole, and no line has a
+length cap: the CLI's own lines (tool results) run long. A missing
+transcript (the CLI then refuses the `--resume`) or one it can't open this
+way is unknown too.
+
+This guarantees what the Docker test checks, not every path of a loader
+the runner can't see all of: `docker_the_pinned_cli_restores_whatever_total_the_runner_reads`
+(a runner unit test CI's Docker job runs) resumes the pinned CLI from the
+sandbox image on crafted transcripts, against a stub API that answers 400
+so the result's `total_cost_usd` is the restored total, and asserts that
+whenever the runner reads a total the CLI restored exactly it: the CLI's
+own shapes (no cost line, one, two, a file of exactly 5,242,880 bytes)
+must read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
+`leaf3`, a duplicated key, a ledger-prefixed line) must be unknown. On the
+code before this, the test read 0.25 where the CLI restored 5 for
+`ledger_big` and `attr_big`, and 5 where it restored 7 for `leaf2` and
+`leaf3`. The CLI restores the same line only if nothing changes the file
+between the two reads, which only a process left running in the container
+could do (Deferred work's "Killing leftover processes at turn end").
 
 A turn's cost is unknown (`None`, and billed as 0) when its result or the
 process's previous one has no plausible total (so a result without one
@@ -6526,8 +6543,8 @@ unknown. Even so, the agent can write the transcript and the CLI's stdout
 limit is enforced with: no cap reads it.
 
 `fake-claude` now appends a `cost-state` line shaped as 2.1.285 writes
-it, with the session's id, when its input ends, and none when it crashes,
-and restores the session's last one on `--resume`;
+it, starting with the same bytes, when its input ends, and none when it
+crashes, and restores the session's last one on `--resume`;
 a runner test checks the resumed turn's cost after a clean stop and after
 a crash, and the Docker test now checks the corrected cost against the real
 CLI in CI.

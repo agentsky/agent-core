@@ -341,14 +341,14 @@ impl Session {
 
     /// Appends the process's running total to the transcript as a
     /// `cost-state` line, as the real CLI does when it exits, if the
-    /// session has a transcript. A crash or a kill writes none.
+    /// session has a transcript: compact, starting
+    /// `{"type":"cost-state","sessionId":"<id>",` as the CLI's does. A
+    /// crash or a kill writes none.
     fn save_cost(&self) -> Result<(), String> {
         if !self.transcript.exists() {
             return Ok(());
         }
-        let line = json!({
-            "type": "cost-state",
-            "sessionId": self.id,
+        let rest = json!({
             "totalCostUSD": self.total_cost_usd.get(),
             "totalAPIDuration": 0,
             "totalAPIDurationWithoutRetries": 0,
@@ -359,7 +359,13 @@ impl Session {
             "startTime": 0,
             "modelUsage": {},
             "hasUnknownModelCost": false,
-        });
+        })
+        .to_string();
+        let line = format!(
+            r#"{{"type":"cost-state","sessionId":"{}",{}"#,
+            self.id,
+            &rest[1..]
+        );
         let mut file = OpenOptions::new()
             .append(true)
             .open(&self.transcript)

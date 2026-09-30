@@ -3,43 +3,51 @@
 //! Claude Code appends
 //! `{"type":"cost-state","sessionId":…,"totalCostUSD":…,…}` to a session's
 //! transcript when a process exits, and none when one is killed. A
-//! `--resume`d process starts its running `total_cost_usd` from the last
-//! line of the transcript that is a `cost-state` line of the session and
-//! passes the CLI's schema, skipping any other, so its first result
-//! reports that total plus the turn's own cost. [`restored_total`] finds
-//! the same line, so the runner can take it off.
+//! `--resume`d process starts its running `total_cost_usd` from a
+//! `cost-state` line of the transcript, so its first result reports that
+//! total plus the turn's own cost. [`restored_total`] reads the same total,
+//! so the runner can take it off.
 //!
 //! The transcript is in the session's directory, which the agent can
-//! write. So nothing on the way to it is followed if it is a symlink, the
-//! file must be a regular file, and at most [`MAX_SCAN_BYTES`] of it, read
-//! from its end, are searched. Whatever the runner can't be sure the CLI
-//! skips could be the line the CLI takes, so it makes the total unknown
-//! rather than lead to an earlier line: a line longer than
-//! [`MAX_COST_LINE_BYTES`], one that isn't a JSON object, one whose `type`
-//! isn't a string, a `cost-state` line the runner can't be sure the CLI
-//! takes (see [`cost_state`]), or a start of the file past the scan.
+//! write, and the CLI's loader has more paths than the runner can follow:
+//! past [`CLI_INDEX_BYTES`] it files lines by their first bytes before it
+//! parses them, and it restores the `cost-state` line of the session its
+//! last message names, skipping any line that fails its schema. So the
+//! runner doesn't mirror the loader. It reads a total only from a
+//! transcript it is sure the loader reads one way, and otherwise the total
+//! is unknown: the file is a regular file, reached without following a
+//! symlink, of at most [`CLI_INDEX_BYTES`], ending its last line; every
+//! line is blank or a JSON object with no key written twice; every line
+//! with a `sessionId`, and every message, carries the session's own id;
+//! and every `cost-state` line is one the CLI writes (see [`cost_state`]).
+//! The total is then the last `cost-state` line's, or 0 without one. The
+//! unknown side is always the runner's: an agent can make its first turn's
+//! cost unknown, not move it. A Docker test checks the pinned CLI restores
+//! whatever total the runner reads, for the CLI's own transcripts and for
+//! the ones an agent could write to tell the two apart.
 
+use std::fmt;
 use std::fs::File;
-use std::os::unix::fs::FileExt as _;
+use std::io::Read as _;
 use std::path::Path;
 
 use core_types::SessionId;
 use rustix::fs::{Mode, OFlags};
+use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::stream::MAX_PROCESS_TOTAL_USD;
 
-/// How much of a transcript is searched, from its end, for the last
-/// `cost-state` line.
-pub(crate) const MAX_SCAN_BYTES: u64 = 32 * 1024 * 1024;
+/// The largest transcript the runner reads a total from: Claude Code
+/// 2.1.285 loads a larger one with an index pass that files lines by their
+/// first bytes (`{"type":"attribution-snapshot"`, say) before it parses
+/// them, and compacts it, so a line's type there isn't what the runner
+/// parses.
+pub(crate) const CLI_INDEX_BYTES: u64 = 5 * 1024 * 1024;
 
-/// How much is read at a time.
-const CHUNK_BYTES: u64 = 64 * 1024;
-
-/// The longest line read. The CLI's `cost-state` lines are a few hundred
-/// bytes; a longer line after the last one the runner finds makes the
-/// total unknown, since it can't tell whether the CLI would take it.
-const MAX_COST_LINE_BYTES: usize = 64 * 1024;
+/// The types of the lines the CLI loads as messages; a resumed session's
+/// `cost-state` line is looked up by its last message's `sessionId`.
+const MESSAGE_TYPES: [&str; 5] = ["user", "assistant", "system", "attachment", "progress"];
 
 /// What the CLI will restore for `session`, as
 /// [`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from)
@@ -60,19 +68,24 @@ pub(crate) async fn restored_cost(session_dir: &Path, session: SessionId) -> Opt
 /// directory is `session_dir` (`sessions/<id>/` on its volume, as agentd
 /// sees it): the last `cost-state` line's total, or 0 when the transcript
 /// has none. `None` when that isn't known: the transcript is missing (the
-/// CLI then refuses the `--resume`) or can't be read, or the line the CLI
-/// would take can't be read within the bounds the [module docs](self)
-/// give. The transcript is `claude/projects/<id>/<id>.jsonl` there, since
-/// the runner names the project directory after the session.
+/// CLI then refuses the `--resume`) or can't be read, or it isn't one the
+/// [module docs](self) say the runner is sure of. The transcript is
+/// `claude/projects/<id>/<id>.jsonl` there, since the runner names the
+/// project directory after the session.
 pub(crate) fn restored_total(session_dir: &Path, session: SessionId) -> Option<f64> {
     let id = session.to_string();
-    match open_transcript(session_dir, &id) {
-        Ok(file) => last_cost_state(&file, &id, MAX_SCAN_BYTES, CHUNK_BYTES),
+    let file = match open_transcript(session_dir, &id) {
+        Ok(file) => file,
         Err(err) => {
             tracing::warn!(%session, error = %err, "couldn't open the transcript to read its restored cost");
-            None
+            return None;
         }
-    }
+    };
+    let mut bytes = Vec::new();
+    file.take(CLI_INDEX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    last_cost_state(&bytes, &id)
 }
 
 /// Opens the transcript without following a symlink anywhere below
@@ -98,46 +111,116 @@ fn open_transcript(session_dir: &Path, id: &str) -> rustix::io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// The total of the last `cost-state` line in `file` the CLI restores for
-/// the session `id`, searching back from its end, `chunk` bytes at a time,
-/// at most `max_scan` bytes: 0 when the whole file has none, and `None`
-/// when it isn't known.
-fn last_cost_state(file: &File, id: &str, max_scan: u64, chunk: u64) -> Option<f64> {
-    let len = file.metadata().ok()?.len();
-    let mut end = len;
-    let mut line = Vec::new();
-    while end > 0 {
-        if len - end >= max_scan {
-            return None;
-        }
-        let start = end.saturating_sub(chunk);
-        let mut bytes = vec![0; usize::try_from(end - start).ok()?];
-        file.read_exact_at(&mut bytes, start).ok()?;
-        let mut pieces = bytes.rsplit(|b| *b == b'\n');
-        let mut piece = pieces.next()?;
-        for earlier in pieces {
-            line = joined(piece, &line)?;
-            if let Some(total) = cost_state(&line, id)? {
-                return Some(total);
-            }
-            line.clear();
-            piece = earlier;
-        }
-        line = joined(piece, &line)?;
-        end = start;
-    }
-    Some(cost_state(&line, id)?.unwrap_or(0.0))
-}
-
-/// `piece` followed by `after`, the rest of its line, or `None` once the
-/// line is longer than [`MAX_COST_LINE_BYTES`].
-fn joined(piece: &[u8], after: &[u8]) -> Option<Vec<u8>> {
-    if piece.len() + after.len() > MAX_COST_LINE_BYTES {
+/// The total the CLI restores from `transcript`, the session `id`'s, as
+/// the [module docs](self) give it: the last `cost-state` line's, 0
+/// without one, and `None` unless the runner is sure.
+fn last_cost_state(transcript: &[u8], id: &str) -> Option<f64> {
+    let fits = u64::try_from(transcript.len()).is_ok_and(|len| len <= CLI_INDEX_BYTES);
+    if !fits || transcript.last().is_some_and(|last| *last != b'\n') {
         return None;
     }
-    let mut line = piece.to_vec();
-    line.extend_from_slice(after);
-    Some(line)
+    let mut total = 0.0;
+    for line in transcript.split(|b| *b == b'\n') {
+        if let Some(line_total) = line_total(line, id)? {
+            total = line_total;
+        }
+    }
+    Some(total)
+}
+
+/// What one line says: `Some(Some(total))` for a `cost-state` line the CLI
+/// restores, `Some(None)` for a blank line or one of another type the
+/// [module docs](self) allow, and `None` for any other.
+fn line_total(line: &[u8], id: &str) -> Option<Option<f64>> {
+    if line.trim_ascii().is_empty() {
+        return Some(None);
+    }
+    let Strict(Value::Object(entry)) = serde_json::from_slice(line).ok()? else {
+        return None;
+    };
+    match entry.get("sessionId") {
+        Some(session) if session.as_str() != Some(id) => return None,
+        None if entry.contains_key("uuid") || entry.contains_key("parentUuid") => return None,
+        _ => {}
+    }
+    match entry.get("type") {
+        None => Some(None),
+        Some(Value::String(kind)) if kind == "cost-state" => cost_state(line, &entry, id).map(Some),
+        Some(Value::String(kind))
+            if MESSAGE_TYPES.contains(&kind.as_str()) && !entry.contains_key("sessionId") =>
+        {
+            None
+        }
+        Some(Value::String(_)) => Some(None),
+        Some(_) => None,
+    }
+}
+
+/// A JSON value in which no object has a key written twice. `JSON.parse`
+/// keeps a repeated key's last value where a line's first bytes can say
+/// otherwise, so such a line is one the runner can't be sure of.
+struct Strict(Value);
+
+impl<'de> Deserialize<'de> for Strict {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictVisitor).map(Strict)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("JSON with no key written twice")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(Strict(value)) = seq.next_element()? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = Map::new();
+        while let Some((key, Strict(value))) = map.next_entry::<String, Strict>()? {
+            if object.insert(key, value).is_some() {
+                return Err(A::Error::custom("a key written twice"));
+            }
+        }
+        Ok(Value::Object(object))
+    }
 }
 
 /// The keys of a `cost-state` line, as Claude Code 2.1.285 writes one.
@@ -194,37 +277,16 @@ const MODEL_USAGE_SUMS: [&str; 4] = [
 /// `totalCostUSD`, which is at most [`MAX_PROCESS_TOTAL_USD`].
 const CLI_MAX_AMOUNT: f64 = 1e15;
 
-/// What one line says: `Some(Some(total))` for a `cost-state` line the CLI
-/// restores for `session`, `Some(None)` for a blank line or an object
-/// whose `type` is another string or missing, which the CLI never takes
-/// for one, and `None` for anything else.
-///
-/// The CLI parses each line with `JSON.parse`, so a key written twice
-/// holds its last value, as in the [`Map`] here, and it restores a line
-/// only if its `type` is `cost-state`, its `sessionId` is the session's
-/// and it passes the CLI's schema, skipping it otherwise. The runner takes
-/// a line only where it is sure the CLI does: every key one the CLI
-/// writes, every amount a finite number from 0 to half the CLI's bound
-/// (so the two parsers' rounding can't disagree across it), model names
-/// printable ASCII. Every other line whose `type` is `cost-state`, or
-/// isn't a string, and every line that isn't a JSON object, is unknown.
-fn cost_state(line: &[u8], session: &str) -> Option<Option<f64>> {
-    if line.trim_ascii().is_empty() {
-        return Some(None);
-    }
-    let entry: Map<String, Value> = serde_json::from_slice(line).ok()?;
-    match entry.get("type") {
-        None => Some(None),
-        Some(Value::String(kind)) if kind != "cost-state" => Some(None),
-        Some(Value::String(_)) => restored(&entry, session).map(Some),
-        Some(_) => None,
-    }
-}
-
-/// The total of `entry`, a `cost-state` line, if the CLI restores it for
-/// `session`; see [`cost_state`].
-fn restored(entry: &Map<String, Value>, session: &str) -> Option<f64> {
-    if entry.get("sessionId")?.as_str()? != session
+/// The total of `entry`, the parsed `line`, a `cost-state` line of the
+/// session `id`, if the runner is sure the CLI restores it: it starts with
+/// the bytes the CLI writes, `{"type":"cost-state","sessionId":"<id>",`,
+/// holds only the keys the CLI writes, and every amount is a finite
+/// number from 0 to half the CLI's bound (so the two parsers' rounding
+/// can't fall on different sides of it), with model names printable ASCII
+/// and the token sums in bounds, as its zod schema requires.
+fn cost_state(line: &[u8], entry: &Map<String, Value>, id: &str) -> Option<f64> {
+    let prefix = format!(r#"{{"type":"cost-state","sessionId":"{id}","#);
+    if !line.starts_with(prefix.as_bytes())
         || !entry
             .keys()
             .all(|key| COST_STATE_KEYS.contains(&key.as_str()))
@@ -242,7 +304,7 @@ fn restored(entry: &Map<String, Value>, session: &str) -> Option<f64> {
 }
 
 /// `Some(())` if `models`, a `cost-state` line's `modelUsage`, passes the
-/// CLI's schema as [`cost_state`] requires.
+/// CLI's schema as [`cost_state`] requires it to.
 fn model_usage(models: &Map<String, Value>) -> Option<()> {
     let mut sums = [0.0; MODEL_USAGE_SUMS.len()];
     for (name, usage) in models {
@@ -281,9 +343,15 @@ fn amount(value: Option<&Value>, max: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
     use super::*;
+
+    const ID: &str = "3b0f5c2e-8d41-4a6b-9c1e-2f7a5d9e0b13";
+    const OTHER: &str = "99999999-9999-4999-8999-999999999999";
+    const U1: &str = "11111111-1111-4111-8111-111111111111";
+    const A1: &str = "22222222-2222-4222-8222-222222222222";
 
     struct Dir(PathBuf);
 
@@ -308,16 +376,14 @@ mod tests {
         }
     }
 
-    const ID: &str = "3b0f5c2e-8d41-4a6b-9c1e-2f7a5d9e0b13";
-
     fn session() -> SessionId {
         ID.parse().unwrap()
     }
 
-    fn cost_value(total: f64) -> Value {
-        serde_json::json!({
+    fn cost_value(total: f64, session: &str) -> Map<String, Value> {
+        let Value::Object(line) = serde_json::json!({
             "type": "cost-state",
-            "sessionId": ID,
+            "sessionId": session,
             "totalCostUSD": total,
             "totalAPIDuration": 5_120,
             "totalAPIDurationWithoutRetries": 5_004,
@@ -338,17 +404,38 @@ mod tests {
                 },
             },
             "hasUnknownModelCost": false,
-        })
+        }) else {
+            unreachable!()
+        };
+        line
+    }
+
+    /// `line` as the CLI writes it: `type` first, then `sessionId`, then
+    /// the rest, compact.
+    fn written(mut line: Map<String, Value>) -> String {
+        match (line.remove("type"), line.remove("sessionId")) {
+            (Some(kind), Some(session)) => {
+                let rest = Value::Object(line).to_string();
+                let rest = &rest[1..rest.len() - 1];
+                let comma = if rest.is_empty() { "" } else { "," };
+                format!(r#"{{"type":{kind},"sessionId":{session}{comma}{rest}}}"#)
+            }
+            (kind, session) => {
+                line.extend(kind.map(|kind| ("type".to_owned(), kind)));
+                line.extend(session.map(|session| ("sessionId".to_owned(), session)));
+                Value::Object(line).to_string()
+            }
+        }
     }
 
     fn cost_line(total: f64) -> String {
-        cost_value(total).to_string()
+        written(cost_value(total, ID))
     }
 
     fn changed(change: impl FnOnce(&mut Map<String, Value>)) -> String {
-        let mut line = cost_value(9.0);
-        change(line.as_object_mut().unwrap());
-        line.to_string()
+        let mut line = cost_value(9.0, ID);
+        change(&mut line);
+        written(line)
     }
 
     fn model(line: &mut Map<String, Value>) -> &mut Map<String, Value> {
@@ -357,10 +444,63 @@ mod tests {
             .unwrap()
     }
 
-    fn message(len: usize) -> String {
+    fn user(uuid: &str, parent: Option<&str>, session: &str, at: &str) -> String {
+        serde_json::json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/volume/work",
+            "sessionId": session,
+            "version": "2.1.285",
+            "type": "user",
+            "message": {"role": "user", "content": "hello"},
+            "uuid": uuid,
+            "timestamp": at,
+        })
+        .to_string()
+    }
+
+    fn assistant(uuid: &str, parent: &str, session: &str) -> String {
+        serde_json::json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "userType": "external",
+            "cwd": "/volume/work",
+            "sessionId": session,
+            "version": "2.1.285",
+            "type": "assistant",
+            "message": {
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-opus-4-5-20251101",
+                "content": [{"type": "text", "text": "hi there"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+            "requestId": "req_1",
+            "uuid": uuid,
+            "timestamp": "2026-09-30T10:00:01.000Z",
+        })
+        .to_string()
+    }
+
+    /// A user message and its reply in the session `session`.
+    fn exchange(session: &str) -> Vec<String> {
+        vec![
+            user(U1, None, session, "2026-09-30T10:00:00.000Z"),
+            assistant(A1, U1, session),
+        ]
+    }
+
+    /// A line of `len` bytes, or the shortest there is, of padding the CLI
+    /// keeps but never reads a cost from.
+    fn note(len: usize) -> String {
+        let empty = r#"{"type":"x-note","pad":""}"#;
         format!(
-            r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
-            "x".repeat(len)
+            r#"{{"type":"x-note","pad":"{}"}}"#,
+            "p".repeat(len.saturating_sub(empty.len()))
         )
     }
 
@@ -371,8 +511,30 @@ mod tests {
         }
     }
 
-    fn scan(path: &Path, max_scan: u64, chunk: u64) -> Option<f64> {
-        last_cost_state(&File::open(path).unwrap(), ID, max_scan, chunk)
+    fn restored(lines: &[String]) -> Option<f64> {
+        let dir = Dir::new();
+        write(&dir.transcript(session()), lines);
+        restored_total(&dir.0, session())
+    }
+
+    /// `lines` padded with [`note`]s after the first, so the file is `len`
+    /// bytes long.
+    fn padded_to(len: u64, mut lines: Vec<String>) -> Vec<String> {
+        let mut left = len - lines.iter().map(|line| line.len() as u64 + 1).sum::<u64>();
+        let mut pad = Vec::new();
+        while left > 0 {
+            let piece = match left {
+                0..=60_000 => left,
+                60_001..60_100 => 30_000,
+                _ => 60_000,
+            };
+            let line = note(usize::try_from(piece - 1).unwrap());
+            assert_eq!(line.len() as u64 + 1, piece);
+            left -= piece;
+            pad.push(line);
+        }
+        lines.splice(1..1, pad);
+        lines
     }
 
     #[test]
@@ -387,7 +549,7 @@ mod tests {
             None,
             "the CLI refuses to resume without a transcript"
         );
-        write(&path, &[message(10), message(20)]);
+        write(&path, &exchange(ID));
         assert_eq!(restored_total(&dir.0, session), Some(0.0));
         std::fs::write(&path, b"").unwrap();
         assert_eq!(restored_total(&dir.0, session), Some(0.0));
@@ -396,21 +558,24 @@ mod tests {
     }
 
     #[test]
-    fn the_last_cost_line_wins_even_with_messages_after_it() {
+    fn the_last_cost_line_wins_even_with_other_lines_after_it() {
         let dir = Dir::new();
         let session = session();
         let path = dir.transcript(session);
-        write(
-            &path,
-            &[
-                message(5),
-                cost_line(0.25),
-                message(5),
-                cost_line(0.75),
-                message(5),
-                message(5),
-            ],
-        );
+        let mut lines = exchange(ID);
+        lines.extend([
+            cost_line(0.25),
+            note(40),
+            cost_line(0.75),
+            note(5),
+            user(
+                "33333333-3333-4333-8333-333333333333",
+                Some(A1),
+                ID,
+                "2026-09-30T10:05:00.000Z",
+            ),
+        ]);
+        write(&path, &lines);
         assert_eq!(restored_total(&dir.0, session), Some(0.75));
         std::fs::OpenOptions::new()
             .append(true)
@@ -420,107 +585,74 @@ mod tests {
             .unwrap();
         assert_eq!(
             restored_total(&dir.0, session),
-            Some(1.5),
-            "a last line without its newline counts"
-        );
-    }
-
-    #[test]
-    fn lines_are_found_across_chunks() {
-        let dir = Dir::new();
-        let path = dir.transcript(session());
-        let lines = [message(3), cost_line(0.5), message(40), message(1)];
-        write(&path, &lines);
-        for chunk in 1..=40 {
-            assert_eq!(scan(&path, u64::MAX, chunk), Some(0.5), "chunk {chunk}");
-        }
-        write(&path, &[cost_line(0.5)]);
-        for chunk in [1, 7, 1_000] {
-            assert_eq!(scan(&path, u64::MAX, chunk), Some(0.5));
-        }
-    }
-
-    #[test]
-    fn a_cost_line_too_far_from_the_end_is_unknown() {
-        let dir = Dir::new();
-        let path = dir.transcript(session());
-        write(&path, &[cost_line(0.5), message(200)]);
-        assert_eq!(scan(&path, 100, 16), None);
-        assert_eq!(scan(&path, 10_000, 16), Some(0.5));
-        write(&path, &[message(200)]);
-        assert_eq!(
-            scan(&path, 100, 16),
             None,
-            "an unread start could still hold one"
+            "the CLI ends every line it writes, so a last line without its newline is unknown"
         );
     }
 
     #[test]
-    fn lines_of_other_types_are_passed_over_and_an_escaped_type_is_read() {
-        let dir = Dir::new();
-        let session = session();
-        let path = dir.transcript(session);
-        write(
-            &path,
-            &[
-                cost_line(0.125),
-                r#"{"type":"user","text":"cost-state","totalCostUSD":3}"#.to_owned(),
-                r#"{"no":"type","totalCostUSD":3}"#.to_owned(),
-                changed(|line| {
-                    line.remove("type");
-                }),
-                String::new(),
-                "  ".to_owned(),
-                message(MAX_COST_LINE_BYTES - 64),
-            ],
-        );
-        assert_eq!(restored_total(&dir.0, session), Some(0.125));
-        assert_eq!(scan(&path, u64::MAX, 1_000), Some(0.125));
-        write(
-            &path,
-            &[
-                cost_line(0.125),
-                cost_line(2.5).replace(r#""cost-state""#, r#""cost\u002dstate""#),
-            ],
+    fn a_transcript_past_the_clis_index_threshold_is_unknown() {
+        let mut lines = exchange(ID);
+        lines.push(cost_line(0.5));
+        assert_eq!(
+            restored(&padded_to(CLI_INDEX_BYTES, lines.clone())),
+            Some(0.5)
         );
         assert_eq!(
-            restored_total(&dir.0, session),
-            Some(2.5),
-            "the CLI parses the escape, so the runner does too"
+            restored(&padded_to(CLI_INDEX_BYTES + 1, lines)),
+            None,
+            "past 5 MiB the CLI files lines by their first bytes before it parses them"
         );
     }
 
     #[test]
-    fn a_key_written_twice_holds_its_last_value_as_in_json_parse() {
-        let dir = Dir::new();
-        let session = session();
-        let path = dir.transcript(session);
+    fn lines_of_other_types_are_passed_over() {
+        let mut lines = exchange(ID);
+        lines.extend([
+            cost_line(0.125),
+            r#"{"type":"summary","summary":"cost-state","leafUuid":"22222222-2222-4222-8222-222222222222"}"#
+                .to_owned(),
+            r#"{"type":"file-history-snapshot","totalCostUSD":3}"#.to_owned(),
+            r#"{"no":"type","totalCostUSD":3}"#.to_owned(),
+            format!(r#"{{"type":"last-prompt","sessionId":"{ID}","lastPrompt":"x"}}"#),
+            String::new(),
+            "  ".to_owned(),
+            note(200_000),
+        ]);
+        assert_eq!(restored(&lines), Some(0.125));
+    }
+
+    #[test]
+    fn a_key_written_twice_anywhere_is_unknown() {
         let first = |key: &str| cost_line(3.0).replacen('{', &format!("{{{key},"), 1);
         let last = |key: &str| {
             let line = cost_line(3.0);
             format!("{},{key}}}", &line[..line.len() - 1])
         };
-        let read: Vec<_> = [
+        let twice = [
             first(r#""type":"user""#),
             last(r#""type":"user""#),
-            first(r#""totalCostUSD":"three""#),
             last(r#""totalCostUSD":0.5"#),
-            last(r#""totalCostUSD":"three""#),
-        ]
-        .into_iter()
-        .map(|last| {
-            write(&path, &[cost_line(0.125), last]);
-            restored_total(&dir.0, session)
-        })
-        .collect();
-        assert_eq!(read, [Some(3.0), Some(0.125), Some(3.0), Some(0.5), None]);
+            cost_line(3.0).replacen(
+                r#""inputTokens":10"#,
+                r#""inputTokens":10,"inputTokens":11"#,
+                1,
+            ),
+            user(U1, None, ID, "2026-09-30T10:05:00.000Z").replacen(
+                '{',
+                &format!(r#"{{"sessionId":"{OTHER}","#),
+                1,
+            ),
+        ];
+        for line in twice {
+            let mut lines = exchange(ID);
+            lines.extend([cost_line(0.125), line.clone()]);
+            assert_eq!(restored(&lines), None, "{line}");
+        }
     }
 
     #[test]
     fn only_a_line_the_cli_surely_restores_is_taken() {
-        let dir = Dir::new();
-        let session = session();
-        let path = dir.transcript(session);
         for (last, total) in [
             (cost_line(0.0), 0.0),
             (
@@ -543,23 +675,24 @@ mod tests {
                 }),
                 9.0,
             ),
+            (
+                changed(|line| {
+                    let usage = line["modelUsage"]["claude-opus-4-5-20251101"].clone();
+                    line["modelUsage"]["y".repeat(70 * 1024)] = usage;
+                }),
+                9.0,
+            ),
         ] {
-            write(&path, &[cost_line(0.125), last.clone(), message(5)]);
-            assert_eq!(restored_total(&dir.0, session), Some(total), "{last}");
+            let mut lines = exchange(ID);
+            lines.extend([cost_line(0.125), last.clone(), note(5)]);
+            assert_eq!(restored(&lines), Some(total), "{last}");
         }
     }
 
     #[test]
-    fn a_last_cost_line_the_runner_cant_take_makes_the_total_unknown() {
-        let dir = Dir::new();
-        let session = session();
-        let path = dir.transcript(session);
-        let oversized = changed(|line| {
-            let usage = line["modelUsage"]["claude-opus-4-5-20251101"].clone();
-            line["modelUsage"]["y".repeat(70 * 1024)] = usage;
-        });
+    fn a_cost_line_the_runner_cant_take_makes_the_total_unknown() {
+        let cost = cost_line(9.0);
         let unsure = [
-            oversized,
             changed(|line| line["totalCostUSD"] = (-1).into()),
             changed(|line| line["totalCostUSD"] = 1e17.into()),
             changed(|line| line["totalCostUSD"] = 6e8.into()),
@@ -571,7 +704,6 @@ mod tests {
             changed(|line| {
                 line.remove("sessionId");
             }),
-            changed(|line| line["sessionId"] = uuid::Uuid::new_v4().to_string().into()),
             changed(|line| line["sessionId"] = ID.to_uppercase().into()),
             changed(|line| {
                 line.remove("startTime");
@@ -617,15 +749,22 @@ mod tests {
             changed(|line| line["type"] = serde_json::json!(["cost-state"])),
             changed(|line| line["type"] = Value::Null),
             changed(|line| line["type"] = 1.into()),
+            Value::Object(cost_value(9.0, ID)).to_string(),
+            cost.replacen(r#""type":"cost-state""#, r#""type": "cost-state""#, 1),
+            cost.replacen(r#""cost-state""#, r#""cost\u002dstate""#, 1),
+            format!(r#"{{"type":"artifact-autoreact-ledger",{}"#, &cost[1..]),
+            format!(r#"{{"type":"attribution-snapshot",{}"#, &cost[1..]),
+            format!(" {cost}"),
+            format!("\0{cost}"),
         ];
         for last in unsure {
-            write(&path, &[cost_line(0.125), last.clone(), message(5)]);
-            assert_eq!(restored_total(&dir.0, session), None, "{last}");
+            let mut lines = exchange(ID);
+            lines.extend([cost_line(0.125), last.clone(), note(5)]);
+            assert_eq!(restored(&lines), None, "{last}");
         }
 
         for last in [
             "cost-state, not JSON",
-            "\0{}",
             "[1]",
             r#"["cost-state", 0]"#,
             r#"[{"type":"cost-state","totalCostUSD":0}]"#,
@@ -634,15 +773,48 @@ mod tests {
             "true",
             "null",
         ] {
-            write(&path, &[cost_line(0.125), last.to_owned(), message(5)]);
-            assert_eq!(restored_total(&dir.0, session), None, "{last}");
+            let mut lines = exchange(ID);
+            lines.extend([cost_line(0.125), last.to_owned(), note(5)]);
+            assert_eq!(restored(&lines), None, "{last}");
         }
-        write(&path, &[cost_line(0.125), message(MAX_COST_LINE_BYTES)]);
-        assert_eq!(
-            restored_total(&dir.0, session),
-            None,
-            "any line too long to read could be the CLI's"
+    }
+
+    #[test]
+    fn a_line_of_another_session_or_a_message_without_one_is_unknown() {
+        let leaf = user(
+            "33333333-3333-4333-8333-333333333333",
+            Some(A1),
+            OTHER,
+            "2099-01-01T00:00:00.000Z",
         );
+        let mut leaf2 = exchange(ID);
+        leaf2.extend([written(cost_value(7.0, OTHER)), leaf, cost_line(5.0)]);
+        let mut leaf3 = exchange(OTHER);
+        leaf3.extend([written(cost_value(7.0, OTHER)), cost_line(5.0)]);
+        let mut unsessioned = exchange(ID);
+        unsessioned.extend([
+            cost_line(5.0),
+            r#"{"parentUuid":"22222222-2222-4222-8222-222222222222","type":"user","message":{"role":"user","content":"x"},"uuid":"44444444-4444-4444-8444-444444444444"}"#.to_owned(),
+        ]);
+        let mut untyped = exchange(ID);
+        untyped.extend([
+            cost_line(5.0),
+            r#"{"uuid":"44444444-4444-4444-8444-444444444444","parentUuid":null}"#.to_owned(),
+        ]);
+        let mut numbered = exchange(ID);
+        numbered.extend([
+            cost_line(5.0),
+            r#"{"type":"queue-operation","sessionId":7}"#.to_owned(),
+        ]);
+        for (case, lines) in [
+            ("leaf2", leaf2),
+            ("leaf3", leaf3),
+            ("unsessioned", unsessioned),
+            ("untyped", untyped),
+            ("numbered", numbered),
+        ] {
+            assert_eq!(restored(&lines), None, "{case}");
+        }
     }
 
     #[test]
@@ -669,6 +841,218 @@ mod tests {
             restored_total(&dir.0, session),
             None,
             "a directory isn't a transcript"
+        );
+    }
+
+    /// The transcripts the Docker test gives the pinned CLI and the runner:
+    /// what a session's CLI writes, and what an agent could append to make
+    /// the two read different totals.
+    fn cli_cases() -> Vec<(&'static str, Vec<String>)> {
+        let with = |mut lines: Vec<String>, more: Vec<String>| {
+            lines.extend(more);
+            lines
+        };
+        let cost = cost_line(0.25);
+        let ledger = format!(r#"{{"type":"artifact-autoreact-ledger",{}"#, &cost[1..]);
+        let attribution = format!(r#"{{"type":"attribution-snapshot",{}"#, &cost[1..]);
+        let leaf = user(
+            "33333333-3333-4333-8333-333333333333",
+            Some(A1),
+            OTHER,
+            "2099-01-01T00:00:00.000Z",
+        );
+        let big = |line: String| {
+            padded_to(
+                CLI_INDEX_BYTES + 200_000,
+                with(exchange(ID), vec![cost_line(5.0), line]),
+            )
+        };
+        let last = cost_line(5.0);
+        vec![
+            ("no cost", exchange(ID)),
+            ("baseline", with(exchange(ID), vec![cost_line(5.0)])),
+            (
+                "two costs",
+                with(
+                    exchange(ID),
+                    vec![cost_line(2.0), note(100), cost_line(5.0)],
+                ),
+            ),
+            (
+                "just under the threshold",
+                padded_to(CLI_INDEX_BYTES, with(exchange(ID), vec![cost_line(5.0)])),
+            ),
+            (
+                "ledger",
+                with(exchange(ID), vec![cost_line(5.0), ledger.clone()]),
+            ),
+            ("ledger_big", big(ledger)),
+            ("attr_big", big(attribution)),
+            (
+                "leaf2",
+                with(
+                    exchange(ID),
+                    vec![written(cost_value(7.0, OTHER)), leaf, cost_line(5.0)],
+                ),
+            ),
+            (
+                "leaf3",
+                with(
+                    exchange(OTHER),
+                    vec![written(cost_value(7.0, OTHER)), cost_line(5.0)],
+                ),
+            ),
+            (
+                "duplicates",
+                with(
+                    exchange(ID),
+                    vec![
+                        cost_line(5.0),
+                        format!(r#"{},"totalCostUSD":0.5}}"#, &last[..last.len() - 1]),
+                    ],
+                ),
+            ),
+        ]
+    }
+
+    /// A stub of the Messages API that refuses every request with a 400, so
+    /// a resumed CLI ends its turn at once, its result's total the one it
+    /// restored.
+    fn refusing_api() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || refuse(stream));
+            }
+        });
+        port
+    }
+
+    fn refuse(mut stream: std::net::TcpStream) {
+        let mut head = Vec::new();
+        let mut byte = [0; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).unwrap_or(0) == 0 {
+                return;
+            }
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|len| len.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body = vec![0; length];
+        let _ = stream.read_exact(&mut body);
+        let error =
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"refused"}}"#;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}",
+            error.len()
+        );
+    }
+
+    fn open_to_all(path: &Path) {
+        let mode = if path.is_dir() { 0o777 } else { 0o666 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                open_to_all(&entry.unwrap().path());
+            }
+        }
+    }
+
+    /// The total the pinned CLI in `image` restores when it resumes the
+    /// session in `dir`, laid out as the runner lays it out, against the
+    /// API stub on `port`.
+    fn cli_restored(image: &str, dir: &Path, port: u16) -> Option<f64> {
+        for sub in ["home", "work"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        open_to_all(dir);
+        let output = std::process::Command::new("timeout")
+            .arg("180")
+            .args(["docker", "run", "--rm", "--network", "host", "-i"])
+            .arg("-v")
+            .arg(format!("{}:/volume/s", dir.display()))
+            .args(["-w", "/volume/s/work"])
+            .args(["-e", "HOME=/volume/s/home"])
+            .args(["-e", "CLAUDE_CONFIG_DIR=/volume/s/claude"])
+            .args(["-e", &format!("CLAUDE_CODE_PROJECT_DIR_NAME={ID}")])
+            .args(["-e", "ANTHROPIC_API_KEY=sk-ant-api03-placeholder"])
+            .args(["-e", &format!("ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")])
+            .args(["-e", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"])
+            .args(["-e", "DISABLE_AUTOUPDATER=1"])
+            .arg(image)
+            .args([
+                "claude",
+                "-p",
+                "hi",
+                "--output-format",
+                "json",
+                "--resume",
+                ID,
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let result: Value = stdout
+            .lines()
+            .rev()
+            .find_map(|line| serde_json::from_str(line).ok())
+            .unwrap_or(Value::Null);
+        let total = result["total_cost_usd"].as_f64();
+        if total.is_none() {
+            eprintln!(
+                "the CLI gave no total: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        total
+    }
+
+    #[test]
+    #[ignore = "needs docker and the sandbox image"]
+    fn docker_the_pinned_cli_restores_whatever_total_the_runner_reads() {
+        let image = std::env::var("AGENT_CORE_SANDBOX_IMAGE")
+            .unwrap_or_else(|_| "agent-core/sandbox:dev".to_owned());
+        let port = refusing_api();
+        let mut read = Vec::new();
+        for (case, lines) in cli_cases() {
+            let dir = Dir::new();
+            write(&dir.transcript(session()), &lines);
+            let runner = restored_total(&dir.0, session());
+            let cli = cli_restored(&image, &dir.0, port);
+            eprintln!("{case}: the runner reads {runner:?}, the CLI restored {cli:?}");
+            read.push((case, runner, cli));
+        }
+        for (case, runner, cli) in &read {
+            if let Some(total) = runner {
+                assert_eq!(
+                    cli.map(|cli| (cli - total).abs() < 1e-9),
+                    Some(true),
+                    "{case}: the runner reads {total}, the CLI restored {cli:?}"
+                );
+            }
+        }
+        let taken: Vec<_> = read
+            .iter()
+            .filter(|(_, runner, _)| runner.is_some())
+            .map(|(case, _, _)| *case)
+            .collect();
+        assert_eq!(
+            taken,
+            [
+                "no cost",
+                "baseline",
+                "two costs",
+                "just under the threshold"
+            ],
+            "the runner reads the CLI's own transcripts, and nothing an agent appended"
         );
     }
 }
