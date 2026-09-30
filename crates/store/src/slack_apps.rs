@@ -64,6 +64,8 @@ pub struct SlackAppKeys {
     pub signing_secret: Option<SecretString>,
     /// The app's bot user, once the app is installed.
     pub bot_user: Option<UserId>,
+    /// The owner of the binding's agent.
+    pub owner: MemberId,
 }
 
 /// A Slack binding and its app, without secrets, from
@@ -134,9 +136,9 @@ macro_rules! reminder_due {
 }
 
 impl Store {
-    /// The signing secret and bot user of the Slack binding `binding` in
-    /// `team`, while it is `creating`, `pending_install` or `active`: the
-    /// bindings whose requests the ingress answers. `None` for any other
+    /// The signing secret, bot user and agent's owner of the Slack binding
+    /// `binding` in `team`, while it is `creating`, `pending_install` or
+    /// `active`: the bindings whose requests the ingress answers. `None` for any other
     /// binding, one in another workspace, or one that is disabled.
     ///
     /// # Errors
@@ -149,21 +151,23 @@ impl Store {
         team: &TeamId,
     ) -> Result<Option<SlackAppKeys>> {
         let key = binding.to_string();
-        let row: Option<(Option<Vec<u8>>, Option<String>)> = sqlx::query_as(
-            "SELECT signing_secret_enc, bot_user_id FROM agent_bindings \
-             WHERE id = ? AND surface = 'slack' AND team_id = ? \
-             AND state IN ('creating', 'pending_install', 'active')",
+        let row: Option<(Option<Vec<u8>>, Option<String>, String)> = sqlx::query_as(
+            "SELECT b.signing_secret_enc, b.bot_user_id, a.owner_id \
+             FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
+             WHERE b.id = ? AND b.surface = 'slack' AND b.team_id = ? \
+             AND b.state IN ('creating', 'pending_install', 'active')",
         )
         .bind(&key)
         .bind(team.as_str())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|(secret, bot_user)| {
+        row.map(|(secret, bot_user, owner)| {
             Ok(SlackAppKeys {
                 signing_secret: secret
                     .map(|sealed| self.open_sealed(aad(SIGNING_SECRET, &key), &sealed))
                     .transpose()?,
                 bot_user: bot_user.map(UserId::from),
+                owner: parse_column(&owner, "agents", "owner_id")?,
             })
         })
         .transpose()

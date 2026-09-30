@@ -5384,6 +5384,15 @@ users on every lookup (`Store::active_bot_users`, which reads no token),
 which also picks up agents another instance installed; an install and a
 deletion do it too.
 
+Whichever binding's lookup or render starts it, `users.list` is read with
+the manager app's token (`SlackSurface::with_members_api`, which
+`SlackBots` gives every agent's surface), never the agent's. The read
+holds the directory's one refresh lock, and a failure sets the shared
+retry wait and, before the first list, the error every caller gets; an
+agent's owner holds its token and could revoke it or use up its Tier 2
+quota, and so keep the list stale, or missing, for every agent. The
+operators hold the manager's token.
+
 ### Owners can forge their agents' events
 
 **Issue.** An agent's app is created with its owner's configuration token,
@@ -5642,6 +5651,54 @@ above.
   lookups in one lane. Slack's 40,000-character limit allows about 3,000
   mention tokens, so a real message mentioning the bot after 100 others
   isn't addressed to it; Rocket.Chat's are capped the same way.
+- Places bound concurrency, not rate: a review signed 100 events with a
+  900 KB `event_id` each in 1.6 seconds, which grew the shared SQLite file
+  by 184 MB, kept for the seven days deduplication remembers a key, and
+  each took about 16 ms of the one queue worker the manager's requests
+  wait behind. Now the ids a key is made of must be shaped like Slack's,
+  or the body gets 400 before the ack and writes nothing: `event_id` is
+  `Ev` and 1 to 32 uppercase letters or digits, `team_id` `T` or `E` and
+  1 to 20, a `message` event's `channel` `C`, `D` or `G` and 1 to 20, and
+  its `ts` and `thread_ts` 10 digits, a dot and 6 digits. Every fixture,
+  taken from Slack's SDK test suites, fits, and so do the ids in Slack's
+  documentation. Only a message's `channel` is checked: other events'
+  `channel` can be an object, and isn't a key. The manager app's requests
+  are checked the same way, which costs it nothing. A signed slash command
+  or interaction is keyed by its signature, whose shape verification
+  already fixes.
+- Each agent's app also has a token bucket (`ingress::Places`, beside its
+  count): `AGENT_BURST` (100) requests at once, refilled at
+  `AGENT_REQUESTS_PER_SECOND` (8), about Slack's own ceiling of 30,000
+  events an hour for one app. Past it, 503, before the deduplication
+  write; a request refused for its places takes no token. The bucket is in
+  memory, since a restart only gives each app one more burst; the manager
+  app has none. So one app adds at most 8 rows a second of a few dozen
+  bytes each, and one owner at most that for each of their agents.
+- One owner's agents' apps together have `MAX_IN_FLIGHT_PER_OWNER` (64)
+  places, twice one app's, rather than 32 for each of up to
+  `agents.max_per_owner` agents: with its default of 10, one owner held
+  320 of the 1,024, and with 32 agents all of them. `slack_app_keys`
+  returns the binding's owner with its secret, joined from `agents`, for
+  the ingress to count by.
+- The queue holds each request's body as it arrived (`Bytes`, at most a
+  megabyte), not the parsed event: a `serde_json::Map` of a megabyte of
+  `[0,0,…]` took 16 to 32 MB, about 5 to 10 GB for one owner's 320 places
+  then. The handler still verifies the raw body, and parses only what it
+  checks (the envelope's type and ids, and a message's ids, skipping the
+  rest), then `Queue::run` parses the body again. Slash commands and
+  interactions are queued the same way.
+- The warnings a flood causes are logged at most once a minute for each
+  binding or agent, the next one saying how many went quiet
+  (`core_types::Throttle`, which the ingress's refusals moved to, now kept
+  per binding too, so one app's flood hides no other's refusals): the
+  pipeline's "too many messages waiting" and "too many notices being
+  posted", and the lanes' "couldn't look a bot sender up".
+- The pipeline reaps finished tasks when it spawns a notice, as it does
+  when it spawns a lane; a flood of notices on an otherwise quiet
+  pipeline kept every finished one until the next lane. A lane in
+  `slack::Messages` checks whether the pipeline has closed
+  (`Sink::is_closed`) before it looks the binding up or calls
+  `bots.info`.
 - The attribution wait (`ATTRIBUTION_WAIT`, 2 seconds) for a message
   claiming to be from another agent's bot and mentioning this one is taken
   on the event as it arrived, before confirming, so a forged event holds
@@ -5649,14 +5706,19 @@ above.
   so that stalls only their own agents.
 
 Several owners flooding together could still take what other agents need:
-four owners the pipeline's 64 places, 32 agents' apps the ingress's 1,024.
+four owners the pipeline's 64 places, 16 the ingress's 1,024. The queue
+worker is still one, so the manager's requests may wait behind up to 1,024
+of agents', each now one small store write.
 End-to-end tests hold each bound with a gate or a held Slack call, not a
 sleep: an agent's flood past its 32 places is refused while another
 agent's message is answered; another agent is answered while a
 `bots.info` of the first is held; one owner's three agents together leave
 another owner's agent its place; and a message whose "try again" line is
 held leaves its place to the next. Each of these failed before the
-change.
+change. So did the ingress tests that an id not shaped like Slack's
+(among them 900 KB ones) gets 400 with nothing recorded, and that an
+agent's burst past its bucket gets 503 while another agent's app and the
+manager's are answered.
 
 ### Bots don't join channels by posting
 

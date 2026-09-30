@@ -110,7 +110,6 @@ async fn fake_slack() -> MockServer {
         ("conversations.replies", json!({"messages": []})),
         ("conversations.history", json!({"messages": []})),
         ("conversations.info", public_channel()),
-        ("users.list", json!({"members": []})),
     ] {
         mount(&slack, name, AGENT_TOKEN, body).await;
     }
@@ -843,7 +842,6 @@ impl Turned {
                 ("conversations.replies", json!({"messages": []})),
                 ("conversations.history", json!({"messages": []})),
                 ("conversations.info", public_channel()),
-                ("users.list", json!({"members": []})),
             ] {
                 mount(&slack, name, agent.token, body).await;
             }
@@ -1204,6 +1202,17 @@ async fn a_channel_mention_of_an_agent_is_answered_with_its_bot_token() {
         turned.confirmations(AGENT_TOKEN).await.len(),
         1,
         "the owner's own message is read back too"
+    );
+    settle("the member list was never read", || async {
+        !turned
+            .requests("users.list", MANAGER_TOKEN)
+            .await
+            .is_empty()
+    })
+    .await;
+    assert!(
+        turned.requests("users.list", AGENT_TOKEN).await.is_empty(),
+        "the shared member list is read with the manager app's token only"
     );
     turned.stop().await;
 }
@@ -1821,6 +1830,10 @@ async fn a_held_bot_lookup_for_one_agent_holds_up_no_other_agent() {
             200
         );
     }
+    settle("helper's lane never reached its first lookup", || async {
+        !turned.requests("bots.info", AGENT_TOKEN).await.is_empty()
+    })
+    .await;
     turned.scout_answers().await;
     assert_eq!(
         turned.requests("bots.info", AGENT_TOKEN).await.len(),

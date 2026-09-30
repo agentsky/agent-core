@@ -68,6 +68,7 @@ pub const CAPS: Caps = Caps {
 #[derive(Clone)]
 pub struct SlackSurface {
     api: WebApi,
+    members_api: WebApi,
     directory: Arc<TeamDirectory>,
     bot_user: Option<UserId>,
 }
@@ -78,10 +79,21 @@ impl SlackSurface {
     /// the bindings of a workspace.
     pub fn new(api: WebApi, directory: Arc<TeamDirectory>) -> Self {
         Self {
+            members_api: api.clone(),
             api,
             directory,
             bot_user: None,
         }
+    }
+
+    /// Reads the workspace's member list, which every binding in it
+    /// shares, through `api` rather than the binding's own token. agentd
+    /// gives agents' surfaces the manager app's, which its operators hold:
+    /// an agent's owner holds the agent's token, and could revoke it or use
+    /// up its quota to keep the shared list stale for everyone.
+    pub fn with_members_api(mut self, api: WebApi) -> Self {
+        self.members_api = api;
+        self
     }
 
     /// Sets the binding's bot user, which [`Surface::confirm`] needs to
@@ -104,13 +116,14 @@ impl SlackSurface {
     }
 
     /// Reads the workspace's members again when the cache is older than its
-    /// TTL, and returns the snapshot [`render`](Surface::render) will use.
+    /// TTL, through the [members API](Self::with_members_api), and returns
+    /// the snapshot [`render`](Surface::render) will use.
     ///
     /// # Errors
     ///
     /// The `users.list` error, when there is no older list to fall back on.
     pub async fn refresh_members(&self) -> Result<Arc<MemberDirectory>> {
-        self.directory.refresh_members(&self.api).await
+        self.directory.refresh_members(&self.members_api).await
     }
 
     /// Starts a member refresh on the current Tokio runtime when the cache

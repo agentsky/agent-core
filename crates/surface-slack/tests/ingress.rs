@@ -9,10 +9,13 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
-use core_types::{BindingId, ConvKind, SendError, Sender, Sink, UserId};
+use core_types::{BindingId, ConvKind, MemberId, SendError, Sender, Sink, UserId};
 use futures::StreamExt as _;
 use secrecy::{ExposeSecret as _, SecretString};
-use surface_slack::ingress::{MAX_IN_FLIGHT_PER_AGENT, PRE_ACK_TIMEOUT};
+use surface_slack::ingress::{
+    AGENT_BURST, AGENT_REQUESTS_PER_SECOND, MAX_IN_FLIGHT_PER_AGENT, MAX_IN_FLIGHT_PER_OWNER,
+    PRE_ACK_TIMEOUT,
+};
 use surface_slack::{BindingRef, BoxError, Dedup, SigningSecrets, SlackApp, SlackInbound, ingress};
 use testkit::slack::{self as fixtures, BOT_USER, CHALLENGE, TEAM};
 use tokio::sync::{Notify, mpsc};
@@ -22,6 +25,8 @@ use tower::ServiceExt as _;
 const MANAGER_SECRET: &str = "manager-signing-secret";
 const AGENT_SECRET: &str = "agent-signing-secret";
 const OTHER_SECRET: &str = "other-agent-signing-secret";
+const THIRD_SECRET: &str = "third-agent-signing-secret";
+const FOURTH_SECRET: &str = "fourth-agent-signing-secret";
 
 #[derive(Default)]
 struct Secrets {
@@ -98,29 +103,64 @@ fn creating_agent() -> BindingId {
     "9a8b7c6d-5e4f-4a3b-9c2d-1e0f2a3b4c5d".parse().unwrap()
 }
 
+fn third_agent() -> BindingId {
+    "3c1d2e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f".parse().unwrap()
+}
+
+fn fourth_agent() -> BindingId {
+    "7e6d5c4b-3a29-4180-9f8e-7d6c5b4a3928".parse().unwrap()
+}
+
+fn owner(n: u128) -> MemberId {
+    MemberId::from_uuid(uuid::Uuid::from_u128(n))
+}
+
 fn app(secret: Option<&str>, bot_user: Option<&str>) -> SlackApp {
     SlackApp {
         signing_secret: secret.map(SecretString::from),
         bot_user: bot_user.map(UserId::from),
+        owner: None,
     }
 }
 
-fn secrets() -> Secrets {
+fn agent_app(secret: &str, bot_user: &str, owner: MemberId) -> SlackApp {
+    SlackApp {
+        owner: Some(owner),
+        ..app(Some(secret), Some(bot_user))
+    }
+}
+
+/// The manager app, and four agents' apps whose owners are `owners`, in
+/// order, besides one being created.
+fn secrets_owned_by(owners: [MemberId; 4]) -> Secrets {
+    let [first, second, third, fourth] = owners;
     Secrets {
         apps: HashMap::from([
             (BindingRef::Manager, app(Some(MANAGER_SECRET), None)),
             (
                 BindingRef::Agent(agent()),
-                app(Some(AGENT_SECRET), Some(BOT_USER)),
+                agent_app(AGENT_SECRET, BOT_USER, first),
             ),
             (
                 BindingRef::Agent(other_agent()),
-                app(Some(OTHER_SECRET), Some("U0BOT0002")),
+                agent_app(OTHER_SECRET, "U0BOT0002", second),
+            ),
+            (
+                BindingRef::Agent(third_agent()),
+                agent_app(THIRD_SECRET, "U0BOT0003", third),
+            ),
+            (
+                BindingRef::Agent(fourth_agent()),
+                agent_app(FOURTH_SECRET, "U0BOT0004", fourth),
             ),
             (BindingRef::Agent(creating_agent()), app(None, None)),
         ]),
         ..Secrets::default()
     }
+}
+
+fn secrets() -> Secrets {
+    secrets_owned_by([owner(1), owner(2), owner(3), owner(4)])
 }
 
 struct Harness {
@@ -136,7 +176,11 @@ impl Harness {
     }
 
     fn with(secrets: Secrets, dedup: MemoryDedup) -> Self {
-        let (router, queue) = ingress(Arc::new(secrets), 64);
+        Self::with_capacity(secrets, dedup, 64)
+    }
+
+    fn with_capacity(secrets: Secrets, dedup: MemoryDedup, capacity: usize) -> Self {
+        let (router, queue) = ingress(Arc::new(secrets), capacity);
         let (tx, out) = mpsc::unbounded_channel();
         let dedup = Arc::new(dedup);
         let worker = tokio::spawn(queue.run(dedup.clone(), Sender::new(Collect(tx))));
@@ -146,6 +190,11 @@ impl Harness {
             worker,
             dedup,
         }
+    }
+
+    /// How many keys are recorded, under any source.
+    fn recorded_anywhere(&self) -> usize {
+        self.dedup.seen.lock().unwrap().len()
     }
 
     /// The keys recorded under `source`.
@@ -1095,6 +1144,14 @@ async fn each_binding_has_its_own_places_in_flight() {
         assert_eq!(status, StatusCode::OK, "the other agent's message {n}");
     }
     let (status, _) = harness
+        .send(signed_events(third_agent(), THIRD_SECRET, &nth_dm(0)))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the agents' apps hold every place agents' apps may"
+    );
+    let (status, _) = harness
         .send(signed(
             &path(BindingRef::Manager, "commands"),
             MANAGER_SECRET,
@@ -1132,5 +1189,191 @@ async fn each_binding_has_its_own_places_in_flight() {
         harness.message().await.event_id,
         format!("Ev0HELD{MAX_IN_FLIGHT_PER_AGENT}"),
         "the refused message wasn't recorded as handled"
+    );
+}
+
+#[tokio::test]
+async fn one_owners_agents_share_their_places_in_flight() {
+    let ada = owner(1);
+    let secrets = secrets_owned_by([ada, ada, ada, owner(2)]);
+    let harness = Harness::with_capacity(secrets, MemoryDedup::default(), 1024);
+    let adas = [(agent(), AGENT_SECRET), (other_agent(), OTHER_SECRET)];
+    for (binding, secret) in adas {
+        for n in 0..MAX_IN_FLIGHT_PER_AGENT {
+            let (status, _) = harness
+                .send(signed_events(binding, secret, &nth_dm(n)))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{binding}'s message {n}");
+        }
+    }
+    assert_eq!(
+        MAX_IN_FLIGHT_PER_OWNER,
+        adas.len() * MAX_IN_FLIGHT_PER_AGENT
+    );
+    let (status, _) = harness
+        .send(signed_events(third_agent(), THIRD_SECRET, &nth_dm(0)))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ada's agents hold every place one owner's may"
+    );
+    let (status, _) = harness
+        .send(signed_events(fourth_agent(), FOURTH_SECRET, &nth_dm(0)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "another owner's agent has its own");
+}
+
+#[tokio::test]
+async fn an_agents_burst_past_its_rate_gets_503_and_other_apps_are_answered() {
+    let mut harness = Harness::start();
+    let started = Instant::now();
+    let limit = usize::try_from(AGENT_BURST).unwrap() * 2;
+    let mut taken = 0;
+    for n in 0..limit {
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, &nth_dm(n)))
+            .await;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        assert_eq!(status, StatusCode::OK, "message {n}");
+        assert_eq!(harness.message().await.event_id, format!("Ev0HELD{n}"));
+        taken += 1;
+    }
+    let refilled = started.elapsed().as_secs_f64() * f64::from(AGENT_REQUESTS_PER_SECOND);
+    assert!(taken < limit, "none of {limit} messages was refused");
+    assert!(
+        taken >= usize::try_from(AGENT_BURST).unwrap(),
+        "only {taken} were taken"
+    );
+    assert!(
+        (taken as f64) <= f64::from(AGENT_BURST) + refilled + 1.0,
+        "{taken} were taken"
+    );
+    assert_eq!(
+        harness
+            .recorded(&format!("slack:{}:message", agent()))
+            .len(),
+        taken,
+        "the refused message wasn't recorded"
+    );
+
+    let (status, _) = harness
+        .send(signed_events(other_agent(), OTHER_SECRET, &nth_dm(0)))
+        .await;
+    assert_eq!(status, StatusCode::OK, "another agent's app is answered");
+    let (status, _) = harness
+        .send(signed(
+            &path(BindingRef::Manager, "commands"),
+            MANAGER_SECRET,
+            fixtures::SLASH_COMMAND,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the manager app is answered");
+}
+
+/// A signed body that changes `fixture` with `edit`.
+fn edited(fixture: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    edit(&mut value);
+    value.to_string()
+}
+
+#[tokio::test]
+async fn ids_not_shaped_like_slacks_are_refused_and_nothing_is_written() {
+    let mut harness = Harness::start();
+    let huge = "A".repeat(900_000);
+    let mut bodies = Vec::new();
+    for event_id in [
+        format!("Ev{huge}"),
+        format!("Ev{}", "A".repeat(33)),
+        "Ev".to_owned(),
+        "Ev0lower".to_owned(),
+        "EV0UPPER".to_owned(),
+        "0EvFIRST".to_owned(),
+    ] {
+        bodies.push(fixtures::with_event_id(fixtures::MESSAGE_IM, &event_id));
+        bodies.push(fixtures::with_event_id(fixtures::USER_CHANGE, &event_id));
+    }
+    bodies.push(edited(fixtures::MESSAGE_IM, |body| {
+        body.as_object_mut().unwrap().remove("event_id");
+    }));
+    for channel in [
+        format!("D{huge}"),
+        format!("C{}", "A".repeat(21)),
+        "C".to_owned(),
+        "c0chan001".to_owned(),
+        "X0CHAN001".to_owned(),
+        "C0CHAN 01".to_owned(),
+    ] {
+        bodies.push(edited(fixtures::MESSAGE_IM, |body| {
+            body["event"]["channel"] = channel.into();
+        }));
+    }
+    for ts in [
+        format!("1727697900.{}", "0".repeat(900_000)),
+        "1727697900.0005001".to_owned(),
+        "172769790.000500".to_owned(),
+        "1727697900000500".to_owned(),
+        "1727697900.00050a".to_owned(),
+        "1.2".to_owned(),
+    ] {
+        for field in ["ts", "thread_ts"] {
+            bodies.push(edited(fixtures::MESSAGE_IM, |body| {
+                body["event"][field] = ts.clone().into();
+            }));
+        }
+    }
+    bodies.push(edited(fixtures::MESSAGE_IM, |body| {
+        body["event"]["channel"] = serde_json::json!({"id": "D0DM00001"});
+    }));
+    for team in [format!("T{huge}"), "t0team001".to_owned(), String::new()] {
+        bodies.push(edited(fixtures::MESSAGE_IM, |body| {
+            body["team_id"] = team.into();
+        }));
+    }
+    for body in &bodies {
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{:.200}", body);
+        let (status, _) = harness
+            .send(signed(
+                &path(BindingRef::Manager, "events"),
+                MANAGER_SECRET,
+                body,
+            ))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "manager: {:.200}", body);
+    }
+    harness.assert_nothing_delivered().await;
+    assert_eq!(
+        harness.recorded_anywhere(),
+        1,
+        "only the marker was recorded"
+    );
+
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_THREAD_REPLY,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "Slack's own shapes pass");
+    let (status, _) = harness
+        .send(signed(
+            &path(BindingRef::Manager, "events"),
+            MANAGER_SECRET,
+            &edited(fixtures::USER_CHANGE, |body| {
+                body["event"]["channel"] = serde_json::json!({"id": "not checked"});
+            }),
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "only a message's channel is a key, so only a message's is checked"
     );
 }

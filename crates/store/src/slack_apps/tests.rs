@@ -79,6 +79,7 @@ async fn a_binding_is_known_to_the_ingress_from_its_creation_to_its_deletion() {
         .unwrap();
     assert!(keys.signing_secret.is_none());
     assert!(keys.bot_user.is_none());
+    assert_eq!(keys.owner, ada);
     assert!(
         store
             .slack_app_keys(binding, &TeamId::new("T0OTHER"))

@@ -100,11 +100,7 @@ impl App {
         );
         let rocketchat = rocketchat_manager(&config, &store)?;
         let slack_agents = slack.as_ref().map(|slack| {
-            let bots = SlackBots::new(
-                store.clone(),
-                slack.client().clone(),
-                Arc::clone(slack.surface().directory()),
-            );
+            let bots = SlackBots::new(store.clone(), slack.client().clone(), slack.surface());
             SlackAgents::new(
                 store.clone(),
                 slack.clone(),

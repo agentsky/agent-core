@@ -15,7 +15,7 @@ use surface_slack::normalize::{self, Context};
 use surface_slack::surface::CAPS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const TOKEN: &str = "xoxb-surface-test";
@@ -142,6 +142,34 @@ async fn render_refreshes_a_stale_member_cache_in_the_background() {
         }
     }
     assert_eq!(rendered, [format!("<@{USER}>")]);
+}
+
+#[tokio::test]
+async fn the_member_list_is_read_with_the_members_api_token_only() {
+    let (server, agent) = setup().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let agent = agent.with_members_api(client.bot(SecretString::from("xoxb-manager")));
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .and(header("authorization", "Bearer xoxb-manager"))
+        .respond_with(ok(
+            json!({"members": [{"id": USER, "name": "ada", "profile": {"display_name": "Ada"}}]}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "token_revoked"})),
+        )
+        .mount(&server)
+        .await;
+    let members = agent.refresh_members().await.unwrap();
+    assert_eq!(members.lookup("ada"), Some(&UserId::from(USER)));
+    let seen = requests(&server).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].headers["authorization"], "Bearer xoxb-manager");
 }
 
 #[test]
