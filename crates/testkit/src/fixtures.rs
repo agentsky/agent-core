@@ -18,7 +18,8 @@ pub const UNREACHABLE: &str = include_str!("../fixtures/stream-json/unreachable.
 /// "ANTHROPIC_API_KEY"` in `init`.
 pub const AUTH_ERROR: &str = include_str!("../fixtures/stream-json/auth-error.jsonl");
 
-/// Two turns on one process against a local server that streams replies.
+/// Two turns on one process, with `CLAUDE_CODE_OAUTH_TOKEN`, against a
+/// local server that streams replies.
 /// The first turn calls `Bash` (`assistant` with a `tool_use`, then a
 /// `rate_limit_event` and a `user` line with the `tool_result`) before its
 /// text reply. Each turn starts with its own `system`/`init` line and ends

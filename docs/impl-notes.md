@@ -377,6 +377,83 @@ and then `--resume`. `fake-claude` follows what they showed:
 Absolute paths in the captures are rewritten to the sandbox layout
 (`/volume/sessions/<id>/work` and `…/claude`).
 
+### `rate_limit_event` comes once per process, and only with OAuth
+
+**Issue.** Review asked for `fake-claude` to print a `rate_limit_event`
+after every successful API call, so runner tests always meet a line they
+must skip. The capture in `tool-turns.jsonl` has one such line for three
+API calls, and the CLI's own schema describes the line as "emitted when rate
+limit info changes". Re-running Claude Code 2.1.285 against a local
+streaming server showed that with `CLAUDE_CODE_OAUTH_TOKEN` it prints one
+right after the first `assistant` line of each process, a `--resume`d
+process included, and with `ANTHROPIC_API_KEY` it prints none.
+
+**Solution.** `fake-claude` does the same: with the OAuth token, the first
+successful turn of each process prints `{"type":"rate_limit_event",
+"rate_limit_info":{"status":"allowed","isUsingOverage":false},…}` after its
+first `assistant` line. A test checks a tool turn and a reply against the
+capture's line sequence. For anything else a parser must skip, including
+lines that aren't JSON, a script turn lists raw `extra_lines`, printed after
+its commands and before its reply.
+
+### The real CLI's `anthropic-beta` header
+
+**Issue.** `fake-claude` sent `anthropic-beta: oauth-2025-04-20` with the
+OAuth token and nothing with an API key. The same capture showed Claude Code
+2.1.285 sending a comma list with either credential: ten betas with the
+OAuth token, starting `claude-code-20250219,oauth-2025-04-20,…`, and nine
+with an API key, without `oauth-2025-04-20` and
+`extended-cache-ttl-2025-04-11` but with
+`mid-conversation-tool-changes-2026-07-01`. It also sends `x-app: cli`.
+
+**Solution.** `fake-claude` sends the captured lists, exported as
+`testkit::claude::OAUTH_BETA` and `API_KEY_BETA` so T18 can check the proxy
+forwards them untouched, and `x-app: cli`. `fake_anthropic()` still records
+every header.
+
+### `MockSurface` lost an event when its loop ended mid-delivery
+
+**Issue.** The `events` loop took each event off its channel and then sent
+it. When the receiver was gone, or the loop was cancelled while the send
+waited for room, that event was dropped, although the docs promise that
+queued events stay for the next loop. The mock also ignored its own `Caps`
+and could not fail, so tests could not drive the core's handling of
+`Unsupported`, `RateLimited` or `Unauthorized`.
+
+**Solution.** Each binding's events are a queue under the mock's lock,
+with a `Notify` for new events. The loop sends a copy of the front event and
+removes it only once the sender has taken it, so neither a closed receiver
+nor a cancellation loses it. Calls check the `Caps` first (`edit` without
+`supports_edit`, a thread root without `supports_threads`), then a
+per-operation queue filled by `fail_next(op, error)`. Failed calls are not
+recorded, as a failed upload already wasn't.
+
+### A refused port the test keeps
+
+**Issue.** The unreachable-upstream test bound a port, dropped the
+listener and used the port. A server started by a parallel test could take
+the port in between, and the request would succeed or hang.
+
+**Solution.** The test binds a `tokio::net::TcpSocket` and never calls
+`listen`. The port stays taken for the whole test, so nothing else can get
+it, and a connection to a bound socket that isn't listening is refused at
+once.
+
+### `fake_claude_path()`'s nested build
+
+**Issue.** Review found the first call blocking the test thread for about
+20 seconds on a second dependency build, without `--locked`.
+
+**Solution.** The nested build passes `--locked`, and the rustdoc says the
+first call blocks and should come before any timeout. After a workspace
+`cargo test`, the nested build finds everything fresh and takes about
+0.2 seconds, and under `cargo coverage` the target directory holds a single
+build of each dependency. It builds again only when the caller's package selection
+resolved testkit's dependencies with other features, which a test process
+can't see. A `--profile` flag doesn't change feature resolution: it would
+only help under `cargo test --release`, which nothing here runs, so it isn't
+passed.
+
 ## T05: store
 
 ### The key reaches the store through `open`
