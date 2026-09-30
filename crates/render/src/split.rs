@@ -3,9 +3,19 @@
 //! The behavioral reference is qm-core's `safeChunks` in
 //! `src/slack/safe-cut.ts`.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use core_types::{LengthUnit, Limit};
+
+use graphemes::{attaches, is_regional};
+
+/// The longest HTML entity name, `CounterClockwiseContourIntegral`, without
+/// its `&` and `;`.
+const MAX_ENTITY_NAME: usize = 31;
+
+/// The longest link label CommonMark accepts.
+const MAX_LABEL: usize = 999;
 
 /// Splits rendered text into chunks that each fit `limit`.
 ///
@@ -24,9 +34,12 @@ use core_types::{LengthUnit, Limit};
 /// 3. The latest position that doesn't break a word, as a last resort.
 ///
 /// A cut never falls inside a Slack token (`<url|label>`, `<@U123>`), an
-/// HTML entity (`&amp;`), a Markdown link or image, an `@mention`, a code
-/// fence line, or a character, and it doesn't separate a character from the
-/// combining marks, joiners or modifiers that follow it. It avoids cutting
+/// HTML entity (`&amp;`), a Markdown link or image (inline, or a reference
+/// whose label the text defines), an `@mention`, a code fence line, or a
+/// character, and it doesn't separate a character from the marks, joiners
+/// or modifiers that follow it. Nor does it fall just before an `@` that
+/// follows anything but whitespace or `>`, since the chunk would then
+/// start with a mention that wasn't one in the text. It avoids cutting
 /// inside a code span or between a pair of `*`, `_` or `~` markers on one
 /// line when it can. These rules give way only when a single construct is
 /// longer than a chunk.
@@ -138,6 +151,10 @@ pub(crate) struct Doc<'a> {
     max: usize,
     breaks: Vec<Break>,
     hard: Vec<bool>,
+    /// Positions inside the name of an `@mention`, past its first
+    /// character. Even a forced cut avoids them, so a chunk can't end with
+    /// a shortened name, such as `@here` cut from `@herectic`.
+    names: Vec<bool>,
     soft: Vec<bool>,
     fences: Vec<Fence>,
     /// The repeated fence, if any, whose body a cut at each position falls
@@ -169,6 +186,7 @@ impl<'a> Doc<'a> {
             max: limit.max,
             breaks: Vec::new(),
             hard: Vec::new(),
+            names: Vec::new(),
             soft: Vec::new(),
             fences: Vec::new(),
             open_at: Vec::new(),
@@ -190,7 +208,7 @@ impl<'a> Doc<'a> {
                 }
             }
         }
-        doc.hard = doc.hard_marks();
+        (doc.hard, doc.names) = doc.hard_marks(&lines);
         doc.soft = doc.soft_marks(&lines, &in_code);
         doc.open_at = vec![None; doc.len() + 1];
         for (i, fence) in doc.fences.iter().enumerate().filter(|(_, f)| f.repeat) {
@@ -330,11 +348,13 @@ impl<'a> Doc<'a> {
             .collect()
     }
 
-    /// Positions inside constructs a cut must never split.
-    fn hard_marks(&self) -> Vec<bool> {
+    /// Positions inside constructs a cut must never split, and the
+    /// positions inside mention names.
+    fn hard_marks(&self, lines: &[Range<usize>]) -> (Vec<bool>, Vec<bool>) {
         let chars = &self.chars;
         let n = self.len();
         let mut marks = Marks::new(n);
+        let mut names = Marks::new(n);
         let mut k = 0;
         while k < n {
             match chars[k] {
@@ -353,25 +373,29 @@ impl<'a> Doc<'a> {
                 '&' => {
                     let name = chars[k + 1..]
                         .iter()
-                        .take(11)
+                        .take(MAX_ENTITY_NAME + 1)
                         .take_while(|c| c.is_ascii_alphanumeric() || **c == '#')
                         .count();
-                    if (1..=10).contains(&name) && chars.get(k + 1 + name) == Some(&';') {
+                    if (1..=MAX_ENTITY_NAME).contains(&name)
+                        && chars.get(k + 1 + name) == Some(&';')
+                    {
                         marks.block(k, k + name + 2);
                     }
                 }
-                '@' if k == 0 || !chars[k - 1].is_alphanumeric() => {
+                '@' => {
                     let name = chars[k + 1..]
                         .iter()
                         .take_while(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
                         .count();
-                    marks.block(k, k + 1 + name);
+                    let bounded = k == 0 || chars[k - 1].is_whitespace() || chars[k - 1] == '>';
+                    marks.block(if bounded { k } else { k - 1 }, k + 1 + name);
+                    names.block(k + 1, k + 1 + name);
                 }
                 _ => {}
             }
             k += 1;
         }
-        self.mark_links(&mut marks);
+        self.mark_links(lines, &mut marks);
         for fence in &self.fences {
             let open_start = self.char_index(fence.open.start);
             marks.block(open_start, fence.body_start + 1);
@@ -384,21 +408,26 @@ impl<'a> Doc<'a> {
         for k in 1..n {
             let (prev, c) = (chars[k - 1], chars[k]);
             regional = if is_regional(prev) { regional + 1 } else { 0 };
-            if is_extender(c) || prev == '\u{200D}' || (is_regional(c) && regional % 2 == 1) {
+            if attaches(prev, c) || (is_regional(c) && regional % 2 == 1) {
                 marks[k] = true;
             }
         }
-        marks
+        (marks, names.finish())
     }
 
-    /// Blocks Markdown links and images, `[label](dest)`, on one line.
-    fn mark_links(&self, marks: &mut Marks) {
+    /// Blocks Markdown links and images on one line: inline ones,
+    /// `[label](dest)`, and reference ones whose label has a definition in
+    /// the text, `[label][ref]`, `[label][]` and `[label]`.
+    fn mark_links(&self, lines: &[Range<usize>], marks: &mut Marks) {
         let chars = &self.chars;
         let n = self.len();
         let mut paren_match = vec![usize::MAX; n];
+        let mut bracket_match = vec![usize::MAX; n];
+        let mut innermost = vec![false; n];
         let mut parens: Vec<usize> = Vec::new();
         let mut brackets: Vec<usize> = Vec::new();
         let mut label_ends: Vec<(usize, usize)> = Vec::new();
+        let mut last_bracket = usize::MAX;
         for (k, &c) in chars.iter().enumerate() {
             match c {
                 '\n' => {
@@ -411,26 +440,71 @@ impl<'a> Doc<'a> {
                         paren_match[open] = k;
                     }
                 }
-                '[' => brackets.push(k),
+                '[' => {
+                    brackets.push(k);
+                    last_bracket = k;
+                }
                 ']' => {
                     if let Some(open) = brackets.pop() {
+                        bracket_match[open] = k;
+                        innermost[open] = last_bracket == open;
                         label_ends.push((open, k));
                     }
+                    last_bracket = k;
                 }
                 _ => {}
             }
         }
+        let defined = self.reference_labels(lines);
+        let is_defined = |open: usize, close: usize| {
+            !defined.is_empty()
+                && innermost[open]
+                && close - open <= MAX_LABEL + 1
+                && defined.contains(&label_key(&chars[open + 1..close]))
+        };
         for (open, close) in label_ends {
-            if chars.get(close + 1) != Some(&'(') || paren_match[close + 1] == usize::MAX {
-                continue;
-            }
+            let next = close + 1;
+            let paren = (chars.get(next) == Some(&'(')).then(|| paren_match[next]);
+            let bracket = (chars.get(next) == Some(&'[')).then(|| bracket_match[next]);
+            let end = match (paren, bracket) {
+                (Some(end), _) if end != usize::MAX => end,
+                (_, Some(end)) if end == next + 1 && is_defined(open, close) => end,
+                (_, Some(end)) if end != usize::MAX && is_defined(next, end) => end,
+                _ if is_defined(open, close) => close,
+                _ => continue,
+            };
             let start = if open > 0 && chars[open - 1] == '!' {
                 open - 1
             } else {
                 open
             };
-            marks.block(start, paren_match[close + 1] + 1);
+            marks.block(start, end + 1);
         }
+    }
+
+    /// The normalized labels of the link reference definitions in the text:
+    /// lines that start with `[label]:` after optional spaces and `>`
+    /// markers.
+    fn reference_labels(&self, lines: &[Range<usize>]) -> HashSet<String> {
+        let mut labels = HashSet::new();
+        for line in lines {
+            let chars = &self.chars[line.clone()];
+            let indent = chars
+                .iter()
+                .take_while(|c| matches!(c, ' ' | '\t' | '>'))
+                .count();
+            let Some(rest) = chars[indent..].strip_prefix(&['[']) else {
+                continue;
+            };
+            let Some(close) = rest.iter().take(MAX_LABEL + 1).position(|&c| c == ']') else {
+                continue;
+            };
+            if rest.get(close + 1) == Some(&':') && !rest[..close].contains(&'[') {
+                labels.insert(label_key(&rest[..close]));
+            }
+        }
+        labels.remove("");
+        labels
     }
 
     /// Positions inside constructs a cut should avoid splitting: code spans
@@ -588,8 +662,20 @@ fn choose(doc: &Doc<'_>, start: usize, prefix: usize) -> usize {
         .find(|&k| doc.allowed(k, Rules::All) && !inside_word(k))
         .or_else(|| fitting().find(|&k| doc.allowed(k, Rules::All)))
         .or_else(|| fitting().find(|&k| doc.allowed(k, Rules::Hard)))
+        .or_else(|| fitting().find(|&k| !doc.names[k]))
         .or_else(|| fitting().next())
         .unwrap_or(start + 1)
+}
+
+/// A link label as CommonMark matches it: case-insensitive, with runs of
+/// whitespace collapsed to one space.
+fn label_key(label: &[char]) -> String {
+    let label: String = label.iter().collect();
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Marks positions strictly inside char ranges, in linear time however
@@ -631,28 +717,6 @@ fn units(c: char, unit: LengthUnit) -> usize {
     }
 }
 
-/// Characters that attach to the one before them: combining marks,
-/// variation selectors, emoji modifiers, the zero-width joiner, the keycap
-/// mark and emoji tag characters.
-fn is_extender(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0300}'..='\u{036F}'
-            | '\u{1AB0}'..='\u{1AFF}'
-            | '\u{1DC0}'..='\u{1DFF}'
-            | '\u{200D}'
-            | '\u{20D0}'..='\u{20FF}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FE20}'..='\u{FE2F}'
-            | '\u{1F3FB}'..='\u{1F3FF}'
-            | '\u{E0020}'..='\u{E007F}'
-            | '\u{E0100}'..='\u{E01EF}'
-    )
-}
-
-fn is_regional(c: char) -> bool {
-    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
-}
-
+mod graphemes;
 #[cfg(test)]
 mod tests;
