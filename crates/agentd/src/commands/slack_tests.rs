@@ -1040,3 +1040,66 @@ fn only_a_deleted_user_in_a_user_change_has_left() {
         None
     );
 }
+
+#[tokio::test]
+async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
+    let dir = std::env::temp_dir().join(format!("agentd-rotator-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("agentd.db").display());
+    let sealer = || Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
+    let old_key = Store::open(&url, sealer()).await.unwrap();
+    let start = OffsetDateTime::now_utc();
+    let token = |refresh: &str, minutes: i64| NewSlackConfigToken {
+        token: SecretString::from("xoxe.xoxp-1-T0"),
+        refresh_token: SecretString::from(refresh),
+        expires_at: start + time::Duration::minutes(minutes),
+    };
+    let bob = old_key
+        .ensure_member(&slack_key("U0HUMAN02"), "bob", start)
+        .await
+        .unwrap();
+    old_key
+        .put_slack_config_token(bob, &TeamId::new(TEAM), &token("xoxe-1-BOB", 10), start)
+        .await
+        .unwrap();
+    old_key.close().await;
+
+    let h = slack_harness().await;
+    let store = Store::open(&url, sealer()).await.unwrap();
+    let alice = store
+        .ensure_member(&slack_key("U0HUMAN01"), "alice", start)
+        .await
+        .unwrap();
+    store
+        .put_slack_config_token(alice, &TeamId::new(TEAM), &token("xoxe-1-R0", 20), start)
+        .await
+        .unwrap();
+    mount_rotation(
+        &h.slack,
+        "xoxe-1-R0",
+        "xoxe.xoxp-1-T1",
+        "xoxe-1-R1",
+        "U0HUMAN01",
+        in_hours(12),
+    )
+    .await;
+    let rotator = ConfigTokenRotator::new(
+        store.clone(),
+        h.manager.client().clone(),
+        h.commands.replies().clone(),
+    );
+    let pass = rotator.pass_at(clock(start)).await.unwrap();
+    assert_eq!(pass.renewed, 1);
+    assert_eq!(
+        store
+            .slack_config_token(alice, &TeamId::new(TEAM))
+            .await
+            .unwrap()
+            .unwrap()
+            .refresh_token
+            .expose_secret(),
+        "xoxe-1-R1"
+    );
+    store.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

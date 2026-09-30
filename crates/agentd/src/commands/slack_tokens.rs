@@ -179,6 +179,13 @@ pub struct RotationPass {
     pub notified: usize,
 }
 
+/// What renewing one token did.
+enum Renewal {
+    Renewed,
+    Broken,
+    Nothing,
+}
+
 /// Renews configuration tokens before they expire, and tells members whose
 /// refresh token Slack refused.
 #[derive(Debug, Clone)]
@@ -201,9 +208,13 @@ impl ConfigTokenRotator {
 
     /// Renews every token that is due and sends every notice owed.
     ///
+    /// A store failure on one token is logged and the pass goes on with
+    /// the next, so a row that can't be read doesn't hold the others up.
+    ///
     /// # Errors
     ///
-    /// A [`StoreError`] if the store fails; what was done stays done.
+    /// A [`StoreError`] if the tokens due or the notices owed can't be
+    /// listed; what was done stays done.
     pub async fn pass(&self) -> Result<RotationPass, StoreError> {
         self.pass_at(OffsetDateTime::now_utc).await
     }
@@ -220,38 +231,12 @@ impl ConfigTokenRotator {
             .due_slack_config_tokens(at + RENEW_BEFORE, at)
             .await?
         {
-            let claimed_at = now();
-            let Some(token) = self
-                .store
-                .claim_slack_config_token(&row, claimed_at, claimed_at + ROTATION_LEASE)
-                .await?
-            else {
-                continue;
-            };
-            match self.client.rotate_config_token(&token.refresh_token).await {
-                Ok(rotated) => {
-                    let stored = self
-                        .store
-                        .update_rotated_slack_config_token(&row, &stored(rotated), now())
-                        .await?;
-                    if stored.is_some() {
-                        pass.renewed += 1;
-                    } else {
-                        tracing::info!(member = %row.member, "a new configuration token replaced the one being renewed");
-                    }
-                }
-                Err(SurfaceError::Unauthorized) => {
-                    tracing::warn!(member = %row.member, team = %row.team, "Slack refused to renew a configuration token");
-                    if self
-                        .store
-                        .mark_slack_config_token_broken(&row, now())
-                        .await?
-                    {
-                        pass.broken += 1;
-                    }
-                }
+            match self.renew(&row, &now).await {
+                Ok(Renewal::Renewed) => pass.renewed += 1,
+                Ok(Renewal::Broken) => pass.broken += 1,
+                Ok(Renewal::Nothing) => {}
                 Err(err) => {
-                    tracing::warn!(member = %row.member, error = %err, "renewing a configuration token failed; trying again later");
+                    tracing::warn!(member = %row.member, error = %err, "renewing a configuration token failed in the store");
                 }
             }
         }
@@ -261,11 +246,57 @@ impl ConfigTokenRotator {
             .pending_slack_config_token_notices(at, NOTICE_MAX_ATTEMPTS)
             .await?
         {
-            if self.notify(&row, &now).await? {
-                pass.notified += 1;
+            match self.notify(&row, &now).await {
+                Ok(true) => pass.notified += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(member = %row.member, error = %err, "sending a configuration token notice failed in the store");
+                }
             }
         }
         Ok(pass)
+    }
+
+    /// Claims `row` and renews it.
+    async fn renew(
+        &self,
+        row: &SlackConfigTokenRef,
+        now: &impl Fn() -> OffsetDateTime,
+    ) -> Result<Renewal, StoreError> {
+        let claimed_at = now();
+        let Some(token) = self
+            .store
+            .claim_slack_config_token(row, claimed_at, claimed_at + ROTATION_LEASE)
+            .await?
+        else {
+            return Ok(Renewal::Nothing);
+        };
+        match self.client.rotate_config_token(&token.refresh_token).await {
+            Ok(rotated) => {
+                let stored = self
+                    .store
+                    .update_rotated_slack_config_token(row, &stored(rotated), now())
+                    .await?;
+                if stored.is_some() {
+                    return Ok(Renewal::Renewed);
+                }
+                tracing::info!(member = %row.member, "a new configuration token replaced the one being renewed");
+            }
+            Err(SurfaceError::Unauthorized) => {
+                tracing::warn!(member = %row.member, team = %row.team, "Slack refused to renew a configuration token");
+                if self
+                    .store
+                    .mark_slack_config_token_broken(row, now())
+                    .await?
+                {
+                    return Ok(Renewal::Broken);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(member = %row.member, error = %err, "renewing a configuration token failed; trying again later");
+            }
+        }
+        Ok(Renewal::Nothing)
     }
 
     /// Sends the notice owed for `row`, if a manager bot reaches its
