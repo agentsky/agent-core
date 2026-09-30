@@ -6599,9 +6599,10 @@ and nothing else counts an agent's turns.
 
 **Solution.** `thread_usage` rows are keyed by thread, day, hour (UTC) and
 agent. The thread's turns this hour and tokens today, and the agent's
-turns for others today (`others_turns`), are sums over it (an index on `(agent_id, day)` serves the
-latter). Rows older than two days are swept with the other expired rows.
-`usage` keeps a member's days for good, for `me`'s month.
+turns for others today (`others_turns`), are sums over it (an index on
+`(agent_id, day)` serves the latter). Rows older than two days are swept
+with the other expired rows. `usage` keeps a member's days for good, for
+`me`'s month.
 
 ### Counts are read before a turn and written after it
 
@@ -6736,14 +6737,14 @@ the deny of a denied target, so under an allow list that didn't hold it
 `allow helper @bob` still left bob out, and took a second `allow`; now a
 denied target is added to the allow list too when the list is not empty,
 and only lifted when it is, so lifting a deny never limits an agent open
-to everyone. A full allow list refuses the command whole, deny included. Replies
-leave a denied target out of the allowed ones, and an allow list whose
-every target is denied reads "Only you may use". `allow everyone` empties
-the allow list and takes `everyone` off the deny list; denies by name
-stay. An `allow` of a member or a channel while `everyone` is denied
+to everyone. A full allow list refuses the command whole, deny included.
+Replies leave a denied target out of the allowed ones, and an allow list
+whose every target is denied reads "Only you may use". `allow everyone`
+empties the allow list and takes `everyone` off the deny list; denies by
+name stay. An `allow` of a member or a channel while `everyone` is denied
 changes nothing anyone can see, so its reply says to send `allow <name>
-everyone` first. Each list holds at most 100 rules. Rules are JSON agentd owns
-(`policy::Rule`), with the identity or conversation and how the owner
+everyone` first. Each list holds at most 100 rules. Rules are JSON agentd
+owns (`policy::Rule`), with the identity or conversation and how the owner
 wrote it; replies name them in code spans, which neither surface turns
 into a mention. A member is resolved as `list` does (Slack sends an id,
 Rocket.Chat a username the manager looks up). A channel on Slack arrives
@@ -6754,15 +6755,14 @@ for an id typed as a `<#…>` token, which is never taken as it is. The
 manager can read private groups a member may not be in, so only a public
 channel is found: a private group reads as unknown whether or not it
 exists, and can't be named in a new rule on Rocket.Chat yet. A room the
-lookup doesn't find is still matched against the agent's own room rules
-by the name the owner wrote (`#secret`), so a channel denied or allowed
-while public and made private since can be allowed or denied again; that
-tells the owner only what their own rules hold. Checking the asker's
-membership of the group would take a lookup of another user's rooms the
-manager doesn't make yet. Rules
-that don't read refuse everyone, the owner too, as `PolicyUnavailable`,
-since the same row holds the hop cap, and `allow <name> everyone` clears
-them.
+lookup doesn't find is still matched against the agent's own room rules by
+the name the owner wrote (`#secret`), so a channel denied or allowed while
+public and made private since can be allowed or denied again; that tells
+the owner only what their own rules hold. Checking the asker's membership
+of the group would take a lookup of another user's rooms the manager
+doesn't make yet. Rules that don't read refuse everyone, the owner too, as
+`PolicyUnavailable`, since the same row holds the hop cap, and `allow
+<name> everyone` clears them.
 
 ### An agent's settings change in one transaction
 
@@ -6809,6 +6809,18 @@ requester's credential, and the agent stays as its owner left it, since
 the owner can't change it while banned, only pause or delete it. An admin
 who wants such an agent silent asks the owner to pause it, or removes its
 bot on the platform.
+
+### The usage migration was edited in place
+
+**Issue.** `thread_usage.others_turns` was added to
+`20260930240000_usage.sql` after the branch's first push, by editing the
+migration rather than adding another, since T27 hadn't merged. sqlx keeps
+each applied migration's checksum and refuses to start on a database whose
+applied migration has since changed.
+
+**Solution.** Nothing migrates such a database: one that ran an earlier
+version of this branch's migration must be recreated (a development store
+only; no release shipped it).
 
 ### The proxy's path allowlist stays deferred
 
