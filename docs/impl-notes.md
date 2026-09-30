@@ -1125,9 +1125,10 @@ dependency (MIT or Apache-2.0; axum's `json`, `form` and `query` features
 already pull it in). A missing field's name, which serde's message quotes, is
 appended to its parent's path, so the key reads `server.listen`. The line
 from `toml`'s span is added to the message. Checks serde can't do (an
-unspecified listen address, a public address inside the sandbox subnet, the
-drain timeout bound, the log filter, a non-SQLite URL, every environment
-variable) produce the same `key: message` form. Values are never repeated,
+unspecified listen address, a public address inside the sandbox subnet, an
+internal one outside it, the drain timeout bound, the log filter, a
+non-SQLite URL, the environment variables) produce the same `key: message`
+form. Values are never repeated,
 except the offending value of a known, non-secret key in a type error.
 
 ### The public listener's subnet guard needed a key
@@ -1140,8 +1141,8 @@ no task was named for it.
 `internal.sandbox_subnet` (CIDR, required) and `net::RefuseSubnet`, which
 closes such connections as soon as they are accepted, before any byte is
 read. Validation refuses a `server.listen` inside the subnet. A Linux-only
-test binds the public listener to `127.0.0.2`, sets the subnet to
-`127.0.0.1/32`, and checks that a client bound to `127.0.0.1` gets no answer
+test binds the public listener to `127.0.0.1`, sets the subnet to
+`127.0.0.2/32`, and checks that a client bound to `127.0.0.2` gets no answer
 while one bound to `127.0.0.3` gets 200.
 
 ### `migrate` needs the master key
@@ -1153,6 +1154,92 @@ a `Sealer`, so the key has to be present.
 `serve`. That also means a migration job checks the configuration it will be
 served with. The store gained `ping` (for `/healthz`) and `close` (so
 shutdown closes the pool after the drain instead of leaving it to drop).
+
+### Address checks compare canonical forms
+
+**Issue.** `[::ffff:0.0.0.0]:8443` passed the "never `0.0.0.0`" check, since
+`Ipv6Addr::is_unspecified` is true only for `::`, yet on a dual-stack
+socket it binds every IPv4 interface. Likewise `127.0.0.1:8080` and
+`[::ffff:127.0.0.1]:8080` counted as different listeners. And a
+`sandbox_subnet` written in mapped form, `::ffff:172.30.0.0/120`, never
+matched a peer, because `Cidr::contains` turns a mapped peer into its IPv4
+address and compared it against an IPv6 network, so the public listener's
+guard and the listener checks were silently off.
+
+**Solution.** Every address check in `Config` validation uses the canonical
+form (`IpAddr::to_canonical`), so a mapped unspecified address is refused
+and mapped duplicates are caught. `Cidr::new` stores a mapped network with
+a prefix of at least 96 as the IPv4 subnet it names (prefix minus 96), so
+`::ffff:172.30.0.0/120` is `172.30.0.0/24`, and `contains` compares an IPv4
+peer against an IPv6 network by its mapped form, so `::/0` holds IPv4 peers
+too.
+
+### The internal listeners weren't tied to the sandbox network
+
+**Issue.** Only `server.listen` was checked against `sandbox_subnet`. A
+`proxy_listen` or `ctl_listen` on a public address was accepted, which
+would have exposed the credential proxy and the agentctl API off the
+sandbox network.
+
+**Solution.** Validation requires both inside `internal.sandbox_subnet`.
+Tests need two local addresses on different sides of the subnet, so the
+test configurations put the public listener on `127.0.0.1` and the
+internal ones on `127.0.0.2` with the subnet `127.0.0.2/32`. The reverse
+(public on `127.0.0.2`, subnet `127.0.0.1/32`) doesn't work: Linux gives a
+connection to `127.0.0.2` the source address `127.0.0.1`, so the public
+listener would refuse the tests' own clients. Linux accepts every
+`127.0.0.0/8` address without setup; CI runs only on Linux.
+
+### Kubernetes sets `AGENTD_*` variables of its own
+
+**Issue.** Any unknown `AGENTD_*` variable was fatal. Kubernetes injects
+service-link variables for every Service in the namespace, so a Service
+named `agentd` produces `AGENTD_PORT=tcp://…`, `AGENTD_SERVICE_HOST`,
+`AGENTD_PORT_8443_TCP_ADDR` and more, and agentd would refuse to start in
+the very Deployment that exposes it.
+
+**Solution.** Unknown variables are sorted in three:
+
+- Service links are skipped silently: names ending in `_PORT`,
+  `_SERVICE_HOST` or `_SERVICE_PORT`, holding `_SERVICE_PORT_`, or ending
+  in `_PORT_<number>_<TCP|UDP|SCTP>` with an optional `_PROTO` or `_ADDR`.
+- Near misses of a secret's name are still errors, so a typo in a secret
+  fails at startup: within two edits (Levenshtein, over bytes) of
+  `AGENTD_MASTER_KEY` or `AGENTD_RC_MANAGER_TOKEN`, or starting within two
+  edits of `AGENTD_SLACK_MANAGER_` without being a valid Slack manager name.
+- Anything else is listed in `Config::unknown_env`, and `serve` and
+  `migrate` log each name (never the value) as a warning once logging is
+  set up. `Config` is loaded before the subscriber exists, so it can't log
+  them itself.
+
+The module docs, the example configuration and the README state the rule.
+
+### A refused sandbox connection logged a warning each time
+
+**Issue.** `RefuseSubnet` logged a `warn!` for every connection it
+refused, so a sandbox retrying in a loop could flood the log.
+
+**Solution.** A small `RefusalLog` keyed by peer IP warns at most once per
+peer every `REFUSAL_WARN_INTERVAL` (a minute); the refusals in between are
+logged at debug level and counted in the next warning's
+`refused_since_last_warning`. Entries older than the interval are dropped
+whenever a warning is logged, so the map holds only recently active peers.
+A unit test drives it with explicit instants.
+
+### A second signal during the drain was swallowed
+
+**Issue.** `shutdown_signal` completed on the first SIGTERM or SIGINT and
+then dropped its handlers' output, so a second signal during a long drain
+(up to an hour) did nothing, and an operator's second Ctrl-C was ignored.
+
+**Solution.** `cli::ShutdownSignals` counts the signals in a task that owns
+the handlers; `first()` and `second()` are futures over the count.
+`Server::run` (and `cli::serve`) take a second future, `abort`, that cuts
+the drain short the way the drain timeout does: in-flight work is dropped,
+then the store is closed, so the process exits promptly and cleanly. An
+in-process test forces shutdown with a hanging request and an hour-long
+drain timeout, and a unit test sends the test process a real SIGINT and
+SIGTERM and checks that each future completes on its own signal.
 
 ## T11: Rocket.Chat REST
 

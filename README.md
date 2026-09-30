@@ -40,11 +40,15 @@ agentd serve --config /etc/agentd/agentd.toml
 
 `serve` also applies pending migrations when it starts; `migrate` is for
 running them as a separate step. Configuration errors name the key or
-variable at fault, and any other variable starting with `AGENTD_` is refused.
-Each listener binds agentd's own address on its network, never `0.0.0.0`.
+variable at fault. A near miss of a secret's name is refused, Kubernetes
+service links such as `AGENTD_PORT` are skipped, and any other variable
+starting with `AGENTD_` is ignored with a warning. Each listener binds
+agentd's own address on its network, never `0.0.0.0`, and the proxy and ctl
+listeners must be inside `internal.sandbox_subnet`.
 `GET /healthz` on the public listener answers 200 while the database does.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
-requests `server.drain_timeout_secs` to finish. Logs go to standard error,
+requests `server.drain_timeout_secs` to finish; a second signal drops them at
+once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
 
 ## CI

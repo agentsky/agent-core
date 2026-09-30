@@ -3,13 +3,14 @@
 use std::ffi::OsString;
 use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use secrecy::ExposeSecret as _;
 use store::Sealer;
+use tokio::sync::watch;
 
 use crate::app::{self, App};
 use crate::config::Config;
@@ -28,7 +29,8 @@ pub struct Cli {
 /// agentd's subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the daemon until SIGTERM or SIGINT.
+    /// Run the daemon until SIGTERM or SIGINT. A second signal stops it
+    /// without waiting for in-flight requests.
     Serve {
         /// The configuration file.
         #[arg(long, value_name = "PATH")]
@@ -83,19 +85,33 @@ where
     match cli.command {
         Command::GenKey => gen_key(&mut std::io::stdout().lock()),
         Command::Serve { config } => {
-            let config = Config::load(&config, env)?;
-            telemetry::init(&config.server.log_filter)?;
+            let config = load(&config, env)?;
             runtime()?.block_on(async {
-                let shutdown = shutdown_signal()?;
-                serve(config, shutdown).await
+                let signals = ShutdownSignals::install()?;
+                serve(config, signals.first(), signals.second()).await
             })
         }
         Command::Migrate { config } => {
-            let config = Config::load(&config, env)?;
-            telemetry::init(&config.server.log_filter)?;
+            let config = load(&config, env)?;
             runtime()?.block_on(migrate(config))
         }
     }
+}
+
+/// Loads the configuration, sets up logging, and warns about each unknown
+/// `AGENTD_` variable the configuration ignored.
+fn load<E, K, V>(path: &Path, env: E) -> anyhow::Result<Config>
+where
+    E: IntoIterator<Item = (K, V)>,
+    K: Into<OsString>,
+    V: Into<OsString>,
+{
+    let config = Config::load(path, env)?;
+    telemetry::init(&config.server.log_filter)?;
+    for name in &config.unknown_env {
+        tracing::warn!(variable = %name, "ignoring an unknown AGENTD_ environment variable");
+    }
+    Ok(config)
 }
 
 fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
@@ -130,53 +146,127 @@ pub async fn migrate(config: Config) -> anyhow::Result<()> {
 }
 
 /// `agentd serve`: opens the store, binds the listeners, and serves until
-/// `shutdown` completes, then shuts down gracefully (see [`Server::run`]).
+/// `shutdown` completes, then shuts down gracefully, cutting the drain short
+/// if `abort` completes (see [`Server::run`]).
 ///
 /// # Errors
 ///
 /// If the store can't be opened, a listener can't be bound, or a listener
 /// fails while serving.
-pub async fn serve<F>(config: Config, shutdown: F) -> anyhow::Result<()>
+pub async fn serve<F, G>(config: Config, shutdown: F, abort: G) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
 {
     let app = App::open(config).await?;
     let server = Server::bind(app.clone(), Routers::new(&app)).await?;
-    server.run(shutdown).await
+    server.run(shutdown, abort).await
 }
 
-/// Completes on the first SIGTERM or SIGINT. The handlers are installed
-/// before this returns, so a signal that arrives during startup is not lost.
-///
-/// # Errors
-///
-/// If a signal handler can't be installed.
-#[cfg(unix)]
-pub fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()> + Send> {
-    use tokio::signal::unix::{SignalKind, signal};
+/// SIGTERM and SIGINT (Ctrl-C elsewhere), counted: the
+/// [`first`](Self::first) asks for a graceful shutdown, and the
+/// [`second`](Self::second) cuts its drain short.
+#[derive(Debug, Clone)]
+pub struct ShutdownSignals {
+    received: watch::Receiver<u32>,
+}
 
-    let mut terminate =
-        signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
-    let mut interrupt = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
-    Ok(async move {
-        tokio::select! {
-            _ = terminate.recv() => tracing::info!(signal = "SIGTERM", "received a shutdown signal"),
-            _ = interrupt.recv() => tracing::info!(signal = "SIGINT", "received a shutdown signal"),
+impl ShutdownSignals {
+    /// Installs the signal handlers and starts counting. The handlers are
+    /// installed before this returns, so a signal that arrives during
+    /// startup is not lost.
+    ///
+    /// # Errors
+    ///
+    /// If a signal handler can't be installed.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime.
+    pub fn install() -> anyhow::Result<Self> {
+        let mut source = SignalSource::install()?;
+        let (count, received) = watch::channel(0);
+        tokio::spawn(async move {
+            let mut seen = 0;
+            while let Some(signal) = source.next().await {
+                seen += 1;
+                count.send_replace(seen);
+                if seen == 1 {
+                    tracing::info!(signal, "received a shutdown signal");
+                } else {
+                    tracing::warn!(
+                        signal,
+                        "received a second shutdown signal; dropping in-flight work"
+                    );
+                    break;
+                }
+            }
+        });
+        Ok(Self { received })
+    }
+
+    /// Completes on the first signal.
+    pub fn first(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.nth(1)
+    }
+
+    /// Completes on the second signal.
+    pub fn second(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.nth(2)
+    }
+
+    fn nth(&self, n: u32) -> impl Future<Output = ()> + Send + 'static {
+        let mut received = self.received.clone();
+        async move {
+            if received.wait_for(|count| *count >= n).await.is_err() {
+                std::future::pending::<()>().await;
+            }
         }
-    })
+    }
 }
 
-/// Completes on Ctrl-C.
-///
-/// # Errors
-///
-/// Never; the `Result` matches the Unix version.
+/// The installed SIGTERM and SIGINT handlers.
+#[cfg(unix)]
+struct SignalSource {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl SignalSource {
+    fn install() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            terminate: signal(SignalKind::terminate()).context("installing the SIGTERM handler")?,
+            interrupt: signal(SignalKind::interrupt()).context("installing the SIGINT handler")?,
+        })
+    }
+
+    /// The next signal's name, or `None` once no more can arrive.
+    async fn next(&mut self) -> Option<&'static str> {
+        tokio::select! {
+            Some(()) = self.terminate.recv() => Some("SIGTERM"),
+            Some(()) = self.interrupt.recv() => Some("SIGINT"),
+            else => None,
+        }
+    }
+}
+
+/// Ctrl-C, where there are no Unix signals.
 #[cfg(not(unix))]
-pub fn shutdown_signal() -> anyhow::Result<impl Future<Output = ()> + Send> {
-    Ok(async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!(signal = "ctrl-c", "received a shutdown signal");
-    })
+struct SignalSource;
+
+#[cfg(not(unix))]
+impl SignalSource {
+    fn install() -> anyhow::Result<Self> {
+        Ok(Self)
+    }
+
+    /// The next Ctrl-C, or `None` if it can't be listened for.
+    async fn next(&mut self) -> Option<&'static str> {
+        tokio::signal::ctrl_c().await.ok().map(|()| "ctrl-c")
+    }
 }
 
 #[cfg(test)]
@@ -184,8 +274,6 @@ mod tests {
     use clap::CommandFactory as _;
     use clap::error::ErrorKind;
     use secrecy::SecretString;
-
-    use std::path::Path;
 
     use super::*;
 
@@ -257,6 +345,39 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Err(std::io::Error::other("closed"))
         }
+    }
+
+    #[cfg(unix)]
+    fn send_self(signal: &str) {
+        let status = std::process::Command::new("kill")
+            .args([signal, &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_signal_shuts_down_and_the_second_forces_it() {
+        let signals = ShutdownSignals::install().unwrap();
+        let (first, second) = (signals.first(), signals.second());
+        tokio::pin!(first, second);
+        let brief = std::time::Duration::from_millis(100);
+        let patient = std::time::Duration::from_secs(10);
+        assert!(tokio::time::timeout(brief, &mut first).await.is_err());
+
+        send_self("-INT");
+        tokio::time::timeout(patient, &mut first).await.unwrap();
+        assert!(
+            tokio::time::timeout(brief, &mut second).await.is_err(),
+            "one signal is not two"
+        );
+
+        send_self("-TERM");
+        tokio::time::timeout(patient, &mut second).await.unwrap();
+        tokio::time::timeout(patient, signals.first())
+            .await
+            .unwrap();
     }
 
     #[test]
