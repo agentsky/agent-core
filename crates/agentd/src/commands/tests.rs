@@ -320,7 +320,9 @@ async fn full_login_flow_from_a_dm_links_the_account_without_logging_the_code() 
 
     logs.snapshot()
         .assert_has("running a command")
-        .assert_has("\"command\":\"login\"")
+        .assert_has("\"command\":\"login\"");
+    global_logs()
+        .snapshot()
         .assert_lacks(CODE)
         .assert_lacks(&pasted);
 }
@@ -381,8 +383,8 @@ async fn a_login_code_in_a_channel_is_refused_and_invalidates_the_pending_login(
     );
     logs.snapshot()
         .assert_has("\"command\":\"login\"")
-        .assert_has("cancelled pending logins after a public secret")
-        .assert_lacks(CODE);
+        .assert_has("cancelled pending logins after a public secret");
+    global_logs().snapshot().assert_lacks(CODE);
 }
 
 #[tokio::test]
@@ -415,8 +417,8 @@ async fn an_api_key_in_a_channel_is_refused_with_revoke_advice() {
     );
     assert!(!reply.contains(API_KEY));
     logs.snapshot()
-        .assert_has("\"command\":\"admin api-key set\"")
-        .assert_lacks(API_KEY);
+        .assert_has("\"command\":\"admin api-key set\"");
+    global_logs().snapshot().assert_lacks(API_KEY);
 }
 
 #[tokio::test]
@@ -443,8 +445,8 @@ async fn secret_looking_text_that_fails_to_parse_in_a_channel_cancels_logins() {
     assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
     logs.snapshot()
         .assert_has("command text didn't parse")
-        .assert_has("cancelled pending logins after a public secret")
-        .assert_lacks(CODE);
+        .assert_has("cancelled pending logins after a public secret");
+    global_logs().snapshot().assert_lacks(CODE);
 }
 
 #[tokio::test]

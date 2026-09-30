@@ -13,12 +13,15 @@
 //! So each test binary installs one global subscriber, once, with
 //! [`Logs::global`] or [`Logs::install`], and each test reads only its own
 //! lines: those naming something only it has, such as a session id, with
-//! [`Logged::matching`], or those logged on its own thread, with
-//! [`Logs::tag`]. An absence check is meaningful only next to a presence
-//! check proving capture was on: [`Logged::assert_lacks`] refuses an empty
-//! capture, and a test also asserts the neighbouring line it expects with
+//! [`Logged::matching`], or those logged inside a span it enters on its own
+//! thread, with [`Logs::tag`]. A tag misses some of a test's lines, so an
+//! absence check reads [`Logged::matching`] or the whole snapshot instead.
+//! An absence check is meaningful only next to a presence check proving
+//! capture was on: [`Logged::assert_lacks`] refuses an empty capture, and a
+//! test also asserts the neighbouring line it expects with
 //! [`Logged::assert_has`].
 
+use std::any::{TypeId, type_name};
 use std::fmt;
 use std::io;
 use std::ops::Deref;
@@ -35,7 +38,7 @@ use uuid::Uuid;
 #[derive(Clone, Default)]
 pub struct Logs(Arc<Mutex<Vec<u8>>>);
 
-static GLOBAL: OnceLock<Logs> = OnceLock::new();
+static GLOBAL: OnceLock<(Logs, TypeId, &str)> = OnceLock::new();
 
 impl Logs {
     /// The binary's global capture, installing on first use a
@@ -58,22 +61,32 @@ impl Logs {
     /// The binary's global capture, installing on first use the subscriber
     /// `make` builds to write into the buffer it is given. Only the first
     /// call's `make` runs, so a binary makes every call through one
-    /// function.
+    /// function, and every call passes the same `make`.
     ///
     /// # Panics
     ///
     /// If this installs the capture and another global subscriber is
-    /// already installed.
-    pub fn install<S>(make: impl FnOnce(Self) -> S) -> &'static Self
+    /// already installed, or if the capture was installed with a different
+    /// `make`, such as [`Logs::global`]'s.
+    pub fn install<F, S>(make: F) -> &'static Self
     where
+        F: FnOnce(Self) -> S + 'static,
         S: Subscriber + Send + Sync + 'static,
     {
-        GLOBAL.get_or_init(|| {
+        let (logs, installed, installed_name) = GLOBAL.get_or_init(|| {
             let logs = Self::default();
             tracing::subscriber::set_global_default(make(logs.clone()))
                 .expect("another global subscriber is installed");
-            logs
-        })
+            tracing::callsite::rebuild_interest_cache();
+            (logs, TypeId::of::<F>(), type_name::<F>())
+        });
+        assert!(
+            *installed == TypeId::of::<F>(),
+            "the global log capture was installed with {installed_name}, not {}: \
+             every call in a binary must pass the same `make`",
+            type_name::<F>()
+        );
+        logs
     }
 
     /// Every line captured so far.
@@ -85,9 +98,19 @@ impl Logs {
     }
 
     /// Enters a span with a unique id on this thread until the [`Tag`] is
-    /// dropped, so that every line logged on this thread meanwhile names
-    /// it. On a current-thread runtime, as `#[tokio::test]` uses, that is
-    /// every line the test's tasks log.
+    /// dropped. [`Tag::snapshot`] keeps the lines naming the id: those of
+    /// events whose span parents lead back to this span. That is a line
+    /// logged on this thread meanwhile, outside any other span or inside
+    /// one made while the tag was entered, including by the tasks a
+    /// current-thread runtime, as `#[tokio::test]` uses, polls here.
+    ///
+    /// A tag misses the lines logged inside a span made before it, such as
+    /// those of a task spawned earlier with its own
+    /// [`instrument`](tracing::Instrument::instrument), and every line
+    /// logged on another thread, such as by `spawn_blocking`. So a tag
+    /// suits presence checks, and an absence check reads the lines
+    /// [`Logged::matching`] an id only this test logs, or the whole
+    /// [`snapshot`](Self::snapshot), where those lines still are.
     pub fn tag(&self) -> Tag<'_> {
         let id = Uuid::new_v4().to_string();
         let entered = tracing::info_span!("test", tag = %id).entered();

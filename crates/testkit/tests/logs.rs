@@ -3,6 +3,8 @@
 use std::thread;
 
 use testkit::Logs;
+use tracing::Instrument as _;
+use uuid::Uuid;
 
 fn tagged_callsite(who: &str) {
     tracing::info!(who, "the tagged callsite");
@@ -26,6 +28,58 @@ fn a_tag_keeps_its_lines_when_another_thread_hit_the_callsite_first() {
     logs.snapshot()
         .matching("the tagged callsite")
         .assert_has("other-thread");
+}
+
+#[tokio::test]
+async fn a_tag_keeps_the_lines_whose_spans_lead_back_to_it() {
+    let logs = Logs::global();
+    let run = Uuid::new_v4().to_string();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let earlier = tokio::spawn({
+        let run = run.clone();
+        async move {
+            released.await.unwrap();
+            tracing::info!(run = %run, "in a span made before the tag");
+        }
+        .instrument(tracing::info_span!("before"))
+    });
+    let tag = logs.tag();
+    tracing::info!(run = %run, "on the tagged thread");
+    let spawned = run.clone();
+    tokio::spawn(async move { tracing::info!(run = %spawned, "in a task spawned inside the tag") })
+        .await
+        .unwrap();
+    let instrumented = run.clone();
+    tokio::spawn(
+        async move { tracing::info!(run = %instrumented, "in a span made inside the tag") }
+            .instrument(tracing::info_span!("after")),
+    )
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    earlier.await.unwrap();
+    let blocking = run.clone();
+    tokio::task::spawn_blocking(move || tracing::info!(run = %blocking, "on a blocking thread"))
+        .await
+        .unwrap();
+
+    let tagged = tag.snapshot().matching(&run);
+    tagged
+        .assert_has("on the tagged thread")
+        .assert_has("in a task spawned inside the tag")
+        .assert_has("in a span made inside the tag");
+    let everything = logs.snapshot().matching(&run);
+    for missed in ["in a span made before the tag", "on a blocking thread"] {
+        tagged.assert_lacks(missed);
+        everything.assert_has(missed);
+    }
+}
+
+#[test]
+#[should_panic(expected = "every call in a binary must pass the same `make`")]
+fn installing_with_a_different_make_panics() {
+    Logs::global();
+    Logs::install(|logs| tracing_subscriber::fmt().with_writer(logs).finish());
 }
 
 #[test]

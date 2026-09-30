@@ -330,7 +330,10 @@ pub(crate) mod tests {
     /// The test binary's global log capture: agentd's JSON lines, redacted
     /// and capped, of every event inside a [`Logs::tag`] span, at every
     /// level. Events outside one aren't formatted at all, so tests that
-    /// capture nothing aren't slowed down.
+    /// capture nothing aren't slowed down. It is the binary's global
+    /// subscriber, so [`init`] fails in a test that reaches it, as
+    /// `cli::main` does with a valid configuration: such a test runs
+    /// `agentd` as its own process, as `tests/binary.rs` does.
     pub(crate) fn global_logs() -> &'static Logs {
         Logs::install(|logs| subscriber(LogFormat::Json, EnvFilter::new("[test]=trace"), logs))
     }
@@ -378,27 +381,24 @@ pub(crate) mod tests {
     #[test]
     fn every_listed_name_is_redacted_in_human_output() {
         let out = capture(LogFormat::Human { ansi: false }, emit_everything);
-        for secret in SECRETS {
-            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        for secret in SECRETS.into_iter().chain(["span-verifier"]) {
+            out.assert_lacks(secret);
         }
-        assert!(!out.contains("span-verifier"), "{out}");
-        for name in REDACTED_FIELDS.iter().filter(|n| **n != "verifier") {
-            assert!(out.contains(&format!("{name}={REDACTED}")), "{name}: {out}");
+        for name in REDACTED_FIELDS {
+            out.assert_has(&format!("{name}={REDACTED}"));
         }
-        assert!(out.contains(&format!("verifier={REDACTED}")), "{out}");
-        assert!(out.contains("scope_key=\"dm:slack:T1:D1\""), "{out}");
-        assert!(out.contains("token_count=7"), "{out}");
-        assert!(out.contains("later=\"recorded-later\""), "{out}");
-        assert!(out.contains("handled a request"), "{out}");
+        out.assert_has("scope_key=\"dm:slack:T1:D1\"")
+            .assert_has("token_count=7")
+            .assert_has("later=\"recorded-later\"")
+            .assert_has("handled a request");
     }
 
     #[test]
     fn every_listed_name_is_redacted_in_json_output() {
         let out = capture(LogFormat::Json, emit_everything);
-        for secret in SECRETS {
-            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        for secret in SECRETS.into_iter().chain(["span-verifier"]) {
+            out.assert_lacks(secret);
         }
-        assert!(!out.contains("span-verifier"), "{out}");
         let line: Value = serde_json::from_str(out.trim()).unwrap();
         let fields = &line["fields"];
         for name in REDACTED_FIELDS.iter().filter(|n| **n != "verifier") {
@@ -449,8 +449,8 @@ pub(crate) mod tests {
         let out = capture(LogFormat::Human { ansi: false }, || {
             tracing::info!(log.target = "sqlx::query", kept = 1, "from log");
         });
-        assert!(out.contains("from log kept=1"), "{out}");
-        assert!(!out.contains("sqlx::query"), "{out}");
+        out.assert_has("from log kept=1")
+            .assert_lacks("sqlx::query");
     }
 
     #[test]
@@ -459,8 +459,8 @@ pub(crate) mod tests {
             tracing::info!(name = ?"a\nb", "line one\nforged \u{1b}[31m");
         });
         assert_eq!(out.lines().count(), 1, "{out}");
-        assert!(out.contains("line one\\nforged \\u{1b}[31m"), "{out}");
-        assert!(!out.contains('\u{1b}'), "{out}");
+        out.assert_has("line one\\nforged \\u{1b}[31m")
+            .assert_lacks("\u{1b}");
     }
 
     #[test]

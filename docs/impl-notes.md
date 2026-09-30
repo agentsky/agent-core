@@ -4436,6 +4436,19 @@ check subscribers themselves, so they still set one per test, through
 first there are always two dispatchers, and `tracing-core` then asks each of
 them about a new callsite, whichever thread hits it.
 
+A tag keeps only the lines whose span parents lead back to it: a line
+inside a span made before the tag, such as a task's own `instrument` span,
+or logged on another thread, such as by `spawn_blocking`, is missing from
+it. So an absence check reads `Logged::matching` a unique id or the whole
+snapshot, never a tag. `Logs::install` rebuilds the interest cache once
+`set_global_default` has installed the subscriber, since `Dispatch::new`
+rebuilt it before the global dispatcher was set and a callsite first hit in
+between stays off; and it panics when a later call passes a different
+`make`, which would otherwise be ignored. agentd's capture is the lib test
+binary's global subscriber, so `telemetry::init` fails in a lib test that
+reaches it; such a test runs `agentd` as a process, as `tests/binary.rs`
+does.
+
 ### A refused `--resume` is known only on a resumed process
 
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
