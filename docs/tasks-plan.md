@@ -180,6 +180,17 @@ description, and must pass T02's policy.
 - Rocket.Chat and MongoDB are on `egress` only.
 - Sandbox containers attach to `sandbox` only. Everything they reach, they reach
   through agentd.
+- Sandboxes can't reach each other. A private task's sandbox holds the
+  owner's files and a placeholder bound to its address (T33), and a channel
+  sandbox, which runs whatever other members prompt, shares its network. The
+  Compose `sandbox` network turns inter-container traffic off
+  (`com.docker.network.bridge.enable_icc: "false"`), which also cuts
+  sandboxes off from agentd, and `deploy/compose/isolate-sandbox.sh` adds
+  iptables rules to Docker's `DOCKER-USER` chain that let only new TCP
+  connections to agentd's sandbox address on 8080 and 8081 through
+  ([impl-notes](impl-notes.md#sandboxes-on-one-network-reach-each-other)).
+  Every deployment must enforce the same isolation, however it creates the
+  network: an internal network alone doesn't.
 - agentd listeners:
 
   | Listener | Binds | Reachable from | Serves |
@@ -193,7 +204,7 @@ description, and must pass T02's policy.
   address in any form, a public address inside the sandbox subnet, and a
   proxy or ctl address outside it (T10). As a second guard, the public listener also refuses
   connections from the sandbox subnet. T16 has a Docker test that a sandbox
-  reaches only ports 8080 and 8081.
+  reaches only ports 8080 and 8081, and not another sandbox.
 - A container's network identity is its IP on the `sandbox` network, read from
   `docker inspect` after start. The proxy and the ctl API map the source IP of
   each connection to a session, and reject any IP they don't know. Docker can
@@ -1329,15 +1340,19 @@ Design:
 Deliverables:
 
 - `images/sandbox/Dockerfile`:
-  - Debian stable slim, with `ca-certificates`, `git`, `curl`, `jq`,
-    `ripgrep` and `tini`.
-  - Claude Code installed with the native installer at the pinned
-    `CLAUDE_CODE_VERSION` build argument, with no Node.js.
+  - Debian stable slim, with `ca-certificates`, `git`, `curl`, `jq` and
+    `ripgrep`.
+  - Claude Code's native build at the pinned `CLAUDE_CODE_VERSION` build
+    argument, downloaded from the release bucket the native installer uses
+    and checked against a SHA-256 pinned per architecture, with no Node.js
+    ([impl-notes](impl-notes.md#the-native-installer-isnt-pinned)).
   - `agentctl` copied from a multi-stage Rust build.
   - A non-root user `agent` with uid 10001, and `WORKDIR /volume`.
   - `/bin/sh`, which `DockerSandbox::exec` runs every command through.
-  - Entrypoint `tini --`. The container idles (`sleep infinity`), and the
-    runner execs `claude` into it.
+  - No entrypoint, and the command `sleep infinity`: the sandbox crate
+    starts containers with Docker's init (`init: true`) as PID 1, and the
+    runner execs `claude` into them
+    ([impl-notes](impl-notes.md#one-init-dockers)).
 - `images/agentd/Dockerfile`: a multi-stage build of agentd on a distroless or
   Debian slim base, run as uid 10001, the sandbox user, so the volume
   directories agentd creates are writable in sandboxes
@@ -1348,7 +1363,11 @@ Deliverables:
     its own address, with the aliases from
     [Network and deployment shape](#network-and-deployment-shape).
   - The `sandbox` network (`internal: true`, with `name: sandbox` so Docker
-    doesn't prefix the project name) and the `egress` network.
+    doesn't prefix the project name, inter-container traffic off, and a
+    fixed bridge name) and the `egress` network (`name: egress`).
+  - `deploy/compose/isolate-sandbox.sh`, which adds, idempotently, and
+    removes the iptables rules that let sandboxes reach agentd's 8080 and
+    8081 and nothing else on their network.
   - A volume root on the host.
   - Access to the Docker socket for agentd, documented as a development-only
     shortcut with a note that production should use a socket proxy.
@@ -1370,7 +1389,7 @@ Acceptance:
 - `docker run --rm <image> which node` fails.
 - A Docker test, with the Compose networks, that a container on `sandbox`
   reaches agentd's ports 8080 and 8081, and not port 8443, Rocket.Chat,
-  MongoDB, the host or the internet.
+  MongoDB, the host, another container on `sandbox` or the internet.
 
 ### T17
 
@@ -1818,7 +1837,9 @@ Deliverables:
   (T17), validated with its `validate`; `image` fills every `SessionSpec`.
   agentd builds a `DockerSandbox` with its data directory, calls
   `reap_orphans` at startup, and documents the section in
-  `config/agentd.example.toml`.
+  `config/agentd.example.toml`, including that the network it names must
+  keep sandboxes from reaching each other
+  ([Network and deployment shape](#network-and-deployment-shape)).
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15
@@ -1903,8 +1924,8 @@ Acceptance:
   every request the CLI made, through the proxy. Blocking direct side traffic
   is T17's and T16's network tests' job, since this network isn't internal.
 
-Live check (manual, recorded in the PR): with the Compose stack from T16 and a
-real linked account, mention an agent in a channel on Rocket.Chat, run a turn
+Live check (manual, recorded in the PR): with the Compose stack from T16, its
+`isolate-sandbox.sh` rules in place, and a real linked account, mention an agent in a channel on Rocket.Chat, run a turn
 that uses Bash and returns a file, restart agentd, and continue the thread with
 `--resume`. That completes design milestone 2.
 
@@ -2361,6 +2382,10 @@ Deliverables:
   turn finds it (T23). Declined and expired outcomes are posted the same way.
 - The private session is never the owner's DM session, and its container is
   reaped right after the task.
+- The private sandbox shares the `sandbox` network with channel sandboxes,
+  so it relies on that network keeping sandboxes from reaching each other
+  ([Network and deployment shape](#network-and-deployment-shape)). The
+  deployment documentation this task touches says so.
 
 Acceptance, as tests named after the design's rules:
 

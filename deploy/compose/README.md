@@ -7,14 +7,25 @@ agentd, on the two networks from the plan's
 | Network | Kind | Members |
 | --- | --- | --- |
 | `egress` (`172.31.0.0/24`) | normal bridge | Rocket.Chat, MongoDB, agentd at `172.31.0.2` |
-| `sandbox` (`172.30.0.0/24`) | internal, and the host has no address on it | agentd at `172.30.0.2` (`cred-proxy.internal`, `agentctl.internal`), sandboxes |
+| `sandbox` (`172.30.0.0/24`, bridge `br-agent-sbx`) | internal, the host has no address on it, and its containers can't reach each other | agentd at `172.30.0.2` (`cred-proxy.internal`, `agentctl.internal`), sandboxes |
 
 agentd's public listener is `172.31.0.2:8443`, the credential proxy
 `172.30.0.2:8080` and the agentctl API `172.30.0.2:8081`, as in
 [`config/agentd.example.toml`](../../config/agentd.example.toml). A sandbox
-reaches those two ports and nothing else; `scripts/ci/compose-test.sh`
-checks that in CI. Docker names the networks `agent-core_egress` and
-`agent-core_sandbox`.
+reaches those two ports and nothing else: not the host, not the internet,
+and not another sandbox. `scripts/ci/compose-test.sh` checks that in CI.
+Docker knows the networks as `egress` and `sandbox`
+(`AGENT_CORE_EGRESS_NETWORK` and `AGENT_CORE_SANDBOX_NETWORK` change that).
+
+Keeping sandboxes apart takes two parts. `compose.yaml` turns
+inter-container traffic off on `sandbox`, so Docker drops everything
+between its containers, and that includes a sandbox's connections to
+agentd. [`isolate-sandbox.sh`](isolate-sandbox.sh) then adds iptables rules
+to Docker's `DOCKER-USER` chain that let new connections to
+`172.30.0.2:8080` and `:8081` through, and drop everything else on the
+bridge. Without the rules sessions can't reach the credential proxy, so a
+missing rule fails loudly rather than letting sandboxes talk to each other.
+The rules need root, and don't survive a reboot of the host.
 
 On the host, Rocket.Chat is at <http://localhost:3000> and agentd's public
 listener at `127.0.0.1:8443`. Both bind the loopback address only.
@@ -27,20 +38,32 @@ v2 plugin, and on Linux a user allowed to use the Docker socket.
 Settings and secrets live in `.env` here, which Compose reads and Git
 ignores. [`compose.yaml`](compose.yaml)'s header lists every variable.
 
+Each line below adds its key to `.env` only when the key isn't there yet,
+so running the block again keeps the master key and the admin password.
+
 ```bash
+touch .env
+
 # The group owning the Docker socket, as containers see it. agentd, which
 # runs as uid 10001, joins it to start sandboxes.
-echo "DOCKER_GID=$(docker run --rm -v /var/run/docker.sock:/sock busybox:1.37 stat -c %g /sock)" > .env
+grep -q '^DOCKER_GID=' .env ||
+  echo "DOCKER_GID=$(docker run --rm -v /var/run/docker.sock:/sock busybox:1.37 stat -c %g /sock)" >> .env
 
 # Build agentd's image and the sandbox image agentd starts sessions from.
 docker compose --profile sandbox build
 
 # The master key that encrypts agentd's stored secrets. Keep a copy: losing
 # it makes every stored secret unreadable.
-echo "AGENTD_MASTER_KEY=$(docker compose run --rm --no-deps agentd gen-key)" >> .env
+grep -q '^AGENTD_MASTER_KEY=' .env ||
+  echo "AGENTD_MASTER_KEY=$(docker compose run --rm --no-deps agentd gen-key)" >> .env
 
 # Rocket.Chat creates this admin on its first start.
-echo "RC_ADMIN_PASS=$(openssl rand -base64 18)" >> .env
+grep -q '^RC_ADMIN_PASS=' .env ||
+  echo "RC_ADMIN_PASS=$(openssl rand -hex 16)" >> .env
+
+# Let sandboxes reach agentd's 8080 and 8081, and nothing else on their
+# network. Again after every reboot of the host.
+sudo sh isolate-sandbox.sh
 
 docker compose up -d
 docker compose ps
@@ -54,6 +77,7 @@ agentd keeps its database and, later, the agents' volumes under `./data`
 (`AGENT_CORE_DATA`), owned by uid 10001 with mode 0700, so reading it on
 the host needs `sudo`. `docker compose down` stops the stack and keeps
 everything; `docker compose down -v` also deletes Rocket.Chat's database.
+`sudo sh isolate-sandbox.sh remove` takes the iptables rules out again.
 
 The Docker socket is mounted into agentd so it can start sandboxes. That is
 a development-only shortcut: whoever controls agentd then controls the
@@ -109,16 +133,14 @@ by default, whose addresses match `compose.yaml`. To change it, copy it here
 and point `AGENT_CORE_CONFIG` at the copy:
 
 ```bash
-cp ../../config/agentd.example.toml agentd.toml
-echo "AGENT_CORE_CONFIG=./agentd.toml" >> .env
+cp -n ../../config/agentd.example.toml agentd.toml
+grep -q '^AGENT_CORE_CONFIG=' .env || echo "AGENT_CORE_CONFIG=./agentd.toml" >> .env
 ```
 
 Keep the `[server]` and `[internal]` addresses unless you change
-`compose.yaml` to match. Add the manager's token from step 2 to `.env`:
-
-```bash
-echo "AGENTD_RC_MANAGER_TOKEN=<token>" >> .env
-```
+`compose.yaml` and `isolate-sandbox.sh` to match. Put the manager's token
+from step 2 in `.env` as `AGENTD_RC_MANAGER_TOKEN=<token>`, replacing the
+line if there is one already.
 
 The manager's user id and Rocket.Chat's address (`http://rocketchat:3000` on
 the `egress` network) go in the `[rocketchat]` section once agentd reads
@@ -127,7 +149,8 @@ one. For sandboxes, the `[sandbox]` section, once agentd reads it, takes:
 ```toml
 [sandbox]
 image = "agent-core/sandbox:dev"
-network = "agent-core_sandbox"
+# The default; the name compose.yaml gives the network.
+network = "sandbox"
 # agentd runs in a container, and Docker resolves bind mounts on the host,
 # so this is ./data as the Docker daemon sees it: `realpath data`.
 host_data_dir = "/absolute/path/to/deploy/compose/data"
@@ -174,14 +197,18 @@ what was run and what was seen, with tokens and ids redacted.
 ## Checking the networks
 
 `scripts/ci/compose-test.sh` checks the sandbox image and what a container
-on the `sandbox` network reaches. It runs its own Compose project,
-`agent-core-test`, but the subnets are fixed, so stop this stack first:
+on the `sandbox` network reaches, another sandbox included. It runs its own
+Compose project, `agent-core-test`, with its own network names, but the
+subnets and the bridge name are fixed, so stop this stack first. It needs
+the rules from `isolate-sandbox.sh`:
 
 ```bash
 docker compose down
+sudo sh isolate-sandbox.sh
 sh ../../scripts/ci/compose-test.sh
 ```
 
 `docker compose run --rm sandbox bash` opens a shell in the sandbox image on
-the `sandbox` network, confined the way agentd confines sessions, to try
-things by hand.
+the `sandbox` network, to try things by hand. It has the network, init,
+read-only root and dropped capabilities that agentd gives sessions, but
+not their mounts, environment or resource limits.

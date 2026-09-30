@@ -6,7 +6,11 @@
 # - `egress` is a normal bridge. Rocket.Chat and MongoDB are on it only.
 # - `sandbox` is internal, so it has no route out, and the host has no
 #   address on it either (inhibit_ipv4), so a sandbox can't reach services
-#   listening on the host. Sandboxes attach to it only.
+#   listening on the host. Sandboxes attach to it only. Inter-container
+#   traffic is off on it (enable_icc), so sandboxes can't reach each other;
+#   that also cuts them off from agentd until isolate-sandbox.sh, next to
+#   this file, lets them reach agentd's ports 8080 and 8081 through
+#   iptables. Its bridge has a fixed name, br-agent-sbx, for those rules.
 # - agentd is on both, with a static address on each, and binds each
 #   listener to its own address (config/agentd.example.toml uses these):
 #   the public listener on 172.31.0.2:8443, the credential proxy on
@@ -14,8 +18,9 @@
 #   containers get addresses from the upper half of each subnet (ip_range),
 #   so one started first can't take agentd's.
 #
-# Compose prefixes the project name, so Docker knows the networks as
-# `agent-core_egress` and `agent-core_sandbox`.
+# The networks set `name:`, so Docker knows them as `sandbox` and `egress`
+# (the sandbox crate's default `[sandbox] network`), not with the project
+# name as a prefix.
 #
 # Variables, read from the environment or from .env next to this file:
 #
@@ -26,6 +31,9 @@
 #                            example, whose addresses match this file.
 #   AGENT_CORE_DATA          agentd's data directory on the host. Default:
 #                            ./data.
+#   AGENT_CORE_SANDBOX_NETWORK, AGENT_CORE_EGRESS_NETWORK
+#                            Docker's names for the two networks. Default:
+#                            sandbox and egress.
 #   RC_ADMIN_USERNAME, RC_ADMIN_PASS, RC_ADMIN_EMAIL
 #                            Rocket.Chat's first admin, created on the first
 #                            start when RC_ADMIN_PASS is set.
@@ -148,7 +156,9 @@ services:
   # Not a running service: `docker compose --profile sandbox build` builds
   # the image agentd starts sessions from, and
   # `docker compose run --rm sandbox bash` opens a shell in it on the
-  # sandbox network, confined the way agentd confines sessions.
+  # sandbox network. It has the network, init, read-only root, tmpfs and
+  # dropped capabilities agentd gives sessions, but none of their mounts,
+  # environment or resource limits.
   sandbox:
     profiles:
       - sandbox
@@ -156,6 +166,7 @@ services:
       context: ../..
       dockerfile: images/sandbox/Dockerfile
     image: agent-core/sandbox:dev
+    init: true
     read_only: true
     tmpfs:
       - /tmp:exec
@@ -168,6 +179,7 @@ services:
 
 networks:
   egress:
+    name: ${AGENT_CORE_EGRESS_NETWORK:-egress}
     enable_ipv6: false
     ipam:
       config:
@@ -175,10 +187,13 @@ networks:
           ip_range: 172.31.0.128/25
           gateway: 172.31.0.1
   sandbox:
+    name: ${AGENT_CORE_SANDBOX_NETWORK:-sandbox}
     internal: true
     enable_ipv6: false
     driver_opts:
+      com.docker.network.bridge.name: br-agent-sbx
       com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_icc: "false"
     ipam:
       config:
         - subnet: 172.30.0.0/24

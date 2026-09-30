@@ -283,7 +283,9 @@ jobs:
   # scripts/ci/compose-test.sh checks the sandbox image (the pinned
   # `claude --version`, uid 10001, no `node`) and brings the Compose stack
   # up to check that a container on its `sandbox` network reaches agentd's
-  # ports 8080 and 8081 and nothing else. images/, deploy/ and the Rust code
+  # ports 8080 and 8081 and nothing else, another sandbox included. That
+  # needs the iptables rules from deploy/compose/isolate-sandbox.sh, added
+  # first and taken out again at the end. images/, deploy/ and the Rust code
   # all count as code for the `changes` job, so a change to any of them
   # runs it. The images build for x86_64 only.
   images:
@@ -306,8 +308,21 @@ jobs:
           DOCKER_GID="$(stat -c %g /var/run/docker.sock)" \
             docker compose -f deploy/compose/compose.yaml --profile sandbox build
 
+      - name: Add the sandbox isolation rules
+        run: |
+          sudo sh deploy/compose/isolate-sandbox.sh
+          sudo iptables -S DOCKER-USER
+          sudo iptables -S AGENT-CORE-SANDBOX
+
       - name: Check the images and the Compose networks
         run: sh scripts/ci/compose-test.sh
+
+      - name: Remove the sandbox isolation rules
+        if: always()
+        run: |
+          sudo sh deploy/compose/isolate-sandbox.sh remove
+          sudo iptables -S DOCKER-USER
+          ! sudo iptables -n -L AGENT-CORE-SANDBOX >/dev/null 2>&1
 
   # agentctl ships in the sandbox image as one static binary, with no TLS
   # and no C dependencies, so the musl target needs no system packages.

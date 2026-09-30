@@ -2518,22 +2518,51 @@ and otherwise gives the manager `admin` for development. What least
 privilege looks like on the Community Edition is added to the design's
 open question on the manager's role, for T11's live check to settle.
 
-### The native installer and a read-only image
+### The native installer isn't pinned
 
-**Issue.** `https://claude.ai/install.sh` downloads the latest build, which
-runs `claude install <version>`: the pinned build goes to
-`~/.local/share/claude/versions/<version>`, linked from
-`~/.local/bin/claude`. Sessions run with a `HOME` of their own on a
-read-only root, so nothing under the build's `HOME` is on their path.
+**Issue.** `https://claude.ai/install.sh` redirects to
+`https://downloads.claude.ai/claude-code-releases/bootstrap.sh`, which
+downloads the latest build and runs `claude install <version>`: the pinned
+build goes to `~/.local/share/claude/versions/<version>`, linked from
+`~/.local/bin/claude`. The first image ran that as root, so whatever the
+latest script and build were at build time ran with root in the image,
+and nothing this repository pins said which bytes `<version>` was. Sessions
+also run with a `HOME` of their own on a read-only root, so nothing under
+the build's `HOME` is on their path.
 
-**Solution.** The image runs the installer with a scratch `HOME`, copies
-the resolved binary to `/usr/local/bin/claude`, and removes the scratch
-directory. The 2.1.285 binary says the auto-updater leaves a copy that
-isn't a link into `versions/` alone, and the image sets
-`DISABLE_AUTOUPDATER=1` as well. The build fails unless the installed
-binary prints `<CLAUDE_CODE_VERSION> (Claude Code)`. That `ARG` in
-`images/sandbox/Dockerfile` is the only place the version is written: the
-CI check reads it from there.
+**Solution.** The image skips the installer and downloads
+`<releases>/<version>/<platform>/claude` itself, as `nobody` in a stage of
+its own, with `platform` `linux-x64` or `linux-arm64` from BuildKit's
+`TARGETARCH`, the layout the installer and the binary's updater use (the
+2.1.285 binary names `https://downloads.claude.ai/claude-code-releases` as
+its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
+`CLAUDE_CODE_SHA256_ARM64`, pinned next to `CLAUDE_CODE_VERSION`, and print
+`<version> (Claude Code)`; only then is it copied to
+`/usr/local/bin/claude`. The checksums are `platforms.<platform>.checksum`
+in the release's `manifest.json`; for 2.1.285 the manifest was read from
+the release bucket, and the `linux-x64` binary downloaded from it hashed to
+the manifest's value and printed `2.1.285 (Claude Code)`. A copy outside
+`~/.local/bin` is left alone by the auto-updater, which
+`DISABLE_AUTOUPDATER=1` also turns off. `CLAUDE_CODE_VERSION` is still the
+only place the version is written: the CI check reads it from there.
+
+The base images (`rust`, `debian`, distroless `cc`) are pinned by the
+digests the CI build log printed for their tags. The Compose file's
+third-party images (Rocket.Chat, MongoDB, busybox) stay tags.
+
+### One init, Docker's
+
+**Issue.** The first image had `ENTRYPOINT ["/usr/bin/tini", "--"]`, and
+the sandbox crate's `container_config` sets `init: true` and the command
+`sleep infinity` without an entrypoint. A session container therefore ran
+Docker's init, which ran tini, which ran `sleep`.
+
+**Solution.** The crate's configuration is what production runs, so the
+image has no entrypoint and no `tini` package, and keeps `CMD ["sleep",
+"infinity"]` for a plain `docker run`. The Compose `sandbox` service sets
+`init: true` to match. The image check asserts that the image's entrypoint
+is empty and its command `sleep infinity`, and that PID 1 of a container
+started with `--init` is `/sbin/docker-init -- sleep infinity`.
 
 ### agentd's data directory is created by root
 
@@ -2545,6 +2574,43 @@ database.
 to `10001:10001` with mode 0700 before agentd starts, through
 `depends_on` with `service_completed_successfully`. Only the top directory
 is changed; agentd owns what it creates inside.
+
+### Sandboxes on one network reach each other
+
+**Issue.** The first stack left inter-container traffic on for the
+`sandbox` network, and a reviewer showed a container on it connecting to a
+listener in another container there. Every sandbox shares that network, so
+a channel sandbox driven by any member's prompt could reach a private
+task's sandbox, or anything a session listens on. Turning inter-container
+traffic off (`com.docker.network.bridge.enable_icc: "false"`) stops that,
+but also stops sandboxes reaching agentd, which is on the same bridge.
+
+**Solution.** Both: `compose.yaml` turns inter-container traffic off and
+fixes the bridge's name (`com.docker.network.bridge.name: br-agent-sbx`),
+and `deploy/compose/isolate-sandbox.sh` adds a chain,
+`AGENT-CORE-SANDBOX`, jumped to from `DOCKER-USER` for traffic in and out
+of that bridge. It accepts new and established TCP connections to
+`172.30.0.2` on 8080 and 8081 and agentd's replies, and drops the rest.
+Docker evaluates `DOCKER-USER` before its own rules and never rewrites
+it, and an accept there skips Docker's inter-container drop. Without the
+rules the stack fails closed: sessions can't reach the credential proxy,
+rather than reaching each other. The chain is rebuilt on each run and the
+jump added once, so the script is idempotent, and `remove` takes both out.
+Bridged traffic only passes through iptables with `br_netfilter`
+(`net.bridge.bridge-nf-call-iptables=1`), which Docker turns on for a
+network with inter-container traffic off. The rules name the bridge, so
+they can go in before the network exists, but not survive a reboot.
+
+On Docker 29.3.1 with busybox stand-ins on a network built like `sandbox`:
+with inter-container traffic on and no rules a peer's listener answered;
+off and no rules, agentd's 8080 and 8081 didn't either; off with the rules,
+8080 and 8081 answered while agentd's 8443, the peer, and agentd
+connecting out to the peer didn't; on with the rules, the peer didn't
+answer either. `compose-test.sh`, run locally with stand-in images for
+agentd and the sandbox and the real Rocket.Chat and MongoDB, passed with
+the rules, and with inter-container traffic on and no rules failed exactly
+the new peer check. The plan's network section makes the same isolation a
+requirement for every deployment.
 
 ### What the network test checks, and how
 
@@ -2561,3 +2627,17 @@ The distroless agentd image has no shell or client for a health check, so
 the test polls `/healthz` with curl from a container on `egress`. The
 cloud metadata address `169.254.169.254` is checked as well, since the
 design blocks it.
+
+Three targets have no control, because nothing answers there by
+construction: agentd's sandbox address on 8443 (the public listener binds
+the egress address only), the sandbox gateway (the host has no address on
+the bridge, which the test checks with `ip addr` in the host's namespace),
+and the metadata address (runners have no metadata service to show). For
+sandbox-to-sandbox traffic a busybox listener starts on `egress`, answers a
+probe there, then moves to `sandbox` and must not answer the sandbox
+probe. The test overrides the networks' names
+(`AGENT_CORE_SANDBOX_NETWORK`, `AGENT_CORE_EGRESS_NETWORK`), which default
+to `sandbox` and `egress` as the plan and the sandbox crate's default
+expect. It sets `RC_ADMIN_PASS` and logs in as that admin through
+`/api/v1/login` from a container on `egress`, as README.md's step 2 does
+in a browser.

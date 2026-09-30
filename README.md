@@ -63,7 +63,8 @@ builds the sandbox image agentd starts sessions from. Its README walks
 through bringing it up, setting up the Rocket.Chat manager, configuring
 agentd, and the manual live checks. The images are built from
 [`images/sandbox`](images/sandbox/Dockerfile), which pins the Claude Code
-version with the `CLAUDE_CODE_VERSION` build argument, and
+version with the `CLAUDE_CODE_VERSION` build argument and checks the
+download against a pinned SHA-256, and
 [`images/agentd`](images/agentd/Dockerfile).
 
 ## CI
@@ -96,11 +97,13 @@ locally, with Docker running, as
 containers.
 
 The `images` job builds both images through the Compose file, without
-pushing them, and runs `scripts/ci/compose-test.sh`: the sandbox image
-prints the pinned `claude --version`, runs as uid 10001 and has no `node`,
-and a container on the Compose `sandbox` network reaches agentd's ports 8080
-and 8081 but not its public port, Rocket.Chat, MongoDB, the host or the
-internet. `deploy/compose/README.md` says how to run it locally.
+pushing them, adds the iptables rules from
+`deploy/compose/isolate-sandbox.sh`, and runs `scripts/ci/compose-test.sh`:
+the sandbox image prints the pinned `claude --version`, runs as uid 10001
+and has no `node`, and a container on the Compose `sandbox` network reaches
+agentd's ports 8080 and 8081 but not its public port, Rocket.Chat, MongoDB,
+the host, another sandbox or the internet. `deploy/compose/README.md` says
+how to run it locally.
 
 A change that touches only documentation (Markdown files and `LICENSE`
 outside `crates/` and `images/`, as decided by `scripts/ci/docs-only.sh`)
