@@ -2541,7 +2541,9 @@ its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
 `/usr/local/bin/claude`. The checksums are `platforms.<platform>.checksum`
 in the release's `manifest.json`; for 2.1.285 the manifest was read from
 the release bucket, and the `linux-x64` binary downloaded from it hashed to
-the manifest's value and printed `2.1.285 (Claude Code)`. A copy outside
+the manifest's value and printed `2.1.285 (Claude Code)`. The CI build
+downloads it from `downloads.claude.ai` and `sha256sum` reports it OK.
+A copy outside
 `~/.local/bin` is left alone by the auto-updater, which
 `DISABLE_AUTOUPDATER=1` also turns off. `CLAUDE_CODE_VERSION` is still the
 only place the version is written: the CI check reads it from there.
@@ -2609,8 +2611,29 @@ connecting out to the peer didn't; on with the rules, the peer didn't
 answer either. `compose-test.sh`, run locally with stand-in images for
 agentd and the sandbox and the real Rocket.Chat and MongoDB, passed with
 the rules, and with inter-container traffic on and no rules failed exactly
-the new peer check. The plan's network section makes the same isolation a
-requirement for every deployment.
+the new peer check. In CI (Docker 28.0.4 on ubuntu-24.04) the script
+adds the rules with `sudo` before the test and removes them after it, and
+the real stack passes. The plan's network section makes the same
+isolation a requirement for every deployment.
+
+### The sandbox bridge keeps an IPv6 link-local address
+
+**Issue.** The first test bound its host listener to IPv4 and checked
+nothing about IPv6. With `enable_ipv6: false`, Docker 28.0.4 on the CI
+runner still left the kernel's link-local address (`fe80::/64`, scope
+link) on the sandbox bridge, so "the host has no address on the network"
+holds for IPv4 only. No Compose or driver option removes it, and a
+host-wide sysctl to stop it would reach every interface.
+
+**Solution.** Docker turns IPv6 off on a container's interface on a
+network without IPv6 (`disable_ipv6` is 1 on `eth0`), and `/proc/sys` is
+read-only in a container without capabilities, so a sandbox has no IPv6
+address to reach the bridge's link-local one from. The test checks both
+sides: in a sandbox, `disable_ipv6` is 1 on `eth0` and
+`/proc/net/if_inet6` lists only `lo`; on the host, `ip addr` in the host's
+namespace shows no IPv4 address on the bridge and no IPv6 address but the
+link-local one. The host listener binds `::`, dual-stack, where the host
+has IPv6.
 
 ### What the network test checks, and how
 

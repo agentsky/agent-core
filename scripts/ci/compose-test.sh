@@ -12,17 +12,18 @@
 # 3. The Compose networks: a container on `sandbox` reaches agentd's proxy
 #    and ctl ports (8080 and 8081), and not its public port (8443),
 #    Rocket.Chat, MongoDB, the host, another container on `sandbox`, a
-#    cloud metadata address or the internet, and has no IPv6 address but
-#    loopback. The host has no address on the sandbox bridge. Every
-#    unreachable target that exists is first shown reachable from the
-#    `egress` network, so a check can't pass because its target is down or
-#    the probe is broken: agentd's 8443, Rocket.Chat and MongoDB by address
-#    and by name, a listener on the host's wildcard address, the peer
-#    container's listener before it moves to `sandbox`, and the internet.
+#    cloud metadata address or the internet, and has IPv6 off on eth0 with
+#    no IPv6 address but loopback's. The host has no address on the sandbox
+#    bridge but the IPv6 link-local one. Every unreachable target that
+#    exists is first shown reachable from the `egress` network, so a check
+#    can't pass because its target is down or the probe is broken: agentd's
+#    8443, Rocket.Chat and MongoDB by address and by name, a listener on the
+#    host's wildcard address, the peer container's listener before it moves
+#    to `sandbox`, and the internet.
 #    Three targets have no control because nothing answers there by
 #    construction: agentd's sandbox address on 8443 (the public listener
 #    binds its egress address only), the sandbox gateway 172.30.0.1 (the
-#    host has no address on the bridge, which is checked), and
+#    host has no IPv4 address on the bridge, which is checked), and
 #    169.254.169.254 (CI and most hosts have no metadata service; the
 #    sandbox has no route to it, as to the internet).
 #
@@ -209,13 +210,18 @@ fi
 echo "== Compose networks"
 
 # The host's addresses on the sandbox bridge, as a container in the host's
-# network namespace lists them: none, of either family.
-bridge_addresses=$(docker run --rm --network host busybox:1.37 ip addr show dev "$sandbox_bridge" 2>&1) \
-    || bridge_addresses="no bridge $sandbox_bridge: $bridge_addresses"
-if printf '%s\n' "$bridge_addresses" | grep -q 'inet\|no bridge'; then
-    fail "the host has an address on $sandbox_bridge: $bridge_addresses"
+# network namespace lists them: no IPv4 address, and no IPv6 address but
+# the link-local one the kernel gives every interface. Sandboxes have IPv6
+# off (the no-ipv6 check below), so they can't reach that one.
+if bridge_addresses=$(docker run --rm --network host busybox:1.37 ip addr show dev "$sandbox_bridge" 2>&1); then
+    unexpected=$(printf '%s\n' "$bridge_addresses" | grep -E '^ *inet' | grep -Ev '^ *inet6 fe80:[^ ]* scope link') || true
 else
-    pass "the host has no IPv4 or IPv6 address on $sandbox_bridge"
+    unexpected="no bridge $sandbox_bridge: $bridge_addresses"
+fi
+if [ -n "$unexpected" ]; then
+    fail "the host has an address on $sandbox_bridge: $unexpected"
+else
+    pass "the host has no IPv4 address and only a link-local IPv6 address on $sandbox_bridge"
 fi
 
 egress_ip() {
@@ -234,8 +240,8 @@ peer_egress=$(egress_ip "$peer")
 # Runs in a container with each argument a check, "<expected> <target>":
 # "open <host> <port>" or "closed <host> <port>" for a TCP connection within
 # five seconds, "resolves <name>" or "unresolved <name>" for DNS, and
-# "no-ipv6 addresses" for no IPv6 address but loopback's. Exits 1 if any
-# check fails.
+# "no-ipv6 eth0" for IPv6 turned off on eth0 and no IPv6 address but
+# loopback's. Exits 1 if any check fails.
 probe='
 failed=0
 for check in "$@"; do
@@ -257,10 +263,13 @@ for check in "$@"; do
         fi
         ;;
     no-ipv6)
+        actual=no-ipv6
+        switch=/proc/sys/net/ipv6/conf/$target/disable_ipv6
+        if [ -e "$switch" ] && [ "$(cat "$switch")" != 1 ]; then
+            actual="IPv6 is on for $target"
+        fi
         if [ -e /proc/net/if_inet6 ] && grep -v " lo$" /proc/net/if_inet6 | grep -q .; then
-            actual="IPv6 on $(grep -v " lo$" /proc/net/if_inet6 | tr -s " " | cut -d" " -f6 | sort -u | tr "\n" " ")"
-        else
-            actual=no-ipv6
+            actual="IPv6 addresses on $(grep -v " lo$" /proc/net/if_inet6 | tr -s " " | cut -d" " -f6 | sort -u | tr "\n" " ")"
         fi
         ;;
     *)
@@ -316,7 +325,7 @@ if compose run --rm --no-deps -T sandbox bash -c "$probe" probe \
     "closed 169.254.169.254 80" \
     "unresolved example.com" \
     "closed 1.1.1.1 443" \
-    "no-ipv6 addresses"; then
+    "no-ipv6 eth0"; then
     pass "a sandbox reaches agentd's 8080 and 8081 only"
 else
     fail "the sandbox network's reachability is wrong"
