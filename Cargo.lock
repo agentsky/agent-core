@@ -628,7 +628,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "wiremock",
 ]
@@ -1906,7 +1905,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2658,6 +2656,8 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]

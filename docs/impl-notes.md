@@ -4421,6 +4421,21 @@ callsite first.
 binary, once, before any test reaches the pool, and the test reads only the
 lines naming its own session, as the egress log test does.
 
+The other log captures, in agentd's sweeper, command and telemetry tests,
+runner's log test and cred-proxy's logging and egress tests, had the same
+flaw or the same ad hoc fix. Every capture now goes through the shared
+`testkit::Logs`: one global subscriber per test binary (`Logs::global`, or
+`Logs::install` with the binary's own, as agentd installs its JSON one),
+read per test by a field only that test logs (`Logged::matching`) or by a
+span it enters on its own thread (`Logs::tag`). agentd's capture formats only
+events inside such a span, so tests that capture nothing aren't slowed down.
+`Logged::assert_lacks` refuses an empty capture, and every absence check
+sits next to a presence check on the line it expects. The telemetry tests
+check subscribers themselves, so they still set one per test, through
+`Logs::scoped` on the global capture: with the global subscriber registered
+first there are always two dispatchers, and `tracing-core` then asks each of
+them about a new callsite, whichever thread hits it.
+
 ### A refused `--resume` is known only on a resumed process
 
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by

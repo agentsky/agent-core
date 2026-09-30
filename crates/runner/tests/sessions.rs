@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use core_types::{
@@ -23,9 +22,8 @@ use sandbox::{
 };
 use secrecy::SecretString;
 use store::{Sealer, Store};
-use testkit::{FakeAnthropic, Turn};
+use testkit::{FakeAnthropic, Logs, Turn};
 use tokio::sync::Notify;
-use tracing_subscriber::fmt::MakeWriter;
 
 struct TempDir(PathBuf);
 
@@ -277,7 +275,7 @@ struct Harness {
     manager: SessionManager<Hooks>,
     agent: AgentId,
     faults: Arc<Faults>,
-    logs: &'static Captured,
+    logs: &'static Logs,
 }
 
 impl Harness {
@@ -289,7 +287,7 @@ impl Harness {
         turns: &[Turn],
         change: impl FnOnce(&mut ProcessConfig, &mut PoolConfig),
     ) -> Self {
-        let logs = Captured::global();
+        let logs = Logs::global();
         let bin = testkit::fake_claude_path();
         let dir = TempDir::new();
         let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
@@ -461,57 +459,6 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
     while !check() {
         assert!(std::time::Instant::now() < deadline, "timed out: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn global() -> &'static Self {
-        static LOGS: OnceLock<Captured> = OnceLock::new();
-        LOGS.get_or_init(|| {
-            let captured = Self::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .with_ansi(false)
-                .with_writer(captured.clone())
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).unwrap();
-            captured
-        })
-    }
-
-    fn about(&self, session: SessionId) -> String {
-        let text = String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
-            .into_owned();
-        let session = format!("session={session}");
-        text.lines()
-            .filter(|line| line.contains(&session))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'w> MakeWriter<'w> for Captured {
-    type Writer = Self;
-
-    fn make_writer(&'w self) -> Self::Writer {
-        self.clone()
     }
 }
 
@@ -1356,9 +1303,11 @@ async fn a_normal_stop_is_not_logged_as_a_death() {
     h.manager.stop(session.id).await;
     assert!(!h.manager.is_warm(session.id));
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let logs = h.logs.about(session.id);
-    assert!(logs.contains("stopped a session container"), "{logs}");
-    assert!(!logs.contains("a session container died"), "{logs}");
+    h.logs
+        .snapshot()
+        .matching(&format!("session={}", session.id))
+        .assert_has("stopped a session container")
+        .assert_lacks("a session container died");
     let stops = h
         .events()
         .iter()

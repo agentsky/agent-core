@@ -322,44 +322,27 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use std::io;
-    use std::sync::{Arc, Mutex};
+
+    use testkit::{Logged, Logs};
 
     use super::*;
 
-    /// A writer that collects everything written to it.
-    #[derive(Clone, Default)]
-    pub(crate) struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl Captured {
-        pub(crate) fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
+    /// The test binary's global log capture: agentd's JSON lines, redacted
+    /// and capped, of every event inside a [`Logs::tag`] span, at every
+    /// level. Events outside one aren't formatted at all, so tests that
+    /// capture nothing aren't slowed down.
+    pub(crate) fn global_logs() -> &'static Logs {
+        Logs::install(|logs| subscriber(LogFormat::Json, EnvFilter::new("[test]=trace"), logs))
     }
 
-    impl io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+    fn capture(format: LogFormat, f: impl FnOnce()) -> Logged {
+        capture_filtered(format, "trace", f)
     }
 
-    impl<'w> MakeWriter<'w> for Captured {
-        type Writer = Self;
-
-        fn make_writer(&'w self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture(format: LogFormat, f: impl FnOnce()) -> String {
-        let captured = Captured::default();
-        let subscriber = subscriber(format, EnvFilter::new("trace"), captured.clone());
-        tracing::subscriber::with_default(subscriber, f);
-        captured.text()
+    fn capture_filtered(format: LogFormat, filter: &str, f: impl FnOnce()) -> Logged {
+        let logs = Logs::default();
+        global_logs().scoped(subscriber(format, EnvFilter::new(filter), logs.clone()), f);
+        logs.snapshot()
     }
 
     fn emit_everything() {
@@ -494,14 +477,11 @@ pub(crate) mod tests {
 
     #[test]
     fn the_filter_applies() {
-        let captured = Captured::default();
-        let subscriber = subscriber(LogFormat::Json, EnvFilter::new("warn"), captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let out = capture_filtered(LogFormat::Json, "warn", || {
             tracing::info!("hidden");
             tracing::warn!("shown");
         });
-        let out = captured.text();
-        assert!(!out.contains("hidden") && out.contains("shown"), "{out}");
+        out.assert_has("shown").assert_lacks("hidden");
     }
 
     #[test]
@@ -518,9 +498,7 @@ pub(crate) mod tests {
         let formats = [LogFormat::Human { ansi: false }, LogFormat::Json];
         for filter in filters {
             for format in formats {
-                let captured = Captured::default();
-                let subscriber = subscriber(format, EnvFilter::new(filter), captured.clone());
-                tracing::subscriber::with_default(subscriber, || {
+                let out = capture_filtered(format, filter, || {
                     let span = tracing::info_span!("turn");
                     let _entered = span.enter();
                     log::debug!(
@@ -531,12 +509,17 @@ pub(crate) mod tests {
                     tracing::debug!(target: "bollard::docker", "agentctl-secret");
                     log::info!(target: "bollard::docker", "bollard-info");
                     log::debug!(target: "sandbox::probe", "other-debug");
+                    log::trace!(target: "sandbox::probe", "other-trace");
+                    tracing::debug!(target: "sandbox::probe", "other-tracing-debug");
                 });
-                let out = captured.text();
-                assert!(!out.contains("agentctl-secret"), "{filter}: {out}");
-                assert!(out.contains("bollard-info"), "{filter}: {out}");
+                out.assert_has("bollard-info")
+                    .assert_lacks("agentctl-secret");
                 if matches!(filter, "trace" | "debug" | "[turn]=trace") {
-                    assert!(out.contains("other-debug"), "{filter}: {out}");
+                    out.assert_has("other-debug")
+                        .assert_has("other-tracing-debug");
+                }
+                if matches!(filter, "trace" | "[turn]=trace") {
+                    out.assert_has("other-trace");
                 }
             }
         }
