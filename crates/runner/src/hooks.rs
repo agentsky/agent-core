@@ -130,7 +130,8 @@ pub trait TurnHooks: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Any failure. The process isn't started and the turn fails.
+    /// Any failure. The process isn't started, the turn fails, and the
+    /// session's container is stopped. A panic is handled the same way.
     async fn process_starting(
         &self,
         session: &Session,
@@ -175,7 +176,8 @@ pub trait TurnHooks: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Any failure. It is logged, and the stop goes ahead.
+    /// Any failure. It is logged, and the stop goes ahead. A panic is
+    /// handled the same way.
     async fn process_stopping(
         &self,
         session: &Session,

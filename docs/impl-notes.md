@@ -3925,7 +3925,8 @@ runs after the turns queued before it; turns queued after it fail with
 
 **Issue.** The plan doesn't say what a failing hook does.
 
-**Solution.** A failed `process_starting` fails the turn. A failed
+**Solution.** A failed `process_starting` fails the turn and stops the
+container, and so does a process that fails to start. A failed
 `turn_starting` fails it without sending it, and `turn_finished` is still
 called, since the placeholder may have been pointed. A failed
 `turn_finished` is logged and returned in `TurnReport::finished`, and the
@@ -3933,13 +3934,22 @@ process is stopped (with `process_stopping`), since the runner can't tell
 whether the placeholder is still pointed. A failed `process_stopping` is
 logged and the stop goes ahead.
 
-A panic is caught at the turn: one in `turn_starting` or the send still has
-`turn_finished` called, and after any panic, `turn_finished`'s included, the
-turn is recorded if it has an outcome and the process is stopped as after a
-failed `turn_finished`. Only then does the panic resume, failing the turn
-with `RunnerError::TurnTask`. Otherwise the next turn would reuse a process
-whose placeholder may still be pointed, and the store would keep
-`maybe_started` for a turn whose outcome was known. The slot's release
+A panic in `process_starting` is taken for its failure, and one in
+`process_stopping` is logged and the stop goes ahead: otherwise a panic in
+`process_stopping` left the process it was stopping running, taken out of
+the session, and the next turn started a second process in the same
+container. It would also have ended the event follower or the reaper for
+good. A process that panics while starting has `process_stopping` called
+and its container stopped, since it may have been started, and the turn
+fails with `RunnerError::TurnTask`.
+
+A panic in a turn is caught at the turn: one in `turn_starting` or the send
+still has `turn_finished` called, and after any panic, `turn_finished`'s
+included, the turn is recorded if it has an outcome and the process is
+stopped as after a failed `turn_finished`. Only then does the panic resume,
+failing the turn with `RunnerError::TurnTask`. Otherwise the next turn would
+reuse a process whose placeholder may still be pointed, and the store would
+keep `maybe_started` for a turn whose outcome was known. The slot's release
 wakes waiters for an idle container from a drop guard, so a panic doesn't
 leave a session waiting on the caps until the idle timeout.
 
@@ -3960,6 +3970,18 @@ container's address is read when a process starts in it, after the
 container is held, so a container whose address can't be read goes the
 same way.
 
+### A normal stop reported as a death
+
+**Issue.** Stopping a container makes the sandbox report it dead, and the
+event can arrive while `Sandbox::stop` is still returning. The pool forgot
+the container only once the stop returned, so the event follower found it
+still tracked and alive, and logged a container death, with a warning, on
+nearly every normal stop.
+
+**Solution.** A session marks its container dead before it stops it. The
+follower takes a dead container's death as already handled, and a stop that
+fails leaves the container marked dead, as before.
+
 ### A refused `--resume` is known only on a resumed process
 
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
@@ -3968,10 +3990,15 @@ Acting on that shape for any process would mark a session unstarted, and
 run its turn again, after a `--session-id` start or a warm process's later
 turn ended that way for some other reason.
 
-**Solution.** The runner treats it as a refusal only on the turn that
-started the process with `SessionStart::Resume`. Any other turn with that
+**Solution.** The runner treats it as a refusal only on the first turn sent
+to a process started with `SessionStart::Resume`. Any other turn with that
 outcome is recorded like any turn without `init_seen`, which leaves
-`maybe_started` as it was.
+`maybe_started` as it was. The process remembers that nothing was sent to it
+yet, and the send clears it: a resumed process whose first turn failed in
+`turn_starting` is kept warm, and the refusal comes on the next turn, which
+didn't start the process. Judged by whether the turn started the process,
+that refusal came back as an error result, the turn didn't run again, and
+its message was lost.
 
 ### What is durable
 

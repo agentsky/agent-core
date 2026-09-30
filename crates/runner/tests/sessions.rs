@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use core_types::{
@@ -24,6 +25,7 @@ use secrecy::SecretString;
 use store::{Sealer, Store};
 use testkit::{FakeAnthropic, Turn};
 use tokio::sync::Notify;
+use tracing_subscriber::fmt::MakeWriter;
 
 struct TempDir(PathBuf);
 
@@ -64,6 +66,8 @@ struct Faults {
     fail_turn_finished: AtomicBool,
     panic_turn_starting: AtomicBool,
     panic_turn_finished: AtomicBool,
+    panic_process_starting: AtomicBool,
+    panic_process_stopping: AtomicBool,
 }
 
 impl Faults {
@@ -92,6 +96,9 @@ impl TurnHooks for Hooks {
     ) -> Result<(ProcessEnv, u32), HookError> {
         let process = self.next.fetch_add(1, Ordering::SeqCst) + 1;
         push(&self.log, Event::ProcessStarting(session.id, kind, process));
+        if Faults::take(&self.faults.panic_process_starting) {
+            panic!("process_starting panicked");
+        }
         let env = ProcessEnv {
             placeholder: SecretString::from(format!("placeholder-{process}")),
             env: BTreeMap::from([
@@ -148,13 +155,16 @@ impl TurnHooks for Hooks {
 
     async fn process_stopping(&self, session: &Session, process: &u32) -> Result<(), HookError> {
         push(&self.log, Event::ProcessStopping(session.id, *process));
+        if Faults::take(&self.faults.panic_process_stopping) {
+            panic!("process_stopping panicked");
+        }
         Ok(())
     }
 }
 
 /// A [`ProcessSandbox`] that logs starts and stops, counts running
-/// containers, can fail stops, and can hide deaths from its event stream
-/// and then break the stream.
+/// containers, can fail stops or return from them late, and can hide deaths
+/// from its event stream and then break the stream.
 struct TestSandbox {
     inner: ProcessSandbox,
     log: Log,
@@ -163,6 +173,7 @@ struct TestSandbox {
     sessions: Mutex<BTreeMap<ContainerId, SessionId>>,
     fail_stops: AtomicBool,
     failed_stops: AtomicU32,
+    stop_delay_ms: AtomicU64,
     hide_deaths: Arc<AtomicBool>,
     break_events: Arc<Notify>,
 }
@@ -219,7 +230,10 @@ impl Sandbox for TestSandbox {
             push(&self.log, Event::ContainerStopped(*session));
         }
         self.running.lock().unwrap().remove(container);
-        self.inner.stop(container).await
+        self.inner.stop(container).await?;
+        let delay = self.stop_delay_ms.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        Ok(())
     }
 
     async fn list_managed(&self) -> sandbox::Result<Vec<ManagedContainer>> {
@@ -299,6 +313,7 @@ impl Harness {
             sessions: Mutex::default(),
             fail_stops: AtomicBool::new(false),
             failed_stops: AtomicU32::new(0),
+            stop_delay_ms: AtomicU64::new(0),
             hide_deaths: Arc::default(),
             break_events: Arc::new(Notify::new()),
         });
@@ -444,6 +459,50 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
         assert!(std::time::Instant::now() < deadline, "timed out: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+    }
+}
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> MakeWriter<'w> for Captured {
+    type Writer = Self;
+
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn projects_dir(h: &Harness, session: &Session) -> PathBuf {
+    let volume = VolumeKey {
+        agent: h.agent,
+        scope: session.scope.clone(),
+    };
+    h._dir
+        .0
+        .join(sandbox::volume_rel_path(&volume))
+        .join("sessions")
+        .join(session.id.to_string())
+        .join("claude/projects")
 }
 
 fn position(events: &[Event], wanted: &Event) -> usize {
@@ -752,18 +811,7 @@ async fn a_refused_resume_reruns_the_turn_with_session_id() {
     reply(&h.run(session.id, request("one")).await);
     h.manager.stop(session.id).await;
     assert!(!h.manager.is_warm(session.id));
-    let volume = VolumeKey {
-        agent: h.agent,
-        scope: channel(),
-    };
-    let projects = h
-        ._dir
-        .0
-        .join(sandbox::volume_rel_path(&volume))
-        .join("sessions")
-        .join(session.id.to_string())
-        .join("claude/projects");
-    std::fs::remove_dir_all(projects).unwrap();
+    std::fs::remove_dir_all(projects_dir(&h, &session)).unwrap();
     h.clear();
     let second = request("two");
     let report = h.run(session.id, second.clone()).await;
@@ -1237,4 +1285,124 @@ async fn a_refusal_shaped_result_from_a_new_process_is_not_a_refused_resume() {
         !stored.started && stored.maybe_started,
         "whether the CLI read the message is still unknown: {stored:?}"
     );
+}
+
+#[tokio::test]
+async fn a_refused_resume_is_caught_on_the_first_turn_sent_to_a_resumed_process() {
+    let h = Harness::new(&[Turn::reply("first"), Turn::reply("again")]).await;
+    let session = h.thread_session("1.1").await;
+    reply(&h.run(session.id, request("one")).await);
+    h.manager.stop(session.id).await;
+    std::fs::remove_dir_all(projects_dir(&h, &session)).unwrap();
+    h.faults.fail_turn_starting.store(true, Ordering::SeqCst);
+    let err = h
+        .manager
+        .run_turn(session.id, request("never sent"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunnerError::Hook {
+                hook: "turn_starting",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(
+        h.manager.is_warm(session.id),
+        "the resumed process was kept"
+    );
+    let report = h.run(session.id, request("two")).await;
+    assert!(report.reran, "{report:?}");
+    assert_eq!(report.process_start, Some(SessionStart::New));
+    assert_eq!(reply(&report), "first");
+    assert_eq!(h.process_starts(), 3);
+    assert_eq!(h.transcript(&session), ["two"]);
+    let stored = h.store.session(session.id).await.unwrap().unwrap();
+    assert!(stored.started && !stored.maybe_started, "{stored:?}");
+}
+
+#[tokio::test]
+async fn a_normal_stop_is_not_logged_as_a_death() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(captured.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let session = h.thread_session("1.1").await;
+    reply(&h.run(session.id, request("1")).await);
+    h.sandbox.stop_delay_ms.store(300, Ordering::SeqCst);
+    h.manager.stop(session.id).await;
+    assert!(!h.manager.is_warm(session.id));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let logs = captured.text();
+    assert!(logs.contains("stopped a session container"), "{logs}");
+    assert!(!logs.contains("a session container died"), "{logs}");
+    let stops = h
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::ProcessStopping(..)))
+        .count();
+    assert_eq!(stops, 1, "{:?}", h.events());
+}
+
+#[tokio::test]
+async fn a_panicking_process_stopping_still_stops_the_process() {
+    let h = Harness::new(&[Turn::reply("one"), Turn::reply("two")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request("1")).await);
+    h.faults
+        .panic_process_stopping
+        .store(true, Ordering::SeqCst);
+    let mut community = request("2");
+    community.credential = CredentialRef::Community;
+    let report = h.run(id, community).await;
+    assert_eq!(reply(&report), "two");
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    let events = h.events();
+    assert!(
+        position(&events, &Event::ProcessStopping(id, 1))
+            < position(
+                &events,
+                &Event::ProcessStarting(id, CredentialKind::ApiKey, 2)
+            ),
+        "{events:?}"
+    );
+    assert_eq!(h.transcript(&session), ["1", "2"]);
+    assert_eq!(h.sandbox.running(), 1);
+}
+
+#[tokio::test]
+async fn a_panicking_process_starting_fails_the_turn_and_stops_the_container() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let session = h.thread_session("1.1").await;
+    h.faults
+        .panic_process_starting
+        .store(true, Ordering::SeqCst);
+    let err = h
+        .manager
+        .run_turn(session.id, request("never sent"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            RunnerError::Hook {
+                hook: "process_starting",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(!h.manager.is_warm(session.id));
+    assert_eq!(h.sandbox.running(), 0);
+    let report = h.run(session.id, request("sent")).await;
+    assert_eq!(reply(&report), "one");
+    assert_eq!(report.process_start, Some(SessionStart::New));
 }
