@@ -1,0 +1,32 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "bot_id": "B0LEGACY1",
+    "type": "message",
+    "text": "Deploy finished.",
+    "ts": "1727698300.000900",
+    "thread_ts": "1727697650.000150",
+    "bot_profile": {
+      "id": "B0LEGACY1",
+      "deleted": false,
+      "name": "deploys",
+      "updated": 1727600000,
+      "app_id": "A0LEGACY1",
+      "team_id": "T0TEAM001"
+    },
+    "team": "T0TEAM001",
+    "channel": "C0CHAN001",
+    "event_ts": "1727698300.000900",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0BOTNOUSR",
+  "event_time": 1727698300,
+  "authorizations": [
+    {"enterprise_id": null, "team_id": "T0TEAM001", "user_id": "U0BOT0001", "is_bot": true, "is_enterprise_install": false}
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ"
+}

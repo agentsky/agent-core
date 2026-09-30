@@ -1,0 +1,24 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "user": "U0HUMAN02",
+    "type": "message",
+    "ts": "1727698100.000700",
+    "client_msg_id": "2c3b1e8e-5d0a-4f0e-9d4c-0c3f1f2a7b07",
+    "text": "<@U0BOT0001> draft the incident note",
+    "team": "T0TEAM001",
+    "channel": "C0PRIV0001",
+    "event_ts": "1727698100.000700",
+    "channel_type": "group"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0GROUP001",
+  "event_time": 1727698100,
+  "authorizations": [
+    {"enterprise_id": null, "team_id": "T0TEAM001", "user_id": "U0BOT0001", "is_bot": true, "is_enterprise_install": false}
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ"
+}

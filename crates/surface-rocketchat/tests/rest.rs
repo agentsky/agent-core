@@ -1253,6 +1253,7 @@ async fn subscriptions_list_the_rooms_the_user_is_in() {
         [("GENERAL", RoomType::Channel), ("SECRET", RoomType::Group)]
     );
     assert_eq!(rooms[0].name.as_deref(), Some("general"));
+    assert_eq!(rooms[0].id, format!("GENERAL{}", helper.user_id()));
     let requests = fake.requests("subscriptions.get").await;
     assert_eq!(
         header(&requests[0], "x-user-id"),

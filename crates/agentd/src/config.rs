@@ -20,6 +20,14 @@
 //! - Anything else is ignored, and named in [`Config::unknown_env`] for
 //!   `serve` and `migrate` to log as a warning.
 //!
+//! A secret may be neither empty nor start or end with white space. The
+//! trailing newline of a secret mounted from a file would otherwise become
+//! part of it, and a signing secret with one fails every request.
+//!
+//! Every other `AGENTD_SLACK_MANAGER_*` secret requires
+//! [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
+//! so a misspelling of that name fails at startup too.
+//!
 //! The environment is passed in rather than read from the process, so tests
 //! supply their own (`std::env::set_var` is `unsafe` in edition 2024, and the
 //! workspace forbids `unsafe`).
@@ -33,6 +41,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use auth::OAuthConfig;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
@@ -44,13 +53,21 @@ use crate::net::Cidr;
 /// The master key for encryption at rest: 32 bytes, standard base64, as
 /// `agentd gen-key` prints it. Required.
 pub const MASTER_KEY_VAR: &str = "AGENTD_MASTER_KEY";
-/// The Rocket.Chat manager's personal access token. Optional until the
-/// Rocket.Chat surface is configured.
+/// The Rocket.Chat manager's personal access token. Required when the
+/// `[rocketchat]` section is present.
 pub const RC_MANAGER_TOKEN_VAR: &str = "AGENTD_RC_MANAGER_TOKEN";
 /// The prefix of the Slack manager app's secrets, such as
 /// `AGENTD_SLACK_MANAGER_SIGNING_SECRET`. They are collected into
 /// [`Secrets::slack_manager`] by lowercased suffix.
 pub const SLACK_MANAGER_PREFIX: &str = "AGENTD_SLACK_MANAGER_";
+/// The Slack manager app's signing secret, which verifies requests to
+/// `/slack/b/manager/…`. The manager binding is known only when it is set,
+/// and every other [`AGENTD_SLACK_MANAGER_*`](SLACK_MANAGER_PREFIX)
+/// variable requires it.
+pub const SLACK_MANAGER_SIGNING_SECRET_VAR: &str = "AGENTD_SLACK_MANAGER_SIGNING_SECRET";
+/// The key of [`SLACK_MANAGER_SIGNING_SECRET_VAR`] in
+/// [`Secrets::slack_manager`].
+const SLACK_MANAGER_SIGNING_SECRET: &str = "signing_secret";
 /// The prefix of every variable agentd reads. Unknown ones are sorted as the
 /// [module docs](self) describe.
 const ENV_PREFIX: &str = "AGENTD_";
@@ -79,6 +96,12 @@ pub struct Config {
     pub store: StoreConfig,
     /// `[limits]`: caps on what agents may do.
     pub limits: LimitsConfig,
+    /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
+    /// accounts. Every key has a default, so the section is optional.
+    pub claude_oauth: OAuthConfig,
+    /// `[rocketchat]`: the Rocket.Chat server and its manager bot, if agentd
+    /// serves Rocket.Chat.
+    pub rocketchat: Option<RocketChatConfig>,
     /// Secrets from the environment.
     pub secrets: Secrets,
     /// Unknown `AGENTD_` variables that were ignored, by name, sorted.
@@ -95,6 +118,9 @@ struct File {
     store: StoreConfig,
     #[serde(default)]
     limits: LimitsConfig,
+    #[serde(default)]
+    claude_oauth: OAuthConfig,
+    rocketchat: Option<RocketChatConfig>,
 }
 
 /// `[server]`.
@@ -156,6 +182,28 @@ pub struct StoreConfig {
     pub data_dir: PathBuf,
 }
 
+/// `[rocketchat]`. The manager bot's token comes from
+/// [`AGENTD_RC_MANAGER_TOKEN`](RC_MANAGER_TOKEN_VAR).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RocketChatConfig {
+    /// The server's base URL, `https://` (or `http://`), such as
+    /// `https://chat.example.com`.
+    pub base_url: String,
+    /// The realtime endpoint, `wss://` or `ws://`, when it isn't
+    /// `<base_url>/websocket`.
+    #[serde(default)]
+    pub websocket_url: Option<String>,
+    /// The id agentd gives the server, which every stored Rocket.Chat
+    /// identity carries, such as `chat.example.com`. Changing it later makes
+    /// every member a stranger.
+    pub team: String,
+    /// The manager bot's user `_id`, whose personal access token is
+    /// `AGENTD_RC_MANAGER_TOKEN`.
+    pub manager_user_id: String,
+}
+
 /// `[limits]`. Every key has a default, so the section is optional.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -185,6 +233,14 @@ pub struct Secrets {
     /// by its lowercased suffix: `AGENTD_SLACK_MANAGER_SIGNING_SECRET` is
     /// `signing_secret`.
     pub slack_manager: BTreeMap<String, SecretString>,
+}
+
+impl Secrets {
+    /// [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
+    /// if set.
+    pub fn slack_manager_signing_secret(&self) -> Option<&SecretString> {
+        self.slack_manager.get(SLACK_MANAGER_SIGNING_SECRET)
+    }
 }
 
 /// Why the configuration couldn't be loaded.
@@ -271,11 +327,19 @@ impl Config {
         let file = parse_file(text)?;
         file.validate()?;
         let (secrets, unknown_env) = Secrets::from_env(env)?;
+        if file.rocketchat.is_some() && secrets.rc_manager_token.is_none() {
+            return Err(invalid(
+                RC_MANAGER_TOKEN_VAR,
+                "must be set when [rocketchat] is configured",
+            ));
+        }
         Ok(Self {
             server: file.server,
             internal: file.internal,
             store: file.store,
             limits: file.limits,
+            claude_oauth: file.claude_oauth,
+            rocketchat: file.rocketchat,
             secrets,
             unknown_env,
         })
@@ -421,6 +485,40 @@ impl File {
         if self.limits.attach_max_bytes == 0 {
             return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
         }
+        self.claude_oauth
+            .validate()
+            .map_err(|err| invalid(format!("claude_oauth.{}", err.key), err.reason))?;
+        if let Some(rocketchat) = &self.rocketchat {
+            rocketchat.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl RocketChatConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        surface_rocketchat::realtime::websocket_url(&self.base_url).map_err(|_| {
+            invalid(
+                "rocketchat.base_url",
+                "must be an http:// or https:// URL, such as https://chat.example.com",
+            )
+        })?;
+        if let Some(url) = &self.websocket_url
+            && !(url.starts_with("wss://") || url.starts_with("ws://"))
+        {
+            return Err(invalid(
+                "rocketchat.websocket_url",
+                "must be a ws:// or wss:// URL",
+            ));
+        }
+        for (key, value) in [
+            ("rocketchat.team", &self.team),
+            ("rocketchat.manager_user_id", &self.manager_user_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(invalid(key, "must not be empty"));
+            }
+        }
         Ok(())
     }
 }
@@ -455,6 +553,8 @@ impl Secrets {
                 master_key = Some(secret(name, value.into())?);
             } else if name == RC_MANAGER_TOKEN_VAR {
                 rc_manager_token = Some(secret(name, value.into())?);
+            } else if is_service_link(name) {
+                continue;
             } else if let Some(suffix) = name.strip_prefix(SLACK_MANAGER_PREFIX)
                 && !suffix.is_empty()
                 && suffix
@@ -462,8 +562,6 @@ impl Secrets {
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             {
                 slack_manager.insert(suffix.to_ascii_lowercase(), secret(name, value.into())?);
-            } else if is_service_link(name) {
-                continue;
             } else if let Some(known) = near_miss(name) {
                 return Err(invalid(
                     name,
@@ -486,6 +584,15 @@ impl Secrets {
             )
         })?;
         Sealer::from_base64(&master_key).map_err(|err| invalid(MASTER_KEY_VAR, err.to_string()))?;
+        if !slack_manager.is_empty() && !slack_manager.contains_key(SLACK_MANAGER_SIGNING_SECRET) {
+            return Err(invalid(
+                SLACK_MANAGER_SIGNING_SECRET_VAR,
+                format!(
+                    "is not set, but other {SLACK_MANAGER_PREFIX}* variables are; the manager \
+                     app's requests can't be verified without it (is one of them misspelled?)"
+                ),
+            ));
+        }
         Ok((
             Self {
                 master_key,
@@ -557,6 +664,13 @@ fn secret(name: &str, value: OsString) -> Result<SecretString, ConfigError> {
         .map_err(|_| invalid(name, "is not valid UTF-8"))?;
     if value.trim().is_empty() {
         return Err(invalid(name, "is set but empty"));
+    }
+    if value.trim() != value {
+        return Err(invalid(
+            name,
+            "starts or ends with white space, such as the trailing newline of a mounted \
+             file; remove it",
+        ));
     }
     Ok(SecretString::from(value))
 }
@@ -642,10 +756,12 @@ data_dir = "/nonexistent/agentd"
     #[test]
     fn the_example_file_loads() {
         let text = include_str!("../../../config/agentd.example.toml");
-        let config = with(text, env()).unwrap();
+        let config = with(text, with_rc_token()).unwrap();
         assert_eq!(config.server.listen.port(), 8443);
         assert_eq!(config.internal.proxy_listen.port(), 8080);
         assert_eq!(config.internal.ctl_listen.port(), 8081);
+        assert_eq!(config.claude_oauth, OAuthConfig::default());
+        assert_eq!(config.rocketchat.unwrap().team, "chat.example.com");
     }
 
     #[test]
@@ -686,6 +802,123 @@ data_dir = "/nonexistent/agentd"
         let debug = format!("{config:?}");
         for secret in ["rc-token", "sig-value", "cli-value"] {
             assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    const ROCKETCHAT: &str = r#"
+[rocketchat]
+base_url = "https://chat.example.com"
+team = "chat.example.com"
+manager_user_id = "manager-id"
+"#;
+
+    fn with_rc_token() -> Vec<(String, String)> {
+        let mut env = env();
+        env.push((RC_MANAGER_TOKEN_VAR.to_owned(), "rc-token".to_owned()));
+        env
+    }
+
+    #[test]
+    fn rocketchat_is_optional_and_loads_with_its_token() {
+        assert!(with(MINIMAL, env()).unwrap().rocketchat.is_none());
+        let config = with(&format!("{MINIMAL}{ROCKETCHAT}"), with_rc_token()).unwrap();
+        let rocketchat = config.rocketchat.unwrap();
+        assert_eq!(rocketchat.base_url, "https://chat.example.com");
+        assert_eq!(rocketchat.websocket_url, None);
+        assert_eq!(rocketchat.team, "chat.example.com");
+        assert_eq!(rocketchat.manager_user_id, "manager-id");
+    }
+
+    #[test]
+    fn rocketchat_needs_the_manager_token() {
+        let err = with(&format!("{MINIMAL}{ROCKETCHAT}"), env()).unwrap_err();
+        assert_eq!(err.key(), Some(RC_MANAGER_TOKEN_VAR), "{err}");
+    }
+
+    #[test]
+    fn rocketchat_values_are_checked() {
+        for (from, to, key) in [
+            (
+                "https://chat.example.com",
+                "ftp://chat.example.com",
+                "rocketchat.base_url",
+            ),
+            (
+                "team = \"chat.example.com\"",
+                "team = \" \"",
+                "rocketchat.team",
+            ),
+            (
+                "manager_user_id = \"manager-id\"",
+                "manager_user_id = \"\"",
+                "rocketchat.manager_user_id",
+            ),
+            (
+                "team =",
+                "websocket_url = \"https://chat.example.com/websocket\"\nteam =",
+                "rocketchat.websocket_url",
+            ),
+        ] {
+            let text = format!("{MINIMAL}{}", ROCKETCHAT.replacen(from, to, 1));
+            let err = with(&text, with_rc_token()).unwrap_err();
+            assert_eq!(err.key(), Some(key), "{err}");
+        }
+        let text = format!(
+            "{MINIMAL}{}",
+            ROCKETCHAT.replacen(
+                "team =",
+                "websocket_url = \"wss://rt.example.com/websocket\"\nteam =",
+                1
+            )
+        );
+        let config = with(&text, with_rc_token()).unwrap();
+        assert_eq!(
+            config.rocketchat.unwrap().websocket_url.as_deref(),
+            Some("wss://rt.example.com/websocket")
+        );
+    }
+
+    #[test]
+    fn claude_oauth_defaults_and_is_checked() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert_eq!(config.claude_oauth, OAuthConfig::default());
+        let text = format!("{MINIMAL}\n[claude_oauth]\ntoken_url = \"http://example.com/token\"\n");
+        let err = with(&text, env()).unwrap_err();
+        assert_eq!(err.key(), Some("claude_oauth.token_url"), "{err}");
+        let text = format!("{MINIMAL}\n[claude_oauth]\nbogus = 1\n");
+        let err = with(&text, env()).unwrap_err();
+        assert_eq!(err.key(), Some("claude_oauth.bogus"), "{err}");
+    }
+
+    #[test]
+    fn the_slack_manager_signing_secret_is_read_by_name() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert!(config.secrets.slack_manager_signing_secret().is_none());
+        let mut env = env();
+        env.push((
+            SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
+            "sig-value".to_owned(),
+        ));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_signing_secret()
+                .map(ExposeSecret::expose_secret),
+            Some("sig-value")
+        );
+    }
+
+    #[test]
+    fn other_slack_manager_secrets_need_the_signing_secret() {
+        for name in [
+            "AGENTD_SLACK_MANAGER_BOT_TOKEN",
+            "AGENTD_SLACK_MANAGER_SIGNNG_SECRET",
+        ] {
+            let err = env_err(&[(name, "value")]);
+            assert_eq!(err.key(), Some(SLACK_MANAGER_SIGNING_SECRET_VAR), "{err}");
+            assert!(err.to_string().contains("misspelled"), "{err}");
+            assert!(!err.to_string().contains("value"), "{err}");
         }
     }
 
@@ -986,6 +1219,46 @@ data_dir = "/nonexistent/agentd"
     }
 
     #[test]
+    fn secrets_with_surrounding_white_space_are_refused() {
+        let key = key();
+        for name in [
+            MASTER_KEY_VAR,
+            RC_MANAGER_TOKEN_VAR,
+            SLACK_MANAGER_SIGNING_SECRET_VAR,
+        ] {
+            for value in [
+                format!("{key}\n"),
+                format!("{key}\r\n"),
+                format!(" {key}"),
+                format!("{key}\t"),
+            ] {
+                let mut env = env();
+                env.retain(|(k, _)| k != name);
+                env.push((name.to_owned(), value.clone()));
+                let err = with(MINIMAL, env).unwrap_err();
+                assert_eq!(err.key(), Some(name), "{err}");
+                let message = err.to_string();
+                assert!(message.contains("white space"), "{message}");
+                assert!(!message.contains(&key), "{message}");
+            }
+        }
+        let mut env = env();
+        env.push((
+            SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
+            "inner space is kept".to_owned(),
+        ));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_signing_secret()
+                .unwrap()
+                .expose_secret(),
+            "inner space is kept"
+        );
+    }
+
+    #[test]
     fn near_misses_of_secret_names_are_refused() {
         for (name, known) in [
             ("AGENTD_MASTERKEY", MASTER_KEY_VAR),
@@ -1053,6 +1326,25 @@ data_dir = "/nonexistent/agentd"
         ] {
             assert!(!is_service_link(name), "{name}");
         }
+    }
+
+    #[test]
+    fn service_links_under_the_slack_manager_prefix_are_not_secrets() {
+        let names = [
+            "AGENTD_SLACK_MANAGER_PORT",
+            "AGENTD_SLACK_MANAGER_SERVICE_HOST",
+            "AGENTD_SLACK_MANAGER_SERVICE_PORT",
+            "AGENTD_SLACK_MANAGER_PORT_8443_TCP_ADDR",
+        ];
+        let mut env = env();
+        env.extend(
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), "tcp://10.0.0.12:8443".to_owned())),
+        );
+        let config = with(MINIMAL, env).unwrap();
+        assert!(config.secrets.slack_manager.is_empty());
+        assert!(config.unknown_env.is_empty(), "{:?}", config.unknown_env);
     }
 
     #[test]

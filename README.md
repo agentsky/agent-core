@@ -46,10 +46,24 @@ starting with `AGENTD_` is ignored with a warning. Each listener binds
 agentd's own address on its network, never `0.0.0.0`, and the proxy and ctl
 listeners must be inside `internal.sandbox_subnet`.
 `GET /healthz` on the public listener answers 200 while the database does.
+It also serves Slack's request URLs, `/slack/b/<binding>/events`,
+`…/interactivity` and `…/commands`; the manager app's binding is `manager`,
+and its requests are verified with `AGENTD_SLACK_MANAGER_SIGNING_SECRET`.
 The ctl listener serves the agentctl API that sandboxed agents call back
 through; at startup agentd deletes every agentctl token and scope lock and
 empties `ctl-outbox/` under `store.data_dir`, since the containers they
 belonged to are gone.
+With a `[rocketchat]` section and `AGENTD_RC_MANAGER_TOKEN` (the manager
+account's personal access token), agentd connects as the manager bot and takes
+commands: a direct message to it is a command as a whole (`login`, `me`), and
+a message that starts with `!agent` is one too in any other room one of
+agentd's bots is in. Replies always come as a direct message from the manager
+bot. A login code or API key posted outside that direct message is refused and
+the member is told to start again or revoke the key. Members whose Claude link
+breaks get a direct message saying so, retried with a growing wait for about
+three days if it can't be delivered. The manager posts every reply, so give its role
+`api-bypass-rate-limit`, or Rocket.Chat's REST rate limiter will delay
+replies when many members use commands at once.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish; a second signal drops them at
 once. Logs go to standard error,
