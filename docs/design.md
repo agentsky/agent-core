@@ -200,7 +200,9 @@ default[^rc-perms].
 
 The custom role needs `create-user`, plus `edit-other-user-active-status` if
 agentd passes `active` on create, and the permission for creating the bot's
-token. A reviewer's reading of the current server source is that `users.create`
+token. It also needs `view-full-other-user-info`: messages don't carry
+the sender's roles, and `users.info` shows another user's roles only with it,
+which is how agentd tells bots from people. A reviewer's reading of the current server source is that `users.create`
 with `roles: ["bot"]` checks only those, and that `assign-roles` is checked on
 update only. That needs a test on the target server version.
 
@@ -350,11 +352,26 @@ flowchart TD
 ```
 
 Response gating is deterministic: an explicit mention, a reply to the agent's
-own message, or a DM. Messages from managed agents only count when they mention
-this agent explicitly. Replying in a thread is not enough, or two agents in one
+own message, or a DM. A reply counts only if it mentions no other managed
+agent: a reply in one agent's thread that mentions only a second agent is
+addressed to the second, so the person pays for one turn, not two. Messages
+from managed agents only count when they mention this agent explicitly, and
+the manager bot's own posts never start a turn. Replying in a thread is not enough, or two agents in one
 thread would answer each other indefinitely. qm-core runs a model call to decide whether to chime in on
 unaddressed thread messages. With subscription credentials that would cost a
 CLI run per message, so agent-core does not do it.
+
+A DM counts only for the agent whose bot received it, so another agent
+mentioned in someone's DM with a different bot never answers there. The
+owner's turns run only on the owner's credential: an owner without a linked
+account gets the link prompt, never the community key. Refusals (a paused
+agent, a banned requester, the agent's deny rules, the hop cap) apply only to
+messages that pass the gate above, so an unaddressed message never draws a
+notice, and they come before the credential, so nobody is offered a link
+prompt or a community-key turn they would then be refused. If the router
+can't tell whether the requester is banned, or what the agent's rules are, it
+refuses rather than assume the requester is allowed. The router's rustdoc
+gives the full order.
 
 ## Sessions and sandboxes
 
@@ -520,12 +537,19 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl post --to <target> <text>` | Post somewhere else the agent is allowed to post |
 | `agentctl react <emoji> [message id]` | Add a reaction |
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
+| `agentctl lock -- <command>` | Run a command while holding the scope's `shared/` lock, for writes to `shared/`. A second `lock`, from any session of the scope, waits |
 | `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
 | `agentctl private <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless the owner is this turn's requester. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
-One bundled skill documents `agentctl`. Its token is scoped to one agent, scope,
-session, turn and requester, is bound to the session's container, and expires
-with the turn.
+One bundled skill documents `agentctl`. Its token is one per `claude`
+process, scoped to one agent, scope and session, and bound to the session's
+container: agentd refuses a request from any other source address. A warm
+process's environment is fixed at start, so a token can't be issued per turn.
+Instead agentd records the current turn, with its requester, side and kind,
+on the token when the turn starts and clears it when the turn ends, and the
+token authorizes nothing between turns. That makes everything it can do
+expire with the turn. Tokens are stored only as SHA-256 hashes and are all
+deleted when agentd restarts.
 
 Launch flags:
 

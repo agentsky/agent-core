@@ -6,6 +6,24 @@
 //! and [`AGENTD_SLACK_MANAGER_*`](SLACK_MANAGER_PREFIX). Each value has one
 //! source, so there is no precedence to get wrong.
 //!
+//! Other variables starting with `AGENTD_`:
+//!
+//! - Kubernetes service links, which Kubernetes sets for a Service named
+//!   `agentd` (or `agentd-…`) in the same namespace, are skipped silently:
+//!   names ending in `_PORT`, `_SERVICE_HOST` or `_SERVICE_PORT`, holding
+//!   `_SERVICE_PORT_`, or ending in `_PORT_<number>_<TCP|UDP|SCTP>`
+//!   optionally followed by `_PROTO`, `_PORT` or `_ADDR`.
+//! - A near miss of a secret's name is an error, so a misspelled secret
+//!   fails at startup: within two edits of `AGENTD_MASTER_KEY` or
+//!   `AGENTD_RC_MANAGER_TOKEN`, or starting within two edits of
+//!   `AGENTD_SLACK_MANAGER_` without being a valid Slack manager name.
+//! - Anything else is ignored, and named in [`Config::unknown_env`] for
+//!   `serve` and `migrate` to log as a warning.
+//!
+//! Every other `AGENTD_SLACK_MANAGER_*` secret requires
+//! [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
+//! so a misspelling of that name fails at startup too.
+//!
 //! The environment is passed in rather than read from the process, so tests
 //! supply their own (`std::env::set_var` is `unsafe` in edition 2024, and the
 //! workspace forbids `unsafe`).
@@ -45,9 +63,12 @@ pub const SLACK_MANAGER_SIGNING_SECRET_VAR: &str = "AGENTD_SLACK_MANAGER_SIGNING
 /// The key of [`SLACK_MANAGER_SIGNING_SECRET_VAR`] in
 /// [`Secrets::slack_manager`].
 const SLACK_MANAGER_SIGNING_SECRET: &str = "signing_secret";
-/// Every variable with this prefix must be one agentd reads, so a misspelled
-/// secret fails at startup instead of going unnoticed.
+/// The prefix of every variable agentd reads. Unknown ones are sorted as the
+/// [module docs](self) describe.
 const ENV_PREFIX: &str = "AGENTD_";
+/// How many single-character edits away from a secret's name an unknown
+/// variable's name may be and still be refused as a misspelling of it.
+const NEAR_MISS_EDITS: usize = 2;
 
 /// The default for `server.drain_timeout_secs`.
 pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
@@ -55,6 +76,8 @@ pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 pub const MAX_DRAIN_TIMEOUT_SECS: u64 = 3600;
 /// The default for `server.log_filter`.
 pub const DEFAULT_LOG_FILTER: &str = "info";
+/// The default for `limits.attach_max_bytes`: 50 MiB.
+pub const DEFAULT_ATTACH_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// agentd's configuration, validated.
 #[derive(Debug)]
@@ -64,10 +87,15 @@ pub struct Config {
     pub server: ServerConfig,
     /// `[internal]`: the listeners sandboxes reach.
     pub internal: InternalConfig,
-    /// `[store]`: the database.
+    /// `[store]`: the database and the data directory.
     pub store: StoreConfig,
+    /// `[limits]`: caps on what agents may do.
+    pub limits: LimitsConfig,
     /// Secrets from the environment.
     pub secrets: Secrets,
+    /// Unknown `AGENTD_` variables that were ignored, by name, sorted.
+    /// Kubernetes service links aren't listed.
+    pub unknown_env: Vec<String>,
 }
 
 /// The file's sections. Each task adds the section it first needs.
@@ -77,6 +105,8 @@ struct File {
     server: ServerConfig,
     internal: InternalConfig,
     store: StoreConfig,
+    #[serde(default)]
+    limits: LimitsConfig,
 }
 
 /// `[server]`.
@@ -86,7 +116,8 @@ struct File {
 pub struct ServerConfig {
     /// `listen`: the public listener's address, agentd's address on the
     /// `egress` network, such as `172.31.0.2:8443`. Never an unspecified
-    /// address such as `0.0.0.0`.
+    /// address such as `0.0.0.0`, `[::]` or `[::ffff:0.0.0.0]`, and never
+    /// inside `internal.sandbox_subnet`.
     pub listen: SocketAddr,
     /// `drain_timeout_secs`: how long shutdown waits for in-flight requests
     /// before dropping them.
@@ -111,13 +142,15 @@ impl ServerConfig {
 #[non_exhaustive]
 pub struct InternalConfig {
     /// `proxy_listen`: the credential proxy listener's address, agentd's
-    /// address on the `sandbox` network, port 8080.
+    /// address on the `sandbox` network, port 8080. Must be inside
+    /// `sandbox_subnet`.
     pub proxy_listen: SocketAddr,
     /// `ctl_listen`: the agentctl API listener's address, agentd's address on
-    /// the `sandbox` network, port 8081.
+    /// the `sandbox` network, port 8081. Must be inside `sandbox_subnet`.
     pub ctl_listen: SocketAddr,
     /// `sandbox_subnet`: the `sandbox` network. The public listener refuses
-    /// connections from it.
+    /// connections from it, and must not be inside it; the proxy and ctl
+    /// listeners must be.
     pub sandbox_subnet: Cidr,
 }
 
@@ -129,6 +162,27 @@ pub struct StoreConfig {
     /// `url`: the SQLite database, such as
     /// `sqlite:///var/lib/agentd/agentd.db`, or `sqlite::memory:` for tests.
     pub url: String,
+    /// `data_dir`: agentd's data directory, an absolute path, such as
+    /// `/var/lib/agentd`. Files agents attach are staged under
+    /// `ctl-outbox/` in it until their turn's reply is posted.
+    pub data_dir: PathBuf,
+}
+
+/// `[limits]`. Every key has a default, so the section is optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct LimitsConfig {
+    /// `attach_max_bytes`: the largest file `agentctl attach` may stage.
+    pub attach_max_bytes: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            attach_max_bytes: DEFAULT_ATTACH_MAX_BYTES,
+        }
+    }
 }
 
 /// Secrets, read from the environment only.
@@ -236,12 +290,14 @@ impl Config {
     {
         let file = parse_file(text)?;
         file.validate()?;
-        let secrets = Secrets::from_env(env)?;
+        let (secrets, unknown_env) = Secrets::from_env(env)?;
         Ok(Self {
             server: file.server,
             internal: file.internal,
             store: file.store,
+            limits: file.limits,
             secrets,
+            unknown_env,
         })
     }
 
@@ -322,7 +378,7 @@ impl File {
             ("internal.ctl_listen", self.internal.ctl_listen),
         ];
         for (i, (key, addr)) in listeners.iter().enumerate() {
-            if addr.ip().is_unspecified() {
+            if canonical(*addr).ip().is_unspecified() {
                 return Err(invalid(
                     *key,
                     format!(
@@ -332,25 +388,35 @@ impl File {
                 ));
             }
             if addr.port() != 0
-                && let Some((other, _)) = listeners[..i].iter().find(|(_, a)| a == addr)
+                && let Some((other, _)) = listeners[..i]
+                    .iter()
+                    .find(|(_, a)| canonical(*a) == canonical(*addr))
             {
                 return Err(invalid(*key, format!("{addr} is already used by {other}")));
             }
         }
-        if self
-            .internal
-            .sandbox_subnet
-            .contains(self.server.listen.ip())
-        {
+        let subnet = self.internal.sandbox_subnet;
+        if subnet.contains(self.server.listen.ip()) {
             return Err(invalid(
                 "server.listen",
                 format!(
-                    "{} is inside internal.sandbox_subnet ({}); the public listener must not \
-                     be on the sandbox network",
+                    "{} is inside internal.sandbox_subnet ({subnet}); the public listener must \
+                     not be on the sandbox network",
                     self.server.listen.ip(),
-                    self.internal.sandbox_subnet
                 ),
             ));
+        }
+        for (key, addr) in &listeners[1..] {
+            if !subnet.contains(addr.ip()) {
+                return Err(invalid(
+                    *key,
+                    format!(
+                        "{} is outside internal.sandbox_subnet ({subnet}); this listener serves \
+                         sandboxes only, so give agentd's own address on the sandbox network",
+                        addr.ip(),
+                    ),
+                ));
+            }
         }
         if self.server.drain_timeout_secs > MAX_DRAIN_TIMEOUT_SECS {
             return Err(invalid(
@@ -366,12 +432,28 @@ impl File {
                 "must be a sqlite: URL, such as sqlite:///var/lib/agentd/agentd.db",
             ));
         }
+        if !self.store.data_dir.is_absolute() {
+            return Err(invalid(
+                "store.data_dir",
+                "must be an absolute path, such as /var/lib/agentd",
+            ));
+        }
+        if self.limits.attach_max_bytes == 0 {
+            return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
+        }
         Ok(())
     }
 }
 
+/// `addr` with an IPv4-mapped IPv6 address replaced by its IPv4 address, so
+/// `[::ffff:0.0.0.0]:8080` is checked as the `0.0.0.0:8080` it binds.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 impl Secrets {
-    fn from_env<E, K, V>(env: E) -> Result<Self, ConfigError>
+    /// The secrets in `env`, and the unknown `AGENTD_` variables it ignored.
+    fn from_env<E, K, V>(env: E) -> Result<(Self, Vec<String>), ConfigError>
     where
         E: IntoIterator<Item = (K, V)>,
         K: Into<OsString>,
@@ -380,6 +462,7 @@ impl Secrets {
         let mut master_key = None;
         let mut rc_manager_token = None;
         let mut slack_manager = BTreeMap::new();
+        let mut unknown = Vec::new();
         for (name, value) in env {
             let name: OsString = name.into();
             let Some(name) = name.to_str() else {
@@ -392,6 +475,8 @@ impl Secrets {
                 master_key = Some(secret(name, value.into())?);
             } else if name == RC_MANAGER_TOKEN_VAR {
                 rc_manager_token = Some(secret(name, value.into())?);
+            } else if is_service_link(name) {
+                continue;
             } else if let Some(suffix) = name.strip_prefix(SLACK_MANAGER_PREFIX)
                 && !suffix.is_empty()
                 && suffix
@@ -399,17 +484,21 @@ impl Secrets {
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             {
                 slack_manager.insert(suffix.to_ascii_lowercase(), secret(name, value.into())?);
-            } else {
+            } else if let Some(known) = near_miss(name) {
                 return Err(invalid(
                     name,
                     format!(
-                        "unknown variable; agentd reads only {MASTER_KEY_VAR}, \
-                         {RC_MANAGER_TOKEN_VAR} and {SLACK_MANAGER_PREFIX}<NAME> from the \
-                         environment, and everything else from the config file"
+                        "unknown variable, and too close to {known} to ignore; agentd reads \
+                         only {MASTER_KEY_VAR}, {RC_MANAGER_TOKEN_VAR} and \
+                         {SLACK_MANAGER_PREFIX}<NAME> (uppercase letters, digits and _) from \
+                         the environment, and everything else from the config file"
                     ),
                 ));
+            } else {
+                unknown.push(name.to_owned());
             }
         }
+        unknown.sort();
         let master_key = master_key.ok_or_else(|| {
             invalid(
                 MASTER_KEY_VAR,
@@ -426,12 +515,69 @@ impl Secrets {
                 ),
             ));
         }
-        Ok(Self {
-            master_key,
-            rc_manager_token,
-            slack_manager,
-        })
+        Ok((
+            Self {
+                master_key,
+                rc_manager_token,
+                slack_manager,
+            },
+            unknown,
+        ))
     }
+}
+
+/// Whether `name` is one of the variables Kubernetes sets for a Service
+/// ("service links"): `<SVC>_SERVICE_HOST`, `<SVC>_SERVICE_PORT`,
+/// `<SVC>_SERVICE_PORT_<PORT_NAME>`, `<SVC>_PORT`, and
+/// `<SVC>_PORT_<number>_<protocol>` with its `_PROTO`, `_PORT` and `_ADDR`
+/// variants.
+fn is_service_link(name: &str) -> bool {
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let is_protocol = |part: &str| matches!(part, "TCP" | "UDP" | "SCTP");
+    let parts: Vec<&str> = name.split('_').collect();
+    let port_protocol = match parts.as_slice() {
+        [_, .., "PORT", number, protocol] | [_, .., "PORT", number, protocol, "PROTO" | "ADDR"] => {
+            is_number(number) && is_protocol(protocol)
+        }
+        _ => false,
+    };
+    port_protocol
+        || name.contains("_SERVICE_PORT_")
+        || matches!(
+            parts.as_slice(),
+            [_, .., "SERVICE", "HOST" | "PORT"] | [_, .., "PORT"]
+        )
+}
+
+/// The secret `name` looks like a misspelling of, as the [module
+/// docs](self) define it, or `None`.
+fn near_miss(name: &str) -> Option<&'static str> {
+    [MASTER_KEY_VAR, RC_MANAGER_TOKEN_VAR]
+        .into_iter()
+        .find(|known| edit_distances(known, name).last() <= Some(&NEAR_MISS_EDITS))
+        .or_else(|| {
+            let closest = edit_distances(SLACK_MANAGER_PREFIX, name).into_iter().min();
+            (closest <= Some(NEAR_MISS_EDITS)).then_some("AGENTD_SLACK_MANAGER_<NAME>")
+        })
+}
+
+/// The edit (Levenshtein) distance from `target` to each prefix of `name`,
+/// from the empty prefix to the whole of `name`, counting bytes.
+fn edit_distances(target: &str, name: &str) -> Vec<usize> {
+    let name = name.as_bytes();
+    let mut row: Vec<usize> = (0..=name.len()).collect();
+    for (i, t) in target.bytes().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for j in 1..=name.len() {
+            let above = row[j];
+            row[j] = (diagonal + usize::from(name[j - 1] != t))
+                .min(above + 1)
+                .min(row[j - 1] + 1);
+            diagonal = above;
+        }
+    }
+    row
 }
 
 fn secret(name: &str, value: OsString) -> Result<SecretString, ConfigError> {
@@ -457,12 +603,13 @@ pub(crate) mod tests {
 listen = "127.0.0.1:0"
 
 [internal]
-proxy_listen = "127.0.0.1:0"
-ctl_listen = "127.0.0.1:0"
-sandbox_subnet = "172.30.0.0/24"
+proxy_listen = "127.0.0.2:0"
+ctl_listen = "127.0.0.2:0"
+sandbox_subnet = "127.0.0.2/32"
 
 [store]
 url = "sqlite::memory:"
+data_dir = "/nonexistent/agentd"
 "#;
 
     pub(crate) fn key() -> String {
@@ -510,11 +657,14 @@ url = "sqlite::memory:"
         assert_eq!(config.server.log_filter, "info");
         assert_eq!(
             config.internal.sandbox_subnet,
-            "172.30.0.0/24".parse().unwrap()
+            "127.0.0.2/32".parse().unwrap()
         );
         assert_eq!(config.store.url, "sqlite::memory:");
+        assert_eq!(config.store.data_dir, Path::new("/nonexistent/agentd"));
+        assert_eq!(config.limits.attach_max_bytes, 50 * 1024 * 1024);
         assert!(config.secrets.rc_manager_token.is_none());
         assert!(config.secrets.slack_manager.is_empty());
+        assert!(config.unknown_env.is_empty());
         config.sealer().unwrap();
     }
 
@@ -639,13 +789,16 @@ url = "sqlite::memory:"
     fn a_missing_key_is_named() {
         let err = file_err(&replace("listen = \"127.0.0.1:0\"\n", ""));
         assert_eq!(err.key(), Some("server.listen"), "{err}");
-        let err = file_err(&replace("sandbox_subnet = \"172.30.0.0/24\"\n", ""));
+        let err = file_err(&replace("sandbox_subnet = \"127.0.0.2/32\"\n", ""));
         assert_eq!(err.key(), Some("internal.sandbox_subnet"), "{err}");
     }
 
     #[test]
     fn a_missing_section_is_named() {
-        let err = file_err(&replace("[store]\nurl = \"sqlite::memory:\"\n", ""));
+        let err = file_err(&replace(
+            "[store]\nurl = \"sqlite::memory:\"\ndata_dir = \"/nonexistent/agentd\"\n",
+            "",
+        ));
         assert_eq!(err.key(), Some("store"), "{err}");
     }
 
@@ -703,13 +856,28 @@ url = "sqlite::memory:"
                 "server.listen",
             ),
             (
-                "proxy_listen = \"127.0.0.1:0\"",
+                "proxy_listen = \"127.0.0.2:0\"",
                 "proxy_listen = \"0.0.0.0:8080\"",
                 "internal.proxy_listen",
             ),
             (
-                "ctl_listen = \"127.0.0.1:0\"",
+                "ctl_listen = \"127.0.0.2:0\"",
                 "ctl_listen = \"[::]:8081\"",
+                "internal.ctl_listen",
+            ),
+            (
+                "listen = \"127.0.0.1:0\"",
+                "listen = \"[::ffff:0.0.0.0]:8443\"",
+                "server.listen",
+            ),
+            (
+                "proxy_listen = \"127.0.0.2:0\"",
+                "proxy_listen = \"[::ffff:0.0.0.0]:8080\"",
+                "internal.proxy_listen",
+            ),
+            (
+                "ctl_listen = \"127.0.0.2:0\"",
+                "ctl_listen = \"[::ffff:0:0]:8081\"",
                 "internal.ctl_listen",
             ),
         ] {
@@ -721,34 +889,89 @@ url = "sqlite::memory:"
 
     #[test]
     fn listeners_need_distinct_addresses() {
-        let text = replace(
-            "proxy_listen = \"127.0.0.1:0\"",
-            "proxy_listen = \"10.0.0.2:8080\"",
-        )
-        .replacen(
-            "ctl_listen = \"127.0.0.1:0\"",
-            "ctl_listen = \"10.0.0.2:8080\"",
-            1,
-        );
-        let err = file_err(&text);
-        assert_eq!(err.key(), Some("internal.ctl_listen"), "{err}");
-        assert!(err.to_string().contains("internal.proxy_listen"), "{err}");
+        for ctl in ["127.0.0.2:8080", "[::ffff:127.0.0.2]:8080"] {
+            let text = replace(
+                "proxy_listen = \"127.0.0.2:0\"",
+                "proxy_listen = \"127.0.0.2:8080\"",
+            )
+            .replacen(
+                "ctl_listen = \"127.0.0.2:0\"",
+                &format!("ctl_listen = \"{ctl}\""),
+                1,
+            );
+            let err = file_err(&text);
+            assert_eq!(err.key(), Some("internal.ctl_listen"), "{ctl}: {err}");
+            assert!(err.to_string().contains("internal.proxy_listen"), "{err}");
+        }
     }
 
     #[test]
     fn the_public_listener_is_not_on_the_sandbox_network() {
         let err = file_err(&replace(
             "listen = \"127.0.0.1:0\"",
-            "listen = \"172.30.0.2:8443\"",
+            "listen = \"127.0.0.2:8443\"",
         ));
         assert_eq!(err.key(), Some("server.listen"), "{err}");
         assert!(err.to_string().contains("internal.sandbox_subnet"), "{err}");
+
+        let err = file_err(&replace(
+            "listen = \"127.0.0.1:0\"",
+            "listen = \"[::ffff:127.0.0.2]:8443\"",
+        ));
+        assert_eq!(err.key(), Some("server.listen"), "{err}");
+    }
+
+    #[test]
+    fn the_internal_listeners_are_on_the_sandbox_network() {
+        for (from, to, key) in [
+            (
+                "proxy_listen = \"127.0.0.2:0\"",
+                "proxy_listen = \"172.31.0.2:8080\"",
+                "internal.proxy_listen",
+            ),
+            (
+                "ctl_listen = \"127.0.0.2:0\"",
+                "ctl_listen = \"127.0.0.3:8081\"",
+                "internal.ctl_listen",
+            ),
+            (
+                "ctl_listen = \"127.0.0.2:0\"",
+                "ctl_listen = \"[::1]:8081\"",
+                "internal.ctl_listen",
+            ),
+        ] {
+            let err = file_err(&replace(from, to));
+            assert_eq!(err.key(), Some(key), "{err}");
+            assert!(
+                err.to_string().contains("outside internal.sandbox_subnet"),
+                "{err}"
+            );
+        }
+
+        let text = replace(
+            "proxy_listen = \"127.0.0.2:0\"",
+            "proxy_listen = \"[::ffff:127.0.0.2]:0\"",
+        );
+        with(&text, env()).unwrap();
+    }
+
+    #[test]
+    fn an_ipv4_mapped_sandbox_subnet_still_guards_the_listeners() {
+        let text = replace("\"127.0.0.2/32\"", "\"::ffff:127.0.0.2/128\"");
+        let config = with(&text, env()).unwrap();
+        assert_eq!(
+            config.internal.sandbox_subnet,
+            "127.0.0.2/32".parse().unwrap()
+        );
+        let err =
+            file_err(&text.replacen("listen = \"127.0.0.1:0\"", "listen = \"127.0.0.2:8443\"", 1));
+        assert_eq!(err.key(), Some("server.listen"), "{err}");
     }
 
     #[test]
     fn a_bad_subnet_is_named() {
         for bad in ["172.30.0.0", "172.30.0.1/24", "172.30.0.0/40", "nope/8"] {
-            let err = file_err(&replace("\"172.30.0.0/24\"", &format!("\"{bad}\"")));
+            let err = file_err(&replace("\"127.0.0.2/32\"", &format!("\"{bad}\"")));
             assert_eq!(err.key(), Some("internal.sandbox_subnet"), "{bad}: {err}");
         }
     }
@@ -781,6 +1004,22 @@ url = "sqlite::memory:"
     }
 
     #[test]
+    fn the_data_dir_must_be_absolute() {
+        let err = file_err(&replace("\"/nonexistent/agentd\"", "\"var/lib/agentd\""));
+        assert_eq!(err.key(), Some("store.data_dir"), "{err}");
+        let err = file_err(&replace("data_dir = \"/nonexistent/agentd\"\n", ""));
+        assert_eq!(err.key(), Some("store.data_dir"), "{err}");
+    }
+
+    #[test]
+    fn the_attach_cap_is_configurable_and_positive() {
+        let text = format!("{MINIMAL}\n[limits]\nattach_max_bytes = 1024\n");
+        assert_eq!(with(&text, env()).unwrap().limits.attach_max_bytes, 1024);
+        let err = file_err(&format!("{MINIMAL}\n[limits]\nattach_max_bytes = 0\n"));
+        assert_eq!(err.key(), Some("limits.attach_max_bytes"), "{err}");
+    }
+
+    #[test]
     fn the_master_key_is_required() {
         let err = with(MINIMAL, vec![("PATH".to_owned(), "/usr/bin".to_owned())]).unwrap_err();
         assert_eq!(err.key(), Some(MASTER_KEY_VAR), "{err}");
@@ -808,18 +1047,115 @@ url = "sqlite::memory:"
     }
 
     #[test]
-    fn unknown_agentd_variables_are_refused() {
-        for name in [
-            "AGENTD_MASTERKEY",
-            "AGENTD_SLACK_MANAGER_",
-            "AGENTD_SLACK_MANAGER_bot_token",
-            "AGENTD_LOG",
+    fn near_misses_of_secret_names_are_refused() {
+        for (name, known) in [
+            ("AGENTD_MASTERKEY", MASTER_KEY_VAR),
+            ("AGENTD_MASTER_KY", MASTER_KEY_VAR),
+            ("AGENTD_MASTR_KEYS", MASTER_KEY_VAR),
+            ("AGENTD_RC_MANAGER_TOKENS", RC_MANAGER_TOKEN_VAR),
+            ("AGENTD_RC_MANGER_TOKN", RC_MANAGER_TOKEN_VAR),
+            ("AGENTD_SLACK_MANAGER_", "AGENTD_SLACK_MANAGER_<NAME>"),
+            (
+                "AGENTD_SLACK_MANAGER_bot_token",
+                "AGENTD_SLACK_MANAGER_<NAME>",
+            ),
+            (
+                "AGENTD_SLACK_MANGER_SIGNING_SECRET",
+                "AGENTD_SLACK_MANAGER_<NAME>",
+            ),
+            (
+                "AGENTD_SLACKMANAGER_BOT_TOKEN",
+                "AGENTD_SLACK_MANAGER_<NAME>",
+            ),
         ] {
             let err = env_err(&[(name, "value")]);
             assert_eq!(err.key(), Some(name), "{err}");
             assert!(err.to_string().contains("unknown variable"), "{err}");
-            assert!(!err.to_string().contains("value;"), "{err}");
+            assert!(err.to_string().contains(known), "{name}: {err}");
+            assert!(!err.to_string().contains("value"), "{err}");
         }
+    }
+
+    #[test]
+    fn kubernetes_service_links_are_skipped() {
+        let names = [
+            "AGENTD_PORT",
+            "AGENTD_SERVICE_HOST",
+            "AGENTD_SERVICE_PORT",
+            "AGENTD_SERVICE_PORT_PUBLIC",
+            "AGENTD_SERVICE_PORT_HTTP_ALT",
+            "AGENTD_PORT_8443_TCP",
+            "AGENTD_PORT_8443_TCP_PROTO",
+            "AGENTD_PORT_8443_TCP_PORT",
+            "AGENTD_PORT_8443_TCP_ADDR",
+            "AGENTD_PORT_53_UDP",
+            "AGENTD_INTERNAL_PORT",
+            "AGENTD_INTERNAL_SERVICE_HOST",
+            "AGENTD_INTERNAL_PORT_8080_SCTP_ADDR",
+        ];
+        let mut env = env();
+        env.extend(
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), "tcp://10.0.0.11:8443".to_owned())),
+        );
+        let config = with(MINIMAL, env).unwrap();
+        assert!(config.unknown_env.is_empty(), "{:?}", config.unknown_env);
+        for name in names {
+            assert!(is_service_link(name), "{name}");
+        }
+        for name in [
+            "AGENTD_PORT_8443",
+            "AGENTD_PORT_X_TCP",
+            "AGENTD_PORT_8443_HTTP",
+            "AGENTD_PORT_8443_TCP_HOST",
+            "AGENTD_SERVICE",
+            "AGENTD_LOG",
+        ] {
+            assert!(!is_service_link(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn service_links_under_the_slack_manager_prefix_are_not_secrets() {
+        let names = [
+            "AGENTD_SLACK_MANAGER_PORT",
+            "AGENTD_SLACK_MANAGER_SERVICE_HOST",
+            "AGENTD_SLACK_MANAGER_SERVICE_PORT",
+            "AGENTD_SLACK_MANAGER_PORT_8443_TCP_ADDR",
+        ];
+        let mut env = env();
+        env.extend(
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), "tcp://10.0.0.12:8443".to_owned())),
+        );
+        let config = with(MINIMAL, env).unwrap();
+        assert!(config.secrets.slack_manager.is_empty());
+        assert!(config.unknown_env.is_empty(), "{:?}", config.unknown_env);
+    }
+
+    #[test]
+    fn other_unknown_agentd_variables_are_ignored_and_listed() {
+        let mut env = env();
+        for name in ["AGENTD_LOG", "AGENTD_DEBUG", "AGENTD_CONFIG"] {
+            env.push((name.to_owned(), "value".to_owned()));
+        }
+        env.push(("NOT_AGENTD_LOG".to_owned(), "value".to_owned()));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config.unknown_env,
+            ["AGENTD_CONFIG", "AGENTD_DEBUG", "AGENTD_LOG"]
+        );
+    }
+
+    #[test]
+    fn edit_distances_cover_every_prefix() {
+        assert_eq!(edit_distances("abc", "abc"), [3, 2, 1, 0]);
+        assert_eq!(edit_distances("abc", "axc"), [3, 2, 2, 1]);
+        assert_eq!(edit_distances("", "ab"), [0, 1, 2]);
+        assert_eq!(edit_distances("ab", ""), [2]);
+        assert_eq!(edit_distances("kitten", "sitting").last(), Some(&3));
     }
 
     #[cfg(unix)]

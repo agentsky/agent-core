@@ -7,7 +7,7 @@
 //! | --- | --- | --- |
 //! | public | `server.listen` | `/healthz`, the Slack request URLs, and later OAuth callbacks |
 //! | proxy | `internal.proxy_listen` | the credential proxy (placeholder) |
-//! | ctl | `internal.ctl_listen` | the agentctl API (placeholder) |
+//! | ctl | `internal.ctl_listen` | the agentctl API ([`ctl`](crate::ctl)) |
 //!
 //! The public listener also refuses connections from
 //! `internal.sandbox_subnet`. Every request carries the peer address as
@@ -65,15 +65,15 @@ pub struct Routers {
 
 impl Routers {
     /// The routes agentd serves: `/healthz` and the Slack request URLs on
-    /// the public listener, with the Slack queue as a worker. The internal
-    /// listeners answer everything with 404 until the credential proxy and
-    /// the agentctl API are added.
+    /// the public listener, with the Slack queue as a worker, and the
+    /// agentctl API on the ctl listener. The proxy listener answers
+    /// everything with 404 until the credential proxy is added.
     pub fn new(app: &App) -> Self {
         let (slack_routes, slack_queue) = slack::routes(app);
         Self {
             public: public_router(app.clone()).merge(slack_routes),
             proxy: Router::new(),
-            ctl: Router::new(),
+            ctl: app.ctl().router(),
             workers: vec![Worker::new(
                 "Slack queue",
                 slack::run_queue(
@@ -200,8 +200,10 @@ impl Server {
     /// Serves until `shutdown` completes, then shuts down gracefully:
     ///
     /// 1. Every listener stops accepting, and idle connections are closed.
-    /// 2. In-flight requests and the sweeper get `server.drain_timeout_secs`
-    ///    to finish. Whatever is still running then is dropped.
+    /// 2. In-flight requests, the workers and the sweeper get
+    ///    `server.drain_timeout_secs` to finish. Whatever is still running
+    ///    then is dropped. If `abort` completes first, as a second shutdown
+    ///    signal does, it is dropped at once instead.
     /// 3. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
@@ -211,9 +213,10 @@ impl Server {
     ///
     /// If a listener, a worker or the sweeper stops before `shutdown` does.
     /// The others are still shut down gracefully first.
-    pub async fn run<F>(self, shutdown: F) -> anyhow::Result<()>
+    pub async fn run<F, G>(self, shutdown: F, abort: G) -> anyhow::Result<()>
     where
         F: Future<Output = ()> + Send,
+        G: Future<Output = ()> + Send,
     {
         let Self {
             app,
@@ -280,11 +283,14 @@ impl Server {
                 }
             }
         };
-        if tokio::time::timeout(drain_timeout, drain).await.is_err() {
-            tracing::warn!(
-                unfinished = tasks.len(),
-                "drain timeout elapsed; dropping in-flight work"
-            );
+        let cut_short = tokio::select! {
+            drained = tokio::time::timeout(drain_timeout, drain) => {
+                drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
+            }
+            () = abort => Some("shutdown forced; dropping in-flight work"),
+        };
+        if let Some(reason) = cut_short {
+            tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
         app.store().close().await;

@@ -1,5 +1,7 @@
 //! A fake Rocket.Chat server for tests.
 //!
+//! [`FakeDdp`] is the realtime side: a WebSocket server speaking DDP.
+//!
 //! [`FakeRest`] answers the REST endpoints `surface-rocketchat` uses, from
 //! wiremock, with shapes taken from the Rocket.Chat server source. It keeps
 //! users, tokens, rooms and messages in memory, so a test can create a bot,
@@ -13,6 +15,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use wiremock::matchers::path_regex;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+mod ddp;
+
+pub use ddp::{
+    FakeDdp, LoginAttempt, NOTIFY_USER, ROOM_MESSAGES, realtime_message, subscription_doc,
+};
 
 /// A user the fake knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +160,8 @@ impl State {
 ///
 /// It starts with one user, the manager ([`FakeRest::MANAGER_ID`],
 /// authenticated by [`FakeRest::MANAGER_TOKEN`]), and no rooms.
+/// `users.info` includes `roles` only for the caller itself and for the
+/// manager, which the fake treats as holding `view-full-other-user-info`.
 pub struct FakeRest {
     server: MockServer,
     state: Arc<Mutex<State>>,
@@ -300,16 +310,35 @@ impl FakeRest {
     /// Makes the next `times` calls to `endpoint` fail with HTTP 429, as
     /// Rocket.Chat's rate limiter does, resetting `reset_in` from now.
     pub async fn rate_limit(&self, endpoint: &str, times: u64, reset_in: Duration) {
-        let now_ms = SystemTime::now()
+        self.rate_limit_at(endpoint, times, reset_in, SystemTime::now())
+            .await;
+    }
+
+    /// Like [`FakeRest::rate_limit`], for a server whose clock reads
+    /// `server_now`, to test clock skew.
+    ///
+    /// The response's `Date` header is `server_now` in whole seconds, as a
+    /// real server sends it, and `X-RateLimit-Reset` is that second plus
+    /// `reset_in`, in milliseconds since the Unix epoch, so a client that
+    /// measures the reset against `Date` waits exactly `reset_in`.
+    pub async fn rate_limit_at(
+        &self,
+        endpoint: &str,
+        times: u64,
+        reset_in: Duration,
+        server_now: SystemTime,
+    ) {
+        let now_s = server_now
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let reset = now_ms + reset_in.as_millis();
+            .map_or(0, |d| d.as_secs());
+        let reset = u128::from(now_s) * 1000 + reset_in.as_millis();
         let seconds = reset_in.as_secs().max(1);
         let body = json!({
             "success": false,
             "error": format!("Error, too many requests. Please slow down. You must wait {seconds} seconds before trying this endpoint again. [error-too-many-requests]"),
         });
         let response = ResponseTemplate::new(429)
+            .insert_header("Date", http_date(now_s))
             .insert_header("X-RateLimit-Limit", "10")
             .insert_header("X-RateLimit-Remaining", "0")
             .insert_header("X-RateLimit-Reset", reset.to_string())
@@ -358,6 +387,19 @@ fn unknown_key<'a>(body: &'a Value, allowed: &[&str]) -> Option<&'a str> {
         .keys()
         .map(String::as_str)
         .find(|k| !allowed.contains(k))
+}
+
+/// Formats Unix seconds as an HTTP `Date` header (IMF-fixdate), such as
+/// `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn http_date(unix_seconds: u64) -> String {
+    let at = i64::try_from(unix_seconds)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    at.format(time::macros::format_description!(
+        "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+    ))
+    .unwrap_or_default()
 }
 
 /// A regex matching `endpoint`, alone or followed by path parameters.
@@ -452,6 +494,38 @@ impl Respond for Router {
         let param = |key: &str| query.get(key).cloned().unwrap_or_default();
         match (post, segments.as_slice()) {
             (false, ["me"]) => ok(state.user_json(&caller)),
+            (false, ["users.info"]) => {
+                let id = param("userId");
+                if !state.users.contains_key(&id) {
+                    return failure("User not found.");
+                }
+                let mut user = state.user_json(&id);
+                if caller != id
+                    && caller != FakeRest::MANAGER_ID
+                    && let Some(user) = user.as_object_mut()
+                {
+                    user.remove("roles");
+                }
+                ok(json!({ "user": user }))
+            }
+            (false, ["subscriptions.get"]) => {
+                let update: Vec<Value> = state
+                    .rooms
+                    .iter()
+                    .filter(|(_, room)| room.members.contains(&caller))
+                    .map(|(id, room)| {
+                        json!({
+                            "_id": format!("{id}{caller}"),
+                            "rid": id,
+                            "t": room.t,
+                            "name": room.name.clone().unwrap_or_default(),
+                            "u": { "_id": caller },
+                            "open": true,
+                        })
+                    })
+                    .collect();
+                ok(json!({ "update": update, "remove": [] }))
+            }
             (true, ["logout"]) => {
                 let token = header(request, "x-auth-token");
                 state.tokens.remove(&token);

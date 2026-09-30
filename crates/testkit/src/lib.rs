@@ -7,7 +7,7 @@
 //!   [`claude::Turn`]. [`claude`] documents what it checks and prints.
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.
-//! - [`rocketchat`]: a fake Rocket.Chat REST server.
+//! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 //! - [`slack`]: Slack request signing and payload fixtures.
 
 #![warn(missing_docs)]
@@ -21,4 +21,4 @@ pub mod surface;
 
 pub use anthropic::{FakeAnthropic, fake_anthropic};
 pub use claude::{Turn, fake_claude_path, write_script};
-pub use surface::{Call, MockSurface, UploadedFile};
+pub use surface::{Call, MockSurface, Op, UploadedFile};

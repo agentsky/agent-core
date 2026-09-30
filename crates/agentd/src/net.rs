@@ -1,10 +1,12 @@
 //! Network helpers: [`Cidr`] subnets and the public listener's
 //! [`RefuseSubnet`] guard.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use axum::serve::Listener;
 use serde::Deserialize;
@@ -14,6 +16,10 @@ use tokio::net::{TcpListener, TcpStream};
 ///
 /// The address must be the network address: `172.30.0.5/24` is refused
 /// rather than silently widened, since it usually means a typo.
+///
+/// An IPv4 subnet written in IPv4-mapped IPv6 form, such as
+/// `::ffff:172.30.0.0/120`, is stored as the IPv4 subnet it names
+/// (`172.30.0.0/24`), so it matches IPv4 peers however they are reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct Cidr {
@@ -42,7 +48,8 @@ pub enum CidrError {
 }
 
 impl Cidr {
-    /// The subnet `network/prefix`.
+    /// The subnet `network/prefix`. An IPv4-mapped `network` with a prefix
+    /// of at least 96 becomes the IPv4 subnet it names.
     ///
     /// # Errors
     ///
@@ -56,6 +63,13 @@ impl Cidr {
         if prefix > max {
             return Err(CidrError::Prefix { max });
         }
+        let (network, prefix) = match network {
+            IpAddr::V6(v6) if prefix >= 96 => match v6.to_ipv4_mapped() {
+                Some(v4) => (IpAddr::V4(v4), prefix - 96),
+                None => (network, prefix),
+            },
+            _ => (network, prefix),
+        };
         let masked = mask(network, prefix);
         if masked != network {
             return Err(CidrError::HostBits(Self {
@@ -67,13 +81,15 @@ impl Cidr {
     }
 
     /// Whether `ip` is in this subnet. An IPv4-mapped IPv6 address, as a
-    /// dual-stack socket reports IPv4 peers, counts as its IPv4 address.
+    /// dual-stack socket reports IPv4 peers, counts as its IPv4 address, and
+    /// an IPv4 address is in an IPv6 subnet that holds its mapped form.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let ip = ip.to_canonical();
-        matches!(
-            (self.network, ip),
-            (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
-        ) && mask(ip, self.prefix) == self.network
+        let ip = match (self.network, ip.to_canonical()) {
+            (IpAddr::V6(_), IpAddr::V4(v4)) => IpAddr::V6(v4.to_ipv6_mapped()),
+            (IpAddr::V4(_), IpAddr::V6(_)) => return false,
+            (_, ip) => ip,
+        };
+        mask(ip, self.prefix) == self.network
     }
 }
 
@@ -120,21 +136,70 @@ impl TryFrom<String> for Cidr {
     }
 }
 
+/// How often [`RefuseSubnet`] logs a warning for one peer address. Further
+/// refusals from it within this window are logged at debug level, and
+/// counted in its next warning.
+pub const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// A TCP listener that drops every connection from one subnet as soon as it
 /// is accepted, before a byte is read.
 ///
 /// The public listener uses it to refuse the sandbox subnet, as a second
-/// guard behind binding to the `egress` address only.
+/// guard behind binding to the `egress` address only. A refusal is logged
+/// as a warning at most once per peer address every
+/// [`REFUSAL_WARN_INTERVAL`], so a sandbox that keeps retrying can't flood
+/// the log.
 #[derive(Debug)]
 pub struct RefuseSubnet {
     inner: TcpListener,
     refused: Cidr,
+    log: RefusalLog,
 }
 
 impl RefuseSubnet {
     /// Wraps `inner`, refusing peers in `refused`.
     pub fn new(inner: TcpListener, refused: Cidr) -> Self {
-        Self { inner, refused }
+        Self {
+            inner,
+            refused,
+            log: RefusalLog::new(REFUSAL_WARN_INTERVAL),
+        }
+    }
+}
+
+/// Decides which refusals are worth a warning: the first from a peer
+/// address, then the first after each `interval`.
+#[derive(Debug)]
+struct RefusalLog {
+    interval: Duration,
+    /// For each peer warned about within `interval`: when, and how many of
+    /// its refusals have been logged at debug level since.
+    peers: HashMap<IpAddr, (Instant, u64)>,
+}
+
+impl RefusalLog {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Records a refusal from `ip` at `now`. Returns how many refusals from
+    /// it went without a warning since the last one if this one deserves a
+    /// warning, and `None` if it doesn't.
+    fn record(&mut self, ip: IpAddr, now: Instant) -> Option<u64> {
+        if let Some((warned, quiet)) = self.peers.get_mut(&ip)
+            && now.duration_since(*warned) < self.interval
+        {
+            *quiet += 1;
+            return None;
+        }
+        let quiet = self.peers.remove(&ip).map_or(0, |(_, quiet)| quiet);
+        self.peers
+            .retain(|_, (warned, _)| now.duration_since(*warned) < self.interval);
+        self.peers.insert(ip, (now, 0));
+        Some(quiet)
     }
 }
 
@@ -148,7 +213,19 @@ impl Listener for RefuseSubnet {
             if !self.refused.contains(peer.ip()) {
                 return (io, peer);
             }
-            tracing::warn!(%peer, subnet = %self.refused, "refused a connection from the sandbox subnet");
+            match self.log.record(peer.ip(), Instant::now()) {
+                Some(quiet) => tracing::warn!(
+                    %peer,
+                    subnet = %self.refused,
+                    refused_since_last_warning = quiet,
+                    "refused a connection from the sandbox subnet"
+                ),
+                None => tracing::debug!(
+                    %peer,
+                    subnet = %self.refused,
+                    "refused a connection from the sandbox subnet"
+                ),
+            }
         }
     }
 
@@ -238,6 +315,54 @@ mod tests {
         assert!(!cidr("0.0.0.0/0").contains(Ipv6Addr::LOCALHOST.into()));
         assert!(cidr("10.1.2.3/32").contains(ip("10.1.2.3")));
         assert!(!cidr("10.1.2.3/32").contains(ip("10.1.2.4")));
+    }
+
+    #[test]
+    fn an_ipv4_mapped_subnet_is_the_ipv4_subnet_it_names() {
+        let mapped = cidr("::ffff:172.30.0.0/120");
+        assert_eq!(mapped, cidr("172.30.0.0/24"));
+        assert_eq!(mapped.to_string(), "172.30.0.0/24");
+        assert!(mapped.contains(ip("172.30.0.9")));
+        assert!(mapped.contains(ip("::ffff:172.30.0.9")));
+        assert!(!mapped.contains(ip("172.30.1.9")));
+        assert_eq!(cidr("::ffff:10.1.2.3/128"), cidr("10.1.2.3/32"));
+        assert_eq!(cidr("::ffff:0.0.0.0/96"), cidr("0.0.0.0/0"));
+        assert_eq!(
+            "::ffff:172.30.0.5/120".parse::<Cidr>(),
+            Err(CidrError::HostBits(cidr("172.30.0.0/24")))
+        );
+    }
+
+    #[test]
+    fn an_ipv6_subnet_holding_the_mapped_range_contains_ipv4_peers() {
+        let all = cidr("::/0");
+        assert!(all.contains(ip("172.30.0.9")));
+        assert!(all.contains(ip("::ffff:172.30.0.9")));
+        assert!(all.contains(ip("fd00::1")));
+        let unrelated = cidr("fd00::/8");
+        assert!(!unrelated.contains(ip("172.30.0.9")));
+        assert!(!unrelated.contains(ip("::ffff:172.30.0.9")));
+    }
+
+    #[test]
+    fn refusals_warn_once_per_peer_per_interval() {
+        let interval = Duration::from_secs(60);
+        let mut log = RefusalLog::new(interval);
+        let (a, b) = (ip("172.30.0.2"), ip("172.30.0.3"));
+        let start = Instant::now();
+        assert_eq!(log.record(a, start), Some(0));
+        assert_eq!(log.record(a, start + Duration::from_secs(1)), None);
+        assert_eq!(log.record(a, start + Duration::from_secs(59)), None);
+        assert_eq!(log.record(b, start + Duration::from_secs(2)), Some(0));
+        assert_eq!(log.record(b, start + Duration::from_secs(3)), None);
+        assert_eq!(log.record(a, start + interval), Some(2));
+        assert_eq!(log.record(a, start + interval), None);
+        assert_eq!(log.record(b, start + Duration::from_secs(200)), Some(1));
+        assert_eq!(
+            log.peers.len(),
+            1,
+            "peers warned about long ago are dropped"
+        );
     }
 
     async fn accept_one(listener: &mut RefuseSubnet) -> Option<SocketAddr> {
