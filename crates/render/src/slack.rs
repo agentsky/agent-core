@@ -27,8 +27,20 @@ const BROADCASTS: &[&str] = &["here", "channel", "everyone"];
 /// What a thematic break (`---`) becomes. mrkdwn has no divider.
 const RULE: &str = "──────────";
 
-/// Inserted after the `@` of a broadcast so it can't notify anyone.
+/// Inserted after the `@` of a broadcast so it can't notify anyone, around
+/// escaped formatting characters so they can't pair up, and inside backtick
+/// runs so they can't close a code block.
 const ZERO_WIDTH_SPACE: char = '\u{200B}';
+
+/// The characters Slack reads as formatting marks.
+const DELIMITERS: [char; 4] = ['*', '_', '~', '`'];
+
+/// Slack only knows backtick fences.
+const FENCE: &str = "```";
+
+/// How many bytes past `<!here` a closing `>` is looked for. A longer
+/// label is left as escaped text, which is just as harmless.
+const MAX_WIRE_LABEL: usize = 256;
 
 /// Elements nested deeper than this are flattened into their ancestor at
 /// this depth. Rendering and dropping the tree recurse once per level, so an
@@ -39,11 +51,22 @@ const MAX_DEPTH: usize = 64;
 ///
 /// - Headings become bold lines.
 /// - `**bold**` and `__bold__` become `*bold*`, `*em*` and `_em_` become
-///   `_em_`, and `~~strike~~` becomes `~strike~`.
+///   `_em_`, and `~~strike~~` becomes `~strike~`. Slack doesn't format inside
+///   a word, so emphasis touching a letter or digit (`5*3*2`) keeps its
+///   Markdown delimiter character instead.
+/// - `*`, `_`, `~` and `` ` `` written as backslash escapes or character
+///   references get zero-width spaces around them, unless a letter or digit
+///   sits on both sides, so Slack shows them instead of formatting with them.
+///   So do those characters in image alt text.
 /// - Inline and fenced code keep their contents; only `&`, `<` and `>` are
-///   escaped. A fenced block keeps its info string.
+///   escaped. A fenced block keeps its info string, and gets a zero-width
+///   space into any run of three backticks inside it, so the run can't close
+///   the block.
 /// - `[label](url)` becomes `<url|label>`, and images become links to their
-///   source. Bare `http(s)` URLs get explicit `<url>` boundaries, so Slack
+///   source. A label that names a different host than the URL
+///   (`[good.com](https://evil.com)`) is shown next to the link instead:
+///   `good.com (<https://evil.com>)`. A link with an empty URL shows only its
+///   label. Bare `http(s)` URLs get explicit `<url>` boundaries, so Slack
 ///   doesn't pull neighboring punctuation or formatting marks into them.
 /// - List items become `•` or numbered lines, indented two spaces per
 ///   nesting level. Blockquotes keep their `>` prefix on every line.
@@ -101,7 +124,9 @@ struct Node<'a> {
 
 enum Kind<'a> {
     Elem(Tag<'a>, Vec<Node<'a>>),
-    Text(String),
+    /// Text, and the byte offsets in it of formatting characters the source
+    /// escaped.
+    Text(String, Vec<usize>),
     Code(CowStr<'a>),
     Html(CowStr<'a>),
     Break,
@@ -137,10 +162,17 @@ fn parse(md: &str) -> Vec<Node<'_>> {
                     span,
                 }
             }
-            Event::Text(text) => Node {
-                kind: Kind::Text(text.into_string()),
-                span,
-            },
+            Event::Text(text) => {
+                let escaped = if is_escaped_delimiter(md, &span, &text) {
+                    vec![0]
+                } else {
+                    Vec::new()
+                };
+                Node {
+                    kind: Kind::Text(text.into_string(), escaped),
+                    span,
+                }
+            }
             Event::Code(code) => Node {
                 kind: Kind::Code(code),
                 span,
@@ -170,18 +202,27 @@ fn parse(md: &str) -> Vec<Node<'_>> {
     root
 }
 
+/// Whether a text event starts with a formatting character that the source
+/// wrote as a backslash escape (`\*`) or a character reference (`&ast;`).
+/// pulldown-cmark starts a new text event at each of them.
+fn is_escaped_delimiter(md: &str, span: &Range<usize>, text: &str) -> bool {
+    text.starts_with(DELIMITERS) && (md[..span.start].ends_with('\\') || md[span.clone()] != *text)
+}
+
 /// pulldown-cmark splits one run of text into several events at characters
 /// that could have been markup. Merging them lets mentions and URLs be
 /// scanned whole.
 fn push_merging_text<'a>(siblings: &mut Vec<Node<'a>>, node: Node<'a>) {
     if let (
         Some(Node {
-            kind: Kind::Text(prev),
+            kind: Kind::Text(prev, prev_escaped),
             span: prev_span,
         }),
-        Kind::Text(text),
+        Kind::Text(text, escaped),
     ) = (siblings.last_mut(), &node.kind)
     {
+        let base = prev.len();
+        prev_escaped.extend(escaped.iter().map(|offset| base + offset));
         prev.push_str(text);
         prev_span.end = node.span.end;
         return;
@@ -429,10 +470,9 @@ impl Renderer<'_> {
             .join("-+-");
         let mut body: Vec<String> = cells.iter().map(format_row).collect();
         body.insert(body.len().min(1), separator);
-        let fence = fence_for(&body.join("\n"));
-        std::iter::once(fence.to_string())
-            .chain(body.iter().map(|row| escape(row)))
-            .chain(std::iter::once(fence.to_string()))
+        std::iter::once(FENCE.to_string())
+            .chain(body.iter().map(|row| escape(&break_fences(row, 0))))
+            .chain(std::iter::once(FENCE.to_string()))
             .map(Line::code)
             .collect()
     }
@@ -447,8 +487,8 @@ impl Renderer<'_> {
 
     fn inline_node(&self, node: &Node<'_>, ctx: Ctx, out: &mut String) {
         match &node.kind {
-            Kind::Text(text) => self.text(text, ctx, out),
-            Kind::Html(html) => self.text(html, ctx, out),
+            Kind::Text(text, escaped) => self.text(text, escaped, ctx, out),
+            Kind::Html(html) => self.text(html, &[], ctx, out),
             Kind::Code(code) if ctx.plain => out.push_str(code),
             Kind::Code(code) => {
                 out.push('`');
@@ -458,6 +498,16 @@ impl Renderer<'_> {
             Kind::Break if ctx.plain || ctx.label || ctx.heading => out.push(' '),
             Kind::Break => out.push('\n'),
             Kind::Rule | Kind::Other => {}
+            Kind::Elem(Tag::Strong | Tag::Emphasis | Tag::Strikethrough, children)
+                if self.inside_word(&node.span) =>
+            {
+                let delimiter = self.src[node.span.start..].chars().next().unwrap_or('*');
+                out.push(delimiter);
+                for child in children {
+                    self.inline_node(child, ctx, out);
+                }
+                out.push(delimiter);
+            }
             Kind::Elem(tag, children) => match tag {
                 Tag::Strong => {
                     let inner = Ctx {
@@ -510,6 +560,21 @@ impl Renderer<'_> {
         out.push(marker);
     }
 
+    /// Whether the source has a letter or digit right before or after `span`.
+    /// Slack doesn't format inside a word, so emphasis there keeps its
+    /// Markdown delimiter character, once on each side: `5*3*2` must not
+    /// become `5_3_2`.
+    fn inside_word(&self, span: &Range<usize>) -> bool {
+        self.src[..span.start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            || self.src[span.end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+    }
+
     fn link(
         &self,
         link_type: LinkType,
@@ -518,49 +583,55 @@ impl Renderer<'_> {
         ctx: Ctx,
         out: &mut String,
     ) {
+        let shown = self.inline(children, Ctx::plain());
         if ctx.plain {
-            plain_link(&self.inline(children, ctx), dest, out);
+            plain_link(&shown, dest, out);
             return;
         }
-        let label_ctx = Ctx { label: true, ..ctx };
-        let label = self.inline(children, label_ctx).replace('\n', " ");
         let url = match link_type {
             LinkType::Email => format!("mailto:{dest}"),
             _ => dest.to_string(),
         };
         let label = match link_type {
-            LinkType::Autolink => "",
-            _ => label.as_str(),
+            LinkType::Autolink => String::new(),
+            _ => self
+                .inline(children, Ctx { label: true, ..ctx })
+                .replace('\n', " "),
         };
-        push_slack_link(&url, label, out);
+        push_link(&url, &label, &shown, out);
     }
 
+    /// Alt text is plain text, so every formatting character in it is shown
+    /// as written.
     fn image(&self, dest: &str, children: &[Node<'_>], ctx: Ctx, out: &mut String) {
         let alt = self.inline(children, Ctx::plain());
         if ctx.plain {
             plain_link(&alt, dest, out);
             return;
         }
+        let literal: Vec<usize> = alt.match_indices(DELIMITERS).map(|(i, _)| i).collect();
         let mut label = String::new();
-        self.slack_text(&alt, false, &mut label);
+        self.slack_text(&alt, &literal, false, &mut label);
         if ctx.label {
             out.push_str(&label);
         } else {
-            push_slack_link(dest, &label, out);
+            push_link(dest, &label, &alt, out);
         }
     }
 
-    fn text(&self, text: &str, ctx: Ctx, out: &mut String) {
+    fn text(&self, text: &str, escaped: &[usize], ctx: Ctx, out: &mut String) {
         if ctx.plain {
             out.push_str(text);
         } else {
-            self.slack_text(text, !ctx.label, out);
+            self.slack_text(text, escaped, !ctx.label, out);
         }
     }
 
-    /// Escapes text outside code and neutralizes broadcasts. With `arm`, it
-    /// also resolves `@Name` mentions and gives bare URLs explicit bounds.
-    fn slack_text(&self, text: &str, arm: bool, out: &mut String) {
+    /// Escapes text outside code and neutralizes broadcasts. The formatting
+    /// characters at the byte offsets in `literal` are kept from pairing up
+    /// into Slack formatting. With `arm`, it also resolves `@Name` mentions
+    /// and gives bare URLs explicit bounds.
+    fn slack_text(&self, text: &str, literal: &[usize], arm: bool, out: &mut String) {
         let mut i = 0;
         while let Some(c) = text[i..].chars().next() {
             if c == '<'
@@ -596,6 +667,11 @@ impl Renderer<'_> {
             if arm && let Some(url) = bare_url(text, i) {
                 push_slack_link(url, "", out);
                 i += url.len();
+                continue;
+            }
+            if literal.binary_search(&i).is_ok() {
+                push_literal(text, i, c, out);
+                i += c.len_utf8();
                 continue;
             }
             push_escaped(c, out);
@@ -642,7 +718,7 @@ fn code_block(kind: &CodeBlockKind<'_>, children: &[Node<'_>]) -> Vec<Line> {
     let content: String = children
         .iter()
         .filter_map(|child| match &child.kind {
-            Kind::Text(text) => Some(text.as_str()),
+            Kind::Text(text, _) => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -650,25 +726,40 @@ fn code_block(kind: &CodeBlockKind<'_>, children: &[Node<'_>]) -> Vec<Line> {
         CodeBlockKind::Fenced(info) => info.as_ref(),
         CodeBlockKind::Indented => "",
     };
-    let fence = fence_for(&content);
     let body = content.strip_suffix('\n').unwrap_or(&content);
     let body_lines = if content.is_empty() {
         Vec::new()
     } else {
-        body.split('\n').map(escape).collect()
+        body.split('\n')
+            .map(|line| escape(&break_fences(line, 0)))
+            .collect()
     };
-    std::iter::once(format!("{fence}{}", escape(info)))
+    let open = format!("{FENCE}{}", escape(&break_fences(info, FENCE.len())));
+    std::iter::once(open)
         .chain(body_lines)
-        .chain(std::iter::once(fence.to_string()))
+        .chain(std::iter::once(FENCE.to_string()))
         .map(Line::code)
         .collect()
 }
 
-/// Slack only knows backtick fences. A body that itself holds a backtick
-/// fence would close it early, so it keeps a tilde fence instead, as qm-core
-/// does.
-fn fence_for(body: &str) -> &'static str {
-    if body.contains("```") { "~~~" } else { "```" }
+/// Slack closes a code block at any run of three backticks, and has no
+/// escape, so this puts a zero-width space before every third backtick in a
+/// row. `run` counts the backticks just before `text`.
+fn break_fences(text: &str, mut run: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '`' {
+            if run >= 2 {
+                out.push(ZERO_WIDTH_SPACE);
+                run = 0;
+            }
+            run += 1;
+        } else {
+            run = 0;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn pad(cell: &str, width: usize, alignment: Alignment) -> String {
@@ -685,11 +776,133 @@ fn plain_link(label: &str, dest: &str, out: &mut String) {
     out.push_str(label);
     if label.is_empty() {
         out.push_str(dest);
-    } else if label != dest {
+    } else if !dest.is_empty() && label != dest {
         out.push_str(" (");
         out.push_str(dest);
         out.push(')');
     }
+}
+
+/// Writes a link to `url` showing `label`, which must already be escaped.
+/// `shown` is the label as plain text. A label that names another host than
+/// `url` goes next to the link instead of in it, so it can't disguise where
+/// the link leads.
+fn push_link(url: &str, label: &str, shown: &str, out: &mut String) {
+    if url.is_empty() {
+        out.push_str(label);
+    } else if label.is_empty() || !misleads(shown, url) {
+        push_slack_link(url, label, out);
+    } else {
+        out.push_str(label);
+        out.push_str(" (");
+        push_slack_link(url, "", out);
+        out.push(')');
+    }
+}
+
+/// Whether any word of `shown` looks like a URL, an email address or a
+/// domain name whose host differs from `url`'s.
+fn misleads(shown: &str, url: &str) -> bool {
+    let dest = host(strip_scheme(url).1);
+    shown
+        .split_whitespace()
+        .filter_map(named_host)
+        .any(|named| named != dest)
+}
+
+/// The host a word of a label names, if it looks like a URL, an email
+/// address or a domain name.
+fn named_host(word: &str) -> Option<String> {
+    let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+    let (scheme, rest) = strip_scheme(word);
+    let named = host(rest);
+    (scheme || looks_like_domain(&named)).then_some(named)
+}
+
+/// Splits off a `scheme://` or `mailto:` prefix, reporting whether there was
+/// one.
+fn strip_scheme(url: &str) -> (bool, &str) {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return (false, url);
+    };
+    let valid = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-'));
+    if valid && (rest.starts_with("//") || scheme.eq_ignore_ascii_case("mailto")) {
+        (true, rest)
+    } else {
+        (false, url)
+    }
+}
+
+/// The host of a URL with its scheme removed, normalized for comparison:
+/// no user info, port, trailing dot or invisible characters, lowercase,
+/// dot look-alikes as `.`, and no leading `www.`. Browsers end the authority
+/// at `\` as well as `/`.
+fn host(rest: &str) -> String {
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host.strip_prefix('[') {
+        Some(ipv6) => ipv6.split(']').next(),
+        None => host.split(':').next(),
+    }
+    .unwrap_or_default();
+    let host: String = host
+        .chars()
+        .filter(|&c| !is_default_ignorable(c))
+        .map(|c| match c {
+            '\u{2024}' | '\u{3002}' | '\u{FE52}' | '\u{FF0E}' | '\u{FF61}' => '.',
+            _ => c,
+        })
+        .collect();
+    let host = host.to_lowercase();
+    let host = host.trim_end_matches('.');
+    host.strip_prefix("www.").unwrap_or(host).to_string()
+}
+
+/// Unicode's default-ignorable code points: characters that render as
+/// nothing, such as zero-width spaces and bidirectional controls, which IDNA
+/// drops from hostnames and which could hide a dot from the domain check.
+fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Two or more dot-separated labels of letters, digits and `-`, ending in an
+/// alphabetic or punycode top-level label, or an IPv4 address.
+fn looks_like_domain(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let tld = labels.last().copied().unwrap_or_default();
+    let named = tld.chars().count() >= 2 && tld.chars().all(char::is_alphabetic);
+    let ipv4 = labels.len() == 4
+        && labels
+            .iter()
+            .all(|label| label.chars().all(|c| c.is_ascii_digit()));
+    labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_alphanumeric() || c == '-')
+        })
+        && (named || tld.starts_with("xn--") || ipv4)
 }
 
 /// Writes `<url>` or `<url|label>`. `label` must already be escaped.
@@ -729,11 +942,33 @@ fn wire_broadcast(text: &str, at: usize) -> Option<(usize, &str)> {
     let close = if after.starts_with('>') {
         0
     } else if after.starts_with('|') {
-        after.find('>')?
+        let window = &after[..after.floor_char_boundary(MAX_WIRE_LABEL)];
+        let close = window.find('>')?;
+        if window[..close].contains('\n') {
+            return None;
+        }
+        close
     } else {
         return None;
     };
     Some((at + 2 + len + close + 1, word))
+}
+
+/// Writes a formatting character the source escaped. Slack has no escape,
+/// and it only formats at word boundaries, so a character with a letter or
+/// digit on both sides stays as it is. Otherwise zero-width spaces on both
+/// sides keep it from opening or closing formatting.
+fn push_literal(text: &str, at: usize, c: char, out: &mut String) {
+    let word_char = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let inside_word = word_char(text[..at].chars().next_back())
+        && word_char(text[at + c.len_utf8()..].chars().next());
+    if inside_word {
+        out.push(c);
+    } else {
+        out.push(ZERO_WIDTH_SPACE);
+        out.push(c);
+        out.push(ZERO_WIDTH_SPACE);
+    }
 }
 
 fn escape(text: &str) -> String {

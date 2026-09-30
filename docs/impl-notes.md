@@ -123,6 +123,52 @@ dependency that uses a newer manifest feature or edition.
 switches to the current stable toolchain before running cargo-deny, like the
 other jobs.
 
+### `[licenses.private]` exempts any unpublished crate
+
+**Issue.** `[licenses.private] ignore = true` is meant to exempt our own
+crates, which carry only `license-file`. cargo-deny applies it to every crate
+with `publish = false`, wherever it comes from. A scratch copy of the
+workspace in which `agentd` depends on `vendor/gpl`, a path crate with
+`license = "GPL-3.0-only"` and `publish = false`, printed `licenses ok`.
+cargo-deny has no setting that limits the exemption to workspace members:
+`[licenses.private]` only adds private registries, `[sources]` does not see
+path dependencies, and a `[[licenses.clarify]]` entry per workspace crate
+would have to be added for every new crate and pinned to the hash of
+`LICENSE`.
+
+**Solution.** Keep `private.ignore` and add `scripts/ci/check-path-deps.sh`,
+which the `deny` job runs before cargo-deny. It reads
+`cargo metadata --locked --all-features --format-version 1` and fails when a
+package with no source (a path package) has a manifest other than the root
+`Cargo.toml` or `crates/<name>/Cargo.toml`. Matching the manifest path, not
+the `workspace_members` list, also rejects a vendored crate added to
+`[workspace] members` outside `crates/`. The same scratch case fails the
+script, as do a path dependency outside the repository, an optional one
+behind a feature, a Windows-only one, one nested under
+`crates/agentd/vendor/`, and a `[patch.crates-io]` entry pointing at a local
+copy; with a stale lockfile, `--locked` makes it fail too. A crate placed
+directly in `crates/` is a workspace crate by the layout rules in
+`AGENTS.md`, so it is reviewed as our code.
+
+### The `deny` job ran only when code changed
+
+**Issue.** The `deny` job runs only when the `changes` job classifies a
+change as code. An advisory published against a crate already in
+`Cargo.lock` therefore surfaced on the next code pull request, unrelated to
+it, rather than when it was published.
+
+**Solution.** The workflow gains a weekly `schedule` trigger (Mondays at
+04:23 UTC). The `changes` job sets a base commit only for `pull_request` and
+`push` events, so a scheduled run is classified as code and runs every job,
+which also catches breakage from a new stable toolchain. `publish-badges`
+still runs only on pushes to `main` and manual dispatches, and the `docs`
+job's badge check only on pushes to `main`. Scheduled runs take a
+concurrency group of their own: in `main`'s group, where
+`cancel-in-progress` is false, a scheduled run arriving while a push run is
+pending would cancel that pending run, and its badges would not be
+published. GitHub runs schedules on the default branch only, so the trigger
+takes effect once this workflow is on `main`.
+
 ## T03: core-types
 
 ### The `Surface` trait's `Sender` has no runtime to come from
@@ -179,8 +225,9 @@ Rocket.Chat produce today, appear unchanged. Parsing accepts only what
 `Display` writes (no lowercase or other escapes, and no raw `/`), and IDs
 parse only in lowercase hyphenated form, so a key string that parses always
 renders back to itself and one key never has two spellings in a database
-column. A scope key never contains `/`, so it is safe as one path segment.
-`MemberKey` and `ConvRef` have the same `<surface>:<team>:<id>` string form,
+column. A scope key never contains `/`, which keeps `VolumeKey`'s single
+separator unambiguous; it is still not a safe file name (see
+[below](#scope-keys-are-not-file-or-docker-names)). `MemberKey` and `ConvRef` have the same `<surface>:<team>:<id>` string form,
 for columns such as T23's `requester_key`.
 
 ### `post` returns one `MsgRef`
@@ -192,6 +239,369 @@ for every chunk after calling `render` itself.
 **Solution.** `Surface::post` sends one already-rendered chunk, as its
 rustdoc says, and `Surface::render` does the converting and splitting. T29's
 acceptance is reworded to test `render` instead.
+
+## T04: testkit
+
+### `fake_claude_path` built outside `cargo llvm-cov`'s target directory
+
+**Issue.** The plan expected a nested `$CARGO build` to respect "whatever
+target directory is in effect, including `cargo llvm-cov`'s". It doesn't.
+`cargo llvm-cov` passes `--target-dir target/llvm-cov-target` on cargo's
+command line, and a test process sees only the environment, which does carry
+`cargo llvm-cov`'s `RUSTC_WRAPPER`. The nested build therefore went to
+`target/debug`, instrumented, where no coverage report looks and where it
+disturbs the next plain build. `fake-claude.rs` showed 3.7% line coverage and
+pulled the workspace under the 85% gate.
+
+**Solution.** `fake_claude_path()` finds the directory the running test
+executable was built in (its nearest ancestor with cargo's `CACHEDIR.TAG`)
+and passes it as `--target-dir`. With the inherited wrapper environment the
+nested build then matches the outer one: a workspace run reuses the binary
+it already built, and a run that didn't build it builds it instrumented in
+the same place. `fake-claude.rs` is now at 96% line coverage. The plan's
+Testing section says so.
+
+### Clearing the environment loses `fake-claude`'s coverage
+
+**Issue.** Under `cargo llvm-cov`, `fake-claude` is instrumented and writes
+its profile where `LLVM_PROFILE_FILE` says. A test that starts it with
+`env_clear()`, as a runner passing an explicit launch environment would,
+drops that variable: the counts are lost and `default.profraw` lands in the
+child's working directory.
+
+**Solution.** testkit's own tests pass `LLVM_PROFILE_FILE` through when it is
+set, and `fake_claude_path()`'s rustdoc tells other crates to do the same
+(T17's `ProcessSandbox`, T20, T21).
+
+### The real CLI prefers `ANTHROPIC_API_KEY`
+
+**Issue.** T04 said `fake-claude` sends `Authorization: Bearer` from
+`CLAUDE_CODE_OAUTH_TOKEN`, and `x-api-key` only when the API key is the only
+credential. Against a local capture server, Claude Code 2.1.285 with both
+variables set sent only `x-api-key` and reported `apiKeySource:
+"ANTHROPIC_API_KEY"`.
+
+**Solution.** `fake-claude` does the same, and its `init` line reports
+`apiKeySource` like the real one. The T04 bullet and the plan's Claude Code
+CLI section say so, and note that the runner sets exactly one of the two.
+
+### What capturing the fixtures showed
+
+**Issue.** Capturing with an unreachable `ANTHROPIC_BASE_URL`, as the plan
+describes, gave ten `system/api_retry` lines and no result within two
+minutes: the CLI retries with backoff. It also left open how the CLI behaves
+on the paths `fake-claude` imitates.
+
+**Solution.** The captures set `CLAUDE_CODE_MAX_RETRIES=0` (and `IS_SANDBOX=1`,
+since the capture ran as root and `bypassPermissions` refuses root otherwise).
+Two captures ran against a local server that answers with the same SSE
+stream as `fake_anthropic()`, which the CLI accepted, with `--session-id`
+and then `--resume`. `fake-claude` follows what they showed:
+
+- `system/init` starts every turn, not only the process. The plan's Claude
+  Code CLI section now says so.
+- The transcript appears with the first user message, not at start. A
+  process reaped before its first turn leaves nothing to `--resume`, so T21
+  should mark a session started only after a turn.
+- `--session-id` with an existing transcript prints `Error: Session ID … is
+  already in use.` to stderr and exits 1. `--resume` without one prints `No
+  conversation found with session ID: …` and a `result` line with `subtype:
+  "error_during_execution"` and an `errors` list, but no `result`,
+  `terminal_reason` or `api_error_status`, then exits 1. Unknown flags and
+  both session flags also exit 1 on the real CLI; `fake-claude` keeps the
+  plan's status 2 for them so tests can tell usage errors apart.
+- Requests go to `/v1/messages?beta=true`, so T18's proxy must forward the
+  query string. The CLI also sends `HEAD /api/hello` before the first
+  request of each process, and an `x-claude-code-session-id` header.
+- A 401 gives `api_error_status: 401` and a synthetic assistant message with
+  `error: "authentication_failed"`. The CLI exits 1 when its last result was
+  an error and 0 otherwise.
+- `rate_limit_event` lines appear after a streamed reply. The
+  `active_goal`, `autocompact_state` and `system/commands_changed` lines the
+  plan lists didn't appear in these short runs; the fixtures hold only what
+  was captured.
+
+Absolute paths in the captures are rewritten to the sandbox layout
+(`/volume/sessions/<id>/work` and `…/claude`).
+
+## T05: store
+
+### The key reaches the store through `open`
+
+**Issue.** The plan gives `Store::open(url)` and `Store::open_in_memory()`,
+but the store owns encryption, so it needs the master key, and nothing said
+how the key gets there.
+
+**Solution.** Both take a `Sealer`: `Store::open(url, sealer)` and
+`Store::open_in_memory(sealer)`. agentd builds the `Sealer` with
+`Sealer::from_base64(&master_key)` when it loads its configuration (T10), so
+a bad key fails at startup rather than at the first login.
+`Sealer::generate_key()` writes a key in the form `from_base64` reads, for
+`agentd gen-key` and for tests. The key is standard base64 with padding;
+surrounding whitespace, such as a trailing newline, is ignored.
+
+### In-memory SQLite needs one connection that never closes
+
+**Issue.** Every connection to a plain `:memory:` database is a separate,
+empty database, so a pool sees a different database on each connection.
+sqlx's `sqlite::memory:` URL works around that with a shared-cache database
+under a unique name, but a shared-cache in-memory database is deleted when
+its last connection closes, and the pool closes idle connections after 10
+minutes and every connection after 30. Shared cache also swaps
+`busy_timeout` for table-level locks, which can fail with `SQLITE_LOCKED`.
+
+**Solution.** `open_in_memory` uses a pool of exactly one connection with no
+idle timeout and no maximum lifetime. Concurrent callers queue for it. `open`
+routes in-memory URLs (`sqlite::memory:`, or a `mode=memory` parameter) to the
+same pool settings, so an agentd test configured with an in-memory URL (T10)
+behaves the same way.
+
+### Switching to WAL can't wait on `busy_timeout`
+
+**Issue.** Changing a database into WAL mode needs an exclusive lock that
+SQLite's busy handler doesn't wait for (sqlx says so where it declines to
+set a journal mode by default). Two connections opening a new file at once
+could fail.
+
+**Solution.** `open` sets `journal_mode=WAL` on every connection, but the
+pool opens one connection first and runs the migrations on it before
+returning, so the switch happens before any concurrency. WAL mode is stored
+in the file, and later connections find it already set. A test checks
+`journal_mode`, `foreign_keys` and `busy_timeout` on a file database.
+
+### A deferred transaction can't upgrade to a write under contention
+
+**Issue.** In WAL mode, a transaction that reads and then writes fails at
+once with `SQLITE_BUSY` if another connection committed in between;
+`busy_timeout` doesn't retry it, because the read snapshot is already stale.
+sqlx's `begin()` starts such a deferred transaction.
+
+**Solution.** Writes that must be atomic use a single statement or
+`BEGIN IMMEDIATE`, which takes the write lock up front and does wait on
+`busy_timeout`. `take_pending_login` is one `DELETE … RETURNING`. With a
+separate `SELECT` and `DELETE`, the concurrent test (eight callers, twenty
+rounds, file database) failed in each of three runs. `ensure_member` checks
+for the identity, and if it's missing takes
+`pool.begin_with("BEGIN IMMEDIATE")`, checks again and inserts, so concurrent
+calls for one identity create one member. Later tasks with read-then-write transactions (T15's scope locks,
+T21's sessions) should do the same.
+
+### Timestamps are Unix seconds and IDs are text
+
+**Issue.** sqlx encodes `OffsetDateTime` as RFC 3339 text in the value's own
+offset, writing fractional seconds only when they are non-zero. SQLite
+compares that text byte by byte, so `expires_at <= ?` is wrong across
+offsets, and even in UTC `…:00Z` sorts after `…:00.5Z`. sqlx encodes `Uuid`
+as a 16-byte blob, which is unreadable in the `sqlite3` shell and doesn't
+match the canonical text form core-types uses in keys.
+
+**Solution.** Timestamps are `INTEGER` Unix seconds (sub-second precision is
+dropped), and IDs are `TEXT` in core-types' lowercase hyphenated form, bound
+with `to_string()` and parsed back with `FromStr`. A value that doesn't parse
+is `StoreError::Corrupt`. Tables are `STRICT`, so a mistyped bind fails
+instead of being stored. The foundation migration's header lists these
+conventions for later migrations.
+
+### `sqlx::migrate!` doesn't notice new migrations
+
+**Issue.** `sqlx::migrate!` embeds `migrations/` at compile time, but on
+stable Rust it can't ask Cargo to watch the directory. Adding a migration
+without touching Rust code leaves a stale build that doesn't apply it.
+
+**Solution.** `crates/store/build.rs` prints
+`cargo:rerun-if-changed=migrations`. sqlx also checksums applied migrations,
+so a migration must never be edited once merged; add a new one instead.
+
+### sqlx 0.9.0 brings older copies of six crates
+
+**Issue.** With sqlx in the lockfile, cargo-deny warned about duplicate
+versions: sqlx-core 0.9.0, the latest release, depends on `base64` 0.22,
+`sha2` 0.10 (so `block-buffer` 0.10, `cpufeatures` 0.2 and `crypto-common`
+0.1), `hashlink` 0.11 (so `hashbrown` 0.16) and `syn` 2, while the workspace
+uses the newer ones (`base64` 0.23, chacha20poly1305's RustCrypto 0.2/0.3
+crates, `syn` 3).
+
+**Solution.** `deny.toml` skips exactly those versions, each with the reason,
+so a new duplicate of the same crates still warns. No license changed.
+
+### The store needs no `rand`
+
+**Issue.** The plan lists `rand` for crypto. chacha20poly1305 0.11 (aead
+0.6) generates nonces and keys itself through its default `getrandom`
+feature (`Nonce::try_generate()`), returning an error instead of panicking
+if the OS generator fails.
+
+**Solution.** `store` doesn't depend on `rand`. It enables chacha20poly1305's
+`zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
+buffer that is wiped after the `SecretString` is built.
+
+### A link label can disguise its destination
+
+**Issue.** `[https://good.com](https://evil.com)` became
+`<https://evil.com|https://good.com>`: Slack shows `https://good.com` and
+opens `evil.com`. Model output is untrusted (a prompt injection can write the
+link), so a label must not be able to name a different site than the link.
+
+**Solution.** Before writing `<url|label>`, the renderer takes the label as
+plain text and looks at each word. A word with a `scheme://` or `mailto:`
+prefix, or one shaped like a domain name (two or more dot-separated labels of
+letters, digits and `-` ending in an alphabetic or `xn--` label, including
+`user@host` addresses) or an IPv4 address, names a host. The authority ends at
+`/`, `?`, `#` or `\`, as in browsers, and the host is what follows its last
+`@`. Hosts are compared after dropping the port and a trailing dot, dropping
+default-ignorable characters (zero-width spaces, soft hyphens, bidirectional
+controls: they render as nothing and could hide a dot from the check), mapping
+dot look-alikes (`。`, `．`, `｡`, `﹒`, `․`) to `.`, lowercasing, and dropping
+a leading `www.`. When any named host differs from the URL's, the label is
+written as text next to a bare link, `https://good.com (<https://evil.com>)`,
+the same shape table cells already use. The label's text stays unarmed, as in
+a link; if Slack links a URL in it on its own, that link shows its own
+destination, so nothing needs neutralizing. Images get the same check on their
+alt text. Autolinks have no separate label, and email autolinks pass because
+the address and the `mailto:` URL name the same host.
+
+The check errs toward showing the URL. There is no IDNA mapping, so a Unicode
+label and its punycode URL (`bücher.de`, `https://xn--bcher-kva.de`) count as
+different, and so do a domain and its subdomains. File names whose extension
+is also a top-level domain (`main.rs`, `README.md`) look like domains, so
+`[main.rs](https://github.com/…)` becomes `main.rs (<https://github.com/…>)`.
+A homoglyph URL (`https://аpple.com` with a Cyrillic `а`) is still shown as
+written; the check only stops a label from vouching for it.
+
+### Slack doesn't format inside a word
+
+**Issue.** CommonMark lets `*` emphasis start or end inside a word, so `5*3*2`
+and `a*b*c` parse as emphasis. Rendering it as `_3_` gave `5_3_2`, which Slack
+doesn't format either, since it only formats at word boundaries: the reader saw
+underscores where the agent wrote asterisks. qm-core's regex leaves both
+alone.
+
+**Solution.** Emphasis, strong emphasis and strikethrough directly preceded or
+followed by a letter or digit in the source keep their Markdown delimiter
+character, once on each side, and their contents render without that style:
+`5*3*2` → `5*3*2`, and `foo**bar**baz` → `foo*bar*baz`, which is also what
+qm-core produces. Doubling the delimiter back to `**` would leave an inner
+`*bar*` pair that Slack could format. `_` can't open or close emphasis inside
+a word in CommonMark, so `snake_case_name` was already text.
+
+### Backslash escapes have no Slack equivalent
+
+**Issue.** `\*not bold\*` parses as the literal text `*not bold*`, and
+Slack then bolds it; the same goes for `_`, `~` and `` ` ``, and for character
+references such as `&ast;`. Slack's mrkdwn has no escape character.
+
+**Solution.** pulldown-cmark starts a new text event at each escaped
+character, so the tree builder records the offset of any text event that
+begins with one of `*`, `_`, `~` or `` ` `` and either follows a backslash or
+differs from its source (a character reference). Outside code those
+characters get U+200B on both sides, which keeps them from opening or closing
+Slack formatting if Slack treats U+200B as a word character or as a space.
+(If it treated it as punctuation, no invisible character could help.) A
+character with a letter or digit on both sides is left alone, because
+Slack wouldn't format there and the zero-width space could act as a boundary
+that lets it. Image alt text is plain text, so every such character in it is
+treated as escaped. Table cells render inside a code block and need nothing.
+A literal `*` right after an escaped backslash (`\\* x`) counts as escaped
+too, which only adds zero-width spaces. Slack's exact boundary rules aren't
+documented, so T29's live check should confirm this renders as intended.
+
+### Backtick runs close a Slack code block
+
+**Issue.** A code body holding ```` ``` ```` used to get a `~~~` fence, as in
+qm-core. Slack doesn't know tilde fences, so the whole block rendered as
+mrkdwn and the inner ```` ``` ```` opened a real code block.
+
+**Solution.** Code blocks and tables always use a backtick fence. Slack closes
+a code block at any run of three backticks and has no escape, so a U+200B goes
+before every third backtick in a row inside the block, and before a backtick
+that starts the info string. The block shows the same characters, but copying
+it out carries the zero-width spaces along.
+
+### A link with an empty URL
+
+**Issue.** `[x]()` rendered as `<|x>`, which Slack doesn't parse as a link.
+
+**Solution.** A link or image whose URL is empty shows only its label (`x`),
+and nothing when the label is empty too. Table cells show just the label as
+well, instead of `x ()`.
+
+### Wire broadcast labels are searched a bounded distance
+
+**Issue.** Each `<!here|` looked for its closing `>` to the end of the text,
+so a message of many `<!here|` without `>` took quadratic time: 210 KB took
+0.2 s.
+
+**Solution.** The `>` must come within 256 bytes (`MAX_WIRE_LABEL`) and before
+a line break. A longer or unclosed token stays escaped text (`&lt;!here|…`),
+which is just as harmless. A test renders 2.1 MB of unclosed `<!here|` under a
+time limit that the quadratic version exceeds several times over.
+
+### Code spans holding backticks
+
+**Issue.** Slack ends inline code at the next backtick and has no escape, so
+a code span that holds one (``` `` a`b `` ```) renders as `` `a`b` ``, and
+Slack shows `a` as code followed by a stray `` b` ``. qm-core has the same
+limit.
+
+**Solution.** Left as is. A zero-width space doesn't stop a backtick from
+closing inline code, and replacing the backtick with a look-alike would change
+the code's text. Agents rarely put backticks in inline code; a fenced block
+shows them correctly.
+
+### The scope lock had no lease id
+
+**Issue.** `LockResponse::Held` carried only an expiry, and renew and
+release named no lease: the server could match them only by session. Claude
+Code runs Bash tool calls in parallel, so one session can run two
+`agentctl lock -- …` at once. Both would get `Held`, and when the first
+command exited its `Release` would free the lock while the second command
+was still writing to `shared/`.
+
+**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
+on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
+`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
+`Release { lease }`, so a renew or release without a lease fails to
+deserialize. The lock is exclusive per lease, not per session: a second
+acquire, from any session, gets `Busy`, and a renew or release naming any
+lease but the current one answers `Released` and changes nothing. T15's
+`scope_locks` table takes `lease_id` as its primary key next to
+`holder_session`, and its acceptance tests the same-session case.
+
+### Scope keys are not file or Docker names
+
+**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
+segment" because it never contains `/`. It always contains `:`, and may
+contain `%` and any other character a platform id holds. A `:` splits a
+bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
+`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
+Docker volume after the key would break or be refused.
+
+**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
+is a key for columns, labels and logs, not a file or Docker object name. T17
+in the plan fixes how volumes are named and mounted: host directories at
+`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
+data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
+type `bind`), never `binds` strings or named Docker volumes. A digest was
+chosen over a reversible encoding of the key (hex or base32), which grows
+with the key and could pass the 255-byte file-name limit for a long
+Rocket.Chat team id; the `volumes` table records which key a directory holds.
+
+### A Slack bot message may name no user
+
+**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
+message may carry only a `bot_id` and no `user`, and the router's
+managed-bot lookup (T22) needs one key to look up. The plan did not say what
+`sender.user` holds then, or whether the router keys on `sender` or on
+`sender_bot_user`.
+
+**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
+surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
+so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
+`user`, or the `user_id` from `bots.info` (T29) when the event has only a
+`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
+has `sender_bot_user: None`; no binding has that id, so the router ignores
+it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
+section saying this, and T12, T22, T28 and T29 in the plan match it.
 
 ## T06: Slack mrkdwn
 
@@ -237,6 +647,17 @@ is harmless whatever flags the Slack surface posts with, and it matches what
 the wire forms become. These names are never offered to the directory, so a
 member called "here" can't be pinged through them.
 
+case, not after a letter or digit, so `me@here.com` is untouched), which
+matches what the wire forms become. These names are never offered to the
+directory, so a member called "here" can't be pinged through them.
+
+This does not make the output safe under every posting flag. With
+`link_names=1` (or `parse=full`) Slack would still link an unresolved `@devs`
+that stays text, and ping that user group, and code keeps a typed `@here`
+as written. Rewriting every unresolved `@word` would mangle ordinary text, so
+the renderer relies on the Slack surface never setting either flag. T29's
+deliverables and acceptance in the plan now say so.
+
 ### Bare URLs get explicit bounds
 
 **Issue.** T06 said bare URLs are "left alone". qm-core wraps them in `<…>`
@@ -268,6 +689,9 @@ otherwise, so `### Deep\nbody` still gives `*Deep*\nbody`. Fenced blocks keep
 their info string, as qm-core and T07's fence reopening assume, even though
 Slack doesn't highlight syntax. A code body that itself holds ```` ``` ````
 keeps a `~~~` fence, like qm-core, because a backtick fence would close early.
+
+still gets a backtick fence (see
+[Backtick runs close a Slack code block](#backtick-runs-close-a-slack-code-block)).
 
 ### Unbounded nesting overflows the stack
 
