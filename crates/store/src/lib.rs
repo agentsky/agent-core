@@ -16,8 +16,11 @@
 //!
 //! Repository methods are grouped by table: [`members`](Store::ensure_member),
 //! [`claude_links`](Store::put_claude_link),
-//! [`pending_logins`](Store::put_pending_login) and
-//! [`processed_events`](Store::mark_event_processed).
+//! [`pending_logins`](Store::put_pending_login),
+//! [`processed_events`](Store::mark_event_processed),
+//! [`ctl_tokens`](Store::put_ctl_token),
+//! [`scope_locks`](Store::acquire_scope_lock) and
+//! [`volumes`](Store::put_volume).
 
 #![warn(missing_docs)]
 
@@ -30,15 +33,19 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use time::OffsetDateTime;
 
 mod claude_links;
+mod ctl;
 mod events;
 mod members;
 mod pending_logins;
 mod seal;
+mod volumes;
 
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
+pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use seal::{KeyError, SealError, Sealer};
+pub use volumes::Volume;
 
 use seal::Aad;
 
@@ -154,6 +161,24 @@ impl Store {
             pool,
             sealer: Arc::new(sealer),
         })
+    }
+
+    /// Checks that the database answers a trivial query, for health checks.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if no connection can be had or the query
+    /// fails, including after [`close`](Self::close).
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Closes the pool: waits for connections in use to be returned, then
+    /// closes every connection. Later calls on this store or its clones fail
+    /// with [`StoreError::Database`].
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     fn seal(&self, aad: Aad<'_>, value: &secrecy::SecretString) -> Result<Vec<u8>> {
@@ -311,10 +336,13 @@ mod tests {
                 "_sqlx_migrations",
                 "claude_link_generations",
                 "claude_links",
+                "ctl_tokens",
                 "members",
                 "pending_logins",
                 "processed_events",
+                "scope_locks",
                 "surface_identities",
+                "volumes",
             ]
         );
     }
@@ -387,6 +415,16 @@ mod tests {
             store.member_for_identity(&member_key("u1")).await.unwrap(),
             Some(member)
         );
+    }
+
+    #[tokio::test]
+    async fn ping_succeeds_until_the_store_is_closed() {
+        let store = memory_store().await;
+        store.ping().await.unwrap();
+        let clone = store.clone();
+        store.close().await;
+        let err = clone.ping().await.unwrap_err();
+        assert!(matches!(err, StoreError::Database(_)), "{err:?}");
     }
 
     #[test]

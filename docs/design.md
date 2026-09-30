@@ -123,8 +123,8 @@ A mentionable agent therefore needs its own bot identity.
 | --- | --- | --- |
 | Mention in the message | `<@U…>` user id token, produced by autocomplete | `@username` text, parsed by the server into `mentions[]` |
 | Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
-| How the bot hears it | `app_mention` event, bot must be a channel member[^slack-mention] | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
-| Bot-to-bot mentions | Expected but not yet verified for one app's bot user mentioning another's[^slack-botmention]. `app_mention` is never sent for DMs, which arrive as `message.im` | Delivered |
+| How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel message only if it mentions the bot (`<@U…>` in the text or blocks) or replies in a thread, so the router can see replies to the agent's own messages. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
+| Bot-to-bot mentions | Expected but not yet verified: whether one app's bot user's post reaches another app as a `message.*` event[^slack-botmention] | Delivered |
 | Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a custom role (`create-user` and token creation)[^rc-create] |
 | Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
 
@@ -153,11 +153,31 @@ Each agent is its own Slack app, created from a manifest.
   for agent apps, and one transport is simpler. agentd's public HTTPS endpoint is
   therefore a prerequisite for `/agent create` on Slack: the manifest's
   `request_url` must answer Slack's `url_verification` challenge when the app is
-  created. Each app's requests are verified with its own `signing_secret`.
+  created. Each app has its own request URLs, `/slack/b/{binding}/events`,
+  `…/interactivity` and `…/commands`, keyed by agentd's binding id (the manager
+  app's is `manager`), because the manifest must carry them before Slack has
+  assigned an app id. The path selects the secret: each app's requests are
+  verified with its own `signing_secret`, a `v0` HMAC-SHA256 over the raw body
+  compared in constant time, with a timestamp at most five minutes from now.
+  Unknown bindings get 404.
+- **The challenge is answered unsigned.** Slack sends `url_verification` while
+  `apps.manifest.create` is still running, before agentd has the new app's
+  signing secret, so agentd echoes the challenge for any binding it knows
+  (including one still being created) without checking the signature. That is
+  safe because the echo has no side effects: it reads no state beyond the
+  binding's existence, writes nothing and queues nothing, and returns only the
+  string the caller sent, as `text/plain` with `nosniff`. A forger learns only
+  that the binding exists, which the 401 on its other requests says anyway.
+  Every other request, including a `url_verification` on the command or
+  interactivity URL, must verify.
 - **Acknowledge first.** Slack expects an acknowledgement within three seconds
   and retries otherwise. Turns take minutes, so agentd acknowledges every event,
-  command and interaction immediately, processes it asynchronously, and drops
-  retried deliveries by `event_id`.
+  command and interaction as soon as it is verified and queued, processes it
+  asynchronously, and replies to commands and interactions through their
+  `response_url`. A full queue gets 503, so Slack retries later. Deduplication
+  is per binding: retried events by `event_id`, a message that reached the same
+  app twice by `(channel, ts)`, and a replayed command or interaction by its
+  signature.
 
 Slash commands are neither namespaced nor unique. Two apps can both register
 `/agent`, and Slack routes it to whichever was installed most recently, so a
@@ -180,7 +200,9 @@ default[^rc-perms].
 
 The custom role needs `create-user`, plus `edit-other-user-active-status` if
 agentd passes `active` on create, and the permission for creating the bot's
-token. A reviewer's reading of the current server source is that `users.create`
+token. It also needs `view-full-other-user-info`: messages don't carry
+the sender's roles, and `users.info` shows another user's roles only with it,
+which is how agentd tells bots from people. A reviewer's reading of the current server source is that `users.create`
 with `roles: ["bot"]` checks only those, and that `assign-roles` is checked on
 update only. That needs a test on the target server version.
 
@@ -330,11 +352,26 @@ flowchart TD
 ```
 
 Response gating is deterministic: an explicit mention, a reply to the agent's
-own message, or a DM. Messages from managed agents only count when they mention
-this agent explicitly. Replying in a thread is not enough, or two agents in one
+own message, or a DM. A reply counts only if it mentions no other managed
+agent: a reply in one agent's thread that mentions only a second agent is
+addressed to the second, so the person pays for one turn, not two. Messages
+from managed agents only count when they mention this agent explicitly, and
+the manager bot's own posts never start a turn. Replying in a thread is not enough, or two agents in one
 thread would answer each other indefinitely. qm-core runs a model call to decide whether to chime in on
 unaddressed thread messages. With subscription credentials that would cost a
 CLI run per message, so agent-core does not do it.
+
+A DM counts only for the agent whose bot received it, so another agent
+mentioned in someone's DM with a different bot never answers there. The
+owner's turns run only on the owner's credential: an owner without a linked
+account gets the link prompt, never the community key. Refusals (a paused
+agent, a banned requester, the agent's deny rules, the hop cap) apply only to
+messages that pass the gate above, so an unaddressed message never draws a
+notice, and they come before the credential, so nobody is offered a link
+prompt or a community-key turn they would then be refused. If the router
+can't tell whether the requester is banned, or what the agent's rules are, it
+refuses rather than assume the requester is allowed. The router's rustdoc
+gives the full order.
 
 ## Sessions and sandboxes
 
@@ -500,12 +537,19 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl post --to <target> <text>` | Post somewhere else the agent is allowed to post |
 | `agentctl react <emoji> [message id]` | Add a reaction |
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
+| `agentctl lock -- <command>` | Run a command while holding the scope's `shared/` lock, for writes to `shared/`. A second `lock`, from any session of the scope, waits |
 | `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
 | `agentctl private <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless the owner is this turn's requester. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
-One bundled skill documents `agentctl`. Its token is scoped to one agent, scope,
-session, turn and requester, is bound to the session's container, and expires
-with the turn.
+One bundled skill documents `agentctl`. Its token is one per `claude`
+process, scoped to one agent, scope and session, and bound to the session's
+container: agentd refuses a request from any other source address. A warm
+process's environment is fixed at start, so a token can't be issued per turn.
+Instead agentd records the current turn, with its requester, side and kind,
+on the token when the turn starts and clears it when the turn ends, and the
+token authorizes nothing between turns. That makes everything it can do
+expire with the turn. Tokens are stored only as SHA-256 hashes and are all
+deleted when agentd restarts.
 
 Launch flags:
 
@@ -676,7 +720,8 @@ for Rocket.Chat bindings.
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
-| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret`. Retried events are deduplicated by `event_id`. |
+| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo skips it. Retried events are deduplicated by `event_id`, and a command or interaction replayed within the window by its signature. |
+| Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel messages at ingress and never logs message content. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 
 ## Crate layout
@@ -732,7 +777,8 @@ shared code. A `MockSurface` drives the shared core in tests.
    agent apps with a one-click install, manager bot with `/agent`.
 5. Consent cards and `agentctl private`, agent-to-agent hand-off with requester
    attribution, hop caps. Before this milestone, verify on a real workspace that
-   one app's bot user mentioning another app's bot user produces `app_mention`.
+   one app's bot user's post mentioning another app's bot user reaches that app
+   as a `message.*` event.
 6. Owner-initiated cloud hand-off (`claude --cloud`) for long PR work.
 7. Slack Connect.
 
@@ -782,8 +828,8 @@ Direct calls would also need our own agent loop.
   `edit-other-user-active-status` when passing `active`, and token creation.
   An issue from 2017 reported that `users.create` also needed edit-user
   permissions[^rc-7351]. Needs a test on the target server version.
-- Whether Slack delivers `app_mention` when one app's bot user mentions
-  another's. Agent-to-agent turns on Slack depend on it.
+- Whether Slack delivers one app's bot user's post to another app as a
+  `message.*` event. Agent-to-agent turns on Slack depend on it.
 - One container per active session costs more than one per scope. Idle reaping
   bounds it, but a busy channel with many threads needs a per-scope container
   cap and a queue.
@@ -807,7 +853,7 @@ Direct calls would also need our own agent loop.
 [^sdk-credit]: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
 [^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
 [^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
-[^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/).
+[^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
 [^slack-botmention]: [slackapi/java-slack-sdk#1279](https://github.com/slackapi/java-slack-sdk/issues/1279) shows `app_mention` with the `bot_message` subtype for a message posted by a workflow, not for one app's bot user mentioning another's. To be verified on a real workspace.
 [^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
 [^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.

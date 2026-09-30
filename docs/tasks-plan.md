@@ -114,7 +114,7 @@ associated data, so a ciphertext copied into another row fails to decrypt.
 | Errors | `thiserror` in libraries, `anyhow` in the two binaries |
 | Logging | `tracing`, `tracing-subscriber` with JSON output in production |
 | Secrets | `secrecy` for every token, key and secret in memory. `Debug` never prints them. |
-| Serialization | `serde`, `serde_json`, `toml` |
+| Serialization | `serde`, `serde_json`, `toml`, and `serde_path_to_error` so configuration errors name the key |
 | IDs | `uuid` with `v4` and `serde` |
 | Time | `time` with `serde` and `formatting` (not `chrono`) |
 | Crypto | `chacha20poly1305`, `sha2`, `hmac`, `base64`, `rand`, `subtle` for constant-time compares |
@@ -182,7 +182,9 @@ description, and must pass T02's policy.
   | ctl | agentd's `sandbox` address, port 8081 | sandboxes | agentctl API |
 
 - Each listener binds its own address, never `0.0.0.0`, so a sandbox can't
-  reach the public routes. As a second guard, the public listener also refuses
+  reach the public routes. Configuration validation refuses an unspecified
+  address in any form, a public address inside the sandbox subnet, and a
+  proxy or ctl address outside it (T10). As a second guard, the public listener also refuses
   connections from the sandbox subnet. T16 has a Docker test that a sandbox
   reaches only ports 8080 and 8081.
 - A container's network identity is its IP on the `sandbox` network, read from
@@ -994,7 +996,7 @@ Deliverables:
 - An axum public listener with `GET /healthz`, which checks the store. The
   internal listeners are placeholders that later tasks fill.
 - Graceful shutdown on SIGTERM: stop accepting, then drain for a configurable
-  timeout.
+  timeout. A second SIGTERM or SIGINT drops in-flight work at once.
 - An `App` struct holding the shared state (config, store, later the surfaces,
   runner and proxy) that later tasks extend. Keep it in
   `crates/agentd/src/app.rs`.
@@ -1199,6 +1201,10 @@ Deliverables:
   the manager invites it where the manager is a member. `allow` and `deny` come
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
+- A realtime connection is `RocketChatSurface::events` (T12). agentd builds
+  each surface with a store-backed `Dedup` and one `BotRoles` over the
+  manager's client, shared by every surface
+  ([impl-notes](impl-notes.md#messages-dont-carry-the-senders-roles)).
 
 Acceptance: tests with `FakeRest` and `FakeDdp` for create, a name collision,
 persona edit by a non-owner (refused), pause (events ignored), delete, and
@@ -1258,8 +1264,13 @@ Deliverables:
     notes it in the design's `agentctl` paragraph.
   - Tokens are 32 random bytes, stored as a SHA-256 hash in a new
     `ctl_tokens` table (`hash`, `session_id`, `agent_id`, `volume_key`,
-    `container_ip`, and the current turn: `turn_id`, `requester`, `hop`,
-    `kind`, `side`, nullable). That table's migration belongs to this task.
+    `container_ip`, and the current turn: `turn_id`, `requester_member`
+    and `requester_key`, `hop`, `kind` and `consent_id`, `side`, and the
+    turn's thread and message, `conversation`, `thread_root` and
+    `trigger_message`, which the target rules and `history` need; all
+    nullable). That table's migration belongs to this task. A session has
+    one token at a time: issuing a new one revokes the old
+    ([impl-notes](impl-notes.md#t15-agentctl)).
     agentd deletes every row at startup: containers from before a restart are
     reaped (T17), and Docker can give their IPs to new containers.
   - The connection's source IP must match `container_ip`, and `turn_id` must
@@ -1268,7 +1279,8 @@ Deliverables:
     and `revoke_process_token(...)`, called through T21's hooks.
   - Handlers write to a per-turn outbox (attachments staged on disk under the
     agentd data directory, reactions and posts queued) that the turn pipeline
-    (T23) drains.
+    (T23) drains: `end_turn` returns it. The data directory is the new
+    `store.data_dir` key, and the attachment cap `limits.attach_max_bytes`.
   - Target rules, checked when the request arrives, from the turn's `Side`
     (the `core-types` type T22's router decides with, stored at
     `begin_turn`):
@@ -1279,7 +1291,10 @@ Deliverables:
       target any conversation the agent's bot is a member of. The surface
       refuses the rest.
     - Anything else is refused with a reason the model can read.
-  - `history` calls `Surface::history`.
+  - `history` calls `Surface::history`, on the surface a `SurfaceLookup`
+    finds for the agent and conversation. agentd passes one to `App` once
+    surfaces are wired in (T23); until then `history` answers "not
+    available".
   - `ask-agent` and `private` return "not available yet" until T33 and T34.
   - Refusal rule already in place: inside a `TurnKind::PrivateTask` token,
     everything except `attach` is refused.
@@ -1313,16 +1328,20 @@ Deliverables:
     `CLAUDE_CODE_VERSION` build argument, with no Node.js.
   - `agentctl` copied from a multi-stage Rust build.
   - A non-root user `agent` with uid 10001, and `WORKDIR /volume`.
+  - `/bin/sh`, which `DockerSandbox::exec` runs every command through.
   - Entrypoint `tini --`. The container idles (`sleep infinity`), and the
     runner execs `claude` into it.
 - `images/agentd/Dockerfile`: a multi-stage build of agentd on a distroless or
-  Debian slim base, run as non-root.
+  Debian slim base, run as uid 10001, the sandbox user, so the volume
+  directories agentd creates are writable in sandboxes
+  ([impl-notes](impl-notes.md#agent-writable-directories-are-given-to-the-sandbox-user)).
 - `deploy/compose/compose.yaml` for development:
   - Rocket.Chat 7.x and MongoDB, on `egress` only.
   - agentd, on both networks with static addresses, binding each listener to
     its own address, with the aliases from
     [Network and deployment shape](#network-and-deployment-shape).
-  - The `sandbox` network (`internal: true`) and the `egress` network.
+  - The `sandbox` network (`internal: true`, with `name: sandbox` so Docker
+    doesn't prefix the project name) and the `egress` network.
   - A volume root on the host.
   - Access to the Docker socket for agentd, documented as a development-only
     shortcut with a note that production should use a socket proxy.
@@ -1376,6 +1395,8 @@ Deliverables:
     so the runner can revoke their mappings at once (T21).
 - A migration `…_volumes.sql` for the `volumes` table (`agent_id`,
   `scope_key`, `path`, `created_at`), keyed by `(agent_id, scope_key)`.
+  `path` is relative to the data directory and unique
+  ([impl-notes](impl-notes.md#the-volumes-row-records-a-relative-path)).
 - Volumes are host directories under `volumes/` in the agentd data
   directory, at `volumes/<agent id>/<scope dir>`. `<scope dir>` is the
   lowercase hex SHA-256 of the scope key's string form: 64 characters from
@@ -1409,23 +1430,36 @@ Deliverables:
   - Network `sandbox` only, `no-new-privileges`, all capabilities dropped,
     memory, CPU and PID limits from configuration, and a read-only root
     filesystem.
-  - Labels `agentd.session=<id>`, `agentd.agent=<id>` and
-    `agentd.scope=<key>`.
-  - `exec` attaches stdin and stdout with bollard's exec API.
-  - `list_managed` finds containers by label.
+  - Labels `agentd.session=<id>`, `agentd.agent=<id>`,
+    `agentd.scope=<key>` and `agentd.instance=<[sandbox] instance>`.
+  - `exec` attaches stdin and stdout with bollard's exec API, through a
+    `/bin/sh` wrapper that reports the pid so the process can be killed
+    ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
+  - `list_managed` finds containers by the `agentd.session` label and this
+    agentd's `agentd.instance` label
+    ([impl-notes](impl-notes.md#several-agentd-or-test-runs-on-one-docker-host)).
   - `events` follows Docker's event stream, filtered to `die` events for
     managed containers.
+  - Mount sources are rewritten to `[sandbox] host_data_dir` when agentd
+    sees its data directory at another path than the Docker daemon
+    ([impl-notes](impl-notes.md#agentds-paths-arent-the-docker-daemons)).
+  - Agent-writable directories are given to the sandbox user, and nothing
+    on the host follows a symlink inside them
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
   given environment and working directory, and `ip` returns `127.0.0.1`. It
   isolates nothing, and says so in its rustdoc.
-- `reap_orphans()` at startup: stop every container labeled `agentd.session`.
+- `reap_orphans()` at startup: stop every container labeled `agentd.session`
+  with this agentd's `agentd.instance`.
   Placeholder mappings and agentctl tokens don't survive a restart, so no
   container from before one can be used.
 - A CI job `docker-tests`, added to `ci-passed`. It runs
   `cargo test --workspace -- --ignored docker_` on ubuntu-24.04, when code
   changed. The tests here use `debian:stable-slim` with a non-root user, since
-  they check mounts and isolation, not the CLI. The sandbox image is T16's,
+  they check mounts and isolation, not the CLI. They run as the test
+  process's own non-root uid, since a non-root test can't give directories
+  to uid 10001. The sandbox image is T16's,
   and the test that launches the real `claude` belongs to T23.
 
 Acceptance:
@@ -1689,27 +1723,48 @@ Deliverables:
 
 - A pure function `route(event, agent, view: &dyn RouterView) -> Decision`.
   `RouterView` answers:
-  - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
-    and user as every identity is, so a matching user id from another team or
-    server is never taken for a managed agent. The router asks it for
-    `event.sender` when `sender_is_bot` is true. Surfaces put the bot's user
-    id in both `sender.user` and `sender_bot_user`, so the router needs only
-    `sender`; a bot known only by its bot id matches no binding.
-  - `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`.
+  - `managed_bot(MemberKey) -> Option<ManagedBot>`, where `ManagedBot` is
+    `Agent(AgentId)` or `Manager`, keyed by surface, team and user as every
+    identity is, so a matching user id from another team or server is never
+    taken for a managed bot. The router asks it for `event.sender`, and for
+    every sender, whatever `sender_is_bot` says, so a managed agent's post is
+    never routed as a person's
+    ([impl-notes](impl-notes.md#surface-flags-arent-trusted-for-managed-agents)),
+    and the manager bot's posts are ignored
+    ([impl-notes](impl-notes.md#the-manager-bot-had-no-identity-in-the-view)).
+    Surfaces put the bot's user id in both `sender.user` and
+    `sender_bot_user`, so the router needs only `sender`; a bot known only by
+    its bot id is an unmanaged bot without a lookup. Mentions are looked up
+    the same way, in the conversation's surface and team.
+  - `binding_agent(BindingId) -> Option<AgentId>`, so a one-to-one DM counts
+    only for the agent whose binding received it
+    ([impl-notes](impl-notes.md#a-dm-didnt-say-whose-dm-it-is)).
+  - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
+    accepted only when `agent` is the agent that sent the message
+    ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
   - `member_for(MemberKey)`, `is_linked(member)`.
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
-  - `policy(agent)`, which returns allow and deny (T27 fills it; the default
-    allows).
-  - `is_banned(member)` (T27 fills it; the default is false).
+  - `policy(agent) -> Option<AgentPolicy>`, which returns allow and deny and
+    the effective hop cap (T27 fills it; an agent with no rules has
+    `AgentPolicy::default()`, which allows, with a cap of 3).
+  - `is_banned(requester) -> Option<bool>` (T27 fills it).
+  - `policy` and `is_banned` fail closed: `None` means the view doesn't
+    know, and the router refuses with `RefuseReason::PolicyUnavailable`. The
+    trait's rustdoc lists every lookup `route` may make for an event, in
+    order
+    ([impl-notes](impl-notes.md#a-synchronous-view-over-an-asynchronous-store-failed-open)).
 - `Decision` is one of:
   - `Ignore(reason)`.
-  - `LinkPrompt`.
+  - `LinkPrompt { requester }`, naming who should link: the sender, or a
+    hop's inherited requester.
   - `Run { requester, hop, credential: CredentialRef, scope: ScopeKind,
     side: Owner | Public }`.
   - `Refuse(reason)`, used for paused agents, bans, deny rules and the hop
     cap.
+  - Reasons are enums, not strings. The order of the checks is in the
+    crate rustdoc ([impl-notes](impl-notes.md#the-plan-and-the-design-name-no-order-for-the-checks)).
 - The flowchart from the design, each branch a named test:
   - Unmanaged bot, ignored, including one known only by its bot id
     (`sender_bot_user: None`).
@@ -1727,7 +1782,9 @@ Deliverables:
   - Unlinked with the community key, community credential.
   - Unlinked without it, a link prompt.
   - A thread reply that doesn't mention the agent and isn't a reply to it,
-    ignored.
+    ignored. A reply to the agent that mentions only another managed agent,
+    ignored too
+    ([impl-notes](impl-notes.md#a-reply-naming-another-agent-ran-two-turns)).
   - Over the hop cap, refused.
 - The model is chosen from the requester's plan by a `ModelPolicy`
   (configuration maps a plan to a model, with a default).
@@ -1758,14 +1815,30 @@ Deliverables:
     the thread lookups below.
   - Rows exist for every message agentd posts, and for inbound messages shown
     to the model, so short ids resolve.
+- agentd's `[sandbox]` configuration section is `sandbox::SandboxConfig`
+  (T17), validated with its `validate`; `image` fills every `SessionSpec`.
+  agentd builds a `DockerSandbox` with its data directory, calls
+  `reap_orphans` at startup, and documents the section in
+  `config/agentd.example.toml`.
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
-  T19, and issues agentctl tokens and records their turns with T15.
+  T19, and issues agentctl tokens and records their turns with T15
+  (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
+  turn's outbox, and `revoke_process_token`). It builds `App` with a
+  `SurfaceLookup` for `agentctl history`, and resolves the short message ids
+  it shows the model where agentctl takes a message id
+  ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
-     `RouterView`. The candidates are every managed agent mentioned, the
-     agent whose DM it is, and the agent that posted the thread root
+     `RouterView`. The store is asynchronous and the view is not, so first
+     load everything the lookups listed in `RouterView`'s rustdoc need for
+     the event and every candidate, the manager bot's identities included.
+     Until T27, `policy` answers `AgentPolicy::default()` and `is_banned`
+     answers `Some(false)`. A lookup the view can't answer withholds the
+     turn: `None` from `is_banned` or `policy` is refused as
+     `PolicyUnavailable`. The candidates are every managed agent mentioned,
+     the agent whose DM it is, and the agent that posted the thread root
      (`reply_to`, looked up in `message_refs`). When the surface has
      `per_binding_delivery`, only the receiving binding's agent is a
      candidate, since each other agent gets its own copy.
@@ -1774,16 +1847,18 @@ Deliverables:
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
-     3. Render and split for the surface. `MentionDirectory` is synchronous,
-        so the pipeline first builds a snapshot of the names the reply
-        mentions from agent bindings and the surface's member cache.
+     3. Render and split with `Surface::render`. The trait takes no
+        `MentionDirectory`, so each surface resolves `@Name` from its own
+        member list; on Slack that is T29's per-team member cache, which
+        includes the agents' bot users
+        ([impl-notes](impl-notes.md#t29-slack-web-api)).
      4. Post as the agent's bot identity in the thread.
      5. Record `message_refs` for every chunk with the turn's requester and
         hop.
      6. Apply reactions, and send the `agentctl post` messages the turn queued
         (T15 already checked their targets).
-  5. On `LinkPrompt`, reply in the thread with a private-link instruction
-     (manager bot DM or ephemeral where the surface allows).
+  5. On `LinkPrompt`, send the decision's `requester` a private-link
+     instruction (manager bot DM or ephemeral where the surface allows).
 - Turn message builder:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
@@ -1943,8 +2018,16 @@ Deliverables:
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
+  `AgentPolicy::max_hops` is the effective cap, the global one lowered by the
+  agent's, and allow and deny follow `AgentPolicy::permits` (T22). This task
+  extends T22's `AgentPolicy` with the daily turn cap and `RefuseReason`
+  with a variant for it, and fills `policy` and `is_banned` from these
+  tables, returning `None` only when a lookup fails, never for an agent or
+  member with no rows.
 - `/agent allow|deny <name> <target>`. A target is a member (`@user`), a
-  channel (`#room`), or `everyone`. Deny wins, and the default allows
+  channel (`#room`), or `everyone`. A member rule stores the identity and
+  the member it belongs to, as `PolicyTarget::Member { key, member }`, so it
+  covers the member on every surface. Deny wins, and the default allows
   everyone.
 - Thread caps from `[limits]`:
   - Agent turns per thread per hour.
@@ -1984,23 +2067,29 @@ Deliverables:
 
   The app id doesn't exist until `apps.manifest.create` returns, but the
   manifest must already carry its URLs, so agentd mints the binding id first
-  (T31). The manager app uses the fixed binding `manager`. The path selects
-  the signing secret: the binding's for agent apps, the one from configuration
-  for the manager. Unknown bindings get 404.
+  (T31). The manager app uses the fixed binding `manager`, whose events carry
+  the nil UUID as their `BindingId` (`BindingRef::MANAGER_ID`). The path
+  selects the signing secret: the binding's for agent apps, the one from
+  configuration for the manager. Unknown bindings get 404.
+  ([impl-notes](impl-notes.md#t28-slack-ingress))
 - Signature verification: `v0=HMAC-SHA256(secret, "v0:{ts}:{body}")` over the
   raw body, compared in constant time, rejecting timestamps more than 5 minutes
-  old.
+  from now in either direction, missing or repeated headers, and bodies over
+  1 MiB.
 - `url_verification`: echo the challenge for a known binding, without checking
   the signature. Slack sends it during `apps.manifest.create`, before agentd
   has the new app's signing secret. The echo has no side effects. Every other
   request type must verify.
   This PR adds that detail to the design's Slack transport bullet.
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
-  200 at once. Slash commands and interactivity return an empty 200 and reply
-  later through `response_url`.
+  200 at once, or 503 when the queue is full, so Slack retries; they never
+  wait for the queue. Slash commands and interactivity return an empty 200 and
+  reply later through `response_url`.
 - Deduplication per binding: `store.mark_event_processed("slack:<binding>",
   event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
-  a message that reached the same app twice. `X-Slack-Retry-Num` is logged.
+  a message that reached the same app twice. Slash commands and
+  interactivity, which have no event id, are deduplicated by signature, which
+  drops a replay inside the 5-minute window. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
   - Agent apps take every message from `message.channels`,
     `message.groups`, `message.im` and `message.mpim`, and don't subscribe to
@@ -2072,13 +2161,16 @@ Deliverables:
   of 3,000 chars, and `supports_edit`, `supports_buttons`, `supports_threads`
   and `per_binding_delivery` all true.
 - A member cache per team, filled from `users.list` and refreshed on a
-  TTL, mapping display and real names to user ids. The pipeline's
-  `MentionDirectory` snapshot (T23) reads it together with agent bindings.
-  `users.info` can't look a user up by name.
+  TTL, mapping display and real names to user ids. `SlackSurface::render`
+  reads it; bot users are listed too, so agents' names resolve without the
+  bindings. `users.info` can't look a user up by name.
 - `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
   `user_id` for bot events that lack a `user` field, cached per bot id. A bot
   id that maps to no user keeps the `bot_id` as `sender.user` and no
-  `sender_bot_user`, so the router ignores it as an unmanaged bot.
+  `sender_bot_user`, so the router ignores it as an unmanaged bot. The
+  ingress has no bot tokens, so the lookup is
+  `SlackSurface::fill_bot_sender`, which the receiver of `SlackInbound`
+  calls before routing (T31).
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `render` converts and splits through `render`, so that
@@ -2185,6 +2277,10 @@ Deliverables:
   agentd disables the binding, stops handling its events, and tells the owner
   to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
+- agentd's receiver of T28's `SlackInbound` builds a T29 `SlackSurface` per
+  active binding, with one `TeamDirectory` per team, awaits
+  `refresh_members` when a binding starts, and passes each message through
+  `fill_bot_sender` before routing it.
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 
@@ -2408,3 +2504,8 @@ Not scheduled. Each needs a decision before it becomes a task.
   [Alternatives considered](design.md#alternatives-considered)).
 - **Managed Agents backend** for channel agents funded by a community API key
   (design, same section).
+- **Backfill after a Rocket.Chat reconnect.** A realtime connection that
+  drops misses what was posted until it is back (T12). Every bot in a room
+  would need to miss it for a message to be lost, but a lone agent in a room,
+  or an agentd restart, loses it. Fetching each room's history since the last
+  message seen, through the same deduplication, would close the gap.

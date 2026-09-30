@@ -1,0 +1,77 @@
+# agentd configuration. Run agentd with
+#
+#   agentd serve --config /etc/agentd/agentd.toml
+#
+# Every key agentd reads is listed here, with its default where it has one.
+# Unknown keys and sections are errors, so a typo fails at startup.
+#
+# Secrets never go in this file. agentd reads them from the environment:
+#
+#   AGENTD_MASTER_KEY          Required. The key that encrypts secrets at rest:
+#                              32 bytes, standard base64. `agentd gen-key`
+#                              prints a new one. Losing it makes every stored
+#                              secret unreadable.
+#   AGENTD_RC_MANAGER_TOKEN    The Rocket.Chat manager's personal access token.
+#   AGENTD_SLACK_MANAGER_<NAME>
+#                              The Slack manager app's secrets.
+#                              AGENTD_SLACK_MANAGER_SIGNING_SECRET verifies
+#                              requests to /slack/b/manager/events,
+#                              /interactivity and /commands; without it those
+#                              URLs answer 404. Every other
+#                              AGENTD_SLACK_MANAGER_* variable requires it.
+#
+# A variable whose name is a near miss of one of these (within two edits of
+# AGENTD_MASTER_KEY or AGENTD_RC_MANAGER_TOKEN, or starting within two edits of
+# AGENTD_SLACK_MANAGER_) is refused, so a misspelled secret fails at startup.
+# Kubernetes service links for a Service named agentd (AGENTD_PORT,
+# AGENTD_SERVICE_HOST, AGENTD_PORT_8443_TCP_ADDR, ...) are skipped, and any
+# other AGENTD_ variable is ignored with a warning.
+#
+# Listeners bind agentd's own address on the network they serve, never
+# 0.0.0.0 or [::] (in any form, [::ffff:0.0.0.0] included): the public
+# listener on the `egress` network, the proxy and ctl listeners on the
+# `sandbox` network. A port of 0 picks a free port.
+
+[server]
+# The public listener: /healthz, the Slack request URLs
+# (/slack/b/<binding>/events, /interactivity and /commands), and later OAuth
+# callbacks. agentd terminates no TLS; put a TLS terminator in front of it.
+listen = "172.31.0.2:8443"
+
+# On SIGTERM or SIGINT agentd stops accepting connections, then waits this
+# many seconds (at most 3600) for in-flight requests before dropping them. A
+# second SIGTERM or SIGINT drops them at once.
+drain_timeout_secs = 30
+
+# Which log lines to write, in tracing-subscriber's EnvFilter syntax, for
+# example "info,agentd=debug". Logs go to standard error: human-readable on a
+# terminal, one JSON object per line otherwise.
+log_filter = "info"
+
+[internal]
+# The credential proxy listener that sandboxes use as ANTHROPIC_BASE_URL and
+# HTTPS_PROXY (cred-proxy.internal). Must be inside sandbox_subnet.
+proxy_listen = "172.30.0.2:8080"
+
+# The agentctl API listener (agentctl.internal). Must be inside
+# sandbox_subnet.
+ctl_listen = "172.30.0.2:8081"
+
+# The sandbox network, in CIDR form. The public listener refuses connections
+# from it, and server.listen must not be inside it. An IPv4 subnet written in
+# IPv4-mapped form (::ffff:172.30.0.0/120) means the IPv4 subnet it names.
+sandbox_subnet = "172.30.0.0/24"
+
+[store]
+# The SQLite database. agentd creates the file if it is missing, and applies
+# pending migrations at startup (and with `agentd migrate`).
+url = "sqlite:///var/lib/agentd/agentd.db"
+
+# agentd's data directory, an absolute path. Files agents stage with
+# `agentctl attach` wait under ctl-outbox/ in it until their turn's reply is
+# posted; agentd empties ctl-outbox/ at startup.
+data_dir = "/var/lib/agentd"
+
+[limits]
+# The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
+attach_max_bytes = 52428800

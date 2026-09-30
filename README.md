@@ -26,13 +26,48 @@ that fails if line coverage is below 85%. Change `--fail-under-lines` there to
 move the threshold. It needs `cargo install cargo-llvm-cov` and
 `rustup component add llvm-tools-preview`.
 
+## Running agentd
+
+agentd reads one TOML file, documented key by key in
+[`config/agentd.example.toml`](config/agentd.example.toml), and takes its
+secrets from the environment only:
+
+```bash
+export AGENTD_MASTER_KEY="$(agentd gen-key)"   # keep it: it decrypts stored secrets
+agentd migrate --config /etc/agentd/agentd.toml
+agentd serve --config /etc/agentd/agentd.toml
+```
+
+`serve` also applies pending migrations when it starts; `migrate` is for
+running them as a separate step. Configuration errors name the key or
+variable at fault. A near miss of a secret's name is refused, Kubernetes
+service links such as `AGENTD_PORT` are skipped, and any other variable
+starting with `AGENTD_` is ignored with a warning. Each listener binds
+agentd's own address on its network, never `0.0.0.0`, and the proxy and ctl
+listeners must be inside `internal.sandbox_subnet`.
+`GET /healthz` on the public listener answers 200 while the database does.
+It also serves Slack's request URLs, `/slack/b/<binding>/events`,
+`…/interactivity` and `…/commands`; the manager app's binding is `manager`,
+and its requests are verified with `AGENTD_SLACK_MANAGER_SIGNING_SECRET`.
+The ctl listener serves the agentctl API that sandboxed agents call back
+through; at startup agentd deletes every agentctl token and scope lock and
+empties `ctl-outbox/` under `store.data_dir`, since the containers they
+belonged to are gone.
+On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
+requests `server.drain_timeout_secs` to finish; a second signal drops them at
+once. Logs go to standard error,
+human-readable on a terminal and one JSON object per line otherwise.
+
 ## CI
 
 GitHub Actions runs the same formatting, lint, test, doc, and coverage checks
 on pushes to `main` and on pull requests, plus a `cargo check` on the minimum
 supported Rust version declared in `Cargo.toml`. The formatting, lint, test
 and doc checks run on both x86_64 and aarch64 Linux. Dependabot keeps actions
-and crates up to date.
+and crates up to date. The `agentctl-static` job builds `agentctl` for
+`x86_64-unknown-linux-musl` and fails if `readelf -l` shows an `INTERP`
+segment, so the binary copied into the sandbox image needs no dynamic
+loader.
 
 The `deny` job enforces the dependency policy in `deny.toml` with
 [cargo-deny](https://github.com/EmbarkStudios/cargo-deny): no OpenSSL or
@@ -44,6 +79,13 @@ newly published advisory fails a run of its own. Run it locally with
 `cargo install cargo-deny --locked`,
 `cargo deny --workspace --locked check -W unmaintained` and
 `sh scripts/ci/check-path-deps.sh`.
+
+The `docker-tests` job runs the tests that need a Docker daemon: they are
+named `docker_*` and marked ignored, so the other jobs skip them. Run them
+locally, with Docker running, as
+`cargo test --workspace -- --ignored docker_`. They pull
+`debian:stable-slim` and create and remove their own networks and
+containers.
 
 A change that touches only documentation (Markdown files and `LICENSE`, as
 decided by `scripts/ci/docs-only.sh`) skips the build and test jobs and runs
