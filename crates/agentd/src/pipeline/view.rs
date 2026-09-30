@@ -57,7 +57,10 @@ async fn attribution(
 /// owner and those members have a link and whether it broke, and whether a
 /// community admin has set the community API key; then whether any of those
 /// members is banned, the agent's policy with the turns it took today, and,
-/// outside a one-to-one DM, what agents spent in the event's thread.
+/// outside a one-to-one DM, what agents spent in the event's thread. A
+/// sender or attributed requester whose identity is a community admin's is
+/// never banned, as [`Commands`](crate::commands::Commands) never holds an
+/// admin back, so a ban row left on an admin's member can't silence them.
 ///
 /// Those last three fail closed on their own: a lookup that fails is logged
 /// and leaves its answer `None`, which the router refuses, rather than
@@ -77,6 +80,7 @@ pub(crate) struct StoreView {
     members: HashMap<MemberKey, MemberId>,
     links: HashMap<MemberId, LinkState>,
     community_key: bool,
+    admins: Vec<MemberKey>,
     banned: Option<HashSet<MemberId>>,
     policy: Option<AgentPolicy>,
     thread: Option<ThreadBudget>,
@@ -87,6 +91,8 @@ pub(crate) struct StoreView {
 pub(crate) struct ViewContext<'a> {
     /// The manager bots' identities.
     pub(crate) managers: &'a [MemberKey],
+    /// The community admins' identities, whom a ban never holds back.
+    pub(crate) admins: &'a [MemberKey],
     /// The thread the event is in, as its turn would run.
     pub(crate) thread: &'a ThreadKey,
     /// The community's caps.
@@ -164,6 +170,15 @@ impl StoreView {
             view.replied = Some((reply_to.clone(), poster));
         }
         view.member(store, &event.sender).await?;
+        view.admins = std::iter::once(&event.sender)
+            .chain(
+                view.attribution
+                    .as_ref()
+                    .map(|(_, attributed)| &attributed.requester.key),
+            )
+            .filter(|key| context.admins.contains(key))
+            .cloned()
+            .collect();
         view.community_key = store.community_api_key_set().await?;
         view.banned = view.bans(store, agent).await;
         view.policy = policy(store, agent, context).await;
@@ -287,6 +302,9 @@ impl RouterView for StoreView {
     }
 
     fn is_banned(&self, requester: &Requester) -> Option<bool> {
+        if self.admins.contains(&requester.key) {
+            return Some(false);
+        }
         let banned = self.banned.as_ref()?;
         Some(
             requester

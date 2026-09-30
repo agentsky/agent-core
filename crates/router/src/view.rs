@@ -124,7 +124,8 @@ pub trait RouterView {
 
     /// Whether a community admin banned the requester: the member it names,
     /// or the member its key belongs to. `None` if the view doesn't know,
-    /// which refuses.
+    /// which refuses. A view may exempt a requester by their key, as
+    /// agentd's does a community admin.
     fn is_banned(&self, requester: &Requester) -> Option<bool>;
 
     /// What agents have spent in the thread the event is in, every agent's

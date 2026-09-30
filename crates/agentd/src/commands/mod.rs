@@ -637,7 +637,7 @@ impl Commands {
         };
         reply.push('\n');
         reply.push_str(&self.usage(member).await?);
-        if let Some(member) = member
+        if let Some(member) = member.filter(|_| !self.is_admin(key))
             && let Some(ban) = self.inner.store.ban(member).await?
         {
             reply.push_str("\nA community admin banned you: agents won't take your requests, and you can only run `me`, `logout`, and `pause` or `delete` your agents.");

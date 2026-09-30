@@ -1282,6 +1282,34 @@ async fn bans_and_deny_rules_refuse_a_requester_privately_once_a_day() {
 }
 
 #[tokio::test]
+async fn a_ban_never_holds_back_a_community_admin() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.admins = vec![key("bob")],
+        ..Setup::default()
+    })
+    .await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    stack.next_turn(Turn::reply("For the admin."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "adm1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "For the admin.");
+    assert!(stack.dms_to("bob").is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_hop_refused_for_its_requester_tells_no_one() {
     let stack = start().await;
     let store = stack.store();

@@ -84,6 +84,9 @@ pub struct PipelineSettings {
     pub data_dir: PathBuf,
     /// The manager bots' identities, whose posts start no turn.
     pub managers: Vec<MemberKey>,
+    /// The community admins' identities, whom a ban never holds back, as
+    /// [`Commands`](crate::commands::Commands) never holds them back.
+    pub admins: Vec<MemberKey>,
     /// The emoji a bot reacts with while its turn runs.
     pub working_emoji: String,
     /// Which model a requester's plan gets, or `None` for the CLI's
@@ -698,6 +701,7 @@ impl Pipeline {
         let thread = thread_of(event, caps);
         let context = ViewContext {
             managers: &settings.managers,
+            admins: &settings.admins,
             thread: &thread,
             limits: &settings.limits,
             now: (settings.now)(),

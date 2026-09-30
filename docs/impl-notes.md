@@ -6783,9 +6783,12 @@ secret-bearing command sent where others can read it. `admin ban @member
 so every identity they link is covered; an identity of theirs they never
 linked is another member to agentd, and isn't. The reason is at most 500
 characters and shown to them by `me`, never logged. Admins, matched by
-identity as T26 does, can't be banned, and `Commands::run` never holds an
-admin back, so a ban row left on an admin's member (made before they
-were listed) can't lock the community out of `admin unban`. Deleting a
+identity as T26 does, can't be banned, and neither `Commands::run` nor
+the router holds an admin back (the pipeline's view never counts an
+admin's identity as banned, as sender or as a hop's requester, and `me`
+doesn't say they are), so a ban row left on an admin's member (made
+before they were listed) can't lock the community out of `admin unban`
+or silence the admin's requests. Deleting a
 member deletes their ban (`ON DELETE CASCADE`). The router's view loads
 bans for every member it knows (the sender's, the attributed requester's
 and its key's) and fails closed if the store can't say.

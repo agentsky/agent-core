@@ -2495,6 +2495,12 @@ async fn a_banned_owner_may_still_take_away_and_an_admin_is_never_held_back() {
         .unwrap();
     h.dm(ADMIN, "list").await;
     assert_ne!(h.last_reply(ADMIN), BANNED);
+    h.dm(ADMIN, "me").await;
+    assert!(
+        !h.last_reply(ADMIN).contains("banned"),
+        "{}",
+        h.last_reply(ADMIN)
+    );
 }
 
 #[tokio::test]

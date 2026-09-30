@@ -149,8 +149,9 @@ impl Turns {
 
 impl PipelineSettings {
     /// The settings `app` gives: its data directory, its manager bots,
-    /// `[runner]`'s working emoji and models, and `[limits]`' caps, with the
-    /// default queue bounds and the system clock.
+    /// `[community]`'s admins, `[runner]`'s working emoji and models, and
+    /// `[limits]`' caps, with the default queue bounds and the system
+    /// clock.
     pub fn from_app(app: &App) -> Self {
         let managers = app
             .rocketchat()
@@ -162,6 +163,7 @@ impl PipelineSettings {
         Self {
             data_dir: app.config().store.data_dir.clone(),
             managers,
+            admins: app.config().community.admins.clone(),
             working_emoji: runner.working_emoji.clone(),
             models: runner.models.clone(),
             queue_per_thread: DEFAULT_QUEUE_PER_THREAD,
