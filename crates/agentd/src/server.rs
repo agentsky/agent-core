@@ -6,7 +6,7 @@
 //! | Listener | Key | Serves |
 //! | --- | --- | --- |
 //! | public | `server.listen` | `/healthz`, the Slack request URLs, and later OAuth callbacks |
-//! | proxy | `internal.proxy_listen` | the credential proxy (placeholder) |
+//! | proxy | `internal.proxy_listen` | the credential proxy and the egress proxy ([`cred_proxy`]) |
 //! | ctl | `internal.ctl_listen` | the agentctl API ([`ctl`](crate::ctl)) |
 //!
 //! The public listener also refuses connections from
@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
+use auth::TokenSource;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -32,6 +33,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::serve::Listener;
 use core_types::Sender;
+use cred_proxy::CredProxy;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -49,6 +51,7 @@ use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
+use crate::pipeline::{NoCommunityKey, Turns};
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -79,10 +82,15 @@ pub struct Routers {
 impl Routers {
     /// The routes agentd serves: `/healthz` and the Slack request URLs on
     /// the public listener, with the Slack queue as a worker handing
-    /// commands to the command intake, and the agentctl API on the ctl
-    /// listener. The proxy listener answers everything with 404 until the
-    /// credential proxy is added.
-    pub fn new(app: &App) -> Self {
+    /// commands to the command intake; the credential proxy on the proxy
+    /// listener, forwarding to `proxy.upstream` with the placeholders in
+    /// [`App::registry`] and answering `CONNECT` with the egress proxy
+    /// `[proxy]` describes; and the agentctl API on the ctl listener.
+    ///
+    /// # Errors
+    ///
+    /// If the credential proxy can't be built.
+    pub fn new(app: &App) -> anyhow::Result<Self> {
         let (slack_routes, slack_queue) = slack::routes(app);
         let (intake, commands) = CommandIntake::new(app.commands().clone());
         let inbound = slack::Inbound::new(
@@ -90,9 +98,18 @@ impl Routers {
             app.slack().map(|slack| slack.identity().clone()),
             commands.clone(),
         );
-        Self {
+        let tokens: Arc<dyn TokenSource> = app.auth().clone();
+        let proxy = CredProxy::new(
+            &app.config().proxy.upstream,
+            app.registry().clone(),
+            tokens,
+            Arc::new(NoCommunityKey),
+        )
+        .context("proxy.upstream")?
+        .with_egress(app.config().egress_proxy()?);
+        Ok(Self {
             public: public_router(app.clone()).merge(slack_routes),
-            proxy: Router::new(),
+            proxy: proxy.into_router(),
             ctl: app.ctl().router(),
             workers: vec![Worker::new(
                 "Slack queue",
@@ -100,7 +117,7 @@ impl Routers {
             )],
             intake,
             commands,
-        }
+        })
     }
 }
 
@@ -180,6 +197,7 @@ pub struct Server {
     proxy: TcpListener,
     ctl: TcpListener,
     addrs: Addrs,
+    turns: Option<Turns>,
 }
 
 impl Server {
@@ -207,12 +225,19 @@ impl Server {
             proxy,
             ctl,
             addrs,
+            turns: None,
         })
     }
 
     /// The bound addresses.
     pub fn addrs(&self) -> Addrs {
         self.addrs
+    }
+
+    /// Runs turns with `turns` while serving. Without it agentd runs none.
+    pub fn with_turns(mut self, turns: Turns) -> Self {
+        self.turns = Some(turns);
+        self
     }
 
     /// Serves until `shutdown` completes, then shuts down gracefully:
@@ -249,6 +274,7 @@ impl Server {
             proxy,
             ctl,
             addrs,
+            turns,
         } = self;
         let drain_timeout = app.config().server.drain_timeout();
         let (stop, stopping) = watch::channel(false);
@@ -351,6 +377,7 @@ impl Server {
             public = %addrs.public,
             proxy = %addrs.proxy,
             ctl = %addrs.ctl,
+            turns = turns.is_some(),
             "listening"
         );
 
@@ -381,6 +408,7 @@ impl Server {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
+        drop(turns);
         app.store().close().await;
         tracing::info!("stopped");
         failure.map_or(Ok(()), Err)

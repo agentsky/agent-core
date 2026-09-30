@@ -30,7 +30,7 @@ struct Running {
 impl Running {
     async fn start(text: &str, routes: impl FnOnce(Routers) -> Routers) -> Self {
         let app = App::open(config(text)).await.unwrap();
-        let server = Server::bind(app.clone(), routes(Routers::new(&app)))
+        let server = Server::bind(app.clone(), routes(Routers::new(&app).unwrap()))
             .await
             .unwrap();
         let addrs = server.addrs();
@@ -100,7 +100,9 @@ async fn serve_answers_healthz_and_shuts_down_cleanly() {
     assert_eq!(health.status, 200, "{health:?}");
     assert_eq!(health.body, "ok\n");
     assert_eq!(get(addrs.public, "/nope").await.unwrap().status, 404);
-    assert_eq!(get(addrs.proxy, "/healthz").await.unwrap().status, 404);
+    let proxied = get(addrs.proxy, "/healthz").await.unwrap();
+    assert_eq!(proxied.status, 403, "{proxied:?}");
+    assert!(proxied.body.contains(r#""type":"error""#), "{proxied:?}");
     assert_eq!(get(addrs.ctl, "/healthz").await.unwrap().status, 404);
 
     let (app, result) = running.stop().await;
@@ -296,7 +298,7 @@ async fn an_address_in_use_is_named() {
         1,
     );
     let app = App::open(config(&text)).await.unwrap();
-    let err = Server::bind(app.clone(), Routers::new(&app))
+    let err = Server::bind(app.clone(), Routers::new(&app).unwrap())
         .await
         .unwrap_err();
     assert!(
@@ -339,7 +341,7 @@ async fn the_public_listener_refuses_the_sandbox_subnet() {
         common::read_response(&mut stream)
     });
     assert_eq!(allowed.await.unwrap().unwrap().status, 200);
-    assert_eq!(get(proxy, "/").await.unwrap().status, 404);
+    assert_eq!(get(proxy, "/").await.unwrap().status, 403);
     running.stop().await.1.unwrap();
 }
 

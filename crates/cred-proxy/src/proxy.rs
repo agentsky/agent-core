@@ -339,6 +339,17 @@ struct Upstream {
     base: Url,
 }
 
+/// Checks `upstream` as [`CredProxy::new`] does, for configuration that is
+/// validated before the proxy is built.
+///
+/// # Errors
+///
+/// [`ProxyError::Upstream`] unless `upstream` is an `http` or `https` URL
+/// with a host and no credentials, query or fragment.
+pub fn check_upstream(upstream: &str) -> Result<(), ProxyError> {
+    Upstream::parse(upstream).map(drop)
+}
+
 impl Upstream {
     fn parse(text: &str) -> Result<Self, ProxyError> {
         let base = Url::parse(text).map_err(|_| ProxyError::Upstream("not a URL"))?;
@@ -679,7 +690,9 @@ mod tests {
                 Err(ProxyError::Upstream(got)) => assert_eq!(got, reason, "{text}"),
                 other => panic!("{text}: {:?}", other.map(|u| u.base)),
             }
+            assert!(check_upstream(text).is_err(), "{text}");
         }
+        check_upstream(DEFAULT_UPSTREAM).unwrap();
     }
 
     #[test]

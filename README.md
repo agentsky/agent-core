@@ -50,7 +50,22 @@ HTTPS tunnels to through the proxy listener. It is empty by default, and
 `api.anthropic.com`, IP addresses, and hosts that resolve to loopback,
 link-local (cloud metadata), agentd's or private addresses are refused
 whatever it says. `max_tunnels` and `max_session_tunnels` cap the open
-tunnels in all and per sandbox.
+tunnels in all and per sandbox. The same listener is the credential proxy,
+sandboxes' `ANTHROPIC_BASE_URL`: it swaps the placeholder a sandbox holds for
+the real credential and forwards to `[proxy] upstream`
+(`https://api.anthropic.com`).
+Turns run only with a `[sandbox]` section: agentd then connects to the Docker
+daemon at startup, stops every container a previous run of the same
+`[sandbox] instance` left, and runs one container per active session from
+`[sandbox] image`, on the network `[sandbox] network` names. That network
+must be an existing `internal` Docker network, named exactly, and sandboxes
+must not reach each other on it: an internal network alone doesn't stop that,
+so turn inter-container traffic off and let only agentd's ports 8080 and 8081
+through, as `deploy/compose/compose.yaml` and `isolate-sandbox.sh` do.
+`[runner]` sets the `claude` executable, the turn timeout, how long idle
+containers stay warm, and how many run at once. Sandboxes reach agentd as
+`cred-proxy.internal:8080` and `agentctl.internal:8081`, so give agentd those
+names on the sandbox network and keep those ports.
 `GET /healthz` on the public listener answers 200 while the database does.
 It also serves Slack's request URLs, `/slack/b/<binding>/events`,
 `…/interactivity` and `…/commands`; the manager app's binding is `manager`,
@@ -168,7 +183,10 @@ named `docker_*` and marked ignored, so the other jobs skip them. Run them
 locally, with Docker running, as
 `cargo test --workspace -- --ignored docker_`. They pull
 `debian:stable-slim` and create and remove their own networks and
-containers.
+containers. `docker_real_claude_starts` runs the real `claude` from the
+sandbox image, which the job builds first: build it as
+`docker build -f images/sandbox/Dockerfile -t agent-core/sandbox:dev .`, or
+name another tag in `AGENT_CORE_SANDBOX_IMAGE`.
 
 The `images` job builds both images through the Compose file, without
 pushing them, adds the iptables rules from

@@ -148,8 +148,8 @@ line if there is one already.
 Then add the example's `[rocketchat]` section, with `base_url =
 "http://rocketchat:3000"` (Rocket.Chat on the `egress` network), a `team`
 name, and the manager's user id as `manager_user_id`. agentd refuses to
-start with the section and no `AGENTD_RC_MANAGER_TOKEN`. For sandboxes, the
-`[sandbox]` section, once agentd reads it, takes:
+start with the section and no `AGENTD_RC_MANAGER_TOKEN`. agentd runs turns
+with the example's `[sandbox]` section; add `host_data_dir` to it:
 
 ```toml
 [sandbox]
@@ -160,6 +160,10 @@ network = "sandbox"
 # so this is ./data as the Docker daemon sees it: `realpath data`.
 host_data_dir = "/absolute/path/to/deploy/compose/data"
 ```
+
+Sessions' containers reach agentd only through `isolate-sandbox.sh`'s rules,
+which also keep them from reaching each other: without the rules, turns fail
+because sandboxes can't reach the credential proxy.
 
 Apply changes with `docker compose up -d`, which recreates agentd when
 `.env` changed, or `docker compose restart agentd` after editing

@@ -47,7 +47,9 @@ async fn the_ctl_listener_serves_the_agentctl_api_by_source_address() {
     let app = App::open(Config::parse(CONFIG, env()).unwrap())
         .await
         .unwrap();
-    let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
+    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+        .await
+        .unwrap();
     let ctl = server.addrs().ctl;
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
@@ -92,7 +94,9 @@ async fn startup_deletes_tokens_and_staged_files_from_before() {
 
     let app = App::open(config()).await.unwrap();
     assert!(!dir.path().join(STAGING_DIR).exists());
-    let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
+    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+        .await
+        .unwrap();
     let ctl = server.addrs().ctl;
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(

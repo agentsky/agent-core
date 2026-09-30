@@ -4631,3 +4631,175 @@ tokens that T08's parser reads. agentd's image build context leaves out
 `include_str!` and parse it with `serde_norway` (MIT OR Apache-2.0, a
 maintained fork of the deprecated `serde_yaml`; with `unsafe-libyaml-norway`,
 MIT, it is a dev-dependency of agentd only).
+
+## T23: Turn pipeline end to end
+
+### One row per session and one attribution per post
+
+**Issue.** The plan made `message_refs` unique on `(surface, team_id,
+conversation, platform_ref)` and gave every row a per-session short id. A
+message then has at most one row, in one session, but an inbound message
+mentioning two agents is shown to both agents' sessions, and a private
+task's result, posted from the private session, is later shown to the
+channel session. Only the first session could have given the model a short
+id for it.
+
+**Solution.** A row belongs to its session: `(session_id, short_id)` is the
+key, and `(session_id, surface, team_id, conversation, platform_ref)` is
+unique, so a message has at most one short id per session and keeps it.
+What must be unique across sessions is the attribution, so a partial unique
+index covers `(surface, team_id, conversation, platform_ref)` where
+`agent_id` is set: agentd records each message it posts once, with the
+agent, turn, requester and hop, and `Store::posted_message_ref` reads that
+row. A session that is shown a message agentd posted elsewhere records its
+own row without `agent_id`. An inbound row's requester is the message's
+sender, with hop 0, so the columns the plan lists stay required. The next
+short id is taken inside the insert, in one `BEGIN IMMEDIATE` transaction;
+a test with sixteen concurrent inserts on a file database gets 1 to 16.
+`Store::posted_elsewhere` finds the agent's posts in a thread that the
+session hasn't recorded yet, which is what the turn message builder (T23b)
+shows once and then records.
+
+### `process_stopping` revokes the process, not the session
+
+**Issue.** The plan has `process_stopping` call `Registry::revoke_session`.
+T21 gave every hook the process's own `Process` value so that a late call
+for an old process, as when Docker reports an old container's death after
+the session started a new one, never touches the new one.
+`revoke_session` would revoke the new process's placeholder too.
+
+**Solution.** `process_stopping` revokes the process's own placeholder with
+`Registry::revoke(PlaceholderId)` and its own agentctl token. A session
+runs one process at a time, so this is the session's last placeholder,
+and `revoke` then drops the session's watch sender, which closes its
+egress tunnels exactly as `revoke_session` would. A test stops an old
+process after a new one started and the new placeholder still works. A
+second call is harmless: both revocations find nothing.
+
+### A resumed process restores the session's total cost
+
+**Issue.** T20 left open whether the first result of a `--resume`d process
+reports a `total_cost_usd` counted from 0; the runner's per-turn `cost_usd`
+assumed so, and T23's live check was to find out.
+
+**Solution.** It doesn't. The native 2.1.285 build in a stand-in for the
+sandbox image (Debian with `/opt/claude-code/bin/claude` copied in, since
+the real image's download is blocked here), run by
+`docker_real_claude_starts` against `fake_anthropic()`, reported 0.0001 for
+a turn, and 0.0002 for the same usage on the first turn after the process
+was stopped and the session resumed. The CLI appends a line
+`{"type":"cost-state","totalCostUSD":…,"modelUsage":{…}}` to the transcript
+when a process exits, none while it runs (a warm process's second turn left
+none), and on `--resume` restores the total from the last one. A process
+that is killed writes none, so the restored total is the session's total as
+of its last clean exit.
+
+The runner's `cost_usd` for such a turn therefore holds the restored total
+too. Nothing reads it yet, so the runner only says so in its rustdoc, and
+the Docker test pins the behavior: it fails if the resumed total stops
+being the sum. T27, which meters cost, takes the restored total off, from
+the transcript's last `cost-state` line (read without following links, with
+its size capped: the transcript is agent-writable, but the CLI restores
+from the same line, so the difference is still the turn's cost) or from a
+total the runner keeps in `sessions` when a process exits cleanly. The
+plan's T27 says so.
+
+### The real `claude` test serves the proxy on the network's gateway
+
+**Issue.** The plan's `docker_real_claude_starts` used a network that isn't
+internal and `host-gateway`, so the container could reach the proxy in the
+test process. `DockerSandbox` refuses a network that isn't internal unless
+told otherwise for tests, and gives the container no `extra_hosts`.
+
+**Solution.** The test creates an internal network without `inhibit_ipv4`,
+on whose bridge the host holds the gateway address (T16's note on internal
+networks), and serves the proxy there, as T19's Docker test does.
+`ANTHROPIC_BASE_URL` names the gateway's address, and `NO_PROXY` names it
+too, since the hooks set the egress proxy variables. Nothing else routes
+out, so the test also shows that the CLI needs no direct traffic. The CLI
+runs through the runner and agentd's hooks, with a community API key
+placeholder, and the test asserts the read-only root, the transcript at
+`$CLAUDE_CONFIG_DIR/projects/<id>/<id>.jsonl` holding both turns, a
+`--resume` start for the second, and that every request the fake saw came
+through the proxy with the swapped key. On CI the sandbox runs as the test
+process's own uid, which has no entry in the image's `/etc/passwd`;
+locally, as root, it ran as 10001.
+
+### The native CLI honors `NO_PROXY`
+
+**Issue.** T19 saw the npm build send `ANTHROPIC_BASE_URL` traffic straight
+to the base URL when `NO_PROXY` named it, and left the native build to
+T23's live check.
+
+**Solution.** In the same stand-in image, with `HTTP_PROXY` pointing at the
+unresolvable `cred-proxy.internal:8080`, the native 2.1.285 build reached
+the base URL directly when `NO_PROXY` named its address, and when
+`NO_PROXY` named only `cred-proxy.internal,agentctl.internal` it sent the
+request to the proxy and retried until the turn timed out. So the proxy
+variables reach it, and agentd's sandboxes, whose base URL is
+`cred-proxy.internal`, work as T19 expects.
+
+### Sandboxes reach agentd by name, not by configuration
+
+**Issue.** `runner::ProcessConfig` takes `ANTHROPIC_BASE_URL`, and agentctl
+reads `AGENTCTL_URL`. As configuration, a base URL whose host isn't in the
+egress environment's `NO_PROXY` would send the CLI's API traffic to the
+egress proxy, which refuses it.
+
+**Solution.** `[runner]` has only `claude_bin`, `turn_timeout_secs` and the
+pool's keys. Processes always get `cred_proxy::PROXY_URL`
+(`http://cred-proxy.internal:8080`) and `pipeline::AGENTCTL_URL`
+(`http://agentctl.internal:8081`), the names `NO_PROXY` lists, so the
+deployment gives agentd those aliases on the sandbox network and keeps
+those ports, as the Compose file does; the example configuration and the
+README say so. Tests, which serve the listeners on port 0, build
+`TurnSettings` themselves with the bound addresses and a `NO_PROXY` naming
+them, and name `fake-claude`'s script and `agentctl`'s directory in
+`TurnSettings::env`, which is added after the egress variables and holds
+no secret. agentd sets nothing there.
+
+### `[sandbox]` is optional
+
+**Issue.** The plan has agentd build a `DockerSandbox` and reap orphans at
+startup, but most tests start agentd without Docker, and an operator may
+run agentd for commands alone.
+
+**Solution.** Without `[sandbox]`, `serve` logs a warning and runs no
+turns. With it, `serve` connects to the Docker daemon, which must answer,
+stops what a previous run of the same `instance` left (`reap_orphans`),
+and starts the runner (`pipeline::Turns`) after the listeners are bound.
+The example configuration has the section, with the image the Compose file
+builds; the Compose README adds `host_data_dir`, which depends on where the
+checkout is.
+
+### A process sandbox gives every container one address
+
+**Issue.** `ProcessSandbox::ip` answers `127.0.0.1` for every container,
+and minting a placeholder for an address revokes other sessions'
+placeholders there (T18). Tests that run turns on two sessions would find
+the first session's warm process holding a revoked placeholder.
+
+**Solution.** The tests set `global_container_cap = 1`, so a second
+session's turn stops the first session's idle container, and with it its
+placeholder, before minting. Docker gives each container its own address,
+so production is unaffected.
+
+### agentctl for scripted turns
+
+**Issue.** `fake-claude` runs a script's commands from its `PATH`, and
+agentd's tests need `agentctl` there, but cargo sets `CARGO_BIN_EXE_*`
+only for a package's own tests.
+
+**Solution.** `testkit::agentctl_path()` builds it the way
+`fake_claude_path()` builds `fake-claude`, with the package named, and the
+tests put its directory on the script's `PATH`.
+
+### No community key until T26
+
+**Issue.** `CredProxy::new` takes a `CommunityKey`, which T26 implements
+over the store.
+
+**Solution.** agentd's proxy uses `pipeline::NoCommunityKey`, which always
+answers `NotConfigured`, so a placeholder pointed at the community key gets
+401 from the proxy. The router never picks the community key before T26
+either, since `community_key_configured` answers false until then.

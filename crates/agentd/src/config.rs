@@ -46,7 +46,12 @@ use std::time::Duration;
 
 use auth::OAuthConfig;
 use core_types::Cidr;
-use cred_proxy::{EgressLimits, EgressPolicy, EgressProxy, HostRule};
+use cred_proxy::{DEFAULT_UPSTREAM, EgressLimits, EgressPolicy, EgressProxy, HostRule};
+use runner::{
+    DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP, DEFAULT_IDLE_TIMEOUT_SECS,
+    DEFAULT_SCOPE_CONTAINER_CAP, DEFAULT_TURN_TIMEOUT_SECS, PoolConfig, ProcessConfig,
+};
+use sandbox::SandboxConfig;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
@@ -109,8 +114,15 @@ pub struct Config {
     pub store: StoreConfig,
     /// `[limits]`: caps on what agents may do.
     pub limits: LimitsConfig,
-    /// `[proxy]`: what sandboxes may reach through the egress proxy.
+    /// `[proxy]`: the credential proxy's upstream, and what sandboxes may
+    /// reach through the egress proxy.
     pub proxy: ProxyConfig,
+    /// `[sandbox]`: the containers sessions run in. agentd runs turns only
+    /// when it is set.
+    pub sandbox: Option<SandboxConfig>,
+    /// `[runner]`: the `claude` processes turns run in, and how long they
+    /// stay warm.
+    pub runner: RunnerConfig,
     /// `[agents]`: caps on members' agents.
     pub agents: AgentsConfig,
     /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
@@ -141,6 +153,9 @@ struct File {
     limits: LimitsConfig,
     #[serde(default)]
     proxy: ProxyConfig,
+    sandbox: Option<SandboxConfig>,
+    #[serde(default)]
+    runner: RunnerConfig,
     #[serde(default)]
     agents: AgentsConfig,
     #[serde(default)]
@@ -273,11 +288,16 @@ impl Default for LimitsConfig {
 }
 
 /// `[proxy]`. Every key has a default, so the section is optional; without
-/// it sandboxes reach no host at all.
+/// it sandboxes reach no host but the credential proxy's upstream.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct ProxyConfig {
+    /// `upstream`: where the credential proxy forwards the requests
+    /// sandboxes send to `ANTHROPIC_BASE_URL`, [`DEFAULT_UPSTREAM`] unless a
+    /// test points it at a fake. An `http://` or `https://` URL with a host,
+    /// and no credentials, query or fragment.
+    pub upstream: String,
     /// `allow`: the hosts sandboxes may open HTTPS tunnels to, as
     /// [`HostRule`]s such as `github.com`, `*.githubusercontent.com` or
     /// `git.example.com:8443`. Port 443 unless a rule names another.
@@ -296,10 +316,80 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         let limits = EgressLimits::default();
         Self {
+            upstream: DEFAULT_UPSTREAM.to_owned(),
             allow: Vec::new(),
             max_tunnels: limits.max_tunnels,
             max_session_tunnels: limits.max_session_tunnels,
         }
+    }
+}
+
+/// `[runner]`. Every key has a default, so the section is optional.
+///
+/// The addresses a process uses are not configuration: it reaches the
+/// credential proxy as `ANTHROPIC_BASE_URL` at
+/// [`cred_proxy::PROXY_URL`] and the agentctl API at
+/// [`AGENTCTL_URL`](crate::pipeline::AGENTCTL_URL), the names agentd has on
+/// the sandbox network, which the egress environment's `NO_PROXY` names.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct RunnerConfig {
+    /// `claude_bin`: the `claude` executable in the sandbox image, a name
+    /// looked up on its `PATH` or an absolute path. Default `claude`.
+    pub claude_bin: String,
+    /// `turn_timeout_secs`: how long one turn may take before its process
+    /// is killed and the turn fails, from 1 to 86400. Default 1800.
+    pub turn_timeout_secs: u64,
+    /// `idle_timeout_secs`: how long a session's container and process stay
+    /// warm after its last turn, from 1 to 86400. Default 900.
+    pub idle_timeout_secs: u64,
+    /// `scope_container_cap`: how many containers one agent may run in one
+    /// scope at once, from 1 to 4096. Default 4.
+    pub scope_container_cap: usize,
+    /// `global_container_cap`: how many containers may run at once in all,
+    /// from 1 to 4096. Default 32.
+    pub global_container_cap: usize,
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            claude_bin: DEFAULT_CLAUDE_BIN.to_owned(),
+            turn_timeout_secs: DEFAULT_TURN_TIMEOUT_SECS,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            scope_container_cap: DEFAULT_SCOPE_CONTAINER_CAP,
+            global_container_cap: DEFAULT_GLOBAL_CONTAINER_CAP,
+        }
+    }
+}
+
+impl RunnerConfig {
+    /// The processes' settings: [`claude_bin`](Self::claude_bin) and
+    /// [`turn_timeout_secs`](Self::turn_timeout_secs), with the credential
+    /// proxy's name on the sandbox network as `ANTHROPIC_BASE_URL`.
+    pub fn process(&self) -> ProcessConfig {
+        ProcessConfig {
+            claude_bin: self.claude_bin.clone(),
+            anthropic_base_url: cred_proxy::PROXY_URL.to_owned(),
+            turn_timeout_secs: self.turn_timeout_secs,
+        }
+    }
+
+    /// The warm pool's settings.
+    pub fn pool(&self) -> PoolConfig {
+        PoolConfig {
+            idle_timeout_secs: self.idle_timeout_secs,
+            scope_container_cap: self.scope_container_cap,
+            global_container_cap: self.global_container_cap,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let named =
+            |err: runner::ConfigError| invalid(format!("runner.{}", err.key()), err.reason());
+        self.process().validate().map_err(named)?;
+        self.pool().validate().map_err(named)
     }
 }
 
@@ -445,6 +535,8 @@ impl Config {
             store: file.store,
             limits: file.limits,
             proxy: file.proxy,
+            sandbox: file.sandbox,
+            runner: file.runner,
             agents: file.agents,
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
@@ -645,6 +737,19 @@ impl File {
             ));
         }
         egress_policy(&self.proxy, &self.server, &self.internal)?;
+        cred_proxy::check_upstream(&self.proxy.upstream).map_err(|_| {
+            invalid(
+                "proxy.upstream",
+                "must be an http:// or https:// URL with a host, and no user info, query or \
+                 fragment",
+            )
+        })?;
+        if let Some(sandbox) = &self.sandbox {
+            sandbox
+                .validate()
+                .map_err(|err| invalid(format!("sandbox.{}", err.key), err.message))?;
+        }
+        self.runner.validate()?;
         if self.agents.max_per_owner == 0 {
             return Err(invalid("agents.max_per_owner", "must be at least 1"));
         }
@@ -938,6 +1043,11 @@ data_dir = "/nonexistent/agentd"
         assert!(config.secrets.slack_manager.is_empty());
         assert!(config.unknown_env.is_empty());
         assert!(config.proxy.allow.is_empty());
+        assert_eq!(config.proxy.upstream, "https://api.anthropic.com");
+        assert!(config.sandbox.is_none());
+        let process = config.runner.process();
+        assert_eq!(process, runner::ProcessConfig::default());
+        assert_eq!(config.runner.pool(), runner::PoolConfig::default());
         let egress = config.egress_proxy().unwrap();
         assert!(egress.policy().rules().is_empty());
         assert_eq!(egress.limits(), cred_proxy::EgressLimits::default());
@@ -1019,6 +1129,91 @@ data_dir = "/nonexistent/agentd"
     }
 
     #[test]
+    fn the_sandbox_section_is_the_sandbox_crates_config() {
+        let config = with(
+            &format!(
+                "{MINIMAL}\n[sandbox]\nimage = \"agent-core/sandbox:dev\"\nnetwork = \"sbx\"\n\
+                 host_data_dir = \"/srv/agentd\"\n"
+            ),
+            env(),
+        )
+        .unwrap();
+        let sandbox = config.sandbox.unwrap();
+        assert_eq!(sandbox.image, "agent-core/sandbox:dev");
+        assert_eq!(sandbox.network, "sbx");
+        assert_eq!(sandbox.host_data_dir, Some(PathBuf::from("/srv/agentd")));
+        assert_eq!(sandbox.uid, sandbox::DEFAULT_SANDBOX_UID);
+
+        for (section, key, message) in [
+            ("network = \"x\"", "sandbox.image", "missing field"),
+            ("image = \" \"", "sandbox.image", "must not be empty"),
+            (
+                "image = \"i\"\nnetwork = \"bridge\"",
+                "sandbox.network",
+                "internal sandbox network",
+            ),
+            ("image = \"i\"\nuid = 0", "sandbox.uid", "never run as root"),
+            ("image = \"i\"\nbogus = 1", "sandbox.bogus", "unknown field"),
+        ] {
+            let err = file_err(&format!("{MINIMAL}\n[sandbox]\n{section}\n"));
+            assert_eq!(err.key(), Some(key), "{section}: {err}");
+            assert!(err.to_string().contains(message), "{section}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_runner_section_sets_the_processes_and_the_pool() {
+        let config = with(
+            &format!(
+                "{MINIMAL}\n[runner]\nclaude_bin = \"/opt/claude\"\nturn_timeout_secs = 60\n\
+                 idle_timeout_secs = 120\nscope_container_cap = 2\nglobal_container_cap = 8\n"
+            ),
+            env(),
+        )
+        .unwrap();
+        let process = config.runner.process();
+        assert_eq!(process.claude_bin, "/opt/claude");
+        assert_eq!(process.anthropic_base_url, cred_proxy::PROXY_URL);
+        assert_eq!(process.turn_timeout(), Duration::from_secs(60));
+        let pool = config.runner.pool();
+        assert_eq!(pool.idle_timeout(), Duration::from_secs(120));
+        assert_eq!(
+            (pool.scope_container_cap, pool.global_container_cap),
+            (2, 8)
+        );
+
+        for (section, key) in [
+            ("claude_bin = \"-x\"", "runner.claude_bin"),
+            ("turn_timeout_secs = 0", "runner.turn_timeout_secs"),
+            ("idle_timeout_secs = 0", "runner.idle_timeout_secs"),
+            ("scope_container_cap = 0", "runner.scope_container_cap"),
+            ("global_container_cap = 5000", "runner.global_container_cap"),
+            (
+                "anthropic_base_url = \"http://x\"",
+                "runner.anthropic_base_url",
+            ),
+        ] {
+            let err = file_err(&format!("{MINIMAL}\n[runner]\n{section}\n"));
+            assert_eq!(err.key(), Some(key), "{section}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_proxy_upstream_is_configurable_and_checked() {
+        let config = with(
+            &format!("{MINIMAL}\n[proxy]\nupstream = \"http://127.0.0.1:9\"\n"),
+            env(),
+        )
+        .unwrap();
+        assert_eq!(config.proxy.upstream, "http://127.0.0.1:9");
+        for bad in ["ftp://x", "https://u:p@x", "https://x/?q=1", "nope"] {
+            let err = file_err(&format!("{MINIMAL}\n[proxy]\nupstream = \"{bad}\"\n"));
+            assert_eq!(err.key(), Some("proxy.upstream"), "{bad}: {err}");
+            assert!(!err.to_string().contains(bad), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn the_example_file_loads() {
         let text = include_str!("../../../config/agentd.example.toml");
         let config = with(text, with_rc_token()).unwrap();
@@ -1027,6 +1222,11 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(config.internal.ctl_listen.port(), 8081);
         assert_eq!(config.claude_oauth, OAuthConfig::default());
         assert_eq!(config.rocketchat.unwrap().team, "chat.example.com");
+        assert_eq!(config.proxy.upstream, DEFAULT_UPSTREAM);
+        let sandbox = config.sandbox.unwrap();
+        assert_eq!(sandbox, SandboxConfig::new("agent-core/sandbox:dev"));
+        assert_eq!(config.runner.process(), ProcessConfig::default());
+        assert_eq!(config.runner.pool(), PoolConfig::default());
     }
 
     #[test]

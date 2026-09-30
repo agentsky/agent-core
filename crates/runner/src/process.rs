@@ -275,7 +275,10 @@ impl ClaudeProcess {
     ///
     /// The result's [`cost_usd`](crate::TurnResult::cost_usd) is the turn's
     /// own: the CLI reports a running total for the process, and the
-    /// process keeps the previous total to take it off.
+    /// process keeps the previous total to take it off. On the first turn
+    /// of a process started with [`SessionStart::Resume`] it also holds
+    /// what the CLI restored (see
+    /// [`process_total_cost_usd`](crate::TurnResult::process_total_cost_usd)).
     ///
     /// Neither the message nor any line of output is logged. One log line
     /// per turn gives its outcome, [`TurnStats`] and the result's codes.
