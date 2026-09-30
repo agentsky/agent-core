@@ -137,11 +137,21 @@ fn migrate_creates_and_migrates_the_database() {
             .args(["migrate", "--config"])
             .arg(&config)
             .env("AGENTD_MASTER_KEY", &key)
+            .env("AGENTD_PORT", "tcp://10.0.0.11:8443")
+            .env("AGENTD_SERVICE_HOST", "10.0.0.11")
+            .env("AGENTD_UNUSED_SETTING", "value")
             .output()
             .unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains("the store is migrated"), "{stderr}");
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|line| line.contains("ignoring an unknown AGENTD_ environment variable"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{stderr}");
+        assert!(warnings[0].contains("AGENTD_UNUSED_SETTING"), "{stderr}");
+        assert!(!warnings[0].contains("value"), "{stderr}");
     }
     assert!(db.exists());
 }

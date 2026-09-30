@@ -18,8 +18,8 @@ impl Store {
         lookup(&mut conn, key).await
     }
 
-    /// The member that owns the surface identity `key`, created with
-    /// `display_name` if there is none yet.
+    /// The member that owns the surface identity `key`, created at `now`
+    /// with `display_name` if there is none yet.
     ///
     /// The display name is only used when the member is created; an existing
     /// member keeps theirs. Concurrent calls for one identity return one
@@ -29,7 +29,12 @@ impl Store {
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if a query
     /// fails.
-    pub async fn ensure_member(&self, key: &MemberKey, display_name: &str) -> Result<MemberId> {
+    pub async fn ensure_member(
+        &self,
+        key: &MemberKey,
+        display_name: &str,
+        now: OffsetDateTime,
+    ) -> Result<MemberId> {
         if let Some(member) = self.member_for_identity(key).await? {
             return Ok(member);
         }
@@ -42,7 +47,7 @@ impl Store {
         sqlx::query("INSERT INTO members (id, display_name, created_at) VALUES (?, ?, ?)")
             .bind(member.to_string())
             .bind(display_name)
-            .bind(to_unix(OffsetDateTime::now_utc()))
+            .bind(to_unix(now))
             .execute(&mut *tx)
             .await?;
         sqlx::query(
@@ -94,14 +99,17 @@ mod tests {
     #[tokio::test]
     async fn ensure_member_creates_once_and_then_finds() {
         let store = memory_store().await;
-        let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
+        let member = store
+            .ensure_member(&member_key("u1"), "Ada", at(1_000))
+            .await
+            .unwrap();
         assert_eq!(
             store.member_for_identity(&member_key("u1")).await.unwrap(),
             Some(member)
         );
         assert_eq!(
             store
-                .ensure_member(&member_key("u1"), "Renamed")
+                .ensure_member(&member_key("u1"), "Renamed", at(1_000))
                 .await
                 .unwrap(),
             member
@@ -129,7 +137,7 @@ mod tests {
         };
         let mut members = Vec::new();
         for key in [&base, &other_user, &other_team, &other_surface] {
-            members.push(store.ensure_member(key, "x").await.unwrap());
+            members.push(store.ensure_member(key, "x", at(1_000)).await.unwrap());
         }
         members.sort();
         members.dedup();
@@ -147,10 +155,10 @@ mod tests {
         let store = crate::Store::open(&dir.db_url(), sealer()).await.unwrap();
         let key = member_key("u1");
         let (a, b, c, d) = tokio::join!(
-            store.ensure_member(&key, "Ada"),
-            store.ensure_member(&key, "Ada"),
-            store.ensure_member(&key, "Ada"),
-            store.ensure_member(&key, "Ada"),
+            store.ensure_member(&key, "Ada", at(1_000)),
+            store.ensure_member(&key, "Ada", at(1_000)),
+            store.ensure_member(&key, "Ada", at(1_000)),
+            store.ensure_member(&key, "Ada", at(1_000)),
         );
         let a = a.unwrap();
         assert_eq!([b.unwrap(), c.unwrap(), d.unwrap()], [a, a, a]);

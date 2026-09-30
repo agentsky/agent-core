@@ -27,16 +27,23 @@ pub const DEFAULT_MESSAGE_LIMIT: Limit = Limit {
 
 /// Converts agent-written Markdown to Rocket.Chat Markdown.
 ///
-/// The text passes through unchanged except outside code spans, code
-/// blocks, link destinations and URLs:
+/// The text passes through unchanged except for mentions:
 ///
 /// - `@all` and `@here` are neutralized with a zero-width space after the
-///   `@`, ignoring case, so they can't notify the room. They are never
-///   offered to the directory.
-/// - `@Name` becomes `@username` when `directory` resolves it, and stays
-///   text otherwise. On Rocket.Chat the directory returns usernames. A
-///   username that isn't made of letters, digits, `.`, `_` and `-`, or that
-///   is a broadcast name, is ignored, so a directory entry can't turn a
+///   `@`, ignoring case, so they can't notify the room. This covers the
+///   whole output, code and link destinations included, because the server
+///   looks for mentions in the raw text: after an `@`, it reads the longest
+///   run of ASCII letters, digits, `.`, `_` and `-`, and a run equal to
+///   `all` or `here` is a broadcast, wherever it is and whatever follows.
+///   So `@allé` and `` `@here` `` are neutralized too, and so is a run
+///   that only adds trailing `.`, `_` or `-` (`@here.`), while `@allison`
+///   and `@all.hands` are not. Broadcasts are never offered to the
+///   directory.
+/// - Outside code spans, code blocks, link destinations and URLs, `@Name`
+///   becomes `@username` when `directory` resolves it, and stays text
+///   otherwise. On Rocket.Chat the directory returns usernames. A username
+///   that isn't made of ASCII letters, digits, `.`, `_` and `-`, or that is
+///   a broadcast name, is ignored, so a directory entry can't turn a
 ///   mention into `@all`.
 ///
 /// # Examples
@@ -54,7 +61,7 @@ pub const DEFAULT_MESSAGE_LIMIT: Limit = Limit {
 ///
 /// assert_eq!(
 ///     to_markdown("**Thanks** @Ada Lovelace, and @all: see `@here`", &Team),
-///     "**Thanks** @ada, and @\u{200B}all: see `@here`",
+///     "**Thanks** @ada, and @\u{200B}all: see `@\u{200B}here`",
 /// );
 /// ```
 pub fn to_markdown(md: &str, directory: &dyn MentionDirectory) -> String {
@@ -66,17 +73,15 @@ pub fn to_markdown(md: &str, directory: &dyn MentionDirectory) -> String {
         at = range.end;
     }
     rewrite(&md[at..], directory, &mut out);
-    out
+    neutralize_broadcasts(&out)
 }
 
 fn rewrite(text: &str, directory: &dyn MentionDirectory, out: &mut String) {
     let mut i = 0;
     while let Some(c) = text[i..].chars().next() {
         if c == '@' {
-            if let Some(end) = mention::broadcast(text, i, BROADCASTS) {
-                out.push('@');
-                out.push(ZERO_WIDTH_SPACE);
-                out.push_str(&text[i + 1..end]);
+            if let Some(end) = broadcast_end(text, i) {
+                out.push_str(&text[i..end]);
                 i = end;
                 continue;
             }
@@ -102,17 +107,56 @@ fn rewrite(text: &str, directory: &dyn MentionDirectory, out: &mut String) {
     }
 }
 
-fn is_username(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !BROADCASTS.iter().any(|b| name.eq_ignore_ascii_case(b))
+/// Inserts a zero-width space after every `@` that starts a broadcast in
+/// the server's grammar.
+fn neutralize_broadcasts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (i, _) in text.match_indices('@') {
+        if broadcast_end(text, i).is_some() {
+            out.push_str(&text[at..=i]);
+            out.push(ZERO_WIDTH_SPACE);
+            at = i + 1;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
 }
+
+/// Returns the end of the name after the `@` at byte offset `at` of `text`
+/// when the server could read that name as a broadcast.
+fn broadcast_end(text: &str, at: usize) -> Option<usize> {
+    let rest = text[at..].strip_prefix('@')?;
+    let len = rest.find(|c: char| !is_name_char(c)).unwrap_or(rest.len());
+    is_broadcast(&rest[..len]).then_some(at + 1 + len)
+}
+
+/// Whether `name`, a run of name characters, is a broadcast name, ignoring
+/// case and trailing `.`, `_` and `-`. The server's default grammar keeps
+/// those in the name, so `@here.` doesn't notify today, but neutralizing it
+/// costs nothing and stays safe under a grammar that ends names earlier.
+fn is_broadcast(name: &str) -> bool {
+    let name = name.trim_end_matches(['.', '_', '-']);
+    BROADCASTS.iter().any(|b| name.eq_ignore_ascii_case(b))
+}
+
+/// The characters of a name in the server's mention pattern: its default
+/// `UTF8_Names_Validation` setting, `[0-9a-zA-Z-_.]+`.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+fn is_username(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(is_name_char) && !is_broadcast(name)
+}
+
+#[cfg(test)]
+pub(crate) mod server;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::directives;
 
     struct Directory(&'static [(&'static str, &'static str)]);
 
@@ -155,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcasts_are_neutralized_outside_code() {
+    fn broadcasts_are_neutralized_everywhere() {
         check(&[
             ("@all", "hey @all", "hey @\u{200B}all"),
             ("@here", "@here now", "@\u{200B}here now"),
@@ -177,16 +221,73 @@ mod tests {
             ),
             ("not an email", "me@all.io", "me@all.io"),
             ("longer words are names", "@allison", "@allison"),
-            ("inline code", "`@all`", "`@all`"),
-            ("fenced code", "```\n@here\n```", "```\n@here\n```"),
-            ("indented code", "    @all\n", "    @all\n"),
+            ("a dotted name", "@all.hands", "@all.hands"),
+            ("inline code", "`@all`", "`@\u{200B}all`"),
+            (
+                "inline code after a space",
+                "run ` @all` now",
+                "run ` @\u{200B}all` now",
+            ),
+            ("fenced code", "```\n@here\n```", "```\n@\u{200B}here\n```"),
+            (
+                "tilde fence",
+                "~~~\nx @all\n~~~",
+                "~~~\nx @\u{200B}all\n~~~",
+            ),
+            (
+                "indented code",
+                "    @here indented",
+                "    @\u{200B}here indented",
+            ),
             (
                 "link destination",
                 "[x](https://x.io/@all)",
-                "[x](https://x.io/@all)",
+                "[x](https://x.io/@\u{200B}all)",
             ),
-            ("autolink", "<https://x.io/@here>", "<https://x.io/@here>"),
-            ("bare URL", "https://x.io/@all ok", "https://x.io/@all ok"),
+            (
+                "link title across lines",
+                "[x](https://a.io '\n@all')",
+                "[x](https://a.io '\n@\u{200B}all')",
+            ),
+            (
+                "autolink",
+                "<https://x.io/@here>",
+                "<https://x.io/@\u{200B}here>",
+            ),
+            (
+                "bare URL",
+                "https://x.io/@all ok",
+                "https://x.io/@\u{200B}all ok",
+            ),
+            (
+                "inline HTML",
+                "<a href=x>@all</a>",
+                "<a href=x>@\u{200B}all</a>",
+            ),
+            ("quote", "> @here", "> @\u{200B}here"),
+            ("quote without a space", ">@all", ">@\u{200B}all"),
+            ("after a letter", "x@all", "x@\u{200B}all"),
+            (
+                "a non-ASCII letter ends the name",
+                "hey @allé",
+                "hey @\u{200B}allé",
+            ),
+            (
+                "a non-ASCII digit ends the name",
+                "hey @here\u{663}",
+                "hey @\u{200B}here\u{663}",
+            ),
+            (
+                "a federated name",
+                "@all@server @here:srv",
+                "@\u{200B}all@server @\u{200B}here:srv",
+            ),
+            (
+                "Unicode spaces",
+                "\u{A0}@all\u{3000}@here",
+                "\u{A0}@\u{200B}all\u{3000}@\u{200B}here",
+            ),
+            ("already neutral", "@\u{200B}all", "@\u{200B}all"),
             (
                 "Slack names are not broadcasts here",
                 "@channel",
@@ -197,7 +298,141 @@ mod tests {
 
     #[test]
     fn broadcast_names_never_reach_the_directory() {
-        check(&[("a member named all", "@all", "@\u{200B}all")]);
+        check(&[
+            ("a member named all", "@all", "@\u{200B}all"),
+            (
+                "a longer name starting with a broadcast",
+                "@All Hands",
+                "@\u{200B}All Hands",
+            ),
+        ]);
+    }
+
+    struct Evil;
+
+    impl MentionDirectory for Evil {
+        fn resolve(&self, name: &str) -> Option<String> {
+            match name {
+                "Bob" => Some("allé".into()),
+                "Carol" => Some("here".into()),
+                "Dan" => Some("all.".into()),
+                "Erin" => Some("ⅰall".into()),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn a_directory_entry_cannot_become_a_broadcast() {
+        for (input, expected) in [
+            ("hi @Bob", "hi @Bob"),
+            ("hi @Carol", "hi @Carol"),
+            ("hi @Dan", "hi @Dan"),
+            ("hi @Erin", "hi @Erin"),
+        ] {
+            assert_eq!(to_markdown(input, &Evil), expected);
+        }
+    }
+
+    const PROVEN: &[&str] = &[
+        "```\n@all\n```",
+        "    @here indented",
+        "run ` @all` now",
+        "hey @allé",
+        "hey @here\u{663}",
+        "[x](https://a.io '\n@all')",
+        "<a href=x>@all</a>",
+        "> ```\n> @all\n> ```",
+        "- item\n\n      @here in a list's code",
+        "text\n[x](y)@all",
+        "[x](y)\n@here",
+        "@all\u{2028}@here",
+    ];
+
+    #[test]
+    fn the_server_finds_no_broadcast_in_the_output() {
+        for md in PROVEN {
+            let out = to_markdown(md, &TEAM);
+            assert_eq!(server::broadcasts(&out), Vec::<String>::new(), "{md:?}");
+            assert_eq!(
+                server::broadcasts(&to_markdown(md, &Evil)),
+                Vec::<String>::new()
+            );
+        }
+        assert!(server::broadcasts(&to_markdown("hi @Bob", &Evil)).is_empty());
+    }
+
+    #[test]
+    fn stripping_directives_cannot_expose_a_broadcast() {
+        for md in [
+            "[[react: eyes]]```\n@all\n```",
+            "x\n[[react: eyes]]\n    @here",
+            "[[react: eyes]]\n@all",
+            "a [[react: eyes]]@here",
+            "```\n[[react: eyes]]\n@all",
+        ] {
+            let (text, _) = directives::extract(md);
+            let out = to_markdown(&text, &TEAM);
+            assert!(server::broadcasts(&out).is_empty(), "{md:?} gave {out:?}");
+        }
+    }
+
+    #[test]
+    fn property_no_output_holds_a_broadcast() {
+        const PARTS: &[&str] = &[
+            "@all",
+            "@here",
+            "@ALL",
+            "@Here",
+            "@allé",
+            "@here\u{663}",
+            "@all.",
+            "x",
+            " ",
+            "\n",
+            "\n\n",
+            ">",
+            "> ",
+            "`",
+            "```\n",
+            "~~~\n",
+            "    ",
+            "[",
+            "]",
+            "(",
+            ")",
+            "](",
+            "@",
+            "@Ada",
+            "@Sneaky",
+            "@All Hands",
+            "\u{A0}",
+            "\u{200B}",
+            "é",
+            "https://x.io/",
+            "<",
+            ">",
+            "'",
+            "*",
+            "_",
+            "-",
+            ".",
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for seed in 0..4000 {
+            let mut md = String::new();
+            for _ in 0..(seed % 24) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                md.push_str(PARTS[(state % PARTS.len() as u64) as usize]);
+            }
+            let out = to_markdown(&md, &TEAM);
+            assert!(
+                server::broadcasts(&out).is_empty(),
+                "seed {seed}: {md:?} gave {out:?}"
+            );
+        }
     }
 
     #[test]
@@ -215,8 +450,8 @@ mod tests {
             ("not in code", "`@Ada`", "`@Ada`"),
             (
                 "URL after an unknown name",
-                "@nobody https://x.io/@all",
-                "@nobody https://x.io/@all",
+                "@nobody https://x.io/@allow",
+                "@nobody https://x.io/@allow",
             ),
             ("a username that is a broadcast", "@Sneaky", "@Sneaky"),
             ("a username with a space", "@Spacey", "@Spacey"),

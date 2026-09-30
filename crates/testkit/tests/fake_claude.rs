@@ -6,8 +6,8 @@ use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use testkit::claude::{CRASH_EXIT_CODE, DEFAULT_MODEL, SCRIPT_ENV};
-use testkit::{FakeAnthropic, Turn, fake_anthropic, fake_claude_path, write_script};
+use testkit::claude::{API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, SCRIPT_ENV};
+use testkit::{FakeAnthropic, Turn, fake_anthropic, fake_claude_path, fixtures, write_script};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use wiremock::matchers::method;
@@ -138,16 +138,19 @@ impl Setup {
     }
 
     async fn run_args(&self, args: &[String], lines: &[&str]) -> Run {
+        Run::new(self.output(args, lines).await)
+    }
+
+    async fn output(&self, args: &[String], lines: &[&str]) -> Output {
         let mut child = self.command(args).spawn().unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
         let _ = stdin.write_all(input.as_bytes()).await;
         drop(stdin);
-        let output = tokio::time::timeout(WAIT, child.wait_with_output())
+        tokio::time::timeout(WAIT, child.wait_with_output())
             .await
             .expect("fake-claude timed out")
-            .unwrap();
-        Run::new(output)
+            .unwrap()
     }
 
     async fn run(&self, session: &str, messages: &[&str]) -> Run {
@@ -163,21 +166,40 @@ fn user_line(text: &str) -> String {
 
 struct Run {
     code: Option<i32>,
+    raw: Vec<String>,
     lines: Vec<Value>,
     stderr: String,
 }
 
 impl Run {
+    /// Every stdout line must be JSON.
     fn new(output: Output) -> Self {
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let lines = stdout
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("stdout line is JSON"))
-            .collect();
+        let run = Self::lenient(output);
+        assert_eq!(run.lines.len(), run.raw.len(), "a stdout line is not JSON");
+        run
+    }
+
+    /// Keeps every stdout line in `raw`, and the JSON ones in `lines`.
+    fn lenient(output: Output) -> Self {
         Self {
             code: output.status.code(),
-            lines,
             stderr: String::from_utf8(output.stderr).unwrap(),
+            ..Self::stdout(&String::from_utf8(output.stdout).unwrap())
+        }
+    }
+
+    /// The lines of `stdout`, such as a capture, without a process.
+    fn stdout(stdout: &str) -> Self {
+        let raw: Vec<String> = stdout.lines().map(str::to_owned).collect();
+        let lines = raw
+            .iter()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        Self {
+            code: None,
+            raw,
+            lines,
+            stderr: String::new(),
         }
     }
 
@@ -221,7 +243,10 @@ async fn plays_a_turn_with_the_design_flags() {
     let run = setup.run_args(&args, &[&user_line("Say hello.")]).await;
 
     assert_eq!(run.code, Some(0), "{}", run.stderr);
-    assert_eq!(run.kinds(), ["system/init", "assistant", "result"]);
+    assert_eq!(
+        run.kinds(),
+        ["system/init", "assistant", "rate_limit_event", "result"]
+    );
     let init = &run.lines[0];
     assert_eq!(init["session_id"], setup.id.to_string());
     assert_eq!(init["model"], "claude-opus-test");
@@ -242,7 +267,10 @@ async fn plays_a_turn_with_the_design_flags() {
     );
     let assistant = &run.lines[1];
     assert_eq!(assistant["message"]["content"][0]["text"], "Hello, world.");
-    let result = &run.lines[2];
+    let rate_limit = &run.lines[2];
+    assert_eq!(rate_limit["session_id"], setup.id.to_string());
+    assert_eq!(rate_limit["rate_limit_info"]["status"], "allowed");
+    let result = &run.lines[3];
     assert_eq!(result["subtype"], "success");
     assert_eq!(result["is_error"], false);
     assert_eq!(result["result"], "Hello, world.");
@@ -255,7 +283,9 @@ async fn plays_a_turn_with_the_design_flags() {
     let request = &requests[0];
     assert_eq!(request.url.query(), Some("beta=true"));
     assert_eq!(request.headers["authorization"], "Bearer sub-placeholder");
-    assert_eq!(request.headers["anthropic-beta"], "oauth-2025-04-20");
+    assert_eq!(request.headers["anthropic-beta"], OAUTH_BETA);
+    assert_eq!(request.headers["anthropic-version"], "2023-06-01");
+    assert_eq!(request.headers["x-app"], "cli");
     assert!(request.headers.get("x-api-key").is_none());
     assert_eq!(
         request.headers["x-claude-code-session-id"],
@@ -288,6 +318,7 @@ async fn sends_the_api_key_as_x_api_key_and_prefers_it_like_the_real_cli() {
         }
         let run = setup.run("--session-id", &["hi"]).await;
         assert_eq!(run.code, Some(0), "{}", run.stderr);
+        assert_eq!(run.kinds(), ["system/init", "assistant", "result"]);
         assert_eq!(run.lines[0]["apiKeySource"], "ANTHROPIC_API_KEY");
         assert_eq!(run.lines[0]["model"], DEFAULT_MODEL);
     }
@@ -296,7 +327,7 @@ async fn sends_the_api_key_as_x_api_key_and_prefers_it_like_the_real_cli() {
     for request in requests {
         assert_eq!(request.headers["x-api-key"], "key-placeholder");
         assert!(request.headers.get("authorization").is_none());
-        assert!(request.headers.get("anthropic-beta").is_none());
+        assert_eq!(request.headers["anthropic-beta"], API_KEY_BETA);
     }
 }
 
@@ -407,6 +438,7 @@ async fn a_resumed_session_continues_the_script_and_the_transcript() {
         [
             "system/init",
             "assistant",
+            "rate_limit_event",
             "result",
             "system/init",
             "assistant",
@@ -485,17 +517,21 @@ async fn http_failures_become_error_results_and_use_up_the_turn() {
 
 #[tokio::test]
 async fn an_unreachable_base_url_or_no_credential_is_an_error_result() {
-    let closed = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
+    // Bound but never listening: the port stays taken until `held` is
+    // dropped, so no server started by a parallel test can get it, and a
+    // connection to it is refused at once.
+    let held = tokio::net::TcpSocket::new_v4().unwrap();
+    held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = format!("http://{}", held.local_addr().unwrap());
     let setup = Setup::new(&closed, &[Turn::reply("unused")]);
     let run = setup.run("--session-id", &["hi"]).await;
+    drop(held);
     assert_eq!(run.code, Some(1));
     let result = run.results()[0];
     assert_eq!(result["is_error"], true);
     assert!(result["api_error_status"].is_null());
-    assert!(result["result"].as_str().unwrap().starts_with("API Error:"));
+    let text = result["result"].as_str().unwrap();
+    assert!(text.starts_with("API Error: request failed"), "{text}");
 
     let api = anthropic().await;
     let setup =
@@ -544,7 +580,13 @@ async fn a_crash_exits_mid_turn_without_a_result() {
     assert_eq!(run.code, Some(CRASH_EXIT_CODE));
     assert_eq!(
         run.kinds(),
-        ["system/init", "assistant", "result", "system/init"]
+        [
+            "system/init",
+            "assistant",
+            "rate_limit_event",
+            "result",
+            "system/init"
+        ]
     );
     assert_eq!(api.message_requests().await.len(), 2);
 }
@@ -581,6 +623,7 @@ async fn scripted_commands_run_on_path_with_the_fake_environment() {
         [
             "system/init",
             "assistant",
+            "rate_limit_event",
             "user",
             "assistant",
             "user",
@@ -641,7 +684,10 @@ async fn other_line_types_are_ignored_and_bad_input_is_fatal() {
         )
         .await;
     assert_eq!(run.code, Some(1));
-    assert_eq!(run.kinds(), ["system/init", "assistant", "result"]);
+    assert_eq!(
+        run.kinds(),
+        ["system/init", "assistant", "rate_limit_event", "result"]
+    );
     assert!(
         run.stderr.contains("stdin line is not JSON"),
         "{}",
@@ -676,4 +722,82 @@ async fn missing_environment_and_a_bad_script_are_fatal() {
     assert_eq!(run.code, Some(1));
     assert_eq!(run.kinds(), ["system/init"]);
     assert!(run.stderr.contains("reading the script"), "{}", run.stderr);
+}
+
+#[tokio::test]
+async fn a_tool_turn_then_a_reply_prints_the_captured_line_sequence() {
+    let api = anthropic().await;
+    let setup = Setup::new(
+        &api.uri(),
+        &[
+            Turn::reply("Hello from the fake.").with_command(["echo", "hi"]),
+            Turn::reply("Again."),
+        ],
+    );
+    let run = setup.run("--session-id", &["one", "two"]).await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+
+    let captured = Run::stdout(fixtures::TOOL_TURNS);
+    assert_eq!(run.kinds(), captured.kinds());
+    let keys = |run: &Run| -> Vec<String> {
+        let line = run.of_type("rate_limit_event")[0];
+        let mut keys: Vec<String> = line.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(keys(&run), keys(&captured));
+    assert_eq!(
+        run.of_type("rate_limit_event")[0]["rate_limit_info"],
+        captured.of_type("rate_limit_event")[0]["rate_limit_info"]
+    );
+}
+
+#[tokio::test]
+async fn extra_lines_are_printed_verbatim_before_the_reply() {
+    let api = anthropic().await;
+    let goal = r#"{"type":"active_goal","goal":null}"#;
+    let setup = Setup::new(
+        &api.uri(),
+        &[
+            Turn::reply("ok")
+                .with_extra_line(goal)
+                .with_extra_line("{not json"),
+            Turn::api_error(429, "limit").with_extra_line("plain text"),
+        ],
+    );
+    let output = setup
+        .output(
+            &setup.flags("--session-id"),
+            &[&user_line("one"), &user_line("two")],
+        )
+        .await;
+    let run = Run::lenient(output);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    let shape: Vec<String> = run
+        .raw
+        .iter()
+        .map(|line| match serde_json::from_str::<Value>(line) {
+            Ok(value) if value["type"] == "active_goal" => line.clone(),
+            Ok(value) => value["type"].as_str().unwrap().to_owned(),
+            Err(_) => line.clone(),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            "system",
+            goal,
+            "{not json",
+            "assistant",
+            "rate_limit_event",
+            "result",
+            "system",
+            "plain text",
+            "assistant",
+            "result",
+        ]
+    );
+    let entries = transcript_entries(&setup.transcript());
+    assert!(entries.iter().all(|e| e["type"] != "active_goal"));
+    assert_eq!(entries.len(), 4);
 }

@@ -278,6 +278,37 @@ jobs:
       - name: Run Docker tests
         run: cargo test --locked --workspace --all-features -- --ignored docker_
 
+  # agentctl ships in the sandbox image as one static binary, with no TLS
+  # and no C dependencies, so the musl target needs no system packages.
+  # musl builds are static-pie, which `file` doesn't call "statically
+  # linked", so the check is that `readelf -l` shows no INTERP segment: the
+  # binary names no dynamic loader. x86_64 only, like the image.
+  agentctl-static:
+    name: agentctl static build (x86_64 musl)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust with the musl target
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+
+      - name: Build agentctl
+        run: cargo build --locked --release -p agentctl --target x86_64-unknown-linux-musl
+
+      - name: Check that agentctl is static
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/agentctl
+          readelf -l "$bin"
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "agentctl has an INTERP segment, so it needs a dynamic loader" >&2
+            exit 1
+          fi
+          "$bin" --version
+
   # Dependency policy in deny.toml: banned crates, licenses, advisories and
   # sources. `--workspace` makes every workspace crate a root of the graph;
   # the root manifest is a package, so without it only that package's
@@ -323,7 +354,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, docker-tests]
+    needs: [changes, rust, docs, coverage, msrv, deny, docker-tests, agentctl-static]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

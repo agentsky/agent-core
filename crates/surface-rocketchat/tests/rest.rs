@@ -1,7 +1,7 @@
 //! Tests of the REST client against `testkit::rocketchat::FakeRest`.
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::{ExposeSecret, SecretString};
@@ -9,7 +9,7 @@ use serde_json::Value;
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType};
 use testkit::rocketchat::FakeRest;
 use wiremock::matchers::path;
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 fn manager(fake: &FakeRest) -> RestClient {
     RestClient::new(
@@ -706,6 +706,96 @@ async fn upload_errors_map_at_each_step() {
 }
 
 #[tokio::test]
+async fn upload_larger_than_the_limit_fails_and_sends_nothing() {
+    let fake = FakeRest::start().await;
+    fake.add_room("C1", "c", "general");
+    let client = manager(&fake).with_max_upload_size(4);
+    let file = temp_file("five.txt", b"12345");
+    assert_eq!(
+        client.upload(&conv("C1"), None, &file).await,
+        Err(SurfaceError::Api(
+            "the file to upload is 5 bytes, more than the 4-byte limit".into()
+        ))
+    );
+    assert!(fake.requests("rooms.media").await.is_empty());
+    let file = temp_file("four.txt", b"1234");
+    assert!(client.upload(&conv("C1"), None, &file).await.is_ok());
+}
+
+#[tokio::test]
+async fn upload_limit_defaults_to_100_mib_and_is_checked_before_reading() {
+    let fake = FakeRest::start().await;
+    fake.add_room("C1", "c", "general");
+    let file = temp_file("sparse.bin", b"");
+    std::fs::File::options()
+        .write(true)
+        .open(&file.path)
+        .unwrap()
+        .set_len(100 * 1024 * 1024 + 1)
+        .unwrap();
+    assert_eq!(
+        manager(&fake).upload(&conv("C1"), None, &file).await,
+        Err(SurfaceError::Api(
+            "the file to upload is 104857601 bytes, more than the 104857600-byte limit".into()
+        ))
+    );
+    assert!(fake.requests("rooms.media").await.is_empty());
+    std::fs::remove_file(&file.path).unwrap();
+}
+
+#[tokio::test]
+async fn upload_of_a_directory_is_refused() {
+    let fake = FakeRest::start().await;
+    let file = OutFile {
+        name: "dir".into(),
+        path: std::env::temp_dir(),
+    };
+    assert_eq!(
+        manager(&fake).upload(&conv("C1"), None, &file).await,
+        Err(SurfaceError::Api(
+            "the file to upload is not a regular file".into()
+        ))
+    );
+    assert!(fake.requests("rooms.media").await.is_empty());
+}
+
+/// Answers the first request with a 429 after deleting the file being
+/// uploaded, so a retry that read the file again would fail.
+struct DeleteThenRateLimit(PathBuf);
+
+impl Respond for DeleteThenRateLimit {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        std::fs::remove_file(&self.0).unwrap();
+        ResponseTemplate::new(429).set_body_json(serde_json::json!({
+            "success": false,
+            "error": "Error, too many requests. [error-too-many-requests]",
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_429_on_upload_resends_the_bytes_read_the_first_time() {
+    let fake = FakeRest::start().await;
+    fake.add_room("C1", "c", "general");
+    let file = temp_file("once.txt", b"read once");
+    Mock::given(path("/api/v1/rooms.media/C1"))
+        .respond_with(DeleteThenRateLimit(file.path.clone()))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
+    let client = manager(&fake).with_max_retry_wait(Duration::from_secs(2));
+    let message = client.upload(&conv("C1"), None, &file).await.unwrap();
+    assert_eq!(message.files[0].name, "once.txt");
+    assert!(!file.path.exists());
+    let media = fake.requests("rooms.media").await;
+    assert_eq!(media.len(), 2);
+    for request in media {
+        assert!(String::from_utf8_lossy(&request.body).contains("read once"));
+    }
+}
+
+#[tokio::test]
 async fn room_history_uses_the_endpoint_for_the_room_type() {
     let fake = FakeRest::start().await;
     let client = manager(&fake);
@@ -855,6 +945,61 @@ async fn a_429_resetting_later_than_the_max_wait_fails_at_once() {
         panic!("expected rate limited, got {err:?}");
     };
     assert!(retry_after > Duration::from_secs(590), "{retry_after:?}");
+    assert_eq!(fake.requests("me").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_429_from_a_server_clock_an_hour_ahead_is_retried_after_the_reset() {
+    let fake = FakeRest::start().await;
+    let server_now = SystemTime::now() + Duration::from_secs(3600);
+    fake.rate_limit_at("me", 1, Duration::from_millis(300), server_now)
+        .await;
+    let started = Instant::now();
+    manager(&fake).me().await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    assert_eq!(fake.requests("me").await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_429_from_a_server_clock_an_hour_behind_waits_for_the_reset() {
+    let fake = FakeRest::start().await;
+    let server_now = SystemTime::now() - Duration::from_secs(3600);
+    fake.rate_limit_at("me", 1, Duration::from_millis(1200), server_now)
+        .await;
+    let started = Instant::now();
+    manager(&fake).me().await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(1200), "{elapsed:?}");
+    assert_eq!(fake.requests("me").await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_skewed_server_reports_the_reset_by_its_own_clock() {
+    let fake = FakeRest::start().await;
+    let behind = SystemTime::now() - Duration::from_secs(3600);
+    fake.rate_limit_at("me", 5, Duration::from_millis(20), behind)
+        .await;
+    assert_eq!(
+        manager(&fake).me().await,
+        Err(SurfaceError::RateLimited {
+            retry_after: Duration::from_millis(20)
+        })
+    );
+    assert_eq!(fake.requests("me").await.len(), 2);
+
+    let fake = FakeRest::start().await;
+    let ahead = SystemTime::now() + Duration::from_secs(3600);
+    fake.rate_limit_at("me", 5, Duration::from_secs(600), ahead)
+        .await;
+    let client = manager(&fake).with_max_retry_wait(Duration::from_secs(1));
+    assert_eq!(
+        client.me().await,
+        Err(SurfaceError::RateLimited {
+            retry_after: Duration::from_secs(600)
+        })
+    );
     assert_eq!(fake.requests("me").await.len(), 1);
 }
 
@@ -1085,4 +1230,74 @@ async fn bot_password_debug_is_redacted() {
     let printed = format!("{password:?}");
     assert_eq!(printed, "BotPassword([REDACTED])");
     assert!(!printed.contains(&sent));
+}
+
+#[tokio::test]
+async fn subscriptions_list_the_rooms_the_user_is_in() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    let helper = bot(&client, "helper").await;
+    fake.add_room("GENERAL", "c", "general");
+    fake.add_room("SECRET", "p", "secret");
+    fake.add_room("OTHER", "c", "other");
+    fake.add_member("GENERAL", helper.user_id().as_str());
+    fake.add_member("SECRET", helper.user_id().as_str());
+    let mut rooms = helper.subscriptions().await.unwrap();
+    rooms.sort_by(|a, b| a.room.cmp(&b.room));
+    let listed: Vec<(&str, RoomType)> = rooms
+        .iter()
+        .map(|s| (s.room.as_str(), s.room_type.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("GENERAL", RoomType::Channel), ("SECRET", RoomType::Group)]
+    );
+    assert_eq!(rooms[0].name.as_deref(), Some("general"));
+    let requests = fake.requests("subscriptions.get").await;
+    assert_eq!(
+        header(&requests[0], "x-user-id"),
+        Some(helper.user_id().as_str())
+    );
+}
+
+#[tokio::test]
+async fn user_info_shows_roles_to_the_manager_and_to_the_user_itself() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    let helper = bot(&client, "helper").await;
+    let other = bot(&client, "other").await;
+    let seen_by_manager = client.user_info(other.user_id()).await.unwrap();
+    assert_eq!(seen_by_manager.username, "other");
+    assert_eq!(seen_by_manager.roles, ["bot"]);
+    let seen_by_itself = other.user_info(other.user_id()).await.unwrap();
+    assert_eq!(seen_by_itself.roles, ["bot"]);
+    let seen_by_a_peer = helper.user_info(other.user_id()).await.unwrap();
+    assert!(seen_by_a_peer.roles.is_empty());
+    let missing = client.user_info(&UserId::from("nobody")).await.unwrap_err();
+    assert_eq!(missing, SurfaceError::Api("User not found.".into()));
+    let requests = fake.requests("users.info").await;
+    assert_eq!(
+        requests[0].url.query(),
+        Some(format!("userId={}", other.user_id()).as_str())
+    );
+}
+
+#[tokio::test]
+async fn file_urls_sit_under_the_base_path() {
+    let creds = Credentials {
+        user_id: "u1".into(),
+        token: SecretString::from("t"),
+    };
+    let client = RestClient::new("https://chat.example.com/rc/", creds).unwrap();
+    let file = surface_rocketchat::rest::FileRef {
+        id: "f1".into(),
+        name: "a b/c.png".into(),
+        mime_type: None,
+        size: None,
+    };
+    assert_eq!(
+        client.file_url(&file),
+        "https://chat.example.com/rc/file-upload/f1/a%20b%2Fc.png"
+    );
+    assert_eq!(client.credentials().user_id.as_str(), "u1");
 }

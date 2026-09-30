@@ -23,6 +23,7 @@ struct Running {
     app: App,
     addrs: Addrs,
     stop: oneshot::Sender<()>,
+    abort: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
@@ -34,19 +35,43 @@ impl Running {
             .unwrap();
         let addrs = server.addrs();
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(server.run(async {
-            let _ = stopped.await;
-        }));
+        let (abort, aborted) = oneshot::channel();
+        let task = tokio::spawn(server.run(
+            async {
+                let _ = stopped.await;
+            },
+            async {
+                if aborted.await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            },
+        ));
         Self {
             app,
             addrs,
             stop,
+            abort,
             task,
         }
     }
 
     async fn stop(self) -> (App, anyhow::Result<()>) {
         self.stop.send(()).unwrap();
+        let result = within(Duration::from_secs(10), self.task).await.unwrap();
+        (self.app, result)
+    }
+
+    /// Asks for a graceful shutdown, then, once it has stopped accepting,
+    /// forces it, as a second signal does.
+    async fn stop_then_force(self) -> (App, anyhow::Result<()>) {
+        let public = self.addrs.public;
+        self.stop.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(public).is_ok() {
+            assert!(Instant::now() < deadline, "still accepting after shutdown");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.abort.send(()).unwrap();
         let result = within(Duration::from_secs(10), self.task).await.unwrap();
         (self.app, result)
     }
@@ -92,9 +117,13 @@ async fn serve_answers_healthz_and_shuts_down_cleanly() {
 #[tokio::test]
 async fn cli_serve_runs_until_shutdown() {
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(agentd::cli::serve(config(CONFIG), async {
-        let _ = stopped.await;
-    }));
+    let task = tokio::spawn(agentd::cli::serve(
+        config(CONFIG),
+        async {
+            let _ = stopped.await;
+        },
+        std::future::pending(),
+    ));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!task.is_finished());
     stop.send(()).unwrap();
@@ -184,12 +213,45 @@ async fn shutdown_drops_requests_still_running_after_the_drain_timeout() {
 }
 
 #[tokio::test]
+async fn a_forced_shutdown_drops_in_flight_requests_without_waiting_for_the_drain() {
+    let text = CONFIG.replace("drain_timeout_secs = 5", "drain_timeout_secs = 3600");
+    let started = Arc::new(Notify::new());
+    let notify = started.clone();
+    let running = Running::start(&text, move |mut routers| {
+        routers.public = routers.public.route(
+            "/hang",
+            routing::get(move || async move {
+                notify.notify_one();
+                std::future::pending::<()>().await;
+            }),
+        );
+        routers
+    })
+    .await;
+    let request = tokio::spawn(get(running.addrs.public, "/hang"));
+    within(Duration::from_secs(5), started.notified()).await;
+
+    let begun = Instant::now();
+    let (app, result) = running.stop_then_force().await;
+    result.unwrap();
+    let took = begun.elapsed();
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert!(
+        within(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    app.store().ping().await.unwrap_err();
+}
+
+#[tokio::test]
 async fn an_address_in_use_is_named() {
-    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
     let port = taken.local_addr().unwrap().port();
     let text = CONFIG.replacen(
-        "proxy_listen = \"127.0.0.1:0\"",
-        &format!("proxy_listen = \"127.0.0.1:{port}\""),
+        "proxy_listen = \"127.0.0.2:0\"",
+        &format!("proxy_listen = \"127.0.0.2:{port}\""),
         1,
     );
     let app = App::open(config(&text)).await.unwrap();
@@ -197,7 +259,7 @@ async fn an_address_in_use_is_named() {
         .await
         .unwrap_err();
     assert!(
-        format!("{err:#}").contains(&format!("internal.proxy_listen (127.0.0.1:{port})")),
+        format!("{err:#}").contains(&format!("internal.proxy_listen (127.0.0.2:{port})")),
         "{err:#}"
     );
 }
@@ -212,14 +274,11 @@ async fn a_bad_store_url_is_named() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_public_listener_refuses_the_sandbox_subnet() {
-    let text = CONFIG
-        .replacen("listen = \"127.0.0.1:0\"", "listen = \"127.0.0.2:0\"", 1)
-        .replace("172.30.0.0/24", "127.0.0.1/32");
-    let running = Running::start(&text, |routers| routers).await;
+    let running = Running::start(CONFIG, |routers| routers).await;
     let public = running.addrs.public;
     let proxy = running.addrs.proxy;
     let refused = tokio::task::spawn_blocking(move || {
-        let socket = socket_from("127.0.0.1");
+        let socket = socket_from("127.0.0.2");
         let mut stream = socket.connect(public).ok()?;
         std::io::Write::write_all(&mut stream, b"GET /healthz HTTP/1.1\r\nHost: a\r\n\r\n").ok()?;
         common::read_response(&mut stream)
