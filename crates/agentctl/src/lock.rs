@@ -5,28 +5,38 @@
 //! runs the command in a process group of its own, renews the lease while
 //! the command runs, and releases it when the command exits.
 //!
-//! A lease it can't renew is lost: agentd refused the renewal, or no
-//! renewal succeeded before the last second of the lease, which is when
-//! agentctl stops relying on it (lease times are whole seconds, and another
-//! command may take the lock the moment the lease runs out). agentctl then
-//! kills the command's whole process group, so no process the command
-//! started writes under the next holder, and exits with status 1. A renewal
-//! that stalls is abandoned at that point too; it never delays the kill.
+//! A lease is timed on agentctl's own monotonic clock, from when it sent the
+//! request that agentd answered with the lease's `seconds_left`, so skew
+//! between agentd's clock and the sandbox's doesn't matter. agentctl relies
+//! on it until two seconds before that many seconds have passed: one for the
+//! whole seconds agentd keeps leases in, and one because another command may
+//! take the lock the moment the lease runs out. A lease that leaves too
+//! little time to renew it is given back at once, and `lock` fails.
 //!
-//! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start: agentctl
-//! kills the command's process group if it is running, releases the lease
-//! if it holds one, and exits with 128 plus the signal. A process that
-//! leaves the group (with `setsid`, say) escapes the kill, and one the
-//! command leaves running when it exits on its own is not stopped. An
-//! agentctl killed outright stops renewing, and the lease expires on its
-//! own.
+//! A lease it can't renew is lost: agentd refused the renewal, or no
+//! renewal succeeded before that deadline. agentctl then kills the
+//! command's whole process group, so no process the command started writes
+//! under the next holder, and exits with status 1. A renewal that stalls is
+//! abandoned at the deadline too; it never delays the kill. A renewal that
+//! failed on agentd's side (an internal error, such as a busy database) or
+//! in transit is retried until the deadline.
+//!
+//! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start. During an
+//! acquire, agentctl lets a request already sent finish, for up to two
+//! seconds, and gives back the lease if it was granted. While the command
+//! runs, agentctl passes the signal on to the command's process group,
+//! gives it up to two seconds to exit (never past the lease's deadline),
+//! then kills the group. Either way it releases the lease and exits with
+//! 128 plus the signal. A process that leaves the group (with `setsid`,
+//! say) escapes the kill, and one the command leaves running when it exits
+//! on its own is not stopped. An agentctl killed outright stops renewing,
+//! and the lease expires on its own.
 
 use std::ffi::OsString;
 use std::process::{ExitCode, ExitStatus};
 use std::time::Duration;
 
-use core_types::{LeaseId, LockRequest, LockResponse};
-use time::OffsetDateTime;
+use core_types::{CtlErrorCode, LeaseId, LockRequest, LockResponse};
 use tokio::process::Child;
 use tokio::time::Instant;
 
@@ -38,10 +48,25 @@ const FIRST_RETRY: Duration = Duration::from_millis(100);
 const MAX_RETRY: Duration = Duration::from_secs(1);
 /// The shortest wait between renewals.
 const MIN_RENEW_WAIT: Duration = Duration::from_millis(200);
-/// How long before a lease's expiry agentctl stops relying on it. Lease
-/// times are whole seconds, and the lock can be taken over at the expiry
-/// itself.
-const SAFETY_MARGIN: time::Duration = time::Duration::SECOND;
+/// How much shorter than its `seconds_left` a lease may really be: leases
+/// are kept in whole seconds.
+const ROUNDING: Duration = Duration::from_secs(1);
+/// How long before a lease's expiry agentctl stops relying on it: the lock
+/// can be taken over at the expiry itself.
+const SAFETY_MARGIN: Duration = Duration::from_secs(1);
+/// The least time a new lease must leave before agentctl stops relying on
+/// it: enough to wait [`MIN_RENEW_WAIT`] and then renew it. With
+/// [`ROUNDING`] and [`SAFETY_MARGIN`], a lease must last three seconds.
+const MIN_TIME_LEFT: Duration = Duration::from_millis(500);
+/// How long an acquire already sent may take to finish after a stop signal,
+/// so a lease it was granted can be given back.
+const ACQUIRE_GRACE: Duration = Duration::from_secs(2);
+/// How long the command may take to exit after agentctl passes a stop
+/// signal on to it, before its process group is killed.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+/// How often agentctl checks whether the command has exited after passing a
+/// stop signal on.
+const STOP_POLL: Duration = Duration::from_millis(20);
 /// How long releasing the lease may take. The lease expires on its own if
 /// agentd doesn't answer, so a signal never waits long for it.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,8 +75,8 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// # Errors
 ///
-/// If the lock can't be had within `timeout`, the command can't be started,
-/// or the lease is lost while it runs.
+/// If the lock can't be had within `timeout`, its lease is too short to
+/// hold, the command can't be started, or the lease is lost while it runs.
 pub async fn run(
     client: &Client,
     timeout: Duration,
@@ -59,29 +84,21 @@ pub async fn run(
 ) -> Result<ExitCode, String> {
     let (program, args) = command.split_first().ok_or("lock needs a command")?;
     let mut stop = Stop::install();
-    let (lease, expires_at) = tokio::select! {
-        acquired = acquire(client, timeout) => acquired?,
-        signal = stop.recv() => return Ok(signal_code(signal)),
+    let (lease, deadline) = match acquire(client, timeout, &mut stop).await? {
+        Acquired::Held { lease, deadline } => (lease, deadline),
+        Acquired::Stopped(signal) => return Ok(signal_code(signal)),
     };
     let mut child = tokio::process::Command::new(program);
     child.args(args).kill_on_drop(true);
     #[cfg(unix)]
     child.process_group(0);
     let outcome = match child.spawn() {
-        Ok(mut child) => hold(client, lease, expires_at, &mut child, &mut stop).await,
+        Ok(mut child) => hold(client, lease, deadline, &mut child, &mut stop).await,
         Err(err) => Err(format!("can't run {}: {err}", program.to_string_lossy())),
     };
-    let release = LockRequest::Release { lease };
-    let released = tokio::select! {
-        released = client.send_within(&release, RELEASE_TIMEOUT) => {
-            released.err().map(|err| err.to_string())
-        }
-        _ = stop.recv() => Some("interrupted".to_owned()),
-    };
+    let released = release(client, lease, &mut stop).await;
     let ended = outcome?;
-    if let Some(err) = released {
-        eprintln!("agentctl: releasing the shared/ lock failed ({err}); it expires on its own");
-    }
+    report_release(released);
     Ok(match ended {
         Ended::Exited(status) => exit_code(status),
         Ended::Signalled(signal) => signal_code(signal),
@@ -96,16 +113,52 @@ enum Ended {
     Signalled(i32),
 }
 
-async fn acquire(client: &Client, timeout: Duration) -> Result<(LeaseId, OffsetDateTime), String> {
-    let deadline = Instant::now() + timeout;
+/// How [`acquire`] ended, short of an error.
+enum Acquired {
+    /// agentctl holds `lease`, and may rely on it until `deadline`.
+    Held { lease: LeaseId, deadline: Instant },
+    /// agentctl got this signal, and holds no lease.
+    Stopped(i32),
+}
+
+async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<Acquired, String> {
+    let give_up = Instant::now() + timeout;
     let mut wait = FIRST_RETRY;
     let mut told = false;
     loop {
-        match client.send(&LockRequest::Acquire).await? {
-            LockResponse::Held { lease, expires_at } => return Ok((lease, expires_at)),
+        let sent = Instant::now();
+        let request = client.send(&LockRequest::Acquire);
+        tokio::pin!(request);
+        let answer = tokio::select! {
+            answer = &mut request => answer?,
+            signal = stop.recv() => {
+                if let Ok(Ok(LockResponse::Held { lease, .. })) =
+                    tokio::time::timeout(ACQUIRE_GRACE, request).await
+                {
+                    report_release(release(client, lease, stop).await);
+                }
+                return Ok(Acquired::Stopped(signal));
+            }
+        };
+        match answer {
+            LockResponse::Held {
+                lease,
+                seconds_left,
+                ..
+            } => {
+                let deadline = reliable_until(sent, seconds_left);
+                if deadline.saturating_duration_since(Instant::now()) < MIN_TIME_LEFT {
+                    let _ = release(client, lease, stop).await;
+                    return Err(format!(
+                        "the shared/ lock's lease is too short to hold (agentd granted \
+                         {seconds_left}s; agentctl needs at least 3s)"
+                    ));
+                }
+                return Ok(Acquired::Held { lease, deadline });
+            }
             LockResponse::Busy | LockResponse::Released => {}
         }
-        if Instant::now() + wait > deadline {
+        if Instant::now() + wait > give_up {
             return Err(format!(
                 "gave up after {}s waiting for the shared/ lock; another command holds it",
                 timeout.as_secs()
@@ -115,31 +168,35 @@ async fn acquire(client: &Client, timeout: Duration) -> Result<(LeaseId, OffsetD
             eprintln!("agentctl: waiting for the shared/ lock");
             told = true;
         }
-        tokio::time::sleep(wait).await;
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            signal = stop.recv() => return Ok(Acquired::Stopped(signal)),
+        }
         wait = (wait * 2).min(MAX_RETRY);
     }
 }
 
 /// Waits for `child`, renewing `lease` about three times per lease period,
-/// and kills it on a stop signal or when the lease can no longer be relied
-/// on.
+/// and stops it on a stop signal or when the lease can no longer be relied
+/// on, which is at `deadline` unless a renewal moves it.
 async fn hold(
     client: &Client,
     lease: LeaseId,
-    mut expires_at: OffsetDateTime,
+    mut deadline: Instant,
     child: &mut Child,
     stop: &mut Stop,
 ) -> Result<Ended, String> {
     let mut failure = None;
     loop {
-        let left = time_left(expires_at, OffsetDateTime::now_utc());
-        let deadline = Instant::now() + left;
-        let renewal = async {
-            tokio::time::sleep(renew_wait(left)).await;
-            let limit = deadline.saturating_duration_since(Instant::now());
-            client
+        let until = deadline;
+        let renewal = async move {
+            tokio::time::sleep(renew_wait(until.saturating_duration_since(Instant::now()))).await;
+            let sent = Instant::now();
+            let limit = until.saturating_duration_since(sent);
+            let renewed = client
                 .send_within(&LockRequest::Renew { lease }, limit)
-                .await
+                .await;
+            (sent, renewed)
         };
         let reason = tokio::select! {
             status = child.wait() => {
@@ -148,19 +205,24 @@ async fn hold(
                     .map_err(|err| format!("waiting for the command failed: {err}"));
             }
             signal = stop.recv() => {
-                kill(child).await;
+                let grace = STOP_GRACE.min(deadline.saturating_duration_since(Instant::now()));
+                interrupt(child, signal, grace).await;
                 return Ok(Ended::Signalled(signal));
             }
             () = tokio::time::sleep_until(deadline) => failure
                 .take()
                 .unwrap_or_else(|| "agentd didn't renew it in time".to_owned()),
-            renewed = renewal => match renewed {
-                Ok(LockResponse::Held { expires_at: at, .. }) => {
-                    expires_at = at;
+            (sent, renewed) = renewal => match renewed {
+                Ok(LockResponse::Held { seconds_left, .. }) => {
+                    deadline = reliable_until(sent, seconds_left);
                     failure = None;
                     continue;
                 }
                 Ok(LockResponse::Busy | LockResponse::Released) => "the lease expired".to_owned(),
+                Err(Failure::Refused(err)) if err.code == CtlErrorCode::Internal => {
+                    failure = Some(err.message);
+                    continue;
+                }
                 Err(Failure::Refused(err)) => err.message,
                 Err(Failure::Transport(message)) => {
                     failure = Some(message);
@@ -175,18 +237,71 @@ async fn hold(
     }
 }
 
+/// Gives `lease` back, within [`RELEASE_TIMEOUT`] and unless another stop
+/// signal comes first. Returns why it failed, if it did.
+async fn release(client: &Client, lease: LeaseId, stop: &mut Stop) -> Option<String> {
+    let request = LockRequest::Release { lease };
+    tokio::select! {
+        released = client.send_within(&request, RELEASE_TIMEOUT) => {
+            released.err().map(|err| err.to_string())
+        }
+        _ = stop.recv() => Some("interrupted".to_owned()),
+    }
+}
+
+/// Tells the model that releasing the lease failed, if it did.
+fn report_release(failure: Option<String>) {
+    if let Some(err) = failure {
+        eprintln!("agentctl: releasing the shared/ lock failed ({err}); it expires on its own");
+    }
+}
+
+/// Passes `signal` on to `child`'s process group, waits up to `grace` for
+/// `child` to exit, then kills the group and reaps `child`.
+///
+/// `child` is left unreaped while it is waited for, so its process id, the
+/// group's id, can't be reused before the group is killed.
+async fn interrupt(child: &mut Child, signal: i32, grace: Duration) {
+    #[cfg(unix)]
+    if let (Some(group), Some(signal)) = (
+        group(child),
+        rustix::process::Signal::from_named_raw(signal),
+    ) {
+        use rustix::process::{WaitId, WaitIdOptions, kill_process_group, waitid};
+
+        if kill_process_group(group, signal).is_ok() {
+            let give_up = Instant::now() + grace;
+            let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+            while Instant::now() < give_up
+                && matches!(waitid(WaitId::Pid(group), options), Ok(None))
+            {
+                tokio::time::sleep(STOP_POLL).await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (signal, grace);
+    kill(child).await;
+}
+
 /// Kills `child`'s process group, which is everything it started that
 /// stayed in it, then `child` itself, and reaps it.
 async fn kill(child: &mut Child) {
     #[cfg(unix)]
-    if let Some(group) = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .and_then(rustix::process::Pid::from_raw)
-    {
+    if let Some(group) = group(child) {
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
     let _ = child.kill().await;
+}
+
+/// The id of `child`'s process group, which is its own process id, while
+/// it hasn't been reaped.
+#[cfg(unix)]
+fn group(child: &Child) -> Option<rustix::process::Pid> {
+    child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(rustix::process::Pid::from_raw)
 }
 
 /// The signals that stop `agentctl lock`: `SIGTERM`, `SIGINT` and
@@ -246,10 +361,13 @@ impl Stop {
     }
 }
 
-/// How long a lease that runs out at `expires_at` can still be relied on:
-/// until [`SAFETY_MARGIN`] before its expiry.
-fn time_left(expires_at: OffsetDateTime, now: OffsetDateTime) -> Duration {
-    Duration::try_from(expires_at - SAFETY_MARGIN - now).unwrap_or(Duration::ZERO)
+/// When agentctl stops relying on a lease that agentd said, answering a
+/// request sent at `sent`, has `seconds_left`: [`ROUNDING`] and
+/// [`SAFETY_MARGIN`] before `seconds_left` have passed since `sent`.
+/// agentd measured it no earlier than `sent`, so the time the answer took
+/// only makes this earlier.
+fn reliable_until(sent: Instant, seconds_left: u64) -> Instant {
+    sent + Duration::from_secs(seconds_left).saturating_sub(ROUNDING + SAFETY_MARGIN)
 }
 
 /// How long to wait before renewing a lease that can be relied on for
@@ -278,23 +396,22 @@ fn signal_code(signal: i32) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use time::macros::datetime;
-
     use super::*;
 
     #[test]
-    fn a_lease_is_relied_on_until_a_second_before_it_runs_out() {
-        let now = datetime!(2026-09-30 12:00:00 UTC);
-        assert_eq!(
-            time_left(now + time::Duration::seconds(30), now),
-            Duration::from_secs(29)
-        );
-        assert_eq!(
-            time_left(now + time::Duration::milliseconds(1_500), now),
-            Duration::from_millis(500)
-        );
-        assert_eq!(time_left(now + time::Duration::SECOND, now), Duration::ZERO);
-        assert_eq!(time_left(now, now), Duration::ZERO);
+    fn a_lease_is_relied_on_until_two_seconds_before_its_seconds_left() {
+        let sent = Instant::now();
+        assert_eq!(reliable_until(sent, 30), sent + Duration::from_secs(28));
+        assert_eq!(reliable_until(sent, 3), sent + Duration::from_secs(1));
+        assert_eq!(reliable_until(sent, 2), sent);
+        assert_eq!(reliable_until(sent, 0), sent);
+    }
+
+    #[test]
+    fn the_shortest_lease_agentctl_holds_lasts_three_seconds() {
+        let sent = Instant::now();
+        assert!(reliable_until(sent, 3) - sent >= MIN_TIME_LEFT);
+        assert!(reliable_until(sent, 2) - sent < MIN_TIME_LEFT);
     }
 
     #[test]

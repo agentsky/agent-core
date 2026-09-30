@@ -784,6 +784,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
     }
     let held = lock(&fixture, &a, json!({"op": "acquire"})).await;
     assert_eq!(held["state"], "held");
+    assert_eq!(held["seconds_left"], DEFAULT_LEASE_TTL.as_secs());
     let lease = held["lease"].clone();
     assert_eq!(
         lock(&fixture, &b, json!({"op": "acquire"})).await,
@@ -798,6 +799,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
     let renewed = lock(&fixture, &a, json!({"op": "renew", "lease": lease})).await;
     assert_eq!(renewed["state"], "held");
     assert_eq!(renewed["lease"], lease);
+    assert_eq!(renewed["seconds_left"], DEFAULT_LEASE_TTL.as_secs());
     assert_eq!(
         lock(&fixture, &b, json!({"op": "release", "lease": lease})).await,
         json!({"state": "released"})

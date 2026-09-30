@@ -35,7 +35,9 @@
 //! `agentctl lock` takes leases in `scope_locks`, one volume at a time. A
 //! lease lasts no longer than the turn that took it: beginning or ending a
 //! turn, and revoking or replacing the token, delete the session's leases,
-//! so the lock is free at once rather than when the lease runs out.
+//! so the lock is free at once rather than when the lease runs out, and an
+//! acquire or renewal takes effect only while the turn it was authorized
+//! under is still the token's turn.
 
 mod api;
 mod outbox;

@@ -1875,7 +1875,13 @@ Acceptance:
 Live check (manual, recorded in the PR): with the Compose stack from T16 and a
 real linked account, mention an agent in a channel on Rocket.Chat, run a turn
 that uses Bash and returns a file, restart agentd, and continue the thread with
-`--resume`. That completes design milestone 2.
+`--resume`. Also run `agentctl lock -- sh -c 'sleep 600'` with a short Bash
+tool timeout, and record whether the CLI kills a timed-out command through
+its process group or its process, and with which signal: `agentctl lock`
+runs its command in a group of its own, so a group kill would leave the
+command running after agentctl dies
+([impl-notes](impl-notes.md#the-command-runs-in-its-own-process-group)).
+That completes design milestone 2.
 
 ### T24
 
