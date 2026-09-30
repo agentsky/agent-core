@@ -986,3 +986,171 @@ reply. Whitespace is cleaned only next to removed directives: a line that
 held only directives goes, space before a directive at the end of a line
 goes, and at most one blank line is left where a line was removed. Code is
 found with the parse tree, and a directive overlapping it is left as text.
+
+## T08: commands parser
+
+### Chat text isn't a shell command line
+
+**Issue.** clap parses an argument vector, but commands arrive as chat
+text. Shell-style quoting would make `persona helper You're terse` fail on
+the apostrophe, and would make members quote every persona. Splitting at
+white space and letting clap collect the rest into a `Vec` loses the line
+breaks and spacing of a multi-line persona.
+
+**Solution.** The text is split at Unicode white space, with no quoting or
+escaping: quotes are ordinary characters. The command words are matched
+against a table of specs in `help.rs`, ignoring case, because phones
+capitalize the first word of a message. For the commands with a free-text
+tail (`create`'s persona, `persona`'s text, `admin ban`'s reason), the table
+says how many positional arguments come first, and everything after them is
+cut from the original text verbatim, trimmed only at its ends, and handed to
+clap as one argument. The same table is the only source of usage text, for
+`help`, `Command::help` and parse errors.
+
+### clap errors quote the input
+
+**Issue.** clap's rendered errors repeat the offending argument ("unexpected
+argument 'sk-ant-…' found"), so a malformed `admin api-key set` or
+`login <code>` would put the secret in the reply and in any log of the
+error. Its `InvalidArg` context holds the typed value for some error kinds and
+the argument's name for others.
+
+**Solution.** `ParseError` never uses clap's text. `clap_problem` rewords
+each error kind itself, reads `InvalidArg` only for missing arguments (where
+it holds the argument names), and uses the value parser's own message for
+validation errors. Every value parser's message is a fixed sentence. Unknown
+commands and help topics aren't echoed either. A test feeds malformed text
+holding a marker to every command and checks that neither `Display` nor
+`Debug` of the error contains it.
+
+### Secret-bearing text that fails to parse
+
+**Issue.** `Command::is_secret_bearing` only helps when parsing succeeds.
+`!agent admin api-key set <key> oops` or `!agent admin api-key <key>` (with
+`set` forgotten) fails to parse, yet the key is now public in the channel,
+and T13 has to tell the admin to revoke it.
+
+**Solution.** `ParseError::is_secret_bearing` is true when the text starts
+with `login` or `slack-token` and has arguments, or with `admin api-key` and
+has anything but a bare `set` or `clear` after it. Callers apply the same
+channel rule to both. Review widened the rule to misspelt commands and known
+token prefixes; see
+[Misspelt secret-bearing commands](#misspelt-secret-bearing-commands-arent-commands-at-all).
+
+### Secrets are `SecretString`, not `String`
+
+**Issue.** The plan listed `Login { code: Option<String> }` and asked for a
+`Debug` that redacts the secret-bearing variants. A hand-written `Debug`
+has to be kept in step with every new field, and the plan's Libraries table
+says every token and key in memory is a `secrecy` type.
+
+**Solution.** The login code, both Slack configuration tokens and the API
+key are `SecretString`, so the derived `Debug` redacts them by construction
+and they are zeroized on drop. `Command` therefore has no `PartialEq`; tests
+use patterns and `expose_secret`. The plan's T08 bullets are updated.
+
+### `skill rm` needs the agent and the skill
+
+**Issue.** The design's `/agent skill add|rm <name> <source>` and T25's
+`/agent skill rm <name>` leave `rm` with one argument. Everywhere else
+`<name>` is the agent, and skills are stored per agent, so an owner with two
+agents can't say which one loses the skill; if `<name>` were the skill, the
+agent would be missing instead.
+
+**Solution.** `skill add <name> [source]` takes the agent, with the skill's
+own name coming from its `SKILL.md` as T25 says, and `skill rm <name>
+<skill>` takes the agent and the skill. The skill name is validated as
+Claude Code's `[a-z0-9-]{1,64}`, which also keeps it safe as the directory
+`<data>/skills/<agent>/<name>/`. The design's command table and T25 are
+updated.
+
+### Slack rewrites mentions, channels and links
+
+**Issue.** Slack delivers slash command text (with "escape channels, users,
+and links" on) and every message text with `@name` rewritten to
+`<@U123|name>`, `#room` to `<#C123|name>` and URLs to `<url|label>`, while
+Rocket.Chat delivers what was typed. It also encodes `&`, `<` and `>` as
+entities in message text.
+
+**Solution.** Member and channel arguments accept both forms, as
+`UserRef`/`RoomRef` `Name` or `Id`; the label after `|` is dropped because
+only the id is stable. `everyone`, `@everyone` and `<!everyone>` all mean
+everyone; other `<!…>` broadcasts are refused. A `skill add` source written
+as a Slack link token becomes its URL. Decoding entities stays with the
+Slack surface (T30), before it calls `parse`: mention and link tokens parse
+the same either way, and a persona then gets `<` rather than `&lt;`.
+
+### clap treats a lone `--` as the end of options
+
+**Issue.** With every argument allowing leading hyphens, `pause -x` parses,
+but clap still swallows a lone `--` as its end-of-options marker, so
+`allow -- helper everyone` parsed as `allow helper everyone`, `login --`
+started a new login, and `persona helper --` looked like a persona upload.
+clap has no setting to turn the marker off.
+
+**Solution.** A lone `--` among the arguments is refused with "A lone `--`
+isn't an argument." A `--` inside a longer free-text tail is kept as text.
+The name `--` itself is valid under the plan's `[a-z0-9-]{2,32}` rule, but it
+can't be created through chat, so no agent has it.
+
+### Help is an error, and `limits` needs at least one setting
+
+**Issue.** The plan says an unknown command returns the help text as the
+error message, but has no `help` command, and gives `limits` as
+`turns=N/day hops=N` without saying whether both are required.
+
+**Solution.** Empty text, `help` and `help <command>` return a `ParseError`
+of kind `Help` whose message is the help text, and an unknown command one of
+kind `UnknownCommand` whose message is "Unknown command." and the help text.
+Callers reply with any `ParseError`'s message, so no `Help` variant is
+needed. `limits` takes one or both settings in either order, each at most
+once; a missing one is `None`, meaning unchanged. `turns=N` is accepted
+without `/day`. Numbers are plain digits (`turns` is `u32`, `hops` is `u8`,
+the width of `core_types::Hop`).
+
+### A skill source reaches `git clone`
+
+**Issue.** `skill add <name> <source>` took any word as the source, and every
+argument may start with `-` (see the lone `--` entry above), so
+`skill add helper --upload-pack=<command>` parsed. T25 passes the source to
+`git clone`, where such a word is an option that runs a command, and other
+forms are just as unwelcome there: `ext::` and `file://` transports, local
+paths, SSH URLs, and a ref such as `#--upload-pack=…` that `git` would read
+as an option. A URL with `user:token@` would also put a credential in the
+agent's configuration.
+
+**Solution.** The source is checked by a value parser and must be an
+`https://` URL: the host is letters, digits, `.` and `-`, with an optional
+numeric port and no user info; the path is letters, digits and `-._~/%+`;
+and an optional `#ref` starts with a letter or digit, continues with letters,
+digits and `._/-`, and has no `..`, no `//` and no trailing `/` or `.`.
+Any other form, or a source over 2048 bytes, is refused with one fixed
+message that says what a source is and that leaving it out adds an attached
+`SKILL.md` or `.zip`. The Slack link token is unwrapped before the check. Query strings
+and non-ASCII paths are refused; percent-encoding covers the rare path that
+needs them. T25's plan now also has agentd pass the URL after `--` and the
+ref only inside an `--opt=value` word, as a second line of defense.
+
+### Misspelt secret-bearing commands aren't commands at all
+
+**Issue.** The rule in "Secret-bearing text that fails to parse" only looked
+at text whose command words parsed as `login`, `slack-token` or
+`admin api-key`. `api-key set sk-…` without `admin`, `slack_token …`,
+`slacktoken …` and `admin apikey set …` came back as `UnknownCommand` or
+`Invalid` with `is_secret_bearing()` false, so T13 wouldn't tell the member
+that the secret they just posted in a channel is public.
+
+**Solution.** `parse` computes the flag once for every error, from the words
+alone. It is true when a word naming a secret (`login`, `api-key` or
+`slack-token`, compared ignoring case, `-`, `_` and surrounding punctuation,
+so `apikey`, `API_KEY`, `slack_token`, `SlackToken:` and `log-in` match) is
+followed by anything but a bare `set` or `clear`, wherever it stands, or when
+any word contains a known token prefix: `sk-ant-` (Anthropic API keys and
+OAuth tokens), `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` and `xapp-` (Slack). This
+replaces the earlier rule, which it covers. It errs towards caution, since a
+missed warning leaves a live secret in a channel while a false one costs the
+member a new login: `how do I login here` counts, and so does a help request
+naming a token. The flag is computed only for errors; a command that parses
+is judged by `Command::is_secret_bearing` alone, so a persona mentioning
+`sk-ant-` is still just a persona. Error messages still never repeat the
+text.
