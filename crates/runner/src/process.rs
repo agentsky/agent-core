@@ -218,7 +218,7 @@ impl ClaudeProcess {
     /// restores for a `--resume`d session, so the first result's
     /// [`cost_usd`](crate::TurnResult::cost_usd) is the turn's own too.
     /// `None` when that total isn't known: the first result then has no
-    /// `cost_usd`, and later ones do. Call it before the first turn.
+    /// `cost_usd`. Call it before the first turn.
     pub fn count_cost_from(&mut self, restored: Option<f64>) {
         self.process_total_cost_usd = restored;
     }

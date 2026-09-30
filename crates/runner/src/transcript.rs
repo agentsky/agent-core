@@ -3,25 +3,32 @@
 //! Claude Code appends `{"type":"cost-state","totalCostUSD":…,…}` to a
 //! session's transcript when a process exits, and none when one is killed.
 //! A `--resume`d process starts its running `total_cost_usd` from the last
-//! such line, so its first result reports that total plus the turn's own
-//! cost. [`restored_total`] reads the same line, so the runner can take it
-//! off.
+//! line of the transcript that parses as a `cost-state` line, so its first
+//! result reports that total plus the turn's own cost. [`restored_total`]
+//! finds the same line, so the runner can take it off.
 //!
 //! The transcript is in the session's directory, which the agent can
 //! write. So nothing on the way to it is followed if it is a symlink, the
 //! file must be a regular file, and at most [`MAX_SCAN_BYTES`] of it, read
-//! from its end, are searched. The CLI restores from the same line, so
-//! whatever the agent wrote there, the difference is still the turn's cost,
-//! unless something in the container changes the line between this read
-//! and the CLI's.
+//! from its end, are searched. Whatever the runner can't read within those
+//! bounds could be the line the CLI takes, so it makes the total unknown
+//! rather than lead to an earlier line: a line longer than
+//! [`MAX_COST_LINE_BYTES`], one that isn't a JSON object, a `cost-state`
+//! line whose `totalCostUSD` isn't a plausible total, or a start of the
+//! file past the scan. The CLI parses JSON more leniently than the runner
+//! in places, so a line the runner can't parse is unknown too.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 
 use core_types::SessionId;
 use rustix::fs::{Mode, OFlags};
+use serde::Deserialize;
 use serde_json::Value;
+
+use crate::stream::plausible_total;
 
 /// How much of a transcript is searched, from its end, for the last
 /// `cost-state` line.
@@ -30,57 +37,47 @@ pub(crate) const MAX_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 /// How much is read at a time.
 const CHUNK_BYTES: u64 = 64 * 1024;
 
-/// The longest line read as a possible `cost-state` line. The CLI's are a
-/// few hundred bytes; longer lines are messages and tool output.
+/// The longest line read. The CLI's `cost-state` lines are a few hundred
+/// bytes; a longer line after the last one the runner finds makes the
+/// total unknown, since it can't tell whether the CLI would take it.
 const MAX_COST_LINE_BYTES: usize = 64 * 1024;
-
-/// What the CLI restores as the running total of a `--resume`d process.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Restored {
-    /// This total, in US dollars: the last `cost-state` line's, or 0
-    /// when the transcript has none.
-    Total(f64),
-    /// The transcript couldn't be read, or its last `cost-state` line lies
-    /// further from its end than [`MAX_SCAN_BYTES`].
-    Unknown,
-}
 
 /// What the CLI will restore for `session`, as
 /// [`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from)
-/// takes it: [`restored_total`], read off the async runtime, or `None` when
-/// it isn't known.
+/// takes it: [`restored_total`], read off the async runtime.
 pub(crate) async fn restored_cost(session_dir: &Path, session: SessionId) -> Option<f64> {
     let dir = session_dir.to_owned();
-    match tokio::task::spawn_blocking(move || restored_total(&dir, session)).await {
-        Ok(Restored::Total(total)) => Some(total),
-        Ok(Restored::Unknown) | Err(_) => {
-            tracing::warn!(%session, "the total a resumed process restores isn't known; its first turn has no cost");
+    let restored = tokio::task::spawn_blocking(move || restored_total(&dir, session))
+        .await
+        .ok()
+        .flatten();
+    if restored.is_none() {
+        tracing::warn!(%session, "the total a resumed process restores isn't known; its first turn has no cost");
+    }
+    restored
+}
+
+/// What the CLI will restore, in US dollars, for `session`, whose
+/// directory is `session_dir` (`sessions/<id>/` on its volume, as agentd
+/// sees it): the last `cost-state` line's total, or 0 when the transcript
+/// has none. `None` when that isn't known: the transcript is missing (the
+/// CLI then refuses the `--resume`) or can't be read, or the line the CLI
+/// would take can't be read within the bounds the [module docs](self)
+/// give. The transcript is `claude/projects/<id>/<id>.jsonl` there, since
+/// the runner names the project directory after the session.
+pub(crate) fn restored_total(session_dir: &Path, session: SessionId) -> Option<f64> {
+    match open_transcript(session_dir, &session.to_string()) {
+        Ok(file) => last_cost_state(&file, MAX_SCAN_BYTES, CHUNK_BYTES),
+        Err(err) => {
+            tracing::warn!(%session, error = %err, "couldn't open the transcript to read its restored cost");
             None
         }
     }
 }
 
-/// What the CLI will restore for `session`, whose directory is
-/// `session_dir` (`sessions/<id>/` on its volume, as agentd sees it). The
-/// transcript is `claude/projects/<id>/<id>.jsonl` there, since the runner
-/// names the project directory after the session.
-pub(crate) fn restored_total(session_dir: &Path, session: SessionId) -> Restored {
-    let id = session.to_string();
-    match open_transcript(session_dir, &id) {
-        Ok(Some(file)) => {
-            last_cost_state(&file, MAX_SCAN_BYTES, CHUNK_BYTES).unwrap_or(Restored::Unknown)
-        }
-        Ok(None) => Restored::Total(0.0),
-        Err(err) => {
-            tracing::warn!(%session, error = %err, "couldn't open the transcript to read its restored cost");
-            Restored::Unknown
-        }
-    }
-}
-
 /// Opens the transcript without following a symlink anywhere below
-/// `session_dir`: `Ok(None)` when it doesn't exist.
-fn open_transcript(session_dir: &Path, id: &str) -> rustix::io::Result<Option<File>> {
+/// `session_dir`.
+fn open_transcript(session_dir: &Path, id: &str) -> rustix::io::Result<File> {
     const DIR: OFlags = OFlags::PATH
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
@@ -89,109 +86,83 @@ fn open_transcript(session_dir: &Path, id: &str) -> rustix::io::Result<Option<Fi
         .union(OFlags::NOFOLLOW)
         .union(OFlags::NONBLOCK)
         .union(OFlags::CLOEXEC);
-    let found = |result: rustix::io::Result<_>| match result {
-        Ok(fd) => Ok(Some(fd)),
-        Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(err) => Err(err),
-    };
-    let Some(mut dir) = found(rustix::fs::open(session_dir, DIR, Mode::empty()))? else {
-        return Ok(None);
-    };
+    let mut dir = rustix::fs::open(session_dir, DIR, Mode::empty())?;
     for name in ["claude", "projects", id] {
-        let Some(next) = found(rustix::fs::openat(&dir, name, DIR, Mode::empty()))? else {
-            return Ok(None);
-        };
-        dir = next;
+        dir = rustix::fs::openat(&dir, name, DIR, Mode::empty())?;
     }
-    let Some(fd) = found(rustix::fs::openat(
-        &dir,
-        format!("{id}.jsonl"),
-        FILE,
-        Mode::empty(),
-    ))?
-    else {
-        return Ok(None);
-    };
+    let fd = rustix::fs::openat(&dir, format!("{id}.jsonl"), FILE, Mode::empty())?;
     let stat = rustix::fs::fstat(&fd)?;
     if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
         return Err(rustix::io::Errno::INVAL);
     }
-    Ok(Some(File::from(fd)))
+    Ok(File::from(fd))
 }
 
-/// The last `cost-state` line's total in `file`, searching back from its
-/// end, `chunk` bytes at a time, at most `max_scan` bytes. `None` when
-/// reading fails.
-fn last_cost_state(file: &File, max_scan: u64, chunk: u64) -> Option<Restored> {
+/// The total of the last `cost-state` line in `file`, searching back from
+/// its end, `chunk` bytes at a time, at most `max_scan` bytes: 0 when the
+/// whole file has none, and `None` when it isn't known.
+fn last_cost_state(file: &File, max_scan: u64, chunk: u64) -> Option<f64> {
     let len = file.metadata().ok()?.len();
     let mut end = len;
-    let mut carry = Some(Vec::new());
+    let mut line = Vec::new();
     while end > 0 {
         if len - end >= max_scan {
-            return Some(Restored::Unknown);
+            return None;
         }
         let start = end.saturating_sub(chunk);
         let mut bytes = vec![0; usize::try_from(end - start).ok()?];
         file.read_exact_at(&mut bytes, start).ok()?;
-        let pieces: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-        let (head, lines) = match pieces.split_first() {
-            Some((first, rest)) if start > 0 => (Some(*first), rest),
-            _ => (None, &pieces[..]),
-        };
-        match lines.split_last() {
-            None => carry = head.and_then(|head| joined(head, carry.take())),
-            Some((latest, earlier)) => {
-                let latest = joined(latest, carry.take());
-                let earlier = earlier
-                    .iter()
-                    .rev()
-                    .filter(|line| line.len() <= MAX_COST_LINE_BYTES);
-                if let Some(total) = latest
-                    .as_deref()
-                    .into_iter()
-                    .chain(earlier.copied())
-                    .find_map(cost_state)
-                {
-                    return Some(Restored::Total(total));
-                }
-                carry = head
-                    .filter(|head| head.len() <= MAX_COST_LINE_BYTES)
-                    .map(<[u8]>::to_vec);
+        let mut pieces = bytes.rsplit(|b| *b == b'\n');
+        let mut piece = pieces.next()?;
+        for earlier in pieces {
+            line = joined(piece, &line)?;
+            if let Some(total) = cost_state(&line)? {
+                return Some(total);
             }
+            line.clear();
+            piece = earlier;
         }
+        line = joined(piece, &line)?;
         end = start;
     }
-    Some(Restored::Total(0.0))
+    Some(cost_state(&line)?.unwrap_or(0.0))
 }
 
-/// `piece` followed by what came after it on its line, or `None` once
-/// that is longer than any `cost-state` line.
-fn joined(piece: &[u8], after: Option<Vec<u8>>) -> Option<Vec<u8>> {
-    let after = after?;
+/// `piece` followed by `after`, the rest of its line, or `None` once the
+/// line is longer than [`MAX_COST_LINE_BYTES`].
+fn joined(piece: &[u8], after: &[u8]) -> Option<Vec<u8>> {
     if piece.len() + after.len() > MAX_COST_LINE_BYTES {
         return None;
     }
     let mut line = piece.to_vec();
-    line.extend_from_slice(&after);
+    line.extend_from_slice(after);
     Some(line)
 }
 
-/// The total of a `cost-state` line: a finite number of at least 0.
-fn cost_state(line: &[u8]) -> Option<f64> {
-    if !line
-        .windows(b"cost-state".len())
-        .any(|w| w == b"cost-state")
-    {
-        return None;
+/// The fields of a transcript line the runner reads. A line with either
+/// twice doesn't parse, so it is unknown rather than read as the CLI
+/// might.
+#[derive(Deserialize)]
+struct Entry<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(rename = "totalCostUSD")]
+    total: Option<Value>,
+}
+
+/// What one line says: `Some(Some(total))` for a `cost-state` line with a
+/// plausible total, `Some(None)` for a blank line or one of another type,
+/// and `None` for a line the runner can't read.
+fn cost_state(line: &[u8]) -> Option<Option<f64>> {
+    if line.trim_ascii().is_empty() {
+        return Some(None);
     }
-    let value: Value = serde_json::from_slice(line).ok()?;
-    if value.get("type")?.as_str()? != "cost-state" {
-        return None;
+    let entry: Entry<'_> = serde_json::from_slice(line).ok()?;
+    if entry.kind.as_deref() != Some("cost-state") {
+        return Some(None);
     }
-    value
-        .get("totalCostUSD")?
-        .as_f64()
-        .filter(|total| total.is_finite() && *total >= 0.0)
+    let total = entry.total?.as_f64().filter(|total| plausible_total(*total))?;
+    Some(Some(total))
 }
 
 #[cfg(test)]
@@ -242,25 +213,28 @@ mod tests {
         }
     }
 
-    fn scan(path: &Path, max_scan: u64, chunk: u64) -> Option<Restored> {
+    fn scan(path: &Path, max_scan: u64, chunk: u64) -> Option<f64> {
         last_cost_state(&File::open(path).unwrap(), max_scan, chunk)
     }
 
     #[test]
-    fn without_a_transcript_or_a_cost_line_the_total_is_zero() {
+    fn without_a_cost_line_the_total_is_zero_and_without_a_transcript_unknown() {
         let dir = Dir::new();
         let session = SessionId::new_v4();
-        assert_eq!(restored_total(&dir.0, session), Restored::Total(0.0));
-        assert_eq!(
-            restored_total(&dir.0.join("missing"), session),
-            Restored::Total(0.0)
-        );
+        assert_eq!(restored_total(&dir.0, session), None);
+        assert_eq!(restored_total(&dir.0.join("missing"), session), None);
         let path = dir.transcript(session);
-        assert_eq!(restored_total(&dir.0, session), Restored::Total(0.0));
+        assert_eq!(
+            restored_total(&dir.0, session),
+            None,
+            "the CLI refuses to resume without a transcript"
+        );
         write(&path, &[message(10), message(20)]);
-        assert_eq!(restored_total(&dir.0, session), Restored::Total(0.0));
+        assert_eq!(restored_total(&dir.0, session), Some(0.0));
         std::fs::write(&path, b"").unwrap();
-        assert_eq!(restored_total(&dir.0, session), Restored::Total(0.0));
+        assert_eq!(restored_total(&dir.0, session), Some(0.0));
+        std::fs::write(&path, b"\n\n").unwrap();
+        assert_eq!(restored_total(&dir.0, session), Some(0.0));
     }
 
     #[test]
@@ -279,7 +253,7 @@ mod tests {
                 message(5),
             ],
         );
-        assert_eq!(restored_total(&dir.0, session), Restored::Total(0.75));
+        assert_eq!(restored_total(&dir.0, session), Some(0.75));
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -288,7 +262,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             restored_total(&dir.0, session),
-            Restored::Total(1.5),
+            Some(1.5),
             "a last line without its newline counts"
         );
     }
@@ -302,13 +276,13 @@ mod tests {
         for chunk in 1..=40 {
             assert_eq!(
                 scan(&path, u64::MAX, chunk),
-                Some(Restored::Total(0.5)),
+                Some(0.5),
                 "chunk {chunk}"
             );
         }
         write(&path, &[cost_line(0.5)]);
         for chunk in [1, 7, 1_000] {
-            assert_eq!(scan(&path, u64::MAX, chunk), Some(Restored::Total(0.5)));
+            assert_eq!(scan(&path, u64::MAX, chunk), Some(0.5));
         }
     }
 
@@ -317,39 +291,87 @@ mod tests {
         let dir = Dir::new();
         let path = dir.transcript(SessionId::new_v4());
         write(&path, &[cost_line(0.5), message(200)]);
-        assert_eq!(scan(&path, 100, 16), Some(Restored::Unknown));
-        assert_eq!(scan(&path, 10_000, 16), Some(Restored::Total(0.5)));
+        assert_eq!(scan(&path, 100, 16), None);
+        assert_eq!(scan(&path, 10_000, 16), Some(0.5));
         write(&path, &[message(200)]);
         assert_eq!(
             scan(&path, 100, 16),
-            Some(Restored::Unknown),
+            None,
             "an unread start could still hold one"
         );
     }
 
     #[test]
-    fn values_that_arent_totals_and_overlong_lines_are_passed_over() {
+    fn lines_of_other_types_are_passed_over_and_an_escaped_type_is_read() {
         let dir = Dir::new();
         let session = SessionId::new_v4();
         let path = dir.transcript(session);
-        let long = format!(
-            r#"{{"type":"cost-state","totalCostUSD":9,"pad":"{}"}}"#,
-            "y".repeat(MAX_COST_LINE_BYTES)
-        );
         write(
             &path,
             &[
                 cost_line(0.125),
-                r#"{"type":"cost-state","totalCostUSD":-1}"#.to_owned(),
-                r#"{"type":"cost-state","totalCostUSD":"2"}"#.to_owned(),
-                r#"{"type":"cost-state"}"#.to_owned(),
                 r#"{"type":"user","text":"cost-state","totalCostUSD":3}"#.to_owned(),
-                "cost-state, not JSON".to_owned(),
-                long,
+                r#"{"no":"type","totalCostUSD":3}"#.to_owned(),
+                String::new(),
+                "  ".to_owned(),
+                message(MAX_COST_LINE_BYTES - 64),
             ],
         );
-        assert_eq!(restored_total(&dir.0, session), Restored::Total(0.125));
-        assert_eq!(scan(&path, u64::MAX, 1_000), Some(Restored::Total(0.125)));
+        assert_eq!(restored_total(&dir.0, session), Some(0.125));
+        assert_eq!(scan(&path, u64::MAX, 1_000), Some(0.125));
+        write(
+            &path,
+            &[
+                cost_line(0.125),
+                r#"{"type":"cost\u002dstate","totalCostUSD":2.5}"#.to_owned(),
+            ],
+        );
+        assert_eq!(
+            restored_total(&dir.0, session),
+            Some(2.5),
+            "the CLI parses the escape, so the runner does too"
+        );
+    }
+
+    #[test]
+    fn a_last_cost_line_the_runner_cant_take_makes_the_total_unknown() {
+        let dir = Dir::new();
+        let session = SessionId::new_v4();
+        let path = dir.transcript(session);
+        let oversized = format!(
+            r#"{{"type":"cost-state","totalCostUSD":1e6,"pad":"{}"}}"#,
+            "y".repeat(70 * 1024)
+        );
+        let read: Vec<_> = [
+            oversized,
+            r#"{"type":"cost-state","totalCostUSD":-1}"#.to_owned(),
+            r#"{"type":"cost-state","totalCostUSD":1e17}"#.to_owned(),
+            r#"{"type":"cost-state","totalCostUSD":"2"}"#.to_owned(),
+        ]
+        .into_iter()
+        .map(|last| {
+            write(&path, &[cost_line(0.125), last, message(5)]);
+            restored_total(&dir.0, session)
+        })
+        .collect();
+        assert_eq!(read, [None; 4], "oversized, negative, huge and a string");
+
+        for last in [
+            r#"{"type":"cost-state"}"#,
+            r#"{"type":"cost-state","totalCostUSD":null}"#,
+            r#"{"type":"user","type":"cost-state","totalCostUSD":1}"#,
+            "cost-state, not JSON",
+            "[1]",
+        ] {
+            write(&path, &[cost_line(0.125), last.to_owned(), message(5)]);
+            assert_eq!(restored_total(&dir.0, session), None, "{last}");
+        }
+        write(&path, &[cost_line(0.125), message(MAX_COST_LINE_BYTES)]);
+        assert_eq!(
+            restored_total(&dir.0, session),
+            None,
+            "any line too long to read could be the CLI's"
+        );
     }
 
     #[test]
@@ -362,19 +384,19 @@ mod tests {
 
         let path = dir.transcript(session);
         std::os::unix::fs::symlink(&target, &path).unwrap();
-        assert_eq!(restored_total(&dir.0, session), Restored::Unknown);
+        assert_eq!(restored_total(&dir.0, session), None);
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir_all(dir.0.join("claude")).unwrap();
         std::os::unix::fs::symlink(elsewhere.0.join("claude"), dir.0.join("claude")).unwrap();
-        assert_eq!(restored_total(&dir.0, session), Restored::Unknown);
+        assert_eq!(restored_total(&dir.0, session), None);
 
         std::fs::remove_file(dir.0.join("claude")).unwrap();
         let path = dir.transcript(session);
         std::fs::create_dir(&path).unwrap();
         assert_eq!(
             restored_total(&dir.0, session),
-            Restored::Unknown,
+            None,
             "a directory isn't a transcript"
         );
     }

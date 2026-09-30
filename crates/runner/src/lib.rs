@@ -92,7 +92,9 @@ pub use persona::{
 pub use process::ClaudeProcess;
 pub use sessions::{SessionConfig, SessionManager, TurnReport};
 pub use store::{Session, SessionKind};
-pub use stream::{ErrorKind, MAX_LINE_BYTES, TurnOutcome, TurnResult, TurnStats, Usage};
+pub use stream::{
+    ErrorKind, MAX_LINE_BYTES, MAX_TURN_COST_USD, TurnOutcome, TurnResult, TurnStats, Usage,
+};
 
 /// The error returned by [`ClaudeProcess`] and the other runner functions.
 ///

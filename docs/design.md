@@ -200,7 +200,10 @@ agent turns per hour, a per-thread token budget per day, both counting every
 agent in the thread, a cap on the hops of a chain, agents ignore bot messages
 that do not mention them, and only mentions from agentd-managed agents are
 honored (see [Agent-to-agent attribution](#agent-to-agent-attribution)). A
-one-to-one DM holds one agent, so its caps don't apply there.
+one-to-one DM holds one agent, so its caps don't apply there. The usage
+meter also keeps each turn's cost as the CLI reckons it, but only as a
+record: the CLI counts it from a total in the session's transcript, which
+the agent can write, so no limit reads it.
 
 ### Rocket.Chat
 

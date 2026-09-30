@@ -6475,16 +6475,34 @@ own on every turn. The transcript is agent-writable, so the read opens
 component at a time with `O_NOFOLLOW` (rustix `openat`, a runner
 dependency now), accepts only a regular file, opened `O_NONBLOCK` so a
 FIFO can't hang it, and searches back from its end in 64 KiB chunks, at
-most 32 MiB, skipping lines longer than 64 KiB, for the last line whose
-`type` is `cost-state` with a finite `totalCostUSD` of at least 0. No line
-in the whole file means 0, as the CLI restores then. A file it can't read
-this way, or a line further back than the cap, makes the total unknown:
-the first turn's `cost_usd` is `None` and bills no cost, and the next
-turns' are known again. The CLI reads the same line, so a value the agent
-wrote there still leaves the difference right, unless something rewrites
-it between the two reads, which only a process left running in the
-container could do (Deferred work's "Killing leftover processes at turn
-end"). `fake-claude` now appends
+most 32 MiB, for the last line whose `type` is `cost-state`, as the CLI
+does. No line in the whole file means 0, as the CLI restores then.
+
+The runner must take the line the CLI takes, never an earlier one: an
+agent that appends a `cost-state` line the runner passes over (padded past
+a length cap, say) would otherwise have the CLI restore a total the runner
+doesn't take off, and bill it as the turn's cost. So whatever the runner
+can't read makes the total unknown instead of being skipped: a line longer
+than 64 KiB, one that doesn't parse as a JSON object (a type written twice
+included, which the CLI would read as its last), a `cost-state` line whose
+`totalCostUSD` isn't a number from 0 to 1e9, a start of the file past the
+32 MiB, a missing transcript (the CLI then refuses the `--resume`), or one
+it can't open this way. The type is parsed, not searched for, since
+`cost\u002dstate` is the same type. The CLI restores the same line only
+if nothing changes it between the two reads, which only a process left
+running in the container could do (Deferred work's "Killing leftover
+processes at turn end").
+
+A turn's cost is unknown (`None`, and billed as 0) when its result or the
+process's previous one has no plausible total (so a result without one
+leaves the next turn unknown too, and the one after is known again), when
+the total falls, or when it rises by more than `MAX_TURN_COST_USD`
+($1,000). An unknown restored total makes only the first turn's cost
+unknown. Even so, the agent can write the transcript and the CLI's stdout
+(it runs as the same user), so `cost_usd` is a record, never something a
+limit is enforced with: no cap reads it.
+
+`fake-claude` now appends
 `{"type":"cost-state","totalCostUSD":…,"modelUsage":{}}` when its input
 ends, and none when it crashes, and restores the last one on `--resume`;
 a runner test checks the resumed turn's cost after a clean stop and after

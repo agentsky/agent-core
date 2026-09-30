@@ -21,6 +21,22 @@ const MAX_CODE_LEN: usize = 64;
 /// What the name of a tool the process wasn't given is kept as.
 const OTHER_TOOL: &str = "<other>";
 
+/// The most one turn's [`cost_usd`](TurnResult::cost_usd) can be. The CLI
+/// reckons it from a total the agent can write (see
+/// [`count_cost_from`](crate::ClaudeProcess::count_cost_from)), so a larger
+/// rise is taken for a forged total, and the cost is unknown.
+pub const MAX_TURN_COST_USD: f64 = 1_000.0;
+
+/// The largest running total taken as the CLI's. Far above any session's,
+/// and small enough that a cent still shows in an `f64` difference.
+const MAX_PROCESS_TOTAL_USD: f64 = 1e9;
+
+/// Whether `total` can be the CLI's running total: a number from 0 to
+/// [`MAX_PROCESS_TOTAL_USD`].
+pub(crate) fn plausible_total(total: f64) -> bool {
+    (0.0..=MAX_PROCESS_TOTAL_USD).contains(&total)
+}
+
 /// How one turn ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnOutcome {
@@ -113,11 +129,18 @@ pub struct TurnResult {
     pub usage: Option<Usage>,
     /// The turn's cost in US dollars, as the CLI reckons it: the rise in
     /// [`process_total_cost_usd`](Self::process_total_cost_usd) since the
-    /// process's previous result, never below 0. The first result of a
-    /// process started with `--resume` rises from the total the CLI
-    /// restored, when the process was told it
-    /// ([`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from));
-    /// `None` when that total isn't known.
+    /// process's previous result. The first result of a process started
+    /// with `--resume` rises from the total the CLI restored, when the
+    /// process was told it
+    /// ([`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from)).
+    /// `None` when the turn's cost isn't known: either total is missing or
+    /// out of range, the total fell, or it rose by more than
+    /// [`MAX_TURN_COST_USD`]. So a result without a total leaves the next
+    /// turn's cost unknown too.
+    ///
+    /// The agent can write the transcript the restored total comes from,
+    /// and the CLI's stdout, so this is a figure for the meter's record,
+    /// never one to enforce a limit with.
     pub cost_usd: Option<f64>,
     /// The line's `total_cost_usd`: the CLI's running total for its
     /// process, not the turn's cost. A process started with `--session-id`
@@ -263,23 +286,22 @@ pub(crate) struct ResultLine {
 }
 
 impl ResultLine {
-    /// The turn's result. `process_total` is the running
-    /// `total_cost_usd` of the process's previous results, 0 on a new
-    /// process; the turn's cost is what this line adds to it, and it is
-    /// moved on to this line's total.
     /// The result, with its cost the rise of the line's total over
     /// `process_total`, the process's previous total, which becomes the
-    /// line's. The cost is `None` when either total is unknown.
+    /// line's. The cost is `None` when either total is unknown or not
+    /// [plausible](plausible_total), or when the rise is below 0 or above
+    /// [`MAX_TURN_COST_USD`].
     pub(crate) fn into_result(
         self,
         stats: TurnStats,
         process_total: &mut Option<f64>,
     ) -> TurnResult {
-        let cost_usd = self.total_cost_usd.and_then(|total| {
-            process_total
-                .replace(total)
-                .map(|previous| (total - previous).max(0.0))
-        });
+        let total = self.total_cost_usd.filter(|total| plausible_total(*total));
+        let previous = std::mem::replace(process_total, total);
+        let cost_usd = total
+            .zip(previous)
+            .map(|(total, previous)| total - previous)
+            .filter(|cost| (0.0..=MAX_TURN_COST_USD).contains(cost));
         let error_kind = self.is_error.then(|| {
             ErrorKind::classify(
                 self.api_error_status,
@@ -669,18 +691,30 @@ mod tests {
         let second = result(r#","total_cost_usd":0.75"#, &mut process_total);
         assert_eq!(second.cost_usd, Some(0.25));
         assert_eq!(second.process_total_cost_usd, Some(0.75));
-        let none = result("", &mut process_total);
-        assert_eq!(none.cost_usd, None);
-        assert_eq!(
-            process_total,
-            Some(0.75),
-            "a result without a total moves nothing"
-        );
         let lower = result(r#","total_cost_usd":0.125"#, &mut process_total);
-        assert_eq!(lower.cost_usd, Some(0.0), "a falling total costs nothing");
+        assert_eq!(lower.cost_usd, None, "a falling total isn't the CLI's");
         assert_eq!(process_total, Some(0.125));
         let third = result(r#","total_cost_usd":0.25"#, &mut process_total);
         assert_eq!(third.cost_usd, Some(0.125));
+        let none = result("", &mut process_total);
+        assert_eq!(none.cost_usd, None);
+        assert_eq!(process_total, None, "a result without a total forgets it");
+        let after = result(r#","total_cost_usd":0.5"#, &mut process_total);
+        assert_eq!(after.cost_usd, None, "so the next turn's cost is unknown");
+        let known = result(r#","total_cost_usd":0.75"#, &mut process_total);
+        assert_eq!(known.cost_usd, Some(0.25), "and the one after is known");
+
+        let mut process_total = Some(0.0);
+        let huge = result(r#","total_cost_usd":1000000.5"#, &mut process_total);
+        assert_eq!(huge.cost_usd, None, "a turn can't cost that much");
+        let most = result(r#","total_cost_usd":1001000.5"#, &mut process_total);
+        assert_eq!(most.cost_usd, Some(MAX_TURN_COST_USD));
+        for total in ["-1", "1e17", "\"1\""] {
+            let mut process_total = Some(0.0);
+            let bad = result(&format!(r#","total_cost_usd":{total}"#), &mut process_total);
+            assert_eq!(bad.cost_usd, None, "{total}");
+            assert_eq!(process_total, None, "{total}");
+        }
 
         let mut unknown = None;
         let first = result(r#","total_cost_usd":3.5"#, &mut unknown);
