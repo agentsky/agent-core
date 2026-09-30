@@ -16,6 +16,11 @@ use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
 const TOKENS: &str = "ctl_tokens";
 const LOCKS: &str = "scope_locks";
 
+/// Deletes every lease held by the session of the token whose digest is
+/// bound.
+const DELETE_TOKEN_LEASES: &str = "DELETE FROM scope_locks WHERE holder_session = \
+     (SELECT session_id FROM ctl_tokens WHERE hash = ?)";
+
 /// The SHA-256 digest of an agentctl token. The store keeps only this, never
 /// the token.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -202,8 +207,9 @@ impl Store {
     ///
     /// A session runs one process at a time, so a token already stored for
     /// the same session is deleted in the same transaction: the newest
-    /// process's token is the only one that works. Returns the digests of
-    /// the tokens it replaced.
+    /// process's token is the only one that works. The session's leases go
+    /// with the old token, whose process can no longer renew them. Returns
+    /// the digests of the tokens it replaced.
     ///
     /// # Errors
     ///
@@ -211,6 +217,10 @@ impl Store {
     /// already stored.
     pub async fn put_ctl_token(&self, token: &NewCtlToken) -> Result<Vec<TokenHash>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM scope_locks WHERE holder_session = ?")
+            .bind(token.session.to_string())
+            .execute(&mut *tx)
+            .await?;
         let replaced: Vec<Vec<u8>> =
             sqlx::query_scalar("DELETE FROM ctl_tokens WHERE session_id = ? RETURNING hash")
                 .bind(token.session.to_string())
@@ -252,6 +262,10 @@ impl Store {
     /// Records `turn` as the token's current turn, replacing any other, or
     /// clears it with `None`. Returns false when no such token is stored.
     ///
+    /// Either way, every lease the token's session holds is deleted in the
+    /// same transaction: a lease lasts no longer than the turn that took it,
+    /// so the lock is free as soon as the turn ends.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails.
@@ -265,6 +279,7 @@ impl Store {
             Side::Owner => "owner",
             Side::Public => "public",
         });
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
             "UPDATE ctl_tokens SET turn_id = ?, requester_member = ?, requester_key = ?, \
              hop = ?, kind = ?, consent_id = ?, side = ?, conversation = ?, thread_root = ?, \
@@ -286,22 +301,34 @@ impl Store {
         }))
         .bind(turn.and_then(|turn| turn.trigger.as_ref().map(|msg| msg.as_str().to_owned())))
         .bind(&hash.0[..])
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(DELETE_TOKEN_LEASES)
+            .bind(&hash.0[..])
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    /// Deletes the token with digest `hash`. Returns false when it wasn't
-    /// stored, so revoking twice is harmless.
+    /// Deletes the token with digest `hash`, and every lease its session
+    /// holds. Returns false when it wasn't stored, so revoking twice is
+    /// harmless.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails.
     pub async fn delete_ctl_token(&self, hash: &TokenHash) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(DELETE_TOKEN_LEASES)
+            .bind(&hash.0[..])
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM ctl_tokens WHERE hash = ?")
             .bind(&hash.0[..])
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -584,6 +611,52 @@ mod tests {
         store.put_ctl_token(&new).await.unwrap();
         let stored = store.ctl_token(&new.hash).await.unwrap().unwrap();
         assert_eq!(stored.container_ip, "172.30.0.7".parse::<IpAddr>().unwrap());
+    }
+
+    /// Takes `volume`'s lock for `holder` at 1,000 s, and says whether it was
+    /// free.
+    async fn free(store: &Store, volume: &VolumeKey, holder: SessionId) -> bool {
+        store
+            .acquire_scope_lock(volume, holder, at(1_000), TTL)
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_sessions_leases_end_with_its_turn_and_its_token() {
+        let store = memory_store().await;
+        let other = new_token(9, SessionId::new_v4());
+        store.put_ctl_token(&other).await.unwrap();
+        assert!(free(&store, &other.volume, other.session).await);
+        let session = SessionId::new_v4();
+        let first = new_token(1, session);
+        let second = NewCtlToken {
+            hash: TokenHash([2; 32]),
+            ..first.clone()
+        };
+        let volume = &first.volume;
+        store.put_ctl_token(&first).await.unwrap();
+        let running = turn(TurnKind::Normal, Side::Public);
+
+        assert!(free(&store, volume, session).await);
+        assert!(
+            store
+                .set_ctl_turn(&first.hash, Some(&running))
+                .await
+                .unwrap()
+        );
+        assert!(free(&store, volume, session).await, "a new turn");
+        assert!(store.set_ctl_turn(&first.hash, None).await.unwrap());
+        assert!(free(&store, volume, session).await, "the turn ended");
+        store.put_ctl_token(&second).await.unwrap();
+        assert!(free(&store, volume, session).await, "a new token");
+        assert!(store.delete_ctl_token(&second.hash).await.unwrap());
+        assert!(free(&store, volume, SessionId::new_v4()).await, "revoked");
+        assert!(
+            !free(&store, &other.volume, SessionId::new_v4()).await,
+            "another session's lease is untouched"
+        );
     }
 
     #[tokio::test]

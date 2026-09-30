@@ -78,12 +78,26 @@ impl Client {
     ///
     /// [`Failure::Refused`] with agentd's reason, or [`Failure::Transport`].
     pub async fn send<R: CtlRequest>(&self, request: &R) -> Result<R::Response, Failure> {
+        self.send_within(request, REQUEST_TIMEOUT).await
+    }
+
+    /// Sends `request` and returns agentd's answer, giving up after `limit`
+    /// or the usual request timeout, whichever is shorter.
+    ///
+    /// # Errors
+    ///
+    /// As for [`send`](Self::send).
+    pub async fn send_within<R: CtlRequest>(
+        &self,
+        request: &R,
+        limit: Duration,
+    ) -> Result<R::Response, Failure> {
         let response = self
             .http
             .post(self.url(R::PATH))
             .bearer_auth(&self.token)
             .json(request)
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(limit.min(REQUEST_TIMEOUT))
             .send()
             .await
             .map_err(|err| self.transport(&err))?;

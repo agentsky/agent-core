@@ -344,15 +344,35 @@ fn attachment_name(name: &str) -> Result<String, ApiError> {
         && name != ".."
         && !name
             .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control());
+            .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c));
     if ok {
         Ok(name.to_owned())
     } else {
         Err(error(
             CtlErrorCode::BadRequest,
-            "the attachment name must be a plain file name of at most 255 bytes",
+            "the attachment name must be a plain file name of at most 255 bytes, with no \
+             control or invisible formatting characters",
         ))
     }
+}
+
+/// Whether `c` changes how a name displays without showing itself:
+/// bidirectional controls, which can make `exe.txt` read as `txt.exe`,
+/// zero-width and other invisible format characters, tag characters, and the
+/// line and paragraph separators.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 /// `POST /v1/post`: queues a message after checking its target.
@@ -582,6 +602,15 @@ mod tests {
             "../x",
             "a\\b",
             "a\nb",
+            "invoice\u{202E}txt.exe",
+            "a\u{200E}b",
+            "a\u{200F}b",
+            "\u{2066}x\u{2069}",
+            "x\u{061C}",
+            "a\u{200B}b",
+            "a\u{FEFF}b",
+            "a\u{2028}b",
+            "a\u{E0041}b",
             &"x".repeat(256),
         ] {
             assert_eq!(
