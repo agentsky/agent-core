@@ -193,110 +193,89 @@ for every chunk after calling `render` itself.
 rustdoc says, and `Surface::render` does the converting and splitting. T29's
 acceptance is reworded to test `render` instead.
 
-## T06: Slack mrkdwn
+## T04: testkit
 
-### Escaping applies inside code too
+### `fake_claude_path` built outside `cargo llvm-cov`'s target directory
 
-**Issue.** T06 said to escape `&`, `<` and `>` "outside code", while its
-acceptance criterion says code must come out "untouched except for escaping".
-Slack reads its control sequences (`<!here>`, `<@U…>`, `<url|label>`) before
-it applies any formatting, so an unescaped `<!here>` inside a code block still
-notifies the channel. qm-core leaves code verbatim and has that hole.
+**Issue.** The plan expected a nested `$CARGO build` to respect "whatever
+target directory is in effect, including `cargo llvm-cov`'s". It doesn't.
+`cargo llvm-cov` passes `--target-dir target/llvm-cov-target` on cargo's
+command line, and a test process sees only the environment, which does carry
+`cargo llvm-cov`'s `RUSTC_WRAPPER`. The nested build therefore went to
+`target/debug`, instrumented, where no coverage report looks and where it
+disturbs the next plain build. `fake-claude.rs` showed 3.7% line coverage and
+pulled the workspace under the 85% gate.
 
-**Solution.** `to_mrkdwn` escapes the three characters everywhere, code
-included, and changes nothing else inside code: no mention resolution, no
-broadcast neutralization, no formatting. Slack shows `&lt;` as `<` inside code,
-so the reader sees the original text. The T06 bullet in the plan now says
-"everywhere".
+**Solution.** `fake_claude_path()` finds the directory the running test
+executable was built in (its nearest ancestor with cargo's `CACHEDIR.TAG`)
+and passes it as `--target-dir`. With the inherited wrapper environment the
+nested build then matches the outer one: a workspace run reuses the binary
+it already built, and a run that didn't build it builds it instrumented in
+the same place. `fake-claude.rs` is now at 96% line coverage. The plan's
+Testing section says so.
 
-### Literal Slack tokens are escaped, not passed through
+### Clearing the environment loses `fake-claude`'s coverage
 
-**Issue.** qm-core passes literal wire tokens in model output through
-unchanged (`<@U123>`, `<!subteam^S1>`, `<!date^…>`, `<https://x.io|label>`),
-and only rewrites `<!here>`, `<!channel>` and `<!everyone>`. That lets model
-output ping a whole user group, and it conflicts with escaping `<`.
+**Issue.** Under `cargo llvm-cov`, `fake-claude` is instrumented and writes
+its profile where `LLVM_PROFILE_FILE` says. A test that starts it with
+`env_clear()`, as a runner passing an explicit launch environment would,
+drops that variable: the counts are lost and `default.profraw` lands in the
+child's working directory.
 
-**Solution.** The agent writes standard Markdown, and mentions go through the
-`MentionDirectory`, as the design says. So every literal `<` is escaped, and
-the tokens show as text. The broadcast forms still become qm-core's
-`@\u{200B}here` text rather than escaped brackets, since the plan asks for
-that. CommonMark parses `<https://x.io|label>` as an autolink whose URL
-contains `|`; link URLs percent-encode `|` (and spaces), so it becomes
-`<https://x.io%7Clabel>`. A link destination starting with `!`, `@` or `#` is
-percent-encoded too, because `[x](<!here>)` would otherwise render as the
-broadcast `<!here|x>`.
+**Solution.** testkit's own tests pass `LLVM_PROFILE_FILE` through when it is
+set, and `fake_claude_path()`'s rustdoc tells other crates to do the same
+(T17's `ProcessSandbox`, T20, T21).
 
-### Typed broadcasts get a zero-width space
+### The real CLI prefers `ANTHROPIC_API_KEY`
 
-**Issue.** qm-core leaves typed `@here`, `@channel` and `@everyone` alone. They
-are inert only because qm-core posts without Slack's `link_names` flag.
+**Issue.** T04 said `fake-claude` sends `Authorization: Bearer` from
+`CLAUDE_CODE_OAUTH_TOKEN`, and `x-api-key` only when the API key is the only
+credential. Against a local capture server, Claude Code 2.1.285 with both
+variables set sent only `x-api-key` and reported `apiKeySource:
+"ANTHROPIC_API_KEY"`.
 
-**Solution.** `to_mrkdwn` inserts U+200B after the `@` (outside code, ignoring
-case, not after a letter or digit, so `me@here.com` is untouched). The output
-is harmless whatever flags the Slack surface posts with, and it matches what
-the wire forms become. These names are never offered to the directory, so a
-member called "here" can't be pinged through them.
+**Solution.** `fake-claude` does the same, and its `init` line reports
+`apiKeySource` like the real one. The T04 bullet and the plan's Claude Code
+CLI section say so, and note that the runner sets exactly one of the two.
 
-### Bare URLs get explicit bounds
+### What capturing the fixtures showed
 
-**Issue.** T06 said bare URLs are "left alone". qm-core wraps them in `<…>`
-because Slack's own URL detection pulled neighboring mrkdwn marks into the
-link: `*https://x.io/#/device*` linked to `…/device*` (qm-core's
-"device-code bug"). The Markdown parser strips the `**`, but the output puts
-Slack's `*` right back next to the URL.
+**Issue.** Capturing with an unreachable `ANTHROPIC_BASE_URL`, as the plan
+describes, gave ten `system/api_retry` lines and no result within two
+minutes: the CLI retries with backoff. It also left open how the CLI behaves
+on the paths `fake-claude` imitates.
 
-**Solution.** Bare `http://` and `https://` URLs in text become `<url>`, with
-trailing punctuation and unmatched closing brackets left outside, as qm-core's
-`trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
-still left to Slack. The T06 bullet in the plan now says so.
+**Solution.** The captures set `CLAUDE_CODE_MAX_RETRIES=0` (and `IS_SANDBOX=1`,
+since the capture ran as root and `bypassPermissions` refuses root otherwise).
+Two captures ran against a local server that answers with the same SSE
+stream as `fake_anthropic()`, which the CLI accepted, with `--session-id`
+and then `--resume`. `fake-claude` follows what they showed:
 
-### CommonMark disagrees with some qm-core regex cases
+- `system/init` starts every turn, not only the process. The plan's Claude
+  Code CLI section now says so.
+- The transcript appears with the first user message, not at start. A
+  process reaped before its first turn leaves nothing to `--resume`, so T21
+  should mark a session started only after a turn.
+- `--session-id` with an existing transcript prints `Error: Session ID … is
+  already in use.` to stderr and exits 1. `--resume` without one prints `No
+  conversation found with session ID: …` and a `result` line with `subtype:
+  "error_during_execution"` and an `errors` list, but no `result`,
+  `terminal_reason` or `api_error_status`, then exits 1. Unknown flags and
+  both session flags also exit 1 on the real CLI; `fake-claude` keeps the
+  plan's status 2 for them so tests can tell usage errors apart.
+- Requests go to `/v1/messages?beta=true`, so T18's proxy must forward the
+  query string. The CLI also sends `HEAD /api/hello` before the first
+  request of each process, and an `x-claude-code-session-id` header.
+- A 401 gives `api_error_status: 401` and a synthetic assistant message with
+  `error: "authentication_failed"`. The CLI exits 1 when its last result was
+  an error and 0 otherwise.
+- `rate_limit_event` lines appear after a streamed reply. The
+  `active_goal`, `autocompact_state` and `system/commands_changed` lines the
+  plan lists didn't appear in these short runs; the fixtures hold only what
+  was captured.
 
-**Issue.** qm-core converts with regexes; this renderer walks the
-`pulldown-cmark` tree, which follows CommonMark:
-
-- `above\n---\nbelow` is a setext heading, not a rule.
-- An unclosed fence runs to the end of the document instead of staying
-  verbatim.
-- A ```` ``` ```` run in the middle of a line is a code span, not a fence.
-- Block spacing isn't in the event stream.
-
-**Solution.** Follow the parse tree, and adapt the ported test cases, which
-name each difference. Blocks are separated by a blank line when the source had
-one between them (compared by source line numbers), and by a line break
-otherwise, so `### Deep\nbody` still gives `*Deep*\nbody`. Fenced blocks keep
-their info string, as qm-core and T07's fence reopening assume, even though
-Slack doesn't highlight syntax. A code body that itself holds ```` ``` ````
-keeps a `~~~` fence, like qm-core, because a backtick fence would close early.
-
-### Unbounded nesting overflows the stack
-
-**Issue.** `pulldown-cmark` emits a flat event stream, but any tree walk over
-it recurses once per nesting level, and so does dropping the tree. A line of
-100,000 `>` (or `*`) aborted the process with a stack overflow.
-
-**Solution.** The tree builder keeps at most 64 levels (`MAX_DEPTH`). Elements
-nested deeper are flattened into their ancestor at the limit: their text
-stays, their markup is dropped. A test renders 100,000 levels on a test
-thread's default stack.
-
-### `@Name` grammar details
-
-**Issue.** qm-core's `PLAIN_MENTION` regex relies on backtracking. When the
-greedy one-to-three-word name runs into `/` or `@`, the regex retries shorter
-matches, down to part of a word (`@ankit/x` tries `anki`). When nothing
-resolves, it skips the whole matched run, so `@nobody https://x.io` never
-wraps the URL.
-
-**Solution.** `render::mention::scan` takes the greedy words, drops the last
-word when it runs into `/` or `@` (a lone word then isn't a mention), and tries
-the longest name first, as qm-core does, including its rule that a capitalized
-next word means somebody else (`@Ankit Torres` stays text when only "Ankit" is
-known). An unresolved name consumes only its first word, so the rest of the
-line is still scanned. Names are passed to the directory as written;
-`MentionDirectory` implementations own case folding. The scanner lives in
-`render::mention` so T07's Rocket.Chat renderer can reuse it with its own
-broadcast names.
+Absolute paths in the captures are rewritten to the sandbox layout
+(`/volume/sessions/<id>/work` and `…/claude`).
 
 ## T05: store
 
@@ -408,3 +387,108 @@ if the OS generator fails.
 **Solution.** `store` doesn't depend on `rand`. It enables chacha20poly1305's
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
+
+## T06: Slack mrkdwn
+
+### Escaping applies inside code too
+
+**Issue.** T06 said to escape `&`, `<` and `>` "outside code", while its
+acceptance criterion says code must come out "untouched except for escaping".
+Slack reads its control sequences (`<!here>`, `<@U…>`, `<url|label>`) before
+it applies any formatting, so an unescaped `<!here>` inside a code block still
+notifies the channel. qm-core leaves code verbatim and has that hole.
+
+**Solution.** `to_mrkdwn` escapes the three characters everywhere, code
+included, and changes nothing else inside code: no mention resolution, no
+broadcast neutralization, no formatting. Slack shows `&lt;` as `<` inside code,
+so the reader sees the original text. The T06 bullet in the plan now says
+"everywhere".
+
+### Literal Slack tokens are escaped, not passed through
+
+**Issue.** qm-core passes literal wire tokens in model output through
+unchanged (`<@U123>`, `<!subteam^S1>`, `<!date^…>`, `<https://x.io|label>`),
+and only rewrites `<!here>`, `<!channel>` and `<!everyone>`. That lets model
+output ping a whole user group, and it conflicts with escaping `<`.
+
+**Solution.** The agent writes standard Markdown, and mentions go through the
+`MentionDirectory`, as the design says. So every literal `<` is escaped, and
+the tokens show as text. The broadcast forms still become qm-core's
+`@\u{200B}here` text rather than escaped brackets, since the plan asks for
+that. CommonMark parses `<https://x.io|label>` as an autolink whose URL
+contains `|`; link URLs percent-encode `|` (and spaces), so it becomes
+`<https://x.io%7Clabel>`. A link destination starting with `!`, `@` or `#` is
+percent-encoded too, because `[x](<!here>)` would otherwise render as the
+broadcast `<!here|x>`.
+
+### Typed broadcasts get a zero-width space
+
+**Issue.** qm-core leaves typed `@here`, `@channel` and `@everyone` alone. They
+are inert only because qm-core posts without Slack's `link_names` flag.
+
+**Solution.** `to_mrkdwn` inserts U+200B after the `@` (outside code, ignoring
+case, not after a letter or digit, so `me@here.com` is untouched). The output
+is harmless whatever flags the Slack surface posts with, and it matches what
+the wire forms become. These names are never offered to the directory, so a
+member called "here" can't be pinged through them.
+
+### Bare URLs get explicit bounds
+
+**Issue.** T06 said bare URLs are "left alone". qm-core wraps them in `<…>`
+because Slack's own URL detection pulled neighboring mrkdwn marks into the
+link: `*https://x.io/#/device*` linked to `…/device*` (qm-core's
+"device-code bug"). The Markdown parser strips the `**`, but the output puts
+Slack's `*` right back next to the URL.
+
+**Solution.** Bare `http://` and `https://` URLs in text become `<url>`, with
+trailing punctuation and unmatched closing brackets left outside, as qm-core's
+`trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
+still left to Slack. The T06 bullet in the plan now says so.
+
+### CommonMark disagrees with some qm-core regex cases
+
+**Issue.** qm-core converts with regexes; this renderer walks the
+`pulldown-cmark` tree, which follows CommonMark:
+
+- `above\n---\nbelow` is a setext heading, not a rule.
+- An unclosed fence runs to the end of the document instead of staying
+  verbatim.
+- A ```` ``` ```` run in the middle of a line is a code span, not a fence.
+- Block spacing isn't in the event stream.
+
+**Solution.** Follow the parse tree, and adapt the ported test cases, which
+name each difference. Blocks are separated by a blank line when the source had
+one between them (compared by source line numbers), and by a line break
+otherwise, so `### Deep\nbody` still gives `*Deep*\nbody`. Fenced blocks keep
+their info string, as qm-core and T07's fence reopening assume, even though
+Slack doesn't highlight syntax. A code body that itself holds ```` ``` ````
+keeps a `~~~` fence, like qm-core, because a backtick fence would close early.
+
+### Unbounded nesting overflows the stack
+
+**Issue.** `pulldown-cmark` emits a flat event stream, but any tree walk over
+it recurses once per nesting level, and so does dropping the tree. A line of
+100,000 `>` (or `*`) aborted the process with a stack overflow.
+
+**Solution.** The tree builder keeps at most 64 levels (`MAX_DEPTH`). Elements
+nested deeper are flattened into their ancestor at the limit: their text
+stays, their markup is dropped. A test renders 100,000 levels on a test
+thread's default stack.
+
+### `@Name` grammar details
+
+**Issue.** qm-core's `PLAIN_MENTION` regex relies on backtracking. When the
+greedy one-to-three-word name runs into `/` or `@`, the regex retries shorter
+matches, down to part of a word (`@ankit/x` tries `anki`). When nothing
+resolves, it skips the whole matched run, so `@nobody https://x.io` never
+wraps the URL.
+
+**Solution.** `render::mention::scan` takes the greedy words, drops the last
+word when it runs into `/` or `@` (a lone word then isn't a mention), and tries
+the longest name first, as qm-core does, including its rule that a capitalized
+next word means somebody else (`@Ankit Torres` stays text when only "Ankit" is
+known). An unresolved name consumes only its first word, so the rest of the
+line is still scanned. Names are passed to the directory as written;
+`MentionDirectory` implementations own case folding. The scanner lives in
+`render::mention` so T07's Rocket.Chat renderer can reuse it with its own
+broadcast names.
