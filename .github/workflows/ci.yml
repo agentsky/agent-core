@@ -160,7 +160,7 @@ jobs:
 
       - name: Coverage summary
         if: always()
-        run: cargo llvm-cov report --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+        run: cargo llvm-cov report --workspace --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload coverage reports
         if: always()

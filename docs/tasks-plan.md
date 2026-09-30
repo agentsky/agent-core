@@ -103,7 +103,7 @@ associated data, so a ciphertext copied into another row fails to decrypt.
 | --- | --- |
 | Async runtime | `tokio` (multi-thread) |
 | HTTP server | `axum` on `hyper` 1 |
-| HTTP client | `reqwest` with `default-features = false` and rustls on the `ring` provider. No OpenSSL anywhere (T02 enforces it). `agentctl` only talks plain HTTP to `agentctl.internal`, so it builds `reqwest` without any TLS feature. |
+| HTTP client | `reqwest` with `default-features = false`, plus its `rustls` feature (the `aws-lc-rs` provider) in crates that talk HTTPS; see [impl-notes](impl-notes.md#reqwest-013-defaults-to-aws-lc-rs-not-ring). No OpenSSL anywhere (T02 enforces it). `agentctl` only talks plain HTTP to `agentctl.internal`, so it builds `reqwest` without any TLS feature. |
 | WebSocket | `tokio-tungstenite` with rustls |
 | Database | `sqlx` with `sqlite` and `runtime-tokio`, runtime-checked queries (`sqlx::query_as` with `FromRow`), not the `query!` macros, so CI needs no `DATABASE_URL` and no offline query cache |
 | Migrations | `sqlx::migrate!("./migrations")` in `store`, file names `<UTC timestamp>_<name>.sql`, so parallel PRs don't collide on numbers |
@@ -335,7 +335,7 @@ Every PR, in addition to its task's acceptance criteria:
 
 Progress:
 
-- [ ] T01 Workspace skeleton
+- [x] T01 Workspace skeleton
 - [ ] T02 Dependency policy in CI
 - [ ] T03 `core-types`
 - [ ] T04 `testkit`: mock surface and fake claude
@@ -509,7 +509,8 @@ Deliverables:
     duplicate versions.
   - `[licenses]` allows the permissive licenses the lockfile actually needs
     (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unicode-3.0, Zlib, and
-    CDLA-Permissive-2.0 if `webpki-roots` is pulled in). GPL, LGPL and AGPL
+    CDLA-Permissive-2.0 if `webpki-roots` is pulled in), and `OpenSSL` as a
+    per-crate exception for `aws-lc-sys`. GPL, LGPL and AGPL
     are denied. A weak-copyleft license such as MPL-2.0 is allowed only as a
     per-crate exception with a reason. `[licenses.private] ignore = true`,
     because the workspace crates carry only `license-file`.

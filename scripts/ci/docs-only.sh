@@ -7,8 +7,9 @@
 #
 #   scripts/ci/docs-only.sh BASE HEAD
 #
-# Documentation is any Markdown file and any file named LICENSE. Both
-# commits must be present locally. The README is also the crate's rustdoc
+# Documentation is any Markdown file and any file named LICENSE, except
+# under crates/, where Markdown files are runtime assets (personas,
+# skills) that tests read. Both commits must be present locally. The README is also the crate's rustdoc
 # (src/lib.rs includes it), so CI still runs the doctests and rustdoc for
 # a docs-only change; see the `docs` job in .github/workflows/ci.yml.
 set -eu
@@ -21,6 +22,10 @@ head=${2:?head commit}
 paths=$(git diff --name-only --no-renames "$base" "$head") || exit 1
 printf '%s\n' "$paths" | while IFS= read -r path; do
     case $path in
+        crates/*)
+            echo "docs-only: $path is under crates/"
+            exit 1
+            ;;
         '' | *.md | LICENSE | */LICENSE) ;;
         *)
             echo "docs-only: $path is not documentation"
