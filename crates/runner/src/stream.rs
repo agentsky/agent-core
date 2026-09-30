@@ -1,5 +1,6 @@
 //! Reading a turn from `claude`'s stream-json output, and what a turn gives.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
@@ -26,6 +27,14 @@ const OTHER_TOOL: &str = "<other>";
 /// [`count_cost_from`](crate::ClaudeProcess::count_cost_from)), so a larger
 /// rise is taken for a forged total, and the cost is unknown.
 pub const MAX_TURN_COST_USD: f64 = 1_000.0;
+
+/// The most tokens of each kind one turn's [`usage`](TurnOutcome::usage)
+/// counts. The agent can print lines the runner reads usage from (see
+/// [`TurnOutcome::usage`]), so a line reporting more of any kind is taken
+/// for forged and its usage ignored, and what a turn's lines add up to
+/// stops here. Far above what a turn uses: a million-token context read
+/// fresh on each of a hundred calls.
+pub const MAX_TURN_TOKENS: u64 = 100_000_000;
 
 /// The largest running total taken as the CLI's. Far above any session's,
 /// and small enough that a cent still shows in an `f64` difference.
@@ -85,7 +94,8 @@ impl TurnOutcome {
     /// The agent runs as the CLI's user and can write to its stdout, so
     /// these are the CLI's figures only as far as the agent leaves them
     /// alone: a record, and a budget against agents that loop by mistake,
-    /// not a bound on one that means to overspend.
+    /// not a bound on one that means to overspend. A figure past
+    /// [`MAX_TURN_TOKENS`] is ignored, and no count is more than it.
     pub fn usage(&self) -> Usage {
         let streamed = self.stats().message_usage;
         match self {
@@ -212,6 +222,11 @@ impl Usage {
         self.zip(other, u64::max)
     }
 
+    /// `self` and `more` added up, each count at most [`MAX_TURN_TOKENS`].
+    fn plus(self, more: Self) -> Self {
+        self.zip(more, |a, b| a.saturating_add(b).min(MAX_TURN_TOKENS))
+    }
+
     fn zip(self, other: Self, f: impl Fn(u64, u64) -> u64) -> Self {
         Self {
             input_tokens: f(self.input_tokens, other.input_tokens),
@@ -224,16 +239,27 @@ impl Usage {
         }
     }
 
-    /// The counts in `value`, a `usage` object, or `None` if it isn't one.
+    /// The counts in `value`, a `usage` object, or `None` if it isn't one
+    /// or any count is past [`MAX_TURN_TOKENS`].
     fn read(value: Option<&Value>) -> Option<Self> {
         let usage = value.filter(|usage| usage.is_object())?;
         let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-        Some(Self {
+        let read = Self {
             input_tokens: count("input_tokens"),
             output_tokens: count("output_tokens"),
             cache_creation_input_tokens: count("cache_creation_input_tokens"),
             cache_read_input_tokens: count("cache_read_input_tokens"),
-        })
+        };
+        let counts = [
+            read.input_tokens,
+            read.output_tokens,
+            read.cache_creation_input_tokens,
+            read.cache_read_input_tokens,
+        ];
+        counts
+            .iter()
+            .all(|count| *count <= MAX_TURN_TOKENS)
+            .then_some(read)
     }
 }
 
@@ -266,14 +292,20 @@ pub struct TurnStats {
     pub duration: Duration,
     /// The token counts of the API messages the turn's `assistant` lines
     /// carried, added up. The CLI prints a line per content block of a
-    /// message, each with the message's usage so far, so consecutive lines
-    /// with one `message.id` count once, at their largest. See
-    /// [`TurnOutcome::usage`].
+    /// message, each with the message's usage so far, and the lines of
+    /// subagents running at once come interleaved, so the lines with one
+    /// `message.id` count once, at their largest, among the latest
+    /// [`RECENT_MESSAGES`] ids. See [`TurnOutcome::usage`].
     pub message_usage: Usage,
-    /// The last `assistant` line's message id, if it had a short one, and
-    /// that message's usage so far, counted in `message_usage` already.
-    last_message: Option<(String, Usage)>,
+    /// The latest short message ids of `assistant` lines, the latest last,
+    /// each with that message's usage so far, counted in `message_usage`
+    /// already.
+    recent_messages: VecDeque<(String, Usage)>,
 }
+
+/// How many message ids [`TurnStats`] remembers. More subagents than this
+/// printing at once would count a message's lines more than once.
+const RECENT_MESSAGES: usize = 64;
 
 /// The longest message id kept to tell a message's lines apart. The API's
 /// are far shorter.
@@ -466,22 +498,31 @@ fn note_assistant(line: &Value, stats: &mut TurnStats) {
 }
 
 /// Adds `usage`, what `message` used so far, to the stats' message usage:
-/// all of it for a new message, and only what it adds to the last line's
-/// for another line of the same message.
+/// all of it for a message without a short id or one not among the recent
+/// ones, and only what it adds to what was counted for a recent one.
 fn note_message_usage(message: Option<&Value>, usage: Usage, stats: &mut TurnStats) {
     let id = message
         .and_then(|message| message.get("id"))
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty() && id.len() <= MAX_MESSAGE_ID_LEN);
-    let counted = match (&stats.last_message, id) {
-        (Some((last, counted)), Some(id)) if last == id => *counted,
-        _ => Usage::default(),
+    let Some(id) = id else {
+        stats.message_usage = stats.message_usage.plus(usage);
+        return;
     };
+    let recent = &mut stats.recent_messages;
+    let counted = recent
+        .iter()
+        .position(|(known, _)| known == id)
+        .and_then(|at| recent.remove(at))
+        .map_or_else(Usage::default, |(_, counted)| counted);
     let usage = usage.max(counted);
     stats.message_usage = stats
         .message_usage
-        .zip(usage.zip(counted, u64::saturating_sub), u64::saturating_add);
-    stats.last_message = id.map(|id| (id.to_owned(), usage));
+        .plus(usage.zip(counted, u64::saturating_sub));
+    recent.push_back((id.to_owned(), usage));
+    if recent.len() > RECENT_MESSAGES {
+        recent.pop_front();
+    }
 }
 
 /// Parses one line, folding it into `stats`, and returns the result line
@@ -662,14 +703,17 @@ mod tests {
                     output_tokens: 2,
                     ..Usage::default()
                 },
-                last_message: Some((
-                    "msg_cap2".into(),
-                    Usage {
-                        input_tokens: 10,
-                        output_tokens: 1,
-                        ..Usage::default()
-                    }
-                )),
+                recent_messages: ["msg_cap1", "msg_cap2"]
+                    .into_iter()
+                    .map(|id| {
+                        let usage = Usage {
+                            input_tokens: 10,
+                            output_tokens: 1,
+                            ..Usage::default()
+                        };
+                        (id.to_owned(), usage)
+                    })
+                    .collect(),
             }
         );
         assert_eq!(
@@ -926,7 +970,7 @@ mod tests {
                 malformed_lines: 2,
                 duration: Duration::ZERO,
                 message_usage: Usage::default(),
-                last_message: None,
+                recent_messages: VecDeque::new(),
             }
         );
     }
@@ -960,10 +1004,10 @@ mod tests {
         assert_eq!(
             stats.message_usage,
             Usage {
-                input_tokens: 10 + 30 + 10 + 5 + 5 + 1 + 1,
-                output_tokens: 7 + 4 + 7 + 5 + 5 + 1 + 1,
-                cache_creation_input_tokens: 2 * 7,
-                cache_read_input_tokens: 100 * 7,
+                input_tokens: 10 + 30 + 5 + 5 + 1 + 1,
+                output_tokens: 7 + 4 + 5 + 5 + 1 + 1,
+                cache_creation_input_tokens: 2 * 6,
+                cache_read_input_tokens: 100 * 6,
             }
         );
 
@@ -986,6 +1030,76 @@ mod tests {
             },
             "a result can't report less than the messages did"
         );
+    }
+
+    #[test]
+    fn interleaved_lines_of_parallel_subagents_count_each_message_once() {
+        let line = |id: &str, output: u64| {
+            format!(
+                r#"{{"type":"assistant","parent_tool_use_id":"toolu_1","message":{{"id":"{id}","content":[],"usage":{{"input_tokens":5,"output_tokens":{output}}}}}}}"#
+            )
+        };
+        let mut stats = TurnStats::default();
+        for text in [line("s1", 3), line("s2", 4), line("s1", 5), line("s2", 5)] {
+            note_line(text.as_bytes(), &mut stats);
+        }
+        assert_eq!(
+            (
+                stats.message_usage.input_tokens,
+                stats.message_usage.output_tokens
+            ),
+            (10, 10)
+        );
+    }
+
+    #[test]
+    fn a_message_counts_again_once_its_id_is_no_longer_recent() {
+        let line = |id: usize| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"msg_{id}","content":[],"usage":{{"output_tokens":1}}}}}}"#
+            )
+        };
+        let mut stats = TurnStats::default();
+        for id in (0..RECENT_MESSAGES).chain([0, RECENT_MESSAGES, 1, 0]) {
+            note_line(line(id).as_bytes(), &mut stats);
+        }
+        let messages = u64::try_from(RECENT_MESSAGES).unwrap();
+        assert_eq!(stats.message_usage.output_tokens, messages + 2);
+        assert_eq!(stats.recent_messages.len(), RECENT_MESSAGES);
+    }
+
+    #[test]
+    fn a_count_past_the_turn_cap_is_ignored_and_a_turn_counts_at_most_the_cap() {
+        let line = |id: &str, output: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","content":[],"usage":{{"input_tokens":1,"output_tokens":{output}}}}}}}"#
+            )
+        };
+        let mut stats = TurnStats::default();
+        note_line(line("m1", 7).as_bytes(), &mut stats);
+        note_line(line("m1", MAX_TURN_TOKENS + 1).as_bytes(), &mut stats);
+        note_line(line("m2", u64::MAX).as_bytes(), &mut stats);
+        assert_eq!(
+            (
+                stats.message_usage.input_tokens,
+                stats.message_usage.output_tokens
+            ),
+            (1, 7),
+            "a line past the cap is taken for forged"
+        );
+        let huge = br#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":100000001}}"#;
+        let finished = TurnOutcome::Finished(
+            note_line(huge, &mut stats.clone())
+                .unwrap()
+                .into_result(stats.clone(), &mut Some(0.0)),
+        );
+        assert_eq!(finished.usage(), stats.message_usage);
+
+        for id in ["m3", "m4", "m5"] {
+            note_line(line(id, MAX_TURN_TOKENS / 2).as_bytes(), &mut stats);
+        }
+        assert_eq!(stats.message_usage.output_tokens, MAX_TURN_TOKENS);
+        assert_eq!(stats.message_usage.input_tokens, 4);
     }
 
     #[test]

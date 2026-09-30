@@ -2945,7 +2945,11 @@ Not scheduled. Each needs a decision before it becomes a task.
   agents that loop by mistake, not for one that forges its counts. Counting
   each turn's tokens and cost from the API responses the credential proxy
   (T18) forwards, keyed by the turn's placeholder, would make the budget
-  and the meter hard bounds too.
+  and the meter hard bounds too. The same stdout lets the agent print a
+  forged `result` line, which ends its turn early with its own reply; the
+  CLI's real result is then read as the next turn's, so the next
+  requester gets this turn's reply and pays its cost. Reading turns from a
+  channel the agent can't write would close that as well.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private

@@ -6554,13 +6554,27 @@ used would undercut it too.
 
 **Solution.** `TurnStats::message_usage` adds up the `message.usage` of
 the turn's `assistant` lines. The CLI prints one line per content block of
-an API message, each with that message's usage so far, so consecutive
-lines with one `message.id` count once, at their largest; in the captures
+an API message, each with that message's usage so far; in the captures
 their output counts are lower than the result's, and their input counts
-add up to it. `TurnOutcome::usage` is that sum for a turn that crashed or
-timed out, and for a finished one each count the larger of the result's
-and the sum, so a forged low result can't undercut what was streamed
-first. The meter bills it.
+add up to it. Subagents print their messages as `assistant` lines too,
+with a `parent_tool_use_id` (2.1.285's source emits each subagent
+message's blocks as they stream), so the lines of Task subagents running
+at once come interleaved: `s1, s2, s1, s2`. A first version counted a
+message once only across consecutive lines, and so counted such a turn
+twice. `TurnStats` now keeps the latest 64 message ids with what each has
+counted, and a line of a known id adds only what it raises that by; an id
+pushed out by 64 others counts again, which only more than 64 messages
+streaming at once would reach. `TurnOutcome::usage` is that sum for a turn
+that crashed or timed out, and for a finished one each count the larger
+of the result's and the sum, so a forged low result can't undercut what
+was streamed first. The meter bills it.
+
+A `usage` with any count past `MAX_TURN_TOKENS` (100 million, far above a
+turn's use, as `MAX_TURN_COST_USD` is above its cost) is taken for forged
+and ignored, and a turn's sum stops at it. Ignoring only that line, not
+the turn's tokens, matters: an agent that could make its turn's tokens
+unknown by printing one huge line would take them out of the thread's
+budget, while a line past the cap now only adds nothing.
 
 The agent runs as the CLI's user, so it can write to the CLI's stdout as
 well as its transcript, and print whatever lines it likes. Token counts
@@ -6569,7 +6583,13 @@ stop agents that loop by mistake, not one that means to overspend. The
 turn caps (per thread and hour, and per agent and day) and the hop cap
 count turns agentd starts itself, so they are the hard bounds on a loop.
 Metering at the credential proxy, which sees every API response, would
-make tokens and cost a bound too (the plan's Deferred work).
+make tokens and cost a bound too (the plan's Deferred work). The same
+stdout predates T27 with a worse problem, which this task leaves there
+too: a forged `result` line ends the turn early with the agent's text as
+the reply, and the CLI's real result for the turn is then read as the
+next turn's, so the next requester gets this turn's reply and pays its
+cost and tokens. Reading turns from a channel the agent can't write
+closes both.
 
 ### One table counts threads and agents
 
