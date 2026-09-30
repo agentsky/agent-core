@@ -329,6 +329,7 @@ async fn plays_a_turn_with_the_design_flags() {
         "the process saves its total when its input ends"
     );
     assert_eq!(entries[2]["totalCostUSD"], REPLY_COST_USD);
+    assert_eq!(entries[2]["sessionId"], setup.id.to_string());
     assert_eq!(entries[0]["message"]["content"], "Say hello.");
     assert_eq!(entries[0]["sessionId"], setup.id.to_string());
     assert_eq!(entries[1]["message"]["content"][0]["text"], "Hello, world.");

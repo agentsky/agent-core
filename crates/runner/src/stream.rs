@@ -29,7 +29,7 @@ pub const MAX_TURN_COST_USD: f64 = 1_000.0;
 
 /// The largest running total taken as the CLI's. Far above any session's,
 /// and small enough that a cent still shows in an `f64` difference.
-const MAX_PROCESS_TOTAL_USD: f64 = 1e9;
+pub(crate) const MAX_PROCESS_TOTAL_USD: f64 = 1e9;
 
 /// Whether `total` can be the CLI's running total: a number from 0 to
 /// [`MAX_PROCESS_TOTAL_USD`].

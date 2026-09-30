@@ -319,8 +319,9 @@ impl Session {
         Ok(false)
     }
 
-    /// The total the last `cost-state` line of the transcript holds, as
-    /// the real CLI restores it on `--resume`, or 0 without one.
+    /// The total the last `cost-state` line of the session in the
+    /// transcript holds, as the real CLI restores it on `--resume`, or 0
+    /// without one.
     fn restored_cost(&self) -> Result<f64, String> {
         let file =
             File::open(&self.transcript).map_err(|err| format!("reading the transcript: {err}"))?;
@@ -329,6 +330,7 @@ impl Session {
             let line = line.map_err(|err| format!("reading the transcript: {err}"))?;
             if let Ok(entry) = serde_json::from_str::<Value>(&line)
                 && entry["type"] == "cost-state"
+                && entry["sessionId"] == self.id.to_string()
                 && let Some(saved) = entry["totalCostUSD"].as_f64()
             {
                 total = saved;
@@ -346,8 +348,17 @@ impl Session {
         }
         let line = json!({
             "type": "cost-state",
+            "sessionId": self.id,
             "totalCostUSD": self.total_cost_usd.get(),
+            "totalAPIDuration": 0,
+            "totalAPIDurationWithoutRetries": 0,
+            "totalToolDuration": 0,
+            "totalLinesAdded": 0,
+            "totalLinesRemoved": 0,
+            "totalDuration": 0,
+            "startTime": 0,
             "modelUsage": {},
+            "hasUnknownModelCost": false,
         });
         let mut file = OpenOptions::new()
             .append(true)

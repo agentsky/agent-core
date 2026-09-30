@@ -62,9 +62,10 @@
 //! process's running total, as the real CLI reports them: each reply adds
 //! [`REPLY_COST_USD`] and an error result nothing. A process started with
 //! `--session-id` counts from 0, and one started with `--resume` from the
-//! transcript's last `{"type":"cost-state","totalCostUSD":…}` line, or 0
-//! without one. Like the real CLI, the fake appends that line with its
-//! running total when stdin ends and the session has a transcript, and a
+//! transcript's last `{"type":"cost-state","sessionId":…,"totalCostUSD":…}`
+//! line of the session, or 0 without one. Like the real CLI, the fake
+//! appends that line, with its running total and the other fields the CLI
+//! 2.1.285 writes, when stdin ends and the session has a transcript, and a
 //! crash writes none.
 //!
 //! With the OAuth token, the first successful turn of each process also

@@ -6481,17 +6481,40 @@ does. No line in the whole file means 0, as the CLI restores then.
 The runner must take the line the CLI takes, never an earlier one: an
 agent that appends a `cost-state` line the runner passes over (padded past
 a length cap, say) would otherwise have the CLI restore a total the runner
-doesn't take off, and bill it as the turn's cost. So whatever the runner
-can't read makes the total unknown instead of being skipped: a line longer
-than 64 KiB, one that doesn't parse as a JSON object (a type written twice
-included, which the CLI would read as its last), a `cost-state` line whose
-`totalCostUSD` isn't a number from 0 to 1e9, a start of the file past the
-32 MiB, a missing transcript (the CLI then refuses the `--resume`), or one
-it can't open this way. The type is parsed, not searched for, since
-`cost\u002dstate` is the same type. The CLI restores the same line only
-if nothing changes it between the two reads, which only a process left
-running in the container could do (Deferred work's "Killing leftover
-processes at turn end").
+doesn't take off, and bill it as the turn's cost; and a line the runner
+takes but the CLI skips does the same the other way. The pinned CLI
+(2.1.285's bundled source, read from the npm package) parses each line with
+`JSON.parse`, where a key written twice holds its last value, and restores
+the last line whose `type` is exactly the string `cost-state`, whose
+`sessionId` is the session's, and which passes a zod schema: every field
+it writes present (`totalCostUSD`, five durations and line counts,
+`startTime`, `modelUsage`; `hasUnknownModelCost` optional), each a finite
+number from 0 (`totalCostUSD` at most 1e9, the rest 1e15), and each
+model's counts likewise. It skips any other such line and restores an
+earlier one. An earlier version of the runner read a line with a derived
+serde struct, which accepts a JSON array as the struct's fields in order,
+so `["cost-state", 0]`, or `{"type":"cost-state","totalCostUSD":0}`
+without the schema's other fields, was read as a total of 0 where the CLI
+skipped it and restored the real one: up to `MAX_TURN_COST_USD` shifted
+onto the next requester per forced resume.
+
+So the runner parses a line into a `serde_json::Map` (last key wins, as in
+`JSON.parse`, and anything but an object fails), passes over a line whose
+`type` is missing or another string, and takes a `cost-state` line only
+where it is sure the CLI does: the session's id, only the keys the CLI
+writes, every amount at most half the CLI's bound (so the two parsers'
+rounding can't fall on different sides of it), model names printable
+ASCII, and the token sums in bounds. Whatever it can't be sure the CLI
+skips makes the total unknown instead: a line longer than 64 KiB, one that
+isn't a JSON object, one whose `type` isn't a string, any other
+`cost-state` line, a start of the file past the 32 MiB, a missing
+transcript (the CLI then refuses the `--resume`), or one it can't open
+this way. So the unknown side is always the runner's: an agent can make
+its first turn's cost unknown, never move it. The type is parsed, not
+searched for, since `cost\u002dstate` is the same type. The CLI restores
+the same line only if nothing changes it between the two reads, which
+only a process left running in the container could do (Deferred work's
+"Killing leftover processes at turn end").
 
 A turn's cost is unknown (`None`, and billed as 0) when its result or the
 process's previous one has no plausible total (so a result without one
@@ -6502,9 +6525,9 @@ unknown. Even so, the agent can write the transcript and the CLI's stdout
 (it runs as the same user), so `cost_usd` is a record, never something a
 limit is enforced with: no cap reads it.
 
-`fake-claude` now appends
-`{"type":"cost-state","totalCostUSD":…,"modelUsage":{}}` when its input
-ends, and none when it crashes, and restores the last one on `--resume`;
+`fake-claude` now appends a `cost-state` line shaped as 2.1.285 writes
+it, with the session's id, when its input ends, and none when it crashes,
+and restores the session's last one on `--resume`;
 a runner test checks the resumed turn's cost after a clean stop and after
 a crash, and the Docker test now checks the corrected cost against the real
 CLI in CI.
