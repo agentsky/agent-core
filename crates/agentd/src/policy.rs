@@ -12,10 +12,11 @@
 //! - `deny <target>` puts the target on the deny list and leaves the allow
 //!   list as it is, so a deny never lets anyone in: denying the one target
 //!   an agent allows leaves it to its owner.
-//! - `allow <target>` takes a denied target off the deny list, which is all
-//!   it does then, so an earlier allow of it applies again. Otherwise it
-//!   puts the target on the allow list, so the first `allow` of a member or
-//!   a channel limits the agent to it.
+//! - `allow <target>` puts the target on the allow list, so the first
+//!   `allow` of a member or a channel limits the agent to it, and takes it
+//!   off the deny list. A denied target is put on the allow list only if
+//!   the list already limits the agent, so lifting a deny never limits an
+//!   agent open to everyone, and one `allow` always lets the target in.
 //! - `allow everyone` empties the allow list and takes `everyone` off the
 //!   deny list, so everyone not denied by name may use the agent again.
 
@@ -185,12 +186,14 @@ impl Rules {
             self.deny.retain(|denied| *denied != Rule::Everyone);
             return changed(before != (self.allow.len(), self.deny.len()));
         }
-        let denied = self.deny.len();
-        self.deny.retain(|denied| !denied.same_target(&rule));
-        if self.deny.len() != denied {
-            return Change::Changed;
+        if !self.deny.iter().any(|denied| denied.same_target(&rule)) {
+            return add(&mut self.allow, rule);
         }
-        add(&mut self.allow, rule)
+        if !self.allow.is_empty() && add(&mut self.allow, rule.clone()) == Change::Full {
+            return Change::Full;
+        }
+        self.deny.retain(|denied| !denied.same_target(&rule));
+        Change::Changed
     }
 
     /// Applies `deny <rule>`; see the [module docs](self).
@@ -339,7 +342,7 @@ mod tests {
         assert_eq!(rules.allow(member("bob")), Change::Changed);
         assert!(
             permits(&rules, "carol", "C1"),
-            "allowing a denied member only lifts the deny"
+            "without an allow list, allowing a denied member only lifts the deny"
         );
         assert!(permits(&rules, "bob", "C1"));
         assert_eq!(rules, Rules::default());
@@ -399,6 +402,36 @@ mod tests {
         assert_eq!(rules.allow(member("bob")), Change::Changed);
         assert!(permits(&rules, "bob", "C1"), "allow undoes the deny");
         assert!(!permits(&rules, "carol", "C1"));
+    }
+
+    #[test]
+    fn allowing_a_denied_target_lets_it_in_with_one_command() {
+        let mut rules = Rules::default();
+        rules.allow(member("alice"));
+        rules.deny(member("bob"));
+        assert_eq!(rules.allow(member("bob")), Change::Changed);
+        assert!(permits(&rules, "bob", "C1"));
+        assert!(!permits(&rules, "carol", "C1"));
+        assert_eq!(rules.allow, [member("alice"), member("bob")]);
+        assert!(rules.deny.is_empty());
+
+        let mut rules = Rules::default();
+        rules.deny(member("bob"));
+        assert_eq!(rules.allow(member("bob")), Change::Changed);
+        assert_eq!(
+            rules,
+            Rules::default(),
+            "an agent open to everyone stays open"
+        );
+
+        let mut rules = Rules::default();
+        for n in 0..MAX_RULES {
+            rules.allow(member(&format!("u{n}")));
+        }
+        rules.deny(member("bob"));
+        let full = rules.clone();
+        assert_eq!(rules.allow(member("bob")), Change::Full);
+        assert_eq!(rules, full, "a full allow list keeps the deny too");
     }
 
     #[test]

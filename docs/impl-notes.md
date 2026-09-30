@@ -6729,10 +6729,14 @@ back from a mistake.
 the allow list alone. Taking the target off the allow list too, as a first
 version did, widened access: after `allow helper @bob`, `deny helper @bob`
 emptied the allow list and opened the agent to everyone else. A deny must
-never grant access, and deny wins anyway, so the allow entry stays, and
-`allow <target>` of a denied target only lifts the deny, which lets an
-earlier allow of it apply again. Otherwise `allow` puts the target on the
-allow list, so the first `allow` limits the agent to its targets. Replies
+never grant access, and deny wins anyway, so the allow entry stays.
+`allow` puts the target on the allow list, so the first `allow` limits the
+agent to its targets, and lifts a deny of it. A first version only lifted
+the deny of a denied target, so under an allow list that didn't hold it
+`allow helper @bob` still left bob out, and took a second `allow`; now a
+denied target is added to the allow list too when the list is not empty,
+and only lifted when it is, so lifting a deny never limits an agent open
+to everyone. A full allow list refuses the command whole, deny included. Replies
 leave a denied target out of the allowed ones, and an allow list whose
 every target is denied reads "Only you may use". `allow everyone` empties
 the allow list and takes `everyone` off the deny list; denies by name
@@ -6749,7 +6753,13 @@ manager looks it up with `rooms.info`, by `roomName`
 for an id typed as a `<#…>` token, which is never taken as it is. The
 manager can read private groups a member may not be in, so only a public
 channel is found: a private group reads as unknown whether or not it
-exists, and can't be named in a rule on Rocket.Chat yet. Rules
+exists, and can't be named in a new rule on Rocket.Chat yet. A room the
+lookup doesn't find is still matched against the agent's own room rules
+by the name the owner wrote (`#secret`), so a channel denied or allowed
+while public and made private since can be allowed or denied again; that
+tells the owner only what their own rules hold. Checking the asker's
+membership of the group would take a lookup of another user's rooms the
+manager doesn't make yet. Rules
 that don't read refuse everyone, the owner too, as `PolicyUnavailable`,
 since the same row holds the hop cap, and `allow <name> everyone` clears
 them.

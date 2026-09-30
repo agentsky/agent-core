@@ -2340,6 +2340,41 @@ async fn allow_and_deny_change_the_owners_rules() {
     assert_eq!(policy().await, router::AgentPolicy::default());
 }
 
+#[tokio::test]
+async fn a_room_agentd_cant_find_is_found_among_the_rules_by_its_name() {
+    let h = harness().await;
+    let (helper, _) = helper_and_bob(&h).await;
+    let mut rules = crate::policy::Rules::default();
+    rules.allow(crate::policy::Rule::Room {
+        conv: conv("GENERAL"),
+        label: "#general".into(),
+    });
+    rules.deny(crate::policy::Rule::Room {
+        conv: conv("SECRET"),
+        label: "#secret".into(),
+    });
+    h.store
+        .update_agent_settings(helper, |settings| rules.write(settings))
+        .await
+        .unwrap();
+    h.dm("alice", "allow helper #secret").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you and `#general`, `#secret` may use `helper`.",
+        "a channel made private since it was denied can still be allowed by name"
+    );
+    h.dm("alice", "deny helper #secret").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you and `#general` may use `helper`, except `#secret`."
+    );
+    h.dm("alice", "deny helper #other").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "I don't know `#other`. Name a public channel agentd can see."
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn changes_sent_at_once_are_all_kept() {
     let h = harness().await;

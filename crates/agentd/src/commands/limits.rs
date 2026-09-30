@@ -2,7 +2,7 @@
 //! agent, which the router applies to every turn (see [`crate::policy`]).
 
 use commands::{RoomRef, Setting, Target, UserRef};
-use core_types::{ConvRef, ConversationId, MemberKey, SurfaceKind};
+use core_types::{AgentId, ConvRef, ConversationId, MemberKey, SurfaceKind};
 
 use super::agents::no_such_agent;
 use super::{Commands, Failure};
@@ -80,7 +80,7 @@ impl Commands {
         let Some(agent) = self.own_agent(key, name).await? else {
             return Ok(no_such_agent(name));
         };
-        let rule = match self.rule_for(key, target).await? {
+        let rule = match self.rule_for(key, agent.id, target).await? {
             Ok(rule) => rule,
             Err(reply) => return Ok(reply),
         };
@@ -136,10 +136,14 @@ impl Commands {
     }
 
     /// The rule `target` names, from `key`'s surface and team, or the reply
-    /// when it names nobody agentd can find.
+    /// when it names nobody agentd can find. A room agentd can't find (a
+    /// Rocket.Chat private group) is still found among `agent`'s rules by
+    /// the name the owner gave it, so a rule on a channel made private can
+    /// be lifted.
     async fn rule_for(
         &self,
         key: &MemberKey,
+        agent: AgentId,
         target: &Target,
     ) -> Result<Result<Rule, String>, Failure> {
         Ok(match target {
@@ -168,10 +172,13 @@ impl Commands {
             Target::Room(room) => {
                 let label = format!("#{}", room.shown());
                 match self.resolve_room(key, room).await? {
-                    None => Err(format!(
-                        "I don't know `{}`. Name a public channel agentd can see.",
-                        label.replace('`', "")
-                    )),
+                    None => match self.room_rule_named(key, agent, &label).await? {
+                        Some(rule) => Ok(rule),
+                        None => Err(format!(
+                            "I don't know `{}`. Name a public channel agentd can see.",
+                            label.replace('`', "")
+                        )),
+                    },
                     Some(conversation) => Ok(Rule::Room {
                         conv: ConvRef {
                             surface: key.surface,
@@ -183,6 +190,24 @@ impl Commands {
                 }
             }
         })
+    }
+
+    /// The first of `agent`'s room rules on `key`'s surface and team, denies
+    /// first, that the owner named `label`, or `None`.
+    async fn room_rule_named(
+        &self,
+        key: &MemberKey,
+        agent: AgentId,
+        label: &str,
+    ) -> Result<Option<Rule>, Failure> {
+        let settings = self.inner.store.agent_settings(agent).await?;
+        let Ok(rules) = Rules::read(&settings) else {
+            return Ok(None);
+        };
+        Ok(rules.deny.into_iter().chain(rules.allow).find(|rule| {
+            matches!(rule, Rule::Room { conv, label: named }
+                if named == label && conv.surface == key.surface && conv.team == key.team)
+        }))
     }
 
     /// The conversation `room` names on `key`'s surface, or `None` if
