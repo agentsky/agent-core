@@ -6523,9 +6523,18 @@ the runner can't see all of: `docker_the_pinned_cli_restores_whatever_total_the_
 (a runner unit test CI's Docker job runs) resumes the pinned CLI from the
 sandbox image on crafted transcripts, against a stub API that answers 400
 so the result's `total_cost_usd` is the restored total, and asserts that
-whenever the runner reads a total the CLI restored exactly it: the CLI's
-own shapes (no cost line, one, two, a file of exactly 5,242,880 bytes)
-must read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
+whenever the runner reads a total the CLI restored exactly it. First it
+has the CLI write a real session: one `-p` turn against a stub that
+streams a `Write` call and then a text reply, so the transcript holds what
+the CLI writes for a tool turn (queue operations, attachments, the
+`tool_use` and `tool_result` lines, `last-prompt`, `atis-latch` and its
+`cost-state` line), and the runner must read the total that turn reported
+(0.0112), which the CLI then restores; no rule had to be relaxed for it.
+The transcript is printed, and kept in
+`testkit/fixtures/transcript/tool-turn.jsonl` (four long attachment lines
+left out) for a unit test that needs no Docker. Then the hand-built
+shapes (no cost line, one, two, a file of exactly 5,242,880 bytes) must
+read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
 `leaf3`, a duplicated key, a ledger-prefixed line) must be unknown. On the
 code before this, the test read 0.25 where the CLI restored 5 for
 `ledger_big` and `attr_big`, and 5 where it restored 7 for `leaf2` and

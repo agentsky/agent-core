@@ -598,6 +598,18 @@ mod tests {
     }
 
     #[test]
+    fn the_total_of_a_tool_turn_the_cli_wrote_is_read() {
+        let lines: Vec<String> = testkit::fixtures::TOOL_TURN_TRANSCRIPT
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(restored(&lines), Some(0.0112));
+        let mut appended = lines.clone();
+        appended.push(written(cost_value(900.0, OTHER)));
+        assert_eq!(restored(&appended), None);
+    }
+
+    #[test]
     fn a_transcript_past_the_clis_index_threshold_is_unknown() {
         let mut lines = exchange(ID);
         lines.push(cost_line(0.5));
@@ -922,21 +934,32 @@ mod tests {
         ]
     }
 
-    /// A stub of the Messages API that refuses every request with a 400, so
-    /// a resumed CLI ends its turn at once, its result's total the one it
-    /// restored.
-    fn refusing_api() -> u16 {
+    /// How the stub Messages API answers.
+    #[derive(Clone, Copy)]
+    enum Api {
+        /// A 400 for every request, so a resumed CLI ends its turn at once,
+        /// its result's total the one it restored.
+        Refuse,
+        /// A `Write` call for the file `note.txt` while the request offers
+        /// the tool and holds no tool result yet, and a text reply that
+        /// ends the turn otherwise: a real turn with a tool, as the CLI
+        /// records one.
+        WriteANote,
+    }
+
+    /// Serves `api` on a free local port, and returns the port.
+    fn stub_api(api: Api) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                std::thread::spawn(move || refuse(stream));
+                std::thread::spawn(move || answer(stream, api));
             }
         });
         port
     }
 
-    fn refuse(mut stream: std::net::TcpStream) {
+    fn answer(mut stream: std::net::TcpStream, api: Api) {
         let mut head = Vec::new();
         let mut byte = [0; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -953,13 +976,74 @@ mod tests {
             .unwrap_or(0);
         let mut body = vec![0; length];
         let _ = stream.read_exact(&mut body);
-        let error =
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"refused"}}"#;
+        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let (status, kind, body) = match api {
+            _ if !head.starts_with("post /v1/messages") => {
+                ("404 Not Found", "application/json", "{}".to_owned())
+            }
+            Api::Refuse => (
+                "400 Bad Request",
+                "application/json",
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"refused"}}"#
+                    .to_owned(),
+            ),
+            Api::WriteANote => ("200 OK", "text/event-stream", write_a_note(&request)),
+        };
         let _ = write!(
             stream,
-            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{error}",
-            error.len()
+            "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
         );
+    }
+
+    /// The SSE stream [`Api::WriteANote`] answers `request` with.
+    fn write_a_note(request: &Value) -> String {
+        let offers_write = request["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == "Write"));
+        let has_result = request.to_string().contains(r#""type":"tool_result""#);
+        let model = request["model"].as_str().unwrap_or("claude-sonnet-4-5");
+        let (block, delta, stop) = if offers_write && !has_result {
+            let input = serde_json::json!({
+                "file_path": "/volume/s/work/note.txt",
+                "content": "a note\n",
+            });
+            (
+                serde_json::json!({"type": "tool_use", "id": "toolu_01note", "name": "Write", "input": {}}),
+                serde_json::json!({"type": "input_json_delta", "partial_json": input.to_string()}),
+                "tool_use",
+            )
+        } else {
+            (
+                serde_json::json!({"type": "text", "text": ""}),
+                serde_json::json!({"type": "text_delta", "text": "Done."}),
+                "end_turn",
+            )
+        };
+        let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        [
+            serde_json::json!({"type": "message_start", "message": {
+                "id": id, "type": "message", "role": "assistant", "model": model,
+                "content": [], "stop_reason": null, "stop_sequence": null,
+                "usage": {"input_tokens": 1_200, "output_tokens": 1,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            }}),
+            serde_json::json!({"type": "content_block_start", "index": 0, "content_block": block}),
+            serde_json::json!({"type": "content_block_delta", "index": 0, "delta": delta}),
+            serde_json::json!({"type": "content_block_stop", "index": 0}),
+            serde_json::json!({"type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": null},
+                "usage": {"output_tokens": 40}}),
+            serde_json::json!({"type": "message_stop"}),
+        ]
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {event}\n\n",
+                event["type"].as_str().unwrap()
+            )
+        })
+        .collect()
     }
 
     fn open_to_all(path: &Path) {
@@ -972,10 +1056,10 @@ mod tests {
         }
     }
 
-    /// The total the pinned CLI in `image` restores when it resumes the
-    /// session in `dir`, laid out as the runner lays it out, against the
-    /// API stub on `port`.
-    fn cli_restored(image: &str, dir: &Path, port: u16) -> Option<f64> {
+    /// Runs the pinned CLI in `image` with `args`, on the session in
+    /// `dir` laid out as the runner lays it out, against the API stub on
+    /// `port`, and returns its result's `total_cost_usd`.
+    fn cli_total(image: &str, dir: &Path, port: u16, args: &[&str]) -> Option<f64> {
         for sub in ["home", "work"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
@@ -994,15 +1078,8 @@ mod tests {
             .args(["-e", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1"])
             .args(["-e", "DISABLE_AUTOUPDATER=1"])
             .arg(image)
-            .args([
-                "claude",
-                "-p",
-                "hi",
-                "--output-format",
-                "json",
-                "--resume",
-                ID,
-            ])
+            .arg("claude")
+            .args(args)
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -1022,13 +1099,53 @@ mod tests {
         total
     }
 
+    /// The total the pinned CLI in `image` restores when it resumes the
+    /// session in `dir`, against the refusing stub on `port`.
+    fn cli_restored(image: &str, dir: &Path, port: u16) -> Option<f64> {
+        let args = ["-p", "hi", "--output-format", "json", "--resume", ID];
+        cli_total(image, dir, port, &args)
+    }
+
+    /// A session whose one turn the pinned CLI in `image` ran itself,
+    /// writing a file with a tool against the stub on `port`, and the total
+    /// it reported.
+    fn cli_tool_turn(image: &str, dir: &Path, port: u16) -> Option<f64> {
+        let args = [
+            "-p",
+            "Write a note.",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            "bypassPermissions",
+            "--session-id",
+            ID,
+        ];
+        cli_total(image, dir, port, &args)
+    }
+
     #[test]
     #[ignore = "needs docker and the sandbox image"]
     fn docker_the_pinned_cli_restores_whatever_total_the_runner_reads() {
         let image = std::env::var("AGENT_CORE_SANDBOX_IMAGE")
             .unwrap_or_else(|_| "agent-core/sandbox:dev".to_owned());
-        let port = refusing_api();
+        let port = stub_api(Api::Refuse);
         let mut read = Vec::new();
+
+        let tool_turn = Dir::new();
+        let reported = cli_tool_turn(&image, &tool_turn.0, stub_api(Api::WriteANote));
+        let transcript = std::fs::read_to_string(tool_turn.transcript(session())).unwrap();
+        eprintln!("the CLI's own tool turn, reporting {reported:?}:\n{transcript}");
+        assert!(
+            transcript.contains(r#""name":"Write""#) && transcript.contains("tool_result"),
+            "the CLI ran the tool"
+        );
+        assert!(reported.is_some_and(|total| total > 0.0));
+        let runner = restored_total(&tool_turn.0, session());
+        let cli = cli_restored(&image, &tool_turn.0, port);
+        eprintln!("tool turn: the runner reads {runner:?}, the CLI restored {cli:?}");
+        assert_eq!(runner, reported, "the runner reads the CLI's own tool turn");
+        read.push(("tool turn", runner, cli));
+
         for (case, lines) in cli_cases() {
             let dir = Dir::new();
             write(&dir.transcript(session()), &lines);
@@ -1054,6 +1171,7 @@ mod tests {
         assert_eq!(
             taken,
             [
+                "tool turn",
                 "no cost",
                 "baseline",
                 "two costs",
