@@ -6,13 +6,15 @@
 //! what the content declares:
 //!
 //! - At most [`MAX_SKILL_BYTES`] of files in all, [`MAX_FILES`] files and
-//!   directories, and [`MAX_DEPTH`] levels.
+//!   directories, [`MAX_DEPTH`] levels, and paths of [`MAX_PATH_BYTES`].
 //! - Names are plain: no empty, `.` or `..` component, no `\`, and no
 //!   control or invisible formatting character, so nothing lands outside
 //!   the skill's directory or hides what it is.
-//! - Only regular files and directories. A symlink, in an archive or a
-//!   clone, is refused rather than followed or copied; so are devices,
-//!   sockets and FIFOs.
+//! - Only regular files and directories. A symlink in an archive is
+//!   refused rather than followed or copied; so are devices, sockets and
+//!   FIFOs. A clone has neither: `git` checks symlinks out as plain files
+//!   holding their targets, and a symlink found in a tree is refused all
+//!   the same.
 //! - Modes are rewritten: directories `0755`, files `0644`, or `0755` when
 //!   an execute bit was set, so a skill may ship scripts, but never
 //!   set-id, sticky or group- or world-writable files.
@@ -40,6 +42,8 @@ pub const MAX_SKILL_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_FILES: usize = 1_000;
 /// The deepest a skill's files may be, in path components.
 pub const MAX_DEPTH: usize = 16;
+/// The longest path of a skill's file, from the skill's top, in bytes.
+pub const MAX_PATH_BYTES: usize = 1024;
 /// The largest `SKILL.md`.
 pub const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
 /// The largest front matter in a `SKILL.md`.
@@ -115,10 +119,11 @@ pub enum Problem {
     /// Too many hosts.
     #[error("A skill may ask for at most {MAX_HOSTS} hosts in `allowed-hosts`.")]
     TooManyHosts,
-    /// Over [`MAX_SKILL_BYTES`], [`MAX_FILES`] or [`MAX_DEPTH`].
+    /// Over [`MAX_SKILL_BYTES`], [`MAX_FILES`], [`MAX_DEPTH`] or
+    /// [`MAX_PATH_BYTES`].
     #[error(
         "The skill is too large: at most {} MB of files, {MAX_FILES} files and directories, \
-         {MAX_DEPTH} levels deep.",
+         {MAX_DEPTH} levels deep, and paths of at most {MAX_PATH_BYTES} bytes.",
         MAX_SKILL_BYTES / (1024 * 1024)
     )]
     TooLarge,
@@ -195,7 +200,7 @@ pub fn parse_skill_file(text: &str) -> Result<Manifest, Problem> {
     let mut yaml = String::new();
     let mut closed = false;
     for line in lines {
-        if matches!(line.trim_end(), "---" | "...") {
+        if line.trim_end() == "---" {
             closed = true;
             break;
         }
@@ -239,13 +244,19 @@ pub fn parse_skill_file(text: &str) -> Result<Manifest, Problem> {
     }
     let mut hosts: Vec<HostRule> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
+        let host = |reason: String| Problem::Host {
+            index: i + 1,
+            reason,
+        };
+        let entry = entry.trim();
+        if entry.starts_with('*') {
+            return Err(host(
+                "a skill names each host it needs; wildcards aren't allowed".into(),
+            ));
+        }
         let rule: HostRule = entry
-            .trim()
             .parse()
-            .map_err(|err: cred_proxy::HostRuleError| Problem::Host {
-                index: i + 1,
-                reason: err.to_string(),
-            })?;
+            .map_err(|err: cred_proxy::HostRuleError| host(err.to_string()))?;
         if !hosts.contains(&rule) {
             hosts.push(rule);
         }
@@ -291,9 +302,11 @@ struct Budget {
 }
 
 impl Budget {
-    fn entry(&mut self, depth: usize) -> Result<(), Problem> {
+    /// Counts an entry `depth` components deep whose path from the top is
+    /// `path_bytes` long.
+    fn entry(&mut self, depth: usize, path_bytes: usize) -> Result<(), Problem> {
         self.entries += 1;
-        if self.entries > MAX_FILES || depth > MAX_DEPTH {
+        if self.entries > MAX_FILES || depth > MAX_DEPTH || path_bytes > MAX_PATH_BYTES {
             return Err(Problem::TooLarge);
         }
         Ok(())
@@ -379,10 +392,11 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
         if parts[0] == MACOS_METADATA {
             continue;
         }
-        if !seen.insert(parts.join("/")) {
+        let joined = parts.join("/");
+        budget.entry(parts.len(), joined.len())?;
+        if !seen.insert(joined) {
             return Err(Problem::Duplicate.into());
         }
-        budget.entry(parts.len())?;
         let mode = entry.unix_mode().unwrap_or(0o644);
         let kind = mode & 0o170_000;
         if !is_dir && kind != 0 && kind != 0o100_000 {
@@ -437,8 +451,8 @@ pub fn check_tree(root: &Path) -> Result<(), CheckError> {
         fs::remove_dir_all(&git).map_err(io("removing a clone's .git"))?;
     }
     let mut budget = Budget::default();
-    let mut stack = vec![(root.to_owned(), 0usize)];
-    while let Some((dir, depth)) = stack.pop() {
+    let mut stack = vec![(root.to_owned(), 0usize, 0usize)];
+    while let Some((dir, depth, dir_bytes)) = stack.pop() {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
             .map_err(io("setting a skill directory's mode"))?;
         for entry in fs::read_dir(&dir).map_err(io("reading a skill's directory"))? {
@@ -447,14 +461,15 @@ pub fn check_tree(root: &Path) -> Result<(), CheckError> {
             if !name.to_str().is_some_and(plain_component) {
                 return Err(Problem::BadName.into());
             }
-            budget.entry(depth + 1)?;
+            let path_bytes = dir_bytes + usize::from(depth > 0) + name.len();
+            budget.entry(depth + 1, path_bytes)?;
             let path = entry.path();
             let meta = fs::symlink_metadata(&path).map_err(io("reading a skill's file"))?;
             let kind = meta.file_type();
             if kind.is_symlink() {
                 return Err(Problem::Symlink.into());
             } else if kind.is_dir() {
-                stack.push((path, depth + 1));
+                stack.push((path, depth + 1, path_bytes));
             } else if kind.is_file() {
                 budget.bytes(meta.len())?;
                 let mode = file_mode(meta.permissions().mode());
@@ -471,7 +486,8 @@ pub fn check_tree(root: &Path) -> Result<(), CheckError> {
 /// Finds the skill in `root`, a tree [`check_tree`] passed: `root` itself
 /// when it holds `SKILL.md`, or else the one directory in it, when that is
 /// all it holds and it holds `SKILL.md`. Returns that directory and what
-/// its `SKILL.md` says.
+/// its `SKILL.md` says. Anything else is [`Problem::NoSkillFile`], a lone
+/// file at the top included.
 ///
 /// # Errors
 ///
@@ -505,7 +521,14 @@ pub fn find_skill(root: &Path) -> Result<(PathBuf, Manifest), CheckError> {
 fn is_file(path: &Path) -> Result<bool, CheckError> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(meta.is_file()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
         Err(err) => Err(io("reading a skill's file")(err)),
     }
 }

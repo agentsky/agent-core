@@ -14,8 +14,9 @@ refused or fails, it prints `agentctl: <reason>` on standard error and exits
 with status 1; the reason says what to change. A usage mistake exits with
 status 2 and prints the usage.
 
-Messages are named by the ids the conversation shows you, such as `#7`. A
-platform message id (a Slack timestamp, a Rocket.Chat id) works too.
+`react` and `history --before` name a message by the id the conversation
+shows you, such as `#7`, or by its platform id (a Slack timestamp, a
+Rocket.Chat id). `post --to` takes platform ids only.
 
 ## attach
 

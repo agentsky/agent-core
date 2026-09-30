@@ -66,7 +66,7 @@ fn front_matter_gives_the_name_description_and_hosts() {
     assert!(manifest.hosts.is_empty());
 
     let text = "\u{feff}---\r\nname: gh\r\ndescription: >\r\n  Work with\r\n  GitHub.\r\n\
-                allowed-hosts:\r\n  - api.github.com\r\n  - API.GitHub.com.\r\n  - '*.githubusercontent.com'\r\n  - git.example.org:8443\r\n\
+                allowed-hosts:\r\n  - api.github.com\r\n  - API.GitHub.com.\r\n  - raw.githubusercontent.com\r\n  - git.example.org:8443\r\n\
                 allowed-tools: Bash\r\n---\r\nbody\r\n";
     let manifest = parse_skill_file(text).unwrap();
     assert_eq!(manifest.name.as_str(), "gh");
@@ -76,7 +76,7 @@ fn front_matter_gives_the_name_description_and_hosts() {
         hosts,
         [
             "api.github.com",
-            "*.githubusercontent.com",
+            "raw.githubusercontent.com",
             "git.example.org:8443"
         ],
         "hosts are normalized and repeats dropped"
@@ -101,6 +101,7 @@ fn front_matter_is_required_and_bounded() {
         "name: x\n---\n",
         "---\nname: x\ndescription: y\n",
         "--- \nname: x\n",
+        "---\nname: x\ndescription: y\n...\n",
     ] {
         assert_eq!(
             parse_skill_file(text),
@@ -167,6 +168,8 @@ fn hosts_follow_the_egress_rules() {
         ("github.com, 169.254.169.254", 2),
         ("localhost", 1),
         ("'*.com'", 1),
+        ("github.com, '*.github.io'", 2),
+        ("'*.githubusercontent.com'", 1),
         ("'10.0.0.1'", 1),
         ("'[::1]'", 1),
         ("'github.com:0'", 1),
@@ -180,6 +183,10 @@ fn hosts_follow_the_egress_rules() {
         assert!(!reason.contains("169.254"), "the reason repeats no input");
         assert!(err.to_string().starts_with(&format!("Entry {index} of")));
     }
+    let Err(Problem::Host { reason, .. }) = with("'*.example.org:8443'") else {
+        panic!("a wildcard");
+    };
+    assert!(reason.contains("wildcards aren't allowed"), "{reason}");
     let many: Vec<String> = (0..=MAX_HOSTS)
         .map(|i| format!("h{i}.example.org"))
         .collect();
@@ -328,6 +335,29 @@ fn a_zip_that_inflates_past_the_limits_is_refused() {
         )),
         Problem::TooLarge
     );
+
+    let long = format!("{0}/{0}/{0}/{0}/{0}", "n".repeat(205));
+    assert!(long.len() > MAX_PATH_BYTES);
+    assert_eq!(
+        problem(unpack_zip(
+            &zip_of(&[(&long, Some(b"x"), 0o100644)]),
+            &dir.join("d")
+        )),
+        Problem::TooLarge
+    );
+}
+
+#[test]
+fn a_tree_with_a_path_past_the_limit_is_refused() {
+    let dir = TempDir::new();
+    let tree = dir.join("long");
+    let part = "n".repeat(250);
+    let fits = tree.join(format!("{part}/{part}/{part}/{part}"));
+    fs::create_dir_all(&fits).unwrap();
+    fs::write(tree.join("SKILL.md"), SKILL).unwrap();
+    check_tree(&tree).unwrap();
+    fs::write(fits.join("n".repeat(25)), "x").unwrap();
+    assert_eq!(problem(check_tree(&tree)), Problem::TooLarge);
 }
 
 #[test]
@@ -422,6 +452,11 @@ fn the_skill_is_at_the_top_or_in_the_only_directory() {
     let empty = dir.join("empty");
     fs::create_dir_all(&empty).unwrap();
     assert_eq!(problem(find_skill(&empty)), Problem::NoSkillFile);
+
+    let lone = dir.join("lone");
+    fs::create_dir_all(&lone).unwrap();
+    fs::write(lone.join("README.md"), SKILL).unwrap();
+    assert_eq!(problem(find_skill(&lone)), Problem::NoSkillFile);
 
     let binary = dir.join("binary");
     fs::create_dir_all(&binary).unwrap();
