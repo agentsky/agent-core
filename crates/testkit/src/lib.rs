@@ -1,5 +1,7 @@
 //! Test doubles and fakes for agent-core.
 
+pub mod rocketchat;
+
 #[cfg(test)]
 mod tests {
     #[test]

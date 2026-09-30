@@ -945,8 +945,10 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
     never stored.
   - A token for the new bot, in one of two ways. Pick the one that works with
     the custom role on the target server version and record which in the PR:
-    - `users.createToken`. Recent servers refuse it unless the server runs
-      with `CREATE_TOKENS_FOR_USERS=true`.
+    - `users.createToken`. 7.x refuses it unless the server runs with
+      `CREATE_TOKENS_FOR_USERS=true`; 8.0 and later require a `secret` equal
+      to the server's `CREATE_TOKENS_FOR_USERS_SECRET`
+      ([impl-notes](impl-notes.md#userscreatetoken-needs-a-server-secret-and-its-token-expires)).
     - Log in once as the bot with its random password, then call
       `users.generatePersonalAccessToken`. The `bot` role needs
       `create-personal-access-tokens`, and the password is discarded
@@ -955,7 +957,9 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
   - `channels.invite` and `groups.invite`, `rooms.info`,
     `im.create`.
   - `chat.postMessage` with `tmid` for threads, `chat.update`, `chat.react`.
-  - `rooms.upload/{rid}` (multipart) with `tmid`.
+  - `rooms.media/{rid}` (multipart) then `rooms.mediaConfirm/{rid}/{fileId}`
+    with `tmid`. `rooms.upload/{rid}` was removed in Rocket.Chat 8.0
+    ([impl-notes](impl-notes.md#roomsupload-is-gone-in-rocketchat-80)).
   - `channels.history`, `groups.history`, `im.history` and
     `chat.getThreadMessages` for `history`.
 - Handles the rate limiter: honor `x-ratelimit-reset` on 429, and retry at most
