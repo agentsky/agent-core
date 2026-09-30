@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use auth::{Auth, AuthError, Endpoint, OAuthConfig, Plan, PlanInfo, TokenSource};
+use auth::{Auth, AuthError, Endpoint, LinkStatus, OAuthConfig, Plan, PlanInfo, TokenSource};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use core_types::{MemberId, MemberKey, SurfaceKind, TeamId, UserId};
@@ -44,7 +44,7 @@ async fn harness() -> Harness {
             .await
             .unwrap();
     let member = store
-        .ensure_member(&member_key("ada"), "Ada")
+        .ensure_member(&member_key("ada"), "Ada", now())
         .await
         .unwrap();
     let config = OAuthConfig {
@@ -101,7 +101,13 @@ async fn mount_profile(server: &MockServer, bearer: &str, organization_type: &st
         .await;
 }
 
-async fn link(store: &Store, member: MemberId, access: &str, refresh: &str, expires_in: i64) {
+async fn link(
+    store: &Store,
+    member: MemberId,
+    access: &str,
+    refresh: &str,
+    expires_in: i64,
+) -> i64 {
     store
         .put_claude_link(
             member,
@@ -112,9 +118,35 @@ async fn link(store: &Store, member: MemberId, access: &str, refresh: &str, expi
                 plan: Some("claude_max".to_owned()),
                 rate_limit_tier: Some("default_claude_max".to_owned()),
             },
+            now(),
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// Polls `check` until it holds, for work a refresh task finishes after its
+/// callers got their result.
+async fn eventually<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !check().await {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn stored_plan(store: &Store, member: MemberId) -> Option<String> {
+    store.get_claude_link(member).await.unwrap().unwrap().plan
+}
+
+async fn wait_for_plan(store: &Store, member: MemberId, plan: &str) {
+    eventually("the plan is stored", || async {
+        stored_plan(store, member).await.as_deref() == Some(plan)
+    })
+    .await;
 }
 
 fn query(url: &Url, key: &str) -> String {
@@ -398,7 +430,7 @@ async fn another_members_code_is_refused_and_invalidated() {
         .await;
     let bob = h
         .store
-        .ensure_member(&member_key("bob"), "Bob")
+        .ensure_member(&member_key("bob"), "Bob", now())
         .await
         .unwrap();
     let start = h.auth.start_login(h.member).await.unwrap();
@@ -644,10 +676,10 @@ async fn a_token_expiring_within_five_minutes_is_refreshed_and_the_plan_reread()
     let before = now();
     let token = h.auth.access_token(h.member).await.unwrap();
     assert_eq!(token.expose_secret(), "access-2");
+    wait_for_plan(&h.store, h.member, "claude_pro").await;
     let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
     assert_eq!(stored.access_token.expose_secret(), "access-2");
     assert_eq!(stored.refresh_token.expose_secret(), "refresh-2");
-    assert_eq!(stored.plan.as_deref(), Some("claude_pro"));
     assert_eq!(
         stored.rate_limit_tier.as_deref(),
         Some("default_claude_pro")
@@ -704,6 +736,11 @@ async fn a_refresh_keeps_the_old_plan_when_the_profile_fails() {
         .await;
     link(&h.store, h.member, "access-1", "refresh-1", 60).await;
     h.auth.access_token(h.member).await.unwrap();
+    eventually("the profile is read", || async {
+        !requests_to(&h.server, PROFILE_PATH).await.is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
     assert_eq!(stored.access_token.expose_secret(), "access-2");
     assert_eq!(stored.plan.as_deref(), Some("claude_max"));
@@ -743,6 +780,10 @@ async fn ten_concurrent_calls_during_expiry_cause_one_refresh() {
     }
     assert_eq!(tokens, vec!["access-2"; 10]);
     assert_eq!(requests_to(&h.server, TOKEN_PATH).await.len(), 1);
+    eventually("the profile is read", || async {
+        !requests_to(&h.server, PROFILE_PATH).await.is_empty()
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -758,43 +799,72 @@ async fn a_refused_refresh_breaks_the_link_and_requires_relink() {
         .mount(&h.server)
         .await;
     link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+    let mut notices = h.auth.take_relink_notices().unwrap();
+    assert!(h.auth.take_relink_notices().is_none());
 
     let err = h.auth.access_token(h.member).await.unwrap_err();
-    assert!(
-        matches!(err, AuthError::RelinkRequired { newly_broken: true }),
-        "{err:?}"
-    );
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
     assert!(!format!("{err} {err:?}").contains("refresh-1"));
     let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
     assert!(stored.broken_at.is_some());
+    assert_eq!(notices.try_recv().unwrap(), h.member);
 
     let err = h.auth.access_token(h.member).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            AuthError::RelinkRequired {
-                newly_broken: false
-            }
-        ),
-        "{err:?}"
-    );
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
+    assert!(notices.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn unauthorized_and_forbidden_refreshes_also_break_the_link() {
-    for status in [401, 403] {
+async fn terminal_oauth_errors_and_an_account_on_hold_break_the_link() {
+    let bodies = [
+        (401, json!({"error": "invalid_grant"})),
+        (400, json!({"error": "invalid_client"})),
+        (400, json!({"error": "invalid_scope"})),
+        (400, json!({"error": "unauthorized_client"})),
+        (
+            403,
+            json!({"error": "access_denied", "error_description": "account_on_hold"}),
+        ),
+    ];
+    for (status, body) in bodies {
         let h = harness().await;
         Mock::given(method("POST"))
             .and(path(TOKEN_PATH))
-            .respond_with(ResponseTemplate::new(status))
+            .respond_with(ResponseTemplate::new(status).set_body_json(&body))
             .mount(&h.server)
             .await;
         link(&h.store, h.member, "access-1", "refresh-1", 60).await;
         let err = h.auth.access_token(h.member).await.unwrap_err();
         assert!(
-            matches!(err, AuthError::RelinkRequired { newly_broken: true }),
-            "{status}: {err:?}"
+            matches!(err, AuthError::RelinkRequired),
+            "{status} {body}: {err:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn a_4xx_without_a_terminal_oauth_error_does_not_break_the_link() {
+    let responses = [
+        ResponseTemplate::new(403).set_body_string("<html>Just a moment...</html>"),
+        ResponseTemplate::new(401),
+        ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_request"})),
+        ResponseTemplate::new(403).set_body_json(json!({"error": "invalid_grant"})),
+    ];
+    for response in responses {
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(response)
+            .expect(1)
+            .mount(&h.server)
+            .await;
+        link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+        let token = h.auth.access_token(h.member).await.unwrap();
+        assert_eq!(token.expose_secret(), "access-1");
+        let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+        assert!(stored.broken_at.is_none());
+        let mut notices = h.auth.take_relink_notices().unwrap();
+        assert!(notices.try_recv().is_err());
     }
 }
 
@@ -1028,6 +1098,350 @@ async fn a_refresh_finishing_after_the_link_was_deleted_does_not_recreate_it() {
     let err = refresh.await.unwrap().unwrap_err();
     assert!(matches!(err, AuthError::NotLinked), "{err:?}");
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
+    eventually("the orphaned refresh token is revoked", || async {
+        !requests_to(&h.server, REVOKE_PATH).await.is_empty()
+    })
+    .await;
+}
+
+async fn stored_tokens(store: &Store, member: MemberId) -> (String, String) {
+    let link = store.get_claude_link(member).await.unwrap().unwrap();
+    (
+        link.access_token.expose_secret().to_owned(),
+        link.refresh_token.expose_secret().to_owned(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_caller_does_not_lose_the_rotated_refresh_token() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(
+            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    mount_profile(&h.server, "access-2", "claude_pro").await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(100), h.auth.access_token(h.member)).await;
+    assert!(cancelled.is_err());
+    eventually("the rotated tokens are stored", || async {
+        stored_tokens(&h.store, h.member).await == ("access-2".to_owned(), "refresh-2".to_owned())
+    })
+    .await;
+    wait_for_plan(&h.store, h.member, "claude_pro").await;
+    let token = h.auth.access_token(h.member).await.unwrap();
+    assert_eq!(token.expose_secret(), "access-2");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_caller_does_not_lose_the_broken_mark_or_the_notice() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"error": "invalid_grant"}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+    let mut notices = h.auth.take_relink_notices().unwrap();
+
+    let cancelled =
+        tokio::time::timeout(Duration::from_millis(100), h.auth.access_token(h.member)).await;
+    assert!(cancelled.is_err());
+    let notice = tokio::time::timeout(Duration::from_secs(5), notices.recv())
+        .await
+        .unwrap();
+    assert_eq!(notice, Some(h.member));
+    let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+    assert!(stored.broken_at.is_some());
+    let err = h.auth.access_token(h.member).await.unwrap_err();
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
+    assert!(notices.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ten_concurrent_calls_during_a_failing_refresh_send_one_request() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(200)))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..10 {
+        let (auth, member) = (h.auth.clone(), h.member);
+        tasks.spawn(async move { auth.access_token(member).await });
+    }
+    let mut tokens = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        tokens.push(result.unwrap().unwrap().expose_secret().to_owned());
+    }
+    assert_eq!(tokens, vec!["access-1"; 10]);
+    assert_eq!(requests_to(&h.server, TOKEN_PATH).await.len(), 1);
+
+    let token = h.auth.access_token(h.member).await.unwrap();
+    assert_eq!(token.expose_secret(), "access-1");
+    assert_eq!(requests_to(&h.server, TOKEN_PATH).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_callers_share_a_failed_refresh_of_an_expired_token() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(200)))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", -1).await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..5 {
+        let (auth, member) = (h.auth.clone(), h.member);
+        tasks.spawn(async move { auth.access_token(member).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AuthError::Status {
+                    endpoint: Endpoint::Token,
+                    status: 503,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_token_that_expires_during_a_failed_refresh_is_not_returned() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(2_500)))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 2).await;
+    let err = h.auth.access_token(h.member).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AuthError::Status {
+                endpoint: Endpoint::Token,
+                status: 503,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_plan_is_read_after_the_members_lock_is_released() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(token_response("access-2", Some("refresh-2")))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(PROFILE_PATH))
+        .respond_with(profile_response("claude_pro").set_delay(Duration::from_millis(1_500)))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(REVOKE_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+
+    let token = tokio::time::timeout(Duration::from_millis(1_000), h.auth.access_token(h.member))
+        .await
+        .expect("the caller doesn't wait for the profile")
+        .unwrap();
+    assert_eq!(token.expose_secret(), "access-2");
+    eventually("the profile is requested", || async {
+        !requests_to(&h.server, PROFILE_PATH).await.is_empty()
+    })
+    .await;
+    let logged_out = tokio::time::timeout(Duration::from_millis(1_000), h.auth.logout(h.member))
+        .await
+        .expect("logout doesn't wait for the profile");
+    assert!(logged_out.unwrap());
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_refresh_does_not_break_a_newer_login() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"error": "invalid_grant"}))
+                .set_delay(Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+    let mut notices = h.auth.take_relink_notices().unwrap();
+
+    let refresh = {
+        let (auth, member) = (h.auth.clone(), h.member);
+        tokio::spawn(async move { auth.access_token(member).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    link(&h.store, h.member, "access-new", "refresh-new", 3600).await;
+    let token = refresh.await.unwrap().unwrap();
+    assert_eq!(token.expose_secret(), "access-new");
+    let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+    assert!(stored.broken_at.is_none());
+    assert!(notices.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_finishing_after_a_new_login_does_not_overwrite_it() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(
+            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    mount_profile(&h.server, "access-2", "claude_pro").await;
+    Mock::given(method("POST"))
+        .and(path(REVOKE_PATH))
+        .and(body_json(json!({
+            "token": "refresh-2",
+            "token_type_hint": "refresh_token",
+            "client_id": CLIENT_ID,
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+
+    let refresh = {
+        let (auth, member) = (h.auth.clone(), h.member);
+        tokio::spawn(async move { auth.access_token(member).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let fresh = link(&h.store, h.member, "access-new", "refresh-new", 3600).await;
+    let token = refresh.await.unwrap().unwrap();
+    assert_eq!(token.expose_secret(), "access-new");
+    assert_eq!(
+        stored_tokens(&h.store, h.member).await,
+        ("access-new".to_owned(), "refresh-new".to_owned())
+    );
+    eventually("the orphaned refresh token is revoked", || async {
+        !requests_to(&h.server, REVOKE_PATH).await.is_empty()
+    })
+    .await;
+    let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+    assert_eq!(stored.generation, fresh);
+    assert_eq!(stored.plan.as_deref(), Some("claude_max"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_start_logins_leave_exactly_one_pending_login() {
+    let h = harness().await;
+    let starts = tokio::join!(
+        h.auth.start_login(h.member),
+        h.auth.start_login(h.member),
+        h.auth.start_login(h.member),
+        h.auth.start_login(h.member),
+        h.auth.start_login(h.member),
+        h.auth.start_login(h.member),
+    );
+    let mut live = 0;
+    for start in [starts.0, starts.1, starts.2, starts.3, starts.4, starts.5] {
+        let state = query(&Url::parse(&start.unwrap().url).unwrap(), "state");
+        if h.store.take_pending_login(&state).await.unwrap().is_some() {
+            live += 1;
+        }
+    }
+    assert_eq!(live, 1);
+}
+
+#[tokio::test]
+async fn status_reports_the_link_the_plan_and_a_break() {
+    let h = harness().await;
+    assert_eq!(
+        h.auth.status(h.member).await.unwrap(),
+        LinkStatus {
+            linked: false,
+            plan: PlanInfo::default(),
+            broken: false,
+        }
+    );
+    let generation = link(&h.store, h.member, "access-1", "refresh-1", 3600).await;
+    assert_eq!(
+        h.auth.status(h.member).await.unwrap(),
+        LinkStatus {
+            linked: true,
+            plan: PlanInfo {
+                plan: Some(Plan::Max),
+                rate_limit_tier: Some("default_claude_max".to_owned()),
+            },
+            broken: false,
+        }
+    );
+    assert!(
+        h.store
+            .mark_claude_link_broken(h.member, generation, now())
+            .await
+            .unwrap()
+    );
+    let status = h.auth.status(h.member).await.unwrap();
+    assert!(status.linked && status.broken);
+}
+
+#[tokio::test]
+async fn status_reads_no_token() {
+    let path = std::env::temp_dir().join(format!("auth-status-{}.db", MemberId::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let key = || Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
+    let store = Store::open(&url, key()).await.unwrap();
+    let member = store
+        .ensure_member(&member_key("ada"), "Ada", now())
+        .await
+        .unwrap();
+    link(&store, member, "access-1", "refresh-1", 3600).await;
+    drop(store);
+
+    let store = Store::open(&url, key()).await.unwrap();
+    assert!(store.get_claude_link(member).await.is_err());
+    let auth = Auth::new(OAuthConfig::default(), store.clone()).unwrap();
+    let status = auth.status(member).await.unwrap();
+    assert!(status.linked && !status.broken);
+    assert_eq!(status.plan.plan, Some(Plan::Max));
+    drop((auth, store));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }
 
 #[tokio::test]
@@ -1035,7 +1449,8 @@ async fn errors_never_contain_secrets() {
     let secrets = ["access-secret", "refresh-secret", "code-secret"];
     let errors = [
         AuthError::NotLinked,
-        AuthError::RelinkRequired { newly_broken: true },
+        AuthError::RelinkRequired,
+        AuthError::RefreshInterrupted,
         AuthError::MalformedCode,
         AuthError::UnknownLogin,
         AuthError::LoginExpired,

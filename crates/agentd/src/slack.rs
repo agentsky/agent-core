@@ -19,6 +19,7 @@ use store::Store;
 use surface_slack::{
     BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, SlackInbound, ingress,
 };
+use time::OffsetDateTime;
 
 use crate::app::App;
 
@@ -82,7 +83,10 @@ pub struct StoreDedup(pub Store);
 #[async_trait::async_trait]
 impl Dedup for StoreDedup {
     async fn first_time(&self, source: &str, key: &str) -> Result<bool, BoxError> {
-        Ok(self.0.mark_event_processed(source, key).await?)
+        Ok(self
+            .0
+            .mark_event_processed(source, key, OffsetDateTime::now_utc())
+            .await?)
     }
 }
 

@@ -29,6 +29,7 @@ unsafe_code = "forbid"
 all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
+agentd = { path = "crates/agentd" }
 core-types = { path = "crates/core-types" }
 store = { path = "crates/store" }
 auth = { path = "crates/auth" }

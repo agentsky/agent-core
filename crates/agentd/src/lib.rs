@@ -7,6 +7,7 @@
 //!
 //! - [`config`]: the TOML file plus secret environment variables.
 //! - [`app`]: [`App`], the shared state.
+//! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
 //! - [`slack`]: the Slack request URLs' signing secrets, deduplication and
 //!   queue.
@@ -19,6 +20,7 @@
 pub mod app;
 pub mod cli;
 pub mod config;
+pub mod ctl;
 pub mod net;
 pub mod server;
 pub mod slack;

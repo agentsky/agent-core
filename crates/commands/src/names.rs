@@ -14,7 +14,7 @@ pub(crate) struct Reason(pub(crate) &'static str);
 
 impl From<Reason> for ParseError {
     fn from(reason: Reason) -> Self {
-        ParseError::new(ParseErrorKind::Invalid, reason.0.to_owned(), false)
+        ParseError::new(ParseErrorKind::Invalid, reason.0.to_owned())
     }
 }
 
@@ -211,10 +211,79 @@ fn plain_name(name: &str) -> Option<String> {
     valid.then(|| name.to_owned())
 }
 
+const SKILL_SOURCE_RULE: Reason = Reason(
+    "A skill source is an https:// Git URL, optionally ending in #ref. \
+     Leave it out to add a SKILL.md or .zip attached to a direct message with me.",
+);
+
+/// The longest skill source accepted, in bytes.
+const SKILL_SOURCE_MAX: usize = 2048;
+
+/// Parses a `skill add` source: an `https://` Git URL, optionally ending
+/// in `#ref`, given as typed or as a Slack link token.
+///
+/// agentd passes the source to `git clone`, so the rule is deliberately
+/// narrow. The scheme must be `https://`, which keeps out `-` option
+/// look-alikes, `ext::` and `file://` transports, and SSH forms. The host
+/// is letters, digits, `.` and `-`, with an optional numeric port, so
+/// credentials (`user:token@host`) are refused rather than stored. The path
+/// is letters, digits and `-._~/%+`. A ref starts with a letter or digit,
+/// continues with letters, digits and `._/-`, and has no `..` or `//` and no
+/// trailing `/` or `.`, which also rules out a ref that `git` would read as
+/// an option.
+pub(crate) fn parse_skill_source(s: &str) -> Result<String, Reason> {
+    let url = unwrap_slack_link(s);
+    if url.len() > SKILL_SOURCE_MAX {
+        return Err(SKILL_SOURCE_RULE);
+    }
+    let rest = url.strip_prefix("https://").ok_or(SKILL_SOURCE_RULE)?;
+    let (location, git_ref) = match rest.split_once('#') {
+        Some((location, git_ref)) => (location, Some(git_ref)),
+        None => (rest, None),
+    };
+    let (authority, path) = location
+        .find('/')
+        .map_or((location, ""), |i| location.split_at(i));
+    let valid = is_git_host(authority)
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._~/%+".contains(c))
+        && git_ref.is_none_or(is_git_ref);
+    if valid {
+        Ok(url.to_owned())
+    } else {
+        Err(SKILL_SOURCE_RULE)
+    }
+}
+
+fn is_git_host(authority: &str) -> bool {
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    host.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        && port.is_none_or(|port| {
+            (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+fn is_git_ref(git_ref: &str) -> bool {
+    git_ref.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && git_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        && !git_ref.contains("..")
+        && !git_ref.contains("//")
+        && !git_ref.ends_with(['/', '.'])
+}
+
 /// Unwraps a Slack link token, `<url>` or `<url|label>`, to its URL. Slack
 /// wraps links this way in message text and in slash command text. Other
 /// text is returned unchanged.
-pub(crate) fn unwrap_slack_link(s: &str) -> &str {
+fn unwrap_slack_link(s: &str) -> &str {
     match s.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         Some(body) if !body.starts_with(['@', '#', '!']) => {
             body.split_once('|').map_or(body, |(url, _label)| url)
@@ -307,6 +376,88 @@ mod tests {
         assert_eq!(parse_user("<@U1|bob>"), Ok(UserRef::Id("U1".into())));
         for bad in ["bob", "#general", "<#C1>", "everyone", "<@lower>"] {
             assert_eq!(parse_user(bad), Err(USER_RULE), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn skill_sources_accept_https_git_urls_with_an_optional_ref() {
+        for ok in [
+            "https://github.com/o/r.git",
+            "https://github.com/o/r",
+            "https://github.com/o/r.git#v1.2.0",
+            "https://github.com/o/r#release/2026-09",
+            "https://github.com/o/r#0123abcdef",
+            "https://git.example.org:8443/~team/skills_repo%20x+y.git#main",
+            "https://example.org",
+        ] {
+            assert_eq!(parse_skill_source(ok).as_deref(), Ok(ok), "{ok}");
+        }
+        assert_eq!(
+            parse_skill_source("<https://g.it/a.git#v1|g.it/a.git#v1>").as_deref(),
+            Ok("https://g.it/a.git#v1")
+        );
+    }
+
+    #[test]
+    fn skill_sources_that_git_could_read_as_options_are_refused() {
+        for bad in [
+            "--upload-pack=touch /tmp/pwned",
+            "-uhttps://github.com/o/r",
+            "--config=core.sshCommand=x",
+            "https://github.com/o/r#--upload-pack=x",
+            "https://github.com/o/r#-b",
+        ] {
+            assert_eq!(parse_skill_source(bad), Err(SKILL_SOURCE_RULE), "{bad}");
+        }
+    }
+
+    #[test]
+    fn skill_sources_other_than_https_are_refused() {
+        for bad in [
+            "",
+            "http://github.com/o/r",
+            "HTTPS://github.com/o/r",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r",
+            "git://github.com/o/r",
+            "file:///etc",
+            "/srv/repo",
+            "../repo",
+            "ext::sh -c touch% /tmp/pwned",
+            "github.com/o/r",
+            "<@U1>",
+        ] {
+            assert_eq!(parse_skill_source(bad), Err(SKILL_SOURCE_RULE), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn skill_sources_with_a_malformed_host_path_or_ref_are_refused() {
+        let long = format!("https://g.it/{}", "a".repeat(SKILL_SOURCE_MAX));
+        for bad in [
+            "https://",
+            "https:///o/r",
+            "https://user:token@github.com/o/r",
+            "https://-x.org/o/r",
+            "https://g.it:/o/r",
+            "https://g.it:123456/o/r",
+            "https://g.it:80a/o/r",
+            "https://g.it/o/r?x=1",
+            "https://g.it/o/r;x",
+            "https://g.it/o/r$(id)",
+            "https://g.it/o/ré",
+            "https://g.it/o/r#",
+            "https://g.it/o/r#a..b",
+            "https://g.it/o/r#a//b",
+            "https://g.it/o/r#a/",
+            "https://g.it/o/r#a.",
+            "https://g.it/o/r#.a",
+            "https://g.it/o/r#a@{1}",
+            "https://g.it/o/r#a#b",
+            "https://g.it/o/r#a b",
+            &long,
+        ] {
+            assert_eq!(parse_skill_source(bad), Err(SKILL_SOURCE_RULE), "{bad:?}");
         }
     }
 
