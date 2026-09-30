@@ -2935,6 +2935,16 @@ Not scheduled. Each needs a decision before it becomes a task.
   credential while turn N+1 runs, whoever its requester is. Only killing
   the processes a turn leaves behind in the container when it ends removes
   that.
+- **Metering at the credential proxy.** T27's meter and thread token
+  budget read tokens and cost from the CLI's output, and the agent runs as
+  the CLI's user, so it can print its own `assistant` and `result` lines
+  and write the transcript the CLI restores its cost from. The turn caps
+  and the hop cap are the hard bounds on a loop; tokens are not. [T34](#t34)'s
+  acceptance ("the thread token budget from T27 stops a chain") holds for
+  agents that loop by mistake, not for one that forges its counts. Counting
+  each turn's tokens and cost from the API responses the credential proxy
+  (T18) forwards, keyed by the turn's placeholder, would make the budget
+  and the meter hard bounds too.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private

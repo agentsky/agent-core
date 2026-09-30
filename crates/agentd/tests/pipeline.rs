@@ -1026,6 +1026,25 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
             .is_none(),
         "an unlinked member without the community key runs nothing and isn't billed"
     );
+
+    stack.next_turn(Turn {
+        commands: vec![vec!["sh".into(), "-c".into(), "kill -9 $PPID".into()]],
+        ..Turn::reply("Never said.")
+    });
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "k1", None, &[BOT]))
+        .await;
+    let billed = store.member_usage_since(bob, today).await.unwrap();
+    assert_eq!(
+        (billed.turns, billed.input_tokens, billed.output_tokens),
+        (2, 20, 2),
+        "a turn whose CLI the agent killed is billed what its messages used"
+    );
+    let spend = store
+        .thread_spend(&thread("GENERAL", "k1"), OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
     stack.stop().await;
 }
 

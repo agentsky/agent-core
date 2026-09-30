@@ -1238,19 +1238,21 @@ fn limit_window(
 
 /// What the meter bills for a turn that ended as `outcome`: the input the
 /// model read fresh (uncached input and cache writes), the output and the
-/// cost. Cache reads, which every call of a turn repeats, aren't billed. A
-/// turn that crashed or timed out has no usage.
+/// cost, from [`TurnOutcome::usage`], so a turn that crashed or timed out
+/// is billed what its messages used. Cache reads, which every call of a
+/// turn repeats, aren't billed.
 fn turn_usage(outcome: &TurnOutcome) -> TurnUsage {
-    let TurnOutcome::Finished(result) = outcome else {
-        return TurnUsage::default();
+    let usage = outcome.usage();
+    let cost_usd = match outcome {
+        TurnOutcome::Finished(result) => result.cost_usd.unwrap_or(0.0),
+        TurnOutcome::Crashed { .. } | TurnOutcome::TimedOut { .. } => 0.0,
     };
-    let usage = result.usage.unwrap_or_default();
     TurnUsage {
         input_tokens: usage
             .input_tokens
             .saturating_add(usage.cache_creation_input_tokens),
         output_tokens: usage.output_tokens,
-        cost_usd: result.cost_usd.unwrap_or(0.0),
+        cost_usd,
     }
 }
 

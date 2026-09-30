@@ -6519,8 +6519,34 @@ stop a long thread after a few turns.
 **Solution.** The meter's input tokens are uncached input plus cache
 writes, and its tokens are those plus output, for `usage`, `thread_usage`
 and `me`. `usage.cost_usd` keeps the CLI's own figure, which prices every
-kind. A turn that crashed or timed out is counted as a turn with no
-tokens.
+kind.
+
+### A turn is billed at least what its messages used
+
+**Issue.** Only a result line carries a turn's usage, so a turn that
+crashed or timed out, one whose CLI the agent killed itself included,
+counted as a turn with no tokens, and a loop of such turns never reached
+the thread's token budget. A result line that reports less than the turn
+used would undercut it too.
+
+**Solution.** `TurnStats::message_usage` adds up the `message.usage` of
+the turn's `assistant` lines. The CLI prints one line per content block of
+an API message, each with that message's usage so far, so consecutive
+lines with one `message.id` count once, at their largest; in the captures
+their output counts are lower than the result's, and their input counts
+add up to it. `TurnOutcome::usage` is that sum for a turn that crashed or
+timed out, and for a finished one each count the larger of the result's
+and the sum, so a forged low result can't undercut what was streamed
+first. The meter bills it.
+
+The agent runs as the CLI's user, so it can write to the CLI's stdout as
+well as its transcript, and print whatever lines it likes. Token counts
+are therefore the CLI's only as long as the agent leaves them alone: they
+stop agents that loop by mistake, not one that means to overspend. The
+turn caps (per thread and hour, and per agent and day) and the hop cap
+count turns agentd starts itself, so they are the hard bounds on a loop.
+Metering at the credential proxy, which sees every API response, would
+make tokens and cost a bound too (the plan's Deferred work).
 
 ### One table counts threads and agents
 

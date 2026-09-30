@@ -161,7 +161,10 @@ fn cost_state(line: &[u8]) -> Option<Option<f64>> {
     if entry.kind.as_deref() != Some("cost-state") {
         return Some(None);
     }
-    let total = entry.total?.as_f64().filter(|total| plausible_total(*total))?;
+    let total = entry
+        .total?
+        .as_f64()
+        .filter(|total| plausible_total(*total))?;
     Some(Some(total))
 }
 
@@ -274,11 +277,7 @@ mod tests {
         let lines = [message(3), cost_line(0.5), message(40), message(1)];
         write(&path, &lines);
         for chunk in 1..=40 {
-            assert_eq!(
-                scan(&path, u64::MAX, chunk),
-                Some(0.5),
-                "chunk {chunk}"
-            );
+            assert_eq!(scan(&path, u64::MAX, chunk), Some(0.5), "chunk {chunk}");
         }
         write(&path, &[cost_line(0.5)]);
         for chunk in [1, 7, 1_000] {

@@ -76,6 +76,24 @@ impl TurnOutcome {
         }
     }
 
+    /// What the turn used, as far as the CLI's output shows: for a
+    /// finished turn, each count the larger of its result's and its
+    /// `assistant` lines' ([`TurnStats::message_usage`]), so a result that
+    /// reports less than the messages printed before it can't lower it;
+    /// for a turn that crashed or timed out, its `assistant` lines'.
+    ///
+    /// The agent runs as the CLI's user and can write to its stdout, so
+    /// these are the CLI's figures only as far as the agent leaves them
+    /// alone: a record, and a budget against agents that loop by mistake,
+    /// not a bound on one that means to overspend.
+    pub fn usage(&self) -> Usage {
+        let streamed = self.stats().message_usage;
+        match self {
+            Self::Finished(result) => result.usage.map_or(streamed, |usage| usage.max(streamed)),
+            Self::Crashed { .. } | Self::TimedOut { .. } => streamed,
+        }
+    }
+
     /// Whether the turn finished with a result that isn't an error.
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Finished(result) if !result.is_error)
@@ -173,7 +191,8 @@ impl fmt::Debug for TurnResult {
     }
 }
 
-/// A result's token counts. A missing count is 0.
+/// Token counts, from a result or an `assistant` line's message. A
+/// missing count is 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     /// Input tokens not read from or written to the cache.
@@ -184,6 +203,38 @@ pub struct Usage {
     pub cache_creation_input_tokens: u64,
     /// Input tokens read from the prompt cache.
     pub cache_read_input_tokens: u64,
+}
+
+impl Usage {
+    /// Each count the larger of `self`'s and `other`'s.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        self.zip(other, u64::max)
+    }
+
+    fn zip(self, other: Self, f: impl Fn(u64, u64) -> u64) -> Self {
+        Self {
+            input_tokens: f(self.input_tokens, other.input_tokens),
+            output_tokens: f(self.output_tokens, other.output_tokens),
+            cache_creation_input_tokens: f(
+                self.cache_creation_input_tokens,
+                other.cache_creation_input_tokens,
+            ),
+            cache_read_input_tokens: f(self.cache_read_input_tokens, other.cache_read_input_tokens),
+        }
+    }
+
+    /// The counts in `value`, a `usage` object, or `None` if it isn't one.
+    fn read(value: Option<&Value>) -> Option<Self> {
+        let usage = value.filter(|usage| usage.is_object())?;
+        let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        Some(Self {
+            input_tokens: count("input_tokens"),
+            output_tokens: count("output_tokens"),
+            cache_creation_input_tokens: count("cache_creation_input_tokens"),
+            cache_read_input_tokens: count("cache_read_input_tokens"),
+        })
+    }
 }
 
 /// Structural metadata about a turn, for diagnostics. It never holds a
@@ -213,7 +264,20 @@ pub struct TurnStats {
     pub malformed_lines: u32,
     /// How long the turn took.
     pub duration: Duration,
+    /// The token counts of the API messages the turn's `assistant` lines
+    /// carried, added up. The CLI prints a line per content block of a
+    /// message, each with the message's usage so far, so consecutive lines
+    /// with one `message.id` count once, at their largest. See
+    /// [`TurnOutcome::usage`].
+    pub message_usage: Usage,
+    /// The last `assistant` line's message id, if it had a short one, and
+    /// that message's usage so far, counted in `message_usage` already.
+    last_message: Option<(String, Usage)>,
 }
+
+/// The longest message id kept to tell a message's lines apart. The API's
+/// are far shorter.
+const MAX_MESSAGE_ID_LEN: usize = 128;
 
 /// What kind of failure an error result is. agentd tells the thread, and
 /// the turn's requester, which it was.
@@ -357,15 +421,7 @@ fn parse_result(line: &Value) -> ResultLine {
         .get("is_error")
         .and_then(Value::as_bool)
         .unwrap_or(subtype.as_deref() != Some("success"));
-    let usage = line.get("usage").filter(|u| u.is_object()).map(|u| {
-        let count = |key| u.get(key).and_then(Value::as_u64).unwrap_or(0);
-        Usage {
-            input_tokens: count("input_tokens"),
-            output_tokens: count("output_tokens"),
-            cache_creation_input_tokens: count("cache_creation_input_tokens"),
-            cache_read_input_tokens: count("cache_read_input_tokens"),
-        }
-    });
+    let usage = Usage::read(line.get("usage"));
     ResultLine {
         is_error,
         subtype,
@@ -388,14 +444,18 @@ fn parse_result(line: &Value) -> ResultLine {
 }
 
 /// Folds an `assistant` line into the stats: the count, the tool names of
-/// its `tool_use` blocks and its error code. Nothing else is read.
+/// its `tool_use` blocks, its error code and its message's id and usage.
+/// Nothing else is read.
 fn note_assistant(line: &Value, stats: &mut TurnStats) {
     stats.assistant_messages = stats.assistant_messages.saturating_add(1);
     if let Some(error) = code(line.get("error")) {
         stats.api_error = Some(error);
     }
-    let blocks = line
-        .get("message")
+    let message = line.get("message");
+    if let Some(usage) = Usage::read(message.and_then(|message| message.get("usage"))) {
+        note_message_usage(message, usage, stats);
+    }
+    let blocks = message
         .and_then(|message| message.get("content"))
         .and_then(Value::as_array);
     for block in blocks.into_iter().flatten() {
@@ -403,6 +463,25 @@ fn note_assistant(line: &Value, stats: &mut TurnStats) {
             stats.tool_calls.push(tool_name(block.get("name")));
         }
     }
+}
+
+/// Adds `usage`, what `message` used so far, to the stats' message usage:
+/// all of it for a new message, and only what it adds to the last line's
+/// for another line of the same message.
+fn note_message_usage(message: Option<&Value>, usage: Usage, stats: &mut TurnStats) {
+    let id = message
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= MAX_MESSAGE_ID_LEN);
+    let counted = match (&stats.last_message, id) {
+        (Some((last, counted)), Some(id)) if last == id => *counted,
+        _ => Usage::default(),
+    };
+    let usage = usage.max(counted);
+    stats.message_usage = stats
+        .message_usage
+        .zip(usage.zip(counted, u64::saturating_sub), u64::saturating_add);
+    stats.last_message = id.map(|id| (id.to_owned(), usage));
 }
 
 /// Parses one line, folding it into `stats`, and returns the result line
@@ -578,7 +657,25 @@ mod tests {
                 ignored_lines: 1,
                 malformed_lines: 0,
                 duration: Duration::ZERO,
+                message_usage: Usage {
+                    input_tokens: 20,
+                    output_tokens: 2,
+                    ..Usage::default()
+                },
+                last_message: Some((
+                    "msg_cap2".into(),
+                    Usage {
+                        input_tokens: 10,
+                        output_tokens: 1,
+                        ..Usage::default()
+                    }
+                )),
             }
+        );
+        assert_eq!(
+            TurnOutcome::Finished(first.clone()).usage(),
+            first.usage.unwrap(),
+            "the result counts every message in full"
         );
         assert!(!second.is_error);
         assert_eq!(second.usage.unwrap().output_tokens, 5);
@@ -828,7 +925,66 @@ mod tests {
                 ignored_lines: 5,
                 malformed_lines: 2,
                 duration: Duration::ZERO,
+                message_usage: Usage::default(),
+                last_message: None,
             }
+        );
+    }
+
+    #[test]
+    fn a_messages_lines_count_once_and_every_message_counts() {
+        let line = |id: &str, input: u64, output: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":{id},"content":[],"usage":{{"input_tokens":{input},"output_tokens":{output},"cache_creation_input_tokens":2,"cache_read_input_tokens":100}}}}}}"#
+            )
+        };
+        let mut stats = TurnStats::default();
+        for text in [
+            line(r#""msg_1""#, 10, 1),
+            line(r#""msg_1""#, 10, 7),
+            line(r#""msg_1""#, 9, 3),
+            line(r#""msg_2""#, 30, 4),
+            line(r#""msg_1""#, 10, 7),
+            line("null", 5, 5),
+            line("null", 5, 5),
+        ] {
+            note_line(text.as_bytes(), &mut stats);
+        }
+        let long_id = line(
+            &format!(r#""{}""#, "x".repeat(MAX_MESSAGE_ID_LEN + 1)),
+            1,
+            1,
+        );
+        note_line(long_id.as_bytes(), &mut stats);
+        note_line(long_id.as_bytes(), &mut stats);
+        assert_eq!(
+            stats.message_usage,
+            Usage {
+                input_tokens: 10 + 30 + 10 + 5 + 5 + 1 + 1,
+                output_tokens: 7 + 4 + 7 + 5 + 5 + 1 + 1,
+                cache_creation_input_tokens: 2 * 7,
+                cache_read_input_tokens: 100 * 7,
+            }
+        );
+
+        let crashed = TurnOutcome::Crashed {
+            exit_code: None,
+            stats: stats.clone(),
+        };
+        assert_eq!(crashed.usage(), stats.message_usage);
+        let low = br#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":500}}"#;
+        let finished = TurnOutcome::Finished(
+            note_line(low, &mut stats.clone())
+                .unwrap()
+                .into_result(stats.clone(), &mut Some(0.0)),
+        );
+        assert_eq!(
+            finished.usage(),
+            Usage {
+                output_tokens: 500,
+                ..stats.message_usage
+            },
+            "a result can't report less than the messages did"
         );
     }
 
