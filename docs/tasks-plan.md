@@ -234,7 +234,9 @@ description, and must pass T02's policy.
     `terminal_reason: "api_error"`.
   - Other line types, such as `rate_limit_event`, `system/api_retry`,
     `active_goal`, `autocompact_state` and `system/commands_changed`, appear
-    too and must be ignored. Parse every line
+    too and must be ignored. With an OAuth token, `rate_limit_event` follows
+    the first `assistant` line of each process; with an API key it didn't
+    appear. Parse every line
     leniently: unknown `type` values are skipped, and unknown fields are
     allowed.
 - The transcript lands at
@@ -264,8 +266,10 @@ description, and must pass T02's policy.
   account.
 - Other crates find the binary with `testkit::fake_claude_path()`. Cargo only
   sets `CARGO_BIN_EXE_<name>` for a package's own integration tests. The helper
-  runs `$CARGO build -p testkit --bin fake-claude --message-format=json` once
-  per test process and reads the executable path from the artifact message.
+  runs `$CARGO build --locked -p testkit --bin fake-claude
+  --message-format=json` once per test process and reads the executable path
+  from the artifact message. That call blocks, so tests make it before
+  starting any timeout.
   It passes `--target-dir` with the directory the running test executable
   was built in, because `cargo llvm-cov` names its target directory on the
   command line, where a nested cargo can't see it
@@ -643,7 +647,10 @@ Deliverables:
 - `MockSurface`, implementing `Surface`. It records every `post`, `edit`,
   `react` and `upload` in an inspectable log, serves canned `history`, has
   configurable `Caps`, and has an `inject(InboundEvent)` helper feeding the
-  `events` channel.
+  `events` channel. It honors its `Caps` (`Unsupported` for `edit` without
+  `supports_edit` and for thread targets without `supports_threads`), and
+  `fail_next(op, error)` makes the next call of an operation fail with a
+  platform error such as `RateLimited` or `Unauthorized`.
 - A `fake-claude` binary (`src/bin/fake-claude.rs`) that:
   - Accepts the full launch flag set from the design. It fails with exit 2 on
     unknown flags, and when both `--session-id` and `--resume` are given, or
@@ -657,7 +664,11 @@ Deliverables:
     a 200.
   - Emits the `init`, `assistant` and `result` lines from the script file named
     by `FAKE_CLAUDE_SCRIPT` (JSON: a list of turns, each with reply text,
-    `is_error`, optional delay, optional crash).
+    `is_error`, optional delay, optional crash, and optional raw
+    `extra_lines`, which may be unknown line types or not JSON at all). Like
+    the real CLI with an OAuth token, it also prints a `rate_limit_event`
+    after the first reply of each process, so a runner test always sees a
+    line it must skip.
   - Appends to the transcript at
     `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<id>.jsonl`.
   - Can run `agentctl` commands listed in the script, to exercise the ctl API
@@ -805,15 +816,20 @@ Deliverables:
   JavaScript string length, so its limit counts UTF-16 code units, and an emoji
   counts as two. It:
   - Prefers paragraph breaks, then line breaks, then spaces.
-  - Never cuts inside a Slack `<…>` token, a Markdown link, a mention or a
-    multi-byte character. Cuts fall on `char` boundaries.
+  - Never cuts inside a Slack `<…>` token, an HTML entity, a Markdown link
+    (inline, or a reference with a definition in the text), a mention or a
+    grapheme cluster, nor right before an `@` that follows anything but
+    whitespace or `>`. Cuts fall on `char` boundaries.
   - Closes an open code fence at the end of a chunk and reopens it, with the
     same info string, at the start of the next.
 - `render::directives::extract(text) -> (String, Vec<Directive>)` for
   `[[react: <emoji>]]` (the only directive for now). Directives inside code are
-  not parsed.
+  not parsed. Emoji names longer than 64 characters are dropped.
 - `render::rocketchat::to_markdown(md, directory)`: pass-through, neutralizing
-  `@all` and `@here` outside code, with the same `@Name` resolution as Slack
+  `@all` and `@here` everywhere, code included, because the server finds
+  mentions in the raw text (see
+  [impl-notes](impl-notes.md#code-doesnt-protect-a-broadcast-on-rocketchat)),
+  with the same `@Name` resolution as Slack
   (the directory returns usernames there; see
   [impl-notes](impl-notes.md#rocketchat-mentions-need-a-username-not-an-id)).
 - Per-surface limits as constants: Slack 3,000 characters per `text` chunk

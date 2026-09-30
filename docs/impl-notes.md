@@ -377,6 +377,83 @@ and then `--resume`. `fake-claude` follows what they showed:
 Absolute paths in the captures are rewritten to the sandbox layout
 (`/volume/sessions/<id>/work` and `…/claude`).
 
+### `rate_limit_event` comes once per process, and only with OAuth
+
+**Issue.** Review asked for `fake-claude` to print a `rate_limit_event`
+after every successful API call, so runner tests always meet a line they
+must skip. The capture in `tool-turns.jsonl` has one such line for three
+API calls, and the CLI's own schema describes the line as "emitted when rate
+limit info changes". Re-running Claude Code 2.1.285 against a local
+streaming server showed that with `CLAUDE_CODE_OAUTH_TOKEN` it prints one
+right after the first `assistant` line of each process, a `--resume`d
+process included, and with `ANTHROPIC_API_KEY` it prints none.
+
+**Solution.** `fake-claude` does the same: with the OAuth token, the first
+successful turn of each process prints `{"type":"rate_limit_event",
+"rate_limit_info":{"status":"allowed","isUsingOverage":false},…}` after its
+first `assistant` line. A test checks a tool turn and a reply against the
+capture's line sequence. For anything else a parser must skip, including
+lines that aren't JSON, a script turn lists raw `extra_lines`, printed after
+its commands and before its reply.
+
+### The real CLI's `anthropic-beta` header
+
+**Issue.** `fake-claude` sent `anthropic-beta: oauth-2025-04-20` with the
+OAuth token and nothing with an API key. The same capture showed Claude Code
+2.1.285 sending a comma list with either credential: ten betas with the
+OAuth token, starting `claude-code-20250219,oauth-2025-04-20,…`, and nine
+with an API key, without `oauth-2025-04-20` and
+`extended-cache-ttl-2025-04-11` but with
+`mid-conversation-tool-changes-2026-07-01`. It also sends `x-app: cli`.
+
+**Solution.** `fake-claude` sends the captured lists, exported as
+`testkit::claude::OAUTH_BETA` and `API_KEY_BETA` so T18 can check the proxy
+forwards them untouched, and `x-app: cli`. `fake_anthropic()` still records
+every header.
+
+### `MockSurface` lost an event when its loop ended mid-delivery
+
+**Issue.** The `events` loop took each event off its channel and then sent
+it. When the receiver was gone, or the loop was cancelled while the send
+waited for room, that event was dropped, although the docs promise that
+queued events stay for the next loop. The mock also ignored its own `Caps`
+and could not fail, so tests could not drive the core's handling of
+`Unsupported`, `RateLimited` or `Unauthorized`.
+
+**Solution.** Each binding's events are a queue under the mock's lock,
+with a `Notify` for new events. The loop sends a copy of the front event and
+removes it only once the sender has taken it, so neither a closed receiver
+nor a cancellation loses it. Calls check the `Caps` first (`edit` without
+`supports_edit`, a thread root without `supports_threads`), then a
+per-operation queue filled by `fail_next(op, error)`. Failed calls are not
+recorded, as a failed upload already wasn't.
+
+### A refused port the test keeps
+
+**Issue.** The unreachable-upstream test bound a port, dropped the
+listener and used the port. A server started by a parallel test could take
+the port in between, and the request would succeed or hang.
+
+**Solution.** The test binds a `tokio::net::TcpSocket` and never calls
+`listen`. The port stays taken for the whole test, so nothing else can get
+it, and a connection to a bound socket that isn't listening is refused at
+once.
+
+### `fake_claude_path()`'s nested build
+
+**Issue.** Review found the first call blocking the test thread for about
+20 seconds on a second dependency build, without `--locked`.
+
+**Solution.** The nested build passes `--locked`, and the rustdoc says the
+first call blocks and should come before any timeout. After a workspace
+`cargo test`, the nested build finds everything fresh and takes about
+0.2 seconds, and under `cargo coverage` the target directory holds a single
+build of each dependency. It builds again only when the caller's package selection
+resolved testkit's dependencies with other features, which a test process
+can't see. A `--profile` flag doesn't change feature resolution: it would
+only help under `cargo test --release`, which nothing here runs, so it isn't
+passed.
+
 ## T05: store
 
 ### The key reaches the store through `open`
@@ -727,10 +804,10 @@ a table or a list cut in two renders differently.
 delivery steps already list. `split` knows both renderers' output syntax:
 it never cuts inside a Slack `<…>` token, an HTML entity such as `&amp;`, a
 Markdown link or image, an `@mention`, a fence line, or a character, and
-keeps combining marks, joiners, skin-tone modifiers and flag pairs with the
-character before them. A property test renders generated Markdown with
-`to_mrkdwn` and checks that no cut lands inside a token or an entity. The
-crate docs state the order.
+keeps grapheme clusters together (see [Grapheme clusters need a mark
+table](#grapheme-clusters-need-a-mark-table)). A property test renders
+generated Markdown with `to_mrkdwn` and checks that no cut lands inside a
+token or an entity. The crate docs state the order.
 
 ### Chunks keep their whitespace, so they rejoin exactly
 
@@ -789,13 +866,102 @@ user id, which is what Slack's `<@U…>` needs. Rocket.Chat mentions are written
 
 **Solution.** The trait now returns "the handle the surface's mention syntax
 needs": a user id on Slack, a username on Rocket.Chat. The Rocket.Chat
-renderer only accepts a username made of letters, digits, `.`, `_` and `-`
-that isn't `all` or `here`, so a directory entry can't turn a mention into a
-broadcast. `@all` and `@here` get the same zero-width space as Slack's
-broadcasts. Code spans, code blocks, link destinations, autolinks and bare
-URLs are left alone, found with the same `pulldown-cmark` parse
-(`render::verbatim`), so `https://x.io/@all` keeps working. The bare URL
+renderer only accepts a username made of ASCII letters and digits, `.`, `_`
+and `-` (the server's name pattern) that isn't a broadcast name, so a
+directory entry can't turn a mention into a broadcast. Name resolution
+leaves code spans, code blocks, link destinations, autolinks and bare URLs
+alone, found with the same `pulldown-cmark` parse (`render::verbatim`).
+Broadcasts are neutralized everywhere, code and URLs included (see [Code
+doesn't protect a broadcast on
+Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
 scanner moved from `slack.rs` to `render::url` to be shared.
+
+### Code doesn't protect a broadcast on Rocket.Chat
+
+**Issue.** The renderer first neutralized `@all` and `@here` only outside
+code and link targets, with the Slack renderer's word rules (Unicode letters
+and digits, not after a letter). Rocket.Chat decides who a message notifies
+from its raw text, not from rendered Markdown. `MentionsParser.getUserMentions`
+(`app/mentions/lib/MentionsParser.ts`, the same in 7.10.0 and 8.0.0) removes
+`[label](dest)` links with `/\[[^\]]*\]\([^)]+\)/g`, then matches
+`(^|\s|>)@([0-9a-zA-Z-_.]+…)` with flags `gm`, and
+`MentionsServer.getUsersByMentions` (`app/mentions/server/Mentions.ts`)
+notifies the room when the name is `all` or `here`. The name class is
+ASCII-only and code isn't special. So `@all` in a fenced, indented or inline
+code span, `@allé` and `@here٣` (the name ends at the first non-ASCII
+character), a link title spanning lines, inline HTML (`<a>@all</a>`),
+`[x](y)@all` at a line start (the link removal leaves `@all` there), and a
+directory entry resolving to `allé` all broadcast.
+
+**Solution.** After rendering, `to_markdown` makes one last pass over the
+whole output, code and link targets included, with the server's grammar: it
+inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
+precedes the `@`. The server reads no name after the zero-width space. A
+URL or a code sample containing `/@all` or `@here` gets the zero-width space
+too; that is the price of the server not knowing about code. `@allison` and
+`@all.hands` stay untouched. The pass is the only place that inserts the
+space; name resolution just skips broadcasts so they are never offered to
+the directory. Usernames from the directory must match the server's ASCII
+class. The tests port the server's regex (`rocketchat::server`, checked
+against the JavaScript regex under Node on 30,000 generated strings while
+writing it) and assert that no output, and no chunk `split` makes from it,
+yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
+pattern; a server configured with a narrower name pattern could read `@all`
+out of `@all.hands`.
+
+### A cut can create or shorten a mention
+
+**Issue.** A mention was kept whole only when its `@` followed a
+non-alphanumeric character, and a cut could fall right before any `@`. The
+server's grammar accepts an `@` at the start of the message, so a harmless
+`x@name` could become a mention at the start of the next chunk, and a forced
+cut inside an oversized construct could shorten `@herectic` to `@here`.
+
+**Solution.** `split` keeps every `@` and the name after it together,
+whatever precedes the `@`, and never cuts right before an `@` that follows
+anything but whitespace or `>`. When a single construct is longer than the
+chunk and a cut has to fall inside it, the cut still avoids the inside of a
+name: it falls right after the `@` instead, so neither chunk holds a
+shortened name. Together with the final pass above, every `@` run in a chunk
+is a run of the rendered text, and those are already neutralized.
+
+### Grapheme clusters need a mark table
+
+**Issue.** The splitter's list of characters that attach to the one before
+them covered combining diacritics, variation selectors, emoji modifiers,
+the joiner and tags, but no script-specific marks. `"कि"` repeated and split
+at 1,001 characters gave chunks starting with the vowel sign U+093F; Thai
+vowels and tone marks, Hebrew and Arabic points, and Hangul vowel and
+trailing jamo were cut the same way. The workspace has no Unicode property
+crate.
+
+**Solution.** `split::graphemes` holds a table of 336 ranges: every
+character of general category `Mn`, `Mc` or `Me`, plus everything Unicode 17
+gives `Grapheme_Cluster_Break` `Extend`, `SpacingMark`, `V`, `T` or `ZWJ`,
+generated from the `unicode-segmentation` crate's tables and Python's
+`unicodedata`. A cut also never falls after an Indic virama
+(`Indic_Conjunct_Break=Linker`) before a letter, after a zero-width joiner,
+or after a Hangul leading jamo before another leading jamo or a syllable.
+Prepend characters and the full emoji ZWJ grammar are left out; the rules
+only ever remove cut positions, so an approximation errs toward longer
+clusters.
+
+### Reference links and long entity names
+
+**Issue.** Codex's review found two cuts the splitter allowed: inside a
+reference-style link, `aaaa[label][ref]` with `[ref]: /url` below, split at
+13, and inside an HTML entity with a name longer than ten characters, such
+as `&CounterClockwiseContourIntegral;`.
+
+**Solution.** When the text defines a label (a line starting `[label]:`
+after optional spaces and `>` markers), `[text][label]`, `[label][]` and
+`[label]` on one line are kept whole like inline links, with labels matched
+case-insensitively and with whitespace collapsed, as CommonMark does. Only
+labels without brackets and up to 999 characters count, which also keeps
+the matching linear. Brackets without a definition are ordinary text. An
+entity name may now have up to 31 characters, the length of the longest
+HTML5 name.
 
 ### Directive details qm-core decides and T07 doesn't
 
@@ -808,8 +974,9 @@ code included, whenever it removed something.
 
 **Solution.** `directives::extract` accepts several names separated by spaces
 or commas, strips colons, lowercases, keeps only valid short names
-(`[a-z0-9_+'-]+` with an optional `::skin-tone-2` to `-6`), drops duplicates
-and returns at most `MAX_REACTIONS` (5). Literal emoji characters are dropped:
+(`[a-z0-9_+'-]+` with an optional `::skin-tone-2` to `-6`, at most
+`MAX_NAME_LEN`, 64, characters in all), drops duplicates and returns at most
+`MAX_REACTIONS` (5). Literal emoji characters are dropped:
 the table would be a large data file for a case the agent's instructions can
 avoid. A directive with an `@` target is removed without effect, since
 reacting to the current message instead would be wrong and short message ids

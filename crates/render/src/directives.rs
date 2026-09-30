@@ -12,6 +12,9 @@ use crate::verbatim::{self, Scope};
 /// The most reactions one reply may add, as in qm-core.
 pub const MAX_REACTIONS: usize = 5;
 
+/// The longest emoji name kept, colons stripped and skin tone included.
+pub const MAX_NAME_LEN: usize = 64;
+
 const REACT: &[u8] = b"[[react:";
 
 /// An instruction the agent embedded in its reply.
@@ -34,7 +37,7 @@ pub enum Directive {
 /// - `[[react: <emoji>]]` adds a reaction. The keyword ignores ASCII case,
 ///   one directive may name several emoji separated by spaces or commas,
 ///   and names may carry colons (`:eyes:`). A name that isn't a valid short
-///   name is dropped. Duplicates are dropped, and at most
+///   name, or is longer than [`MAX_NAME_LEN`] characters, is dropped. Duplicates are dropped, and at most
 ///   [`MAX_REACTIONS`] reactions are returned.
 /// - A directive naming a target message after `@` is removed without
 ///   effect: reacting to another message isn't supported yet.
@@ -135,10 +138,14 @@ fn reactions(inner: &str) -> Vec<String> {
 }
 
 /// Lowercases a name and strips its colons. Returns `None` unless it is a
-/// short name: `[a-z0-9_+'-]+`, optionally followed by `::skin-tone-2` to
-/// `::skin-tone-6`.
+/// short name of at most [`MAX_NAME_LEN`] characters: `[a-z0-9_+'-]+`,
+/// optionally followed by `::skin-tone-2` to `::skin-tone-6`.
 fn normalize(raw: &str) -> Option<String> {
-    let name = raw.trim_matches(':').to_ascii_lowercase();
+    let name = raw.trim_matches(':');
+    if name.len() > MAX_NAME_LEN {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
     let (base, tone) = match name.split_once("::") {
         Some((base, tone)) => (base, Some(tone)),
         None => (name.as_str(), None),
@@ -381,6 +388,20 @@ mod tests {
             ),
             ("the keyword ignores case", "[[REACT: tada]]", "", &["tada"]),
         ]);
+    }
+
+    #[test]
+    fn names_longer_than_the_cap_are_dropped() {
+        let longest = "a".repeat(MAX_NAME_LEN);
+        let too_long = "b".repeat(MAX_NAME_LEN + 1);
+        let toned = format!("{}::skin-tone-2", "c".repeat(MAX_NAME_LEN - 13));
+        let toned_too_long = format!("{}::skin-tone-2", "d".repeat(MAX_NAME_LEN - 12));
+        let (text, directives) = extract(&format!(
+            "[[react: :{longest}: {too_long} {toned} {toned_too_long} {}]]",
+            "e".repeat(100_000)
+        ));
+        assert_eq!(text, "");
+        assert_eq!(directives, react(&[&longest, &toned]));
     }
 
     #[test]

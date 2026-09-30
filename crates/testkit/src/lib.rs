@@ -17,4 +17,4 @@ pub mod surface;
 
 pub use anthropic::{FakeAnthropic, fake_anthropic};
 pub use claude::{Turn, fake_claude_path, write_script};
-pub use surface::{Call, MockSurface, UploadedFile};
+pub use surface::{Call, MockSurface, Op, UploadedFile};
