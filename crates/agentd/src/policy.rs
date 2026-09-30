@@ -9,11 +9,13 @@
 //! and the owner is never refused. The commands change them so that each
 //! undoes the other:
 //!
-//! - `deny <target>` takes the target off the allow list and puts it on the
-//!   deny list.
+//! - `deny <target>` puts the target on the deny list and leaves the allow
+//!   list as it is, so a deny never lets anyone in: denying the one target
+//!   an agent allows leaves it to its owner.
 //! - `allow <target>` takes a denied target off the deny list, which is all
-//!   it does then. Otherwise it puts the target on the allow list, so the
-//!   first `allow` of a member or a channel limits the agent to it.
+//!   it does then, so an earlier allow of it applies again. Otherwise it
+//!   puts the target on the allow list, so the first `allow` of a member or
+//!   a channel limits the agent to it.
 //! - `allow everyone` empties the allow list and takes `everyone` off the
 //!   deny list, so everyone not denied by name may use the agent again.
 
@@ -196,18 +198,13 @@ impl Rules {
 
     /// Applies `deny <rule>`; see the [module docs](self).
     pub fn deny(&mut self, rule: Rule) -> Change {
-        let known = self.deny.iter().any(|denied| denied.same_target(&rule));
-        if !known && self.deny.len() >= MAX_RULES {
-            return Change::Full;
-        }
-        let allowed = self.allow.len();
-        self.allow.retain(|allowed| !allowed.same_target(&rule));
-        if known {
-            changed(self.allow.len() != allowed)
-        } else {
-            self.deny.push(rule);
-            Change::Changed
-        }
+        add(&mut self.deny, rule)
+    }
+
+    /// Whether `everyone` is denied, which leaves the agent to its owner
+    /// whatever the allow list says.
+    pub fn denies_everyone(&self) -> bool {
+        self.deny.contains(&Rule::Everyone)
     }
 
     /// Who may use the agent `name`, in a sentence or two.
@@ -219,13 +216,19 @@ impl Rules {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        if self.deny.contains(&Rule::Everyone) {
+        let allowed: Vec<Rule> = self
+            .allow
+            .iter()
+            .filter(|allowed| !self.deny.iter().any(|denied| denied.same_target(allowed)))
+            .cloned()
+            .collect();
+        if self.denies_everyone() || (allowed.is_empty() && !self.allow.is_empty()) {
             return format!("Only you may use `{name}`.");
         }
-        let mut text = if self.allow.is_empty() {
+        let mut text = if allowed.is_empty() {
             format!("Everyone may use `{name}`")
         } else {
-            format!("Only you and {} may use `{name}`", list(&self.allow))
+            format!("Only you and {} may use `{name}`", list(&allowed))
         };
         if self.deny.is_empty() {
             text.push('.');
@@ -362,7 +365,11 @@ mod tests {
             !permits(&rules, "alice", "C2"),
             "deny wins over a room rule"
         );
-        assert_eq!(rules.allow, [room("C2")]);
+        assert_eq!(rules.allow, [member("alice"), room("C2")]);
+        assert_eq!(
+            rules.describe("helper"),
+            "Only you and `#C2` may use `helper`, except `@alice`."
+        );
         assert_eq!(rules.allow(Rule::Everyone), Change::Changed);
         assert!(permits(&rules, "bob", "C1"));
         assert!(
@@ -385,12 +392,24 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_moves_between_the_lists_and_a_full_list_takes_no_more() {
+    fn a_deny_never_opens_the_agent_to_anyone() {
         let mut rules = Rules::default();
         rules.allow(member("bob"));
         assert_eq!(rules.deny(member("bob")), Change::Changed);
-        assert!(rules.allow.is_empty());
-        rules.deny.clear();
+        assert!(!permits(&rules, "bob", "C1"));
+        assert!(
+            !permits(&rules, "carol", "C1"),
+            "denying the only allowed member leaves the agent to its owner"
+        );
+        assert_eq!(rules.describe("helper"), "Only you may use `helper`.");
+        assert_eq!(rules.allow(member("bob")), Change::Changed);
+        assert!(permits(&rules, "bob", "C1"), "allow undoes the deny");
+        assert!(!permits(&rules, "carol", "C1"));
+    }
+
+    #[test]
+    fn a_full_list_takes_no_more() {
+        let mut rules = Rules::default();
         for n in 0..MAX_RULES {
             assert_eq!(rules.deny(member(&format!("u{n}"))), Change::Changed);
         }

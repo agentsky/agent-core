@@ -2317,6 +2317,13 @@ async fn allow_and_deny_change_the_owners_rules() {
 
     h.dm("alice", "deny helper everyone").await;
     assert_eq!(h.last_reply("alice"), "Only you may use `helper`.");
+    h.dm("alice", "allow helper <@DAVE>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you may use `helper`. `everyone` is denied, which wins over any allow: to let \
+         only your allowed targets use it, send `allow helper everyone` first, then allow them \
+         again."
+    );
     h.dm("alice", "allow helper everyone").await;
     assert_eq!(h.last_reply("alice"), "Everyone may use `helper`.");
     assert_eq!(policy().await, router::AgentPolicy::default());

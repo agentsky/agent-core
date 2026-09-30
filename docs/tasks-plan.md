@@ -2377,8 +2377,9 @@ Deliverables:
   channel (`#room`), or `everyone`. A member rule stores the identity and
   the member it belongs to, as `PolicyTarget::Member { key, member }`, so it
   covers the member on every surface. Deny wins, and the default allows
-  everyone. `deny` takes a target off the allow list, `allow` of a denied
-  target only lifts the deny, and `allow everyone` empties the allow list
+  everyone. `deny` never takes a target off the allow list, so it never
+  lets anyone in, `allow` of a denied target only lifts the deny, and
+  `allow everyone` empties the allow list
   ([impl-notes](impl-notes.md#allow-and-deny-undo-each-other)).
 - Thread caps from `[limits]`:
   - Agent turns per thread per hour (`thread_turns_per_hour`).

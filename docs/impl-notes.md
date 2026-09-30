@@ -6618,12 +6618,20 @@ time, as before.
 list restricts), but no command removes a rule, so the owner had no way
 back from a mistake.
 
-**Solution.** `deny <target>` takes the target off the allow list and puts
-it on the deny list. `allow <target>` of a denied target only lifts the
-deny; otherwise it puts the target on the allow list, so the first
-`allow` limits the agent to its targets. `allow everyone` empties the
-allow list and takes `everyone` off the deny list; denies by name stay.
-Each list holds at most 100 rules. Rules are JSON agentd owns
+**Solution.** `deny <target>` puts the target on the deny list and leaves
+the allow list alone. Taking the target off the allow list too, as a first
+version did, widened access: after `allow helper @bob`, `deny helper @bob`
+emptied the allow list and opened the agent to everyone else. A deny must
+never grant access, and deny wins anyway, so the allow entry stays, and
+`allow <target>` of a denied target only lifts the deny, which lets an
+earlier allow of it apply again. Otherwise `allow` puts the target on the
+allow list, so the first `allow` limits the agent to its targets. Replies
+leave a denied target out of the allowed ones, and an allow list whose
+every target is denied reads "Only you may use". `allow everyone` empties
+the allow list and takes `everyone` off the deny list; denies by name
+stay. An `allow` of a member or a channel while `everyone` is denied
+changes nothing anyone can see, so its reply says to send `allow <name>
+everyone` first. Each list holds at most 100 rules. Rules are JSON agentd owns
 (`policy::Rule`), with the identity or conversation and how the owner
 wrote it; replies name them in code spans, which neither surface turns
 into a mention. A member is resolved as `list` does (Slack sends an id,

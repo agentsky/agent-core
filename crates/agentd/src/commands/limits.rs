@@ -97,6 +97,7 @@ impl Commands {
                 ));
             }
         };
+        let allows_some = allow && rule != Rule::Everyone;
         let change = if allow {
             rules.allow(rule)
         } else {
@@ -117,7 +118,14 @@ impl Commands {
                 tracing::info!(agent = %agent.id, allow, "changed an agent's rules");
             }
         }
-        Ok(rules.describe(name))
+        let mut reply = rules.describe(name);
+        if allows_some && rules.denies_everyone() {
+            reply.push_str(&format!(
+                " `everyone` is denied, which wins over any allow: to let only your allowed \
+                 targets use it, send `allow {name} everyone` first, then allow them again."
+            ));
+        }
+        Ok(reply)
     }
 
     /// The rule `target` names, from `key`'s surface and team, or the reply
