@@ -6644,7 +6644,10 @@ day and hour, per thread, and per member, and the plan doesn't settle them.
   platform's copy's (T31's confirmation), as a turn ends or a window turns.
   The pipeline used to drop such a message silently; it now acts on the
   copy's decision when either is a limit's refusal (`limited`), since the
-  copy is the message as the platform has it.
+  copy is the message as the platform has it, but only if both decisions
+  name the same requester (`Decision::requester`): a limit can change
+  between the two routings, who asked can't, so a copy that names someone
+  else is dropped as any other difference is.
 
 ### The owner is never capped by their own agent's limit
 

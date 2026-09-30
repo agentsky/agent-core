@@ -58,6 +58,20 @@ pub enum Decision {
     },
 }
 
+impl Decision {
+    /// Whose request the decision answers: who pays for a turn, who is
+    /// prompted or refused. `None` for [`Decision::Ignore`].
+    pub fn requester(&self) -> Option<&Requester> {
+        match self {
+            Self::Ignore(_) => None,
+            Self::LinkPrompt { requester }
+            | Self::RelinkPrompt { requester }
+            | Self::Run { requester, .. }
+            | Self::Refuse { requester, .. } => Some(requester),
+        }
+    }
+}
+
 /// Why the router ignored an event. Ignored events get no reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IgnoreReason {

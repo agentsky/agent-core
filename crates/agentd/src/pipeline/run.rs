@@ -661,11 +661,8 @@ impl Pipeline {
     }
 
     /// Routes `job`'s message for `agent`, and unless the decision is to
-    /// ignore it, routes the platform's copy again and acts on the copy.
-    /// The copy's decision must be the event's, unless either is a limit's
-    /// refusal ([`limited`]): the counts a limit reads can change between
-    /// the two, as a turn ends or an hour or a day turns, and the copy is
-    /// the message as the platform has it.
+    /// ignore it, routes the platform's copy again and acts on the copy
+    /// if its decision may stand ([`copy_stands`]).
     async fn candidate(&self, job: &Job, agent: AgentId) {
         let (event, caps) = (job.event.as_ref(), job.caps);
         let Some(decision) = self.decide(event, agent, caps).await else {
@@ -685,7 +682,7 @@ impl Pipeline {
         let Some(confirmed) = self.decide(&copy, agent, caps).await else {
             return;
         };
-        if confirmed != decision && !limited(&decision) && !limited(&confirmed) {
+        if !copy_stands(&decision, &confirmed) {
             tracing::warn!(%agent, message = %event.message.id, "the platform's copy of a message routes differently from its event; dropped it");
             return;
         }
@@ -1324,6 +1321,18 @@ fn limited(decision: &Decision) -> bool {
     )
 }
 
+/// Whether the decision on the platform's copy of a message, `confirmed`,
+/// may be acted on when the event's was `decision`: when they are the
+/// same, or, for the same requester, when either is a limit's refusal
+/// ([`limited`]). The counts a limit reads can change between the two, as
+/// a turn ends or an hour or a day turns, and the copy is the message as
+/// the platform has it; who asked can't.
+fn copy_stands(decision: &Decision, confirmed: &Decision) -> bool {
+    confirmed == decision
+        || ((limited(decision) || limited(confirmed))
+            && decision.requester() == confirmed.requester())
+}
+
 /// For a refusal a limit over a day or an hour gives, the kind of notice
 /// and the window it counts in.
 fn limit_window(reason: RefuseReason) -> Option<(&'static str, LimitWindow)> {
@@ -1698,10 +1707,51 @@ mod tests {
             assert!(!limited(&refuse(reason)), "{reason}");
             assert!(limit_window(reason).is_none(), "{reason}");
         }
-        assert!(!limited(&Decision::LinkPrompt { requester }));
+        assert!(!limited(&Decision::LinkPrompt {
+            requester: requester.clone()
+        }));
         assert!(!limited(&Decision::Ignore(
             router::IgnoreReason::NotAddressed
         )));
+
+        let capped = refuse(RefuseReason::DailyCap { max: 1 });
+        let run = Decision::Run {
+            requester: requester.clone(),
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            scope: ScopeKind::Channel,
+            side: Side::Public,
+        };
+        let other = Requester {
+            member: Some(MemberId::new_v4()),
+            ..requester.clone()
+        };
+        let run_for_other = Decision::Run {
+            requester: other.clone(),
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            scope: ScopeKind::Channel,
+            side: Side::Public,
+        };
+        let capped_for_other = Decision::Refuse {
+            reason: RefuseReason::DailyCap { max: 1 },
+            requester: other,
+        };
+        assert!(copy_stands(&run, &run));
+        assert!(copy_stands(&capped, &run));
+        assert!(copy_stands(&run, &capped));
+        assert!(copy_stands(
+            &capped,
+            &refuse(RefuseReason::ThreadTurns { max: 1 })
+        ));
+        assert!(!copy_stands(&capped, &run_for_other));
+        assert!(!copy_stands(&run, &capped_for_other));
+        assert!(!copy_stands(&run, &run_for_other));
+        assert!(!copy_stands(&run, &refuse(RefuseReason::Denied)));
+        assert!(!copy_stands(
+            &capped,
+            &Decision::Ignore(router::IgnoreReason::NotAddressed)
+        ));
     }
 
     /// Whatever a decision says, only the owner's own turn, on the owner's
