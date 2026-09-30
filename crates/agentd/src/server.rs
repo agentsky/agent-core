@@ -37,7 +37,7 @@ use tower::Service as _;
 
 use crate::app::App;
 use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
-use crate::commands::rocketchat;
+use crate::commands::rocketchat::{self, CommandIntake};
 use crate::net::RefuseSubnet;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -160,7 +160,9 @@ impl Server {
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// relink notifier and, with `[rocketchat]`, the manager bot's
-    /// connection, which runs the commands it hears.
+    /// connection, which feeds the commands it hears to the
+    /// [`CommandIntake`]. The intake finishes the commands it received once
+    /// the connection stops.
     ///
     /// # Errors
     ///
@@ -215,11 +217,20 @@ impl Server {
             "relink notifier"
         });
         if let Some(manager) = app.rocketchat() {
-            let surface = manager.surface.clone();
-            let binding = manager.binding.clone();
-            let commands = app.commands().clone();
+            let (intake, feed) =
+                CommandIntake::new(app.commands().clone(), manager.binding.clone());
             tasks.spawn(async move {
-                if let Err(err) = rocketchat::serve(surface, binding, commands, stopping).await {
+                intake.run().await;
+                "Rocket.Chat command intake"
+            });
+            let connection = rocketchat::listen(
+                manager.surface.clone(),
+                manager.binding.clone(),
+                feed.into_sender(None),
+                stopping,
+            );
+            tasks.spawn(async move {
+                if let Err(err) = connection.await {
                     tracing::error!(error = %err, "the Rocket.Chat manager bot's connection ended");
                 }
                 "Rocket.Chat manager bot's connection"

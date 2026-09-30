@@ -19,8 +19,11 @@ use tokio::sync::watch;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::relink::{RelinkNotifier, relink_notice};
-use super::rocketchat::{command_in, serve};
+use super::relink::{
+    RELINK_BACKOFF_INITIAL, RELINK_BACKOFF_MAX, RELINK_LEASE, RELINK_MAX_ATTEMPTS, RelinkNotifier,
+    relink_notice,
+};
+use super::rocketchat::{CommandIntake, command_in, listen};
 use super::*;
 use crate::telemetry::tests::Captured;
 use crate::telemetry::{LogFormat, subscriber};
@@ -216,6 +219,25 @@ impl Harness {
     }
 }
 
+/// Runs the manager bot's connection to the mock surface, feeding a new
+/// intake, as the server does. Completes once both have finished.
+fn serve(
+    h: &Harness,
+    stopping: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Result<(), SurfaceError>> {
+    let (intake, feed) = CommandIntake::new(h.commands.clone(), h.manager.clone());
+    let connection = listen(
+        h.mock.clone(),
+        h.manager.clone(),
+        feed.into_sender(None),
+        stopping,
+    );
+    tokio::spawn(async move {
+        let (ended, ()) = tokio::join!(connection, intake.run());
+        ended
+    })
+}
+
 fn state_of(reply: &str) -> String {
     let at = reply.find("state=").expect("no state in the link") + "state=".len();
     reply[at..]
@@ -270,12 +292,7 @@ async fn full_login_flow_from_a_dm_links_the_account_without_logging_the_code() 
     let h = harness().await;
     let (logs, _guard) = capture_logs();
     let (stop, stopping) = watch::channel(false);
-    let task = tokio::spawn(serve(
-        h.mock.clone(),
-        h.manager.clone(),
-        h.commands.clone(),
-        stopping,
-    ));
+    let task = serve(&h, stopping);
 
     h.mock
         .inject(h.event("alice", ConvKind::Dm, &dm_room("alice"), "login"));
@@ -320,12 +337,7 @@ async fn one_members_commands_run_in_order_without_holding_up_others() {
     let state = state_of(&h.last_reply("alice"));
     mount_exchange(&h.oauth, &state, Duration::from_millis(300)).await;
     let (_stop, stopping) = watch::channel(false);
-    let task = tokio::spawn(serve(
-        h.mock.clone(),
-        h.manager.clone(),
-        h.commands.clone(),
-        stopping,
-    ));
+    let task = serve(&h, stopping);
     let dm = dm_room("alice");
     h.mock
         .inject(h.event("alice", ConvKind::Dm, &dm, &format!("login {CODE}#{state}")));
@@ -374,6 +386,22 @@ async fn a_login_code_in_a_channel_is_refused_and_invalidates_the_pending_login(
     );
     let out = logs.text();
     assert!(!out.contains(CODE), "{out}");
+}
+
+#[tokio::test]
+async fn a_login_code_posted_publicly_by_someone_else_cancels_the_login_it_names() {
+    let h = harness().await;
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+    h.dm("bob", "login").await;
+    let bobs = state_of(&h.last_reply("bob"));
+
+    h.channel("bob", &format!("login {CODE}#{state}")).await;
+
+    assert!(h.last_reply("bob").contains("cancelled your pending login"));
+    assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
+    assert!(h.store.take_pending_login(&bobs).await.unwrap().is_none());
+    assert_eq!(h.oauth_requests().await, 0);
 }
 
 #[tokio::test]
@@ -612,12 +640,7 @@ async fn which_rocketchat_messages_are_commands() {
 async fn the_intake_ignores_non_commands_and_stops_when_the_connection_ends() {
     let h = harness().await;
     let (_stop, stopping) = watch::channel(false);
-    let task = tokio::spawn(serve(
-        h.mock.clone(),
-        h.manager.clone(),
-        h.commands.clone(),
-        stopping,
-    ));
+    let task = serve(&h, stopping);
     h.mock
         .inject(h.event("alice", ConvKind::Channel, "GENERAL", "hello there"));
     h.mock
@@ -696,21 +719,134 @@ async fn a_relink_notice_is_sent_once_per_break_across_instances() {
     assert_eq!(h.replies_to("alice").len(), 2);
 }
 
-#[tokio::test]
-async fn a_relink_notice_that_fails_to_send_is_retried() {
-    let h = harness().await;
-    let (member, generation) = h.linked_member("alice", "claude_max").await;
+/// Opens no DM: every open fails, and each try is counted.
+#[derive(Default)]
+struct DeadDms(std::sync::atomic::AtomicUsize);
+
+#[async_trait]
+impl OpenDm for DeadDms {
+    async fn open_dm(&self, _: &MemberKey) -> Result<ConversationId, SurfaceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(SurfaceError::Transport("down".into()))
+    }
+}
+
+async fn broken_member(h: &Harness, user: &str) -> core_types::MemberId {
+    let (member, generation) = h.linked_member(user, "claude_max").await;
     h.store
         .mark_claude_link_broken(member, generation, OffsetDateTime::now_utc())
         .await
         .unwrap();
+    member
+}
+
+fn clock(at: OffsetDateTime) -> impl Fn() -> OffsetDateTime {
+    move || at
+}
+
+#[tokio::test]
+async fn a_relink_notice_that_fails_to_send_is_retried_after_a_backoff() {
+    let h = harness().await;
+    broken_member(&h, "alice").await;
     let notifier = RelinkNotifier::new(h.store.clone(), h.commands.replies().clone());
+    let start = OffsetDateTime::now_utc();
     h.mock
         .fail_next(Op::Post, SurfaceError::Transport("down".into()));
-    assert_eq!(notifier.send_pending().await.unwrap(), 0);
-    assert_eq!(h.store.pending_relink_notices().await.unwrap().len(), 1);
-    assert_eq!(notifier.send_pending().await.unwrap(), 1);
+    assert_eq!(notifier.send_pending_at(clock(start)).await.unwrap(), 0);
+    let later = start + Duration::from_secs(59);
+    assert!(
+        h.store
+            .pending_relink_notices(later, u32::MAX)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(notifier.send_pending_at(clock(later)).await.unwrap(), 0);
+    assert_eq!(h.mock.posts().len(), 0);
+    let after = start + Duration::from_secs(60);
+    assert_eq!(notifier.send_pending_at(clock(after)).await.unwrap(), 1);
+    assert_eq!(h.replies_to("alice"), [relink_notice(&key("alice"))]);
+    let much_later = after + Duration::from_secs(86_400);
+    assert_eq!(
+        notifier.send_pending_at(clock(much_later)).await.unwrap(),
+        0
+    );
     assert_eq!(h.replies_to("alice").len(), 1);
+}
+
+#[tokio::test]
+async fn an_unreachable_member_is_retried_with_growing_waits_then_given_up_once() {
+    let h = harness().await;
+    let (logs, _guard) = capture_logs();
+    broken_member(&h, "alice").await;
+    let dms = Arc::new(DeadDms::default());
+    let bot = Arc::new(ManagerBot::new(
+        h.manager.bot.clone(),
+        h.mock.clone(),
+        dms.clone(),
+    ));
+    let notifier = RelinkNotifier::new(h.store.clone(), Replies::new(Some(bot)));
+    let tries = || dms.0.load(std::sync::atomic::Ordering::SeqCst);
+    let mut now = OffsetDateTime::now_utc();
+    let mut waits = Vec::new();
+    for _ in 0..RELINK_MAX_ATTEMPTS {
+        let before = tries();
+        let mut wait = Duration::ZERO;
+        while tries() == before {
+            assert!(wait <= RELINK_BACKOFF_MAX, "no attempt after {wait:?}");
+            notifier.send_pending_at(clock(now)).await.unwrap();
+            if tries() == before {
+                now += Duration::from_secs(60);
+                wait += Duration::from_secs(60);
+            }
+        }
+        waits.push(wait);
+    }
+    assert_eq!(waits[0], Duration::ZERO);
+    assert_eq!(waits[1], RELINK_BACKOFF_INITIAL);
+    assert_eq!(waits[2], RELINK_BACKOFF_INITIAL * 2);
+    assert_eq!(waits[3], RELINK_BACKOFF_INITIAL * 4);
+    assert_eq!(waits.last(), Some(&RELINK_BACKOFF_MAX));
+    for _ in 0..3 {
+        now += RELINK_BACKOFF_MAX * 2;
+        notifier.send_pending_at(clock(now)).await.unwrap();
+    }
+    assert_eq!(tries(), usize::try_from(RELINK_MAX_ATTEMPTS).unwrap());
+    let out = logs.text();
+    assert_eq!(
+        out.matches("giving up on the relink notice").count(),
+        1,
+        "{out}"
+    );
+}
+
+#[tokio::test]
+async fn a_notice_claimed_by_an_instance_that_died_is_sent_when_the_lease_ends() {
+    let h = harness().await;
+    let member = broken_member(&h, "alice").await;
+    let start = OffsetDateTime::now_utc();
+    let notice = h.store.pending_relink_notices(start, 1).await.unwrap()[0];
+    let claimed = h
+        .store
+        .claim_relink_notice(member, notice.generation, start, start + RELINK_LEASE, 1)
+        .await
+        .unwrap();
+    assert_eq!(claimed, Some(1));
+    let notifier = RelinkNotifier::new(h.store.clone(), h.commands.replies().clone());
+    let before_end = start + RELINK_LEASE - Duration::from_secs(1);
+    assert_eq!(
+        notifier.send_pending_at(clock(before_end)).await.unwrap(),
+        0
+    );
+    assert!(h.replies_to("alice").is_empty());
+    let lease_end = start + RELINK_LEASE;
+    assert_eq!(notifier.send_pending_at(clock(lease_end)).await.unwrap(), 1);
+    assert_eq!(h.replies_to("alice"), [relink_notice(&key("alice"))]);
+    let much_later = lease_end + Duration::from_secs(86_400);
+    assert_eq!(
+        notifier.send_pending_at(clock(much_later)).await.unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -723,7 +859,12 @@ async fn a_relink_notice_waits_while_no_manager_bot_reaches_the_member() {
         .unwrap();
     let unreachable = RelinkNotifier::new(h.store.clone(), Replies::default());
     assert_eq!(unreachable.send_pending().await.unwrap(), 0);
-    assert_eq!(h.store.pending_relink_notices().await.unwrap().len(), 1);
+    let pending = h
+        .store
+        .pending_relink_notices(OffsetDateTime::now_utc(), RELINK_MAX_ATTEMPTS)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
     h.store.close().await;
     assert!(unreachable.send_pending().await.is_err());
 }

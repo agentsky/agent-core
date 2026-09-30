@@ -2327,14 +2327,32 @@ survive a restart and would not be shared by a second instance.
 `broken_at`. What is owed is every link with `broken_at` set and
 `relink_notified_at` empty (`Store::pending_relink_notices`). agentd's
 `RelinkNotifier` claims each with a conditional `UPDATE` keyed by the link's
-generation (`claim_relink_notice`) before it sends, and gives the claim back
-(`release_relink_notice`) if no send worked, so exactly one instance sends
-it, at most once, and a failed send is tried again. It runs a pass at
-startup, whenever the `auth` channel wakes it, and every minute. A member
-no manager bot can reach (a Slack-only member until T30) is left pending
-without a claim. The window left is a process killed between the claim and
-the post, which loses that one notice; claiming after the post instead
-would let two instances both send it.
+generation (`claim_relink_notice`) before it sends, so one instance at a
+time sends it, and marks it sent afterwards (`mark_relink_notice_sent`). It
+runs a pass at startup, whenever the `auth` channel wakes it, and every
+minute. A member no manager bot can reach (a Slack-only member until T30)
+is left pending without a claim.
+
+A second migration adds `relink_attempts` and `relink_next_attempt_at`,
+cleared with `relink_notified_at`, because a notice that can't be sent
+(the member's account is gone, the manager is refused) would otherwise
+cost a `users.info`, an `im.create` and maybe a post on the manager's
+account, plus a warning, every minute forever:
+
+- The claim is a lease: it counts an attempt and sets
+  `relink_next_attempt_at` to ten minutes on. A process killed between the
+  claim and marking the notice sent leaves the lease to run out, and the
+  notice is pending again, so it is sent at least once, and twice only
+  after such a crash. Before, the claim stayed set and the notice was lost
+  for good.
+- A failed send defers the next claim (`defer_relink_notice`) by a backoff
+  that starts at a minute and doubles up to six hours.
+- After 20 attempts, about three days, the notice is no longer pending,
+  and the notifier logs once that it gave up. A crash during the last
+  attempt gives up without that log line.
+
+The notifier reads the clock through a function its tests replace, so the
+backoff and the lease are tested without waiting.
 
 ### A DM to a member needs their username
 
@@ -2368,6 +2386,31 @@ is a command only with `!agent`, and it is not private, since the agent's
 sessions can read that conversation's history, so a login code there is
 refused.
 
+### Every bot connection has to look for commands
+
+**Issue.** The surface records each Rocket.Chat message once, under one
+source for every bot (T12's `Dedup`), and delivers it only on the
+connection that records it first. The first version heard commands only on
+the manager bot's connection. Once T14 adds the agents' connections, an
+`!agent` message in a room the manager shares with an agent would be lost
+whenever the agent's connection recorded it first, and one in a room or DM
+without the manager would never be heard.
+
+**Solution.** `commands::rocketchat::CommandIntake` owns the channel, the
+per-member ordering and the drain at shutdown, and knows nothing of any
+connection. Each connection delivers through a `CommandFeed`'s
+`into_sender(onward)`, which runs `command_in` with the manager bot's
+binding on every event the connection won, sends commands to the one
+intake and passes only other messages to `onward`, so a command is never
+also taken as a turn. The manager bot's connection is one feeder; T14
+feeds every agent's too, and from then on passes the manager's other
+messages onward as well, since whichever connection wins a message
+delivers it for every bot in the room. `command_in` already treated a
+message on another binding as not private, so a login code in a DM with
+an agent's bot is refused whichever connection heard it. The intake runs
+until every feed is dropped, so it finishes the commands it received after
+the connections stop.
+
 ### A member's commands run in order, others' alongside
 
 **Issue.** A code exchange can take the token endpoint's 30-second timeout,
@@ -2376,12 +2419,12 @@ every member. Running each in its own task could swap one member's
 `logout` and `login`, or answer `me` before the `login <code>` sent just
 before it.
 
-**Solution.** Each command runs in its own task inside the connection's
+**Solution.** Each command runs in its own task inside the intake's
 task, and waits for the previous command of the same member to finish
 first (a `oneshot` per member, pruned once finished). On shutdown the
-connection stops listening, runs the commands it already received (the
-store has recorded them as processed, so no other instance would), and
-waits for them within the drain timeout.
+connections stop listening, and the intake runs the commands it already
+received (the store has recorded them as processed, so no other instance
+would) and waits for them within the drain timeout.
 
 ### Secret-looking text that doesn't parse, in a channel
 
@@ -2395,7 +2438,12 @@ token they posted, followed by the parser's usage message. A secret-bearing
 command that parses gets the refusal for its kind: `login <code>` cancels
 the pending logins, `admin api-key set` says to revoke the key at the
 Anthropic Console, `slack-token` says to revoke it at api.slack.com. None
-of them is used. agentd can't delete the message (the `bot` role lacks
+of them is used. The refusal matches every command explicitly, so a new
+secret-bearing command doesn't compile until it has its own advice. A
+public `login <code>` also takes the pending login its `state` names
+(`Auth::cancel_pasted_login`, with `auth`'s own paste parsing and no
+exchange), whoever started it: the sender's own pending logins are not
+necessarily the one the code belongs to. agentd can't delete the message (the `bot` role lacks
 `delete-message`), so the reply suggests the member does.
 
 ### Smaller choices the plan left open
@@ -2421,6 +2469,11 @@ of them is used. agentd can't delete the message (the `bot` role lacks
   `im.create` for a channel command, so its custom role should include
   `api-bypass-rate-limit`, as the T11 note on the role expected; the
   README says so.
+- `surface-rocketchat`'s `conv_kind` took a `d` room whose `rooms.info`
+  had neither `usersCount` nor `uids` for a one-to-one DM, which would
+  make a DM of unknown size private enough for a login code if it reached
+  the manager bot. It is a group DM now, and only a count or a member list
+  of at most two makes a DM one-to-one.
 - The captured-log test logs at `trace` for every crate through a whole
   DM login, exchange included, and finds neither the code nor the pasted
   text, so reqwest, hyper and sqlx don't log request bodies either.

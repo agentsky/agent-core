@@ -1,15 +1,28 @@
-//! Commands over Rocket.Chat end to end: `serve` with the manager bot's
-//! connection to a fake Rocket.Chat, and wiremock OAuth endpoints.
+//! Commands over Rocket.Chat end to end: the manager bot's and an agent
+//! bot's connections to a fake Rocket.Chat feeding the command intake, and
+//! wiremock OAuth endpoints.
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use agentd::commands::rocketchat::{CommandIntake, RocketChatDms, StoreDedup, listen};
+use agentd::commands::{Commands, ManagerBot, Replies};
 use agentd::server::{Routers, Server};
 use agentd::{App, Config};
+use async_trait::async_trait;
+use auth::{Auth, OAuthConfig};
+use core_types::{
+    AgentId, Binding, BindingId, InboundEvent, MemberKey, SendError, Sender, Sink, SurfaceKind,
+};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
+use store::{Sealer, Store};
+use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
+use surface_rocketchat::{BotRoles, RocketChatConfig, RocketChatSurface};
 use testkit::rocketchat::{FakeDdp, FakeRest, realtime_message};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, watch};
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -143,4 +156,162 @@ async fn the_manager_bot_runs_dm_and_channel_commands() {
         .unwrap()
         .unwrap();
     assert_eq!(posted(&fake, &dm).await.len(), 1);
+}
+
+struct Onward(mpsc::UnboundedSender<InboundEvent>);
+
+#[async_trait]
+impl Sink<InboundEvent> for Onward {
+    async fn send(&self, event: InboundEvent) -> Result<(), SendError> {
+        self.0.send(event).map_err(|_| SendError)
+    }
+}
+
+fn binding(user: &str, agent: Option<AgentId>) -> Binding {
+    Binding {
+        id: BindingId::new_v4(),
+        agent,
+        bot: MemberKey {
+            surface: SurfaceKind::RocketChat,
+            team: "chat.example".into(),
+            user: user.into(),
+        },
+    }
+}
+
+fn surface(
+    fake: &FakeRest,
+    ddp: &FakeDdp,
+    credentials: Credentials,
+    dedup: &Arc<StoreDedup>,
+    bots: &BotRoles,
+) -> Arc<RocketChatSurface> {
+    let mut config = RocketChatConfig::new(fake.uri(), "chat.example".into(), credentials);
+    config.websocket_url = Some(ddp.url());
+    Arc::new(RocketChatSurface::new(config, dedup.clone(), bots.clone()).unwrap())
+}
+
+#[tokio::test]
+async fn every_bot_connection_feeds_commands_to_the_one_intake() {
+    let fake = FakeRest::start().await;
+    let ddp = FakeDdp::start().await;
+    ddp.add_token(FakeRest::MANAGER_TOKEN, FakeRest::MANAGER_ID);
+    let manager_credentials = Credentials {
+        user_id: FakeRest::MANAGER_ID.into(),
+        token: SecretString::from(FakeRest::MANAGER_TOKEN),
+    };
+    let manager_rest = RestClient::new(&fake.uri(), manager_credentials.clone()).unwrap();
+    let new = NewBotUser {
+        username: "helper",
+        name: "helper",
+        email: "bot@bots.invalid",
+    };
+    let (helper, password) = manager_rest.create_bot_user(&new).await.unwrap();
+    let helper_credentials = manager_rest
+        .issue_bot_token(&helper.username, password, "agentd")
+        .await
+        .unwrap();
+    ddp.add_token(helper_credentials.token.expose_secret(), helper.id.as_str());
+    let helper = helper.id.to_string();
+    let alice = fake.add_user("alice");
+    fake.add_room("SHARED", "c", "shared");
+    fake.add_room("AGENTS", "c", "agents");
+    fake.add_room("HELPER-DM", "d", "");
+    for room in ["SHARED", "AGENTS", "HELPER-DM"] {
+        fake.add_member(room, &alice);
+        fake.add_member(room, &helper);
+    }
+    fake.remove_member("AGENTS", FakeRest::MANAGER_ID);
+    fake.remove_member("HELPER-DM", FakeRest::MANAGER_ID);
+
+    let store =
+        Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
+            .await
+            .unwrap();
+    let auth = Arc::new(Auth::new(OAuthConfig::default(), store.clone()).unwrap());
+    let dedup = Arc::new(StoreDedup(store.clone()));
+    let bots = BotRoles::new(manager_rest.clone());
+    let manager_surface = surface(&fake, &ddp, manager_credentials, &dedup, &bots);
+    let helper_surface = surface(&fake, &ddp, helper_credentials, &dedup, &bots);
+    let manager = binding(FakeRest::MANAGER_ID, None);
+    let bot = Arc::new(ManagerBot::new(
+        manager.bot.clone(),
+        manager_surface.clone(),
+        Arc::new(RocketChatDms(manager_rest)),
+    ));
+    let commands = Commands::new(store, auth, Replies::new(Some(bot)));
+    let (intake, feed) = CommandIntake::new(commands, manager.clone());
+    let (onward_tx, mut onward) = mpsc::unbounded_channel();
+    let (stop, stopping) = watch::channel(false);
+    let manager_connection = tokio::spawn(listen(
+        manager_surface,
+        manager.clone(),
+        feed.clone().into_sender(None),
+        stopping.clone(),
+    ));
+    let helper_connection = tokio::spawn(listen(
+        helper_surface,
+        binding(&helper, Some(AgentId::new_v4())),
+        feed.into_sender(Some(Sender::new(Onward(onward_tx)))),
+        stopping,
+    ));
+    let intake = tokio::spawn(intake.run());
+    ddp.wait_for_room(FakeRest::MANAGER_ID, "SHARED").await;
+    for room in ["SHARED", "AGENTS", "HELPER-DM"] {
+        ddp.wait_for_room(&helper, room).await;
+    }
+    let mut dm = [FakeRest::MANAGER_ID.to_owned(), alice.clone()];
+    dm.sort();
+    let dm = dm.concat();
+    let from_alice =
+        |id: &str, room: &str, text: &str| realtime_message(id, room, (&alice, "alice"), text);
+    let not_linked = "Claude account: not linked. Send `login` to link one.";
+
+    let first = from_alice("m-1", "SHARED", "!agent me");
+    assert_eq!(ddp.send_message_to(&helper, &first), 1);
+    assert_eq!(wait_for_posts(&fake, &dm, 1).await, [not_linked]);
+    assert_eq!(ddp.send_message_to(FakeRest::MANAGER_ID, &first), 1);
+
+    let second = from_alice("m-2", "SHARED", "!agent me");
+    assert_eq!(ddp.send_message_to(FakeRest::MANAGER_ID, &second), 1);
+    assert_eq!(wait_for_posts(&fake, &dm, 2).await[1], not_linked);
+    assert_eq!(ddp.send_message_to(&helper, &second), 1);
+
+    let without_manager = from_alice("m-3", "AGENTS", "!agent me");
+    assert_eq!(ddp.send_message(&without_manager), 1);
+    assert_eq!(wait_for_posts(&fake, &dm, 3).await[2], not_linked);
+
+    let code_in_agent_dm = from_alice("m-4", "HELPER-DM", "!agent login x#y");
+    assert_eq!(ddp.send_message(&code_in_agent_dm), 1);
+    let refused = wait_for_posts(&fake, &dm, 4).await.remove(3);
+    assert!(
+        refused.starts_with("You posted a secret in a room others can read."),
+        "{refused}"
+    );
+
+    let chat = from_alice("m-5", "SHARED", "hello helper");
+    assert_eq!(ddp.send_message_to(&helper, &chat), 1);
+    let passed_on = tokio::time::timeout(Duration::from_secs(10), onward.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(passed_on.text, "hello helper");
+
+    stop.send_replace(true);
+    for connection in [manager_connection, helper_connection] {
+        tokio::time::timeout(Duration::from_secs(10), connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(10), intake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(posted(&fake, &dm).await.len(), 4);
+    for room in ["SHARED", "AGENTS", "HELPER-DM"] {
+        assert!(posted(&fake, room).await.is_empty(), "{room}");
+    }
+    assert!(onward.try_recv().is_err());
 }

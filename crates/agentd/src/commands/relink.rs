@@ -4,11 +4,16 @@
 //! is dead, and sends the member on [`auth::Auth::take_relink_notices`] when
 //! its mark set `claude_links.broken_at`. That channel only wakes the
 //! [`RelinkNotifier`] up. What is owed lives in the store: every broken link
-//! whose notice hasn't been claimed. The notifier claims each one with a
-//! conditional update before sending, so across instances and restarts a
-//! break is announced once, and a notice nobody could send is released and
-//! tried again at the next pass. A pass runs at startup, on every wake-up and
-//! every [`RELINK_SWEEP_INTERVAL`].
+//! whose member hasn't been told. The notifier claims each one with a
+//! conditional update before sending, so across instances and restarts one
+//! instance at a time sends it, and marks it sent afterwards. The claim is a
+//! lease of [`RELINK_LEASE`]: if the instance dies before marking the notice
+//! sent, it is pending again when the lease ends, so a notice is sent at
+//! least once, and twice only after such a crash. A notice nobody could send
+//! is tried again after a backoff that starts at [`RELINK_BACKOFF_INITIAL`]
+//! and doubles up to [`RELINK_BACKOFF_MAX`], at most
+//! [`RELINK_MAX_ATTEMPTS`] times. A pass runs at startup, on every wake-up
+//! and every [`RELINK_SWEEP_INTERVAL`].
 
 use std::time::Duration;
 
@@ -22,6 +27,28 @@ use super::{Replies, login_command};
 
 /// How often pending notices are looked for without a wake-up.
 pub const RELINK_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a claim keeps other instances from sending the notice while
+/// its sender posts it.
+pub const RELINK_LEASE: Duration = Duration::from_secs(10 * 60);
+
+/// How long after the first failed attempt the notice is tried again.
+pub const RELINK_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
+
+/// The longest wait between attempts.
+pub const RELINK_BACKOFF_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How many attempts a notice gets before the notifier gives up on it:
+/// about three days of retries.
+pub const RELINK_MAX_ATTEMPTS: u32 = 20;
+
+/// How long to wait after failed attempt number `attempt` (from 1).
+fn backoff(attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(31);
+    RELINK_BACKOFF_INITIAL
+        .saturating_mul(1 << doublings)
+        .min(RELINK_BACKOFF_MAX)
+}
 
 /// The notice, for a member on `identity`'s surface.
 pub fn relink_notice(identity: &MemberKey) -> String {
@@ -49,15 +76,27 @@ impl RelinkNotifier {
     /// many members were told.
     ///
     /// A member is sent the notice on each identity a manager bot can reach.
-    /// If none can reach them, their notice stays pending; if every send
-    /// fails, it is released and tried again at the next pass.
+    /// If none can reach them, their notice stays pending without an
+    /// attempt; if every send fails, it is tried again after a backoff.
     ///
     /// # Errors
     ///
     /// A [`StoreError`] if the store fails; notices already sent stay sent.
     pub async fn send_pending(&self) -> Result<usize, StoreError> {
+        self.send_pending_at(OffsetDateTime::now_utc).await
+    }
+
+    /// [`send_pending`](Self::send_pending), reading the time from `now`.
+    pub(super) async fn send_pending_at(
+        &self,
+        now: impl Fn() -> OffsetDateTime,
+    ) -> Result<usize, StoreError> {
         let mut told = 0;
-        for notice in self.store.pending_relink_notices().await? {
+        let pending = self
+            .store
+            .pending_relink_notices(now(), RELINK_MAX_ATTEMPTS)
+            .await?;
+        for notice in pending {
             let member = notice.member;
             let reachable: Vec<MemberKey> = self
                 .store
@@ -70,19 +109,32 @@ impl RelinkNotifier {
                 tracing::debug!(%member, "no manager bot reaches this member; the relink notice waits");
                 continue;
             }
-            let claimed = self
+            let claimed_at = now();
+            let Some(attempt) = self
                 .store
-                .claim_relink_notice(member, notice.generation, OffsetDateTime::now_utc())
-                .await?;
-            if !claimed {
+                .claim_relink_notice(
+                    member,
+                    notice.generation,
+                    claimed_at,
+                    claimed_at + RELINK_LEASE,
+                    RELINK_MAX_ATTEMPTS,
+                )
+                .await?
+            else {
+                continue;
+            };
+            if self.send(member, &reachable).await {
+                self.store
+                    .mark_relink_notice_sent(member, notice.generation, now())
+                    .await?;
+                told += 1;
                 continue;
             }
-            if self.send(member, &reachable).await {
-                told += 1;
-            } else {
-                self.store
-                    .release_relink_notice(member, notice.generation)
-                    .await?;
+            self.store
+                .defer_relink_notice(member, notice.generation, now() + backoff(attempt))
+                .await?;
+            if attempt >= RELINK_MAX_ATTEMPTS {
+                tracing::warn!(%member, attempts = attempt, "giving up on the relink notice");
             }
         }
         Ok(told)

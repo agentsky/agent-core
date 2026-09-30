@@ -17,8 +17,9 @@
 //! A secret-bearing command (`login <code>`, `admin api-key set`,
 //! `slack-token`) is refused when it comes from a room others can read
 //! ([`Origin::is_private`] is false), and the member is told privately that
-//! the secret is now public: a login code's pending logins are cancelled, an
-//! API key or token has to be revoked. Text that fails to parse but looks
+//! the secret is now public: a login code cancels the member's pending
+//! logins and the one its `state` names, whoever started it; an API key or
+//! token has to be revoked. Text that fails to parse but looks
 //! secret-bearing gets the same treatment. Commands are logged by name only,
 //! never with their text or arguments.
 
@@ -327,8 +328,11 @@ impl Commands {
     ) -> Result<String, Failure> {
         let place = origin.private_place();
         let advice = match command {
-            Command::Login { .. } => {
+            Command::Login { code: Some(code) } => {
                 self.cancel_pending_logins(key).await?;
+                if self.inner.auth.cancel_pasted_login(code).await? {
+                    tracing::info!(member = %key, "cancelled the pending login a public code belongs to");
+                }
                 format!(
                     "That login code is no longer secret, so I didn't use it and cancelled your \
                      pending login. Start again with {}, and send the code only {place}.",
@@ -339,9 +343,35 @@ impl Commands {
                 "That API key is no longer secret, so I didn't store it. Revoke it in the \
                  Anthropic Console now, create a new one, and set that one {place}."
             ),
-            _ => format!(
+            Command::SlackToken { .. } => format!(
                 "That token is no longer secret, so I didn't store it. Revoke it at \
                  api.slack.com now, and send a new one only {place}."
+            ),
+            Command::Login { code: None }
+            | Command::Logout
+            | Command::Me
+            | Command::Create { .. }
+            | Command::Persona { .. }
+            | Command::Skill(_)
+            | Command::Allow { .. }
+            | Command::Deny { .. }
+            | Command::Limits { .. }
+            | Command::Pause { .. }
+            | Command::Resume { .. }
+            | Command::Delete { .. }
+            | Command::Sessions { .. }
+            | Command::Reset { .. }
+            | Command::List { .. }
+            | Command::Admin(
+                AdminCommand::ApiKey(ApiKeyCommand::Clear)
+                | AdminCommand::Ban { .. }
+                | AdminCommand::Unban { .. }
+                | AdminCommand::Slack,
+            )
+            | Command::Approve { .. }
+            | Command::Decline { .. } => format!(
+                "Whatever secret it held is no longer secret, so I didn't use it. Revoke it now, \
+                 and send a new one only {place}."
             ),
         };
         Ok(format!(

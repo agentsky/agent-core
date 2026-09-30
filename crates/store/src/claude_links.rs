@@ -139,6 +139,8 @@ impl Store {
              rate_limit_tier = excluded.rate_limit_tier, \
              broken_at = NULL, \
              relink_notified_at = NULL, \
+             relink_attempts = 0, \
+             relink_next_attempt_at = NULL, \
              updated_at = excluded.updated_at, \
              generation = excluded.generation",
         )
@@ -183,7 +185,8 @@ impl Store {
         let refresh = self.seal(aad(REFRESH, &key), &tokens.refresh_token)?;
         let result = sqlx::query(
             "UPDATE claude_links SET access_token_enc = ?, refresh_token_enc = ?, \
-             expires_at = ?, broken_at = NULL, relink_notified_at = NULL, updated_at = ? \
+             expires_at = ?, broken_at = NULL, relink_notified_at = NULL, relink_attempts = 0, \
+             relink_next_attempt_at = NULL, updated_at = ? \
              WHERE member_id = ? AND generation = ?",
         )
         .bind(access)

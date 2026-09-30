@@ -453,6 +453,45 @@ async fn another_members_code_is_refused_and_invalidated() {
 }
 
 #[tokio::test]
+async fn a_pasted_code_cancels_its_login_without_an_exchange() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(token_response("access-1", Some("refresh-1")))
+        .expect(0)
+        .mount(&h.server)
+        .await;
+    let start = h.auth.start_login(h.member).await.unwrap();
+    let state = query(&Url::parse(&start.url).unwrap(), "state");
+
+    assert!(
+        !h.auth
+            .cancel_pasted_login(&SecretString::from("just-a-code"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !h.auth
+            .cancel_pasted_login(&paste("code", "no-such-state"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        h.auth
+            .cancel_pasted_login(&paste("code", &state))
+            .await
+            .unwrap()
+    );
+    assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
+    let err = h
+        .auth
+        .complete_login(h.member, &paste("code", &state))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::UnknownLogin), "{err:?}");
+}
+
+#[tokio::test]
 async fn unknown_states_and_malformed_pastes_are_refused() {
     let h = harness().await;
     let err = h
