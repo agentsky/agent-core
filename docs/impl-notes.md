@@ -5691,8 +5691,9 @@ above.
   binding or agent, the next one saying how many went quiet
   (`core_types::Throttle`, which the ingress's refusals moved to, now kept
   per binding too, so one app's flood hides no other's refusals): the
-  pipeline's "too many messages waiting" and "too many notices being
-  posted", and the lanes' "couldn't look a bot sender up".
+  ingress's 400s and `app_rate_limited` notices, the pipeline's "too many
+  messages waiting" and "too many notices being posted", and the lanes'
+  "couldn't look a bot sender up".
 - The pipeline reaps finished tasks when it spawns a notice, as it does
   when it spawns a lane; a flood of notices on an otherwise quiet
   pipeline kept every finished one until the next lane. A lane in
