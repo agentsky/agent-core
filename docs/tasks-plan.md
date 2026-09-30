@@ -17,8 +17,9 @@ updates `docs/design.md` and says why in its description.
 1. Pick a task whose dependencies are all merged. The
    [dependency graph](#dependency-graph) and [lanes](#parallel-lanes) show what
    is unblocked.
-2. Branch from the latest `main` as `claude/<branch>` (the branch name is given
-   per task; see `AGENTS.md`).
+2. Branch from the latest `main` as `<agent-name>/<branch>`. The branch name
+   is given per task. The prefix names your coding agent (`claude`, `codex`,
+   `copilot`), as `AGENTS.md` says.
 3. Read the design sections the task links to, and this plan's
    [Decisions](#decisions-this-plan-fixes) and
    [Definition of done](#definition-of-done).
@@ -275,7 +276,9 @@ Every PR, in addition to its task's acceptance criteria:
 - No `unsafe`. No `unwrap()` or `expect()` outside tests and `main` startup,
   unless the reason is a proven invariant; say which in the PR.
 - No secret reaches a log line, an error message, a panic message or a test
-  snapshot. Secret-bearing types use `secrecy`.
+  snapshot. Secret-bearing types use `secrecy`. Content that may hold secrets
+  without being a typed secret (chat message text, model output, tool input
+  and output) is never logged either; log ids, sizes and kinds instead.
 - Public items of library crates have rustdoc comments. Behavior that's easy to
   get wrong (the proxy's swap rules, gating, attribution) has tests named after
   the rule they check.
@@ -427,7 +430,7 @@ is a suggestion, not an owner: pick any unblocked task.
 
 ### T01
 
-**Workspace skeleton.** Branch `claude/workspace-skeleton`. Depends on nothing.
+**Workspace skeleton.** Branch `workspace-skeleton`. Depends on nothing.
 
 Design: [Crate layout](design.md#crate-layout).
 
@@ -463,7 +466,7 @@ Out of scope: any real code in the crates.
 
 ### T02
 
-**Dependency policy in CI.** Branch `claude/cargo-deny-policy`. Depends on T01.
+**Dependency policy in CI.** Branch `cargo-deny-policy`. Depends on T01.
 
 Deliverables:
 
@@ -488,7 +491,7 @@ adds `native-tls` fails it; say so in the PR.
 
 ### T03
 
-**`core-types`.** Branch `claude/core-types`. Depends on T01.
+**`core-types`.** Branch `core-types`. Depends on T01.
 
 Design: [Terminology](design.md#terminology),
 [Surface trait](design.md#crate-layout),
@@ -545,7 +548,7 @@ Out of scope: any logic beyond construction, parsing and formatting.
 
 ### T04
 
-**`testkit`: mock surface and fake claude.** Branch `claude/testkit`. Depends
+**`testkit`: mock surface and fake claude.** Branch `testkit`. Depends
 on T03.
 
 Design: [Surface trait](design.md#crate-layout) ("A `MockSurface` drives the
@@ -600,7 +603,7 @@ clients in T11, T12, T28 and T29, under `testkit::rocketchat` and
 
 ### T05
 
-**`store` foundation and encryption.** Branch `claude/store-foundation`.
+**`store` foundation and encryption.** Branch `store-foundation`.
 Depends on T03.
 
 Design: [Data model](design.md#data-model),
@@ -655,7 +658,7 @@ usage, policies, bans and thread usage (T27), Slack configuration tokens
 
 ### T06
 
-**`render`: Slack mrkdwn.** Branch `claude/render-slack-mrkdwn`. Depends on
+**`render`: Slack mrkdwn.** Branch `render-slack-mrkdwn`. Depends on
 T01.
 
 Design: [Rendering and delivery](design.md#rendering-and-delivery).
@@ -693,7 +696,7 @@ Out of scope: splitting (T07).
 ### T07
 
 **`render`: splitting, directives, Rocket.Chat.** Branch
-`claude/render-split-directives`. Depends on T06.
+`render-split-directives`. Depends on T06.
 
 Design: [Rendering and delivery](design.md#rendering-and-delivery).
 Reference: qm-core `src/slack/safe-cut.ts`.
@@ -729,7 +732,7 @@ block.
 
 ### T08
 
-**`commands`: `/agent` parser.** Branch `claude/commands-parser`. Depends on
+**`commands`: `/agent` parser.** Branch `commands-parser`. Depends on
 T03.
 
 Design: [Commands](design.md#commands),
@@ -773,7 +776,7 @@ Out of scope: handlers (T13 onward).
 
 ### T09
 
-**`auth`: PKCE, exchange, refresh, plan.** Branch `claude/auth-pkce`. Depends
+**`auth`: PKCE, exchange, refresh, plan.** Branch `auth-pkce`. Depends
 on T05.
 
 Design: [Account linking](design.md#account-linking),
@@ -829,7 +832,7 @@ in [Configuration](#configuration).
 
 ### T10
 
-**`agentd` skeleton.** Branch `claude/agentd-skeleton`. Depends on T05.
+**`agentd` skeleton.** Branch `agentd-skeleton`. Depends on T05.
 
 Deliverables:
 
@@ -858,7 +861,7 @@ errors have tests.
 
 ### T11
 
-**Rocket.Chat REST client.** Branch `claude/rocketchat-rest`. Depends on T03.
+**Rocket.Chat REST client.** Branch `rocketchat-rest`. Depends on T03.
 
 Design: [Rocket.Chat](design.md#rocketchat).
 
@@ -901,7 +904,7 @@ Update the Rocket.Chat section of `docs/design.md` with the result.
 
 ### T12
 
-**Rocket.Chat realtime and `Surface`.** Branch `claude/rocketchat-realtime`.
+**Rocket.Chat realtime and `Surface`.** Branch `rocketchat-realtime`.
 Depends on T04 and T11.
 
 Design: [Chat identities and mentions](design.md#chat-identities-and-mentions),
@@ -952,7 +955,7 @@ Acceptance:
 
 ### T13
 
-**Command dispatch and account commands.** Branch `claude/account-commands`.
+**Command dispatch and account commands.** Branch `account-commands`.
 Depends on T08, T09, T10 and T12.
 
 Design: [Account linking](design.md#account-linking),
@@ -992,7 +995,7 @@ unlinked members.
 ### T14
 
 **Agent lifecycle on Rocket.Chat.** Branch
-`claude/agent-lifecycle-rocketchat`. Depends on T13.
+`agent-lifecycle-rocketchat`. Depends on T13.
 
 Design: [Rocket.Chat](design.md#rocketchat), [Commands](design.md#commands),
 [Data model](design.md#data-model).
@@ -1043,7 +1046,7 @@ that mentions arrive per bot.
 
 ### T15
 
-**`agentctl` and the ctl API.** Branch `claude/agentctl`. Depends on T04, T05
+**`agentctl` and the ctl API.** Branch `agentctl`. Depends on T04, T05
 and T10.
 
 Design: [Tools and skills](design.md#tools-and-skills).
@@ -1116,7 +1119,7 @@ Acceptance:
 
 ### T16
 
-**Sandbox image and Compose dev stack.** Branch `claude/sandbox-image`.
+**Sandbox image and Compose dev stack.** Branch `sandbox-image`.
 Depends on T15.
 
 Design: [Why the CLI runs inside the sandbox](design.md#why-the-cli-runs-inside-the-sandbox),
@@ -1167,7 +1170,7 @@ Acceptance:
 
 ### T17
 
-**`sandbox` crate.** Branch `claude/sandbox-crate`. Depends on T04 and T05.
+**`sandbox` crate.** Branch `sandbox-crate`. Depends on T04 and T05.
 
 Design: [Sessions and sandboxes](design.md#sessions-and-sandboxes),
 [Persistence](design.md#persistence). This plan:
@@ -1251,7 +1254,7 @@ Acceptance:
 
 ### T18
 
-**Credential proxy: header swap.** Branch `claude/cred-proxy-swap`. Depends on
+**Credential proxy: header swap.** Branch `cred-proxy-swap`. Depends on
 T04 and T09.
 
 Design: [Credential proxy](design.md#credential-proxy) (rules 1 and 2), the
@@ -1305,7 +1308,7 @@ Out of scope: egress for other hosts (T19), bearer swap for other CLIs
 
 ### T19
 
-**Credential proxy: egress allowlist.** Branch `claude/egress-allowlist`.
+**Credential proxy: egress allowlist.** Branch `egress-allowlist`.
 Depends on T18.
 
 Design: [Credential proxy](design.md#credential-proxy) (rule 3).
@@ -1341,7 +1344,7 @@ Acceptance:
 
 ### T20
 
-**`runner`: stream-json process driver.** Branch `claude/runner-process`.
+**`runner`: stream-json process driver.** Branch `runner-process`.
 Depends on T04 and T17.
 
 Design: [Lifecycle](design.md#lifecycle), [Tools and skills](design.md#tools-and-skills)
@@ -1365,9 +1368,12 @@ Deliverables:
   and reads lines until `type == "result"`. The outcome carries:
   - `is_error`, `result` text, `terminal_reason`, `api_error_status`.
   - `usage`, `total_cost_usd`, `session_id`.
-  - The `assistant` messages seen, for logging.
+  - Structural metadata for diagnostics: the number of `assistant` messages
+    and the names of the tools called. Message bodies, tool inputs and tool
+    output are never kept or logged: they can hold file contents and secrets
+    that no field-name redaction can catch.
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
-  is logged and skipped.
+  is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
   is killed and the turn fails.
 - Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
@@ -1390,11 +1396,13 @@ Acceptance:
   - An `is_error` result.
   - Unknown line types are ignored.
   - The environment contains no real credential, only the placeholder.
+  - A turn whose assistant message and tool output contain a fake secret
+    leaves no trace of it in captured logs.
 - A fixture test parsing the real CLI lines captured in T04.
 
 ### T21
 
-**`runner`: sessions, queue, warm pool.** Branch `claude/runner-sessions`.
+**`runner`: sessions, queue, warm pool.** Branch `runner-sessions`.
 Depends on T20. It must not depend on T15 or T18: it reaches them through
 `TurnHooks`, which agentd implements in T23.
 
@@ -1460,7 +1468,7 @@ Acceptance:
 
 ### T22
 
-**`router`: gating and credential policy.** Branch `claude/router-policy`.
+**`router`: gating and credential policy.** Branch `router-policy`.
 Depends on T03 and T04.
 
 Design: [Routing](design.md#routing),
@@ -1471,7 +1479,9 @@ Deliverables:
 
 - A pure function `route(event, agent, view: &dyn RouterView) -> Decision`.
   `RouterView` answers:
-  - `is_managed_bot(user) -> Option<AgentId>`.
+  - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
+    and user as every identity is, so a matching user id from another team or
+    server is never taken for a managed agent.
   - `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`.
   - `member_for(MemberKey)`, `is_linked(member)`.
   - `community_key_configured()`.
@@ -1509,7 +1519,7 @@ No I/O in the crate.
 
 ### T23
 
-**Turn pipeline end to end.** Branch `claude/turn-pipeline`. Depends on T07,
+**Turn pipeline end to end.** Branch `turn-pipeline`. Depends on T07,
 T14, T15, T16, T18, T19, T21 and T22.
 
 Design: [Architecture](design.md#architecture),
@@ -1599,7 +1609,7 @@ that uses Bash and returns a file, restart agentd, and continue the thread with
 
 ### T24
 
-**Session commands.** Branch `claude/session-commands`. Depends on T23.
+**Session commands.** Branch `session-commands`. Depends on T23.
 
 Deliverables:
 
@@ -1617,7 +1627,7 @@ turn after reset uses `--session-id` with a new id.
 
 ### T25
 
-**Skills and the `agentctl` skill.** Branch `claude/skills`. Depends on T23.
+**Skills and the `agentctl` skill.** Branch `skills`. Depends on T23.
 
 Design: [Tools and skills](design.md#tools-and-skills).
 
@@ -1647,7 +1657,7 @@ file, validation failures, rm, mounting (the path is visible in a
 
 ### T26
 
-**Requester-pays routing.** Branch `claude/requester-pays`. Depends on T23.
+**Requester-pays routing.** Branch `requester-pays`. Depends on T23.
 
 Design: [Turn routing and billing](design.md#turn-routing-and-billing),
 [Lifecycle](design.md#lifecycle) (credential kind and model restarts).
@@ -1682,7 +1692,7 @@ tests.
 
 ### T27
 
-**Usage meter, limits, allow and deny.** Branch `claude/usage-limits`.
+**Usage meter, limits, allow and deny.** Branch `usage-limits`.
 Depends on T26.
 
 Design: [Commands](design.md#commands), [Slack](design.md#slack) (loop
@@ -1724,7 +1734,7 @@ alongside phases 2 and 3.
 
 ### T28
 
-**Slack ingress.** Branch `claude/slack-ingress`. Depends on T05 and T10.
+**Slack ingress.** Branch `slack-ingress`. Depends on T05 and T10.
 Secrets are looked up through a `SigningSecrets` trait. This task implements
 it for the manager binding from configuration. T31 adds the store-backed
 agent bindings.
@@ -1791,7 +1801,7 @@ Acceptance:
 
 ### T29
 
-**Slack Web API and `Surface`.** Branch `claude/slack-web-api`. Depends on T07
+**Slack Web API and `Surface`.** Branch `slack-web-api`. Depends on T07
 and T28.
 
 Design: [Rendering and delivery](design.md#rendering-and-delivery),
@@ -1830,7 +1840,7 @@ HTTP 200 with `ok: false` on errors; test that mapping.
 ### T30
 
 **Slack manager app and configuration token.** Branch
-`claude/slack-manager-app`. Depends on T13 and T29.
+`slack-manager-app`. Depends on T13 and T29.
 
 Design: [Slack](design.md#slack) (one-time setup, slash command takeover),
 [Commands](design.md#commands).
@@ -1878,7 +1888,7 @@ configuration token, and confirm the rotation after forcing a short expiry.
 
 ### T31
 
-**Slack agent apps from manifests.** Branch `claude/slack-agent-apps`.
+**Slack agent apps from manifests.** Branch `slack-agent-apps`.
 Depends on T30 and T23.
 
 Design: [Slack](design.md#slack) (per agent), [Data model](design.md#data-model)
@@ -1939,7 +1949,7 @@ completes design milestone 4.
 
 ### T32
 
-**Verify Slack bot-to-bot delivery.** Branch `claude/slack-bot-mention-check`.
+**Verify Slack bot-to-bot delivery.** Branch `slack-bot-mention-check`.
 Depends on T31. Docs-only PR, and a gate for T34's Slack half.
 
 Design: [Chat identities and mentions](design.md#chat-identities-and-mentions)
@@ -1968,7 +1978,7 @@ and this plan are updated.
 
 ### T33
 
-**Consent cards and private tasks.** Branch `claude/private-tasks`. Depends on
+**Consent cards and private tasks.** Branch `private-tasks`. Depends on
 T26 and T31.
 
 Design: [Private tasks](design.md#private-tasks), the security rows on private
@@ -2035,7 +2045,7 @@ Acceptance, as tests named after the design's rules:
 
 ### T34
 
-**Agent-to-agent hand-off.** Branch `claude/agent-to-agent`. Depends on T32
+**Agent-to-agent hand-off.** Branch `agent-to-agent`. Depends on T32
 and T33.
 
 Design: [Agent-to-agent attribution](design.md#agent-to-agent-attribution),
@@ -2079,7 +2089,7 @@ and stop at the cap. That completes design milestone 5.
 
 ### T35
 
-**Cloud hand-off.** Branch `claude/cloud-handoff-design`. Depends on T34.
+**Cloud hand-off.** Branch `cloud-handoff-design`. Depends on T34.
 
 Design milestone 6, "Owner-initiated cloud hand-off (`claude --cloud`) for
 long PR work". The design says only that the CLI can create a cloud session
@@ -2096,7 +2106,7 @@ Implementation tasks follow in a later revision of this plan.
 
 ### T36
 
-**Slack Connect.** Branch `claude/slack-connect-design`. Depends on T34.
+**Slack Connect.** Branch `slack-connect-design`. Depends on T34.
 
 Design milestone 7 and [Slack Connect](design.md#slack-connect). Design
 addendum first, covering:
