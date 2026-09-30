@@ -244,13 +244,41 @@ impl World {
         }
     }
 
-    /// The router's decision, with a refusal's requester left out: the
-    /// tests of who is refused compare [`refused`], and
-    /// `a_refusal_names_the_requester_to_tell` checks the requester.
+    /// The router's decision, with a refusal's requester checked and then
+    /// left out, so the tests of who is refused compare [`refused`]: it
+    /// must be the sender for a person's message, and for another agent's
+    /// the requester its post was attributed to, with the member their key
+    /// belongs to if none was recorded.
     fn route(&self, event: &InboundEvent) -> Decision {
         match route(event, self.a, &self.view) {
-            Decision::Refuse { reason, .. } => refused(reason),
+            Decision::Refuse { reason, requester } => {
+                assert_eq!(
+                    requester,
+                    self.asked_by(event),
+                    "the refusal ({reason}) names who asked"
+                );
+                refused(reason)
+            }
             decision => decision,
+        }
+    }
+
+    /// Who asked for `event`: the attributed requester of another agent's
+    /// post, or the sender.
+    fn asked_by(&self, event: &InboundEvent) -> Requester {
+        let from_agent = matches!(
+            self.view.managed_bot(&event.sender),
+            Some(ManagedBot::Agent(_))
+        );
+        match self.view.refs.get(&event.message) {
+            Some(attribution) if from_agent => {
+                let Requester { member, key } = attribution.requester.clone();
+                Requester {
+                    member: member.or_else(|| self.view.member_for(&key)),
+                    key,
+                }
+            }
+            _ => self.requester(&event.sender),
         }
     }
 
