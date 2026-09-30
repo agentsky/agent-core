@@ -32,7 +32,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::serve::Listener;
-use core_types::Sender;
+use core_types::{Sender, Surface as _};
 use cred_proxy::CredProxy;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -51,7 +51,7 @@ use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
-use crate::pipeline::{NoCommunityKey, Turns};
+use crate::pipeline::{NoCommunityKey, Pipeline, Turns};
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -255,8 +255,9 @@ impl Server {
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
     /// the agents' connections. Every connection feeds the commands it hears
     /// to the intake like the Slack queue does, and passes other messages to
-    /// [`Acknowledge`]. The intake finishes the commands it received once
-    /// they all stop.
+    /// the turn [`Pipeline`] when agentd runs turns
+    /// ([`with_turns`](Self::with_turns)), or else to [`Acknowledge`]. The
+    /// intake finishes the commands it received once they all stop.
     ///
     /// # Errors
     ///
@@ -336,12 +337,16 @@ impl Server {
                 "Slack configuration token rotator"
             });
         }
+        let pipeline = turns.clone().map(|turns| Pipeline::for_app(&app, turns));
         if let Some(manager) = app.rocketchat() {
             let feed = CommandFeed::new(commands.clone(), manager.binding.clone());
-            let onward = Sender::new(Acknowledge::new(
-                manager.agents.clone(),
-                manager.binding.bot.clone(),
-            ));
+            let onward = match &pipeline {
+                Some(pipeline) => pipeline.sink(manager.surface.caps()),
+                None => Sender::new(Acknowledge::new(
+                    manager.agents.clone(),
+                    manager.binding.bot.clone(),
+                )),
+            };
             let supervisor = Supervisor::new(
                 manager.agents.clone(),
                 manager.surface_config.clone(),

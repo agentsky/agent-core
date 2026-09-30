@@ -845,6 +845,13 @@ impl RestClient {
         self.call_unit(Call::post("chat.react", body)).await
     }
 
+    /// `POST chat.react` with `shouldReact: false`, which removes this
+    /// client's reaction if there is one.
+    pub async fn unreact(&self, message: &MessageId, emoji: &str) -> Result<()> {
+        let body = json!({ "messageId": message, "emoji": emoji, "shouldReact": false });
+        self.call_unit(Call::post("chat.react", body)).await
+    }
+
     /// `GET chat.getMessage`: one message by id.
     pub async fn get_message(&self, message: &MessageId) -> Result<Message> {
         let found: MessageEnvelope = self

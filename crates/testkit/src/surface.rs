@@ -1,14 +1,14 @@
 //! [`MockSurface`]: a [`Surface`] that records what the shared core does
 //! with it.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use core_types::surface_trait::Result;
 use core_types::{
-    Binding, BindingId, Caps, Cursor, InboundEvent, LengthUnit, Limit, MessageId, Msg, MsgRef,
-    OutFile, ReplyTarget, Sender, Surface, SurfaceError, ThreadKey,
+    Binding, BindingId, Caps, ConvRef, Cursor, InboundEvent, LengthUnit, Limit, MessageId, Msg,
+    MsgRef, OutFile, ReplyTarget, Sender, Surface, SurfaceError, ThreadKey,
 };
 use tokio::sync::Notify;
 
@@ -34,6 +34,13 @@ pub enum Call {
     /// [`Surface::react`].
     React {
         /// The message reacted to.
+        msg: MsgRef,
+        /// The emoji name, without colons.
+        emoji: String,
+    },
+    /// [`Surface::unreact`].
+    Unreact {
+        /// The message whose reaction was removed.
         msg: MsgRef,
         /// The emoji name, without colons.
         emoji: String,
@@ -65,6 +72,8 @@ pub enum Op {
     Edit,
     /// [`Surface::react`].
     React,
+    /// [`Surface::unreact`].
+    Unreact,
     /// [`Surface::upload`].
     Upload,
     /// [`Surface::history`].
@@ -100,6 +109,10 @@ pub struct UploadedFile {
 ///   fail with a given error, such as [`SurfaceError::RateLimited`] or
 ///   [`SurfaceError::Unauthorized`], as the platform would.
 /// - `post` returns references `m1`, `m2`, … in the target conversation.
+/// - [`keep_out_of`](Self::keep_out_of) makes the bot not a member of a
+///   conversation: [`can_post`](Surface::can_post) answers false there,
+///   and `post` and `upload` fail with [`SurfaceError::Forbidden`], as on
+///   a platform where posting would join it.
 /// - `history` serves what [`set_history`](Self::set_history) stored for
 ///   the thread, honoring `before` and `limit` as the trait documents. A
 ///   thread with nothing stored has no messages.
@@ -132,6 +145,7 @@ struct State {
     calls: Vec<Call>,
     posted: u64,
     history: HashMap<ThreadKey, Vec<Msg>>,
+    outside: HashSet<ConvRef>,
     failures: HashMap<Op, VecDeque<SurfaceError>>,
     queues: HashMap<BindingId, Queue>,
 }
@@ -203,6 +217,21 @@ impl MockSurface {
     /// first, replacing what was there.
     pub fn set_history(&self, thread: ThreadKey, messages: Vec<Msg>) {
         self.state().history.insert(thread, messages);
+    }
+
+    /// Makes the bot not a member of `conv`: see the type's docs.
+    pub fn keep_out_of(&self, conv: ConvRef) {
+        self.state().outside.insert(conv);
+    }
+
+    /// Fails with [`SurfaceError::Forbidden`] if the bot is kept out of
+    /// `conv`.
+    fn check_member(state: &State, conv: &ConvRef) -> Result<()> {
+        if state.outside.contains(conv) {
+            Err(SurfaceError::Forbidden("not a member".into()))
+        } else {
+            Ok(())
+        }
     }
 
     /// Makes the next call of `op` fail with `error`, without recording
@@ -312,6 +341,7 @@ impl Surface for MockSurface {
 
     async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
         let mut state = self.begin(Op::Post, to.thread_root.as_ref())?;
+        Self::check_member(&state, &to.conv)?;
         state.posted += 1;
         let msg = MsgRef {
             conv: to.conv.clone(),
@@ -341,11 +371,26 @@ impl Surface for MockSurface {
         Ok(())
     }
 
+    async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<()> {
+        self.begin(Op::Unreact, None)?.calls.push(Call::Unreact {
+            msg: msg.clone(),
+            emoji: emoji.to_owned(),
+        });
+        Ok(())
+    }
+
+    async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
+        Ok(!self.state().outside.contains(conv))
+    }
+
     /// Reads every file and records the upload. A file that can't be read
     /// fails the call with [`SurfaceError::NotFound`], and nothing is
     /// recorded.
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {
-        drop(self.begin(Op::Upload, to.thread_root.as_ref())?);
+        {
+            let state = self.begin(Op::Upload, to.thread_root.as_ref())?;
+            Self::check_member(&state, &to.conv)?;
+        }
         let mut uploaded = Vec::with_capacity(files.len());
         for file in files {
             let contents = tokio::fs::read(&file.path)
@@ -586,6 +631,46 @@ mod tests {
                 (target("C2", None), "other".to_owned())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn unreact_is_recorded_and_can_fail() {
+        let mock = MockSurface::new();
+        let msg = MsgRef {
+            conv: conv("C1"),
+            id: "1".into(),
+        };
+        mock.fail_next(Op::Unreact, SurfaceError::Unauthorized);
+        assert_eq!(
+            mock.unreact(&msg, "eyes").await,
+            Err(SurfaceError::Unauthorized)
+        );
+        mock.unreact(&msg, "eyes").await.unwrap();
+        assert_eq!(
+            mock.calls(),
+            [Call::Unreact {
+                msg,
+                emoji: "eyes".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversation_the_bot_is_kept_out_of_refuses_posts() {
+        let mock = MockSurface::new();
+        mock.keep_out_of(conv("C2"));
+        assert!(mock.can_post(&conv("C1")).await.unwrap());
+        assert!(!mock.can_post(&conv("C2")).await.unwrap());
+        assert!(matches!(
+            mock.post(&target("C2", None), "x").await,
+            Err(SurfaceError::Forbidden(_))
+        ));
+        assert!(matches!(
+            mock.upload(&target("C2", None), &[]).await,
+            Err(SurfaceError::Forbidden(_))
+        ));
+        mock.post(&target("C1", None), "x").await.unwrap();
+        assert_eq!(mock.posts().len(), 1);
     }
 
     #[tokio::test]

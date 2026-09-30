@@ -47,6 +47,7 @@ use std::time::Duration;
 use auth::OAuthConfig;
 use core_types::Cidr;
 use cred_proxy::{DEFAULT_UPSTREAM, EgressLimits, EgressPolicy, EgressProxy, HostRule};
+use router::ModelPolicy;
 use runner::{
     DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP, DEFAULT_IDLE_TIMEOUT_SECS,
     DEFAULT_SCOPE_CONTAINER_CAP, DEFAULT_TURN_TIMEOUT_SECS, PoolConfig, ProcessConfig,
@@ -350,6 +351,14 @@ pub struct RunnerConfig {
     /// `global_container_cap`: how many containers may run at once in all,
     /// from 1 to 4096. Default 32.
     pub global_container_cap: usize,
+    /// `working_emoji`: the reaction an agent's bot puts on the message it
+    /// is answering while the turn runs, and takes off after. A short name
+    /// such as `eyes`, without colons. Default `hourglass_flowing_sand`.
+    pub working_emoji: String,
+    /// `[runner.models]`: which model a requester's plan gets. Without it,
+    /// processes use the CLI's default model. A model that isn't a plain
+    /// model name fails the turns that would use it.
+    pub models: Option<ModelPolicy>,
 }
 
 impl Default for RunnerConfig {
@@ -360,6 +369,8 @@ impl Default for RunnerConfig {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             scope_container_cap: DEFAULT_SCOPE_CONTAINER_CAP,
             global_container_cap: DEFAULT_GLOBAL_CONTAINER_CAP,
+            working_emoji: crate::pipeline::DEFAULT_WORKING_EMOJI.to_owned(),
+            models: None,
         }
     }
 }
@@ -389,7 +400,20 @@ impl RunnerConfig {
         let named =
             |err: runner::ConfigError| invalid(format!("runner.{}", err.key()), err.reason());
         self.process().validate().map_err(named)?;
-        self.pool().validate().map_err(named)
+        self.pool().validate().map_err(named)?;
+        let emoji = &self.working_emoji;
+        if emoji.is_empty()
+            || emoji.len() > 64
+            || !emoji
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_+-'".contains(&b))
+        {
+            return Err(invalid(
+                "runner.working_emoji",
+                "must be a short emoji name such as eyes: lowercase letters, digits, _, +, ' and -",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1181,8 +1205,26 @@ data_dir = "/nonexistent/agentd"
             (pool.scope_container_cap, pool.global_container_cap),
             (2, 8)
         );
+        assert_eq!(config.runner.working_emoji, "hourglass_flowing_sand");
+        assert!(config.runner.models.is_none());
+
+        let config = with(
+            &format!(
+                "{MINIMAL}\n[runner]\nworking_emoji = \"eyes\"\n[runner.models]\n\
+                 default = \"m1\"\nplans = {{ claude_max = \"m2\" }}\n"
+            ),
+            env(),
+        )
+        .unwrap();
+        assert_eq!(config.runner.working_emoji, "eyes");
+        let models = config.runner.models.unwrap();
+        assert_eq!(models.model_for(Some("claude_max")), "m2");
+        assert_eq!(models.model_for(None), "m1");
 
         for (section, key) in [
+            ("working_emoji = \":eyes:\"", "runner.working_emoji"),
+            ("working_emoji = \"\"", "runner.working_emoji"),
+            ("[runner.models]\nplans = {}", "runner.models.default"),
             ("claude_bin = \"-x\"", "runner.claude_bin"),
             ("turn_timeout_secs = 0", "runner.turn_timeout_secs"),
             ("idle_timeout_secs = 0", "runner.idle_timeout_secs"),

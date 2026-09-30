@@ -1,6 +1,9 @@
-//! The turn pipeline: sessions, sandboxes and `claude` processes, and what
-//! agentd gives them.
+//! The turn pipeline: from the messages surfaces deliver to the agents'
+//! replies, through sessions, sandboxes and `claude` processes.
 //!
+//! - [`Pipeline`]: routes each message to the agents it addresses, runs
+//!   their turns and delivers what they made.
+//! - [`StoreSurfaces`]: the surface each agent's bot posts through.
 //! - [`Hooks`]: agentd's [`TurnHooks`](runner::TurnHooks). Each process
 //!   gets a placeholder from the [`Registry`](cred_proxy::Registry) the
 //!   credential proxy checks, and an agentctl token from [`Ctl`], and each
@@ -15,6 +18,10 @@
 //! [`Ctl`]: crate::ctl::Ctl
 
 mod hooks;
+mod message;
+mod run;
+mod surfaces;
+mod view;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -30,6 +37,12 @@ use crate::app::App;
 use crate::config::Config;
 
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
+pub use message::HISTORY_LIMIT;
+pub use run::{
+    DEFAULT_WORKING_EMOJI, FAILED_TEXT, LOGIN_EXPIRED_TEXT, Pipeline, PipelineSettings,
+    TIMED_OUT_TEXT, USAGE_LIMIT_TEXT,
+};
+pub use surfaces::StoreSurfaces;
 
 /// The agentctl API as sandboxes reach it: agentd's name on the sandbox
 /// network and the ctl listener's port. It is in the egress environment's
@@ -124,6 +137,40 @@ impl Turns {
     /// The sessions.
     pub fn sessions(&self) -> &SessionManager<Hooks> {
         &self.sessions
+    }
+}
+
+impl PipelineSettings {
+    /// The settings `app` gives: its data directory, its manager bots, and
+    /// `[runner]`'s working emoji and models.
+    pub fn from_app(app: &App) -> Self {
+        let managers = app
+            .rocketchat()
+            .map(|manager| manager.binding.bot.clone())
+            .into_iter()
+            .chain(app.slack().map(|slack| slack.bot()))
+            .collect();
+        let runner = &app.config().runner;
+        Self {
+            data_dir: app.config().store.data_dir.clone(),
+            managers,
+            working_emoji: runner.working_emoji.clone(),
+            models: runner.models.clone(),
+        }
+    }
+}
+
+impl Pipeline {
+    /// The pipeline of `app`, running turns on `turns`: posting through
+    /// `app`'s surfaces and prompting for links through its manager bots.
+    pub fn for_app(app: &App, turns: Turns) -> Self {
+        Self::new(
+            app.store().clone(),
+            turns,
+            Arc::clone(app.surfaces()),
+            app.commands().replies().clone(),
+            PipelineSettings::from_app(app),
+        )
     }
 }
 

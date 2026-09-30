@@ -4722,8 +4722,8 @@ placeholder, and the test asserts the read-only root, the transcript at
 `$CLAUDE_CONFIG_DIR/projects/<id>/<id>.jsonl` holding both turns, a
 `--resume` start for the second, and that every request the fake saw came
 through the proxy with the swapped key. On CI the sandbox runs as the test
-process's own uid, which has no entry in the image's `/etc/passwd`;
-locally, as root, it ran as 10001.
+process's own uid, which has no entry in the image's `/etc/passwd`, and the
+CLI ran there all the same; locally, as root, it ran as 10001.
 
 ### The native CLI honors `NO_PROXY`
 
@@ -4803,3 +4803,140 @@ over the store.
 answers `NotConfigured`, so a placeholder pointed at the community key gets
 401 from the proxy. The router never picks the community key before T26
 either, since `community_key_configured` answers false until then.
+
+### Surfaces take reactions back and say where the bot may post
+
+**Issue.** The working indicator on Rocket.Chat is a reaction put up at
+turn start and taken off at the end, but `Surface` could only add one.
+And a reply there is a `chat.postMessage`, which joins the poster to a
+public channel it isn't in, while Rocket.Chat delivers a message once for
+every bot in the room, so a mention of an agent that isn't in the room can
+arrive through another bot's connection (T14's note). The pipeline had no
+way to tell before it ran the turn.
+
+**Solution.** `Surface` gains `unreact` (Rocket.Chat's `chat.react` with
+`shouldReact: false`, Slack's `reactions.remove`) and `can_post`. On
+Rocket.Chat `can_post` looks the room up in the bot's `subscriptions.get`,
+trusted for a minute, with a room missing from it always listed again, so
+a DM the manager bot just opened is found. `post` and `upload` refuse a
+room the bot isn't in with `SurfaceError::Forbidden`, which also gives
+agentctl's owner-side posts the refusal T15 left to the surface. Slack
+never joins a poster to a conversation and refuses the post itself
+(`not_in_channel`), so its `can_post` only checks the workspace. The
+pipeline asks `can_post` before it runs a turn, so an agent whose bot isn't
+in the room neither answers nor spends a turn. `MockSurface` records
+`unreact` and has `keep_out_of` for a conversation the bot isn't in. The
+design's trait is updated.
+
+### The pipeline takes `Acknowledge`'s place only with turns
+
+**Issue.** The plan has the pipeline replace T14's `Acknowledge` as every
+Rocket.Chat connection's onward sender, but without `[sandbox]` agentd runs
+no turns, and T14's tests watch for the `:eyes:` reaction.
+
+**Solution.** `Server::run` passes messages to the pipeline when it has
+`Turns` and to `Acknowledge` otherwise, so an agentd without sandboxes
+still shows which bot a mention reached. The plan's T14 bullet says so.
+
+### Short ids are `#` and a number
+
+**Issue.** T15 accepts platform message ids, and T23 resolves the short
+ids the turn message shows. A bare number would be ambiguous: nothing
+stops a platform id from being all digits, and T15's own tests use `1`,
+`2` and `3` as Slack-style ids.
+
+**Solution.** The turn message shows `[#7]`, and `agentctl react` and
+`agentctl history --before` take `#7`: `#` and one to nine digits, which no
+platform id starts with, resolved in the calling token's session through
+`Store::message_ref_by_short_id`. A short id of another conversation is
+refused as `react`'s rule refuses any, and `--before` must name a message
+in the turn's conversation. A short id the session doesn't have is
+`not_found`. Anything else is read as a platform id, as before.
+
+### The turn message starts after the session's last reply
+
+**Issue.** "Thread messages since the agent's last reply" read as the
+agent's bot's last message in the history. But a private task's result is
+posted as the same bot from another session, and would then count as the
+agent's reply, hiding both the result and what came before it from the
+channel session.
+
+**Solution.** The builder reads up to 50 messages of the thread before the
+event, and starts after the last one the session itself posted (a
+`message_refs` row of the session with `agent_id` set). Of the rest it
+shows those the session has no row for: a person's message, or the agent's
+own post from another session, marked as such. Each message shown is
+recorded in the session, which gives it its short id and keeps it out of
+the next turn. Posts from other sessions that the 50 messages didn't reach
+come from `Store::posted_elsewhere`, listed by short id for
+`agentctl history`, since `message_refs` keeps no text. The event's own
+message is recorded and shown last, with the requester when it isn't the
+sender (a hop). Message text is kept to one line in the context block, so
+a message can't forge its structure. A thread the event starts has no
+history to read.
+
+### Refusal notices have no message ref
+
+**Issue.** `message_refs` rows belong to a session, and a refused message
+starts none.
+
+**Solution.** The one-line refusal is posted without a row. Nothing reads
+one: no turn is billed for it, and a reply in its thread replies to the
+thread's root, not to the notice.
+
+### `SurfaceLookup` is asynchronous, and the pipeline posts through it
+
+**Issue.** T15's `SurfaceLookup` was synchronous, but finding an agent's
+surface means reading its binding and token from the store.
+
+**Solution.** It is an `async_trait` now, and `StoreSurfaces` implements
+it: each agent's active binding on the conversation's surface and team,
+with a `RocketChatSurface` built from the manager's configuration and the
+bot's token, or a `SlackSurface` over the manager app's `TeamDirectory`,
+kept per binding. Each Slack lookup also gives the directory the
+workspace's active agents' bot users with `set_managed_bots`. `App` builds
+it and hands the same lookup to the agentctl API and the pipeline; tests
+pass their own through `App::with_surfaces`. Slack agents' messages still
+reach no pipeline until T31 routes them, as T30's note says, but their
+replies would already go out through this lookup.
+
+### Each candidate's turn runs in a task of its own
+
+**Issue.** A turn takes minutes, and a Rocket.Chat connection hands each
+message to its onward sender and waits.
+
+**Solution.** The pipeline's sink spawns a task per message and returns at
+once, and each candidate agent runs in a task of its own, so neither the
+connection nor another agent waits. Two messages in one thread that arrive
+together may reach the session's queue in either order. Like the runner's
+queue, these tasks live in memory: a message whose turn hadn't finished
+when agentd stopped isn't retried, since the store already recorded it as
+handled.
+
+### A turn whose start hook failed stops the process
+
+**Issue.** When `turn_starting` fails, the runner keeps the process warm
+(T21). A placeholder that can't be pointed, because it was revoked when a
+new container took its address, would fail every later turn the same way.
+
+**Solution.** The pipeline stops the session's process after a turn that
+failed in `turn_starting`, so the next turn mints anew.
+
+### Who counts as a managed bot
+
+**Issue.** `RouterView::managed_bot` must know every bot user agentd made,
+whatever the binding's state, but `Store::agent_for_bot` finds active
+bindings only.
+
+**Solution.** `Store::agent_of_bot_user` finds the agent of a bot user on a
+binding in any state, and the view asks it for the sender and each
+mention, besides the manager bots' identities from the configuration.
+Candidates still come from active bindings.
+
+### `fake-claude` still counts cost from 0 on resume
+
+**Issue.** The real CLI restores a resumed session's total cost (see above),
+and `fake-claude` counts each process from 0, as T04 wrote it.
+
+**Solution.** Left as it is: the runner's tests rely on it, and changing
+both belongs with T27's correction, which the plan's T27 now names.

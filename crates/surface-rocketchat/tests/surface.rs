@@ -129,6 +129,64 @@ async fn edit_and_react_act_on_the_posted_message() {
 }
 
 #[tokio::test]
+async fn unreact_removes_only_the_bots_reaction() {
+    let s = setup().await;
+    let root = s.fake.seed_message("GENERAL", &s.alice, "question", None);
+    let msg = MsgRef {
+        conv: conv("GENERAL"),
+        id: root.as_str().into(),
+    };
+    s.surface.react(&msg, "hourglass").await.unwrap();
+    s.surface.unreact(&msg, "hourglass").await.unwrap();
+    s.surface.unreact(&msg, "hourglass").await.unwrap();
+    assert!(s.fake.message(&root).unwrap().reactions.is_empty());
+}
+
+#[tokio::test]
+async fn a_bot_never_posts_where_posting_would_join_it() {
+    let s = setup().await;
+    s.fake.add_room("OTHER", "c", "other");
+    s.fake.add_member("OTHER", &s.alice);
+    let root = s.fake.seed_message("OTHER", &s.alice, "@helper hi", None);
+    assert!(s.surface.can_post(&conv("GENERAL")).await.unwrap());
+    assert!(!s.surface.can_post(&conv("OTHER")).await.unwrap());
+    let err = s
+        .surface
+        .post(&target("OTHER", Some(&root)), "answer")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SurfaceError::Forbidden(_)), "{err:?}");
+    let file = OutFile {
+        name: "x.txt".into(),
+        path: PathBuf::from("/nonexistent"),
+    };
+    let err = s
+        .surface
+        .upload(&target("OTHER", None), &[file])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SurfaceError::Forbidden(_)), "{err:?}");
+    assert!(s.fake.requests("chat.postMessage").await.is_empty());
+
+    s.fake.add_member("OTHER", &s.bot);
+    assert!(s.surface.can_post(&conv("OTHER")).await.unwrap());
+    s.surface
+        .post(&target("OTHER", Some(&root)), "answer")
+        .await
+        .unwrap();
+    let listings = s.fake.requests("subscriptions.get").await.len();
+    s.surface
+        .post(&target("GENERAL", None), "again")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.fake.requests("subscriptions.get").await.len(),
+        listings,
+        "a room known to be joined isn't listed again"
+    );
+}
+
+#[tokio::test]
 async fn upload_posts_each_file_in_the_thread() {
     let s = setup().await;
     let dir = std::env::temp_dir().join(format!("rc-upload-{}", std::process::id()));

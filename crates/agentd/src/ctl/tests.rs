@@ -45,10 +45,12 @@ impl Drop for TempDir {
     }
 }
 
+#[derive(Debug)]
 struct Lookup(Arc<MockSurface>);
 
+#[async_trait::async_trait]
 impl SurfaceLookup for Lookup {
-    fn surface(&self, _agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>> {
+    async fn surface(&self, _agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>> {
         (conv.surface == SurfaceKind::Slack).then(|| self.0.clone() as Arc<dyn Surface>)
     }
 }
@@ -931,9 +933,14 @@ async fn settings_come_from_the_config() {
     assert!(format!("{ctl:?}").starts_with("Ctl"));
 }
 
-#[test]
-fn no_surfaces_has_no_surface() {
-    assert!(NoSurfaces.surface(AgentId::new_v4(), &conv("C1")).is_none());
+#[tokio::test]
+async fn no_surfaces_has_no_surface() {
+    assert!(
+        NoSurfaces
+            .surface(AgentId::new_v4(), &conv("C1"))
+            .await
+            .is_none()
+    );
 }
 
 #[test]
@@ -946,4 +953,97 @@ fn hook_errors_name_what_failed() {
         HookError::Random.to_string(),
         "the system random number generator failed"
     );
+}
+
+#[tokio::test]
+async fn short_ids_name_messages_the_session_was_shown() {
+    let fixture = Fixture::new().await;
+    let (info, token) = fixture.process().await;
+    let sender = Requester {
+        member: None,
+        key: MemberKey {
+            surface: SurfaceKind::Slack,
+            team: "T1".into(),
+            user: "U2".into(),
+        },
+    };
+    let mut rows = Vec::new();
+    for (conv_id, id) in [("C1", "100.5"), ("C9", "200.1"), ("C1", "100.7")] {
+        let msg = MsgRef {
+            conv: conv(conv_id),
+            id: MessageId::new(id),
+        };
+        let row = fixture
+            .store
+            .record_message_ref(
+                &store::NewMessageRef {
+                    session: info.session,
+                    msg: &msg,
+                    thread_root: None,
+                    agent: None,
+                    turn: None,
+                    requester: &sender,
+                    hop: Hop::ZERO,
+                },
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        rows.push(row);
+    }
+    let msg = |id: &str| Msg {
+        id: MessageId::new(id),
+        sender: sender.key.clone(),
+        sender_is_bot: false,
+        text: id.to_owned(),
+        files: vec![],
+        sent_at: datetime!(2026-09-30 10:00 UTC),
+    };
+    fixture
+        .surface
+        .set_history(thread(), ["100.3", "100.5", "100.7"].map(msg).to_vec());
+    fixture.ctl.begin_turn(&token, public()).await.unwrap();
+
+    let first = format!("#{}", rows[0].short_id);
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/react",
+            json!({"emoji": "eyes", "message": first}),
+        )
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let elsewhere = format!("#{}", rows[1].short_id);
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/react",
+            json!({"emoji": "eyes", "message": elsewhere}),
+        )
+        .await;
+    assert_eq!((status, code(&value)), (403, "refused"));
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/react",
+            json!({"emoji": "eyes", "message": "#99"}),
+        )
+        .await;
+    assert_eq!((status, code(&value)), (404, "not_found"));
+
+    let before = format!("#{}", rows[2].short_id);
+    let (status, value) = fixture
+        .call(Some(&token), "/v1/history", json!({"before": before}))
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let response: core_types::HistoryResponse = serde_json::from_value(value).unwrap();
+    assert_eq!(response.messages, vec![msg("100.3"), msg("100.5")]);
+    let (status, value) = fixture
+        .call(Some(&token), "/v1/history", json!({"before": elsewhere}))
+        .await;
+    assert_eq!((status, code(&value)), (400, "bad_request"));
+
+    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+    assert_eq!(outbox.reactions().len(), 1);
+    assert_eq!(outbox.reactions()[0].msg, rows[0].msg);
 }

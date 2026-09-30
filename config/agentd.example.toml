@@ -180,6 +180,18 @@ idle_timeout_secs = 900
 scope_container_cap = 4
 global_container_cap = 32
 
+# The reaction an agent's bot puts on the message it is answering while the
+# turn runs, and takes off after: a short emoji name without colons.
+working_emoji = "hourglass_flowing_sand"
+
+# Which model a turn runs on, from the plan of the member whose account it
+# runs on (claude_max, claude_pro, claude_team, claude_enterprise, as the
+# account's profile names it). Optional: without it, the CLI picks its
+# default model.
+# [runner.models]
+# default = "claude-sonnet-5-5"
+# plans = { claude_max = "claude-opus-5-5" }
+
 [agents]
 # How many agents one member may have (deleted ones don't count). `create`
 # refuses more. Default 10.
