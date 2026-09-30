@@ -1583,12 +1583,15 @@ Deliverables:
 
 - A migration `…_message_refs.sql`: `message_refs` (`session_id`,
   `short_id` per session, `surface`, `team_id`, `conversation`,
-  `platform_ref`, `agent_id` nullable,
-  `turn_id` nullable, `requester_member`, `requester_key`, `hop`,
-  `posted_at`), unique on `(surface, team_id, conversation, platform_ref)`,
-  since a Slack `ts` is unique only within a channel. Rows exist for every
-  message agentd posts, and for inbound messages shown to the model, so short
-  ids resolve.
+  `thread_root` not null (`''` for DMs, as in `sessions`), `platform_ref`,
+  `agent_id` nullable, `turn_id` nullable, `requester_member`,
+  `requester_key`, `hop`, `posted_at`).
+  - Unique on `(surface, team_id, conversation, platform_ref)`, since a Slack
+    `ts` is unique only within a channel.
+  - Indexed on `(agent_id, surface, team_id, conversation, thread_root)` for
+    the thread lookups below.
+  - Rows exist for every message agentd posts, and for inbound messages shown
+    to the model, so short ids resolve.
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15.
@@ -1619,7 +1622,9 @@ Deliverables:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
   - Messages agentd posted for this agent in this thread outside this session,
-    found in `message_refs` by agent and a different `session_id`. That covers
+    found in `message_refs` by agent, thread (`surface`, `team_id`,
+    `conversation`, `thread_root`) and a different `session_id`, so results
+    from other threads of the same channel stay out. That covers
     a private task's result and its declined or expired outcomes (T33), which
     never enter the channel session's transcript. This PR fixes the design's
     Persistence bullet on the per-turn message to say so.
@@ -2090,8 +2095,9 @@ Deliverables:
      agentctl allows only `attach` (T15's rule).
 - Delivery: the final reply and attached files are posted to the recorded
   thread as a new message from the agent. Its `message_refs` row carries the
-  original requester and hop. Declined and expired outcomes are posted the same
-  way.
+  original requester and hop, the private session's id, and the recorded
+  thread's `conversation` and `thread_root`, so the channel session's next
+  turn finds it (T23). Declined and expired outcomes are posted the same way.
 - The private session is never the owner's DM session, and its container is
   reaped right after the task.
 
