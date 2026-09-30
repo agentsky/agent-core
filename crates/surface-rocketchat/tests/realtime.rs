@@ -2,7 +2,7 @@
 //! `testkit::rocketchat::FakeDdp` and `FakeRest`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_types::{
     AgentId, Binding, BindingId, ConvKind, InboundEvent, MemberKey, SendError, Sender, Sink,
@@ -17,6 +17,8 @@ use surface_rocketchat::{BotRoles, DEDUP_SOURCE, Dedup, RocketChatConfig, Rocket
 use testkit::rocketchat::{FakeDdp, FakeRest, NOTIFY_USER, realtime_message, subscription_doc};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use wiremock::matchers::path;
+use wiremock::{Mock, ResponseTemplate};
 
 const TEAM: &str = "chat.example";
 const WAIT: Duration = Duration::from_secs(10);
@@ -217,6 +219,23 @@ impl Harness {
 async fn ready(h: &Harness, bot: &Bot, room: &str) {
     h.ddp.wait_for_logins(&bot.id, 1).await;
     h.ddp.wait_for_room(&bot.id, room).await;
+}
+
+/// The `sub` frames asking for `room`'s messages.
+fn room_subs(h: &Harness, room: &str) -> Vec<Value> {
+    h.ddp
+        .client_frames()
+        .into_iter()
+        .map(|(_, frame)| frame)
+        .filter(|frame| frame["msg"] == "sub" && frame["params"][0] == room)
+        .collect()
+}
+
+/// Waits until `bot`'s connection has handled every frame the server sent
+/// it so far: the pong to a new ping comes after them.
+async fn settled(h: &Harness, bot: &Bot) {
+    let id = h.ddp.ping(&bot.id);
+    h.ddp.wait_for_pong(&id).await;
 }
 
 fn mention(message: &mut Value, bot: &Bot) {
@@ -756,4 +775,212 @@ async fn a_tls_endpoint_that_fails_the_handshake_is_retried() {
     drop(rx);
     let result = tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
     assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_server_that_drops_after_setup_is_retried_less_and_less_often() {
+    let h = harness().await;
+    let bot = h.bot("helper").await;
+    h.room("GENERAL", &[&bot.id]);
+    let flapping = RealtimeOptions {
+        backoff_initial: Duration::from_millis(10),
+        backoff_max: Duration::from_secs(1),
+        ..options()
+    };
+    let _task = h.listen_with(&bot, flapping);
+    let mut gaps = Vec::new();
+    for logins in 1..=7 {
+        h.ddp.wait_for_logins(&bot.id, logins).await;
+        h.ddp.wait_for_room(&bot.id, "GENERAL").await;
+        let dropped = Instant::now();
+        h.ddp.drop_connections();
+        h.ddp.wait_for_logins(&bot.id, logins + 1).await;
+        gaps.push(dropped.elapsed());
+    }
+    assert!(gaps[5] >= Duration::from_millis(150), "{gaps:?}");
+    assert!(gaps[6] >= Duration::from_millis(300), "{gaps:?}");
+}
+
+#[tokio::test]
+async fn a_removal_without_rid_is_resolved_and_a_re_add_subscribes_again() {
+    let mut h = harness().await;
+    let bot = h.bot("helper").await;
+    let alice = h.rest.add_user("alice");
+    h.room("GENERAL", &[&bot.id]);
+    h.room("TEAM", &[&bot.id, &alice]);
+    let _task = h.listen(&bot);
+    ready(&h, &bot, "TEAM").await;
+    h.ddp.notify_subscription(
+        &bot.id,
+        "removed",
+        &json!({ "_id": format!("TEAM{}", bot.id) }),
+    );
+    h.ddp.wait_for_room_unsubscribed(&bot.id, "TEAM").await;
+    assert!(h.ddp.subscribed(&bot.id, "stream-room-messages", "GENERAL"));
+    let mut again = subscription_doc(&bot.id, "TEAM", "c", "team");
+    again["_id"] = json!("a-new-subscription");
+    h.ddp.notify_subscription(&bot.id, "inserted", &again);
+    h.ddp.wait_for_room(&bot.id, "TEAM").await;
+    h.ddp
+        .send_message(&realtime_message("m-back", "TEAM", (&alice, "alice"), "hi"));
+    assert_eq!(h.next_event().await.event_id, "m-back");
+}
+
+#[tokio::test]
+async fn an_inserted_notice_for_a_subscribed_room_subscribes_to_it_again() {
+    let mut h = harness().await;
+    let bot = h.bot("helper").await;
+    let alice = h.rest.add_user("alice");
+    h.room("GENERAL", &[&bot.id, &alice]);
+    let _task = h.listen(&bot);
+    ready(&h, &bot, "GENERAL").await;
+    let first = room_subs(&h, "GENERAL")[0]["id"].clone();
+    h.ddp
+        .notify_subscription(&bot.id, "removed", &json!({ "_id": "unknown" }));
+    h.ddp.notify_subscription(
+        &bot.id,
+        "inserted",
+        &subscription_doc(&bot.id, "GENERAL", "c", "general"),
+    );
+    h.ddp
+        .wait_for_frame("the old subscription's unsub", |frame| {
+            frame["msg"] == "unsub" && frame["id"] == first
+        })
+        .await;
+    h.ddp.wait_for_room(&bot.id, "GENERAL").await;
+    assert_eq!(room_subs(&h, "GENERAL").len(), 2);
+    h.ddp.send_message(&realtime_message(
+        "m-again",
+        "GENERAL",
+        (&alice, "alice"),
+        "hi",
+    ));
+    assert_eq!(h.next_event().await.event_id, "m-again");
+    h.no_more_events();
+}
+
+#[tokio::test]
+async fn room_changes_while_the_rooms_are_listed_apply_on_top_of_the_list() {
+    let h = harness().await;
+    let bot = h.bot("helper").await;
+    let listed = |room: &str| json!({ "_id": format!("{room}-doc"), "rid": room, "t": "c", "name": room.to_lowercase() });
+    let stale = json!({
+        "success": true,
+        "update": [listed("GENERAL"), listed("GONE"), listed("LEFT")],
+        "remove": [],
+    });
+    Mock::given(path("/api/v1/subscriptions.get"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(stale)
+                .set_delay(Duration::from_millis(500)),
+        )
+        .with_priority(1)
+        .mount(h.rest.server())
+        .await;
+    let _task = h.listen(&bot);
+    let notices = format!("{}/subscriptions-changed", bot.id);
+    h.ddp
+        .wait_for_subscription(&bot.id, NOTIFY_USER, &notices)
+        .await;
+    h.ddp.notify_subscription(
+        &bot.id,
+        "removed",
+        &json!({ "_id": "GONE-doc", "rid": "GONE" }),
+    );
+    h.ddp
+        .notify_subscription(&bot.id, "removed", &json!({ "_id": "LEFT-doc" }));
+    h.ddp.notify_subscription(
+        &bot.id,
+        "inserted",
+        &subscription_doc(&bot.id, "NEW", "c", "new"),
+    );
+    h.ddp.wait_for_room(&bot.id, "GENERAL").await;
+    h.ddp.wait_for_room(&bot.id, "NEW").await;
+    settled(&h, &bot).await;
+    assert!(room_subs(&h, "GONE").is_empty());
+    assert!(room_subs(&h, "LEFT").is_empty());
+    assert_eq!(room_subs(&h, "NEW").len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_role_lookup_delivers_the_message_as_a_persons() {
+    let mut h = harness().await;
+    let bot = h.bot("helper").await;
+    let alice = h.rest.add_user("alice");
+    h.room("GENERAL", &[&bot.id, &alice]);
+    h.rest.fail("users.info", 500, "unavailable", None).await;
+    let _task = h.listen(&bot);
+    ready(&h, &bot, "GENERAL").await;
+    h.ddp.send_message(&realtime_message(
+        "m-roles",
+        "GENERAL",
+        (&alice, "alice"),
+        "hello",
+    ));
+    let event = h.next_event().await;
+    assert_eq!(event.event_id, "m-roles");
+    assert!(!event.sender_is_bot);
+    assert_eq!(
+        h.next_decision().await,
+        (bot.username.clone(), "m-roles".into(), true)
+    );
+}
+
+#[tokio::test]
+async fn a_manager_that_cannot_see_roles_still_gets_messages_delivered() {
+    let mut h = harness().await;
+    let bot = h.bot("helper").await;
+    let peer = h.bot("peer").await;
+    let alice = h.rest.add_user("alice");
+    h.room("GENERAL", &[&bot.id, &peer.id, &alice]);
+    let peer_rest = RestClient::new(
+        &h.rest.uri(),
+        Credentials {
+            user_id: peer.id.as_str().into(),
+            token: peer.token.clone(),
+        },
+    )
+    .unwrap();
+    h.bots = BotRoles::new(peer_rest);
+    let _task = h.listen(&bot);
+    ready(&h, &bot, "GENERAL").await;
+    h.ddp.send_message(&realtime_message(
+        "m-hidden",
+        "GENERAL",
+        (&alice, "alice"),
+        "hello",
+    ));
+    let event = h.next_event().await;
+    assert_eq!(event.event_id, "m-hidden");
+    assert!(!event.sender_is_bot);
+}
+
+#[tokio::test]
+async fn a_refused_room_is_not_asked_for_again_until_it_is_inserted() {
+    let h = harness().await;
+    let bot = h.bot("helper").await;
+    h.room("GENERAL", &[&bot.id]);
+    h.room("SECRET", &[&bot.id]);
+    h.ddp.forbid_room("SECRET");
+    let _task = h.listen(&bot);
+    ready(&h, &bot, "GENERAL").await;
+    h.ddp
+        .wait_for_frame("the SECRET subscription", |frame| {
+            frame["msg"] == "sub" && frame["params"][0] == "SECRET"
+        })
+        .await;
+    let secret = subscription_doc(&bot.id, "SECRET", "p", "secret");
+    for _ in 0..3 {
+        h.ddp.notify_subscription(&bot.id, "updated", &secret);
+    }
+    settled(&h, &bot).await;
+    assert_eq!(room_subs(&h, "SECRET").len(), 1);
+    h.ddp.notify_subscription(&bot.id, "inserted", &secret);
+    h.ddp
+        .wait_for_frames("SECRET asked for again", 2, |frame| {
+            frame["msg"] == "sub" && frame["params"][0] == "SECRET"
+        })
+        .await;
+    assert_eq!(h.ddp.logins().len(), 1);
 }

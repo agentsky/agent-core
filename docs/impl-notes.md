@@ -1841,9 +1841,14 @@ store's signature and contract, and `RocketChatSurface::new` takes an
 `Arc<dyn Dedup>`. agentd implements it with a one-line call to the store;
 `DEDUP_SOURCE` is `"rocketchat"`. The tests use a real in-memory `Store`
 (a dev-dependency) behind it. A copy is recorded only after it was
-normalized, and a failure to read the room or the sender's roles, or to
-record, skips that copy without recording it, so another bot's connection can
-still deliver the message. A copy recorded when the event receiver has just
+normalized, and a failure to read the room or to record skips that copy
+without recording it, so another bot's connection can still deliver the
+message. A failure to read the sender's roles doesn't skip it: every surface
+shares one `BotRoles`, so every connection would fail alike and the message
+would be lost everywhere. The sender then counts as a person, with a warning
+logged, as history already did; the router looks every sender up as a
+managed agent whatever `sender_is_bot` says, so a managed agent's post still
+takes the agent path. A copy recorded when the event receiver has just
 closed is lost, which only happens at shutdown.
 
 ### Messages don't carry the sender's roles
@@ -1867,6 +1872,15 @@ sender is a bot when the message has a non-false `bot` field or the sender has
 the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
 only to the user itself and to the manager.
 
+Without the permission, `users.info` leaves `roles` out rather than
+failing, which would have classified every bot as a person without a word.
+Every Rocket.Chat user has at least one role, so `BotRoles::is_bot` treats
+an empty or missing list as `SurfaceError::Forbidden`, naming the missing
+permission and the manager's user id (never the token), and doesn't cache
+it. Messages still flow, as above, and each one logs the error, so a
+misconfigured manager is loud until it is fixed. The cache keeps at most
+10,000 users: making room drops expired entries, then the oldest.
+
 ### Room lists and room kinds come from REST
 
 **Issue.** Nothing in the realtime API lists the rooms a user is in without
@@ -1876,7 +1890,8 @@ can't tell a DM from a group DM.
 **Solution.** Each connection lists rooms with REST `subscriptions.get`, and
 the surface reads a room's `t`, `usersCount` and `uids` with `rooms.info` the
 first time a message arrives from it, then keeps it for the surface's
-lifetime (a DM's members are fixed). `RestClient` gains `subscriptions`,
+lifetime (a DM's members are fixed), for at most 10,000 rooms, dropping the
+oldest beyond that. `RestClient` gains `subscriptions`,
 `file_url` (`<base>/file-upload/<id>/<name>`, for `InFile::url`) and
 `credentials` (the realtime login reuses the token), and `FakeRest` answers
 `subscriptions.get`. Only channels, private groups and DMs are listened to:
@@ -1929,12 +1944,21 @@ answers for another user id also ends it.
 - A stream subscription is `sub` with `params: [event, false]`; the second
   parameter turns off collection compatibility. A refused one gets `nosub`
   with `error: "not-allowed"`. A refused room is dropped and the connection
-  stays up; a refused `subscriptions-changed` reconnects.
+  stays up; a refused `subscriptions-changed` reconnects. The refused room
+  is remembered until an `inserted` notice for it or the next connection,
+  since `updated` notices would otherwise ask for it again on every unread
+  change.
 - `subscriptions-changed` carries `[action, subscription]`. `updated` fires
   on every unread-count change, so subscribing is idempotent. `removed` may
-  lack `rid`. The server also stops a room's message subscription itself when
-  the user is removed, without telling the client, and the client sends
-  `unsub` anyway.
+  lack `rid`, so each connection keeps the subscription document `_id` of
+  each room, from `subscriptions.get` (`Subscription` gains `id`) and from
+  `inserted` and `updated` notices, and resolves such a removal through it.
+  The server also stops a room's message subscription itself when the user
+  is removed, without telling the client, and the client sends `unsub`
+  anyway. Because of that, `inserted` is authoritative: for a room already
+  subscribed, the client sends `unsub` for the old subscription and
+  subscribes again, so a removal it couldn't resolve doesn't leave the bot
+  deaf after it is added back.
 
 ### Reconnecting lists the rooms again instead of remembering them
 
@@ -1947,6 +1971,34 @@ lets any user with `view-c-room` read a public channel's messages
 then, plus what `subscriptions-changed` adds, which also covers rooms joined
 while disconnected. Messages posted while a bot had no connection are not
 fetched; [Deferred work](tasks-plan.md#deferred-work) has a bullet for it.
+
+### Changes that arrive while the rooms are listed
+
+**Issue.** `subscriptions.get` runs after the `subscriptions-changed`
+subscription is ready, so a notice can arrive while the listing is in
+flight. Applied at once, a removal found nothing to unsubscribe, and the
+listing, possibly read before the removal, then subscribed to the room
+anyway.
+
+**Solution.** Notices that arrive during the listing are kept, then applied
+in order to the listed rooms before anything is subscribed: a removal takes
+its room out (resolving a missing `rid` through the listing's document ids),
+and `inserted` or `updated` puts it in. A notice about a change the listing
+already reflects changes nothing.
+
+### The backoff starts over only after a healthy connection
+
+**Issue.** The backoff reset as soon as a connection had logged in and
+subscribed, so a server that accepted and subscribed and then dropped the
+socket, or refused `subscriptions-changed` right after, was reconnected at
+the initial wait forever.
+
+**Solution.** The backoff resets only when a connection stays up for the
+longer of `backoff_max` and twice `heartbeat` (60 s by default). That is
+long enough that reconnecting at once costs no more than waiting the
+longest backoff, and longer than it takes to notice a silent server, which
+is declared dead after twice `heartbeat`. A connection that drops sooner
+counts as a failed attempt and the next wait doubles.
 
 ### Normalizing runs off the socket
 
