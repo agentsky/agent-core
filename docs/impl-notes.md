@@ -4652,8 +4652,13 @@ index covers `(surface, team_id, conversation, platform_ref)` where
 `agent_id` is set: agentd records each message it posts once, with the
 agent, turn, requester and hop, and `Store::posted_message_ref` reads that
 row. A session that is shown a message agentd posted elsewhere records its
-own row without `agent_id`. An inbound row's requester is the message's
-sender, with hop 0, so the columns the plan lists stay required. The next
+own row without `agent_id`. A session shown its own post before recording
+it as posted keeps that row and short id, and recording the post gives the
+row the agent, turn, requester and hop in the same transaction rather than
+returning it unchanged, which would lose the attribution; the partial index
+still refuses it when another session's row attributes the message. An
+inbound row's requester is the message's sender, with hop 0, so the columns
+the plan lists stay required. The next
 short id is taken inside the insert, in one `BEGIN IMMEDIATE` transaction;
 a test with sixteen concurrent inserts on a file database gets 1 to 16.
 `Store::posted_elsewhere` finds the agent's posts in a thread that the
@@ -4675,6 +4680,20 @@ and `revoke` then drops the session's watch sender, which closes its
 egress tunnels exactly as `revoke_session` would. A test stops an old
 process after a new one started and the new placeholder still works. A
 second call is harmless: both revocations find nothing.
+
+### The hooks check the turn's side
+
+**Issue.** The hooks took `TurnRequest::side` as given, but the owner's
+side, which agentctl's target rules and the private volume's mounts grant
+more to, belongs to the agent's private session only (the owner's DM and
+the owner's private tasks). A wrong side from the pipeline would have
+granted it in a channel.
+
+**Solution.** `turn_starting` refuses `Side::Owner` unless the session's
+scope is `ScopeKey::Private`, before it points the placeholder or records
+the turn, so the turn fails and its `turn_finished` finds nothing to clear.
+`turn_finished` unpoints the placeholder, which can't fail, before it
+awaits `Ctl::end_turn`, so the credential stops being reachable first.
 
 ### A resumed process restores the session's total cost
 
@@ -4758,6 +4777,26 @@ them, and name `fake-claude`'s script and `agentctl`'s directory in
 `TurnSettings::env`, which is added after the egress variables and holds
 no secret. agentd sets nothing there.
 
+With `[sandbox]` set, the ports are therefore not a choice:
+`internal.proxy_listen` must use `cred_proxy::PROXY_URL`'s port and
+`internal.ctl_listen` `pipeline::AGENTCTL_URL`'s, both read from the
+constants, or the configuration is refused naming the key. Any other port,
+0 included, would be one sandboxes never try and `isolate-sandbox.sh`
+doesn't let through. Tests that bind port 0 have no `[sandbox]`.
+
+### Plain HTTP upstreams only on loopback
+
+**Issue.** `[proxy] upstream` took any `http://` URL, so a mistyped
+upstream would send members' real credentials over the network
+unencrypted.
+
+**Solution.** `Upstream::parse`, behind both `CredProxy::new` and
+`check_upstream`, takes `http` only when the host is a loopback IP address
+(IPv4-mapped included), which is where tests' fakes listen, and `https`
+otherwise. `localhost` is refused as a name that could resolve anywhere.
+`Routers::new` logs a warning, with the upstream, when it isn't
+`DEFAULT_UPSTREAM`, so a gateway in front of the API is never silent.
+
 ### `[sandbox]` is optional
 
 **Issue.** The plan has agentd build a `DockerSandbox` and reap orphans at
@@ -4770,7 +4809,9 @@ stops what a previous run of the same `instance` left (`reap_orphans`),
 and starts the runner (`pipeline::Turns`) after the listeners are bound.
 The example configuration has the section, with the image the Compose file
 builds; the Compose README adds `host_data_dir`, which depends on where the
-checkout is.
+checkout is. `docker_startup_reaps_only_this_instances_sandboxes` plants a
+container labeled with the configured instance and a session, and one
+without labels, and checks that `connect_docker` removes only the first.
 
 ### A process sandbox gives every container one address
 

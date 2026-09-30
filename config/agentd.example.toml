@@ -55,11 +55,13 @@ log_filter = "info"
 
 [internal]
 # The credential proxy listener that sandboxes use as ANTHROPIC_BASE_URL and
-# HTTPS_PROXY (cred-proxy.internal). Must be inside sandbox_subnet.
+# HTTPS_PROXY (cred-proxy.internal). Must be inside sandbox_subnet. With
+# [sandbox], the port must be 8080, where sandboxes reach it.
 proxy_listen = "172.30.0.2:8080"
 
 # The agentctl API listener (agentctl.internal). Must be inside
-# sandbox_subnet.
+# sandbox_subnet. With [sandbox], the port must be 8081, where sandboxes
+# reach it.
 ctl_listen = "172.30.0.2:8081"
 
 # The sandbox network, in CIDR form. The public listener refuses connections
@@ -85,7 +87,9 @@ attach_max_bytes = 52428800
 # Where the credential proxy forwards the requests sandboxes send to their
 # ANTHROPIC_BASE_URL (http://cred-proxy.internal:8080), after swapping the
 # placeholder they hold for the real credential. Change it only to point
-# tests at a fake.
+# tests at a fake. It must be https://, or http:// to a loopback IP address,
+# so real credentials never cross a network unencrypted; agentd logs a
+# warning at startup when it isn't the default.
 upstream = "https://api.anthropic.com"
 
 # The hosts sandboxes may open HTTPS tunnels to, through the egress proxy on

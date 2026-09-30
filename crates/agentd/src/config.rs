@@ -199,10 +199,14 @@ impl ServerConfig {
 pub struct InternalConfig {
     /// `proxy_listen`: the credential proxy listener's address, agentd's
     /// address on the `sandbox` network, port 8080. Must be inside
-    /// `sandbox_subnet`.
+    /// `sandbox_subnet`, and with `[sandbox]` its port must be
+    /// [`cred_proxy::PROXY_URL`]'s, where sandboxes reach it.
     pub proxy_listen: SocketAddr,
     /// `ctl_listen`: the agentctl API listener's address, agentd's address on
-    /// the `sandbox` network, port 8081. Must be inside `sandbox_subnet`.
+    /// the `sandbox` network, port 8081. Must be inside `sandbox_subnet`, and
+    /// with `[sandbox]` its port must be
+    /// [`AGENTCTL_URL`](crate::pipeline::AGENTCTL_URL)'s, where sandboxes
+    /// reach it.
     pub ctl_listen: SocketAddr,
     /// `sandbox_subnet`: the `sandbox` network. The public listener refuses
     /// connections from it, and must not be inside it; the proxy and ctl
@@ -295,8 +299,10 @@ impl Default for LimitsConfig {
 pub struct ProxyConfig {
     /// `upstream`: where the credential proxy forwards the requests
     /// sandboxes send to `ANTHROPIC_BASE_URL`, [`DEFAULT_UPSTREAM`] unless a
-    /// test points it at a fake. An `http://` or `https://` URL with a host,
-    /// and no credentials, query or fragment.
+    /// test points it at a fake. An `https://` URL, or an `http://` one
+    /// whose host is a loopback IP address, with no credentials, query or
+    /// fragment. agentd logs a warning at startup when it isn't the
+    /// default.
     pub upstream: String,
     /// `allow`: the hosts sandboxes may open HTTPS tunnels to, as
     /// [`HostRule`]s such as `github.com`, `*.githubusercontent.com` or
@@ -740,14 +746,36 @@ impl File {
         cred_proxy::check_upstream(&self.proxy.upstream).map_err(|_| {
             invalid(
                 "proxy.upstream",
-                "must be an http:// or https:// URL with a host, and no user info, query or \
-                 fragment",
+                "must be an https:// URL, or http:// to a loopback IP address, with no user \
+                 info, query or fragment",
             )
         })?;
         if let Some(sandbox) = &self.sandbox {
             sandbox
                 .validate()
                 .map_err(|err| invalid(format!("sandbox.{}", err.key), err.message))?;
+            for (key, addr, url) in [
+                (
+                    "internal.proxy_listen",
+                    self.internal.proxy_listen,
+                    cred_proxy::PROXY_URL,
+                ),
+                (
+                    "internal.ctl_listen",
+                    self.internal.ctl_listen,
+                    crate::pipeline::AGENTCTL_URL,
+                ),
+            ] {
+                if url_port(url) != Some(addr.port()) {
+                    return Err(invalid(
+                        key,
+                        format!(
+                            "{addr} must use the port of {url} with [sandbox]: sandboxes reach \
+                             this listener there, and only that port is let through"
+                        ),
+                    ));
+                }
+            }
         }
         self.runner.validate()?;
         if self.agents.max_per_owner == 0 {
@@ -803,6 +831,12 @@ impl RocketChatConfig {
         }
         Ok(())
     }
+}
+
+/// The port of `url`, an `http://host:port` URL such as
+/// [`cred_proxy::PROXY_URL`].
+fn url_port(url: &str) -> Option<u16> {
+    url.rsplit_once(':')?.1.parse().ok()
 }
 
 /// `addr` with an IPv4-mapped IPv6 address replaced by its IPv4 address, so
@@ -988,6 +1022,21 @@ url = "sqlite::memory:"
 data_dir = "/nonexistent/agentd"
 "#;
 
+    /// [`MINIMAL`] with the ports sandboxes reach, as `[sandbox]` requires.
+    pub(crate) fn sandboxed() -> String {
+        MINIMAL
+            .replacen(
+                "proxy_listen = \"127.0.0.2:0\"",
+                "proxy_listen = \"127.0.0.2:8080\"",
+                1,
+            )
+            .replacen(
+                "ctl_listen = \"127.0.0.2:0\"",
+                "ctl_listen = \"127.0.0.2:8081\"",
+                1,
+            )
+    }
+
     pub(crate) fn key() -> String {
         Sealer::generate_key().unwrap().expose_secret().to_owned()
     }
@@ -1130,9 +1179,10 @@ data_dir = "/nonexistent/agentd"
 
     #[test]
     fn the_sandbox_section_is_the_sandbox_crates_config() {
+        let base = sandboxed();
         let config = with(
             &format!(
-                "{MINIMAL}\n[sandbox]\nimage = \"agent-core/sandbox:dev\"\nnetwork = \"sbx\"\n\
+                "{base}\n[sandbox]\nimage = \"agent-core/sandbox:dev\"\nnetwork = \"sbx\"\n\
                  host_data_dir = \"/srv/agentd\"\n"
             ),
             env(),
@@ -1155,9 +1205,50 @@ data_dir = "/nonexistent/agentd"
             ("image = \"i\"\nuid = 0", "sandbox.uid", "never run as root"),
             ("image = \"i\"\nbogus = 1", "sandbox.bogus", "unknown field"),
         ] {
-            let err = file_err(&format!("{MINIMAL}\n[sandbox]\n{section}\n"));
+            let err = file_err(&format!("{base}\n[sandbox]\n{section}\n"));
             assert_eq!(err.key(), Some(key), "{section}: {err}");
             assert!(err.to_string().contains(message), "{section}: {err}");
+        }
+    }
+
+    #[test]
+    fn with_a_sandbox_the_internal_listeners_use_the_ports_sandboxes_reach() {
+        assert_eq!(url_port(cred_proxy::PROXY_URL), Some(8080));
+        assert_eq!(url_port(crate::pipeline::AGENTCTL_URL), Some(8081));
+        let section = "\n[sandbox]\nimage = \"i\"\n";
+        with(&format!("{}{section}", sandboxed()), env()).unwrap();
+        with(MINIMAL, env()).unwrap();
+        for (from, to, key, url) in [
+            (
+                "proxy_listen = \"127.0.0.2:8080\"",
+                "proxy_listen = \"127.0.0.2:0\"",
+                "internal.proxy_listen",
+                cred_proxy::PROXY_URL,
+            ),
+            (
+                "proxy_listen = \"127.0.0.2:8080\"",
+                "proxy_listen = \"127.0.0.2:9090\"",
+                "internal.proxy_listen",
+                cred_proxy::PROXY_URL,
+            ),
+            (
+                "ctl_listen = \"127.0.0.2:8081\"",
+                "ctl_listen = \"127.0.0.2:0\"",
+                "internal.ctl_listen",
+                crate::pipeline::AGENTCTL_URL,
+            ),
+            (
+                "ctl_listen = \"127.0.0.2:8081\"",
+                "ctl_listen = \"127.0.0.2:8082\"",
+                "internal.ctl_listen",
+                crate::pipeline::AGENTCTL_URL,
+            ),
+        ] {
+            let text = sandboxed().replacen(from, to, 1);
+            with(&text, env()).unwrap();
+            let err = file_err(&format!("{text}{section}"));
+            assert_eq!(err.key(), Some(key), "{to}: {err}");
+            assert!(err.to_string().contains(url), "{to}: {err}");
         }
     }
 
@@ -1200,13 +1291,27 @@ data_dir = "/nonexistent/agentd"
 
     #[test]
     fn the_proxy_upstream_is_configurable_and_checked() {
-        let config = with(
-            &format!("{MINIMAL}\n[proxy]\nupstream = \"http://127.0.0.1:9\"\n"),
-            env(),
-        )
-        .unwrap();
-        assert_eq!(config.proxy.upstream, "http://127.0.0.1:9");
-        for bad in ["ftp://x", "https://u:p@x", "https://x/?q=1", "nope"] {
+        for good in [
+            "http://127.0.0.1:9",
+            "http://[::1]:9/anthropic",
+            "https://llm-gateway.example.com",
+        ] {
+            let config = with(
+                &format!("{MINIMAL}\n[proxy]\nupstream = \"{good}\"\n"),
+                env(),
+            )
+            .unwrap();
+            assert_eq!(config.proxy.upstream, good);
+        }
+        for bad in [
+            "ftp://x",
+            "https://u:p@x",
+            "https://x/?q=1",
+            "nope",
+            "http://api.anthropic.com",
+            "http://localhost:9",
+            "http://10.0.0.1:9",
+        ] {
             let err = file_err(&format!("{MINIMAL}\n[proxy]\nupstream = \"{bad}\"\n"));
             assert_eq!(err.key(), Some("proxy.upstream"), "{bad}: {err}");
             assert!(!err.to_string().contains(bad), "{bad}: {err}");

@@ -131,9 +131,10 @@ impl CredProxy {
     ///
     /// # Errors
     ///
-    /// [`ProxyError::Upstream`] unless `upstream` is an `http` or `https`
-    /// URL with a host and no credentials, query or fragment, and
-    /// [`ProxyError::Client`] if the HTTP client can't be built.
+    /// [`ProxyError::Upstream`] unless `upstream` is an `https` URL, or an
+    /// `http` one whose host is a loopback IP address, so real credentials
+    /// never cross a network unencrypted, with no credentials, query or
+    /// fragment; [`ProxyError::Client`] if the HTTP client can't be built.
     pub fn new(
         upstream: &str,
         registry: Registry,
@@ -333,8 +334,8 @@ async fn handle(State(proxy): State<Arc<CredProxy>>, request: Request) -> Respon
     }
 }
 
-/// The configured upstream: an `http` or `https` origin and an optional
-/// base path.
+/// The configured upstream: an `https` origin, or an `http` one on a
+/// loopback IP address, and an optional base path.
 struct Upstream {
     base: Url,
 }
@@ -344,8 +345,9 @@ struct Upstream {
 ///
 /// # Errors
 ///
-/// [`ProxyError::Upstream`] unless `upstream` is an `http` or `https` URL
-/// with a host and no credentials, query or fragment.
+/// [`ProxyError::Upstream`] unless `upstream` is an `https` URL, or an
+/// `http` one whose host is a loopback IP address, with no credentials,
+/// query or fragment.
 pub fn check_upstream(upstream: &str) -> Result<(), ProxyError> {
     Upstream::parse(upstream).map(drop)
 }
@@ -358,6 +360,11 @@ impl Upstream {
         }
         if base.host().is_none() {
             return Err(ProxyError::Upstream("there is no host"));
+        }
+        if base.scheme() == "http" && !is_loopback_ip(&base) {
+            return Err(ProxyError::Upstream(
+                "plain http is allowed only to a loopback IP address",
+            ));
         }
         if !base.username().is_empty() || base.password().is_some() {
             return Err(ProxyError::Upstream("credentials are not allowed"));
@@ -392,6 +399,14 @@ impl Upstream {
             && inside)
             .then_some(url)
     }
+}
+
+/// Whether `url`'s host is a loopback IP address, IPv4-mapped included.
+fn is_loopback_ip(url: &Url) -> bool {
+    url.host_str()
+        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// The header a credential of `kind` travels in.
@@ -672,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn upstreams_must_be_plain_http_origins() {
+    fn upstreams_must_be_https_or_loopback_http_origins() {
         for (text, reason) in [
             ("not a url", "not a URL"),
             ("ftp://example.com", "the scheme must be http or https"),
@@ -685,6 +700,22 @@ mod tests {
                 "https://example.com/#x",
                 "a query or fragment is not allowed",
             ),
+            (
+                "http://api.anthropic.com",
+                "plain http is allowed only to a loopback IP address",
+            ),
+            (
+                "http://localhost:9",
+                "plain http is allowed only to a loopback IP address",
+            ),
+            (
+                "http://10.0.0.1:9",
+                "plain http is allowed only to a loopback IP address",
+            ),
+            (
+                "http://127.0.0.1.example.com",
+                "plain http is allowed only to a loopback IP address",
+            ),
         ] {
             match Upstream::parse(text) {
                 Err(ProxyError::Upstream(got)) => assert_eq!(got, reason, "{text}"),
@@ -692,7 +723,16 @@ mod tests {
             }
             assert!(check_upstream(text).is_err(), "{text}");
         }
-        check_upstream(DEFAULT_UPSTREAM).unwrap();
+        for good in [
+            DEFAULT_UPSTREAM,
+            "https://llm-gateway.example.com/anthropic",
+            "http://127.0.0.1:9",
+            "http://127.1.2.3",
+            "http://[::1]:9/",
+            "http://[::ffff:127.0.0.1]:9",
+        ] {
+            check_upstream(good).unwrap_or_else(|err| panic!("{good}: {err}"));
+        }
     }
 
     #[test]

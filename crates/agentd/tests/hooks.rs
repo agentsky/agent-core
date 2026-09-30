@@ -272,6 +272,72 @@ async fn a_credential_of_the_other_kind_fails_the_turn_start() {
 }
 
 #[tokio::test]
+async fn the_owners_side_runs_only_in_the_private_session() {
+    let rig = rig().await;
+    let (env, process) = rig.start().await;
+    let turn = TurnRequest {
+        side: Side::Owner,
+        ..rig.turn(CredentialRef::Member(rig.member))
+    };
+    let err = rig
+        .hooks
+        .turn_starting(&rig.session, &process, &turn)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("owner's side"), "{err}");
+    let (status, body) = rig.through_proxy(&env.placeholder).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        rig.hooks
+            .turn_finished(&rig.session, &process, &turn)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let private = rig
+        .store
+        .session_for_thread(
+            rig.session.agent,
+            &ThreadKey {
+                conv: ConvRef {
+                    surface: SurfaceKind::RocketChat,
+                    team: "chat.example".into(),
+                    conversation: "DM-OWNER".into(),
+                },
+                root: None,
+            },
+            &ScopeKey::Private,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+        .session;
+    let (env, process) = rig
+        .hooks
+        .process_starting(
+            &private,
+            CONTAINER.parse::<IpAddr>().unwrap(),
+            CredentialKind::Subscription,
+        )
+        .await
+        .unwrap();
+    rig.hooks
+        .turn_starting(&private, &process, &turn)
+        .await
+        .unwrap();
+    let (status, body) = rig.through_proxy(&env.placeholder).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        rig.hooks
+            .turn_finished(&private, &process, &turn)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn stopping_revokes_the_placeholder_and_the_token_and_is_idempotent() {
     let rig = rig().await;
     let (env, process) = rig.start().await;

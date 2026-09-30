@@ -53,7 +53,9 @@ whatever it says. `max_tunnels` and `max_session_tunnels` cap the open
 tunnels in all and per sandbox. The same listener is the credential proxy,
 sandboxes' `ANTHROPIC_BASE_URL`: it swaps the placeholder a sandbox holds for
 the real credential and forwards to `[proxy] upstream`
-(`https://api.anthropic.com`).
+(`https://api.anthropic.com`), which must be `https://`, or `http://` to a
+loopback IP address for a test's fake; agentd logs a warning when it isn't
+the default.
 Turns run only with a `[sandbox]` section: agentd then connects to the Docker
 daemon at startup, stops every container a previous run of the same
 `[sandbox] instance` left, and runs one container per active session from
@@ -65,7 +67,8 @@ through, as `deploy/compose/compose.yaml` and `isolate-sandbox.sh` do.
 `[runner]` sets the `claude` executable, the turn timeout, how long idle
 containers stay warm, and how many run at once. Sandboxes reach agentd as
 `cred-proxy.internal:8080` and `agentctl.internal:8081`, so give agentd those
-names on the sandbox network and keep those ports.
+names on the sandbox network and keep those ports: with `[sandbox]`,
+`internal.proxy_listen` must use port 8080 and `internal.ctl_listen` 8081.
 `GET /healthz` on the public listener answers 200 while the database does.
 It also serves Slack's request URLs, `/slack/b/<binding>/events`,
 `…/interactivity` and `…/commands`; the manager app's binding is `manager`,
