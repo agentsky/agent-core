@@ -5107,6 +5107,14 @@ session is listed and reset by `reset <name>`, but not by `here`, since it
 isn't the conversation's own session. A reset session is gone from the
 list; its replacement shows up again once it has a turn.
 
+A session left out is one the CLI never read a message of, so it has no
+transcript, and its next turn starts with `--session-id` whether it is
+reset or not. That covers a session the pipeline has just looked up for a
+turn it is still preparing: resetting it would change its id and nothing
+else. A session that has run is reset even with such a turn pending, and
+the turn then finds it reset and moves to the replacement (T23's retry on
+`SessionReset`).
+
 ### `here` is the conversation, not the thread
 
 **Issue.** A channel has one session per thread, so "the current
