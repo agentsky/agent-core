@@ -4,28 +4,36 @@
 //! ```text
 //! <data dir>/volumes/                      0700, agentd's
 //!   <agent id>/<hex SHA-256 of scope key>/ one volume
-//!     sessions/<session id>/               mounted read-write in its session;
-//!                                          agentd's, so the agent can't
-//!                                          rename or replace what is in it
+//!     sessions/<session id>/               mounted read-write in its session
 //!       work/ claude/ home/ tmp/           the sandbox user's
 //!       claude/settings.json               rewritten before every start
 //!     shared/                              the sandbox user's
 //!     memory/                              Private volumes only
 //! ```
 //!
-//! Everything inside a session directory, and inside `shared/` and
-//! `memory/`, is written by the agent, so host-side code here never follows
-//! a symlink there: an entry that should be a directory but is a symlink or
-//! a file is replaced, and `settings.json` is written to a new file and
-//! renamed into place. The volume's own directories are reachable from no
-//! sandbox, so they are only created, never replaced.
+//! agentd runs as the sandbox user, so the agent can rename, replace or
+//! remove anything inside its session directory, and inside `shared/` and
+//! `memory/`. Host-side code here therefore never follows a symlink there:
+//! an entry that should be a directory but is a symlink or a file is
+//! replaced, and `settings.json` is written to a new file and renamed into
+//! place. The directories above those mounts (`volumes/`, the volume and
+//! its `sessions/`) are reachable from no sandbox, so they are only
+//! created, never replaced.
+//!
+//! The repair runs only in [`Sandbox::start`](crate::Sandbox::start),
+//! before the session's container exists, so nothing in the sandbox races
+//! it. Writing `settings.json` doesn't rely on that: it goes through a
+//! handle on `claude/` opened without following a symlink, so a `claude`
+//! swapped for a symlink after its repair makes the write fail instead of
+//! landing elsewhere.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File};
 use std::io::{self, ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, lchown};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, fchown, lchown};
 use std::path::{Path, PathBuf};
 
 use core_types::{ScopeKey, SessionId, VolumeKey};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use store::Store;
 
@@ -145,28 +153,57 @@ impl Layout {
 
     /// Writes `settings.json` into `claude_dir` through a new file renamed
     /// over the old one, so a symlink the agent left there is replaced, not
-    /// followed.
-    fn write_settings(&self, claude_dir: &Path) -> Result<()> {
-        let target = claude_dir.join("settings.json");
-        if fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
-            fs::remove_dir_all(&target).map_err(io_err("replacing settings.json"))?;
+    /// followed. Every step is relative to a handle on `claude_dir` opened
+    /// without following a symlink and checked to be owned as expected, so
+    /// nothing is written outside it.
+    pub(crate) fn write_settings(&self, claude_dir: &Path) -> Result<()> {
+        const TARGET: &str = "settings.json";
+        let dir = rustix::fs::open(
+            claude_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|err| io_err("opening the claude directory")(err.into()))?;
+        let meta = dir
+            .metadata()
+            .map_err(io_err("inspecting the claude directory"))?;
+        if self
+            .owner
+            .is_some_and(|owner| owner != (meta.uid(), meta.gid()))
+        {
+            return Err(SandboxError::Io {
+                what: "checking the claude directory",
+                source: io::Error::other("it changed owner while it was prepared"),
+            });
+        }
+        let is_dir = rustix::fs::statat(&dir, TARGET, AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory);
+        if is_dir {
+            let aside = format!(".settings.json.{}.old", uuid::Uuid::new_v4());
+            rustix::fs::renameat(&dir, TARGET, &dir, &aside)
+                .map_err(|err| io_err("replacing settings.json")(err.into()))?;
+            let _ = fs::remove_dir_all(claude_dir.join(&aside));
         }
         let body = settings_json(self.cleanup_period_days);
-        let temp = claude_dir.join(format!(".settings.json.{}", uuid::Uuid::new_v4()));
+        let temp = format!(".settings.json.{}", uuid::Uuid::new_v4());
+        let file = rustix::fs::openat(
+            &dir,
+            &temp,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(File::from)
+        .map_err(|err| io_err("writing settings.json")(err.into()))?;
         let written = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temp)?;
-            file.write_all(body.as_bytes())?;
+            (&file).write_all(body.as_bytes())?;
             if let Some((uid, gid)) = self.owner {
-                lchown(&temp, Some(uid), Some(gid))?;
+                fchown(&file, Some(uid), Some(gid))?;
             }
-            fs::rename(&temp, &target)
+            rustix::fs::renameat(&dir, &temp, &dir, TARGET).map_err(io::Error::from)
         })();
         if written.is_err() {
-            let _ = fs::remove_file(&temp);
+            let _ = rustix::fs::unlinkat(&dir, &temp, AtFlags::empty());
         }
         written.map_err(io_err("writing settings.json"))
     }
@@ -422,6 +459,33 @@ mod fs_tests {
         fs::create_dir_all(settings.join("nested")).unwrap();
         layout.prepare_session_dirs(&volume, session).await.unwrap();
         assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
+        let names: Vec<_> = fs::read_dir(session_dir.join("claude"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["settings.json"]);
+    }
+
+    #[tokio::test]
+    async fn settings_are_never_written_through_a_swapped_claude_directory() {
+        let dir = TempDir::new();
+        let outside = TempDir::new();
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, SessionId::new_v4())
+            .await
+            .unwrap();
+        let claude = session_dir.join("claude");
+        fs::rename(&claude, session_dir.join("claude-old")).unwrap();
+        symlink(&outside.0, &claude).unwrap();
+        let err = layout.write_settings(&claude).unwrap_err();
+        assert!(matches!(err, SandboxError::Io { .. }), "{err:?}");
+        assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
     }
 
     #[tokio::test]

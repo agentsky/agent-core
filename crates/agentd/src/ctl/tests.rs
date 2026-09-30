@@ -570,7 +570,7 @@ async fn queues_are_capped_per_turn() {
 
 #[tokio::test]
 async fn attach_stages_the_file_until_the_outbox_is_dropped() {
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::with(|settings| settings.attach_max_bytes = 1 << 20).await;
     let (_, token) = fixture.process().await;
     let running = public();
     fixture
@@ -583,6 +583,12 @@ async fn attach_stages_the_file_until_the_outbox_is_dropped() {
     assert_eq!(value, json!({"name": "report v2.txt", "size": 5}));
     let (status, _) = fixture.attach(&token, "empty", b"").await;
     assert_eq!(status, 200);
+    let big = vec![b'x'; JSON_BODY_LIMIT * 2];
+    let (status, value) = fixture.attach(&token, "big.bin", &big).await;
+    assert_eq!(
+        status, 200,
+        "attach is not held to the JSON body limit: {value}"
+    );
 
     let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
     assert_eq!(outbox.turn(), running.id);
@@ -595,6 +601,7 @@ async fn attach_stages_the_file_until_the_outbox_is_dropped() {
             .starts_with(&fixture.ctl.settings().staging_dir)
     );
     assert_eq!(std::fs::read(&files[1].path).unwrap(), b"");
+    assert_eq!(std::fs::read(&files[2].path).unwrap(), big);
     drop(outbox);
     assert!(!files[0].path.exists());
     assert!(!files[0].path.parent().unwrap().exists());
@@ -832,11 +839,64 @@ async fn a_lease_expires_when_its_holder_stops_renewing() {
     }
     let held = lock(&fixture, &a, json!({"op": "acquire"})).await;
     assert_eq!(held["state"], "held");
-    fixture.ctl.revoke_process_token(&a).await.unwrap();
     tokio::time::sleep(Duration::from_millis(2_100)).await;
     let taken = lock(&fixture, &b, json!({"op": "acquire"})).await;
     assert_eq!(taken["state"], "held");
     assert_ne!(taken["lease"], held["lease"]);
+}
+
+#[tokio::test]
+async fn a_lease_ends_with_its_turn_and_its_token() {
+    let fixture = Fixture::new().await;
+    let (info, a) = fixture.process().await;
+    let b = fixture.sibling(&info).await;
+    for token in [&a, &b] {
+        fixture.ctl.begin_turn(token, public()).await.unwrap();
+    }
+    let acquire = || json!({"op": "acquire"});
+    assert_eq!(lock(&fixture, &a, acquire()).await["state"], "held");
+    assert_eq!(lock(&fixture, &b, acquire()).await["state"], "busy");
+    fixture.ctl.end_turn(&a).await.unwrap();
+    assert_eq!(
+        lock(&fixture, &b, acquire()).await["state"],
+        "held",
+        "the lock is free as soon as the holder's turn ends"
+    );
+    fixture.ctl.begin_turn(&a, public()).await.unwrap();
+    assert_eq!(lock(&fixture, &a, acquire()).await["state"], "busy");
+    fixture.ctl.begin_turn(&b, public()).await.unwrap();
+    assert_eq!(
+        lock(&fixture, &a, acquire()).await["state"],
+        "held",
+        "a turn that replaces the holder's turn frees it too"
+    );
+    fixture.ctl.revoke_process_token(&a).await.unwrap();
+    assert_eq!(
+        lock(&fixture, &b, acquire()).await["state"],
+        "held",
+        "the lock is free as soon as the holder's token is revoked"
+    );
+    let c = fixture.sibling(&info).await;
+    fixture.ctl.begin_turn(&c, public()).await.unwrap();
+    assert_eq!(
+        lock(&fixture, &c, acquire()).await["state"],
+        "busy",
+        "a new token for another session leaves the lease alone"
+    );
+    let holder = fixture.store.ctl_token(&b.hash()).await.unwrap().unwrap();
+    fixture
+        .ctl
+        .issue_process_token(ProcessInfo {
+            session: holder.session,
+            ..info
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        lock(&fixture, &c, acquire()).await["state"],
+        "held",
+        "a new token for the holder's session frees it"
+    );
 }
 
 #[tokio::test]

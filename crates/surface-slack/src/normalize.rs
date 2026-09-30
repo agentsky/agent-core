@@ -26,6 +26,8 @@
 //! - The team is the envelope's `team_id`, for the sender and the
 //!   conversation alike.
 
+use std::collections::HashSet;
+
 use core_types::{
     BindingId, ConvKind, ConvRef, InFile, InboundEvent, MemberKey, MsgRef, SurfaceKind, TeamId,
     UserId,
@@ -206,13 +208,9 @@ pub fn mentions(text: &str, blocks: Option<&Value>) -> Vec<UserId> {
     if let Some(blocks) = blocks {
         walk_blocks(blocks, &mut found);
     }
-    let mut unique: Vec<UserId> = Vec::with_capacity(found.len());
-    for user in found {
-        if !unique.contains(&user) {
-            unique.push(user);
-        }
-    }
-    unique
+    let mut seen = HashSet::with_capacity(found.len());
+    found.retain(|user| seen.insert(user.clone()));
+    found
 }
 
 fn walk_blocks(value: &Value, found: &mut Vec<UserId>) {
@@ -352,6 +350,15 @@ mod tests {
         let found = mentions("<@U1> and <@U1>", Some(&blocks));
         let ids: Vec<&str> = found.iter().map(UserId::as_str).collect();
         assert_eq!(ids, ["U1", "U2", "U3", "U4", "U5"]);
+    }
+
+    #[test]
+    fn many_mentions_are_deduplicated_in_linear_time() {
+        let text: String = (0..40_000).map(|n| format!("<@U{n}><@U{n}>")).collect();
+        let found = mentions(&text, None);
+        assert_eq!(found.len(), 40_000);
+        assert_eq!(found[0].as_str(), "U0");
+        assert_eq!(found[39_999].as_str(), "U39999");
     }
 
     #[test]

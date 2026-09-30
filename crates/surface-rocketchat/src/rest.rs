@@ -234,6 +234,10 @@ pub struct RoomInfo {
 /// One room the user belongs to, from `subscriptions.get`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Subscription {
+    /// The subscription document's own `_id`. A `subscriptions-changed`
+    /// removal notice may carry only this.
+    #[serde(rename = "_id")]
+    pub id: String,
     /// The room's id (`rid`).
     #[serde(rename = "rid")]
     pub room: ConversationId,

@@ -168,16 +168,21 @@ Each agent is its own Slack app, created from a manifest.
   binding's existence, writes nothing and queues nothing, and returns only the
   string the caller sent, as `text/plain` with `nosniff`. A forger learns only
   that the binding exists, which the 401 on its other requests says anyway.
-  Every other request, including a `url_verification` on the command or
-  interactivity URL, must verify.
+  Slack's `ssl_check` is the one other exception: it posts a form whose
+  `ssl_check` is `1`, unsigned, to a slash command's URL to check its
+  certificate, and agentd answers it there with an empty 200 on the same
+  terms, as Bolt does. Every other request, including a `url_verification` on
+  the command or interactivity URL, must verify.
 - **Acknowledge first.** Slack expects an acknowledgement within three seconds
   and retries otherwise. Turns take minutes, so agentd acknowledges every event,
   command and interaction as soon as it is verified and queued, processes it
   asynchronously, and replies to commands and interactions through their
-  `response_url`. A full queue gets 503, so Slack retries later. Deduplication
-  is per binding: retried events by `event_id`, a message that reached the same
-  app twice by `(channel, ts)`, and a replayed command or interaction by its
-  signature.
+  `response_url`. A full queue gets 503: Slack retries an event later, while
+  a command or interaction fails and its user can try again. Deduplication is
+  per binding and happens after the ack: a message, whether retried or reaching
+  the same app twice, by `(channel, ts)`, and only once normalization has kept
+  it, so unaddressed channel messages cost no store write; other events by
+  `event_id`; and a replayed command or interaction by its signature.
 
 Slash commands are neither namespaced nor unique. Two apps can both register
 `/agent`, and Slack routes it to whichever was installed most recently, so a
@@ -720,7 +725,7 @@ for Rocket.Chat bindings.
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
-| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo skips it. Retried events are deduplicated by `event_id`, and a command or interaction replayed within the window by its signature. |
+| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals are logged as warnings at most once a minute. |
 | Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel messages at ingress and never logs message content. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 
@@ -854,7 +859,7 @@ Direct calls would also need our own agent loop.
 [^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
 [^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
-[^slack-botmention]: [slackapi/java-slack-sdk#1279](https://github.com/slackapi/java-slack-sdk/issues/1279) shows `app_mention` with the `bot_message` subtype for a message posted by a workflow, not for one app's bot user mentioning another's. To be verified on a real workspace.
+[^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace.
 [^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
 [^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.
 [^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.

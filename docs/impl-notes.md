@@ -1841,9 +1841,14 @@ store's signature and contract, and `RocketChatSurface::new` takes an
 `Arc<dyn Dedup>`. agentd implements it with a one-line call to the store;
 `DEDUP_SOURCE` is `"rocketchat"`. The tests use a real in-memory `Store`
 (a dev-dependency) behind it. A copy is recorded only after it was
-normalized, and a failure to read the room or the sender's roles, or to
-record, skips that copy without recording it, so another bot's connection can
-still deliver the message. A copy recorded when the event receiver has just
+normalized, and a failure to read the room or to record skips that copy
+without recording it, so another bot's connection can still deliver the
+message. A failure to read the sender's roles doesn't skip it: every surface
+shares one `BotRoles`, so every connection would fail alike and the message
+would be lost everywhere. The sender then counts as a person, with a warning
+logged, as history already did; the router looks every sender up as a
+managed agent whatever `sender_is_bot` says, so a managed agent's post still
+takes the agent path. A copy recorded when the event receiver has just
 closed is lost, which only happens at shutdown.
 
 ### Messages don't carry the sender's roles
@@ -1867,6 +1872,15 @@ sender is a bot when the message has a non-false `bot` field or the sender has
 the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
 only to the user itself and to the manager.
 
+Without the permission, `users.info` leaves `roles` out rather than
+failing, which would have classified every bot as a person without a word.
+Every Rocket.Chat user has at least one role, so `BotRoles::is_bot` treats
+an empty or missing list as `SurfaceError::Forbidden`, naming the missing
+permission and the manager's user id (never the token), and doesn't cache
+it. Messages still flow, as above, and each one logs the error, so a
+misconfigured manager is loud until it is fixed. The cache keeps at most
+10,000 users: making room drops expired entries, then the oldest.
+
 ### Room lists and room kinds come from REST
 
 **Issue.** Nothing in the realtime API lists the rooms a user is in without
@@ -1876,7 +1890,8 @@ can't tell a DM from a group DM.
 **Solution.** Each connection lists rooms with REST `subscriptions.get`, and
 the surface reads a room's `t`, `usersCount` and `uids` with `rooms.info` the
 first time a message arrives from it, then keeps it for the surface's
-lifetime (a DM's members are fixed). `RestClient` gains `subscriptions`,
+lifetime (a DM's members are fixed), for at most 10,000 rooms, dropping the
+oldest beyond that. `RestClient` gains `subscriptions`,
 `file_url` (`<base>/file-upload/<id>/<name>`, for `InFile::url`) and
 `credentials` (the realtime login reuses the token), and `FakeRest` answers
 `subscriptions.get`. Only channels, private groups and DMs are listened to:
@@ -1929,12 +1944,21 @@ answers for another user id also ends it.
 - A stream subscription is `sub` with `params: [event, false]`; the second
   parameter turns off collection compatibility. A refused one gets `nosub`
   with `error: "not-allowed"`. A refused room is dropped and the connection
-  stays up; a refused `subscriptions-changed` reconnects.
+  stays up; a refused `subscriptions-changed` reconnects. The refused room
+  is remembered until an `inserted` notice for it or the next connection,
+  since `updated` notices would otherwise ask for it again on every unread
+  change.
 - `subscriptions-changed` carries `[action, subscription]`. `updated` fires
   on every unread-count change, so subscribing is idempotent. `removed` may
-  lack `rid`. The server also stops a room's message subscription itself when
-  the user is removed, without telling the client, and the client sends
-  `unsub` anyway.
+  lack `rid`, so each connection keeps the subscription document `_id` of
+  each room, from `subscriptions.get` (`Subscription` gains `id`) and from
+  `inserted` and `updated` notices, and resolves such a removal through it.
+  The server also stops a room's message subscription itself when the user
+  is removed, without telling the client, and the client sends `unsub`
+  anyway. Because of that, `inserted` is authoritative: for a room already
+  subscribed, the client sends `unsub` for the old subscription and
+  subscribes again, so a removal it couldn't resolve doesn't leave the bot
+  deaf after it is added back.
 
 ### Reconnecting lists the rooms again instead of remembering them
 
@@ -1947,6 +1971,34 @@ lets any user with `view-c-room` read a public channel's messages
 then, plus what `subscriptions-changed` adds, which also covers rooms joined
 while disconnected. Messages posted while a bot had no connection are not
 fetched; [Deferred work](tasks-plan.md#deferred-work) has a bullet for it.
+
+### Changes that arrive while the rooms are listed
+
+**Issue.** `subscriptions.get` runs after the `subscriptions-changed`
+subscription is ready, so a notice can arrive while the listing is in
+flight. Applied at once, a removal found nothing to unsubscribe, and the
+listing, possibly read before the removal, then subscribed to the room
+anyway.
+
+**Solution.** Notices that arrive during the listing are kept, then applied
+in order to the listed rooms before anything is subscribed: a removal takes
+its room out (resolving a missing `rid` through the listing's document ids),
+and `inserted` or `updated` puts it in. A notice about a change the listing
+already reflects changes nothing.
+
+### The backoff starts over only after a healthy connection
+
+**Issue.** The backoff reset as soon as a connection had logged in and
+subscribed, so a server that accepted and subscribed and then dropped the
+socket, or refused `subscriptions-changed` right after, was reconnected at
+the initial wait forever.
+
+**Solution.** The backoff resets only when a connection stays up for the
+longer of `backoff_max` and twice `heartbeat` (60 s by default). That is
+long enough that reconnecting at once costs no more than waiting the
+longest backoff, and longer than it takes to notice a silent server, which
+is declared dead after twice `heartbeat`. A connection that drops sooner
+counts as a failed attempt and the next wait doubles.
 
 ### Normalizing runs off the socket
 
@@ -2082,29 +2134,74 @@ closed port.
 `now + ttl` really lasts between `ttl - 1` and `ttl` seconds, and a
 one-second lease can end almost at once.
 
-**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`) and agentctl
-renews it when a third of the remaining time has passed, at least every
-200 ms. A `ttl` below one second counts as one. Tests that renew use a
-3-second lease.
+**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`). agentctl
+relies on it only until one second before its expiry, since another command
+may take the lock at the expiry itself, and renews it when a third of that
+remaining time has passed, at least every 200 ms. A `ttl` below one second
+counts as one, and agentctl needs a lease of at least two seconds. Tests
+that renew use a 3-second lease.
 
 ### What agentctl does when it loses the lock
 
 **Issue.** The plan says the lease is renewed while the command runs, but
 not what happens when a renewal fails: agentd refused it (the lease
-expired, or the turn ended), or agentd couldn't be reached.
+expired, or the turn ended), or agentd couldn't be reached. A first version
+also awaited each renewal on its own, bounded only by the 30-second request
+timeout, so a renewal agentd never answered let the command keep writing
+past the lease's expiry, and delayed `SIGTERM` by as long.
 
-**Solution.** A refused renewal, or transport failures until the lease's
-expiry has passed, means another command may hold the lock, so agentctl
-kills its command and exits 1 with "lost the shared/ lock (…); stopped the
-command". On `SIGTERM`, `SIGINT` or `SIGHUP` it kills the command, releases
-the lease and exits with 128 plus the signal. Killing stops the command's
-own process only: processes it started in the background keep running, and
-an agentctl killed with `SIGKILL` leaves its command running once the lease
-expires. The lock is a guard for cooperating commands, as the design's
-"scope-level lock that `agentctl` takes for writes" is. agentctl waits at
-most 100 seconds for the lock by default (`--timeout`), below the 2 minutes
-Claude Code's Bash tool gives a command by default, so the model sees why it
-failed rather than a killed command.
+**Solution.** The renewal runs in the same `select!` as the command's exit,
+the stop signals and a deadline one second before the lease's expiry, and
+its request timeout is capped at the time left until that deadline. A
+refused renewal, or no successful renewal by the deadline, means another
+command may soon hold the lock, so agentctl kills its command and exits 1
+with "lost the shared/ lock (…); stopped the command". On `SIGTERM`,
+`SIGINT` or `SIGHUP` it kills the command, releases the lease and exits
+with 128 plus the signal. The signal handlers are installed before the
+lease is acquired and kept until the release is sent, so a signal is never
+lost in between, and the release waits at most two seconds, after which the
+lease expires on its own. agentctl waits at most 100 seconds for the lock
+by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
+a command by default, so the model sees why it failed rather than a killed
+command.
+
+### The command runs in its own process group
+
+**Issue.** Killing the command's process stopped only that process. With
+`sh -c '…'`, which the CLI help recommends, every process the shell started
+survived: it kept writing under the next holder, and it held agentctl's
+standard output and error open, so a caller reading them to the end hung.
+Tokio's `Child::kill` signals one process, and the standard library has no
+call to signal a process group.
+
+**Solution.** agentctl spawns the command with `process_group(0)` and kills
+the whole group with `SIGKILL`, through `rustix::process::kill_process_group`
+(rustix 1, the `process` feature only: safe, pure Rust, and it builds for the
+static musl target), before reaping the command. The group is signalled only
+while the command hasn't been reaped, so its id can't have been reused. A
+process that leaves the group (`setsid`, say) escapes, processes the
+command leaves running when it exits on its own are not stopped, and an
+agentctl killed with `SIGKILL` leaves its command running once the lease
+expires. Being in its own group, the command is not in the terminal's
+foreground group, so it can't read from a terminal; agentctl runs under the
+model's Bash tool, which gives it none. The lock is a guard for cooperating
+commands, as the design's "scope-level lock that `agentctl` takes for
+writes" is.
+
+### A lease outlived its turn
+
+**Issue.** Release goes through the same extractor as every command, which
+refuses a token between turns, and ending a turn or revoking a token left
+`scope_locks` alone. A lease taken in a turn that ended, or by a process
+whose token was revoked, held the lock until it expired, up to 30 seconds.
+
+**Solution.** The store deletes the session's leases in the same
+transaction that records or clears a token's turn (`set_ctl_turn`), deletes
+the token (`delete_ctl_token`), or replaces it with a new token for the
+session (`put_ctl_token`). A lease lasts no longer than the turn that took
+it, and the lock is free as soon as `end_turn` or `revoke_process_token`
+returns. An acquire authorized just before the turn ended can still land
+after the delete; that lease can't be renewed, and expires on its own.
 
 ### `lock` is refused inside private tasks
 
@@ -2126,8 +2223,10 @@ key named one.
 **Solution.** `store.data_dir`, required and absolute. Attachments go in
 `ctl-outbox/<random>/` under it, one directory per turn, created with mode
 0700, holding files named by random UUIDs; the model's file name is only
-display text and is refused if it holds `/`, `\`, a control character, or is
-`.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
+display text and is refused if it holds `/`, `\`, a control character, an
+invisible formatting character (bidirectional controls such as U+202E, which
+can make `exe.txt` read as `txt.exe`, zero-width characters, tag characters,
+or a line or paragraph separator), or is `.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
 directory, and startup empties `ctl-outbox/`. The cap is
 `limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
 files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in
@@ -2161,8 +2260,13 @@ first line from stdout, and `ChildHandle::kill` runs
 `sh -c 'kill -s KILL "$1"'` in the container as the same user. The image
 needs `/bin/sh` (Debian has it). Only the process is killed; processes it
 started are reparented to the container's init and end when the container
-stops. `ProcessSandbox` kills the child's whole process group instead,
-through the `kill` command, since a direct `kill(2)` would need `unsafe`.
+stops. If the pid line hasn't arrived within 2 seconds, `kill` returns an
+error instead of `Ok`: nothing was signalled, so `wait` could hang, and the
+caller must stop the container. `ProcessSandbox` kills the child's whole
+process group instead, through the `kill` command, since a direct
+`kill(2)` would need `unsafe`; it runs the command with `tokio::process`,
+and from `Drop`, which can't wait, in a spawned task (or blocking, off a
+runtime).
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -2175,9 +2279,14 @@ writable in the container.
 `uid:gid` with `lchown` when their owner differs. That works when agentd
 runs as root or as the sandbox user itself, and fails with an error naming
 the cause otherwise. T16's agentd image should therefore run as uid 10001
-(the plan's T16 says so). `volumes/` is `0700` and stays agentd's, and so
-does each `sessions/<id>/`: the agent can write inside `work/` and the
-others but can't rename or replace them.
+(the plan's T16 says so).
+
+That makes agentd and the agent the same user, so the agent owns its
+`sessions/<id>/` too and can rename, replace or remove `work/`, `claude/`
+and the rest. What it can't reach is everything above its mounts:
+`volumes/` (`0700`), the volume directory and its `sessions/` are mounted
+into no sandbox. Host-side code therefore treats everything inside a
+session directory as hostile (next entry).
 
 The Docker tests can't use 10001: on the CI runner the test process is not
 root, so it can't give directories away. They run the sandbox as the test
@@ -2196,13 +2305,26 @@ root) would write through it.
 agent-writable tree. Before each start, each of `work/`, `claude/`,
 `home/` and `tmp/` that isn't a real directory (checked with
 `symlink_metadata`) is removed and created again, as is `claude/skills`
-when there are skills to mount there. `settings.json` is written to a new
-file (`create_new`, so `O_EXCL`, which doesn't follow a symlink) and renamed
-over the old one, which replaces a symlink instead of following it; a
-directory in its place is removed. It is rewritten on every start, so an
-agent can't lower `cleanupPeriodDays` and lose its transcripts. Ownership
-changes use `lchown`. The runner never runs two containers of one session,
-so nothing in the container can race these steps.
+when there are skills to mount there. It is rewritten on every start, so
+an agent can't lower `cleanupPeriodDays` and lose its transcripts.
+Ownership changes use `lchown`.
+
+The plan made this step a public `prepare_session_dirs` on the trait. Run
+while the session's container was up, the agent could swap `claude` for a
+symlink between its repair and the write, and agentd would write, and
+give away, a file wherever the symlink pointed. So the step is
+crate-private and runs only in `start`, before the container is created;
+`start`'s rustdoc says the session must have no running container, and the
+runner never runs two containers of one session.
+
+`settings.json` doesn't rely on that. std has no `openat` (`std::fs::Dir`
+is unstable), so the sandbox crate adds `rustix`, whose `openat` and
+`renameat` are safe functions. `claude/` is opened with `O_NOFOLLOW |
+O_DIRECTORY`, its owner checked on the handle, and the new file is created
+relative to that handle with `O_EXCL | O_NOFOLLOW`, given away with
+`fchown`, and renamed over `settings.json` within the same directory,
+which replaces a symlink instead of following it. A directory in its place
+is renamed aside to a random name first, then removed.
 
 ### Several agentd, or test runs, on one Docker host
 
@@ -2263,6 +2385,12 @@ refuses a client version it doesn't know.
 **Solution.** `DockerSandbox::connect` calls `negotiate_version`, which
 drops to the daemon's version. bollard's 2-minute request timeout covers
 only the response headers, so long `exec` and event streams aren't cut.
+A stop request's headers, though, come only after the container stopped,
+up to `stop_timeout_secs` later, and a stop that timed out would leave the
+container stopping and not removed. `stop_timeout_secs` is therefore at
+most 60, not the 300 first allowed. That grace applies only to the init
+and its `sleep`, the processes SIGTERM reaches; processes started with
+`exec` are killed without one when the container stops.
 
 ### No curl in `debian:stable-slim`
 
@@ -2271,9 +2399,14 @@ only the response headers, so long `exec` and event streams aren't cut.
 
 **Solution.** The test opens a TCP connection with bash's `/dev/tcp`, by
 name (`example.com:443`) and by address (`1.1.1.1:443`), under `timeout`.
-As a control, the same probe must succeed from a container on Docker's
-default `bridge` network, so the test can't pass because the probe itself
-is broken.
+As a control, the same probe must succeed from a container on a network
+the test creates without `internal`, so the test can't pass because the
+probe itself is broken. The control used to run on Docker's `bridge`
+network, but `[sandbox] network` now refuses `bridge`, along with `host`,
+`none`, `default` and anything with a `:` (`container:<id>`): those are
+Docker network modes, not the internal sandbox network, and `validate`
+had only checked that the name wasn't empty. `container_config`, which is
+public, validates the configuration too.
 
 ### A `ChildStdin` closes only when dropped
 
@@ -2293,9 +2426,32 @@ first poll would be missed, and the runner would keep a mapping for a dead
 container's IP.
 
 **Solution.** `DockerSandbox::events` passes `since` with the time of the
-call, and Docker replays the buffered events from then. An error on the
-stream ends it after one `EventsMissed` item, so the runner re-subscribes
-and compares `list_managed` with what it holds.
+call, and Docker replays the buffered events from then. The stream ends
+only after one `EventsMissed` item, so the runner re-subscribes and
+compares `list_managed` with what it holds. That item comes on an error,
+and also when Docker ends the stream cleanly, as a daemon restart does:
+that used to end the stream with no item, which the runner could take for
+a quiet stream and never re-subscribe. `ProcessSandbox` keeps the same
+contract: it ends after `EventsMissed` when it lags or its sender is gone.
+
+### bollard logs request bodies at debug level
+
+**Issue.** bollard 0.21 logs every request body with `log::debug!`
+(`serialize_payload`, which `create_exec` uses), and agentd forwards
+`log` records to `tracing`. An `exec` body holds the process's
+environment: the placeholder and the agentctl token. With
+`server.log_filter` at `debug` or `trace`, both would be logged. A
+`bollard=info` directive appended to the operator's filter isn't enough:
+a more specific one such as `bollard::docker=trace`, or a span filter
+such as `[turn]=trace`, outranks it.
+
+**Solution.** `telemetry::subscriber` adds a separate `Targets` filter,
+layered next to the operator's `EnvFilter`, that caps `bollard` at `info`
+whatever that filter enables; a test feeds `log` records with target
+`bollard::docker` through the bridge under filters from `trace` to
+`bollard::docker=trace` and finds none. `Sandbox::exec`'s rustdoc says the
+environment is kept out of logs only with that cap, and the plan's T23
+says any other subscriber setup must keep it.
 
 ## T22: router
 
@@ -2504,8 +2660,9 @@ doesn't say what a full queue does.
 
 **Solution.** The handler does only what needs no I/O beyond the secret
 lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
-bounded queue. A full or closed queue answers 503, so Slack retries; the
-handler never waits for it. `Queue::run` then deduplicates through the
+bounded queue. A full or closed queue answers 503; Slack retries an event
+that gets one, but not a slash command or an interaction, whose user sees
+Slack's error. The handler never waits for the queue. `Queue::run` then deduplicates through the
 `Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
 and sends `SlackInbound` items, one at a time and in order, to a
 `core_types::Sender`. A failed dedup write drops the request rather than risk
@@ -2554,7 +2711,9 @@ literal as `&lt;@U123&gt;`).
 **Solution.** Mentions are the tokens in `text`, the `user` elements of
 `rich_text` blocks, and the tokens in `mrkdwn` text objects (section and
 context blocks, which bots post). `plain_text` and rich-text `text` elements
-are not scanned. Each user appears once, in order of first appearance.
+are not scanned. Each user appears once, in order of first appearance; the
+ids already seen are kept in a `HashSet`, since a 40,000-character message
+can carry thousands of mentions.
 
 ### A misspelled manager secret went unnoticed
 
@@ -2573,6 +2732,67 @@ the Slack prefix, because a Service named `agentd-slack-manager` would set
 `AGENTD_SLACK_MANAGER_PORT` and `…_SERVICE_HOST`; read as secrets, those
 would fail this check (or become junk entries next to the signing secret).
 No Slack secret's name ends like a service link.
+
+### Slack's `ssl_check` is unsigned
+
+**Issue.** The plan lets only `url_verification` skip the signature. Slack
+also posts `ssl_check=1` (with the legacy verification token) to a slash
+command's URL to check its certificate, unsigned; agentd answered it 401, or
+400 when signed, since it isn't a command form. Bolt for JavaScript and for
+Python answer it with 200 before verifying.
+
+**Solution.** On `/commands`, a known binding answers a form whose
+`ssl_check` is exactly `1` with an empty 200 before the signature check,
+reading nothing else and queueing nothing, like the challenge echo. The
+design's transport bullet and the plan name it as the second exception.
+
+### Unaddressed messages cost a store write each
+
+**Issue.** Agent apps receive every message in their channels, and
+`Queue::run` recorded each event's `event_id` in `processed_events` (kept for
+seven days) before normalization dropped the unaddressed ones: a store write
+per channel message per agent.
+
+**Solution.** `message` events are normalized first, which is pure, and a
+dropped one costs no I/O. A kept message is deduplicated only by
+`<channel>:<ts>` under `slack:<binding>:message`, which catches Slack's
+retries as well as the event_id key did, so messages no longer write an
+`event_id` row. Other events are still deduplicated by `event_id`.
+
+### A slow body held up shutdown
+
+**Issue.** Nothing bounded the secret lookup or the body read before the
+ack. A client that sent headers and then trickled or withheld the body kept
+its connection in flight, so a graceful shutdown waited the whole drain
+timeout for it.
+
+**Solution.** The handler every route goes through gives the lookup and the
+body read one shared deadline, `PRE_ACK_TIMEOUT` (2 seconds, inside Slack's
+3): 503 if the lookup is still running, 408 if the body hasn't arrived.
+
+### Refusals before verification are throttled in the log
+
+**Issue.** Anyone can send unsigned or forged requests and challenges, and
+each was logged at warn or info, so a flood of them floods the log.
+
+**Solution.** Like agentd's `RefuseSubnet`, the ingress logs such refusals
+(bad signature, no secret yet, body refused or too slow) as a warning at most
+once per `WARNING_INTERVAL` (a minute), with how many went quiet since, and
+the rest at debug level. Answered challenges are throttled the same way at
+info level. `ssl_check` is logged at debug level only.
+
+### A trailing newline in a secret failed every request
+
+**Issue.** T10's `secret()` refused only empty or all-white-space values. A
+signing secret mounted from a file with a trailing newline was accepted, and
+every Slack request then failed verification with 401.
+
+**Solution.** Every secret read from the environment (`AGENTD_MASTER_KEY`,
+`AGENTD_RC_MANAGER_TOKEN` and `AGENTD_SLACK_MANAGER_*`) is refused at startup
+when it starts or ends with white space; the error names the variable, never
+the value. That includes the master key, whose base64 decoding (T05) would
+have ignored the newline: the rule is simpler kept the same for all secrets,
+and `export AGENTD_MASTER_KEY="$(agentd gen-key)"` strips the newline anyway.
 
 ## T29: Slack Web API
 

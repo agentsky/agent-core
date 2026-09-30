@@ -19,7 +19,7 @@ use bollard::query_parameters::{
     StopContainerOptionsBuilder,
 };
 use core_types::{SessionId, VolumeKey};
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt};
 use store::Store;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
@@ -61,6 +61,9 @@ const EXEC_WRAPPER: [&str; 4] = ["/bin/sh", "-c", "echo $$; exec \"$@\"", "sh"];
 /// output ends.
 const EXIT_POLL: Duration = Duration::from_secs(10);
 
+/// How long [`ChildHandle::kill`] waits for the pid line before giving up.
+const PID_WAIT: Duration = Duration::from_secs(2);
+
 /// The container configuration for `spec`: a pure function of its inputs.
 ///
 /// - The image, as `uid:gid` from `config` (never root), with `sleep
@@ -85,14 +88,16 @@ const EXIT_POLL: Duration = Duration::from_secs(10);
 ///
 /// # Errors
 ///
-/// [`SandboxError::InvalidSpec`] if the spec breaks a rule on
-/// [`SessionSpec`], or a path to mount isn't UTF-8, or is outside
-/// `data_dir` while `host_data_dir` is set.
+/// [`SandboxError::Config`] if `config` doesn't
+/// [validate](SandboxConfig::validate), and [`SandboxError::InvalidSpec`] if
+/// the spec breaks a rule on [`SessionSpec`], or a path to mount isn't
+/// UTF-8, or is outside `data_dir` while `host_data_dir` is set.
 pub fn container_config(
     config: &SandboxConfig,
     data_dir: &Path,
     spec: &SessionSpec,
 ) -> Result<ContainerCreateBody> {
+    config.validate()?;
     check_spec(spec)?;
     if spec.image.trim().is_empty() {
         return Err(SandboxError::InvalidSpec("the image must not be empty"));
@@ -445,14 +450,6 @@ impl Sandbox for DockerSandbox {
         self.layout.ensure_volume(key).await
     }
 
-    async fn prepare_session_dirs(
-        &self,
-        volume: &VolumeRef,
-        session: SessionId,
-    ) -> Result<PathBuf> {
-        self.layout.prepare_session_dirs(volume, session).await
-    }
-
     async fn start(&self, spec: &SessionSpec) -> Result<Container> {
         let body = container_config(&self.config, &self.layout.data_dir, spec)?;
         let dir = self
@@ -639,23 +636,22 @@ impl Sandbox for DockerSandbox {
             .since(&since(std::time::SystemTime::now()))
             .filters(&filters)
             .build();
-        let config = self.config.clone();
-        let mut failed = false;
-        self.docker
-            .events(Some(options))
-            .filter_map(move |item| {
-                let event = match item {
-                    Ok(message) => died_event(&config, message).map(Ok),
-                    Err(_) => Some(Err(SandboxError::EventsMissed)),
-                };
-                async move { event }
-            })
-            .take_while(move |item| {
-                let go = !failed;
-                failed |= item.is_err();
-                async move { go }
-            })
-            .boxed()
+        let events = self.docker.events(Some(options)).boxed();
+        let state = Some((events, self.config.clone()));
+        stream::unfold(state, |state| async move {
+            let (mut events, config) = state?;
+            loop {
+                match events.next().await {
+                    Some(Ok(message)) => {
+                        if let Some(event) = died_event(&config, message) {
+                            return Some((Ok(event), Some((events, config))));
+                        }
+                    }
+                    Some(Err(_)) | None => return Some((Err(SandboxError::EventsMissed), None)),
+                }
+            }
+        })
+        .boxed()
     }
 }
 
@@ -698,12 +694,16 @@ impl DockerChild {
     }
 
     pub(crate) async fn kill(&mut self) -> Result<()> {
-        let pid = tokio::time::timeout(Duration::from_secs(2), self.pid.wait_for(Option::is_some))
+        let pid = tokio::time::timeout(PID_WAIT, self.pid.wait_for(Option::is_some))
             .await
             .ok()
             .and_then(|pid| pid.ok().and_then(|pid| *pid));
         let Some(pid) = pid else {
-            return Ok(());
+            return Err(SandboxError::Docker {
+                op: "kill",
+                status: None,
+                message: Some("the process's pid is unknown".into()),
+            });
         };
         let options = CreateExecOptions {
             cmd: Some(vec![
