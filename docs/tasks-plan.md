@@ -1463,8 +1463,13 @@ Deliverables:
   - `mint(session, container_ip, kind) -> Placeholder`: a random 32-byte token
     with a recognizable prefix per kind, for example `agentd-sub-…` and
     `agentd-key-…`.
-  - `point(placeholder, CredentialRef)`, called at turn start.
-  - `revoke(placeholder)` and `revoke_session(session)`.
+  - `point(placeholder_id, CredentialRef)`, called at turn start. It refuses a
+    credential of the other kind. Callers hold the placeholder's non-secret
+    `PlaceholderId` for this and for revoking
+    ([impl-notes](impl-notes.md#t18-credential-proxy)).
+  - `revoke(placeholder_id)` and `revoke_session(session)`.
+  - An address belongs to one session: minting for an address revokes other
+    sessions' placeholders bound to it.
   - In memory. It is disposable, re-derivable state: containers are reaped on
     restart.
 - A reverse proxy served by agentd on the proxy listener, forwarding to the
@@ -1486,9 +1491,11 @@ Deliverables:
   - Answers `HEAD /api/hello` locally with 200.
   - Strips hop-by-hop headers.
   - Upstream is the one configured host. No `Host` header or absolute URI from
-    the client can redirect it.
+    the client can redirect it: absolute-form requests get 403 and `CONNECT`
+    gets 405 until T19 takes it over.
 - Metrics hook: a `ProxyObserver` trait called with `(session, status, usage
-  headers)`. T27 uses it for the meter.
+  headers)`, and the credential the request used, since the session's
+  pointer changes from turn to turn. T27 uses it for the meter.
 
 Acceptance, as tests named after the rules:
 
@@ -1533,7 +1540,8 @@ Deliverables:
   session.
 - Absolute-form requests (`GET http://host/…`, what `HTTP_PROXY` produces for
   plain HTTP) get 403. They must never fall through to the Anthropic reverse
-  proxy. Plain HTTP egress is not offered.
+  proxy; T18's proxy already refuses them, and T19 keeps that. Plain HTTP
+  egress is not offered.
 
 Acceptance:
 
@@ -2380,6 +2388,14 @@ Not scheduled. Each needs a decision before it becomes a task.
   Until then, owners who need GitHub use the cloud hand-off (T35) or a
   fine-grained token scoped to one repository in a private task, and accept
   that it enters that private sandbox.
+- **A path allowlist for the credential proxy.** T18 forwards any path on the
+  upstream, so a sandbox can call any Anthropic endpoint its requester's
+  token or the community key allows, such as the profile or, with the
+  community key, the Files and Batches APIs that other members' turns share.
+  Limiting it to the paths the CLI uses (`/v1/messages`,
+  `/v1/messages/count_tokens`, and whatever else a live capture with
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` shows) needs that capture
+  first, since refusing a path the CLI needs breaks turns.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.
