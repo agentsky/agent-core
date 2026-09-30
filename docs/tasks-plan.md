@@ -706,9 +706,11 @@ Design: [Data model](design.md#data-model),
 
 Deliverables:
 
-- `Store::open(url)`, which sets `journal_mode=WAL`, `foreign_keys=ON` and
-  `busy_timeout`, and runs migrations.
-- `Store::open_in_memory()` for tests.
+- `Store::open(url, sealer)`, which sets `journal_mode=WAL`,
+  `foreign_keys=ON` and `busy_timeout`, and runs migrations. The `Sealer`
+  carries the master key
+  ([impl-notes](impl-notes.md#the-key-reaches-the-store-through-open)).
+- `Store::open_in_memory(sealer)` for tests.
 - `Sealer`: ChaCha20-Poly1305 with a random 96-bit nonce per value. The stored
   layout is `version(1) || nonce(12) || ciphertext`. Associated data is
   `table/column/primary key`. The key is loaded from a `SecretString`
@@ -728,7 +730,9 @@ Deliverables:
     Rocket.Chat redeliveries.
 - Repository methods, each a small async function with a test:
   - `member_for_identity`, `ensure_member(MemberKey, display_name)`.
-  - `put_claude_link`, `get_claude_link`, `delete_claude_link`.
+  - `put_claude_link`, `get_claude_link`, `delete_claude_link`, and
+    `mark_claude_link_broken(member, at) -> bool`, true only when it set
+    `broken_at` (T09 marks the link, T13 sends one notice per failure).
   - `put_pending_login`, `take_pending_login(state)` (atomic: delete and
     return), `invalidate_pending_logins(member)`.
   - `mark_event_processed(source, id) -> bool`, which returns false when the
