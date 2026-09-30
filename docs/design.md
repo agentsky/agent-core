@@ -332,11 +332,26 @@ flowchart TD
 ```
 
 Response gating is deterministic: an explicit mention, a reply to the agent's
-own message, or a DM. Messages from managed agents only count when they mention
-this agent explicitly. Replying in a thread is not enough, or two agents in one
+own message, or a DM. A reply counts only if it mentions no other managed
+agent: a reply in one agent's thread that mentions only a second agent is
+addressed to the second, so the person pays for one turn, not two. Messages
+from managed agents only count when they mention this agent explicitly, and
+the manager bot's own posts never start a turn. Replying in a thread is not enough, or two agents in one
 thread would answer each other indefinitely. qm-core runs a model call to decide whether to chime in on
 unaddressed thread messages. With subscription credentials that would cost a
 CLI run per message, so agent-core does not do it.
+
+A DM counts only for the agent whose bot received it, so another agent
+mentioned in someone's DM with a different bot never answers there. The
+owner's turns run only on the owner's credential: an owner without a linked
+account gets the link prompt, never the community key. Refusals (a paused
+agent, a banned requester, the agent's deny rules, the hop cap) apply only to
+messages that pass the gate above, so an unaddressed message never draws a
+notice, and they come before the credential, so nobody is offered a link
+prompt or a community-key turn they would then be refused. If the router
+can't tell whether the requester is banned, or what the agent's rules are, it
+refuses rather than assume the requester is allowed. The router's rustdoc
+gives the full order.
 
 ## Sessions and sandboxes
 

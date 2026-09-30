@@ -7,8 +7,8 @@
 //! Errors map to [`SurfaceError`]. Rocket.Chat answers most failures with HTTP
 //! 400 and a body `{"success": false, "error": "…", "errorType": "…"}`; see
 //! [`map_error`] for the rules. A 429 is retried once, after the time the
-//! `x-ratelimit-reset` header names, when that is within
-//! [`RestClient::with_max_retry_wait`].
+//! `x-ratelimit-reset` header names, measured against the response's own
+//! `Date` header, when that is within [`RestClient::with_max_retry_wait`].
 //!
 //! Endpoint shapes follow the Rocket.Chat server source
 //! (`apps/meteor/server/api/v1/*.ts` on `develop`, and
@@ -18,6 +18,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use rand::RngExt;
 use rand::distr::Alphanumeric;
@@ -28,8 +29,11 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
+use time::format_description::BorrowedFormatItem;
 use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+use time::{OffsetDateTime, PrimitiveDateTime};
+use tokio::io::AsyncReadExt;
 
 /// The result type of [`RestClient`] methods.
 pub type Result<T, E = SurfaceError> = std::result::Result<T, E>;
@@ -48,6 +52,15 @@ const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(1);
 /// The default for [`RestClient::with_max_retry_wait`]: Rocket.Chat's
 /// default rate-limit window (`API_Enable_Rate_Limiter_Limit_Time_Default`).
 const DEFAULT_MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+
+/// The default for [`RestClient::with_max_upload_size`]: Rocket.Chat's
+/// default `FileUpload_MaxFileSize`, 100 MiB.
+const DEFAULT_MAX_UPLOAD_SIZE: u64 = 100 * 1024 * 1024;
+
+/// RFC 7231's IMF-fixdate, the only `Date` format a server may send today.
+const HTTP_DATE: &[BorrowedFormatItem<'static>] = format_description!(
+    "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+);
 
 /// The length of a bot's random password.
 const PASSWORD_LEN: usize = 48;
@@ -408,6 +421,7 @@ pub struct RestClient {
     base: Url,
     creds: Credentials,
     max_retry_wait: Duration,
+    max_upload_size: u64,
 }
 
 /// One request, kept so it can be sent again after a 429.
@@ -433,7 +447,14 @@ enum Auth<'a> {
 enum Body<'a> {
     Empty,
     Json(Value),
-    File(&'a OutFile),
+    File(Upload<'a>),
+}
+
+/// A file read into memory once, so a retry after a 429 sends the same
+/// bytes without reading the file again.
+struct Upload<'a> {
+    name: &'a str,
+    data: Bytes,
 }
 
 impl<'a> Call<'a> {
@@ -505,6 +526,7 @@ impl RestClient {
             base,
             creds,
             max_retry_wait: DEFAULT_MAX_RETRY_WAIT,
+            max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
         })
     }
 
@@ -522,6 +544,16 @@ impl RestClient {
     /// [`SurfaceError::RateLimited`]. The default is 60 seconds.
     pub fn with_max_retry_wait(mut self, wait: Duration) -> Self {
         self.max_retry_wait = wait;
+        self
+    }
+
+    /// Sets the largest file [`RestClient::upload`] sends, in bytes. A
+    /// larger file fails with [`SurfaceError::Api`] before anything is read
+    /// or sent. The default is 100 MiB, Rocket.Chat's default
+    /// `FileUpload_MaxFileSize`; set it to the server's value when that is
+    /// lower, so an oversized file fails without being read.
+    pub fn with_max_upload_size(mut self, bytes: u64) -> Self {
+        self.max_upload_size = bytes;
         self
     }
 
@@ -773,15 +805,24 @@ impl RestClient {
     /// endpoints exist from 7.0 on. The confirm body carries nothing else:
     /// 7.x passes it whole to a strict `check`, which rejects keys such as
     /// `fileName` that newer servers accept.
+    ///
+    /// The file is read into memory once, and only if it is a regular file
+    /// no larger than [`RestClient::with_max_upload_size`]; otherwise the
+    /// call fails with [`SurfaceError::Api`] and sends nothing. A missing
+    /// file is [`SurfaceError::NotFound`].
     pub async fn upload(
         &self,
         room: &ConversationId,
         thread_root: Option<&MessageId>,
         file: &OutFile,
     ) -> Result<Message> {
+        let upload = Upload {
+            name: &file.name,
+            data: read_upload(&file.path, self.max_upload_size).await?,
+        };
         let media = Call {
             path: vec!["rooms.media", room.as_str()],
-            ..Call::new(Method::POST, "rooms.media", Body::File(file))
+            ..Call::new(Method::POST, "rooms.media", Body::File(upload))
         };
         let uploaded: MediaEnvelope = self.call(media).await?;
         let mut body = json!({});
@@ -856,7 +897,7 @@ impl RestClient {
         let endpoint = call.endpoint();
         let mut retried = false;
         let value = loop {
-            let request = self.request(&call).await?;
+            let request = self.request(&call)?;
             let response = request.send().await.map_err(transport)?;
             match outcome(response, SystemTime::now()).await? {
                 Outcome::Done(result) => break result?,
@@ -879,7 +920,7 @@ impl RestClient {
         })
     }
 
-    async fn request(&self, call: &Call<'_>) -> Result<reqwest::RequestBuilder> {
+    fn request(&self, call: &Call<'_>) -> Result<reqwest::RequestBuilder> {
         let mut url = self.base.clone();
         if let Ok(mut segments) = url.path_segments_mut() {
             segments
@@ -912,9 +953,9 @@ impl RestClient {
         Ok(match &call.body {
             Body::Empty => request,
             Body::Json(body) => request.json(body),
-            Body::File(file) => request
+            Body::File(upload) => request
                 .timeout(UPLOAD_TIMEOUT)
-                .multipart(file_form(file).await?),
+                .multipart(file_form(upload)?),
         })
     }
 }
@@ -928,16 +969,46 @@ fn header(value: &str) -> Result<HeaderValue> {
     Ok(value)
 }
 
-async fn file_form(file: &OutFile) -> Result<reqwest::multipart::Form> {
-    let data = tokio::fs::read(&file.path)
+/// Reads a file to upload, refusing anything but a regular file of at most
+/// `max` bytes before reading it. The read stops after `max + 1` bytes, so
+/// a file that grows after the check can't take more memory than that.
+async fn read_upload(path: &Path, max: u64) -> Result<Bytes> {
+    let unreadable = |err: std::io::Error| match err.kind() {
+        std::io::ErrorKind::NotFound => SurfaceError::NotFound("file to upload".into()),
+        kind => SurfaceError::Transport(format!("could not read the file to upload: {kind}")),
+    };
+    let too_large = |size: u64| {
+        SurfaceError::Api(format!(
+            "the file to upload is {size} bytes, more than the {max}-byte limit"
+        ))
+    };
+    let metadata = tokio::fs::metadata(path).await.map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err(SurfaceError::Api(
+            "the file to upload is not a regular file".into(),
+        ));
+    }
+    if metadata.len() > max {
+        return Err(too_large(metadata.len()));
+    }
+    let file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let mut data = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.take(max.saturating_add(1))
+        .read_to_end(&mut data)
         .await
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => SurfaceError::NotFound("file to upload".into()),
-            kind => SurfaceError::Transport(format!("could not read the file to upload: {kind}")),
-        })?;
-    let part = reqwest::multipart::Part::bytes(data)
-        .file_name(file.name.clone())
-        .mime_str(mime_type(&file.name))
+        .map_err(unreadable)?;
+    let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    if size > max {
+        return Err(too_large(size));
+    }
+    Ok(Bytes::from(data))
+}
+
+fn file_form(upload: &Upload<'_>) -> Result<reqwest::multipart::Form> {
+    let length = u64::try_from(upload.data.len()).unwrap_or(u64::MAX);
+    let part = reqwest::multipart::Part::stream_with_length(upload.data.clone(), length)
+        .file_name(upload.name.to_owned())
+        .mime_str(mime_type(upload.name))
         .map_err(transport)?;
     Ok(reqwest::multipart::Form::new().part("file", part))
 }
@@ -967,6 +1038,7 @@ fn mime_type(name: &str) -> &'static str {
 async fn outcome(response: reqwest::Response, now: SystemTime) -> Result<Outcome> {
     let status = response.status();
     let reset = response.headers().get("x-ratelimit-reset").cloned();
+    let date = response.headers().get(reqwest::header::DATE).cloned();
     let bytes = response.bytes().await.map_err(transport)?;
     let body: Option<Value> = serde_json::from_slice(&bytes).ok();
     let rate_limited = status == StatusCode::TOO_MANY_REQUESTS
@@ -974,7 +1046,11 @@ async fn outcome(response: reqwest::Response, now: SystemTime) -> Result<Outcome
             .as_ref()
             .is_some_and(|b| error_codes(b, true).any(|code| RATE_LIMITED_CODES.contains(&code)));
     if rate_limited {
-        return Ok(Outcome::RateLimited(retry_wait(reset.as_ref(), now)));
+        return Ok(Outcome::RateLimited(retry_wait(
+            reset.as_ref(),
+            date.as_ref(),
+            now,
+        )));
     }
     let failed = body
         .as_ref()
@@ -992,20 +1068,39 @@ async fn outcome(response: reqwest::Response, now: SystemTime) -> Result<Outcome
 /// How long to wait before retrying a 429.
 ///
 /// Rocket.Chat sets `x-ratelimit-reset` to the absolute time the limit
-/// resets, in milliseconds since the Unix epoch (`enforceRateLimit` in
-/// `apps/meteor/server/api/ApiClass.ts`). A missing or unreadable header
-/// waits [`DEFAULT_RETRY_WAIT`]; a reset in the past waits nothing.
-fn retry_wait(reset: Option<&HeaderValue>, now: SystemTime) -> Duration {
+/// resets, in milliseconds since the Unix epoch by the server's clock
+/// (`enforceRateLimit` in `apps/meteor/server/api/ApiClass.ts`). The wait
+/// is that time minus the response's `Date` header, which comes from the
+/// same clock, so skew between the server and this host doesn't matter.
+/// `Date` has whole seconds, which makes the wait up to a second longer,
+/// never shorter. Without a readable `Date`, `now` (the local clock) is
+/// used instead. A missing or unreadable reset waits
+/// [`DEFAULT_RETRY_WAIT`]; a reset in the past waits nothing.
+fn retry_wait(
+    reset: Option<&HeaderValue>,
+    date: Option<&HeaderValue>,
+    now: SystemTime,
+) -> Duration {
     let Some(reset_ms) = reset
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
     else {
         return DEFAULT_RETRY_WAIT;
     };
-    let now_ms = now
+    let server_now = date.and_then(http_date).unwrap_or(now);
+    let now_ms = server_now
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
     Duration::from_millis(reset_ms.saturating_sub(now_ms))
+}
+
+/// Reads an HTTP `Date` header in IMF-fixdate form
+/// (`Sun, 06 Nov 1994 08:49:37 GMT`). The obsolete RFC 850 and asctime
+/// forms, which no current server sends, read as `None`.
+fn http_date(value: &HeaderValue) -> Option<SystemTime> {
+    let text = value.to_str().ok()?;
+    let at = PrimitiveDateTime::parse(text.trim(), HTTP_DATE).ok()?;
+    Some(at.assume_utc().into())
 }
 
 /// The error codes a failure body carries: `errorType`, the `[code]` suffix
@@ -1179,23 +1274,79 @@ mod tests {
     fn retry_wait_reads_the_reset_as_epoch_milliseconds() {
         let now = at_ms(1_790_000_000_000);
         let reset = HeaderValue::from_static("1790000002500");
-        assert_eq!(retry_wait(Some(&reset), now), Duration::from_millis(2500));
+        assert_eq!(
+            retry_wait(Some(&reset), None, now),
+            Duration::from_millis(2500)
+        );
     }
 
     #[test]
     fn retry_wait_for_a_past_reset_is_zero() {
         let reset = HeaderValue::from_static("1000");
-        assert_eq!(retry_wait(Some(&reset), at_ms(5000)), Duration::ZERO);
+        assert_eq!(retry_wait(Some(&reset), None, at_ms(5000)), Duration::ZERO);
     }
 
     #[test]
     fn retry_wait_without_a_usable_header_uses_the_default() {
         let now = at_ms(5000);
-        assert_eq!(retry_wait(None, now), DEFAULT_RETRY_WAIT);
+        let date = HeaderValue::from_static("Thu, 01 Jan 1970 00:00:01 GMT");
+        assert_eq!(retry_wait(None, None, now), DEFAULT_RETRY_WAIT);
+        assert_eq!(retry_wait(None, Some(&date), now), DEFAULT_RETRY_WAIT);
         let garbage = HeaderValue::from_static("soon");
-        assert_eq!(retry_wait(Some(&garbage), now), DEFAULT_RETRY_WAIT);
+        assert_eq!(retry_wait(Some(&garbage), None, now), DEFAULT_RETRY_WAIT);
         let float = HeaderValue::from_static("1.5");
-        assert_eq!(retry_wait(Some(&float), now), DEFAULT_RETRY_WAIT);
+        assert_eq!(retry_wait(Some(&float), None, now), DEFAULT_RETRY_WAIT);
+    }
+
+    #[test]
+    fn retry_wait_measures_the_reset_against_the_server_date_not_the_local_clock() {
+        let date = HeaderValue::from_static("Tue, 29 Sep 2026 22:40:00 GMT");
+        let server_now_ms = 1_790_721_600_000;
+        let reset = HeaderValue::from_str(&(server_now_ms + 2500).to_string()).unwrap();
+        for local_skew_ms in [0, 3_600_000, 90_000] {
+            let ahead = at_ms(server_now_ms + local_skew_ms);
+            let behind = at_ms(server_now_ms - local_skew_ms);
+            for now in [ahead, behind] {
+                assert_eq!(
+                    retry_wait(Some(&reset), Some(&date), now),
+                    Duration::from_millis(2500)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_wait_with_an_unreadable_date_falls_back_to_the_local_clock() {
+        let now = at_ms(1_790_721_600_000);
+        let reset = HeaderValue::from_static("1790721602500");
+        for date in [
+            "yesterday",
+            "Tuesday, 29-Sep-26 22:40:00 GMT",
+            "Tue Sep 29 22:40:00 2026",
+            "Tue, 29 Sep 2026 22:40:00 +0000",
+            "Tue, 31 Sep 2026 22:40:00 GMT",
+        ] {
+            let date = HeaderValue::from_static(date);
+            assert_eq!(
+                retry_wait(Some(&reset), Some(&date), now),
+                Duration::from_millis(2500),
+                "{date:?}"
+            );
+        }
+        let not_text = HeaderValue::from_bytes(b"Tue, 29 Sep 2026 \xff GMT").unwrap();
+        assert_eq!(
+            retry_wait(Some(&reset), Some(&not_text), now),
+            Duration::from_millis(2500)
+        );
+    }
+
+    #[test]
+    fn http_date_reads_imf_fixdate() {
+        let date = HeaderValue::from_static(" Sun, 06 Nov 1994 08:49:37 GMT ");
+        assert_eq!(
+            http_date(&date),
+            Some(UNIX_EPOCH + Duration::from_secs(784_111_777))
+        );
     }
 
     #[test]
@@ -1468,6 +1619,11 @@ mod tests {
             known.two_factor_code().expose_secret(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn the_default_upload_limit_is_rocket_chats_default() {
+        assert_eq!(DEFAULT_MAX_UPLOAD_SIZE, 104_857_600);
     }
 
     #[test]

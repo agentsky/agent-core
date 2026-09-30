@@ -271,6 +271,25 @@ fn skill_add() {
 }
 
 #[test]
+fn skill_add_refuses_sources_other_than_https_git_urls() {
+    let message = "A skill source is an https:// Git URL, optionally ending in #ref. \
+                   Leave it out to add a SKILL.md or .zip attached to a direct message with me.\n\
+                   Usage: `skill add <name> [source]`";
+    for text in [
+        "skill add helper --upload-pack=SECRET",
+        "skill add helper -uSECRET",
+        "skill add helper https://github.com/o/r#--upload-pack=SECRET",
+        "skill add helper git@github.com:o/SECRET.git",
+        "skill add helper file:///SECRET",
+        "skill add helper https://user:SECRET@github.com/o/r",
+        "skill add helper <ext::sh%20SECRET|x>",
+    ] {
+        invalid(text, message);
+        assert!(!format!("{:?}", fail(text)).contains("SECRET"), "{text}");
+    }
+}
+
+#[test]
 fn skill_rm() {
     let Command::Skill(SkillCommand::Rm { name: n, skill }) = ok("skill rm helper pdf-tools")
     else {
@@ -753,6 +772,9 @@ fn errors_never_repeat_the_text() {
         "list SECRET1",
         "skill SECRET1",
         "reset helper SECRET1",
+        "api-key set SECRET1",
+        "slack_token SECRET1 SECRET2",
+        "admin apikey set SECRET1",
     ] {
         let err = fail(text);
         assert!(!err.to_string().contains("SECRET"), "{text}: {err}");
@@ -771,4 +793,76 @@ fn quotes_are_ordinary_characters() {
         panic!()
     };
     assert_eq!(reason.as_deref(), Some("'quoted reason'"));
+}
+
+#[test]
+fn misspelt_secret_bearing_commands_are_still_secret_bearing() {
+    for text in [
+        "api-key set sk-ant-api03-SECRET",
+        "apikey set k",
+        "api_key k",
+        "Admin APIKEY set k",
+        "admin apikey set k",
+        "admin api_key set k",
+        "admin key set sk-ant-api03-SECRET",
+        "slack_token a b",
+        "slacktoken a",
+        "Slack-Token: a b",
+        "SlackToken a",
+        "logn please LOGIN abc#def",
+        "log-in abc#def",
+        "please login abc#def",
+        "admin login x",
+        "pause helper api-key k",
+    ] {
+        let err = fail(text);
+        assert_ne!(err.kind(), ParseErrorKind::Help, "{text:?}");
+        assert!(err.is_secret_bearing(), "{text:?}");
+    }
+}
+
+#[test]
+fn errors_holding_a_known_token_prefix_are_secret_bearing() {
+    for text in [
+        "sk-ant-api03-SECRET",
+        "set sk-ant-oat01-SECRET",
+        "admin api-key sk-ant-api03-SECRET",
+        "key=SK-ANT-api03-SECRET",
+        "xoxb-1-SECRET",
+        "tokens xoxe.xoxp-1-SECRET xoxe-1-SECRET",
+        "app xapp-1-SECRET",
+        "user xoxp-1-SECRET",
+        "persona Bad-Name sk-ant-api03-SECRET",
+        "help sk-ant-api03-SECRET",
+    ] {
+        let err = fail(text);
+        assert!(err.is_secret_bearing(), "{text:?}");
+        assert!(!err.to_string().contains("SECRET"), "{text:?}");
+    }
+}
+
+#[test]
+fn errors_without_a_secret_are_not_secret_bearing() {
+    for text in [
+        "",
+        "help",
+        "help login",
+        "help admin",
+        "frobnicate",
+        "logn abc123",
+        "logout now",
+        "pause Bad",
+        "api-key",
+        "api-key set",
+        "apikey clear",
+        "slack_token",
+        "admin apikey",
+        "admin api-key set",
+        "admin api-key",
+        "skill add helper http://x.io/r",
+        "persona Bad-Name xox",
+        "login-page",
+    ] {
+        assert!(!fail(text).is_secret_bearing(), "{text:?}");
+    }
 }

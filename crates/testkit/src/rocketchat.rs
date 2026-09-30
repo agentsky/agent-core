@@ -310,16 +310,35 @@ impl FakeRest {
     /// Makes the next `times` calls to `endpoint` fail with HTTP 429, as
     /// Rocket.Chat's rate limiter does, resetting `reset_in` from now.
     pub async fn rate_limit(&self, endpoint: &str, times: u64, reset_in: Duration) {
-        let now_ms = SystemTime::now()
+        self.rate_limit_at(endpoint, times, reset_in, SystemTime::now())
+            .await;
+    }
+
+    /// Like [`FakeRest::rate_limit`], for a server whose clock reads
+    /// `server_now`, to test clock skew.
+    ///
+    /// The response's `Date` header is `server_now` in whole seconds, as a
+    /// real server sends it, and `X-RateLimit-Reset` is that second plus
+    /// `reset_in`, in milliseconds since the Unix epoch, so a client that
+    /// measures the reset against `Date` waits exactly `reset_in`.
+    pub async fn rate_limit_at(
+        &self,
+        endpoint: &str,
+        times: u64,
+        reset_in: Duration,
+        server_now: SystemTime,
+    ) {
+        let now_s = server_now
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis());
-        let reset = now_ms + reset_in.as_millis();
+            .map_or(0, |d| d.as_secs());
+        let reset = u128::from(now_s) * 1000 + reset_in.as_millis();
         let seconds = reset_in.as_secs().max(1);
         let body = json!({
             "success": false,
             "error": format!("Error, too many requests. Please slow down. You must wait {seconds} seconds before trying this endpoint again. [error-too-many-requests]"),
         });
         let response = ResponseTemplate::new(429)
+            .insert_header("Date", http_date(now_s))
             .insert_header("X-RateLimit-Limit", "10")
             .insert_header("X-RateLimit-Remaining", "0")
             .insert_header("X-RateLimit-Reset", reset.to_string())
@@ -368,6 +387,19 @@ fn unknown_key<'a>(body: &'a Value, allowed: &[&str]) -> Option<&'a str> {
         .keys()
         .map(String::as_str)
         .find(|k| !allowed.contains(k))
+}
+
+/// Formats Unix seconds as an HTTP `Date` header (IMF-fixdate), such as
+/// `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn http_date(unix_seconds: u64) -> String {
+    let at = i64::try_from(unix_seconds)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    at.format(time::macros::format_description!(
+        "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+    ))
+    .unwrap_or_default()
 }
 
 /// A regex matching `endpoint`, alone or followed by path parameters.

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 core-types.workspace = true
 futures.workspace = true
 rand.workspace = true
