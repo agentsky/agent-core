@@ -42,12 +42,19 @@ pub struct TeamDirectory {
 }
 
 /// The member list, and when `users.list` may be read again.
+///
+/// `retrying` says the last read failed, so `next_attempt` is a retry wait
+/// a new managed bot doesn't cut short. `outdated` says a managed bot the
+/// list lacks was set since the last read began, so the read that ends
+/// next leaves the list stale.
 #[derive(Default)]
 struct Members {
     directory: Arc<MemberDirectory>,
     loaded: bool,
     next_attempt: Option<Instant>,
     failure: Option<SurfaceError>,
+    retrying: bool,
+    outdated: bool,
 }
 
 impl Members {
@@ -85,10 +92,23 @@ impl TeamDirectory {
     /// replacing any set before. A name one of them shares with other
     /// members resolves to that agent (see [`MemberDirectory`]). It applies
     /// to the current member list and every later one.
+    ///
+    /// When the list lacks one of them, such as an agent installed since it
+    /// was read, the list goes stale, so the next
+    /// [`refresh_members`](Self::refresh_members) or render reads
+    /// `users.list` again, unless a failed read asks to wait.
     pub fn set_managed_bots(&self, bots: impl IntoIterator<Item = UserId>) {
-        let managed = Arc::new(bots.into_iter().collect::<HashSet<_>>());
+        let managed: HashSet<UserId> = bots.into_iter().collect();
+        let current = self.members();
+        let unknown = !current.knows_all(&managed);
         let mut members = self.write_members();
-        members.directory = Arc::new(members.directory.with_managed(managed));
+        members.directory = Arc::new(members.directory.with_managed(Arc::new(managed)));
+        if unknown {
+            members.outdated = true;
+            if !members.retrying {
+                members.next_attempt = None;
+            }
+        }
     }
 
     /// The member list as last read: empty until the first
@@ -115,6 +135,7 @@ impl TeamDirectory {
         if let Some(fresh) = self.fresh() {
             return fresh;
         }
+        self.write_members().outdated = false;
         let names = api
             .all_users()
             .await
@@ -130,8 +151,10 @@ impl TeamDirectory {
                 *members = Members {
                     directory: Arc::clone(&directory),
                     loaded: true,
-                    next_attempt: Some(now + self.ttl),
+                    next_attempt: (!members.outdated).then(|| now + self.ttl),
                     failure: None,
+                    retrying: false,
+                    outdated: false,
                 };
                 drop(members);
                 tracing::debug!(team = %self.team, names = directory.len(), "refreshed the Slack member cache");
@@ -139,6 +162,7 @@ impl TeamDirectory {
             }
             Err(err) => {
                 members.next_attempt = Some(now + RETRY_AFTER_FAILURE.min(self.ttl));
+                members.retrying = true;
                 if members.loaded {
                     let stale = Arc::clone(&members.directory);
                     drop(members);
@@ -260,6 +284,15 @@ impl MemberDirectory {
             names: Arc::clone(&self.names),
             managed,
         }
+    }
+
+    /// Whether every member in `ids` has a name in the snapshot.
+    fn knows_all(&self, ids: &HashSet<UserId>) -> bool {
+        if ids.is_empty() {
+            return true;
+        }
+        let known: HashSet<&UserId> = self.names.values().flatten().collect();
+        ids.iter().all(|id| known.contains(id))
     }
 
     /// The member called `name`: the only one, or the only managed agent

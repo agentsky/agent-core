@@ -232,6 +232,125 @@ async fn renders_after_a_failed_first_member_refresh_wait_to_retry() {
     assert_eq!(requests(&server).await.len(), 1);
 }
 
+fn members_with_bot() -> ResponseTemplate {
+    ok(json!({
+        "members": [
+            {"id": USER, "name": "ada", "profile": {"display_name": "Ada"}},
+            {"id": BOT_USER, "name": "helper", "is_bot": true, "profile": {"real_name": "helper"}},
+        ],
+    }))
+}
+
+async fn users_list_calls(server: &MockServer) -> usize {
+    requests(server)
+        .await
+        .iter()
+        .filter(|request| request.url.path() == "/api/users.list")
+        .count()
+}
+
+#[tokio::test]
+async fn a_managed_bot_the_member_list_lacks_makes_it_stale() {
+    let (server, surface) = setup().await;
+    mount(&server, "users.list", members_with_bot()).await;
+    surface.refresh_members().await.unwrap();
+    assert_eq!(users_list_calls(&server).await, 1);
+
+    surface
+        .directory()
+        .set_managed_bots([UserId::from(BOT_USER)]);
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        users_list_calls(&server).await,
+        1,
+        "a known bot keeps the list"
+    );
+
+    surface
+        .directory()
+        .set_managed_bots([UserId::from(BOT_USER), UserId::from("U0NEWBOT1")]);
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        users_list_calls(&server).await,
+        2,
+        "a new bot reads it again"
+    );
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        users_list_calls(&server).await,
+        2,
+        "once, even if still absent"
+    );
+
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT2")]);
+    assert_eq!(surface.render("@ada"), [format!("<@{USER}>")]);
+    for _ in 0..100 {
+        if users_list_calls(&server).await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(users_list_calls(&server).await, 3, "render refreshes too");
+}
+
+#[tokio::test]
+async fn a_new_managed_bot_waits_out_a_failed_refresh() {
+    let (server, surface) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .respond_with(members_with_bot())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        "users.list",
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "fatal_error"})),
+    )
+    .await;
+    surface.refresh_members().await.unwrap();
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT1")]);
+    let stale = surface.refresh_members().await.unwrap();
+    assert_eq!(stale.lookup("ada"), Some(&UserId::from(USER)));
+    assert_eq!(users_list_calls(&server).await, 2);
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT2")]);
+    surface.refresh_members().await.unwrap();
+    assert_eq!(users_list_calls(&server).await, 2, "the retry wait holds");
+}
+
+#[tokio::test]
+async fn a_managed_bot_set_during_a_refresh_leaves_the_result_stale() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "users.list",
+        members_with_bot().set_delay(Duration::from_millis(200)),
+    )
+    .await;
+    let refreshing = tokio::spawn({
+        let surface = surface.clone();
+        async move { surface.refresh_members().await.map(drop) }
+    });
+    for _ in 0..100 {
+        if users_list_calls(&server).await == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT1")]);
+    refreshing.await.unwrap().unwrap();
+    surface.refresh_members().await.unwrap();
+    assert_eq!(users_list_calls(&server).await, 2);
+}
+
 #[tokio::test]
 async fn managed_agents_keep_names_humans_share() {
     let (server, surface) = setup().await;

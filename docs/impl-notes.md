@@ -2698,7 +2698,16 @@ bindings and passes each team's to `TeamDirectory::set_managed_bots`, and a
 shared name with exactly one managed agent among its members resolves to
 that agent. The directory keeps every member id per name, so a new managed
 set applies to the current list at once, without reading `users.list`
-again. Deactivated members are left out.
+again. A managed bot the list lacks, such as an agent installed since the
+last read, marks the list stale instead, so the next `refresh_members` or
+render reads `users.list` even within the TTL (T31's `refresh_members` when
+a binding starts would otherwise return the cached list without the new
+agent for up to 15 minutes). That still goes through the one shared
+refresh and honours the wait after a failed read. If the bot is set while
+a read is running, the list that read produces stays stale too, since the
+read may have started before the install. A bot still missing afterwards
+causes no further reads until the managed set changes again. Deactivated
+members are left out.
 
 If a refresh fails, the next attempt waits a minute (or the TTL, if
 shorter). Meanwhile an older list is kept; with none, `refresh_members`
