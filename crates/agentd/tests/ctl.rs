@@ -46,9 +46,12 @@ async fn the_ctl_listener_serves_the_agentctl_api_by_source_address() {
     let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
     let ctl = server.addrs().ctl;
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(async {
-        let _ = stopped.await;
-    }));
+    let task = tokio::spawn(server.run(
+        async {
+            let _ = stopped.await;
+        },
+        std::future::pending(),
+    ));
 
     let response = post(ctl, None).await;
     assert_eq!(response.status, 401, "{response:?}");
@@ -88,9 +91,12 @@ async fn startup_deletes_tokens_and_staged_files_from_before() {
     let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
     let ctl = server.addrs().ctl;
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(async {
-        let _ = stopped.await;
-    }));
+    let task = tokio::spawn(server.run(
+        async {
+            let _ = stopped.await;
+        },
+        std::future::pending(),
+    ));
     assert_eq!(post(ctl, Some(&token)).await.status, 401);
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
