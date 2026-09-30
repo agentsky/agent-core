@@ -51,3 +51,12 @@ sandbox_subnet = "172.30.0.0/24"
 # The SQLite database. agentd creates the file if it is missing, and applies
 # pending migrations at startup (and with `agentd migrate`).
 url = "sqlite:///var/lib/agentd/agentd.db"
+
+# agentd's data directory, an absolute path. Files agents stage with
+# `agentctl attach` wait under ctl-outbox/ in it until their turn's reply is
+# posted; agentd empties ctl-outbox/ at startup.
+data_dir = "/var/lib/agentd"
+
+[limits]
+# The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
+attach_max_bytes = 52428800

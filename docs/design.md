@@ -500,12 +500,19 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl post --to <target> <text>` | Post somewhere else the agent is allowed to post |
 | `agentctl react <emoji> [message id]` | Add a reaction |
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
+| `agentctl lock -- <command>` | Run a command while holding the scope's `shared/` lock, for writes to `shared/`. A second `lock`, from any session of the scope, waits |
 | `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
 | `agentctl private <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless the owner is this turn's requester. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
-One bundled skill documents `agentctl`. Its token is scoped to one agent, scope,
-session, turn and requester, is bound to the session's container, and expires
-with the turn.
+One bundled skill documents `agentctl`. Its token is one per `claude`
+process, scoped to one agent, scope and session, and bound to the session's
+container: agentd refuses a request from any other source address. A warm
+process's environment is fixed at start, so a token can't be issued per turn.
+Instead agentd records the current turn, with its requester, side and kind,
+on the token when the turn starts and clears it when the turn ends, and the
+token authorizes nothing between turns. That makes everything it can do
+expire with the turn. Tokens are stored only as SHA-256 hashes and are all
+deleted when agentd restarts.
 
 Launch flags:
 

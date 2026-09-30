@@ -43,6 +43,10 @@ running them as a separate step. Configuration errors name the key or
 variable at fault, and any other variable starting with `AGENTD_` is refused.
 Each listener binds agentd's own address on its network, never `0.0.0.0`.
 `GET /healthz` on the public listener answers 200 while the database does.
+The ctl listener serves the agentctl API that sandboxed agents call back
+through; at startup agentd deletes every agentctl token and scope lock and
+empties `ctl-outbox/` under `store.data_dir`, since the containers they
+belonged to are gone.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
@@ -53,7 +57,10 @@ GitHub Actions runs the same formatting, lint, test, doc, and coverage checks
 on pushes to `main` and on pull requests, plus a `cargo check` on the minimum
 supported Rust version declared in `Cargo.toml`. The formatting, lint, test
 and doc checks run on both x86_64 and aarch64 Linux. Dependabot keeps actions
-and crates up to date.
+and crates up to date. The `agentctl-static` job builds `agentctl` for
+`x86_64-unknown-linux-musl` and fails if `readelf -l` shows an `INTERP`
+segment, so the binary copied into the sandbox image needs no dynamic
+loader.
 
 The `deny` job enforces the dependency policy in `deny.toml` with
 [cargo-deny](https://github.com/EmbarkStudios/cargo-deny): no OpenSSL or

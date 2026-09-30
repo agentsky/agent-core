@@ -20,7 +20,18 @@ version = "0.1.0"
 name = "agentctl"
 version = "0.1.0"
 dependencies = [
+ "agentd",
+ "axum",
  "clap",
+ "core-types",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "store",
+ "testkit",
+ "time",
+ "tokio",
 ]
 
 [[package]]
@@ -29,15 +40,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.23.1",
  "clap",
  "core-types",
+ "futures",
+ "http-body-util",
  "hyper",
  "hyper-util",
+ "rand",
  "secrecy",
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha2 0.11.0",
  "store",
+ "testkit",
  "thiserror",
  "time",
  "tokio",
@@ -45,6 +62,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1715,12 +1733,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -2914,6 +2934,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

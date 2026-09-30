@@ -1216,8 +1216,13 @@ Deliverables:
     notes it in the design's `agentctl` paragraph.
   - Tokens are 32 random bytes, stored as a SHA-256 hash in a new
     `ctl_tokens` table (`hash`, `session_id`, `agent_id`, `volume_key`,
-    `container_ip`, and the current turn: `turn_id`, `requester`, `hop`,
-    `kind`, `side`, nullable). That table's migration belongs to this task.
+    `container_ip`, and the current turn: `turn_id`, `requester_member`
+    and `requester_key`, `hop`, `kind` and `consent_id`, `side`, and the
+    turn's thread and message, `conversation`, `thread_root` and
+    `trigger_message`, which the target rules and `history` need; all
+    nullable). That table's migration belongs to this task. A session has
+    one token at a time: issuing a new one revokes the old
+    ([impl-notes](impl-notes.md#t15-agentctl)).
     agentd deletes every row at startup: containers from before a restart are
     reaped (T17), and Docker can give their IPs to new containers.
   - The connection's source IP must match `container_ip`, and `turn_id` must
@@ -1226,7 +1231,8 @@ Deliverables:
     and `revoke_process_token(...)`, called through T21's hooks.
   - Handlers write to a per-turn outbox (attachments staged on disk under the
     agentd data directory, reactions and posts queued) that the turn pipeline
-    (T23) drains.
+    (T23) drains: `end_turn` returns it. The data directory is the new
+    `store.data_dir` key, and the attachment cap `limits.attach_max_bytes`.
   - Target rules, checked when the request arrives, from the turn's `Side`
     (the `core-types` type T22's router decides with, stored at
     `begin_turn`):
@@ -1237,7 +1243,10 @@ Deliverables:
       target any conversation the agent's bot is a member of. The surface
       refuses the rest.
     - Anything else is refused with a reason the model can read.
-  - `history` calls `Surface::history`.
+  - `history` calls `Surface::history`, on the surface a `SurfaceLookup`
+    finds for the agent and conversation. agentd passes one to `App` once
+    surfaces are wired in (T23); until then `history` answers "not
+    available".
   - `ask-agent` and `private` return "not available yet" until T33 and T34.
   - Refusal rule already in place: inside a `TurnKind::PrivateTask` token,
     everything except `attach` is refused.
@@ -1706,7 +1715,12 @@ Deliverables:
     to the model, so short ids resolve.
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
-  T19, and issues agentctl tokens and records their turns with T15.
+  T19, and issues agentctl tokens and records their turns with T15
+  (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
+  turn's outbox, and `revoke_process_token`). It builds `App` with a
+  `SurfaceLookup` for `agentctl history`, and resolves the short message ids
+  it shows the model where agentctl takes a message id
+  ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
