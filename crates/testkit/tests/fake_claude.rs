@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -16,6 +17,22 @@ use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const WAIT: Duration = Duration::from_secs(60);
+
+/// Held around every spawn in this binary, and while a test writes an
+/// executable that `fake-claude` will run.
+///
+/// The tests run in parallel. A child starts with a copy of each descriptor
+/// open in the test process and holds it until its exec closes it, so a
+/// spawn on another thread while a script was open for writing could leave
+/// a child holding it, and the script would fail to start with `ETXTBSY`. A
+/// spawn returns only once its child has exec'd, so under the lock no
+/// pre-exec child is left holding another test's pipes or files. The
+/// process sandbox has the same lock for the same reason.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
+fn spawning() -> MutexGuard<'static, ()> {
+    SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 struct TempDir(PathBuf);
 
@@ -144,7 +161,10 @@ impl Setup {
     }
 
     async fn output(&self, args: &[String], lines: &[&str]) -> Output {
-        let mut child = self.command(args).spawn().unwrap();
+        let mut child = {
+            let _spawning = spawning();
+            self.command(args).spawn().unwrap()
+        };
         let mut stdin = child.stdin.take().unwrap();
         let input: String = lines.iter().map(|line| format!("{line}\n")).collect();
         let _ = stdin.write_all(input.as_bytes()).await;
@@ -609,15 +629,18 @@ async fn scripted_commands_run_on_path_with_the_fake_environment() {
     let setup = Setup::new(&api.uri(), &[]).with_env("AGENTCTL_TOKEN", "ctl-token");
     let agentctl = setup.path("bin").join("agentctl");
     let log = setup.path("agentctl.log");
-    std::fs::write(
-        &agentctl,
-        format!(
-            "#!/bin/sh\necho \"$AGENTCTL_TOKEN $*\" >> '{}'\necho reacted\necho note >&2\n",
-            log.display()
-        ),
-    )
-    .unwrap();
-    make_executable(&agentctl);
+    {
+        let _spawning = spawning();
+        std::fs::write(
+            &agentctl,
+            format!(
+                "#!/bin/sh\necho \"$AGENTCTL_TOKEN $*\" >> '{}'\necho reacted\necho note >&2\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        make_executable(&agentctl);
+    }
     setup.script(&[Turn::reply("done")
         .with_command(["agentctl", "react", "eyes"])
         .with_command(["sh", "-c", "echo failing; exit 3"])

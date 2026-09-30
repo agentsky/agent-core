@@ -190,8 +190,8 @@ pub struct TurnStats {
     pub duration: Duration,
 }
 
-/// What kind of failure an error result is. T26 turns these into
-/// member-facing messages.
+/// What kind of failure an error result is. agentd tells the thread, and
+/// the turn's requester, which it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     /// The credential's rate limit, usage limit or credit is used up.

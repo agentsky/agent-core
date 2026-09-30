@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use core_types::{
@@ -23,9 +22,8 @@ use sandbox::{
 };
 use secrecy::SecretString;
 use store::{Sealer, Store};
-use testkit::{FakeAnthropic, Turn};
+use testkit::{FakeAnthropic, Logs, Turn};
 use tokio::sync::Notify;
-use tracing_subscriber::fmt::MakeWriter;
 
 struct TempDir(PathBuf);
 
@@ -277,6 +275,7 @@ struct Harness {
     manager: SessionManager<Hooks>,
     agent: AgentId,
     faults: Arc<Faults>,
+    logs: &'static Logs,
 }
 
 impl Harness {
@@ -288,6 +287,7 @@ impl Harness {
         turns: &[Turn],
         change: impl FnOnce(&mut ProcessConfig, &mut PoolConfig),
     ) -> Self {
+        let logs = Logs::global();
         let bin = testkit::fake_claude_path();
         let dir = TempDir::new();
         let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
@@ -352,11 +352,26 @@ impl Harness {
             manager,
             agent,
             faults,
+            logs,
         }
     }
 
     fn events(&self) -> Vec<Event> {
         self.log.lock().unwrap().clone()
+    }
+
+    /// A connection of its own to the store's database, holding its write
+    /// lock until it commits.
+    async fn lock_writes(&self) -> sqlx::SqliteConnection {
+        use sqlx::Connection;
+
+        let url = format!("sqlite://{}", self._dir.0.join("agentd.db").display());
+        let mut writer = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        writer
     }
 
     fn clear(&self) {
@@ -458,37 +473,6 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
     while !check() {
         assert!(std::time::Instant::now() < deadline, "timed out: {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
-    }
-}
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'w> MakeWriter<'w> for Captured {
-    type Writer = Self;
-
-    fn make_writer(&'w self) -> Self::Writer {
-        self.clone()
     }
 }
 
@@ -667,6 +651,7 @@ async fn the_global_cap_reaps_an_idle_container_of_another_scope() {
     assert_eq!(h.sandbox.most.load(Ordering::SeqCst), 1);
     assert!(!h.manager.is_warm(first.id));
     assert!(h.manager.is_warm(second.id));
+    assert_eq!(h.manager.warm_sessions(), [second.id]);
     let events = h.events();
     assert!(
         position(&events, &Event::ProcessStopping(first.id, 1))
@@ -802,6 +787,32 @@ async fn reset_starts_with_a_new_id() {
         Err(RunnerError::UnknownSession)
     ));
     assert_eq!(h.manager.reset(old.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_reset_holds_its_session_while_its_store_write_waits() {
+    let h = Harness::new(&[Turn::reply("old")]).await;
+    let warm = h.thread_session("1.1").await;
+    reply(&h.run(warm.id, request("one")).await);
+    let mut writer = h.lock_writes().await;
+    let mut reset = Box::pin(h.manager.reset(warm.id));
+    assert!(futures::poll!(reset.as_mut()).is_pending());
+    eventually("the container stops while the store is locked", || {
+        h.events().contains(&Event::ContainerStopped(warm.id))
+    })
+    .await;
+    let mut turn = Box::pin(h.manager.run_turn(warm.id, request("two")));
+    assert!(
+        futures::poll!(turn.as_mut()).is_pending(),
+        "a turn sent while the reset waits for the store waits behind it"
+    );
+    assert_eq!(
+        h.store.session(warm.id).await.unwrap().unwrap().reset_at,
+        None
+    );
+    sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    assert!(reset.await.unwrap().is_some());
+    assert!(matches!(turn.await, Err(RunnerError::SessionReset)));
 }
 
 #[tokio::test]
@@ -1326,13 +1337,6 @@ async fn a_refused_resume_is_caught_on_the_first_turn_sent_to_a_resumed_process(
 
 #[tokio::test]
 async fn a_normal_stop_is_not_logged_as_a_death() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
     let h = Harness::new(&[Turn::reply("one")]).await;
     let session = h.thread_session("1.1").await;
     reply(&h.run(session.id, request("1")).await);
@@ -1340,9 +1344,11 @@ async fn a_normal_stop_is_not_logged_as_a_death() {
     h.manager.stop(session.id).await;
     assert!(!h.manager.is_warm(session.id));
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let logs = captured.text();
-    assert!(logs.contains("stopped a session container"), "{logs}");
-    assert!(!logs.contains("a session container died"), "{logs}");
+    h.logs
+        .snapshot()
+        .matching(&format!("session={}", session.id))
+        .assert_has("stopped a session container")
+        .assert_lacks("a session container died");
     let stops = h
         .events()
         .iter()

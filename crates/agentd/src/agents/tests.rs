@@ -15,6 +15,7 @@ use serde_json::json;
 use store::{AgentCreation, AgentState, BindingState, NewAgent, Sealer, Store, Visibility};
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
 use surface_rocketchat::{BotRoles, RocketChatConfig};
+use testkit::Held;
 use testkit::rocketchat::{FakeDdp, FakeRest, realtime_message};
 use time::OffsetDateTime;
 use tokio::sync::watch;
@@ -59,6 +60,17 @@ async fn harness() -> Harness {
         store,
         agents,
         owner,
+    }
+}
+
+async fn eventually(what: &str, mut done: impl AsyncFnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !done().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -154,14 +166,12 @@ async fn a_creation_abandoned_before_it_starts_makes_no_bot() {
 async fn a_bot_made_after_its_creation_was_abandoned_owes_retirement() {
     let h = harness().await;
     let made = h.fake.add_user("helper");
+    let (held, mut hold) =
+        Held::new(ResponseTemplate::new(200).set_body_json(
+            json!({ "success": true, "user": { "_id": made, "username": "helper" } }),
+        ));
     Mock::given(path("/api/v1/users.create"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(
-                    json!({ "success": true, "user": { "_id": made, "username": "helper" } }),
-                )
-                .set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .up_to_n_times(1)
         .with_priority(1)
         .mount(h.fake.server())
@@ -175,9 +185,10 @@ async fn a_bot_made_after_its_creation_was_abandoned_owes_retirement() {
     let binding = h.creating("helper", OffsetDateTime::now_utc()).await;
     let agents = h.agents.clone();
     let creating = tokio::spawn(async move { agents.create_bot(binding, "helper", "owner").await });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hold.arrived().await;
     let now = OffsetDateTime::now_utc();
     assert!(h.store.abandon_creation(binding, now, now).await.unwrap());
+    hold.release();
     let err = creating.await.unwrap().unwrap_err();
     assert!(matches!(err, CreateError::Abandoned), "{err:?}");
 
@@ -644,11 +655,10 @@ async fn the_supervisor_follows_the_store_and_restarts_ended_connections() {
     wait_for_logins(&ddp, helper.as_str(), 1).await;
     h.agents.rest().set_active(&helper, false).await.unwrap();
     ddp.drop_connections();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !ddp.logins().iter().any(|l| l.user.is_none()) {
-        assert!(tokio::time::Instant::now() < deadline, "no refused login");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    eventually("a refused login", async || {
+        ddp.logins().iter().any(|l| l.user.is_none())
+    })
+    .await;
     h.agents.rest().set_active(&helper, true).await.unwrap();
     wait_for_logins(&ddp, helper.as_str(), 2).await;
 
@@ -660,13 +670,11 @@ async fn the_supervisor_follows_the_store_and_restarts_ended_connections() {
             .unwrap()
     );
     h.agents.poke();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while ddp.connections() > 0 {
-        assert!(tokio::time::Instant::now() < deadline, "still connected");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let retired = h.store.binding(binding).await.unwrap().unwrap();
-    assert!(retired.retired_at.is_some(), "the pass retired the bot");
+    eventually("the bot to be retired and disconnected", async || {
+        let row = h.store.binding(binding).await.unwrap().unwrap();
+        row.retired_at.is_some() && !h.fake.user("helper").unwrap().active && ddp.connections() == 0
+    })
+    .await;
 
     stop.send_replace(true);
     tokio::time::timeout(Duration::from_secs(10), supervising)

@@ -23,10 +23,12 @@
 //! [`scope_locks`](Store::acquire_scope_lock),
 //! [`volumes`](Store::put_volume), [`sessions`](Store::session_for_thread),
 //! [`message_refs`](Store::record_message_ref),
-//! [`slack_config_tokens`](Store::put_slack_config_token), and
+//! [`slack_config_tokens`](Store::put_slack_config_token),
 //! [`agents`](Store::create_agent) with their bindings and
-//! [retirements](Store::claim_retirement), and
-//! [`agent_skills`](Store::put_skill).
+//! [retirements](Store::claim_retirement),
+//! [`agent_skills`](Store::put_skill),
+//! [`community_settings`](Store::set_community_api_key), and
+//! [`failure_notices`](Store::claim_failure_notice).
 
 #![warn(missing_docs)]
 
@@ -37,11 +39,14 @@ use std::time::Duration;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 
 mod agents;
 mod claude_links;
+mod community;
 mod ctl;
 mod events;
+mod failure_notices;
 mod members;
 mod message_refs;
 mod pending_logins;
@@ -57,13 +62,14 @@ pub use agents::{
     NewAgent, PendingRetirement, Visibility,
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
+pub use community::CommunityKeyStatus;
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
-pub use sessions::{Session, SessionKind, ThreadSession};
+pub use sessions::{RESETS_AT_ONCE, Session, SessionKind, ThreadSession};
 pub use skills::{AgentSkill, NewSkill, SkillState};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
@@ -122,6 +128,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 pub struct Store {
     pool: SqlitePool,
     sealer: Arc<Sealer>,
+    resets: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for Store {
@@ -183,6 +190,7 @@ impl Store {
         Ok(Self {
             pool,
             sealer: Arc::new(sealer),
+            resets: Arc::new(Semaphore::new(RESETS_AT_ONCE)),
         })
     }
 
@@ -362,7 +370,9 @@ mod tests {
                 "agents",
                 "claude_link_generations",
                 "claude_links",
+                "community_settings",
                 "ctl_tokens",
+                "failure_notices",
                 "members",
                 "message_refs",
                 "pending_logins",

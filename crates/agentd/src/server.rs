@@ -50,8 +50,9 @@ use crate::commands::intake::{CommandIntake, CommandSubmitter};
 use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
+use crate::community::StoreCommunityKey;
 use crate::net::RefuseSubnet;
-use crate::pipeline::{NoCommunityKey, Pipeline};
+use crate::pipeline::Pipeline;
 use crate::skills::SkillHosts;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
@@ -85,10 +86,11 @@ impl Routers {
     /// the public listener, with the Slack queue as a worker handing
     /// commands to the command intake; the credential proxy on the proxy
     /// listener, forwarding to `proxy.upstream` with the placeholders in
-    /// [`App::registry`] and answering `CONNECT` with the egress proxy
-    /// `[proxy]` describes, extended for each session by its agent's
-    /// skills' confirmed hosts ([`SkillHosts`]); and the agentctl API on
-    /// the ctl listener.
+    /// [`App::registry`], members' tokens from [`App::auth`] and the
+    /// community API key from the store ([`StoreCommunityKey`]), and
+    /// answering `CONNECT` with the egress proxy `[proxy]` describes,
+    /// extended for each session by its agent's skills' confirmed hosts
+    /// ([`SkillHosts`]); and the agentctl API on the ctl listener.
     ///
     /// # Errors
     ///
@@ -114,7 +116,7 @@ impl Routers {
             upstream,
             app.registry().clone(),
             tokens,
-            Arc::new(NoCommunityKey),
+            Arc::new(StoreCommunityKey::new(app.store().clone())),
         )
         .context("proxy.upstream")?
         .with_egress(
@@ -546,10 +548,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
-    use crate::telemetry::tests::Captured;
-    use crate::telemetry::{LogFormat, subscriber};
+    use crate::telemetry::tests::global_logs;
 
-    async fn routers_logs(upstream: Option<&str>) -> String {
+    async fn build_routers(upstream: Option<&str>) {
         let text = match upstream {
             Some(upstream) => format!("{MINIMAL}\n[proxy]\nupstream = \"{upstream}\"\n"),
             None => MINIMAL.to_owned(),
@@ -559,32 +560,35 @@ mod tests {
             .await
             .unwrap();
         let app = App::new(config, store, None).unwrap();
-        let captured = Captured::default();
-        let logs = subscriber(
-            LogFormat::Json,
-            tracing_subscriber::EnvFilter::new("warn"),
-            captured.clone(),
-        );
-        let _guard = tracing::subscriber::set_default(logs);
         Routers::new(&app).unwrap();
-        captured.text()
     }
 
     #[tokio::test]
     async fn another_upstream_than_the_default_is_logged_as_a_warning() {
         let upstream = "https://llm-gateway.example.com";
-        let out = routers_logs(Some(upstream)).await;
-        let lines: Vec<serde_json::Value> = out
+        let logs = global_logs().tag();
+        build_routers(Some(upstream)).await;
+        let out = logs.snapshot();
+        let warnings: Vec<serde_json::Value> = out
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| matches!(line["level"].as_str(), Some("WARN" | "ERROR")))
             .collect();
-        assert_eq!(lines.len(), 1, "{out}");
-        assert_eq!(lines[0]["level"], "WARN");
-        assert_eq!(lines[0]["fields"]["upstream"], upstream);
+        assert_eq!(warnings.len(), 1, "{out}");
+        assert_eq!(warnings[0]["level"], "WARN");
+        assert_eq!(warnings[0]["fields"]["upstream"], upstream);
+
         for quiet in [None, Some(cred_proxy::DEFAULT_UPSTREAM)] {
-            let out = routers_logs(quiet).await;
-            assert!(out.is_empty(), "{quiet:?}: {out}");
+            build_routers(quiet).await;
         }
+        global_logs()
+            .snapshot()
+            .matching("forwards real credentials to proxy.upstream")
+            .assert_has(&format!("\"upstream\":\"{upstream}\""))
+            .assert_lacks(&format!(
+                "\"upstream\":\"{}\"",
+                cred_proxy::DEFAULT_UPSTREAM
+            ));
     }
 
     #[test]

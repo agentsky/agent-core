@@ -27,8 +27,7 @@ use super::slack_tokens::{
 use super::*;
 use crate::slack::Inbound;
 use crate::slack::manager::{ManagerIdentity, SlackManager};
-use crate::telemetry::tests::Captured;
-use crate::telemetry::{LogFormat, subscriber};
+use crate::telemetry::tests::global_logs;
 
 const TEAM: &str = "T0TEAM001";
 const BOT_TOKEN: &str = "xoxb-manager-SECRET-bot";
@@ -41,6 +40,14 @@ fn slack_key(user: &str) -> MemberKey {
         surface: SurfaceKind::Slack,
         team: TeamId::new(TEAM),
         user: UserId::new(user),
+    }
+}
+
+fn slack_channel(id: &str) -> ConvRef {
+    ConvRef {
+        surface: SurfaceKind::Slack,
+        team: TeamId::new(TEAM),
+        conversation: id.into(),
     }
 }
 
@@ -145,11 +152,20 @@ impl SlackHarness {
         (url, path)
     }
 
-    /// Runs `/agent <text>` as `user` and returns the replies sent to its
-    /// `response_url`.
+    /// Runs `/agent <text>` as `user` in `C0CHAN001` and returns the
+    /// replies sent to its `response_url`.
     async fn slash(&self, user: &str, text: &str) -> Vec<String> {
+        self.slash_in(user, &slack_channel("C0CHAN001"), text).await
+    }
+
+    /// Runs `/agent <text>` as `user` in `conv` and returns the replies
+    /// sent to its `response_url`.
+    async fn slash_in(&self, user: &str, conv: &ConvRef, text: &str) -> Vec<String> {
         let (response_url, hook) = self.response_url();
-        let origin = Origin::SlackSlash { response_url };
+        let origin = Origin::SlackSlash {
+            response_url,
+            conv: conv.clone(),
+        };
         self.commands
             .handle_text(&slack_key(user), text, &origin, &[])
             .await;
@@ -268,16 +284,6 @@ async fn mount_rotation(
         .await;
 }
 
-fn capture_logs() -> (Captured, tracing::subscriber::DefaultGuard) {
-    let captured = Captured::default();
-    let logs = subscriber(
-        LogFormat::Json,
-        tracing_subscriber::EnvFilter::new("trace"),
-        captured.clone(),
-    );
-    (captured, tracing::subscriber::set_default(logs))
-}
-
 fn clock(at: OffsetDateTime) -> impl Fn() -> OffsetDateTime {
     move || at
 }
@@ -289,7 +295,7 @@ fn in_hours(hours: i64) -> i64 {
 #[tokio::test]
 async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_either() {
     let h = slack_harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     let exp = in_hours(12);
     mount_rotation(
@@ -331,11 +337,9 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
     let rotations = h.calls("tooling.tokens.rotate").await;
     assert!(rotations[0].headers.get("authorization").is_none());
 
-    let text = logs.text();
-    assert!(
-        text.contains("registered a Slack configuration token"),
-        "{text}"
-    );
+    logs.snapshot()
+        .assert_has("registered a Slack configuration token");
+    let everything = global_logs().snapshot();
     for secret in [
         GIVEN_TOKEN,
         GIVEN_REFRESH,
@@ -344,7 +348,7 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
         BOT_TOKEN,
         "SECRET",
     ] {
-        assert!(!text.contains(secret), "{secret} was logged");
+        everything.assert_lacks(secret);
     }
     for reply in &replies {
         assert!(!reply.contains("SECRET"), "{reply}");
@@ -354,7 +358,7 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
 #[tokio::test]
 async fn a_refused_refresh_token_stores_nothing_and_says_so() {
     let h = slack_harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -376,7 +380,9 @@ async fn a_refused_refresh_token_stores_nothing_and_says_so() {
         "{replies:?}"
     );
     assert_eq!(h.stored(alice).await, None);
-    assert!(!logs.text().contains("SECRET"));
+    logs.snapshot()
+        .assert_has("Slack refused a configuration refresh token");
+    global_logs().snapshot().assert_lacks("SECRET");
 }
 
 #[tokio::test]
@@ -462,7 +468,7 @@ async fn slack_token_needs_a_linked_member_on_slack() {
         team: TeamId::new("chat.example.org"),
         user: UserId::new("alice"),
     };
-    let reply = h
+    let (reply, _) = h
         .commands
         .run(
             &rocketchat,
@@ -487,7 +493,7 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
     let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
     let skills = crate::skills::Skills::new(store.clone(), "/nonexistent/agentd".into(), git);
     let commands = Commands::new(store, auth, Replies::default(), None, None, skills);
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse(&format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}")).unwrap(),
@@ -644,7 +650,7 @@ async fn the_rotator_renews_each_token_before_it_expires() {
 #[tokio::test]
 async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
     let h = slack_harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     let start = OffsetDateTime::now_utc();
     h.store
@@ -693,7 +699,10 @@ async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
         RotationPass::default()
     );
     assert_eq!(h.posts().await.len(), 1);
-    assert!(!logs.text().contains("SECRET"));
+    logs.snapshot()
+        .assert_has("Slack refused to renew a configuration token")
+        .assert_has("sent the configuration token notice");
+    global_logs().snapshot().assert_lacks("SECRET");
 }
 
 #[tokio::test]
@@ -851,11 +860,7 @@ fn slash(text: &str, response_url: SecretString) -> SlashCommand {
     SlashCommand {
         binding: BindingRef::MANAGER_ID,
         sender: slack_key("U0HUMAN01"),
-        conv: ConvRef {
-            surface: SurfaceKind::Slack,
-            team: TeamId::new(TEAM),
-            conversation: "C0CHAN001".into(),
-        },
+        conv: slack_channel("C0CHAN001"),
         command: "/agent".to_owned(),
         text: text.to_owned(),
         response_url,
@@ -993,7 +998,14 @@ fn only_agent_slash_commands_are_taken_and_their_text_is_decoded() {
         slash_command(slash("persona helper a &lt;b&gt; &amp;amp; c", url.clone())).unwrap();
     assert_eq!(member, slack_key("U0HUMAN01"));
     assert_eq!(text, "persona helper a <b> &amp; c");
-    assert!(matches!(origin, Origin::SlackSlash { .. }));
+    let Origin::SlackSlash { conv, .. } = &origin else {
+        panic!("{origin:?}");
+    };
+    assert_eq!(*conv, slack_channel("C0CHAN001"));
+    assert_eq!(
+        origin.conversation(&member),
+        Some(slack_channel("C0CHAN001"))
+    );
     let mut other = slash("me", url);
     other.command = "/other".to_owned();
     assert!(slash_command(other).is_none());
@@ -1367,7 +1379,7 @@ async fn a_checked_pair_is_stored_although_the_first_write_fails() {
 async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     let (store, url, dir) = file_store().await;
     let h = slack_harness_on(store).await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     mount_rotation(
         &h.slack,
@@ -1394,7 +1406,9 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     );
     assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
     assert_eq!(h.stored(alice).await, None);
-    assert!(!logs.text().contains("SECRET"));
+    logs.snapshot()
+        .assert_has("couldn't store a checked configuration token");
+    global_logs().snapshot().assert_lacks("SECRET");
     h.store.close().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1574,4 +1588,166 @@ async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
         .unwrap();
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
     assert_eq!(row.persona, "Via the DM.\n");
+}
+
+#[tokio::test]
+async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channel() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the agent was created");
+    };
+    let mut sessions = Vec::new();
+    for (channel, root) in [
+        ("C0CHAN001", "1727700000.000100"),
+        ("C0OTHER01", "1727700001.000200"),
+    ] {
+        let thread = core_types::ThreadKey {
+            conv: slack_channel(channel),
+            root: Some(root.into()),
+        };
+        let scope =
+            core_types::ScopeKey::for_conversation(ConvKind::Channel, slack_channel(channel));
+        let session = h
+            .store
+            .session_for_thread(agent.id, &thread, &scope, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .session;
+        h.store
+            .record_session_turn(session.id, true, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        sessions.push(session.id);
+    }
+    for thread in [
+        core_types::ThreadKey {
+            conv: slack_channel("D0BOBSDM1"),
+            root: None,
+        },
+        core_types::ThreadKey {
+            conv: slack_channel("C0CHAN001"),
+            root: Some("1727700002.000300".into()),
+        },
+    ] {
+        let task = h
+            .store
+            .create_private_session(
+                agent.id,
+                core_types::ConsentId::new_v4(),
+                &thread,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        h.store
+            .record_session_turn(task.id, true, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+    }
+
+    let listed = h.slash("U0HUMAN01", "sessions helper").await.remove(0);
+    for link in [
+        "https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/C0CHAN001-1727700000.000100",
+        "https://app.slack.com/client/T0TEAM001/C0OTHER01/thread/C0OTHER01-1727700001.000200",
+    ] {
+        assert!(listed.contains(link), "{listed}");
+    }
+    assert!(listed.starts_with("`helper`'s 4 sessions"), "{listed}");
+    let tasks: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.contains("A private task"))
+        .collect();
+    assert_eq!(tasks.len(), 2, "{listed}");
+    for task in tasks {
+        assert!(
+            !task.contains("https://"),
+            "a private task has no link: {task}"
+        );
+    }
+    assert!(!listed.contains("D0BOBSDM1"), "{listed}");
+    assert!(
+        listed.ends_with(
+            "Start them all over with `/agent reset helper`, or one conversation's with \
+             `/agent reset helper here` there."
+        ),
+        "{listed}"
+    );
+
+    let (in_dm, _) = h
+        .commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("reset helper here").unwrap(),
+            &Origin::SlackDm {
+                channel: "D0DM00001".into(),
+            },
+            &[],
+        )
+        .await;
+    assert_eq!(
+        in_dm,
+        "`reset helper here` resets the conversation it is sent in, and no agent answers in \
+         this one. Send `/agent reset helper here` in the conversation to reset, or \
+         `reset helper` here to reset them all."
+    );
+    let slashed_in_dm = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("D0DM00001"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(
+        slashed_in_dm,
+        [
+            "`reset helper here` resets the conversation it is sent in, and no agent answers in \
+          this one. Send `/agent reset helper here` in the conversation to reset, or \
+          `/agent reset helper` here to reset them all."
+        ]
+    );
+    let in_agents_dm = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("D0AGENTS1"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(in_agents_dm, ["`helper` has no session here to reset."]);
+
+    let replies = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("C0CHAN001"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(
+        replies,
+        [
+            "Resetting `helper`'s session here: the next message in it starts a new \
+          conversation. If it is running a turn, it resets once that turn ends. If it can't be \
+          reset, I'll tell you in a direct message."
+        ]
+    );
+    let reset_at = async |id| h.store.session(id).await.unwrap().unwrap().reset_at;
+    assert!(reset_at(sessions[0]).await.is_some());
+    assert!(reset_at(sessions[1]).await.is_none());
 }

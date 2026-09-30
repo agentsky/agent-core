@@ -35,8 +35,9 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 ///    if no member was recorded.
 /// 6. [`is_banned`] for the requester.
 /// 7. [`policy`] for `agent`.
-/// 8. [`is_linked`] for the owner, or for the requester's member, then
-///    [`community_key_configured`].
+/// 8. [`link_state`] for the requester's member (the owner's, when the
+///    requester is the owner), then, unless it is linked or broken,
+///    [`community_key_configured`], which is never read for the owner.
 ///
 /// # Missing answers
 ///
@@ -44,10 +45,16 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 /// and [`policy`] return `None` when the view doesn't have the answer, for
 /// example because the pipeline didn't preload it, and the router then
 /// refuses with [`RefuseReason::PolicyUnavailable`] instead of assuming the
-/// requester is allowed. A missing answer anywhere else can only withhold a
-/// turn: an unknown agent is ignored, an unknown mention or reply doesn't
-/// address the agent, and an unknown link or community key gives a link
-/// prompt.
+/// requester is allowed. A missing answer elsewhere withholds a turn: an
+/// unknown agent is ignored, an unknown mention or reply doesn't address
+/// the agent, and an unknown community key gives a link prompt.
+///
+/// [`link_state`] is the exception: it has no "unknown", and a view without
+/// the answer reads as [`LinkState::Unlinked`], which runs a non-owner's
+/// turn on the community key when one is configured, even if their link
+/// broke. So a view must answer it for every member the router can ask
+/// about: the owner, the sender's member, and an attributed requester's
+/// member. agentd's `StoreView::load` preloads all of them.
 ///
 /// [`agent_owner`]: RouterView::agent_owner
 /// [`agent_state`]: RouterView::agent_state
@@ -58,7 +65,7 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 /// [`message_ref`]: RouterView::message_ref
 /// [`is_banned`]: RouterView::is_banned
 /// [`policy`]: RouterView::policy
-/// [`is_linked`]: RouterView::is_linked
+/// [`link_state`]: RouterView::link_state
 /// [`community_key_configured`]: RouterView::community_key_configured
 /// [`RefuseReason::PolicyUnavailable`]: crate::RefuseReason::PolicyUnavailable
 pub trait RouterView {
@@ -87,8 +94,9 @@ pub trait RouterView {
     /// The member a surface identity belongs to, linked or not.
     fn member_for(&self, key: &MemberKey) -> Option<MemberId>;
 
-    /// Whether `member` has a Claude account linked that turns can run on.
-    fn is_linked(&self, member: MemberId) -> bool;
+    /// Whether `member` has a Claude account linked, and whether turns can
+    /// run on it.
+    fn link_state(&self, member: MemberId) -> LinkState;
 
     /// Whether a community admin has set the community API key.
     fn community_key_configured(&self) -> bool;
@@ -122,6 +130,21 @@ pub enum ManagedBot {
     /// The manager bot. Its posts are never routed, and a mention of it
     /// addresses no agent.
     Manager,
+}
+
+/// Whether a member has a Claude account linked, as `claude_links` holds
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkState {
+    /// No account is linked.
+    Unlinked,
+    /// An account is linked and turns can run on it.
+    Linked,
+    /// An account is linked, but Anthropic refused to renew it
+    /// (`claude_links.broken_at` is set). Turns can't run on it, and the
+    /// member is asked to link again rather than moved to the community
+    /// key.
+    Broken,
 }
 
 /// An agent's lifecycle state, as `agents.state` holds it (T14).
