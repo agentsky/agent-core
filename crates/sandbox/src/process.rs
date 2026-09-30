@@ -14,7 +14,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use store::Store;
 use tokio::sync::broadcast;
 
-use crate::layout::Layout;
+use crate::layout::{Layout, SkillsEntry};
 use crate::{
     ChildHandle, ChildInner, ChildIo, Container, ContainerEvent, ContainerId, ExitStatus,
     ManagedContainer, PERSONA_FILE, Result, Sandbox, SandboxError, SessionPaths, SessionSpec,
@@ -44,8 +44,8 @@ use crate::{
 ///   binaries keep their coverage. No `PATH` is set unless given.
 /// - [`ip`](Sandbox::ip) is `127.0.0.1` while the container runs.
 /// - [`stop`](Sandbox::stop) kills each process group it started whose
-///   leader hasn't been reaped, using the `kill` command, and reports the
-///   container [`Died`](ContainerEvent::Died).
+///   leader hasn't been reaped, and reports the container
+///   [`Died`](ContainerEvent::Died).
 #[derive(Debug, Clone)]
 pub struct ProcessSandbox {
     layout: Layout,
@@ -124,10 +124,12 @@ impl Sandbox for ProcessSandbox {
         check_spec(spec)?;
         let dir = self
             .layout
-            .prepare_session_dirs(&spec.volume, spec.session)
+            .prepare_session_dirs(
+                &spec.volume,
+                spec.session,
+                SkillsEntry::Link(spec.skills_dir.clone()),
+            )
             .await?;
-        let link = dir.join("claude").join("skills");
-        link_skills(&link, spec.skills_dir.as_deref())?;
         let paths = SessionPaths {
             work: dir.join("work"),
             claude_config: dir.join("claude"),
@@ -221,7 +223,7 @@ impl Sandbox for ProcessSandbox {
         };
         for child in &record.children {
             if !child.reaped.load(Ordering::SeqCst) {
-                kill_group(child.pgid).await;
+                kill_group(child.pgid);
             }
         }
         let _ = self.inner.events.send(ContainerEvent::Died {
@@ -254,58 +256,20 @@ impl Sandbox for ProcessSandbox {
                 Err(_) => Some((Err(SandboxError::EventsMissed), None)),
             }
         })
+        .fuse()
         .boxed()
     }
 }
 
-/// Makes `link` a symlink to `skills`. With no skills, only a symlink left
-/// by an earlier start is removed.
-fn link_skills(link: &std::path::Path, skills: Option<&std::path::Path>) -> Result<()> {
-    let io = |source| SandboxError::Io {
-        what: "linking the skills directory",
-        source,
-    };
-    let existing = std::fs::symlink_metadata(link).ok();
-    match (existing, skills) {
-        (Some(meta), Some(_)) if meta.is_dir() => std::fs::remove_dir_all(link).map_err(io)?,
-        (Some(meta), _) if meta.file_type().is_symlink() || skills.is_some() => {
-            std::fs::remove_file(link).map_err(io)?;
-        }
-        _ => {}
+/// Sends SIGKILL to process group `pgid`. It is a plain `kill(2)`, which
+/// returns at once, so `Drop` can call it too.
+fn kill_group(pgid: u32) {
+    if let Some(group) = i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
-    if let Some(skills) = skills {
-        std::os::unix::fs::symlink(skills, link).map_err(io)?;
-    }
-    Ok(())
-}
-
-/// Sends SIGKILL to process group `pgid` with the `kill` command, since
-/// the workspace forbids the `unsafe` a direct `kill(2)` would need.
-async fn kill_group(pgid: u32) {
-    let _ = kill_command(pgid).status().await;
-}
-
-/// [`kill_group`] for `Drop`, which can't wait: on a tokio runtime the
-/// command runs in a task, and elsewhere it blocks.
-fn kill_group_detached(pgid: u32) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(runtime) => {
-            runtime.spawn(kill_group(pgid));
-        }
-        Err(_) => {
-            let _ = kill_command(pgid).into_std().status();
-        }
-    }
-}
-
-fn kill_command(pgid: u32) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("kill");
-    command
-        .args(["-s", "KILL", "--", &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command
 }
 
 /// A child's stdin whose shutdown closes the pipe, as shutting down a
@@ -370,7 +334,7 @@ impl ProcessChild {
 
     pub(crate) async fn kill(&mut self) -> Result<()> {
         if !self.state.reaped.load(Ordering::SeqCst) {
-            kill_group(self.state.pgid).await;
+            kill_group(self.state.pgid);
         }
         let _ = self.child.start_kill();
         Ok(())
@@ -382,7 +346,7 @@ impl Drop for ProcessChild {
         if !self.state.reaped.swap(true, Ordering::SeqCst)
             && matches!(self.child.try_wait(), Ok(None))
         {
-            kill_group_detached(self.state.pgid);
+            kill_group(self.state.pgid);
         }
     }
 }
@@ -681,6 +645,53 @@ mod tests {
         io.child.kill().await.unwrap();
     }
 
+    fn is_gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        }
+    }
+
+    #[test]
+    fn dropping_a_child_on_a_current_thread_runtime_kills_its_group() {
+        let dir = TempDir::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let grandchild = runtime.block_on(async {
+            let sandbox = sandbox(&dir).await;
+            let container = started(&sandbox, &dir, ScopeKey::Private).await;
+            let mut io = sandbox
+                .exec(
+                    &container,
+                    &argv(&["/bin/sh", "-c", "sleep 30 & echo $!; wait"]),
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while io.stdout.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {
+                line.push(byte[0]);
+            }
+            drop(io);
+            String::from_utf8(line).unwrap()
+        });
+        drop(runtime);
+        assert!(!grandchild.is_empty());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !is_gone(&grandchild) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {grandchild} survived"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[tokio::test]
     async fn stop_kills_processes_and_reports_the_death() {
         let dir = TempDir::new();
@@ -730,13 +741,14 @@ mod tests {
     async fn events_end_only_after_events_missed() {
         let dir = TempDir::new();
         let sandbox = sandbox(&dir).await;
-        let events = sandbox.events();
+        let mut events = sandbox.events();
         drop(sandbox);
-        let items: Vec<_> = events.collect().await;
+        let items: Vec<_> = events.by_ref().collect().await;
         assert!(
             matches!(items.as_slice(), [Err(SandboxError::EventsMissed)]),
             "{items:?}"
         );
+        assert!(events.next().await.is_none());
     }
 
     #[tokio::test]
