@@ -408,3 +408,138 @@ if the OS generator fails.
 **Solution.** `store` doesn't depend on `rand`. It enables chacha20poly1305's
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
+
+## T09: auth
+
+### Claude Code 2.1.285's OAuth requests, read from the binary
+
+**Issue.** The plan's `[claude_oauth]` defaults were read from the binary, but
+the request shapes weren't recorded, and the live login T09 asks for needs a
+browser and a Claude account, which the environment T09 was built in doesn't
+have.
+
+**Solution.** `crates/auth` follows the bundled JavaScript in
+`/opt/claude-code/bin/claude` (2.1.285), found with `grep -a` on the functions
+around `grant_type:"authorization_code"`:
+
+- The defaults in the plan's table are all current: `CLAUDE_AI_AUTHORIZE_URL`,
+  `TOKEN_URL`, `MANUAL_REDIRECT_URL`, `CLIENT_ID`, and the profile at
+  `BASE_API_URL + /api/oauth/profile`.
+- Authorize URL parameters, in order: `code=true`, `client_id`,
+  `response_type=code`, `redirect_uri`, `scope`, `code_challenge`,
+  `code_challenge_method=S256`, `state`. The verifier and the state are each
+  32 random bytes, base64url, drawn separately.
+- Code exchange: `POST token_url`, `Content-Type: application/json`, body
+  `{grant_type:"authorization_code", code, redirect_uri, client_id,
+  code_verifier, state}`, 30 s timeout. It sends the `state` it generated;
+  with a pasted code that is the pasted state too, since agentd looks the
+  login up by it.
+- Refresh: `POST token_url`, JSON body `{grant_type:"refresh_token",
+  refresh_token, client_id, scope}`, with `scope` the space-joined scopes. A
+  response without `refresh_token` keeps the old one; `expires_in` is
+  required. Claude Code refreshes when `now + 300 s >= expires_at`, the
+  plan's 5 minutes. Because `scope` is sent, widening `scopes` after members
+  have linked makes their refreshes fail (`invalid_scope`), and they have to
+  log in again.
+- Profile: `GET`, `Authorization: Bearer`, `Content-Type: application/json`,
+  `Cache-Control: no-cache`, 10 s timeout. `organization.organization_type`
+  maps `claude_max`, `claude_pro`, `claude_team`, `claude_enterprise`, and
+  anything else to no subscription type; `organization.rate_limit_tier` is
+  kept. A failed profile read doesn't fail the login or the refresh.
+- Pasted input is split on `#` and needs both parts.
+- Scopes: Claude Code's own claude.ai login asks for `org:create_api_key
+  user:profile user:inference user:sessions:claude_code user:mcp_servers
+  user:file_upload user:plugins`, and `claude setup-token` for
+  `user:inference` alone, so the authorization server accepts a subset for
+  this client. agentd keeps the plan's `user:profile user:inference`: the
+  profile needs the first, the proxy the second. Whether the server accepts
+  exactly this pair is part of the live check still to be done.
+
+### Claude Code revokes the refresh token on logout
+
+**Issue.** The plan said revoking at Anthropic isn't part of Claude Code's
+flow, so `logout` would only delete the link. 2.1.285's logout (and its
+failure paths) calls `POST ${TOKEN_URL}/revoke` with
+`{token: refresh_token, token_type_hint: "refresh_token", client_id}`, JSON,
+5 s timeout, best effort.
+
+**Solution.** `OAuthConfig` has a `revoke_url` key, default
+`https://platform.claude.com/v1/oauth/token/revoke`. `logout` deletes the link
+first, then revokes; a failed revocation is logged and the link stays
+deleted. The plan's table and T09 are updated.
+
+### A refresh failure is not always a dead link
+
+**Issue.** The plan says a refresh failure returns `RelinkRequired` and marks
+the link broken. Taken literally, a network blip, a timeout or a 5xx from the
+token endpoint would force every member who happened to refresh then to log
+in again.
+
+**Solution.** Only a refusal marks the link broken: HTTP 400 (`invalid_grant`
+and the like), 401 or 403 from the token endpoint. Any other failure leaves
+the link as it is. If the current access token hasn't expired yet (a refresh
+starts 5 minutes early) it is returned; otherwise the error is. A broken link
+returns `RelinkRequired` at once, without calling the endpoint again, until
+the member logs in. `RelinkRequired { newly_broken }` carries what
+`mark_claude_link_broken` returned, so T13 sends one notice per failure.
+
+### `put_claude_link` would let a refresh undo a logout
+
+**Issue.** `put_claude_link` is an upsert. A refresh that read the link, then
+waited on the token endpoint while the member logged out, would store its
+result and link the member again.
+
+**Solution.** Two layers. Every write of a member's link in `auth` (refresh,
+login, logout) holds that member's lock from the `KeyedLocks` the
+single-flight refresh uses, so a logout waits for a refresh in flight and then
+deletes its result. And a refresh stores through a new store method,
+`update_claude_link`, a plain `UPDATE` that returns false when there is no
+row, so even a delete that bypasses `auth` isn't undone; `auth` then revokes
+the orphaned refresh token and returns `NotLinked`. A login still upserts,
+since it is meant to create the link.
+
+### Error values could leak what they describe
+
+**Issue.** `reqwest::Error`'s `Display` includes the request URL, and
+`serde_json` errors quote the offending value (`invalid type: string "…"`),
+which in a token response could be a token. OAuth error bodies can carry an
+`error_description` that echoes the request.
+
+**Solution.** Transport errors keep the `reqwest::Error` without its URL.
+Bodies are read as bytes and parsed with `serde_json::from_slice`, and a parse
+failure becomes `InvalidResponse` with a fixed reason. From an error body only
+the OAuth `error` code is kept, and only if it is at most 64 lowercase letters
+and underscores. The client follows no redirects, because a 307 or 308 from
+the token endpoint would resend a body holding a code or refresh token to the
+new location.
+
+### Login choices the plan left open
+
+**Issue.** The plan doesn't say what happens when a member starts several
+logins, pastes someone else's code, or when the profile can't be read.
+
+**Solution.**
+
+- A member has at most one pending login: `start_login` drops the earlier
+  ones, so only the newest link works, and the table can't be filled by
+  repeated `login` commands.
+- `take_pending_login` deletes the row before the member check, so a code
+  pasted by the wrong member is used up. The owner's code has leaked, so they
+  have to start again, and the error (`UnknownLogin`) doesn't reveal that the
+  state exists.
+- If the profile can't be read after the exchange, the link is stored without
+  a plan and `Linked { plan: None }` is returned; the plan is read again at
+  the next refresh. After a refresh, a failed profile read keeps the old plan.
+- The paste parser drops all whitespace (chat clients wrap long lines), strips
+  backticks, quotes and angle brackets around the text, accepts a pasted
+  callback URL (including Slack's `<url|label>` form), and rejects input over
+  4 KiB.
+
+### sqlx's sha2 0.10 next to auth's sha2 0.11
+
+**Issue.** `auth` computes the S256 challenge with `sha2` 0.11, the workspace
+version. sqlx-core 0.9.0 still depends on `sha2` 0.10 and so `digest` 0.10,
+and cargo-deny warned about both duplicates.
+
+**Solution.** `deny.toml` skips exactly `sha2@0.10.9` and `digest@0.10.7`,
+next to the other sqlx entries.

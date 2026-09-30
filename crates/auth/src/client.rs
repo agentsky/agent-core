@@ -1,0 +1,321 @@
+//! The HTTP calls: code exchange, refresh, profile and revocation, with the
+//! request shapes Claude Code 2.1.285 sends.
+
+use std::time::Duration;
+
+use reqwest::{Client, StatusCode, Url};
+use secrecy::{ExposeSecret, SecretString};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::plan::{PlanInfo, ProfileResponse};
+use crate::{AuthError, Endpoint};
+
+/// Claude Code's timeout for the code exchange and refreshes.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Claude Code's timeout for the profile request.
+const PROFILE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Claude Code's timeout for revocation, which is best effort.
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest `expires_in` accepted, a year, as Claude Code's long-lived
+/// tokens have.
+const MAX_EXPIRES_IN: u64 = 365 * 24 * 60 * 60;
+/// Longest OAuth `error` code kept for an error message.
+const MAX_ERROR_CODE: usize = 64;
+
+/// Builds the HTTP client. It never follows redirects: a 307 or 308 from the
+/// token endpoint would otherwise resend a body holding a code or refresh
+/// token to wherever it points.
+pub(crate) fn build_client() -> Result<Client, AuthError> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|source| AuthError::Http {
+            endpoint: Endpoint::Client,
+            source: source.without_url(),
+        })
+}
+
+/// Tokens from the token endpoint.
+pub(crate) struct Tokens {
+    pub(crate) access_token: SecretString,
+    /// `None` when a refresh response leaves the refresh token out, meaning
+    /// the old one stays valid.
+    pub(crate) refresh_token: Option<SecretString>,
+    pub(crate) expires_in: Duration,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: SecretString,
+    #[serde(default)]
+    refresh_token: Option<SecretString>,
+    expires_in: f64,
+}
+
+impl TokenResponse {
+    fn into_tokens(self, endpoint: Endpoint) -> Result<Tokens, AuthError> {
+        let invalid = |reason| AuthError::InvalidResponse { endpoint, reason };
+        if self.access_token.expose_secret().is_empty() {
+            return Err(invalid("empty access_token"));
+        }
+        let refresh_token = self
+            .refresh_token
+            .filter(|token| !token.expose_secret().is_empty());
+        if !self.expires_in.is_finite() || self.expires_in < 1.0 {
+            return Err(invalid("expires_in is not a positive number"));
+        }
+        let expires_in = Duration::from_secs_f64(self.expires_in.min(MAX_EXPIRES_IN as f64));
+        Ok(Tokens {
+            access_token: self.access_token,
+            refresh_token,
+            expires_in,
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct CodeGrant<'a> {
+    grant_type: &'static str,
+    code: &'a str,
+    redirect_uri: &'a str,
+    client_id: &'a str,
+    code_verifier: &'a str,
+    state: &'a str,
+}
+
+#[derive(Serialize)]
+struct RefreshGrant<'a> {
+    grant_type: &'static str,
+    refresh_token: &'a str,
+    client_id: &'a str,
+    scope: &'a str,
+}
+
+#[derive(Serialize)]
+struct Revocation<'a> {
+    token: &'a str,
+    token_type_hint: &'static str,
+    client_id: &'a str,
+}
+
+/// The body of an OAuth error response (RFC 6749 section 5.2).
+#[derive(Deserialize)]
+struct OAuthErrorBody {
+    error: Option<String>,
+}
+
+/// The OAuth `error` code of a failed response, if it has one that is safe
+/// to put in an error message: short, and only lowercase letters and
+/// underscores, as RFC 6749's codes are. `error_description` is never kept.
+fn oauth_error_code(body: &[u8]) -> Option<String> {
+    let code = serde_json::from_slice::<OAuthErrorBody>(body).ok()?.error?;
+    let safe = !code.is_empty()
+        && code.len() <= MAX_ERROR_CODE
+        && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    safe.then_some(code)
+}
+
+/// A response read in full: its status and body.
+struct Response {
+    status: StatusCode,
+    body: Vec<u8>,
+}
+
+async fn send(request: reqwest::RequestBuilder, endpoint: Endpoint) -> Result<Response, AuthError> {
+    let http = |source: reqwest::Error| AuthError::Http {
+        endpoint,
+        source: source.without_url(),
+    };
+    let response = request.send().await.map_err(http)?;
+    let status = response.status();
+    let body = response.bytes().await.map_err(http)?.to_vec();
+    Ok(Response { status, body })
+}
+
+fn parse<T: DeserializeOwned>(body: &[u8], endpoint: Endpoint) -> Result<T, AuthError> {
+    serde_json::from_slice(body).map_err(|_| AuthError::InvalidResponse {
+        endpoint,
+        reason: "not the expected JSON",
+    })
+}
+
+fn status_error(endpoint: Endpoint, response: &Response) -> AuthError {
+    AuthError::Status {
+        endpoint,
+        status: response.status.as_u16(),
+        error: oauth_error_code(&response.body),
+    }
+}
+
+/// Parameters of the code exchange.
+pub(crate) struct Exchange<'a> {
+    pub(crate) code: &'a SecretString,
+    pub(crate) state: &'a str,
+    pub(crate) verifier: &'a SecretString,
+    pub(crate) redirect_uri: &'a Url,
+    pub(crate) client_id: &'a str,
+}
+
+/// POSTs the `authorization_code` grant as JSON.
+pub(crate) async fn exchange_code(
+    client: &Client,
+    token_url: &Url,
+    exchange: Exchange<'_>,
+) -> Result<Tokens, AuthError> {
+    let body = CodeGrant {
+        grant_type: "authorization_code",
+        code: exchange.code.expose_secret(),
+        redirect_uri: exchange.redirect_uri.as_str(),
+        client_id: exchange.client_id,
+        code_verifier: exchange.verifier.expose_secret(),
+        state: exchange.state,
+    };
+    let request = client
+        .post(token_url.clone())
+        .json(&body)
+        .timeout(TOKEN_TIMEOUT);
+    let response = send(request, Endpoint::Token).await?;
+    if !response.status.is_success() {
+        return Err(status_error(Endpoint::Token, &response));
+    }
+    let tokens =
+        parse::<TokenResponse>(&response.body, Endpoint::Token)?.into_tokens(Endpoint::Token)?;
+    if tokens.refresh_token.is_none() {
+        return Err(AuthError::InvalidResponse {
+            endpoint: Endpoint::Token,
+            reason: "no refresh_token",
+        });
+    }
+    Ok(tokens)
+}
+
+/// POSTs the `refresh_token` grant as JSON.
+pub(crate) async fn refresh(
+    client: &Client,
+    token_url: &Url,
+    refresh_token: &SecretString,
+    client_id: &str,
+    scope: &str,
+) -> Result<Tokens, AuthError> {
+    let body = RefreshGrant {
+        grant_type: "refresh_token",
+        refresh_token: refresh_token.expose_secret(),
+        client_id,
+        scope,
+    };
+    let request = client
+        .post(token_url.clone())
+        .json(&body)
+        .timeout(TOKEN_TIMEOUT);
+    let response = send(request, Endpoint::Token).await?;
+    if !response.status.is_success() {
+        return Err(status_error(Endpoint::Token, &response));
+    }
+    parse::<TokenResponse>(&response.body, Endpoint::Token)?.into_tokens(Endpoint::Token)
+}
+
+/// GETs the profile with the access token and reads the plan from it.
+pub(crate) async fn fetch_profile(
+    client: &Client,
+    profile_url: &Url,
+    access_token: &SecretString,
+) -> Result<PlanInfo, AuthError> {
+    let request = client
+        .get(profile_url.clone())
+        .bearer_auth(access_token.expose_secret())
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .timeout(PROFILE_TIMEOUT);
+    let response = send(request, Endpoint::Profile).await?;
+    if !response.status.is_success() {
+        return Err(status_error(Endpoint::Profile, &response));
+    }
+    Ok(parse::<ProfileResponse>(&response.body, Endpoint::Profile)?.into())
+}
+
+/// POSTs a refresh token to the revocation endpoint.
+pub(crate) async fn revoke(
+    client: &Client,
+    revoke_url: &Url,
+    refresh_token: &SecretString,
+    client_id: &str,
+) -> Result<(), AuthError> {
+    let body = Revocation {
+        token: refresh_token.expose_secret(),
+        token_type_hint: "refresh_token",
+        client_id,
+    };
+    let request = client
+        .post(revoke_url.clone())
+        .json(&body)
+        .timeout(REVOKE_TIMEOUT);
+    let response = send(request, Endpoint::Revoke).await?;
+    if !response.status.is_success() {
+        return Err(status_error(Endpoint::Revoke, &response));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(json: &str) -> Result<Tokens, AuthError> {
+        serde_json::from_str::<TokenResponse>(json)
+            .unwrap()
+            .into_tokens(Endpoint::Token)
+    }
+
+    #[test]
+    fn token_responses_are_validated() {
+        let ok = tokens(r#"{"access_token":"a","refresh_token":"r","expires_in":28800}"#).unwrap();
+        assert_eq!(ok.access_token.expose_secret(), "a");
+        assert_eq!(ok.refresh_token.unwrap().expose_secret(), "r");
+        assert_eq!(ok.expires_in, Duration::from_secs(28_800));
+
+        let no_refresh = tokens(r#"{"access_token":"a","expires_in":60.5,"scope":"x"}"#).unwrap();
+        assert!(no_refresh.refresh_token.is_none());
+        assert_eq!(no_refresh.expires_in, Duration::from_millis(60_500));
+
+        let empty_refresh =
+            tokens(r#"{"access_token":"a","refresh_token":"","expires_in":60}"#).unwrap();
+        assert!(empty_refresh.refresh_token.is_none());
+
+        let capped = tokens(r#"{"access_token":"a","expires_in":1e12}"#).unwrap();
+        assert_eq!(capped.expires_in, Duration::from_secs(MAX_EXPIRES_IN));
+
+        for json in [
+            r#"{"access_token":"","expires_in":60}"#,
+            r#"{"access_token":"a","expires_in":0}"#,
+            r#"{"access_token":"a","expires_in":-5}"#,
+        ] {
+            assert!(
+                matches!(tokens(json), Err(AuthError::InvalidResponse { .. })),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_safe_oauth_error_codes_are_kept() {
+        assert_eq!(
+            oauth_error_code(br#"{"error":"invalid_grant","error_description":"tok-123"}"#),
+            Some("invalid_grant".to_owned())
+        );
+        for body in [
+            &br#"{"error":"sk-ant-ort01-abc"}"#[..],
+            br#"{"error":"Invalid Grant"}"#,
+            br#"{"error":""}"#,
+            br#"{"message":"x"}"#,
+            b"<html>",
+        ] {
+            assert_eq!(oauth_error_code(body), None);
+        }
+        let long = format!(r#"{{"error":"{}"}}"#, "a".repeat(MAX_ERROR_CODE + 1));
+        assert_eq!(oauth_error_code(long.as_bytes()), None);
+    }
+}

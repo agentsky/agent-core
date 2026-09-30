@@ -105,6 +105,39 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces `member`'s existing Claude link with `link` and clears
+    /// [`broken_at`](ClaudeLink::broken_at), like
+    /// [`put_claude_link`](Self::put_claude_link), but never creates one.
+    ///
+    /// Returns false, and stores nothing, if the member has no link. A token
+    /// refresh stores its result this way, so a refresh that finishes after
+    /// the member logged out doesn't link them again.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails.
+    pub async fn update_claude_link(&self, member: MemberId, link: &NewClaudeLink) -> Result<bool> {
+        let key = member.to_string();
+        let access = self.seal(aad(ACCESS, &key), &link.access_token)?;
+        let refresh = self.seal(aad(REFRESH, &key), &link.refresh_token)?;
+        let result = sqlx::query(
+            "UPDATE claude_links SET access_token_enc = ?, refresh_token_enc = ?, \
+             expires_at = ?, plan = ?, rate_limit_tier = ?, broken_at = NULL, updated_at = ? \
+             WHERE member_id = ?",
+        )
+        .bind(access)
+        .bind(refresh)
+        .bind(to_unix(link.expires_at))
+        .bind(&link.plan)
+        .bind(&link.rate_limit_tier)
+        .bind(to_unix(OffsetDateTime::now_utc()))
+        .bind(&key)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// `member`'s Claude link, if they have one.
     ///
     /// # Errors
@@ -330,6 +363,89 @@ pub(crate) mod tests {
             .unwrap();
         assert!(store.delete_claude_link(member).await.unwrap());
         assert!(store.get_claude_link(member).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_replaces_an_existing_link_and_clears_broken_at() {
+        let (store, member) = store_with_member("u1").await;
+        store
+            .put_claude_link(member, &new_link("a1", "r1"))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_claude_link_broken(member, at(1_000))
+                .await
+                .unwrap()
+        );
+        let replacement = NewClaudeLink {
+            expires_at: at(2_100_000_000),
+            plan: Some("claude_pro".to_owned()),
+            rate_limit_tier: None,
+            ..new_link("a2", "r2")
+        };
+        assert!(
+            store
+                .update_claude_link(member, &replacement)
+                .await
+                .unwrap()
+        );
+        let link = store.get_claude_link(member).await.unwrap().unwrap();
+        assert_eq!(link.access_token.expose_secret(), "a2");
+        assert_eq!(link.refresh_token.expose_secret(), "r2");
+        assert_eq!(link.expires_at, at(2_100_000_000));
+        assert_eq!(link.plan.as_deref(), Some("claude_pro"));
+        assert_eq!(link.rate_limit_tier, None);
+        assert_eq!(link.broken_at, None);
+    }
+
+    #[tokio::test]
+    async fn update_never_creates_a_link() {
+        let (store, member) = store_with_member("u1").await;
+        assert!(
+            !store
+                .update_claude_link(member, &new_link("a", "r"))
+                .await
+                .unwrap()
+        );
+        assert!(store.get_claude_link(member).await.unwrap().is_none());
+        store
+            .put_claude_link(member, &new_link("a", "r"))
+            .await
+            .unwrap();
+        assert!(store.delete_claude_link(member).await.unwrap());
+        assert!(
+            !store
+                .update_claude_link(member, &new_link("a2", "r2"))
+                .await
+                .unwrap()
+        );
+        assert!(store.get_claude_link(member).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_touches_only_that_members_link() {
+        let (store, alice) = store_with_member("alice").await;
+        let bob = store
+            .ensure_member(&member_key("bob"), "Bob")
+            .await
+            .unwrap();
+        for member in [alice, bob] {
+            store
+                .put_claude_link(member, &new_link("a1", "r1"))
+                .await
+                .unwrap();
+        }
+        assert!(
+            store
+                .update_claude_link(alice, &new_link("a2", "r2"))
+                .await
+                .unwrap()
+        );
+        let bob_link = store.get_claude_link(bob).await.unwrap().unwrap();
+        assert_eq!(bob_link.access_token.expose_secret(), "a1");
+        let alice_link = store.get_claude_link(alice).await.unwrap().unwrap();
+        assert_eq!(alice_link.access_token.expose_secret(), "a2");
     }
 
     #[tokio::test]

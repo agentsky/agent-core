@@ -148,14 +148,18 @@ description, and must pass T02's policy.
   | --- | --- |
   | `authorize_url` | `https://claude.com/cai/oauth/authorize` |
   | `token_url` | `https://platform.claude.com/v1/oauth/token` |
+  | `revoke_url` | `https://platform.claude.com/v1/oauth/token/revoke` |
   | `redirect_uri` | `https://platform.claude.com/oauth/code/callback` |
   | `client_id` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
   | `scopes` | `user:profile user:inference` |
   | `profile_url` | `https://api.anthropic.com/api/oauth/profile` |
 
   qm-core still uses `https://claude.ai/oauth/authorize` and
-  `https://console.anthropic.com/v1/oauth/token`. T09 confirms the defaults with
-  a live login and records the result in its PR.
+  `https://console.anthropic.com/v1/oauth/token`. T09 checked every default,
+  and the request shapes, against the 2.1.285 binary
+  ([impl-notes](impl-notes.md#t09-auth)). Claude Code's own claude.ai login
+  asks for more scopes; `user:profile user:inference` is the least agentd
+  needs. A live login is still to be done.
 
 ### Network and deployment shape
 
@@ -875,7 +879,8 @@ Deliverables:
      `code_verifier`, `redirect_uri` and `client_id`.
   4. Store the tokens.
   5. Fetch the profile.
-- `fetch_plan(access_token) -> Plan`: `GET profile_url` with a Bearer token.
+- `fetch_plan(access_token) -> PlanInfo { plan, rate_limit_tier }`:
+  `GET profile_url` with a Bearer token.
   Map `organization.organization_type` (`claude_pro`, `claude_max`,
   `claude_team`, `claude_enterprise`) to `Plan`, and keep
   `organization.rate_limit_tier`. Unknown values map to `Plan::Unknown(String)`
@@ -884,10 +889,15 @@ Deliverables:
   `async fn access_token(&self, member) -> Result<SecretString>`. It refreshes
   when the token expires within 5 minutes, single-flight per member with a keyed
   async mutex, re-reads the plan after every refresh, and stores both.
-- A refresh failure returns `AuthError::RelinkRequired` and marks the link
-  broken. The DM to the member is sent by agentd (T13), not here.
-- `logout(member)`: deletes the link. Revoking at Anthropic is not part of
-  Claude Code's flow, so there's nothing to call.
+- A refresh the token endpoint refuses (HTTP 400, 401 or 403) returns
+  `AuthError::RelinkRequired { newly_broken }` and marks the link broken;
+  `newly_broken` is true only for the call that set `broken_at`. Other
+  failures (network, timeout, 5xx, 429, an unreadable body) leave the link
+  alone and serve the current token while it is valid
+  ([impl-notes](impl-notes.md#a-refresh-failure-is-not-always-a-dead-link)).
+  The DM to the member is sent by agentd (T13), not here.
+- `logout(member)`: deletes the link, then revokes the refresh token at
+  `revoke_url`, best effort, as Claude Code 2.1.285's logout does.
 
 Acceptance:
 
@@ -1064,8 +1074,9 @@ Deliverables:
   - `me`: link status and plan. The usage line is added in T27, the manager app
     name in T30.
 - Relink notice: when `TokenSource` reports `RelinkRequired`, DM the member.
-  Send it only when `claude_links.broken_at` goes from empty to set, so there is
-  one notice per failure.
+  Send it only when `claude_links.broken_at` goes from empty to set
+  (`RelinkRequired { newly_broken: true }`), so there is one notice per
+  failure.
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
