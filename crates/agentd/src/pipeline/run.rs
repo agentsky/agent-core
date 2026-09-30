@@ -1339,14 +1339,14 @@ fn limited(decision: &Decision) -> bool {
 
 /// Whether the decision on the platform's copy of a message, `confirmed`,
 /// may be acted on when the event's was `decision`: when they are the
-/// same, or, for the same requester, when either is a limit's refusal
-/// ([`limited`]). The counts a limit reads can change between the two, as
-/// a turn ends or an hour or a day turns, and the copy is the message as
-/// the platform has it; who asked can't.
+/// same, or, for the same requester's identity, when either is a limit's
+/// refusal ([`limited`]). The counts a limit reads can change between the
+/// two, as a turn ends or an hour or a day turns, and so can the member an
+/// identity belongs to, as one is made for it; who asked can't.
 fn copy_stands(decision: &Decision, confirmed: &Decision) -> bool {
+    let key = |decision: &Decision| decision.requester().map(|requester| requester.key.clone());
     confirmed == decision
-        || ((limited(decision) || limited(confirmed))
-            && decision.requester() == confirmed.requester())
+        || ((limited(decision) || limited(confirmed)) && key(decision) == key(confirmed))
 }
 
 /// For a refusal a limit over a day or an hour gives, the kind of notice
@@ -1738,9 +1738,22 @@ mod tests {
             scope: ScopeKind::Channel,
             side: Side::Public,
         };
+        let linked = Decision::Run {
+            requester: Requester {
+                member: Some(MemberId::new_v4()),
+                ..requester.clone()
+            },
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            scope: ScopeKind::Channel,
+            side: Side::Public,
+        };
         let other = Requester {
-            member: Some(MemberId::new_v4()),
-            ..requester.clone()
+            member: None,
+            key: MemberKey {
+                user: "U2".into(),
+                ..requester.key.clone()
+            },
         };
         let run_for_other = Decision::Run {
             requester: other.clone(),
@@ -1760,6 +1773,10 @@ mod tests {
             &capped,
             &refuse(RefuseReason::ThreadTurns { max: 1 })
         ));
+        assert!(
+            copy_stands(&capped, &linked),
+            "the requester's identity got a member between the two"
+        );
         assert!(!copy_stands(&capped, &run_for_other));
         assert!(!copy_stands(&run, &capped_for_other));
         assert!(!copy_stands(&run, &run_for_other));
