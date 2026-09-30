@@ -122,3 +122,49 @@ dependency that uses a newer manifest feature or edition.
 **Solution.** The job sets the action's `rust-version: stable`, so the action
 switches to the current stable toolchain before running cargo-deny, like the
 other jobs.
+
+### `[licenses.private]` exempts any unpublished crate
+
+**Issue.** `[licenses.private] ignore = true` is meant to exempt our own
+crates, which carry only `license-file`. cargo-deny applies it to every crate
+with `publish = false`, wherever it comes from. A scratch copy of the
+workspace in which `agentd` depends on `vendor/gpl`, a path crate with
+`license = "GPL-3.0-only"` and `publish = false`, printed `licenses ok`.
+cargo-deny has no setting that limits the exemption to workspace members:
+`[licenses.private]` only adds private registries, `[sources]` does not see
+path dependencies, and a `[[licenses.clarify]]` entry per workspace crate
+would have to be added for every new crate and pinned to the hash of
+`LICENSE`.
+
+**Solution.** Keep `private.ignore` and add `scripts/ci/check-path-deps.sh`,
+which the `deny` job runs before cargo-deny. It reads
+`cargo metadata --locked --all-features --format-version 1` and fails when a
+package with no source (a path package) has a manifest other than the root
+`Cargo.toml` or `crates/<name>/Cargo.toml`. Matching the manifest path, not
+the `workspace_members` list, also rejects a vendored crate added to
+`[workspace] members` outside `crates/`. The same scratch case fails the
+script, as do a path dependency outside the repository, an optional one
+behind a feature, a Windows-only one, one nested under
+`crates/agentd/vendor/`, and a `[patch.crates-io]` entry pointing at a local
+copy; with a stale lockfile, `--locked` makes it fail too. A crate placed
+directly in `crates/` is a workspace crate by the layout rules in
+`AGENTS.md`, so it is reviewed as our code.
+
+### The `deny` job ran only when code changed
+
+**Issue.** The `deny` job runs only when the `changes` job classifies a
+change as code. An advisory published against a crate already in
+`Cargo.lock` therefore surfaced on the next code pull request, unrelated to
+it, rather than when it was published.
+
+**Solution.** The workflow gains a weekly `schedule` trigger (Mondays at
+04:23 UTC). The `changes` job sets a base commit only for `pull_request` and
+`push` events, so a scheduled run is classified as code and runs every job,
+which also catches breakage from a new stable toolchain. `publish-badges`
+still runs only on pushes to `main` and manual dispatches, and the `docs`
+job's badge check only on pushes to `main`. Scheduled runs take a
+concurrency group of their own: in `main`'s group, where
+`cancel-in-progress` is false, a scheduled run arriving while a push run is
+pending would cancel that pending run, and its badges would not be
+published. GitHub runs schedules on the default branch only, so the trigger
+takes effect once this workflow is on `main`.
