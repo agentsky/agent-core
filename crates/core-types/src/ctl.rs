@@ -146,9 +146,16 @@ pub enum LockResponse {
     Held {
         /// The lease to renew and release.
         lease: LeaseId,
-        /// When the lease runs out unless renewed.
+        /// When the lease runs out unless renewed, on agentd's clock.
         #[serde(with = "time::serde::rfc3339")]
         expires_at: OffsetDateTime,
+        /// How many seconds are left until `expires_at`, as agentd measured
+        /// it when it answered, in the whole seconds leases are kept in: the
+        /// lease really runs out between `seconds_left - 1` and
+        /// `seconds_left` seconds after that. agentctl times the lease from
+        /// this on its own clock, so skew between the two hosts' clocks
+        /// doesn't matter.
+        seconds_left: u64,
     },
     /// Another lease holds the lock, possibly one of the same session's.
     /// Answers an acquire. Try again later.
@@ -368,11 +375,13 @@ mod tests {
             json_round_trip(&LockResponse::Held {
                 lease,
                 expires_at: datetime!(2026-09-30 12:00 UTC),
+                seconds_left: 30,
             }),
             json!({
                 "state": "held",
                 "lease": lease.to_string(),
                 "expires_at": "2026-09-30T12:00:00Z",
+                "seconds_left": 30,
             })
         );
         assert_eq!(
@@ -392,8 +401,13 @@ mod tests {
         assert_rejects::<LockRequest>(json!({"op": "release"}));
         assert_rejects::<LockRequest>(json!({"op": "release", "lease": "nope"}));
         assert_rejects::<LockResponse>(
-            json!({"state": "held", "expires_at": "2026-09-30T12:00:00Z"}),
+            json!({"state": "held", "expires_at": "2026-09-30T12:00:00Z", "seconds_left": 30}),
         );
+        assert_rejects::<LockResponse>(json!({
+            "state": "held",
+            "lease": "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "expires_at": "2026-09-30T12:00:00Z",
+        }));
     }
 
     #[test]

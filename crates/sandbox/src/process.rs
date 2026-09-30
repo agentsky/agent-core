@@ -14,7 +14,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use store::Store;
 use tokio::sync::broadcast;
 
-use crate::layout::Layout;
+use crate::layout::{Layout, SkillsEntry};
 use crate::{
     ChildHandle, ChildInner, ChildIo, Container, ContainerEvent, ContainerId, ExitStatus,
     ManagedContainer, PERSONA_FILE, Result, Sandbox, SandboxError, SessionPaths, SessionSpec,
@@ -44,8 +44,8 @@ use crate::{
 ///   binaries keep their coverage. No `PATH` is set unless given.
 /// - [`ip`](Sandbox::ip) is `127.0.0.1` while the container runs.
 /// - [`stop`](Sandbox::stop) kills each process group it started whose
-///   leader hasn't been reaped, using the `kill` command, and reports the
-///   container [`Died`](ContainerEvent::Died).
+///   leader hasn't been reaped, and reports the container
+///   [`Died`](ContainerEvent::Died).
 #[derive(Debug, Clone)]
 pub struct ProcessSandbox {
     layout: Layout,
@@ -120,22 +120,16 @@ impl Sandbox for ProcessSandbox {
         self.layout.ensure_volume(key).await
     }
 
-    async fn prepare_session_dirs(
-        &self,
-        volume: &VolumeRef,
-        session: SessionId,
-    ) -> Result<PathBuf> {
-        self.layout.prepare_session_dirs(volume, session).await
-    }
-
     async fn start(&self, spec: &SessionSpec) -> Result<Container> {
         check_spec(spec)?;
         let dir = self
             .layout
-            .prepare_session_dirs(&spec.volume, spec.session)
+            .prepare_session_dirs(
+                &spec.volume,
+                spec.session,
+                SkillsEntry::Link(spec.skills_dir.clone()),
+            )
             .await?;
-        let link = dir.join("claude").join("skills");
-        link_skills(&link, spec.skills_dir.as_deref())?;
         let paths = SessionPaths {
             work: dir.join("work"),
             claude_config: dir.join("claude"),
@@ -255,49 +249,27 @@ impl Sandbox for ProcessSandbox {
 
     fn events(&self) -> BoxStream<'static, Result<ContainerEvent>> {
         let receiver = self.inner.events.subscribe();
-        stream::unfold(receiver, |mut receiver| async move {
+        stream::unfold(Some(receiver), |receiver| async move {
+            let mut receiver = receiver?;
             match receiver.recv().await {
-                Ok(event) => Some((Ok(event), receiver)),
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    Some((Err(SandboxError::EventsMissed), receiver))
-                }
-                Err(broadcast::error::RecvError::Closed) => None,
+                Ok(event) => Some((Ok(event), Some(receiver))),
+                Err(_) => Some((Err(SandboxError::EventsMissed), None)),
             }
         })
+        .fuse()
         .boxed()
     }
 }
 
-/// Makes `link` a symlink to `skills`. With no skills, only a symlink left
-/// by an earlier start is removed.
-fn link_skills(link: &std::path::Path, skills: Option<&std::path::Path>) -> Result<()> {
-    let io = |source| SandboxError::Io {
-        what: "linking the skills directory",
-        source,
-    };
-    let existing = std::fs::symlink_metadata(link).ok();
-    match (existing, skills) {
-        (Some(meta), Some(_)) if meta.is_dir() => std::fs::remove_dir_all(link).map_err(io)?,
-        (Some(meta), _) if meta.file_type().is_symlink() || skills.is_some() => {
-            std::fs::remove_file(link).map_err(io)?;
-        }
-        _ => {}
-    }
-    if let Some(skills) = skills {
-        std::os::unix::fs::symlink(skills, link).map_err(io)?;
-    }
-    Ok(())
-}
-
-/// Sends SIGKILL to process group `pgid` with the `kill` command, since
-/// the workspace forbids the `unsafe` a direct `kill(2)` would need.
+/// Sends SIGKILL to process group `pgid`. It is a plain `kill(2)`, which
+/// returns at once, so `Drop` can call it too.
 fn kill_group(pgid: u32) {
-    let _ = std::process::Command::new("kill")
-        .args(["-s", "KILL", "--", &format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if let Some(group) = i32::try_from(pgid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
 }
 
 /// A child's stdin whose shutdown closes the pipe, as shutting down a
@@ -478,12 +450,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let session = SessionId::new_v4();
-        let session_dir = sandbox
-            .prepare_session_dirs(&volume, session)
-            .await
-            .unwrap();
-        assert_eq!(session_dir, volume.session_dir(session));
+        let spec = SessionSpec::new(
+            SessionId::new_v4(),
+            volume.clone(),
+            "unused",
+            dir.0.join("agents/a1"),
+        );
+        sandbox.start(&spec).await.unwrap();
+        let session_dir = volume.session_dir(spec.session);
         for sub in ["work", "claude", "home", "tmp"] {
             assert!(session_dir.join(sub).is_dir(), "{sub}");
         }
@@ -494,11 +468,8 @@ mod tests {
         assert_eq!(settings, serde_json::json!({"cleanupPeriodDays": 9}));
 
         let default = ProcessSandbox::new(memory_store().await, dir.0.clone()).unwrap();
-        let other = default
-            .prepare_session_dirs(&volume, session)
-            .await
-            .unwrap();
-        let settings = std::fs::read_to_string(other.join("claude/settings.json")).unwrap();
+        default.start(&spec).await.unwrap();
+        let settings = std::fs::read_to_string(session_dir.join("claude/settings.json")).unwrap();
         assert!(settings.contains("3650"), "{settings}");
     }
 
@@ -674,6 +645,53 @@ mod tests {
         io.child.kill().await.unwrap();
     }
 
+    fn is_gone(pid: &str) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        }
+    }
+
+    #[test]
+    fn dropping_a_child_on_a_current_thread_runtime_kills_its_group() {
+        let dir = TempDir::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let grandchild = runtime.block_on(async {
+            let sandbox = sandbox(&dir).await;
+            let container = started(&sandbox, &dir, ScopeKey::Private).await;
+            let mut io = sandbox
+                .exec(
+                    &container,
+                    &argv(&["/bin/sh", "-c", "sleep 30 & echo $!; wait"]),
+                    &BTreeMap::new(),
+                )
+                .await
+                .unwrap();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while io.stdout.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {
+                line.push(byte[0]);
+            }
+            drop(io);
+            String::from_utf8(line).unwrap()
+        });
+        drop(runtime);
+        assert!(!grandchild.is_empty());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !is_gone(&grandchild) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process {grandchild} survived"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     #[tokio::test]
     async fn stop_kills_processes_and_reports_the_death() {
         let dir = TempDir::new();
@@ -717,6 +735,20 @@ mod tests {
             Err(SandboxError::NotFound)
         ));
         sandbox.stop(container.id()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_end_only_after_events_missed() {
+        let dir = TempDir::new();
+        let sandbox = sandbox(&dir).await;
+        let mut events = sandbox.events();
+        drop(sandbox);
+        let items: Vec<_> = events.by_ref().collect().await;
+        assert!(
+            matches!(items.as_slice(), [Err(SandboxError::EventsMissed)]),
+            "{items:?}"
+        );
+        assert!(events.next().await.is_none());
     }
 
     #[tokio::test]

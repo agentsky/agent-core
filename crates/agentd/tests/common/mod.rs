@@ -53,21 +53,28 @@ pub fn get(addr: SocketAddr, path: &str) -> Option<Response> {
     read_response(&mut stream)
 }
 
-/// Sends `POST path` with a JSON `body` and, if given, a bearer token, over
-/// a new connection, and reads the whole response.
-pub fn post(addr: SocketAddr, path: &str, token: Option<&str>, body: &str) -> Option<Response> {
+/// Sends `POST path` with `headers` and `body` over a new connection and
+/// reads the whole response. Returns `None` if the connection is closed
+/// before a status line arrives.
+pub fn post(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &str,
+) -> Option<Response> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let auth = token.map_or(String::new(), |token| {
-        format!("Authorization: Bearer {token}\r\n")
-    });
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: agentd\r\nConnection: close\r\n{auth}\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: agentd\r\nConnection: close\r\nContent-Length: {}\r\n",
         body.len()
     );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
     stream.write_all(request.as_bytes()).ok()?;
     read_response(&mut stream)
 }

@@ -252,7 +252,9 @@ description, and must pass T02's policy.
     turn.
   - A final `{"type":"result",…}` line with `subtype`, `is_error`, `result`,
     `session_id`, `total_cost_usd`, `usage`, `terminal_reason` and
-    `api_error_status`.
+    `api_error_status`. `usage` is the turn's own, but `total_cost_usd` is
+    the process's running total
+    ([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
     `is_error` decides failure, not `subtype`. An unreachable upstream produced
     `subtype: "success"` with `is_error: true` and
     `terminal_reason: "api_error"`.
@@ -1148,12 +1150,18 @@ Deliverables:
 
 - `crates/agentd/src/commands/`: a dispatcher from `(MemberKey, Command,
   Origin)` to a handler. `Origin` is `SlackSlash { response_url }`,
-  `RocketChatDm` or `RocketChatChannel { room }`.
+  `RocketChatDm { room }` or `RocketChatChannel { room }`. The DM's room
+  saves a `users.info` and `im.create` per reply
+  ([impl-notes](impl-notes.md#a-dm-to-a-member-needs-their-username)).
 - Private reply plumbing: a `reply_private(origin, text)` helper. On Rocket.Chat
   it sends a manager-bot DM; the Slack arm is filled in T30.
 - Rocket.Chat wiring:
   - A DM to the manager bot is parsed whole as a command.
   - A channel message starting with `!agent` is parsed after the prefix.
+  - A `CommandIntake` runs the commands that any connection feeds it, since
+    only the connection that records a message first delivers it
+    ([impl-notes](impl-notes.md#every-bot-connection-has-to-look-for-commands)).
+    The manager bot's connection is its first feeder.
 - Handlers:
   - `login`: start the login and send the link privately.
   - `login <code>`: complete the login.
@@ -1171,7 +1179,12 @@ Deliverables:
   task sends a member exactly when it sets `claude_links.broken_at`, whoever
   asked for the token (a command, or T18's proxy on a session's behalf), so
   there is one notice per failure and none is lost when the caller goes away.
-  Callers that get `RelinkRequired` send nothing themselves.
+  Callers that get `RelinkRequired` send nothing themselves. The channel only
+  wakes the notifier: the notice owed is recorded in the store
+  (`claude_links.relink_notified_at`) and claimed there with a lease before
+  sending, so it survives a restart and a crash mid-send, is sent by one
+  instance, and is retried with a capped backoff when the DM fails, until
+  the attempts run out ([impl-notes](impl-notes.md#the-relink-channel-is-in-memory-the-notice-has-to-be-durable)).
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
@@ -1220,13 +1233,24 @@ Deliverables:
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
-  each surface with a store-backed `Dedup` and one `BotRoles` over the
-  manager's client, shared by every surface
+  each surface with a store-backed `Dedup` (T13's `StoreDedup`) and the one
+  `BotRoles` over the manager's client that T13 keeps in
+  `app::RocketChatManager`, shared by every surface
   ([impl-notes](impl-notes.md#messages-dont-carry-the-senders-roles)).
+- Every connection, each agent's and the manager bot's, delivers through a
+  `CommandFeed` of T13's one `CommandIntake` (`into_sender(onward)`), so the
+  connection that records a message first hands a command to the intake and
+  passes only other messages onward, the manager bot's included; a command
+  is never also taken as a turn
+  ([impl-notes](impl-notes.md#every-bot-connection-has-to-look-for-commands)).
 
 Acceptance: tests with `FakeRest` and `FakeDdp` for create, a name collision,
 persona edit by a non-owner (refused), pause (events ignored), delete, and
-restart restoring connections.
+restart restoring connections. With the manager's and an agent's
+connections running as agentd starts them: `!agent me` in a room both are
+in gets exactly one reply whichever connection records it first, and is
+not taken as a turn; `!agent me` in a room without the manager bot gets a
+reply; `!agent login <code>` in a DM with the agent's bot is refused.
 
 Live check (manual): create two agents on the Compose Rocket.Chat and mention
 each in a channel. Before T23 the reply can be a fixed acknowledgement; record
@@ -1403,13 +1427,15 @@ Deliverables:
 
 - The `Sandbox` trait:
   - `ensure_volume(VolumeKey) -> VolumeRef`.
-  - `prepare_session_dirs(volume, session)`. It creates `sessions/<id>/work`,
-    `sessions/<id>/claude`, `sessions/<id>/home` and `sessions/<id>/tmp`, and
-    writes `sessions/<id>/claude/settings.json` with `cleanupPeriodDays`
-    (configurable, default 3650).
   - `start(SessionSpec) -> Container`, where `SessionSpec` carries the session
     id, volume, image, environment, the agent's persona and skills
-    directories, and labels.
+    directories, and labels. Before creating the container it creates
+    `sessions/<id>/work`, `sessions/<id>/claude`, `sessions/<id>/home` and
+    `sessions/<id>/tmp`, and writes `sessions/<id>/claude/settings.json`
+    with `cleanupPeriodDays` (configurable, default 3650). That step is
+    crate-private, since it is safe only while the session has no running
+    container
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
   - `Container::paths()`, which gives the paths as the CLI sees them: working
     directory, `CLAUDE_CONFIG_DIR`, `HOME`, `TMPDIR`, persona file. Docker and
     process sandboxes differ here, and the runner uses only these.
@@ -1523,8 +1549,19 @@ Deliverables:
   - `mint(session, container_ip, kind) -> Placeholder`: a random 32-byte token
     with a recognizable prefix per kind, for example `agentd-sub-…` and
     `agentd-key-…`.
-  - `point(placeholder, CredentialRef)`, called at turn start.
-  - `revoke(placeholder)` and `revoke_session(session)`.
+  - `point(placeholder_id, CredentialRef)`, called at turn start. It refuses a
+    credential of the other kind. Callers hold the placeholder's non-secret
+    `PlaceholderId` for this and for revoking
+    ([impl-notes](impl-notes.md#t18-credential-proxy)).
+  - `unpoint(placeholder_id) -> bool`, called at turn end, however the turn
+    ended. Until the next `point`, requests carrying the placeholder are
+    refused. It returns whether the placeholder was live, like `revoke`: a
+    placeholder already revoked, as when its container died mid-turn and
+    `process_stopping` ran before `turn_finished`, is a normal case, not an
+    error.
+  - `revoke(placeholder_id)` and `revoke_session(session)`.
+  - An address belongs to one session: minting for an address revokes other
+    sessions' placeholders bound to it.
   - In memory. It is disposable, re-derivable state: containers are reaped on
     restart.
 - A reverse proxy served by agentd on the proxy listener, forwarding to the
@@ -1546,9 +1583,14 @@ Deliverables:
   - Answers `HEAD /api/hello` locally with 200.
   - Strips hop-by-hop headers.
   - Upstream is the one configured host. No `Host` header or absolute URI from
-    the client can redirect it.
+    the client can redirect it: absolute-form requests get 403.
+  - Forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and
+    `OPTIONS`. Every other method, `TRACE` and `CONNECT` included, gets 405
+    before any credential is looked up, until T19 takes `CONNECT` over on the
+    same listener.
 - Metrics hook: a `ProxyObserver` trait called with `(session, status, usage
-  headers)`. T27 uses it for the meter.
+  headers)`, and the credential the request used, since the session's
+  pointer changes from turn to turn. T27 uses it for the meter.
 
 Acceptance, as tests named after the rules:
 
@@ -1562,6 +1604,9 @@ Acceptance, as tests named after the rules:
 - `streams_sse_without_buffering`: the first event arrives before the upstream
   finishes.
 - `revoked_placeholder_is_refused`.
+- `unpointed_placeholder_is_refused`: after the turn ends, nothing reaches
+  the upstream.
+- `refuses_methods_outside_the_allowlist`: `TRACE` and an extension method.
 - An end-to-end test with `fake-claude` and `fake_anthropic()`.
 
 Out of scope: egress for other hosts (T19), bearer swap for other CLIs
@@ -1593,7 +1638,8 @@ Deliverables:
   session.
 - Absolute-form requests (`GET http://host/…`, what `HTTP_PROXY` produces for
   plain HTTP) get 403. They must never fall through to the Anthropic reverse
-  proxy. Plain HTTP egress is not offered.
+  proxy; T18's proxy already refuses them, and T19 keeps that. Plain HTTP
+  egress is not offered.
 
 Acceptance:
 
@@ -1614,8 +1660,10 @@ Design: [Lifecycle](design.md#lifecycle),
 
 Deliverables:
 
-- `ClaudeProcess::start(sandbox, container, LaunchSpec) -> ClaudeProcess`. It
-  builds argv from the design's launch flags:
+- `ClaudeProcess::start(sandbox, container, &ProcessConfig, LaunchSpec) ->
+  ClaudeProcess`. `ProcessConfig` holds the `claude` binary, the proxy's
+  `ANTHROPIC_BASE_URL` and the turn timeout. It builds argv from the design's
+  launch flags:
   - `--session-id <id>` when the session has never started, `--resume <id>`
     otherwise.
   - `--tools "Bash,Read,Edit,Write,Glob,Grep"`, `--strict-mcp-config`,
@@ -1625,11 +1673,18 @@ Deliverables:
   - The environment from the design's credential proxy block, plus
     `HOME` and `TMPDIR` from `Container::paths()`. The placeholder, the
     process's `AGENTCTL_TOKEN` and the egress proxy variables come from the
-    caller in `LaunchSpec.env`. The runner doesn't know how they are made.
+    caller: the placeholder in `LaunchSpec.placeholder`, with
+    `LaunchSpec.credential` choosing its variable, and the rest in
+    `LaunchSpec.env`, which may not set the runner's own variables or any
+    `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` one
+    ([impl-notes](impl-notes.md#the-placeholder-is-not-an-environment-entry)).
+    The runner doesn't know how they are made.
 - `send_turn(user_message) -> TurnOutcome`. It writes one stream-json user line
   and reads lines until `type == "result"`. The outcome carries:
   - `is_error`, `result` text, `terminal_reason`, `api_error_status`.
-  - `usage`, `total_cost_usd`, `session_id`.
+  - `usage`, `session_id`, and the turn's `cost_usd`: the rise in the
+    CLI's running `total_cost_usd` since the process's previous result
+    ([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
   - Structural metadata for diagnostics: the number of `assistant` messages
     and the names of the tools called. Message bodies, tool inputs and tool
     output are never kept or logged: they can hold file contents and secrets
@@ -1637,9 +1692,17 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails.
-- Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
-  new process with `--resume`.
+  is killed and the turn fails. If the kill fails, the container is stopped
+  instead, since nothing was signalled
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
+  `ClaudeProcess::may_be_alive` says whether a killed process was seen to
+  exit: a kill can fail, and under Docker signal nothing
+  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+- Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
+  `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
+  starts a new process with `--resume`. `TurnStats::init_seen` says whether
+  the CLI read the turn's message, which is when its transcript starts
+  ([impl-notes](impl-notes.md#when-a-session-has-started)).
 - Classification of `is_error` results: `usage_limit` (rate limit or credit
   exhausted, when `api_error_status` is 429 or the text says so), `auth` (401
   or 403), `other`. T26 turns these into member-facing messages.
@@ -1682,16 +1745,31 @@ Deliverables:
     doesn't collide with its replacement.
 - The `TurnHooks` trait, the runner's only way out:
   - `process_starting(session, container_ip, kind) -> ProcessEnv`, which
-    returns the placeholder, the agentctl token and the proxy variables for
-    `LaunchSpec.env`.
+    returns the placeholder, the agentctl token and the proxy variables, all
+    as `SecretString`, for `LaunchSpec.placeholder` and `LaunchSpec.env`
+    (`BTreeMap<String, SecretString>`).
   - `turn_starting(session, &TurnRequest)`, which points the placeholder at
     the turn's credential and records the turn on the agentctl token.
-  - `turn_finished(session, turn)`, which clears the turn from the token.
+  - `turn_finished(session, turn)`, which clears the turn from the token and
+    unpoints the placeholder. It is called on every exit from the turn:
+    success, error, timeout, interrupt and cancellation. It completes before
+    the session's queue slot is released, cancellation included, for example
+    by running the turn body in a task the caller's drop doesn't cancel.
+    Otherwise a late `turn_finished` for turn N could run after turn N+1's
+    `turn_starting` and clear N+1's pointer.
   - `process_stopping(session)`, which revokes the placeholder and the token. It
     is called before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.
 - `SessionManager`:
   - `lookup_or_create(agent, thread_key) -> Session`. A new session id is a v4.
+  - A session is marked `started` after a turn whose `TurnStats::init_seen`
+    is true, whatever its outcome, not when its process starts
+    ([impl-notes](impl-notes.md#when-a-session-has-started)).
+  - A turn whose outcome is `TurnOutcome::resume_refused()` (a `--resume`
+    of a session with no transcript) resets the session to `--session-id`:
+    the row is marked not started and the turn runs again, once, on a new
+    process with `SessionStart::New` and the same id, since the CLI never
+    read the message.
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
   - `run_turn(session, TurnRequest) -> TurnOutcome`, serialized per session
@@ -1701,12 +1779,19 @@ Deliverables:
     `process_stopping` and then stops both.
   - It follows `Sandbox::events()`: a container that died has its process
     marked gone and `process_stopping` called at once, so its IP can't be
-    reused with a live mapping.
+    reused with a live mapping. The stream ends only after an `Err` item,
+    which means deaths may have been missed: the pool subscribes again and
+    compares `list_managed()` with the containers it holds.
   - A per-scope container cap, default 4. Turns beyond it wait in a per-scope
     queue.
   - A global cap.
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
+- After a turn that leaves `ClaudeProcess::is_running()` false, or after
+  `stop`, a process whose `may_be_alive()` is still true was killed without
+  its exit being confirmed. Call `process_stopping` and stop the container
+  before starting another process for the session, so two processes never
+  share a transcript.
 - Private sessions: `create_private(agent, consent) -> Session` on the
   agent's `Private` volume, always a fresh id. T33 uses it.
 
@@ -1721,6 +1806,8 @@ Acceptance:
   - A credential-kind change restarts the process.
   - A model change restarts the process.
   - Reset starts with a new id.
+  - A `--resume` the CLI refuses for want of a transcript reruns the turn
+    with `--session-id`.
   - A recording `TurnHooks` double sees the calls in order for each turn:
     `process_starting` once per process, `turn_starting` and `turn_finished`
     per turn, and `process_stopping` before every stop and after a killed
@@ -1839,15 +1926,25 @@ Deliverables:
   `reap_orphans` at startup, and documents the section in
   `config/agentd.example.toml`, including that the network it names must
   keep sandboxes from reaching each other
-  ([Network and deployment shape](#network-and-deployment-shape)).
+  ([Network and deployment shape](#network-and-deployment-shape)). bollard
+  logs every request body at debug level, `exec` environments with
+  placeholders and agentctl tokens included, so `telemetry::subscriber` caps
+  the `bollard` target at `info` whatever `server.log_filter` says. Any other
+  subscriber setup, such as a test harness that captures logs, must keep that
+  cap ([impl-notes](impl-notes.md#bollard-logs-request-bodies-at-debug-level)).
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
-  placeholders with T18's `Registry`, sets the egress proxy variables from
+  placeholders with T18's `Registry`, and `turn_finished` calls
+  `Registry::unpoint`. It sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
   turn's outbox, and `revoke_process_token`). It builds `App` with a
   `SurfaceLookup` for `agentctl history`, and resolves the short message ids
   it shows the model where agentctl takes a message id
   ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
+- agentd serves T18's `CredProxy` on `Routers.proxy`, with the `Registry`
+  shared with its `TurnHooks`. A `[proxy] upstream` key, default
+  `https://api.anthropic.com`, sets the upstream, and
+  `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
@@ -1867,9 +1964,13 @@ Deliverables:
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
-     3. Render and split for the surface. `MentionDirectory` is synchronous,
-        so the pipeline first builds a snapshot of the names the reply
-        mentions from agent bindings and the surface's member cache.
+     3. Render and split with `Surface::render`. The trait takes no
+        `MentionDirectory`, so each surface resolves `@Name` from its own
+        member list; on Slack that is T29's per-team member cache, which
+        includes the agents' bot users. agentd passes each team's managed
+        agents' bot user ids to `TeamDirectory::set_managed_bots`, so an
+        agent keeps a name a human shares
+        ([impl-notes](impl-notes.md#t29-slack-web-api)).
      4. Post as the agent's bot identity in the thread.
      5. Record `message_refs` for every chunk with the turn's requester and
         hop.
@@ -1927,7 +2028,17 @@ Acceptance:
 Live check (manual, recorded in the PR): with the Compose stack from T16, its
 `isolate-sandbox.sh` rules in place, and a real linked account, mention an agent in a channel on Rocket.Chat, run a turn
 that uses Bash and returns a file, restart agentd, and continue the thread with
-`--resume`. That completes design milestone 2.
+`--resume`. Check that the first result of the `--resume`d process reports a
+`total_cost_usd` counted from 0, not the session's total so far: the runner's
+per-turn `cost_usd` assumes it
+([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
+Also run `agentctl lock -- sh -c 'sleep 600'` with a short Bash
+tool timeout, and record whether the CLI kills a timed-out command through
+its process group or its process, and with which signal: `agentctl lock`
+runs its command in a group of its own, so a group kill would leave the
+command running after agentctl dies
+([impl-notes](impl-notes.md#the-command-runs-in-its-own-process-group)).
+That completes design milestone 2.
 
 ### T24
 
@@ -2032,7 +2143,8 @@ Deliverables:
   - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
     `day`, `agent_turns`, `tokens`), for the per-thread caps.
   - `bans` (`member_id`, `banned_by`, `reason`, `created_at`).
-- The meter accrues per requester from each `TurnOutcome`'s usage.
+- The meter accrues per requester from each `TurnOutcome`'s usage and
+  `cost_usd`, which is the turn's own, not the CLI's running total.
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
@@ -2085,23 +2197,34 @@ Deliverables:
 
   The app id doesn't exist until `apps.manifest.create` returns, but the
   manifest must already carry its URLs, so agentd mints the binding id first
-  (T31). The manager app uses the fixed binding `manager`. The path selects
-  the signing secret: the binding's for agent apps, the one from configuration
-  for the manager. Unknown bindings get 404.
+  (T31). The manager app uses the fixed binding `manager`, whose events carry
+  the nil UUID as their `BindingId` (`BindingRef::MANAGER_ID`). The path
+  selects the signing secret: the binding's for agent apps, the one from
+  configuration for the manager. Unknown bindings get 404.
+  ([impl-notes](impl-notes.md#t28-slack-ingress))
 - Signature verification: `v0=HMAC-SHA256(secret, "v0:{ts}:{body}")` over the
   raw body, compared in constant time, rejecting timestamps more than 5 minutes
-  old.
+  from now in either direction, missing or repeated headers, and bodies over
+  1 MiB.
 - `url_verification`: echo the challenge for a known binding, without checking
   the signature. Slack sends it during `apps.manifest.create`, before agentd
-  has the new app's signing secret. The echo has no side effects. Every other
-  request type must verify.
+  has the new app's signing secret. The echo has no side effects. The one
+  other exception is Slack's `ssl_check`: a form whose `ssl_check` is `1`,
+  posted unsigned to the command URL, gets an empty 200 on the same terms.
+  Every other request type must verify.
   This PR adds that detail to the design's Slack transport bullet.
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
-  200 at once. Slash commands and interactivity return an empty 200 and reply
-  later through `response_url`.
+  200 at once, or 503 when the queue is full (Slack retries events, not
+  commands or interactions); they never wait for the queue. The secret lookup
+  and the body read share a 2-second timeout. Slash commands and
+  interactivity return an empty 200 and reply later through `response_url`.
 - Deduplication per binding: `store.mark_event_processed("slack:<binding>",
-  event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
-  a message that reached the same app twice. `X-Slack-Retry-Num` is logged.
+  event_id)` drops retried events, and messages are keyed by `(binding,
+  channel, ts)` instead, which drops a retry and a message that reached the
+  same app twice. Messages are normalized first, so a dropped one costs no
+  store write. Slash commands and
+  interactivity, which have no event id, are deduplicated by signature, which
+  drops a replay inside the 5-minute window. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
   - Agent apps take every message from `message.channels`,
     `message.groups`, `message.im` and `message.mpim`, and don't subscribe to
@@ -2173,13 +2296,18 @@ Deliverables:
   of 3,000 chars, and `supports_edit`, `supports_buttons`, `supports_threads`
   and `per_binding_delivery` all true.
 - A member cache per team, filled from `users.list` and refreshed on a
-  TTL, mapping display and real names to user ids. The pipeline's
-  `MentionDirectory` snapshot (T23) reads it together with agent bindings.
-  `users.info` can't look a user up by name.
+  TTL, mapping display and real names (and bot users' usernames) to user
+  ids. `SlackSurface::render` reads it; bot users are listed too, so agents'
+  names resolve without the bindings, and the managed agents' bot users
+  given to `TeamDirectory::set_managed_bots` win names they share with
+  others. `users.info` can't look a user up by name.
 - `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
   `user_id` for bot events that lack a `user` field, cached per bot id. A bot
   id that maps to no user keeps the `bot_id` as `sender.user` and no
-  `sender_bot_user`, so the router ignores it as an unmanaged bot.
+  `sender_bot_user`, so the router ignores it as an unmanaged bot. The
+  ingress has no bot tokens, so the lookup is
+  `SlackSurface::fill_bot_sender`, which the receiver of `SlackInbound`
+  calls before routing (T31).
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `render` converts and splits through `render`, so that
@@ -2286,6 +2414,12 @@ Deliverables:
   agentd disables the binding, stops handling its events, and tells the owner
   to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
+- agentd's receiver of T28's `SlackInbound` builds a T29 `SlackSurface` per
+  active binding, with one `TeamDirectory` per team. Whenever a team's
+  active agent bindings change, it passes their `bot_user_id`s to
+  `TeamDirectory::set_managed_bots`, so agents win names humans share. It
+  awaits `refresh_members` when a binding starts, and passes each message
+  through `fill_bot_sender` before routing it.
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 
@@ -2493,6 +2627,22 @@ Not scheduled. Each needs a decision before it becomes a task.
   Until then, owners who need GitHub use the cloud hand-off (T35) or a
   fine-grained token scoped to one repository in a private task, and accept
   that it enters that private sandbox.
+- **A path allowlist for the credential proxy.** T18 forwards any path on the
+  upstream, so a sandbox can call any Anthropic endpoint its requester's
+  token or the community key allows, such as the profile or, with the
+  community key, the Files and Batches APIs that other members' turns share.
+  Limiting it to the paths the CLI uses (`/v1/messages`,
+  `/v1/messages/count_tokens`, and whatever else a live capture with
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` shows) needs that capture
+  first, since refusing a path the CLI needs breaks turns. Methods are
+  already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
+  `DELETE` and `OPTIONS`.
+- **Killing leftover processes at turn end.** T18 unpoints the placeholder
+  when a turn ends, so a background process the model left running can't
+  spend credentials between turns. It can still spend turn N+1's
+  credential while turn N+1 runs, whoever its requester is. Only killing
+  the processes a turn leaves behind in the container when it ends removes
+  that.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.

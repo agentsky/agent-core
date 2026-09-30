@@ -4,21 +4,28 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use agentd::ctl::{Ctl, CtlSettings, ProcessInfo, ProcessToken, STAGING_DIR, SurfaceLookup, Turn};
+use axum::Json;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse as _;
 use core_types::{
-    AgentId, ConsentId, ConvRef, Hop, MemberKey, MessageId, Msg, Requester, ScopeKey, SessionId,
-    Side, Surface, SurfaceKind, ThreadKey, TurnId, TurnKind, VolumeKey,
+    AgentId, ConsentId, ConvRef, CtlError, CtlErrorCode, Hop, LeaseId, LockRequest, LockResponse,
+    MemberKey, MessageId, Msg, Requester, ScopeKey, SessionId, Side, Surface, SurfaceKind,
+    ThreadKey, TurnId, TurnKind, VolumeKey,
 };
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use store::Store;
 use testkit::claude::SCRIPT_ENV;
 use testkit::{MockSurface, fake_anthropic, fake_claude_path, write_script};
+use time::OffsetDateTime;
 use time::macros::datetime;
 use tokio::io::AsyncWriteExt as _;
+use tokio::sync::Notify;
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -121,24 +128,7 @@ impl Server {
     }
 
     fn agentctl(&self, token: &ProcessToken) -> tokio::process::Command {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_agentctl"));
-        command
-            .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("AGENTCTL_URL", &self.url)
-            .env("AGENTCTL_TOKEN", token.secret().expose_secret())
-            .env("HTTP_PROXY", "http://127.0.0.1:9")
-            .env("http_proxy", "http://127.0.0.1:9")
-            .env("ALL_PROXY", "http://127.0.0.1:9")
-            .current_dir(&self.dir.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
-            command.env("LLVM_PROFILE_FILE", profile);
-        }
-        command
+        agentctl(&self.url, token.secret().expose_secret(), &self.dir.0)
     }
 
     async fn run(&self, token: &ProcessToken, args: &[&str]) -> Run {
@@ -148,6 +138,76 @@ impl Server {
             .unwrap();
         Run::from(output)
     }
+}
+
+/// `agentctl` against the API at `url`, run in `dir`, with its output piped.
+fn agentctl(url: &str, token: &str, dir: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_agentctl"));
+    command
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("AGENTCTL_URL", url)
+        .env("AGENTCTL_TOKEN", token)
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    command
+}
+
+/// Waits until `path` exists.
+async fn wait_for(path: &Path) {
+    let started = Instant::now();
+    while !path.exists() {
+        assert!(
+            started.elapsed() < WAIT,
+            "{} never appeared",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A shell script that touches `marker` and then runs a background
+/// subshell, a grandchild of agentctl, that appends to `log` until it is
+/// killed.
+fn writer(marker: &Path, log: &Path) -> String {
+    format!(
+        "(while :; do echo x >> {log}; sleep 0.05; done) & touch {marker}; wait",
+        log = log.display(),
+        marker = marker.display()
+    )
+}
+
+/// Asserts that nothing appends to `log` any more, and returns when it was
+/// last written.
+async fn stopped_writing(log: &Path) -> SystemTime {
+    let before = std::fs::metadata(log).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after = std::fs::metadata(log).unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "the command's children still write"
+    );
+    after.modified().unwrap()
+}
+
+#[cfg(unix)]
+fn terminate(child: &tokio::process::Child) {
+    let pid = child.id().unwrap().to_string();
+    let kill = std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    assert!(kill.success());
 }
 
 #[derive(Debug)]
@@ -499,11 +559,7 @@ async fn the_lock_expires_when_its_holder_dies() {
         ])
         .spawn()
         .unwrap();
-    let started = Instant::now();
-    while !marker.exists() {
-        assert!(started.elapsed() < WAIT, "the holder never ran");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for(&marker).await;
     holder.kill().await.unwrap();
     let killed = Instant::now();
     server
@@ -517,17 +573,38 @@ async fn the_lock_expires_when_its_holder_dies() {
 }
 
 #[tokio::test]
-async fn losing_the_lease_stops_the_command() {
+async fn losing_the_lease_stops_the_command_and_frees_the_lock_at_once() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
-    let (_, token) = server.turn().await;
-    let holder = server
-        .agentctl(&token)
-        .args(["lock", "--", "sleep", "20"])
-        .spawn()
+    let (info, token) = server.turn().await;
+    let (_, other) = server.process_at("127.0.0.1", Some(info.volume)).await;
+    server
+        .ctl
+        .begin_turn(&other, turn(Side::Public))
+        .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hold = |marker: &Path| {
+        server
+            .agentctl(&token)
+            .args([
+                "lock",
+                "--",
+                "sh",
+                "-c",
+                &format!("touch {}; exec sleep 20", marker.display()),
+            ])
+            .spawn()
+            .unwrap()
+    };
+
+    let marker = server.dir.path("ended");
+    let holder = hold(&marker);
+    wait_for(&marker).await;
     let started = Instant::now();
     server.ctl.end_turn(&token).await.unwrap();
+    server
+        .run(&other, &["lock", "--timeout", "0", "--", "true"])
+        .await
+        .ok();
     let out = Run::from(
         tokio::time::timeout(WAIT, holder.wait_with_output())
             .await
@@ -536,6 +613,286 @@ async fn losing_the_lease_stops_the_command() {
     );
     out.refused("lost the shared/ lock (no turn is running");
     assert!(started.elapsed() < Duration::from_secs(10), "{out:?}");
+
+    server
+        .ctl
+        .begin_turn(&token, turn(Side::Public))
+        .await
+        .unwrap();
+    let marker = server.dir.path("revoked");
+    let holder = hold(&marker);
+    wait_for(&marker).await;
+    server.ctl.revoke_process_token(&token).await.unwrap();
+    server
+        .run(&other, &["lock", "--timeout", "0", "--", "true"])
+        .await
+        .ok();
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    out.refused("lost the shared/ lock (the agentctl token is missing, revoked");
+}
+
+/// How [`FakeLock`] answers renewals and releases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renewals {
+    /// It never answers them.
+    Stall,
+    /// It fails the first renewal with agentd's internal error, and grants
+    /// the rest.
+    FailOnce,
+}
+
+/// A fake ctl API whose lock grants leases of `ttl` seconds, with whole
+/// seconds as agentd's store has them, from a clock `skew` seconds ahead of
+/// the real one.
+struct FakeLock {
+    url: String,
+    state: Arc<FakeState>,
+}
+
+struct FakeState {
+    ttl: i64,
+    skew: i64,
+    renewals: Renewals,
+    acquire_delay: Duration,
+    expires_at: Mutex<Option<SystemTime>>,
+    granted: Mutex<Vec<LeaseId>>,
+    renewed: Mutex<usize>,
+    released: Mutex<Vec<LeaseId>>,
+    acquiring: Notify,
+    renewing: Notify,
+}
+
+impl FakeLock {
+    async fn start(ttl: i64, skew: i64, renewals: Renewals) -> Self {
+        Self::delayed(ttl, skew, renewals, Duration::ZERO).await
+    }
+
+    /// A fake that answers each acquire only after `acquire_delay`.
+    async fn delayed(ttl: i64, skew: i64, renewals: Renewals, acquire_delay: Duration) -> Self {
+        let state = Arc::new(FakeState {
+            ttl,
+            skew,
+            renewals,
+            acquire_delay,
+            expires_at: Mutex::new(None),
+            granted: Mutex::new(Vec::new()),
+            renewed: Mutex::new(0),
+            released: Mutex::new(Vec::new()),
+            acquiring: Notify::new(),
+            renewing: Notify::new(),
+        });
+        let app = axum::Router::new()
+            .route("/v1/lock", axum::routing::post(fake_lock))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Self { url, state }
+    }
+
+    /// When the lease last granted or renewed really runs out.
+    fn expires_at(&self) -> SystemTime {
+        self.state.expires_at.lock().unwrap().unwrap()
+    }
+
+    fn granted(&self) -> Vec<LeaseId> {
+        self.state.granted.lock().unwrap().clone()
+    }
+
+    fn renewed(&self) -> usize {
+        *self.state.renewed.lock().unwrap()
+    }
+
+    fn released(&self) -> Vec<LeaseId> {
+        self.state.released.lock().unwrap().clone()
+    }
+}
+
+impl FakeState {
+    fn held(&self, lease: LeaseId) -> axum::response::Response {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires_at = now + u64::try_from(self.ttl).unwrap();
+        *self.expires_at.lock().unwrap() =
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(expires_at));
+        let skewed = i64::try_from(expires_at).unwrap() + self.skew;
+        Json(LockResponse::Held {
+            lease,
+            expires_at: OffsetDateTime::from_unix_timestamp(skewed).unwrap(),
+            seconds_left: u64::try_from(self.ttl).unwrap(),
+        })
+        .into_response()
+    }
+}
+
+async fn fake_lock(
+    State(state): State<Arc<FakeState>>,
+    Json(request): Json<LockRequest>,
+) -> axum::response::Response {
+    match request {
+        LockRequest::Acquire => {
+            state.acquiring.notify_one();
+            tokio::time::sleep(state.acquire_delay).await;
+            let lease = LeaseId::new_v4();
+            state.granted.lock().unwrap().push(lease);
+            state.held(lease)
+        }
+        LockRequest::Renew { lease } => {
+            state.renewing.notify_one();
+            if state.renewals == Renewals::Stall {
+                return std::future::pending().await;
+            }
+            let first = {
+                let mut renewed = state.renewed.lock().unwrap();
+                *renewed += 1;
+                *renewed == 1
+            };
+            if first {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(CtlError::new(
+                        CtlErrorCode::Internal,
+                        "agentd failed; try again",
+                    )),
+                )
+                    .into_response();
+            }
+            state.held(lease)
+        }
+        LockRequest::Release { lease } => {
+            state.released.lock().unwrap().push(lease);
+            if state.renewals == Renewals::Stall {
+                return std::future::pending().await;
+            }
+            Json(LockResponse::Released).into_response()
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stalled_renewal_stops_the_command_and_its_children_before_the_lease_runs_out() {
+    let fake = FakeLock::start(3, 5, Renewals::Stall).await;
+    let dir = TempDir::new();
+    let (marker, log) = (dir.path("started"), dir.path("log"));
+    let output = tokio::time::timeout(
+        WAIT,
+        agentctl(&fake.url, "tok", &dir.0)
+            .args(["lock", "--", "sh", "-c", &writer(&marker, &log)])
+            .output(),
+    )
+    .await
+    .expect("agentctl, or a process holding its output, outlived the kill")
+    .unwrap();
+    Run::from(output).refused("lost the shared/ lock (");
+    assert!(
+        stopped_writing(&log).await < fake.expires_at(),
+        "the command wrote after the lease expired, timed by a clock ahead of agentctl's"
+    );
+}
+
+#[tokio::test]
+async fn a_transient_agentd_error_is_retried_under_a_clock_behind_agentctls() {
+    let fake = FakeLock::start(3, -40, Renewals::FailOnce).await;
+    let dir = TempDir::new();
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", &dir.0)
+                .args(["lock", "--", "sleep", "2"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.ok();
+    assert!(out.stderr.is_empty(), "{out:?}");
+    assert!(fake.renewed() >= 3, "{} renewals", fake.renewed());
+    assert_eq!(fake.released(), fake.granted());
+}
+
+#[tokio::test]
+async fn a_lease_too_short_to_renew_is_given_back() {
+    let fake = FakeLock::start(2, 0, Renewals::FailOnce).await;
+    let dir = TempDir::new();
+    let marker = dir.path("ran");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", &dir.0)
+                .args(["lock", "--", "touch", marker.to_str().unwrap()])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.refused("the shared/ lock's lease is too short to hold (agentd granted 2s; agentctl needs at least 3s)");
+    assert!(!marker.exists());
+    assert_eq!(fake.released(), fake.granted());
+    assert_eq!(fake.granted().len(), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_during_acquire_gives_back_the_lease_it_was_granted() {
+    let fake = FakeLock::delayed(30, 0, Renewals::FailOnce, Duration::from_millis(1_500)).await;
+    let dir = TempDir::new();
+    let marker = dir.path("ran");
+    let holder = agentctl(&fake.url, "tok", &dir.0)
+        .args(["lock", "--", "touch", marker.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(WAIT, fake.state.acquiring.notified())
+        .await
+        .expect("agentctl never acquired");
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    assert!(!marker.exists(), "{out:?}");
+    assert_eq!(fake.granted().len(), 1, "{out:?}");
+    assert_eq!(fake.released(), fake.granted(), "{out:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_during_a_stalled_renewal_stops_the_lock_at_once() {
+    let fake = FakeLock::start(6, 0, Renewals::Stall).await;
+    let dir = TempDir::new();
+    let holder = agentctl(&fake.url, "tok", &dir.0)
+        .args(["lock", "--", "sleep", "30"])
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(WAIT, fake.state.renewing.notified())
+        .await
+        .expect("agentctl never renewed");
+    let signalled = Instant::now();
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    assert!(
+        out.stderr.contains("releasing the shared/ lock failed"),
+        "{out:?}"
+    );
+    assert!(signalled.elapsed() < Duration::from_secs(4), "{out:?}");
 }
 
 /// The fake CLI's stream-json output, one value per line.
@@ -712,7 +1069,34 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
 async fn a_terminated_lock_stops_its_command_and_releases_the_lease() {
     let server = Server::start().await;
     let (_, token) = server.turn().await;
-    let marker = server.dir.path("holding");
+    let (marker, log) = (server.dir.path("holding"), server.dir.path("log"));
+    let holder = server
+        .agentctl(&token)
+        .args(["lock", "--", "sh", "-c", &writer(&marker, &log)])
+        .spawn()
+        .unwrap();
+    wait_for(&marker).await;
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .expect("agentctl, or a process holding its output, outlived the kill")
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    stopped_writing(&log).await;
+    server
+        .run(&token, &["lock", "--timeout", "0", "--", "true"])
+        .await
+        .ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stop_signal_reaches_the_command_before_its_group_is_killed() {
+    let server = Server::start().await;
+    let (_, token) = server.turn().await;
+    let (marker, cleaned) = (server.dir.path("trapping"), server.dir.path("cleaned"));
     let holder = server
         .agentctl(&token)
         .args([
@@ -720,21 +1104,17 @@ async fn a_terminated_lock_stops_its_command_and_releases_the_lease() {
             "--",
             "sh",
             "-c",
-            &format!("touch {}; exec sleep 20", marker.display()),
+            &format!(
+                "trap 'echo cleaned > {cleaned}; exit 0' TERM; touch {marker}; \
+                 while :; do sleep 0.1; done",
+                cleaned = cleaned.display(),
+                marker = marker.display()
+            ),
         ])
         .spawn()
         .unwrap();
-    let started = Instant::now();
-    while !marker.exists() {
-        assert!(started.elapsed() < WAIT, "the holder never ran");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let pid = holder.id().unwrap().to_string();
-    let kill = std::process::Command::new("kill")
-        .args(["-TERM", &pid])
-        .status()
-        .unwrap();
-    assert!(kill.success());
+    wait_for(&marker).await;
+    terminate(&holder);
     let out = Run::from(
         tokio::time::timeout(WAIT, holder.wait_with_output())
             .await
@@ -742,8 +1122,41 @@ async fn a_terminated_lock_stops_its_command_and_releases_the_lease() {
             .unwrap(),
     );
     assert_eq!(out.code, Some(143), "{out:?}");
+    assert_eq!(std::fs::read_to_string(&cleaned).unwrap(), "cleaned\n");
     server
-        .run(&token, &["lock", "--timeout", "2", "--", "true"])
+        .run(&token, &["lock", "--timeout", "0", "--", "true"])
+        .await
+        .ok();
+
+    let marker = server.dir.path("ignoring");
+    let holder = server
+        .agentctl(&token)
+        .args([
+            "lock",
+            "--",
+            "sh",
+            "-c",
+            &format!("trap '' TERM; touch {}; exec sleep 30", marker.display()),
+        ])
+        .spawn()
+        .unwrap();
+    wait_for(&marker).await;
+    let signalled = Instant::now();
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .expect("a command ignoring the signal outlived the kill")
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    let took = signalled.elapsed();
+    assert!(
+        took >= Duration::from_millis(1_500) && took < Duration::from_secs(6),
+        "{took:?}"
+    );
+    server
+        .run(&token, &["lock", "--timeout", "0", "--", "true"])
         .await
         .ok();
 }

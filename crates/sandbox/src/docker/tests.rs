@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use bollard::models::EventActor;
 use core_types::{AgentId, ScopeKey};
+use tokio::io::AsyncReadExt;
 
 use super::*;
 use crate::test_util::{awkward_channel, volume};
@@ -434,4 +435,205 @@ async fn a_docker_sandbox_validates_its_inputs() {
 fn events_start_from_the_time_they_are_asked_for() {
     let at = std::time::UNIX_EPOCH + Duration::new(1_790_000_000, 5);
     assert_eq!(since(at), "1790000000.000000005");
+}
+
+#[test]
+fn container_config_validates_the_configuration() {
+    let mut config = SandboxConfig::new("unused");
+    config.network = "host".into();
+    assert!(matches!(
+        container_config(&config, Path::new(DATA), &spec_for(ScopeKey::Private)),
+        Err(SandboxError::Config(_))
+    ));
+}
+
+/// A Docker daemon that answers every request with `200 OK` and `body`,
+/// then closes the connection.
+async fn fake_docker(body: String) -> Docker {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Docker::connect_with_http(
+        &format!("http://{address}"),
+        5,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap()
+}
+
+async fn events_from(body: String) -> Vec<Result<ContainerEvent>> {
+    let docker = fake_docker(body).await;
+    let store = crate::test_util::memory_store().await;
+    let sandbox = DockerSandbox::new(docker, store, DATA, SandboxConfig::new("img")).unwrap();
+    let mut events = sandbox.events();
+    let items = tokio::time::timeout(Duration::from_secs(10), events.by_ref().collect())
+        .await
+        .unwrap();
+    assert!(events.next().await.is_none());
+    items
+}
+
+async fn sandbox_seeing_network(body: serde_json::Value, data_dir: &Path) -> DockerSandbox {
+    let docker = fake_docker(body.to_string()).await;
+    let store = crate::test_util::memory_store().await;
+    DockerSandbox::new(docker, store, data_dir, SandboxConfig::new("img")).unwrap()
+}
+
+#[tokio::test]
+async fn the_network_must_be_internal_and_named_by_its_name() {
+    let data = Path::new(DATA);
+    let ok = serde_json::json!({"Name": "sandbox", "Id": "0123abcd", "Internal": true});
+    sandbox_seeing_network(ok, data)
+        .await
+        .check_network()
+        .await
+        .unwrap();
+    let refused = [
+        serde_json::json!({"Name": "sandbox", "Internal": false}),
+        serde_json::json!({"Name": "sandbox"}),
+        serde_json::json!({"Name": "bridge", "Id": "sandbox", "Internal": false}),
+        serde_json::json!({"Name": "sandbox-internal", "Internal": true}),
+    ];
+    for body in refused {
+        let err = sandbox_seeing_network(body.clone(), data)
+            .await
+            .check_network()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SandboxError::Config(ConfigError { key: "network", .. })
+            ),
+            "{body}: {err:?}"
+        );
+    }
+
+    let open = serde_json::json!({"Name": "sandbox", "Internal": false});
+    let sandbox = sandbox_seeing_network(open, data).await;
+    sandbox
+        .allowing_an_open_network_for_tests()
+        .check_network()
+        .await
+        .unwrap();
+    let other = serde_json::json!({"Name": "other", "Internal": false});
+    let sandbox = sandbox_seeing_network(other, data).await;
+    assert!(matches!(
+        sandbox
+            .allowing_an_open_network_for_tests()
+            .check_network()
+            .await,
+        Err(SandboxError::Config(_))
+    ));
+}
+
+#[tokio::test]
+async fn start_refuses_an_open_network_before_touching_the_disk() {
+    let dir = crate::test_util::TempDir::new();
+    let open = serde_json::json!({"Name": "sandbox", "Internal": false});
+    let sandbox = sandbox_seeing_network(open, &dir.0).await;
+    let spec = SessionSpec::new(
+        SessionId::new_v4(),
+        volume(&dir.0, AgentId::new_v4(), ScopeKey::Private),
+        "img",
+        dir.0.join("agents/a1"),
+    );
+    assert!(matches!(
+        sandbox.start(&spec).await,
+        Err(SandboxError::Config(ConfigError { key: "network", .. }))
+    ));
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn an_event_stream_that_ends_ends_with_events_missed() {
+    let session = SessionId::new_v4();
+    let die = |action: &str| {
+        serde_json::json!({
+            "Type": "container",
+            "Action": action,
+            "Actor": {
+                "ID": "c1",
+                "Attributes": {"agentd.instance": "agentd", "agentd.session": session.to_string()},
+            },
+        })
+    };
+    let body = format!("{}\n{}\n", die("start"), die("die"));
+    let events = events_from(body).await;
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(
+        events[0].as_ref().unwrap(),
+        &ContainerEvent::Died {
+            container: ContainerId("c1".into()),
+            session: Some(session),
+        }
+    );
+    assert!(matches!(events[1], Err(SandboxError::EventsMissed)));
+
+    let events = events_from(String::new()).await;
+    assert!(
+        matches!(events.as_slice(), [Err(SandboxError::EventsMissed)]),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_event_stream_ends_after_its_first_error() {
+    let events = events_from("not json\n{}\n".into()).await;
+    assert!(
+        matches!(events.as_slice(), [Err(SandboxError::EventsMissed)]),
+        "{events:?}"
+    );
+}
+
+fn child_waiting_for(pid: watch::Receiver<Option<u32>>) -> DockerChild {
+    DockerChild {
+        docker: Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)
+            .unwrap(),
+        exec_id: "e1".into(),
+        container: "c1".into(),
+        user: "1:1".into(),
+        pid,
+        pump: None,
+    }
+}
+
+#[tokio::test]
+async fn kill_without_a_pid_is_an_error() {
+    let (sender, pid) = watch::channel(None);
+    let started = tokio::time::Instant::now();
+    let err = child_waiting_for(pid).kill().await.unwrap_err();
+    assert!(started.elapsed() >= PID_WAIT);
+    assert!(
+        matches!(err, SandboxError::Docker { op: "kill", .. }),
+        "{err:?}"
+    );
+    drop(sender);
+
+    let (sender, pid) = watch::channel(None);
+    drop(sender);
+    let err = child_waiting_for(pid).kill().await.unwrap_err();
+    assert!(
+        matches!(err, SandboxError::Docker { op: "kill", .. }),
+        "{err:?}"
+    );
 }

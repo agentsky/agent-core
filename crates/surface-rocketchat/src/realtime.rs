@@ -11,7 +11,10 @@
 //!
 //! It answers the server's `ping`s, pings the server itself when the
 //! connection goes quiet, and reconnects with jittered exponential backoff
-//! when the connection drops. Each connection lists the rooms again, so it
+//! when the connection drops. The backoff starts over only after a
+//! connection stayed up for a while (see [`RealtimeOptions`]), so a server
+//! that accepts and then drops at once is retried less and less often.
+//! Each connection lists the rooms again, so it
 //! subscribes to the rooms the user is in by then, including those it was
 //! added to while disconnected. Messages posted while it was disconnected
 //! are not fetched.
@@ -19,7 +22,7 @@
 //! It hands every message event to the caller unfiltered; normalizing and
 //! deduplicating is [`RocketChatSurface`](crate::RocketChatSurface)'s job.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use core_types::{ConversationId, SurfaceError, UserId};
@@ -47,6 +50,13 @@ const NOTIFY_USER: &str = "stream-notify-user";
 const MIN_TICK: Duration = Duration::from_millis(10);
 
 /// Timing of the realtime connection.
+///
+/// The backoff starts over once a connection has stayed up for the longer
+/// of `backoff_max` and twice `heartbeat`: long enough that reconnecting
+/// at once costs no more than waiting the longest backoff would have, and
+/// longer than it takes to notice a silent server. A connection that drops
+/// sooner, even after logging in and subscribing, counts as a failed
+/// attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RealtimeOptions {
     /// The first wait before reconnecting. Each failed attempt doubles it,
@@ -60,6 +70,13 @@ pub struct RealtimeOptions {
     pub heartbeat: Duration,
     /// How long connecting, logging in and subscribing may take.
     pub setup_timeout: Duration,
+}
+
+impl RealtimeOptions {
+    /// How long a connection must stay up before the backoff starts over.
+    fn healthy_uptime(&self) -> Duration {
+        self.backoff_max.max(self.heartbeat.saturating_mul(2))
+    }
 }
 
 impl Default for RealtimeOptions {
@@ -200,8 +217,12 @@ impl RealtimeClient {
             rooms = conn.room_subs.len(),
             "realtime connection ready"
         );
-        backoff.reset();
-        conn.serve(self.options.heartbeat).await
+        let ready = Instant::now();
+        let end = conn.serve(self.options.heartbeat).await;
+        if ready.elapsed() >= self.options.healthy_uptime() {
+            backoff.reset();
+        }
+        end
     }
 }
 
@@ -252,6 +273,49 @@ enum Sub {
     Notify,
 }
 
+/// What a `subscriptions-changed` notice reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Inserted,
+    Updated,
+    Removed,
+}
+
+/// One `subscriptions-changed` notice: `[action, subscription]`.
+#[derive(Debug)]
+struct Notice {
+    action: Action,
+    /// The subscription document's `_id`.
+    doc: Option<String>,
+    /// The room (`rid`). A removal may lack it.
+    room: Option<ConversationId>,
+    /// Whether the room's type is listened to; true when the notice has
+    /// no type.
+    listened: bool,
+}
+
+impl Notice {
+    fn parse(args: &[Value]) -> Option<Self> {
+        let action = match args.first().and_then(Value::as_str)? {
+            "inserted" => Action::Inserted,
+            "updated" => Action::Updated,
+            "removed" => Action::Removed,
+            _ => return None,
+        };
+        let doc = args.get(1);
+        let field = |key: &str| doc.and_then(|d| d.get(key)).and_then(Value::as_str);
+        Some(Self {
+            action,
+            doc: field("_id").map(str::to_owned),
+            room: field("rid").map(ConversationId::from),
+            listened: field("t")
+                .map(RoomType::from_code)
+                .as_ref()
+                .is_none_or(listens_to),
+        })
+    }
+}
+
 /// One live WebSocket and what is subscribed on it.
 struct Connection<'a> {
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -260,6 +324,15 @@ struct Connection<'a> {
     next_id: u64,
     subs: HashMap<String, Sub>,
     room_subs: HashMap<ConversationId, String>,
+    /// The room of each subscription document seen, so that a removal
+    /// notice without `rid` can be resolved.
+    docs: HashMap<String, ConversationId>,
+    /// Rooms whose subscription the server refused. They aren't asked for
+    /// again until an `inserted` notice or the next connection.
+    refused: HashSet<ConversationId>,
+    /// Notices that arrived while the room list was being read, applied
+    /// on top of it.
+    pending: Option<Vec<Notice>>,
     last_frame: Instant,
     notify_event: String,
 }
@@ -277,6 +350,9 @@ impl<'a> Connection<'a> {
             next_id: 0,
             subs: HashMap::new(),
             room_subs: HashMap::new(),
+            docs: HashMap::new(),
+            refused: HashSet::new(),
+            pending: None,
             last_frame: Instant::now(),
             notify_event: format!("{user}/subscriptions-changed"),
         }
@@ -317,7 +393,8 @@ impl<'a> Connection<'a> {
     }
 
     /// Connects, logs in, subscribes to room changes, lists the rooms and
-    /// subscribes to each.
+    /// subscribes to each. Room changes that arrive while the list is read
+    /// are applied on top of it, since it may predate them.
     async fn setup(&mut self, rest: &RestClient) -> Step {
         self.send(ddp::connect()).await?;
         loop {
@@ -337,6 +414,7 @@ impl<'a> Connection<'a> {
         let event = self.notify_event.clone();
         self.send(ddp::sub(&notify, NOTIFY_USER, &event)).await?;
         self.await_ready(&notify).await?;
+        self.pending = Some(Vec::new());
         let listing = rest.subscriptions();
         tokio::pin!(listing);
         let listed = loop {
@@ -348,18 +426,34 @@ impl<'a> Connection<'a> {
                 }
             }
         };
-        match listed {
-            Ok(listed) => {
-                for subscription in listed {
-                    if listens_to(&subscription.room_type) {
-                        self.subscribe_room(subscription.room).await?;
-                    }
-                }
-            }
+        let notices = self.pending.take().unwrap_or_default();
+        let listed = match listed {
+            Ok(listed) => listed,
             Err(SurfaceError::Unauthorized) => {
                 return Err(End::Fatal(SurfaceError::Unauthorized));
             }
             Err(err) => return Err(End::Retry(format!("could not list rooms: {err}"))),
+        };
+        let mut rooms = HashSet::new();
+        for subscription in listed {
+            if listens_to(&subscription.room_type) {
+                self.docs.insert(subscription.id, subscription.room.clone());
+                rooms.insert(subscription.room);
+            }
+        }
+        for notice in notices {
+            match self.resolve(notice) {
+                Some((Action::Removed, room)) => {
+                    rooms.remove(&room);
+                }
+                Some((_, room)) => {
+                    rooms.insert(room);
+                }
+                None => {}
+            }
+        }
+        for room in rooms {
+            self.subscribe_room(room).await?;
         }
         Ok(())
     }
@@ -453,6 +547,7 @@ impl<'a> Connection<'a> {
                         error = error.map(|e| e.code).unwrap_or_default(),
                         "room subscription ended"
                     );
+                    self.refused.insert(room);
                     Ok(())
                 }
                 Some(Sub::Notify) => Err(End::Retry("room-change subscription ended".into())),
@@ -495,32 +590,62 @@ impl<'a> Connection<'a> {
         }
     }
 
-    /// `["inserted" | "updated" | "removed", subscription]`.
+    /// `["inserted" | "updated" | "removed", subscription]`. While the
+    /// room list is being read, the notice is kept for `setup` instead.
     async fn subscription_changed(&mut self, args: &[Value]) -> Step {
-        let action = args.first().and_then(Value::as_str);
-        let doc = args.get(1);
-        let Some(room) = doc
-            .and_then(|d| d.get("rid"))
-            .and_then(Value::as_str)
-            .map(ConversationId::from)
-        else {
+        let Some(notice) = Notice::parse(args) else {
             return Ok(());
         };
-        let room_type = doc
-            .and_then(|d| d.get("t"))
-            .and_then(Value::as_str)
-            .map(RoomType::from_code);
-        match action {
-            Some("inserted" | "updated") if room_type.as_ref().is_none_or(listens_to) => {
+        if let Some(pending) = &mut self.pending {
+            pending.push(notice);
+            return Ok(());
+        }
+        match self.resolve(notice) {
+            Some((Action::Removed, room)) => {
+                self.refused.remove(&room);
+                self.unsubscribe_room(&room).await
+            }
+            Some((Action::Inserted, room)) => {
+                self.refused.remove(&room);
+                self.unsubscribe_room(&room).await?;
                 self.subscribe_room(room).await
             }
-            Some("removed") => self.unsubscribe_room(&room).await,
-            _ => Ok(()),
+            Some((Action::Updated, room)) => self.subscribe_room(room).await,
+            None => Ok(()),
         }
     }
 
+    /// The room a notice is about, keeping `docs` up to date.
+    /// A removal without `rid` is resolved through its document's `_id`.
+    /// `None` for a room whose type isn't listened to, or a removal of an
+    /// unknown document.
+    fn resolve(&mut self, notice: Notice) -> Option<(Action, ConversationId)> {
+        if notice.action == Action::Removed {
+            let known = notice.doc.and_then(|doc| self.docs.get(&doc).cloned());
+            let Some(room) = notice.room.or(known) else {
+                tracing::debug!(user = %self.user, "ignoring the removal of an unknown room");
+                return None;
+            };
+            self.docs.retain(|_, known| *known != room);
+            return Some((Action::Removed, room));
+        }
+        if !notice.listened {
+            return None;
+        }
+        let room = notice.room?;
+        if let Some(doc) = notice.doc
+            && self.docs.get(&doc) != Some(&room)
+        {
+            self.docs.retain(|_, known| *known != room);
+            self.docs.insert(doc, room.clone());
+        }
+        Some((notice.action, room))
+    }
+
+    /// Subscribes to `room`'s messages, unless it is subscribed already or
+    /// was refused on this connection.
     async fn subscribe_room(&mut self, room: ConversationId) -> Step {
-        if self.room_subs.contains_key(&room) {
+        if self.room_subs.contains_key(&room) || self.refused.contains(&room) {
             return Ok(());
         }
         tracing::debug!(user = %self.user, %room, "subscribing to a room");
