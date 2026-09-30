@@ -8,8 +8,16 @@ use wiremock::{Request, Respond, ResponseTemplate};
 
 /// Answers with its response only once the paired [`Hold`] lets it go, so a
 /// test can act while a request is known to be in flight, and at once from
-/// then on. Holding blocks the mock server's only thread: the server answers
-/// nothing else meanwhile.
+/// then on.
+///
+/// Holding blocks the mock server's only thread while it holds the server's
+/// state lock, so until the response goes the server answers nothing else,
+/// and `MockServer::received_requests`, `Mock::mount`, `MockServer::reset`,
+/// `MockServer::verify`, dropping a `MockGuard` and dropping the
+/// `MockServer`, which verifies, all block too. Release the [`Hold`] before
+/// calling any of them, and declare it after the server: locals drop in
+/// reverse order, so a test that panics mid-hold then drops the [`Hold`],
+/// which lets the response go, before the server, instead of hanging.
 pub struct Held {
     response: ResponseTemplate,
     arrived: Mutex<Option<oneshot::Sender<()>>>,

@@ -618,9 +618,8 @@ impl Inner {
     }
 
     /// The refresh task: refreshes the token of `landing`'s member under their
-    /// lock, hands
-    /// the result to every waiting caller, then does what is left without the
-    /// lock. It runs to the end whether or not anyone still waits.
+    /// lock, hands the result to every waiting caller, then does what is left
+    /// without the lock. It runs to the end whether or not anyone still waits.
     async fn refresh(self: Arc<Self>, landing: Landing, result: Flight) {
         let member = landing.member;
         let guard = self.locks.lock(member).await;
