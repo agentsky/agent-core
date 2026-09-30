@@ -28,11 +28,13 @@ hyper-util.workspace = true
 rand.workspace = true
 render.workspace = true
 router.workspace = true
+rustix = { workspace = true, features = ["std"] }
 runner.workspace = true
 sandbox.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_norway.workspace = true
 serde_path_to_error.workspace = true
 serde_urlencoded.workspace = true
 sha2.workspace = true
@@ -47,11 +49,11 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 bollard.workspace = true
 log.workspace = true
-serde_norway.workspace = true
 sqlx.workspace = true
 testkit.workspace = true
 tower = { workspace = true, features = ["util"] }

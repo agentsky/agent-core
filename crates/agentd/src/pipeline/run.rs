@@ -15,13 +15,14 @@ use core_types::{
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
-use runner::{ErrorKind, RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
+use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
 use store::{Agent, NewMessageRef, Store, StoreError};
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use super::Turns;
+use super::billing::{CredentialFailure, FAILURE_DM_INTERVAL};
 use super::message;
 use super::view::StoreView;
 use crate::commands::Replies;
@@ -31,14 +32,6 @@ use crate::ctl::{MAX_POST_BYTES, Outbox, SurfaceLookup};
 /// while the turn runs, unless `[runner] working_emoji` says otherwise.
 pub const DEFAULT_WORKING_EMOJI: &str = "hourglass_flowing_sand";
 
-/// What a failed turn tells the thread when the usage limit of the account
-/// it ran on is reached: the requester's, or the community key's.
-pub const USAGE_LIMIT_TEXT: &str = "Sorry, I can't answer that: the Claude account this request \
-     runs on has reached its usage limit. Try again when it resets.";
-/// What a failed turn tells the thread when the login it ran on expired.
-pub const LOGIN_EXPIRED_TEXT: &str = "Sorry, I can't answer that: the Claude login this request \
-     runs on has expired. If it's yours, run `/agent login` (`!agent login` on Rocket.Chat) and \
-     ask again.";
 /// What any other failed turn tells the thread, including one that failed
 /// before it reached the model.
 pub const FAILED_TEXT: &str = "Sorry, that turn failed. Try again in a moment.";
@@ -86,7 +79,8 @@ const RETRY_WAIT_CAP: Duration = Duration::from_secs(5);
 /// How the pipeline runs, besides the store and the runner.
 #[derive(Debug, Clone)]
 pub struct PipelineSettings {
-    /// agentd's data directory, which holds the agents' persona files.
+    /// agentd's data directory, which holds the agents' persona files and
+    /// skills.
     pub data_dir: PathBuf,
     /// The manager bots' identities, whose posts start no turn.
     pub managers: Vec<MemberKey>,
@@ -144,14 +138,17 @@ pub struct PipelineSettings {
 /// 5. **The turn.** On [`Decision::Run`], only when the agent's bot may
 ///    post in the conversation without joining it
 ///    ([`Surface::can_post`]): the persona file is written from the store,
+///    and the bundled `agentctl` skill into the agent's skills,
 ///    the thread's session looked up (a DM has one for the conversation, a
 ///    channel one per thread, rooted at the message when it starts one),
 ///    the turn message built with what the session's transcript lacks, and
 ///    the turn run, with the working emoji on the message until its reply
-///    is delivered. A turn refused with [`RunnerError::SessionReset`] runs
-///    once more, on the session looked up again. What the turn message
-///    recorded as shown is forgotten when the turn never reached the model,
-///    so the next turn shows it again.
+///    is delivered. Only the owner's own turn on the owner's side runs in
+///    the agent's private session; a decision that would put anyone else's
+///    there fails the turn before it starts. A turn refused with
+///    [`RunnerError::SessionReset`] runs once more, on the session looked
+///    up again. What the turn message recorded as shown is forgotten when
+///    the turn never reached the model, so the next turn shows it again.
 /// 6. **Delivery**, as the agent's bot, in the thread: the directives are
 ///    taken out of the reply, the turn's staged attachments uploaded, the
 ///    reply cut at [`MAX_POST_BYTES`] (closing a code block the cut left
@@ -160,12 +157,19 @@ pub struct PipelineSettings {
 ///    directives' reactions, and the reactions and posts the turn queued
 ///    with agentctl. Each goes out even when another failed, and then the
 ///    thread is told part of the reply was lost. A failed turn posts a
-///    short message that says why when the runner could tell: a usage
-///    limit, or a login that expired.
+///    short message that says why when the runner could tell. A usage
+///    limit or a refused login names whose account it was, the
+///    requester's or the community key's, and the requester alone is also
+///    told privately by the manager bot, unless the thread is their own DM
+///    with the agent or they were told about the same kind of failure
+///    within [`FAILURE_DM_INTERVAL`]; the agent's owner never is, unless
+///    they asked.
 /// 7. [`Decision::LinkPrompt`] sends the requester a DM from the manager
-///    bot saying how to link an account, when the agent's bot may post in
-///    the conversation; [`Decision::Refuse`] posts one line in the thread,
-///    and [`Decision::Ignore`] does nothing.
+///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
+///    one saying their link stopped working and how to link it again, when
+///    the agent's bot may post in the conversation; nothing runs for them.
+///    [`Decision::Refuse`] posts one line in the thread, and
+///    [`Decision::Ignore`] does nothing.
 ///
 /// Notices the pipeline posts on its own, such as refusals and failures
 /// before a turn reached the model, have no `message_refs` row.
@@ -783,7 +787,13 @@ impl Pipeline {
     async fn act(&self, event: &InboundEvent, agent: AgentId, caps: Caps, decision: Decision) {
         let result = match decision {
             Decision::Ignore(_) => Ok(()),
-            Decision::LinkPrompt { requester } => self.link_prompt(event, agent, &requester).await,
+            Decision::LinkPrompt { requester } => {
+                self.link_prompt(event, agent, &requester, link_text).await
+            }
+            Decision::RelinkPrompt { requester } => {
+                self.link_prompt(event, agent, &requester, relink_text)
+                    .await
+            }
             Decision::Refuse(reason) => self.refuse(event, agent, caps, reason).await,
             Decision::Run {
                 requester,
@@ -807,14 +817,16 @@ impl Pipeline {
         }
     }
 
-    /// Tells `requester` privately how to link an account, if `agent`'s bot
-    /// may post in `event`'s conversation: an agent that couldn't answer
-    /// there doesn't prompt either.
+    /// Tells `requester` privately how to link an account, with the text
+    /// `text` makes from the agent's name, if `agent`'s bot may post in
+    /// `event`'s conversation: an agent that couldn't answer there doesn't
+    /// prompt either.
     async fn link_prompt(
         &self,
         event: &InboundEvent,
         agent: AgentId,
         requester: &Requester,
+        text: fn(&str) -> String,
     ) -> Result<(), PipelineError> {
         let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
             return Ok(());
@@ -822,11 +834,7 @@ impl Pipeline {
         if !surface.can_post(&event.conv).await? {
             return Ok(());
         }
-        let name = self.agent_name(agent).await?;
-        let text = format!(
-            "{name} runs on the Claude account of whoever asks it. Link yours to use it: send \
-             `login` to me here."
-        );
+        let text = text(&self.agent_name(agent).await?);
         if let Err(err) = self.inner.replies.dm(&requester.key, &text).await {
             tracing::warn!(%agent, requester = %requester.key, error = %err, "couldn't send a link prompt");
         }
@@ -905,6 +913,7 @@ impl Pipeline {
         };
         let delivered = match ran {
             Ok((session, turn_id, report)) => {
+                let failure = CredentialFailure::of(&report.outcome);
                 let delivery = Delivery {
                     store: &self.inner.store,
                     surface: surface.as_ref(),
@@ -912,10 +921,17 @@ impl Pipeline {
                     agent,
                     requester: &turn.requester,
                     hop: turn.hop,
+                    credential: turn.credential,
                     target,
                     answered: &event.message,
                 };
                 delivery.report(turn_id, report).await;
+                let their_own_dm = event.is_dm() && event.sender == turn.requester.key;
+                if let Some(failure) = failure
+                    && !their_own_dm
+                {
+                    self.tell_requester(agent, &turn, failure).await;
+                }
                 Ok(())
             }
             Err(err) => {
@@ -932,8 +948,8 @@ impl Pipeline {
     }
 
     /// What a turn of `agent` needs before its session: its bot's identity
-    /// and model, with the persona file written. `None` when the agent or
-    /// its bot is gone.
+    /// and model, with the persona file and the bundled skill written.
+    /// `None` when the agent or its bot is gone.
     async fn prepare(
         &self,
         agent: AgentId,
@@ -947,8 +963,13 @@ impl Pipeline {
             return Ok(None);
         };
         runner::write_persona(&self.inner.settings.data_dir, agent, &row.persona).await?;
+        crate::skills::write_bundled(&self.inner.settings.data_dir, agent).await?;
         let model = self.model_for(credential).await?;
-        Ok(Some(Prepared { bot, model }))
+        Ok(Some(Prepared {
+            bot,
+            model,
+            owner: row.owner,
+        }))
     }
 
     /// Puts the working emoji on `event`'s message until the returned
@@ -996,10 +1017,10 @@ impl Pipeline {
     ) -> Result<(Session, TurnId, TurnReport<Option<Outbox>>), PipelineError> {
         let store = &self.inner.store;
         let thread = thread_of(event, caps);
-        let scope = match turn.scope {
-            ScopeKind::Private => ScopeKey::Private,
-            _ => ScopeKey::for_conversation(event.conv_kind, event.conv.clone()),
-        };
+        let scope = turn_scope(turn, prepared.owner, event).ok_or_else(|| {
+            tracing::error!(%agent, message = %event.message.id, scope = ?turn.scope, side = ?turn.side, "refused to run a turn on the agent's private side for someone other than its owner");
+            PipelineError::NotTheOwnersTurn
+        })?;
         let sessions = self.inner.turns.sessions();
         let mut attempt = 0;
         loop {
@@ -1049,6 +1070,59 @@ impl Pipeline {
         }
     }
 
+    /// Tells `turn`'s requester privately, from the manager bot, that
+    /// `agent`'s turn failed on their account or on the community key.
+    /// A refused login whose link is already marked broken gets no message
+    /// here: the relink notice tells the member once. Nor does a failure of
+    /// a kind the requester was told about within [`FAILURE_DM_INTERVAL`].
+    /// A message that fails to send releases its claim, so the next failure
+    /// of that kind tries again.
+    async fn tell_requester(&self, agent: AgentId, turn: &Run, failure: CredentialFailure) {
+        let store = &self.inner.store;
+        if failure == CredentialFailure::Refused
+            && let CredentialRef::Member(member) = turn.credential
+        {
+            match store.claude_link_status(member).await {
+                Ok(Some(status)) if status.broken_at.is_some() => return,
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(%agent, %member, error = %err, "couldn't read a link's state; telling the requester anyway");
+                }
+            }
+        }
+        let kind = failure.notice_kind(turn.credential);
+        let now = OffsetDateTime::now_utc();
+        let claimed = match store
+            .claim_failure_notice(&turn.requester.key, kind, now, FAILURE_DM_INTERVAL)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::debug!(%agent, requester = %turn.requester.key, kind, "the requester was told about this failure recently");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't check when the requester was last told; telling them anyway");
+                false
+            }
+        };
+        let name = self.agent_name(agent).await.unwrap_or_else(|err| {
+            tracing::warn!(%agent, error = %err, "couldn't read the agent's name");
+            "This agent".to_owned()
+        });
+        let text = failure.requester_text(turn.credential, &name);
+        if let Err(err) = self.inner.replies.dm(&turn.requester.key, &text).await {
+            tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't tell the requester why their turn failed");
+            if claimed
+                && let Err(err) = store
+                    .release_failure_notice(&turn.requester.key, kind, now)
+                    .await
+            {
+                tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't release the claim on telling the requester");
+            }
+        }
+    }
+
     /// The identity of `agent`'s bot on `event`'s surface and team.
     async fn bot_of(
         &self,
@@ -1093,6 +1167,22 @@ impl Pipeline {
     }
 }
 
+/// The link prompt for an agent named `name`.
+fn link_text(name: &str) -> String {
+    format!(
+        "{name} runs on the Claude account of whoever asks it. Link yours to use it: send \
+         `login` to me here."
+    )
+}
+
+/// The prompt for an agent named `name` to a member whose link broke.
+fn relink_text(name: &str) -> String {
+    format!(
+        "{name} runs on the Claude account of whoever asks it, and yours stopped working: \
+         Anthropic refused to renew the link. Send `login` to me here to link it again."
+    )
+}
+
 /// A turn the router decided to run.
 struct Run {
     requester: Requester,
@@ -1106,6 +1196,30 @@ struct Run {
 struct Prepared {
     bot: MemberKey,
     model: Option<String>,
+    owner: MemberId,
+}
+
+/// The scope `turn` runs in, for an agent owned by `owner`: the agent's
+/// private one only for the owner's own turn, on the owner's side and
+/// their own credential, answering the owner's own message in a
+/// one-to-one DM; otherwise `event`'s conversation's own channel, group DM
+/// or DM scope. `None` for a decision that would put anyone else's turn, a
+/// turn on any other event (a channel message, another agent's hop), or a
+/// public-side turn on the private side, or an owner-side turn anywhere
+/// else: such a turn must not run.
+fn turn_scope(turn: &Run, owner: MemberId, event: &InboundEvent) -> Option<ScopeKey> {
+    let owners_own = turn.requester.member == Some(owner)
+        && turn.credential == CredentialRef::Member(owner)
+        && turn.side == Side::Owner
+        && event.is_dm()
+        && event.sender == turn.requester.key
+        && !event.sender_is_bot
+        && event.sender_bot_user.is_none();
+    match turn.scope {
+        ScopeKind::Private => owners_own.then_some(ScopeKey::Private),
+        ScopeKind::Channel | ScopeKind::GroupDm | ScopeKind::Dm => (turn.side == Side::Public)
+            .then(|| ScopeKey::for_conversation(event.conv_kind, event.conv.clone())),
+    }
 }
 
 /// The thread a turn on `event` runs and replies in: a DM's conversation,
@@ -1220,6 +1334,7 @@ struct Delivery<'a> {
     agent: AgentId,
     requester: &'a Requester,
     hop: Hop,
+    credential: CredentialRef,
     target: ReplyTarget,
     answered: &'a MsgRef,
 }
@@ -1249,12 +1364,9 @@ impl Delivery<'_> {
                     .collect();
                 (capped(text), reactions)
             }
-            TurnOutcome::Finished(result) => {
-                let text = match result.error_kind {
-                    Some(ErrorKind::UsageLimit) => USAGE_LIMIT_TEXT,
-                    Some(ErrorKind::Auth) => LOGIN_EXPIRED_TEXT,
-                    _ => FAILED_TEXT,
-                };
+            TurnOutcome::Finished(_) => {
+                let text = CredentialFailure::of(&report.outcome)
+                    .map_or(FAILED_TEXT, |failure| failure.thread_text(self.credential));
                 (text.to_owned(), Vec::new())
             }
             TurnOutcome::Crashed { .. } => (FAILED_TEXT.to_owned(), Vec::new()),
@@ -1350,6 +1462,8 @@ impl Delivery<'_> {
 /// Why handling a message failed.
 #[derive(Debug, thiserror::Error)]
 enum PipelineError {
+    #[error("the turn isn't the owner's own, so it can't run on the agent's private side")]
+    NotTheOwnersTurn,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -1379,6 +1493,113 @@ impl Sink<InboundEvent> for PipelineSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever a decision says, only the owner's own turn, on the owner's
+    /// side and credential, answering the owner's own message in a
+    /// one-to-one DM, resolves to the agent's private scope, and an
+    /// owner-side turn resolves nowhere else.
+    #[test]
+    fn a_non_owners_turn_never_resolves_to_the_private_scope() {
+        let owner = MemberId::new_v4();
+        let other = MemberId::new_v4();
+        let conv = core_types::ConvRef {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            conversation: "C1".into(),
+        };
+        let requester_key: MemberKey = "slack:T1:U1".parse().unwrap();
+        let someone_else: MemberKey = "slack:T1:U2".parse().unwrap();
+        let mut checked = 0;
+        let mut private = 0;
+        for requester in [Some(owner), Some(other), None] {
+            for credential in [
+                CredentialRef::Member(owner),
+                CredentialRef::Member(other),
+                CredentialRef::Community,
+            ] {
+                for scope in [
+                    ScopeKind::Private,
+                    ScopeKind::Channel,
+                    ScopeKind::GroupDm,
+                    ScopeKind::Dm,
+                ] {
+                    for side in [Side::Owner, Side::Public] {
+                        for conv_kind in [ConvKind::Dm, ConvKind::GroupDm, ConvKind::Channel] {
+                            for sender in [&requester_key, &someone_else] {
+                                for (sender_is_bot, bot_user) in
+                                    [(false, false), (true, false), (true, true), (false, true)]
+                                {
+                                    let turn = Run {
+                                        requester: Requester {
+                                            member: requester,
+                                            key: requester_key.clone(),
+                                        },
+                                        hop: Hop::ZERO,
+                                        credential,
+                                        scope,
+                                        side,
+                                    };
+                                    let event = InboundEvent {
+                                        event_id: "e".into(),
+                                        binding: core_types::BindingId::new_v4(),
+                                        sender: sender.clone(),
+                                        sender_is_bot,
+                                        sender_bot_user: bot_user.then(|| sender.user.clone()),
+                                        conv: conv.clone(),
+                                        conv_kind,
+                                        thread_root: None,
+                                        message: MsgRef {
+                                            conv: conv.clone(),
+                                            id: "1.0".into(),
+                                        },
+                                        text: String::new(),
+                                        mentions: Vec::new(),
+                                        reply_to: None,
+                                        files: Vec::new(),
+                                        received_at: OffsetDateTime::UNIX_EPOCH,
+                                    };
+                                    let resolved = turn_scope(&turn, owner, &event);
+                                    let owners_own = requester == Some(owner)
+                                        && credential == CredentialRef::Member(owner)
+                                        && side == Side::Owner
+                                        && scope == ScopeKind::Private
+                                        && conv_kind == ConvKind::Dm
+                                        && *sender == requester_key
+                                        && !sender_is_bot
+                                        && !bot_user;
+                                    let case = format!(
+                                        "{requester:?} {credential:?} {scope:?} {side:?} \
+                                         {conv_kind:?} {sender} bot={sender_is_bot}/{bot_user}"
+                                    );
+                                    assert_eq!(
+                                        resolved == Some(ScopeKey::Private),
+                                        owners_own,
+                                        "{case}"
+                                    );
+                                    if side == Side::Owner {
+                                        assert!(resolved.is_none() || owners_own, "{case}");
+                                    }
+                                    if let Some(resolved) = resolved
+                                        && !owners_own
+                                    {
+                                        assert_eq!(
+                                            resolved,
+                                            ScopeKey::for_conversation(conv_kind, conv.clone()),
+                                            "a public turn runs in the conversation's own scope: {case}"
+                                        );
+                                    }
+                                    private += usize::from(owners_own);
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 3 * 4 * 2 * 3 * 2 * 4);
+        assert_eq!(private, 1, "exactly one combination is the owner's own DM");
+    }
 
     #[test]
     fn a_long_reply_is_cut_on_a_character_boundary_with_a_note() {

@@ -190,8 +190,8 @@ pub struct TurnStats {
     pub duration: Duration,
 }
 
-/// What kind of failure an error result is. T26 turns these into
-/// member-facing messages.
+/// What kind of failure an error result is. agentd tells the thread, and
+/// the turn's requester, which it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     /// The credential's rate limit, usage limit or credit is used up.
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn only_the_given_tools_are_named() {
         let value = |text: &str| Value::String(text.to_owned());
-        for tool in ["Bash", "Read", "Edit", "Write", "Glob", "Grep"] {
+        for tool in ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Skill"] {
             assert_eq!(tool_name(Some(&value(tool))), tool);
         }
         for other in ["bash", "Task", "sk-ant-api03-secret", "", "Bash,Read"] {

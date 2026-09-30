@@ -426,7 +426,16 @@ async fn an_agents_message_reaches_the_pipeline_with_its_bot_sender_looked_up() 
         StatusCode::OK
     );
     let auth = Arc::new(auth::Auth::new(auth::OAuthConfig::default(), h.store.clone()).unwrap());
-    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None, None);
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(h.store.clone(), "/nonexistent/agentd".into(), git);
+    let commands = Commands::new(
+        h.store.clone(),
+        auth,
+        Replies::default(),
+        None,
+        None,
+        skills,
+    );
     let (_intake, submitter) = CommandIntake::new(commands);
     let (messages, worker) = Messages::new(h.agents.bots().clone());
     let inbound = Inbound::new(

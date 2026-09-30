@@ -309,7 +309,7 @@ So a turn always runs on the credential of the person who caused it.
 | The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests runs without a consent card (see below) |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
 | A private task requested during a non-owner's turn | Owner's private sandbox | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
-| Unlinked member | Channel | Community API key if configured, otherwise a "link your account" reply | Public side only |
+| Unlinked member | Channel | Community API key if configured, otherwise a "link your account" DM from the manager bot | Public side only |
 | Agent to agent | Thread | The requester of the turn whose message mentioned the agent | Public side only, hop-capped |
 
 ### Agent-to-agent attribution
@@ -385,9 +385,10 @@ flowchart TD
     O -- yes --> OC["Owner credential,<br/>conversation's scope"]
     O -- no --> L{"Requester linked?"}
     L -- yes --> RQ["Requester credential,<br/>channel scope"]
+    L -- "broken" --> RL["DM from the manager bot:<br/>link your account again"]
     L -- no --> K{"Community API key?"}
     K -- yes --> CK["Community key,<br/>channel scope"]
-    K -- no --> LK["Reply: link your account"]
+    K -- no --> LK["DM from the manager bot:<br/>link your account"]
 ```
 
 Response gating is deterministic: an explicit mention, a reply to the agent's
@@ -403,7 +404,8 @@ CLI run per message, so agent-core does not do it.
 A DM counts only for the agent whose bot received it, so another agent
 mentioned in someone's DM with a different bot never answers there. The
 owner's turns run only on the owner's credential: an owner without a linked
-account gets the link prompt, never the community key. Refusals (a paused
+account gets the link prompt, never the community key. Nor does anyone whose
+link broke: they are asked to link again, and nothing runs until they do. Refusals (a paused
 agent, a banned requester, the agent's deny rules, the hop cap) apply only to
 messages that pass the gate above, so an unaddressed message never draws a
 notice, and they come before the credential, so nobody is offered a link
@@ -589,7 +591,25 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
 | `agentctl private <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless the owner is this turn's requester. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
-One bundled skill documents `agentctl`. Its token is one per `claude`
+An agent's skills are directories in agentd's data directory,
+`skills/<agent>/<name>/`, which every session of the agent mounts read-only
+as its `$CLAUDE_CONFIG_DIR/skills`. The owner adds one with `/agent skill
+add` from an `https://` Git repository (cloned by agentd, shallow, with no
+submodules, only from hosts that resolve to public addresses) or from a
+`SKILL.md` or `.zip` attached to the manager bot's DM. agentd checks it
+before it is used: sizes, plain file names, no symlinks or special files,
+and a `SKILL.md` with `name` and `description` front matter. A skill may
+declare `allowed-hosts:` in its front matter; it is held back until the
+owner confirms those hosts with `/agent skill confirm`, and they then extend
+the egress allowlist for that agent's sandboxes only, never to
+`api.anthropic.com` or private and metadata addresses. Skills reach a
+conversation when its process next starts; removing one refuses new
+connections to its hosts at once, and connections already open end within
+the egress proxy's idle and lifetime limits. Claude Code shows the model
+its skills only when the `Skill` tool is enabled, so the launch flags
+enable it.
+
+One bundled skill documents `agentctl`, and every agent has it. Its token is one per `claude`
 process, scoped to one agent, scope and session, and bound to the session's
 container: agentd refuses a request from any other source address. A warm
 process's environment is fixed at start, so a token can't be issued per turn.
@@ -603,7 +623,7 @@ Launch flags:
 
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose \
-  --tools "Bash,Read,Edit,Write,Glob,Grep" --strict-mcp-config \
+  --tools "Bash,Read,Edit,Write,Glob,Grep,Skill" --strict-mcp-config \
   --setting-sources user --permission-mode bypassPermissions \
   --append-system-prompt-file /agent/persona.md \
   --session-id <uuid> | --resume <uuid>
@@ -636,7 +656,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent slack-token <token> <refresh token>` | Linked member on Slack | Register the app configuration token used to create agent apps |
 | `/agent create <name> [persona]` | Linked member | Create the identity and a default persona |
 | `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
-| `/agent skill add <name> <source>`, `/agent skill rm <name> <skill>` | Owner | Manage skills |
+| `/agent skill add <name> [source]`, `/agent skill confirm <name> <skill>`, `/agent skill rm <name> <skill>` | Owner | Manage skills; confirm the hosts a skill asks for |
 | `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where |
 | `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
@@ -662,6 +682,7 @@ erDiagram
     AGENT ||--o{ VOLUME : uses
     MEMBER ||--o{ USAGE : accrues
     MEMBER ||--o{ SLACK_CONFIG_TOKEN : registers
+    AGENT ||--o{ AGENT_SKILL : has
     PENDING_LOGIN }o--|| MEMBER : for
     AGENT ||--o{ CONSENT : requests
 
@@ -732,6 +753,12 @@ erDiagram
         text scope_key
         text path
     }
+    AGENT_SKILL {
+        text name
+        text state
+        text source
+        text hosts
+    }
     USAGE {
         date day
         int turns
@@ -740,6 +767,16 @@ erDiagram
         text state
         bytes verifier_enc
         timestamp expires_at
+    }
+    COMMUNITY_SETTINGS {
+        bytes api_key_enc
+        text api_key_changed_by
+        timestamp api_key_changed_at
+    }
+    FAILURE_NOTICE {
+        text requester
+        text kind
+        timestamp sent_at
     }
 ```
 
@@ -763,6 +800,8 @@ for Rocket.Chat bindings.
 | Private files left behind for later channel turns | Private resources only run in the owner's private sandbox. Channel sandboxes never mount them. |
 | Concurrent threads corrupt a shared checkout | One working directory per session, a lock for the scope's shared paths. |
 | Model exfiltrates the real token | The real token never enters the sandbox. |
+| A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, name each host (no wildcards), apply to that agent only, and pass the same checks as configured rules. The `Skill` tool also loads `$CLAUDE_CONFIG_DIR/commands/*.md`, which the session may write, so an agent can plant commands for its own session; it can already write `CLAUDE.md` and `settings.json` there, so that grants nothing new. Under `--setting-sources user`, the working directory's `.claude/skills` and `CLAUDE.md` are not loaded. |
+| A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
 | Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |

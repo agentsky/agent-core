@@ -43,6 +43,14 @@ fn slack_key(user: &str) -> MemberKey {
     }
 }
 
+fn slack_channel(id: &str) -> ConvRef {
+    ConvRef {
+        surface: SurfaceKind::Slack,
+        team: TeamId::new(TEAM),
+        conversation: id.into(),
+    }
+}
+
 fn identity() -> ManagerIdentity {
     ManagerIdentity {
         team: TeamId::new(TEAM),
@@ -61,6 +69,7 @@ fn ok(body: Value) -> ResponseTemplate {
 
 struct SlackHarness {
     store: Store,
+    data: TempDir,
     commands: Commands,
     slack: MockServer,
     manager: SlackManager,
@@ -113,15 +122,20 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         identity(),
     );
     let replies = Replies::new(None).with_slack(Arc::new(manager.manager_bot()), client);
+    let data = TempDir::new();
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(store.clone(), data.0.clone(), git);
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
         replies,
         None,
         Some(manager.clone()),
+        skills,
     );
     SlackHarness {
         store,
+        data,
         commands,
         slack,
         manager,
@@ -138,11 +152,20 @@ impl SlackHarness {
         (url, path)
     }
 
-    /// Runs `/agent <text>` as `user` and returns the replies sent to its
-    /// `response_url`.
+    /// Runs `/agent <text>` as `user` in `C0CHAN001` and returns the
+    /// replies sent to its `response_url`.
     async fn slash(&self, user: &str, text: &str) -> Vec<String> {
+        self.slash_in(user, &slack_channel("C0CHAN001"), text).await
+    }
+
+    /// Runs `/agent <text>` as `user` in `conv` and returns the replies
+    /// sent to its `response_url`.
+    async fn slash_in(&self, user: &str, conv: &ConvRef, text: &str) -> Vec<String> {
         let (response_url, hook) = self.response_url();
-        let origin = Origin::SlackSlash { response_url };
+        let origin = Origin::SlackSlash {
+            response_url,
+            conv: conv.clone(),
+        };
         self.commands
             .handle_text(&slack_key(user), text, &origin, &[])
             .await;
@@ -445,7 +468,7 @@ async fn slack_token_needs_a_linked_member_on_slack() {
         team: TeamId::new("chat.example.org"),
         user: UserId::new("alice"),
     };
-    let reply = h
+    let (reply, _) = h
         .commands
         .run(
             &rocketchat,
@@ -467,8 +490,10 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
             .await
             .unwrap();
     let auth = Arc::new(Auth::new(OAuthConfig::default(), store.clone()).unwrap());
-    let commands = Commands::new(store, auth, Replies::default(), None, None);
-    let reply = commands
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(store.clone(), "/nonexistent/agentd".into(), git);
+    let commands = Commands::new(store, auth, Replies::default(), None, None, skills);
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse(&format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}")).unwrap(),
@@ -835,11 +860,7 @@ fn slash(text: &str, response_url: SecretString) -> SlashCommand {
     SlashCommand {
         binding: BindingRef::MANAGER_ID,
         sender: slack_key("U0HUMAN01"),
-        conv: ConvRef {
-            surface: SurfaceKind::Slack,
-            team: TeamId::new(TEAM),
-            conversation: "C0CHAN001".into(),
-        },
+        conv: slack_channel("C0CHAN001"),
         command: "/agent".to_owned(),
         text: text.to_owned(),
         response_url,
@@ -997,7 +1018,14 @@ fn only_agent_slash_commands_are_taken_and_their_text_is_decoded() {
         slash_command(slash("persona helper a &lt;b&gt; &amp;amp; c", url.clone())).unwrap();
     assert_eq!(member, slack_key("U0HUMAN01"));
     assert_eq!(text, "persona helper a <b> &amp; c");
-    assert!(matches!(origin, Origin::SlackSlash { .. }));
+    let Origin::SlackSlash { conv, .. } = &origin else {
+        panic!("{origin:?}");
+    };
+    assert_eq!(*conv, slack_channel("C0CHAN001"));
+    assert_eq!(
+        origin.conversation(&member),
+        Some(slack_channel("C0CHAN001"))
+    );
     let mut other = slash("me", url);
     other.command = "/other".to_owned();
     assert!(slash_command(other).is_none());
@@ -1005,11 +1033,17 @@ fn only_agent_slash_commands_are_taken_and_their_text_is_decoded() {
 
 #[test]
 fn a_manager_dm_is_parsed_whole_or_after_a_prefix() {
-    let (member, text, origin) = dm_command(
-        &dm_event("U0HUMAN01", "persona helper &lt;b&gt;"),
-        &identity(),
-    )
-    .unwrap();
+    let mut event = dm_event("U0HUMAN01", "persona helper &lt;b&gt;");
+    let file = core_types::InFile {
+        id: "F1".into(),
+        name: "persona.md".into(),
+        mime_type: None,
+        size: Some(3),
+        url: "https://files.slack.com/files-pri/T0TEAM-F1/download/persona.md".into(),
+    };
+    event.files = vec![file.clone()];
+    let (member, text, origin, files) = dm_command(&event, &identity()).unwrap();
+    assert_eq!(files, [file]);
     assert_eq!(member, slack_key("U0HUMAN01"));
     assert_eq!(text, "persona helper <b>");
     assert_eq!(
@@ -1017,7 +1051,8 @@ fn a_manager_dm_is_parsed_whole_or_after_a_prefix() {
         r#"SlackDm { channel: ConversationId("D0DM00001") }"#
     );
     assert!(origin.is_private());
-    let (_, text, _) = dm_command(&dm_event("U0HUMAN01", "!agent me"), &identity()).unwrap();
+    let (_, text, _, files) = dm_command(&dm_event("U0HUMAN01", "!agent me"), &identity()).unwrap();
+    assert!(files.is_empty());
     assert_eq!(text, "me");
 }
 
@@ -1398,4 +1433,349 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     global_logs().snapshot().assert_lacks("SECRET");
     h.store.close().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A new temporary directory, removed on drop.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("agentd-slack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
+    let h = slack_harness().await;
+    let data = &h.data;
+    let commands = h.commands.clone();
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let skill = "---\nname: notes\ndescription: Keep notes.\n---\nWrite them down.\n";
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F1/download/SKILL.md"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {BOT_TOKEN}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(skill))
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F2/download/persona.md"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("You are brief.\n"))
+        .mount(&h.slack)
+        .await;
+    let file = |id: &str, name: &str, size: usize| core_types::InFile {
+        id: id.into(),
+        name: name.into(),
+        mime_type: None,
+        size: Some(u64::try_from(size).unwrap()),
+        url: format!("{}/files-pri/T0TEAM001-{id}/download/{name}", h.slack.uri()),
+    };
+    let dm = Origin::SlackDm {
+        channel: "D0DM00001".into(),
+    };
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("skill add helper").unwrap(),
+            &dm,
+            &[file("F1", "SKILL.md", skill.len())],
+        )
+        .await;
+    assert_eq!(
+        reply,
+        "Added the skill `notes` to `helper`. Its conversations use it from their next start."
+    );
+    let installed = runner::skills_dir(&data.0, agent.id).join("notes/SKILL.md");
+    assert_eq!(std::fs::read_to_string(installed).unwrap(), skill);
+
+    let too_big = file("F3", "SKILL.md", 10 * 1024 * 1024);
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("skill add helper").unwrap(),
+            &dm,
+            &[too_big],
+        )
+        .await;
+    assert_eq!(reply, "That file is over the 256 KB limit.");
+
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("persona helper").unwrap(),
+            &dm,
+            &[file("F2", "persona.md", 15)],
+        )
+        .await;
+    assert!(reply.starts_with("Replaced `helper`'s persona."), "{reply}");
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "You are brief.\n");
+
+    let (response_url, _) = h.response_url();
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("skill add helper").unwrap(),
+            &Origin::SlackSlash {
+                response_url,
+                conv: slack_channel("C0CHAN001"),
+            },
+            &[file("F1", "SKILL.md", skill.len())],
+        )
+        .await;
+    assert!(
+        reply.starts_with("Give the skill's https:// Git URL"),
+        "a slash command carries no files: {reply}"
+    );
+}
+
+#[tokio::test]
+async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F9/download/persona.md"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Via the DM.\n"))
+        .mount(&h.slack)
+        .await;
+    let (intake, submitter) = CommandIntake::new(h.commands.clone());
+    let inbound = Sender::new(Inbound::new(h.store.clone(), Some(identity()), submitter));
+    let running = tokio::spawn(intake.run());
+    let mut event = dm_event("U0HUMAN01", "persona helper");
+    event.files = vec![core_types::InFile {
+        id: "F9".into(),
+        name: "persona.md".into(),
+        mime_type: None,
+        size: Some(12),
+        url: format!(
+            "{}/files-pri/T0TEAM001-F9/download/persona.md",
+            h.slack.uri()
+        ),
+    }];
+    inbound
+        .send(SlackInbound::Message(
+            Box::new(event),
+            InFlight::untracked(),
+        ))
+        .await
+        .unwrap();
+    drop(inbound);
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "Via the DM.\n");
+}
+
+#[tokio::test]
+async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channel() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the agent was created");
+    };
+    let mut sessions = Vec::new();
+    for (channel, root) in [
+        ("C0CHAN001", "1727700000.000100"),
+        ("C0OTHER01", "1727700001.000200"),
+    ] {
+        let thread = core_types::ThreadKey {
+            conv: slack_channel(channel),
+            root: Some(root.into()),
+        };
+        let scope =
+            core_types::ScopeKey::for_conversation(ConvKind::Channel, slack_channel(channel));
+        let session = h
+            .store
+            .session_for_thread(agent.id, &thread, &scope, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .session;
+        h.store
+            .record_session_turn(session.id, true, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        sessions.push(session.id);
+    }
+    for thread in [
+        core_types::ThreadKey {
+            conv: slack_channel("D0BOBSDM1"),
+            root: None,
+        },
+        core_types::ThreadKey {
+            conv: slack_channel("C0CHAN001"),
+            root: Some("1727700002.000300".into()),
+        },
+    ] {
+        let task = h
+            .store
+            .create_private_session(
+                agent.id,
+                core_types::ConsentId::new_v4(),
+                &thread,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        h.store
+            .record_session_turn(task.id, true, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+    }
+
+    let listed = h.slash("U0HUMAN01", "sessions helper").await.remove(0);
+    for link in [
+        "https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/C0CHAN001-1727700000.000100",
+        "https://app.slack.com/client/T0TEAM001/C0OTHER01/thread/C0OTHER01-1727700001.000200",
+    ] {
+        assert!(listed.contains(link), "{listed}");
+    }
+    assert!(listed.starts_with("`helper`'s 4 sessions"), "{listed}");
+    let tasks: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.contains("A private task"))
+        .collect();
+    assert_eq!(tasks.len(), 2, "{listed}");
+    for task in tasks {
+        assert!(
+            !task.contains("https://"),
+            "a private task has no link: {task}"
+        );
+    }
+    assert!(!listed.contains("D0BOBSDM1"), "{listed}");
+    assert!(
+        listed.ends_with(
+            "Start them all over with `/agent reset helper`, or one conversation's with \
+             `/agent reset helper here` there."
+        ),
+        "{listed}"
+    );
+
+    let (in_dm, _) = h
+        .commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("reset helper here").unwrap(),
+            &Origin::SlackDm {
+                channel: "D0DM00001".into(),
+            },
+            &[],
+        )
+        .await;
+    assert_eq!(
+        in_dm,
+        "`reset helper here` resets the conversation it is sent in, and no agent answers in \
+         this one. Send `/agent reset helper here` in the conversation to reset, or \
+         `reset helper` here to reset them all."
+    );
+    let slashed_in_dm = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("D0DM00001"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(
+        slashed_in_dm,
+        [
+            "`reset helper here` resets the conversation it is sent in, and no agent answers in \
+          this one. Send `/agent reset helper here` in the conversation to reset, or \
+          `/agent reset helper` here to reset them all."
+        ]
+    );
+    let in_agents_dm = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("D0AGENTS1"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(in_agents_dm, ["`helper` has no session here to reset."]);
+
+    let replies = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("C0CHAN001"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(
+        replies,
+        [
+            "Resetting `helper`'s session here: the next message in it starts a new \
+          conversation. If it is running a turn, it resets once that turn ends. If it can't be \
+          reset, I'll tell you in a direct message."
+        ]
+    );
+    let reset_at = async |id| h.store.session(id).await.unwrap().unwrap().reset_at;
+    assert!(reset_at(sessions[0]).await.is_some());
+    assert!(reset_at(sessions[1]).await.is_none());
 }

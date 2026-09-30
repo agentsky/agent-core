@@ -10,12 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentd::commands::Origin;
 use agentd::ctl::SurfaceLookup;
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
     Turns, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
 };
 use agentd::server::{Routers, Server};
+use agentd::skills::{Added, Confirmed, Source};
 use agentd::{App, Config};
 use core_types::{
     AgentId, Binding, BindingId, Caps, ConvKind, ConvRef, Cursor, InboundEvent, MemberId,
@@ -199,6 +201,7 @@ impl Surface for Held {
 struct Stack {
     app: App,
     pipeline: Pipeline,
+    turns: Turns,
     mock: Arc<MockSurface>,
     holds: Arc<Holds>,
     script: PathBuf,
@@ -377,7 +380,7 @@ async fn start_with(setup: Setup) -> Stack {
     (setup.pipeline)(&mut pipeline_settings);
     let pipeline = Pipeline::new(
         store.clone(),
-        turns,
+        turns.clone(),
         Arc::clone(app.surfaces()),
         app.commands().replies().clone(),
         pipeline_settings,
@@ -393,6 +396,7 @@ async fn start_with(setup: Setup) -> Stack {
     Stack {
         app,
         pipeline,
+        turns,
         mock,
         holds,
         script,
@@ -702,6 +706,62 @@ async fn a_mention_runs_a_turn_and_the_reply_is_delivered_in_the_thread() {
     assert_eq!(bobs.requester.key, key("bob"));
     assert_ne!(bobs.session, first_session);
 
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn skills_are_in_every_session_and_their_confirmed_hosts_extend_egress() {
+    let stack = start().await;
+    let skill =
+        "---\nname: docs\ndescription: Read the docs.\nallowed-hosts: [docs.skill.invalid]\n---\n";
+    let added = stack
+        .app
+        .skills()
+        .add(
+            stack.agent,
+            Source::Upload {
+                name: "SKILL.md",
+                bytes: skill.as_bytes(),
+            },
+            stack.alice,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(added, Added::Pending(_)), "{added:?}");
+    assert!(matches!(
+        stack
+            .app
+            .skills()
+            .confirm(stack.agent, "docs")
+            .await
+            .unwrap(),
+        Confirmed::Active(_)
+    ));
+
+    let probe = "{ ls \"$CLAUDE_CONFIG_DIR/skills\"; sed -n 2p \"$CLAUDE_CONFIG_DIR/skills/docs/SKILL.md\"; \
+                 for host in docs.skill.invalid other.skill.invalid; do \
+                 curl -s -o /dev/null -w '%{http_connect}\\n' --proxy \"$ANTHROPIC_BASE_URL\" \"https://$host/\"; \
+                 done; } > skills.txt 2>&1; agentctl attach skills.txt";
+    stack.next_turn(Turn::reply("Checked.").with_command(["sh", "-c", probe]));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "s1", None, &[BOT]))
+        .await;
+    let calls = stack.calls_since(0);
+    let uploaded = calls
+        .iter()
+        .find_map(|call| match call {
+            Call::Upload { files, .. } => {
+                Some(String::from_utf8(files[0].contents.clone()).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no upload: {calls:#?}"));
+    assert_eq!(
+        uploaded, "agentctl\ndocs\nname: docs\n502\n403\n",
+        "both skills are in the session; the skill's host passes the allowlist and fails only \
+         to resolve, another host is refused"
+    );
     stack.stop().await;
 }
 
@@ -1648,6 +1708,108 @@ async fn only_an_attributed_post_of_the_bot_is_shown_as_from_outside_the_session
         bodies[0].contains("] you, outside this session: a private task's result"),
         "{}",
         bodies[0]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn reset_here_stops_the_warm_process_and_the_next_turn_starts_a_new_id() {
+    let stack = start().await;
+    let argv = stack.script.with_file_name("argv");
+    let record = format!(
+        "tr '\\0' ' ' < /proc/$PPID/cmdline >> {0}; echo >> {0}",
+        argv.display()
+    );
+    stack.next_turn(Turn::reply("First.").with_command(["sh", "-c", record.as_str()]));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "u1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1);
+    let old = stack.session_of(&sent[0].2).await;
+    assert!(stack.turns.sessions().is_warm(old));
+    let launched = std::fs::read_to_string(&argv).unwrap();
+    assert!(
+        launched.contains(&format!("--session-id {old}")),
+        "{launched}"
+    );
+
+    let elsewhere = Origin::RocketChatChannel {
+        room: "RANDOM".into(),
+    };
+    let commands = stack.app.commands();
+    commands
+        .handle_text(
+            &key("bob"),
+            "reset helper here",
+            &Origin::RocketChatChannel {
+                room: "GENERAL".into(),
+            },
+            &[],
+        )
+        .await;
+    commands
+        .handle_text(&key("alice"), "reset helper here", &elsewhere, &[])
+        .await;
+    assert!(
+        stack.turns.sessions().is_warm(old),
+        "neither reset reached the thread"
+    );
+    assert_eq!(
+        stack.store().session(old).await.unwrap().unwrap().reset_at,
+        None
+    );
+
+    let here = Origin::RocketChatChannel {
+        room: "GENERAL".into(),
+    };
+    commands
+        .handle_text(&key("alice"), "reset helper here", &here, &[])
+        .await;
+    assert!(
+        !stack.turns.sessions().is_warm(old),
+        "the reset stopped the warm process"
+    );
+    assert!(
+        stack
+            .store()
+            .session(old)
+            .await
+            .unwrap()
+            .unwrap()
+            .reset_at
+            .is_some()
+    );
+
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "u2",
+            Some("u1"),
+            &[BOT],
+        ))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].1, "First.",
+        "the new session's transcript starts over"
+    );
+    let new = stack.session_of(&sent[0].2).await;
+    assert_ne!(new, old);
+    let row = stack.store().session(new).await.unwrap().unwrap();
+    assert_eq!(row.thread.root, Some("u1".into()), "the same thread");
+    let launched = std::fs::read_to_string(&argv).unwrap();
+    let last = launched.lines().last().unwrap();
+    assert!(last.contains(&format!("--session-id {new}")), "{launched}");
+    assert!(!last.contains("--resume"), "{launched}");
+    assert_eq!(
+        launched.lines().count(),
+        2,
+        "one process per session: {launched}"
     );
     stack.stop().await;
 }

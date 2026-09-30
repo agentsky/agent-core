@@ -2327,9 +2327,10 @@ twice an hour, not every minute, until it is fixed or deleted.
 **Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
 failed under CPU load, always at "the pass retired the bot": 1 of 200
 runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
-server to count no connections, then read the binding once. A pass stops a connection by signalling its task, which
-closes the socket on its own while the pass goes on to `abandon_stale` and
-`retire_pending`, so the socket can close before `mark_retired` runs.
+server to count no connections, then read the binding once. A pass stops a
+connection by signalling its task, which closes the socket on its own while
+the pass goes on to `abandon_stale` and `retire_pending`, so the socket can
+close before `mark_retired` runs.
 Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
 The order can also flip: a delete that lands between a pass's `reconcile`
 and its `retire_pending` is retired by that pass and disconnected by the
@@ -2349,8 +2350,36 @@ and sent `users.create`", and a 300 ms response delay for "the abandonment
 lands before the response". Adding 150 ms before the username is recorded
 failed it 10 of 10 runs. Its `users.create` response is now held until the
 test has abandoned the creation, so the abandonment always lands while the
-request is in flight; it passes 10 of 10 with the 150 ms added. The tests install no tracing subscriber, so
-`RUST_LOG` doesn't change their timing.
+request is in flight; it passes 10 of 10 with the 150 ms added.
+
+The hold is `testkit::Held`, and the other tests that slept and assumed a
+delayed response was still on its way now use it too: the auth tests that
+act during a refresh, the command test that expects a second member's reply
+while the first member's login is out, and the Slack test that changes the
+managed bots during a member refresh. Each waits for its request to arrive,
+acts, then releases the response, and fails after 30 seconds rather than
+hanging when the request never comes. The logout test only waits for its
+refresh to arrive: logout queues behind that refresh on the member's lock,
+so holding the response would deadlock, and either order ends the same.
+
+`concurrent_callers_share_a_failed_refresh_of_an_expired_token` needed more
+than a hold. Its five callers must all join the refresh before the 503
+lands; one that joins later finds no refresh in flight and starts its own,
+which sends a second request. That is the intended behaviour, not a
+bug: T09's notes say an expired token is always retried because there is
+nothing to hand out instead, and the backoff only covers a still-valid
+token. `Auth` had no observable point where every caller had joined, so the
+200 ms response delay was the only margin, and 300 ms added before callers
+2 to 5 start failed the test 10 of 10 runs. The in-flight map now holds the
+refresh's `watch::Sender` rather than a receiver, and a doc-hidden
+`Auth::refresh_waiters(member)` returns its receiver count, which is the
+number of callers waiting. The test holds the 503, waits until that count
+reaches 5, then releases it. It passes 10 of 10 runs with the 300 ms added
+and 200 of 200 with 8 busy loops. The map's sender would keep the channel
+open if the refresh task were dropped before it first ran, so the guard that
+removes the map entry now goes into the task when it is spawned, not on its
+first poll. Waiters of such a task get `RefreshInterrupted`, and the next
+caller starts a new refresh.
 
 ### Before turns, a bot reacts instead of replying
 
@@ -4173,6 +4202,1159 @@ turn when it has no answer. The trait's rustdoc lists every lookup `route`
 may make for an event, in order, so T23 knows what to load, and T23's and
 T27's plan text say what they fill.
 
+## T23: Turn pipeline end to end
+
+### One row per session and one attribution per post
+
+**Issue.** The plan made `message_refs` unique on `(surface, team_id,
+conversation, platform_ref)` and gave every row a per-session short id. A
+message then has at most one row, in one session, but an inbound message
+mentioning two agents is shown to both agents' sessions, and a private
+task's result, posted from the private session, is later shown to the
+channel session. Only the first session could have given the model a short
+id for it.
+
+**Solution.** A row belongs to its session: `(session_id, short_id)` is the
+key, and `(session_id, surface, team_id, conversation, platform_ref)` is
+unique, so a message has at most one short id per session and keeps it.
+What must be unique across sessions is the attribution, so a partial unique
+index covers `(surface, team_id, conversation, platform_ref)` where
+`agent_id` is set: agentd records each message it posts once, with the
+agent, turn, requester and hop, and `Store::posted_message_ref` reads that
+row. A session that is shown a message agentd posted elsewhere records its
+own row without `agent_id`. A session shown its own post before recording
+it as posted keeps that row and short id, and recording the post gives the
+row the agent, turn, requester and hop in the same transaction rather than
+returning it unchanged, which would lose the attribution; the partial index
+still refuses it when another session's row attributes the message. An
+inbound row's requester is the message's sender, with hop 0, so the columns
+the plan lists stay required. The next
+short id is taken inside the insert, in one `BEGIN IMMEDIATE` transaction;
+a test with sixteen concurrent inserts on a file database gets 1 to 16.
+`Store::posted_elsewhere` finds the agent's posts in a thread that the
+session hasn't recorded yet, which is what the turn message builder (T23b)
+shows once and then records.
+
+### `process_stopping` revokes the process, not the session
+
+**Issue.** The plan has `process_stopping` call `Registry::revoke_session`.
+T21 gave every hook the process's own `Process` value so that a late call
+for an old process, as when Docker reports an old container's death after
+the session started a new one, never touches the new one.
+`revoke_session` would revoke the new process's placeholder too.
+
+**Solution.** `process_stopping` revokes the process's own placeholder with
+`Registry::revoke(PlaceholderId)` and its own agentctl token. A session
+runs one process at a time, so this is the session's last placeholder,
+and `revoke` then drops the session's watch sender, which closes its
+egress tunnels exactly as `revoke_session` would. A test stops an old
+process after a new one started and the new placeholder still works. A
+second call is harmless: both revocations find nothing.
+
+### The hooks check the turn's side
+
+**Issue.** The hooks took `TurnRequest::side` as given, but the owner's
+side, which agentctl's target rules and the private volume's mounts grant
+more to, belongs to the agent's private session only (the owner's DM and
+the owner's private tasks). A wrong side from the pipeline would have
+granted it in a channel.
+
+**Solution.** `turn_starting` refuses `Side::Owner` unless the session's
+scope is `ScopeKey::Private`, before it points the placeholder or records
+the turn, so the turn fails and its `turn_finished` finds nothing to clear.
+`turn_finished` unpoints the placeholder, which can't fail, before it
+awaits `Ctl::end_turn`, so the credential stops being reachable first.
+
+### A resumed process restores the session's total cost
+
+**Issue.** T20 left open whether the first result of a `--resume`d process
+reports a `total_cost_usd` counted from 0; the runner's per-turn `cost_usd`
+assumed so, and T23's live check was to find out.
+
+**Solution.** It doesn't. The native 2.1.285 build in a stand-in for the
+sandbox image (Debian with `/opt/claude-code/bin/claude` copied in, since
+the real image's download is blocked here), run by
+`docker_real_claude_starts` against `fake_anthropic()`, reported 0.0001 for
+a turn, and 0.0002 for the same usage on the first turn after the process
+was stopped and the session resumed. The CLI appends a line
+`{"type":"cost-state","totalCostUSD":…,"modelUsage":{…}}` to the transcript
+when a process exits, none while it runs (a warm process's second turn left
+none), and on `--resume` restores the total from the last one. A process
+that is killed writes none, so the restored total is the session's total as
+of its last clean exit.
+
+The runner's `cost_usd` for such a turn therefore holds the restored total
+too. Nothing reads it yet, so the runner only says so in its rustdoc, and
+the Docker test pins the behavior: it fails if the resumed total stops
+being the sum. T27, which meters cost, takes the restored total off, from
+the transcript's last `cost-state` line (read without following links, with
+its size capped: the transcript is agent-writable, but the CLI restores
+from the same line, so the difference is still the turn's cost) or from a
+total the runner keeps in `sessions` when a process exits cleanly. The
+plan's T27 says so.
+
+### The real `claude` test serves the proxy on the network's gateway
+
+**Issue.** The plan's `docker_real_claude_starts` used a network that isn't
+internal and `host-gateway`, so the container could reach the proxy in the
+test process. `DockerSandbox` refuses a network that isn't internal unless
+told otherwise for tests, and gives the container no `extra_hosts`.
+
+**Solution.** The test creates an internal network without `inhibit_ipv4`,
+on whose bridge the host holds the gateway address (T16's note on internal
+networks), and serves the proxy there, as T19's Docker test does.
+`ANTHROPIC_BASE_URL` names the gateway's address, and `NO_PROXY` names it
+too, since the hooks set the egress proxy variables. Nothing else routes
+out, so the test also shows that the CLI needs no direct traffic. The CLI
+runs through the runner and agentd's hooks, with a community API key
+placeholder, and the test asserts the read-only root, the transcript at
+`$CLAUDE_CONFIG_DIR/projects/<id>/<id>.jsonl` holding both turns, a
+`--resume` start for the second, and that every request the fake saw came
+through the proxy with the swapped key. On CI the sandbox runs as the test
+process's own uid, which has no entry in the image's `/etc/passwd`, and the
+CLI ran there all the same; locally, as root, it ran as 10001.
+
+### The native CLI honors `NO_PROXY`
+
+**Issue.** T19 saw the npm build send `ANTHROPIC_BASE_URL` traffic straight
+to the base URL when `NO_PROXY` named it, and left the native build to
+T23's live check.
+
+**Solution.** In the same stand-in image, with `HTTP_PROXY` pointing at the
+unresolvable `cred-proxy.internal:8080`, the native 2.1.285 build reached
+the base URL directly when `NO_PROXY` named its address, and when
+`NO_PROXY` named only `cred-proxy.internal,agentctl.internal` it sent the
+request to the proxy and retried until the turn timed out. So the proxy
+variables reach it, and agentd's sandboxes, whose base URL is
+`cred-proxy.internal`, work as T19 expects.
+
+### Sandboxes reach agentd by name, not by configuration
+
+**Issue.** `runner::ProcessConfig` takes `ANTHROPIC_BASE_URL`, and agentctl
+reads `AGENTCTL_URL`. As configuration, a base URL whose host isn't in the
+egress environment's `NO_PROXY` would send the CLI's API traffic to the
+egress proxy, which refuses it.
+
+**Solution.** `[runner]` has only `claude_bin`, `turn_timeout_secs` and the
+pool's keys. Processes always get `cred_proxy::PROXY_URL`
+(`http://cred-proxy.internal:8080`) and `pipeline::AGENTCTL_URL`
+(`http://agentctl.internal:8081`), the names `NO_PROXY` lists, so the
+deployment gives agentd those aliases on the sandbox network and keeps
+those ports, as the Compose file does; the example configuration and the
+README say so. Tests, which serve the listeners on port 0, build
+`TurnSettings` themselves with the bound addresses and a `NO_PROXY` naming
+them, and name `fake-claude`'s script and `agentctl`'s directory in
+`TurnSettings::env`, which is added after the egress variables and holds
+no secret. agentd sets nothing there.
+
+With `[sandbox]` set, the ports are therefore not a choice:
+`internal.proxy_listen` must use `cred_proxy::PROXY_URL`'s port and
+`internal.ctl_listen` `pipeline::AGENTCTL_URL`'s, both read from the
+constants, or the configuration is refused naming the key. Any other port,
+0 included, would be one sandboxes never try and `isolate-sandbox.sh`
+doesn't let through. Tests that bind port 0 have no `[sandbox]`.
+
+### Plain HTTP upstreams only on loopback
+
+**Issue.** `[proxy] upstream` took any `http://` URL, so a mistyped
+upstream would send members' real credentials over the network
+unencrypted.
+
+**Solution.** `Upstream::parse`, behind both `CredProxy::new` and
+`check_upstream`, takes `http` only when the host is a loopback IP address
+(IPv4-mapped included), which is where tests' fakes listen, and `https`
+otherwise. `localhost` is refused as a name that could resolve anywhere.
+`Routers::new` logs a warning, with the upstream, when it isn't
+`DEFAULT_UPSTREAM`, so a gateway in front of the API is never silent.
+
+### `[sandbox]` is optional
+
+**Issue.** The plan has agentd build a `DockerSandbox` and reap orphans at
+startup, but most tests start agentd without Docker, and an operator may
+run agentd for commands alone.
+
+**Solution.** Without `[sandbox]`, `serve` logs a warning and runs no
+turns. With it, `serve` connects to the Docker daemon, which must answer,
+stops what a previous run of the same `instance` left (`reap_orphans`),
+and starts the runner (`pipeline::Turns`) after the listeners are bound.
+The example configuration has the section, with the image the Compose file
+builds; the Compose README adds `host_data_dir`, which depends on where the
+checkout is. `docker_startup_reaps_only_this_instances_sandboxes` plants a
+container labeled with the configured instance and a session, and one
+without labels, and checks that `connect_docker` removes only the first.
+
+### A process sandbox gives every container one address
+
+**Issue.** `ProcessSandbox::ip` answers `127.0.0.1` for every container,
+and minting a placeholder for an address revokes other sessions'
+placeholders there (T18). Tests that run turns on two sessions would find
+the first session's warm process holding a revoked placeholder.
+
+**Solution.** The tests set `global_container_cap = 1`, so a second
+session's turn stops the first session's idle container, and with it its
+placeholder, before minting. Docker gives each container its own address,
+so production is unaffected.
+
+### agentctl for scripted turns
+
+**Issue.** `fake-claude` runs a script's commands from its `PATH`, and
+agentd's tests need `agentctl` there, but cargo sets `CARGO_BIN_EXE_*`
+only for a package's own tests.
+
+**Solution.** `testkit::agentctl_path()` builds it the way
+`fake_claude_path()` builds `fake-claude`, with the package named, and the
+tests put its directory on the script's `PATH`.
+
+### No community key until T26
+
+**Issue.** `CredProxy::new` takes a `CommunityKey`, which T26 implements
+over the store.
+
+**Solution.** agentd's proxy uses `pipeline::NoCommunityKey`, which always
+answers `NotConfigured`, so a placeholder pointed at the community key gets
+401 from the proxy. The router never picks the community key before T26
+either, since `community_key_configured` answers false until then.
+
+### Surfaces take reactions back and say where the bot may post
+
+**Issue.** The working indicator on Rocket.Chat is a reaction put up at
+turn start and taken off at the end, but `Surface` could only add one.
+And a reply there is a `chat.postMessage`, which joins the poster to a
+public channel it isn't in, while Rocket.Chat delivers a message once for
+every bot in the room, so a mention of an agent that isn't in the room can
+arrive through another bot's connection (T14's note). The pipeline had no
+way to tell before it ran the turn.
+
+**Solution.** `Surface` gains `unreact` (Rocket.Chat's `chat.react` with
+`shouldReact: false`, Slack's `reactions.remove`) and `can_post`. On
+Rocket.Chat `can_post` asks `subscriptions.getOne?roomId=` (whose answer
+is `{"subscription": null}` for a room the user isn't in, per
+`@rocket.chat/rest-typings`) every time. A first version trusted a listing
+of `subscriptions.get` for a minute, and a bot removed from a room in that
+minute posted there and was added back by the post; asking room by room
+also spares the full listing, and finds a DM the manager bot just opened.
+`post` and `upload` refuse a
+room the bot isn't in with `SurfaceError::Forbidden`, which also gives
+agentctl's owner-side posts the refusal T15 left to the surface. Slack
+never joins a poster to a conversation and refuses the post itself
+(`not_in_channel`), so its `can_post` only checks the workspace. The
+pipeline asks `can_post` before it runs a turn, so an agent whose bot isn't
+in the room neither answers nor spends a turn. `MockSurface` records
+`unreact` and has `keep_out_of` for a conversation the bot isn't in. The
+design's trait is updated.
+
+### The pipeline takes `Acknowledge`'s place only with turns
+
+**Issue.** The plan has the pipeline replace T14's `Acknowledge` as every
+Rocket.Chat connection's onward sender, but without `[sandbox]` agentd runs
+no turns, and T14's tests watch for the `:eyes:` reaction.
+
+**Solution.** `Server::run` passes messages to the pipeline when it has
+`Turns` and to `Acknowledge` otherwise, so an agentd without sandboxes
+still shows which bot a mention reached. The plan's T14 bullet says so.
+
+### Short ids are `#` and a number
+
+**Issue.** T15 accepts platform message ids, and T23 resolves the short
+ids the turn message shows. A bare number would be ambiguous: nothing
+stops a platform id from being all digits, and T15's own tests use `1`,
+`2` and `3` as Slack-style ids.
+
+**Solution.** The turn message shows `[#7]`, and `agentctl react` and
+`agentctl history --before` take `#7`: `#` and one to nine digits, which no
+platform id starts with, resolved in the calling token's session through
+`Store::message_ref_by_short_id`. A short id of another conversation is
+refused as `react`'s rule refuses any, and `--before` must name a message
+in the turn's conversation. A short id the session doesn't have is
+`not_found`. Anything else is read as a platform id, as before.
+
+### The turn message shows what the session has no row for
+
+**Issue.** "Thread messages since the agent's last reply" read as the
+agent's bot's last message in the history. But a private task's result is
+posted as the same bot from another session, and would then count as the
+agent's reply, hiding both the result and what came before it from the
+channel session. A first version started after the last message the
+session itself posted instead, and that still hid what people said while a
+turn ran: such a message comes before the turn's reply in the thread, so
+the next turn skipped it. It also recorded what it showed before the turn
+ran, so a turn that failed before reaching the model hid its own request
+from every later turn.
+
+**Solution.** The builder reads up to 50 messages of the thread before the
+event and shows every one the session has no row for: a person's message,
+said before or during an earlier turn, or the agent's own post from outside
+the session, marked as such when it is attributed to a turn (see the next
+note for the bot's posts that aren't). The session's own replies and what
+it was shown have rows and are left out. Each message shown is recorded in
+the session, which gives it its short id and keeps it out of the next turn;
+the builder returns the short ids it recorded, and the pipeline deletes
+those rows (`Store::forget_message_refs`, inbound rows only) when
+`run_turn` fails, which covers every failure before the CLI read the
+message, a `SessionReset` included, so the next turn shows them again. A
+failed write the CLI still read would be shown twice, which is better than
+never. Building that fails halfway forgets what it recorded too. Posts from
+other sessions that the 50 messages didn't reach come from
+`Store::posted_elsewhere`, listed by short id for `agentctl history`, since
+`message_refs` keeps no text. The event's own message is shown last, with
+the requester when it isn't the sender (a hop). Message text is kept to one
+line in the context block, so a message can't forge its structure; the
+event's own text keeps its line breaks, since a request often holds code,
+but every line after the first is indented, so none of it starts where a
+`[#N] name:` entry or a block would. A carriage return, a vertical tab, a
+form feed, NEL and U+2028 and U+2029 break a line there as `\n` does, since
+the model may read any of them as one; each becomes `\n`. A thread the
+event starts has no history to read.
+
+### Notices have no message ref
+
+**Issue.** `message_refs` rows belong to a session, and a refused message
+starts none. A turn that failed before reaching the model has a session,
+but a row with `agent_id` set would attribute the notice to a turn that
+never ran.
+
+**Solution.** agentd's own notices are posted without a row: a refusal,
+a failure before the turn reached the model (a second `SessionReset`
+included), the busy line, the notice that part of a reply was lost, and
+the one a shutdown posts. Nothing reads one: no turn is billed for it, and
+a reply in its thread replies to the thread's root, not to the notice. A
+turn's own failure message (a usage limit, a login that expired, a crash, a
+timeout) comes from a turn that ran, and is recorded as its reply.
+
+The files a turn uploads have no row either: `Surface::upload` returns no
+message, and Slack's `files.completeUploadExternal` doesn't say which
+message shares the files, so the trait wasn't changed for Rocket.Chat
+alone. An attributed upload would also be a second message of one turn
+that another agent's thread could answer. The next turn then shows a
+notice or an upload of the agent's bot as `you`, and only an attributed
+post as `you, outside this session`, since an unattributed one may be the
+session's own. The attribution of an agent's post is waited for only when
+the router reads it (see "An agent's post can arrive before its
+attribution"), so an upload, which mentions no one, holds up no other
+agent's lane.
+
+### `SurfaceLookup` is asynchronous, and the pipeline posts through it
+
+**Issue.** T15's `SurfaceLookup` was synchronous, but finding an agent's
+surface means reading its binding and token from the store.
+
+**Solution.** It is an `async_trait` now, and `StoreSurfaces` implements
+it: each agent's active binding on the conversation's surface and team,
+with a `RocketChatSurface` built from the manager's configuration and the
+bot's token, or a `SlackSurface` over the manager app's `TeamDirectory`,
+kept per binding. Each Slack lookup also gives the directory the
+workspace's active agents' bot users with `set_managed_bots`. `App` builds
+it and hands the same lookup to the agentctl API and the pipeline; tests
+pass their own through `App::with_surfaces`. Slack agents' messages still
+reach no pipeline until T31 routes them, as T30's note says, but their
+replies would already go out through this lookup.
+
+### Each agent answers a thread's messages in order, in the pipeline's tasks
+
+**Issue.** A turn takes minutes, and a Rocket.Chat connection hands each
+message to its onward sender and waits. A first version spawned a task per
+message and per candidate: two messages in one thread could reach the
+session's queue in either order, and since each built its turn message
+before queueing, the later one could show the earlier as history and the
+earlier then run too, answered twice. Nothing bounded the tasks, and
+`Server::run` neither waited for them nor stopped them: a shutdown returned
+at once mid-turn, and the late reply was posted with the store already
+closed.
+
+**Solution.** The sink looks the candidates up and queues the message for
+each in a lane per agent and thread, whose task answers its messages one at
+a time in arrival order, so the turn message is built only once the turn
+before it has delivered. A lane holds at most 8 waiting messages, and the
+pipeline at most 64 waiting or running; a person's message past either gets
+one line in its thread saying the agent is busy, posted from the sink,
+which also slows the connection down. A bot's message gets none, whether
+the surface flags the bot or agentd knows it as an agent's or the manager
+bot: the router ignores most of them anyway, and two bots could otherwise
+answer each other's busy lines. The lanes' tasks run in a `JoinSet` of the
+pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
+panicking message doesn't stop its lane. The set is behind a
+`std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
+a Rocket.Chat connection's is on every reconnect, can't leave a lane
+created without its task. Queueing checks that the pipeline is open under
+that lock and never starts a task once it is closed. `drain` polls the set
+under the lock without holding it across a wait, so a drain cut off by its
+timeout leaves the tasks for `cut_short`, which takes the set and shuts it
+down. On shutdown `Server::run` stops the public listener and the chat
+connections, closes the pipeline, and gives the turns taken the drain
+timeout while the proxy and ctl listeners, which a running turn's CLI and
+agentctl need, still serve; only then do those stop, and the pipeline is
+dropped before the store is closed. Turns still running or delivering their
+reply at the timeout are aborted, their working emoji taken off and their
+threads told to ask again, within five seconds: the guard that holds a
+turn's working emoji is kept until its reply, or its failure notice, has
+gone out, so a reply stuck on a slow post isn't lost without a word. That
+is the simplest option that tells people: the turns and their queue stay in
+memory rather than the store, so a crash, unlike a shutdown, still loses
+them silently, and messages still waiting in a lane at the timeout are
+dropped without a word, since no decision was made about them. The working
+emoji is held by a guard, so a panicking turn takes it off too.
+
+### An agent's post can arrive before its attribution
+
+**Issue.** agentd records a post's `message_refs` row just after
+`chat.postMessage` returns, and the platform may deliver the post to
+another agent's connection first. The router then saw a managed bot's
+message with no attribution and ignored it, dropping the hop.
+
+**Solution.** When the sender is another agent's bot, the message mentions
+the candidate, and it has no attribution yet, the view reads it again,
+with pauses doubling from 25 ms, for up to two seconds before routing. Only
+that candidate's lane waits. The router reads the attribution in that case
+only, so any other post of an agent's bot, such as an upload, which never
+gets one, is routed at once.
+
+### Delivery goes on past a failed part
+
+**Issue.** A failed post of the reply ended the delivery: the directives'
+reactions, the outbox's reactions and the queued agentctl posts were lost,
+and so were the chunks after a failed one. The reply had no size cap,
+while `agentctl post` caps its text at `MAX_POST_BYTES`.
+
+**Solution.** Each chunk, the upload, each reaction and each queued post is
+tried whatever happened to the others; a chunk refused with a rate limit is
+posted once more after the wait the platform asks for, up to five seconds.
+If any part was lost, the thread gets one line saying so. The reply is cut
+at `MAX_POST_BYTES` on a character boundary, with a note that it was cut; a
+backtick or tilde code fence the cut leaves open is closed first, so the
+note isn't rendered as code. Failures before the turn reached the model
+(writing the persona, reading the plan's model, building the turn message,
+starting the process) post the short failure notice too, once the bot is
+known to be able to post; a link prompt waits for the same check. The
+usage-limit and login texts name "the Claude account this request runs on"
+rather than "your", since a turn may run on the community key.
+
+### A turn whose start hook failed stops the process
+
+**Issue.** When `turn_starting` fails, the runner keeps the process warm
+(T21). A placeholder that can't be pointed, because it was revoked when a
+new container took its address, would fail every later turn the same way.
+
+**Solution.** The pipeline stops the session's process after a turn that
+failed in `turn_starting`, so the next turn mints anew.
+
+### Who counts as a managed bot
+
+**Issue.** `RouterView::managed_bot` must know every bot user agentd made,
+whatever the binding's state, but `Store::agent_for_bot` finds active
+bindings only.
+
+**Solution.** `Store::agent_of_bot_user` finds the agent of a bot user on a
+binding in any state, and the view asks it for the sender and each
+mention, besides the manager bots' identities from the configuration.
+Candidates still come from active bindings.
+
+### `fake-claude` still counts cost from 0 on resume
+
+**Issue.** The real CLI restores a resumed session's total cost (see above),
+and `fake-claude` counts each process from 0, as T04 wrote it.
+
+**Solution.** Left as it is: the runner's tests rely on it, and changing
+both belongs with T27's correction, which the plan's T27 now names.
+
+## T24: Session commands
+
+### Which sessions the commands act on
+
+**Issue.** The plan lists "active and recent sessions" without saying which
+rows those are. A reset marks the row reset and inserts its replacement at
+once (T21), so every thread an agent ever answered keeps a live row, and a
+thread reset once has a fresh row that never had a turn. Listing every live
+row would show each thread ever answered, and resetting them would reset
+rows that have no transcript, making yet another row each.
+
+**Solution.** Both commands act on the live sessions in use: not reset, and
+with a turn finished (`last_turn_at`), a turn gone to the CLI (`started` or
+`maybe_started`), or a warm container. `Store::sessions_in_use` selects them
+in SQL, most recently active first (the end of the last turn, or the
+creation), with the ids warm on this instance
+(`SessionManager::warm_sessions`) passed in as a JSON array for `json_each`,
+so the rows a reset leaves behind are never read. `sessions` asks for at
+most 20 (`commands::MAX_LISTED`), and only when it gets that many counts
+them all (`Store::count_sessions_in_use`) to say how many there are. A
+private task's session is listed and reset by `reset <name>`, but not by
+`here`, since it isn't the conversation's own session. A reset session is
+gone from the list; its replacement shows up again once it has a turn.
+
+A session left out is one the CLI never read a message of, so it has no
+transcript, and its next turn starts with `--session-id` whether it is
+reset or not. That covers a session the pipeline has just looked up for a
+turn it is still preparing: resetting it would change its id and nothing
+else. A session that has run is reset even with such a turn pending, and
+the turn then finds it reset and moves to the replacement (T23's retry on
+`SessionReset`).
+
+### `here` is the conversation, not the thread
+
+**Issue.** A channel has one session per thread, so "the current
+conversation's session" is one session only in a DM. A Slack slash command
+names its channel but no thread (Slack doesn't offer slash commands in
+threads), while an `!agent` message on Rocket.Chat may be sent in one.
+
+**Solution.** `here` resets the agent's sessions of the conversation the
+command was sent in: a DM's one session, or every thread of a channel, the
+same on both surfaces. `Origin::SlackSlash` now carries the slash command's
+conversation, and `Origin::conversation` gives it, or for `!agent` the room,
+on the sender's team. In the manager bot's DM there is no conversation to
+reset, so `here` is refused there with how to send it. A message there has
+no conversation, but a Slack slash command sent there names the DM like any
+other, so when a slash command's `here` finds no session, its conversation
+is compared with the manager's DM with the owner (`Replies::dm_room`, a
+`conversations.open`) and the command refused the same way. Only a slash
+command is compared: on Rocket.Chat the manager bot's DM always arrives as
+`Origin::RocketChatDm`, and opening it (`users.info` and `im.create`) would
+only cost two calls for an answer known beforehand. A DM with the
+agent's bot is a room like any other (T13), so `!agent reset <name> here`
+there resets the owner's DM session, and in a room only the agent's bot is
+in the agent's connection hears it, as T14 made every connection feed the
+intake.
+
+### Thread links
+
+**Issue.** "A thread link where the surface can build one" needs a URL for
+each surface, and `Surface` has no way to make one.
+
+**Solution.** Two pure functions, used for the sessions of the surface and
+team agentd serves:
+
+- Slack: `surface_slack::surface::thread_link`, the web client's
+  `https://app.slack.com/client/<team>/<channel>`, then
+  `/thread/<channel>-<ts>`, which names the workspace by id and needs no
+  Web API call (`chat.getPermalink` would, per message).
+- Rocket.Chat: `RestClient::room_link`, the web client's routes
+  `<base>/channel/<name>`, `<base>/group/<name>` or `<base>/direct/<room
+  id>`, then `/thread/<root>`. A DM's route takes its id, so the owner's DM
+  and group DMs need no call; a channel's type and name come from the
+  manager's `rooms.info`, once per room and command, and a room the manager
+  can't read has no link.
+
+Another member's DM with the agent has no link, since the owner can't open
+it, and neither has a private task's session, whose thread (where its
+result goes) may be such a DM. A Rocket.Chat private group has no link
+either: the manager may be in groups the owner isn't, and the link would
+show them the group's name. Rocket.Chat has no cheap call for whether a
+given user is in a room (`groups.members` pages through every member), so
+the owner's membership isn't checked. Neither form was checked against a
+live client.
+
+### The commands reach the runner through a weak handle
+
+**Issue.** `Commands` is built with `App`, before `serve` connects to Docker
+and starts the runner (`pipeline::Turns`), and many tests start agentd with
+no runner at all. A strong handle in `App` would also keep the runner's idle
+reaper and event follower running after the pipeline is dropped at
+shutdown, past the store's close.
+
+**Solution.** `commands::SessionControl` is what the commands need
+(`reset`, `warm_sessions`), implemented for `SessionManager`. `Turns::start`
+hands its sessions to `app.commands()` as a `Weak`, so every path that
+starts a runner for an app wires it, and dropping the runner ends it.
+Without one (no `[sandbox]`, or after shutdown) `reset` marks the session
+reset in the store alone, and nothing is warm. `warm_sessions` knows this
+instance's containers only. A warm process on another instance keeps its
+old session until its next turn there finds the session reset (T21's
+`RunnerError::SessionReset`), which moves the turn to the replacement, and
+the idle reaper stops the old container.
+
+### A reset waits for the session's turns, the reply doesn't
+
+**Issue.** `SessionManager::reset` runs after the turns queued before it,
+which can take up to the turn timeout each, and it joins the session's
+queue only when its future is first polled. Resetting a few sessions at a
+time left the others out of their queues until an earlier reset ended, so a
+message sent in one of them after `reset` ran on the old conversation and
+was then wiped. Waiting for every reset before replying also held up the
+owner's later commands, which the intake runs one at a time (T13), and
+could outlast a Slack `response_url`, which expires after 30 minutes.
+
+**Solution.** Every reset is issued at once and polled once before the
+reply, so each is queued on its session before the owner reads
+"Resetting". The first poll of `reset_all` polls every reset future itself,
+in a plain loop, and only then awaits them all with `join_all`. That loop
+runs under `tokio::task::unconstrained`: Tokio's cooperative budget allows
+128 operations per task poll (tokio 1.53), each lock taken on an idle
+session spends one, and once it is spent a lock returns `Pending` before
+joining the mutex's queue, so a plain poll left every idle session past
+about the 128th out of its queue until after the reply.
+
+The loop polls every reset whatever the others do, so every reset has
+joined its session's queue when the first poll returns, without exception.
+`join_all` alone didn't promise that: it drives more than 30 futures
+through `FuturesOrdered`, whose `FuturesUnordered` returns `Pending` once
+two futures have woken themselves while being polled (`yielded >= 2`,
+futures 0.3.34), and leaves the rest for the next poll, after the reply. A
+reset is woken inside its own poll when its session's lock is handed over,
+its spawned task ends, or a store permit is let go on another worker
+between it registering its waker and returning `Pending`. The agentd
+test's fake runner wakes itself once in every reset's first poll: with
+`join_all` alone 2 of 200 resets held their session before the reply, and
+without `unconstrained` 128. The first poll never yields: for 10,000
+sessions it took 71-75 ms with a runner (a slot lock and a spawned task
+each) and 18-19 ms without one, in a debug build on a loaded machine, two
+runs each, holding one worker thread that long.
+
+A reset's store write takes one of 2 permits (`store::RESETS_AT_ONCE`):
+`Store::reset_session` waits for one before it takes a connection and lets
+it go when its transaction ends. Without a cap, a reset of thousands of
+sessions ran as many `BEGIN IMMEDIATE` transactions at once against the
+store's pool of 10 connections: with 2,000 an unrelated `ping` waited 3
+seconds, and every other agent's turns waited behind them, or past the
+pool's 30-second acquire timeout. The semaphore lives in `Store` and is
+shared by its clones, so it bounds every reset in the process, through the
+runner or, without one, in the store alone, and neither `SessionControl`
+nor `SessionManager` passes permits around. It covers only the write.
+Stopping a container never used the pool and is bounded by
+`global_container_cap`. An earlier version held the permit through the
+stop as well, about 10 seconds or 120 with a degraded Docker daemon, which
+held up every other reset, cold ones and other owners' too, each holding
+its session meanwhile, so turns queued there filled the pipeline's
+`max_pending` and `evict_idle` couldn't free their containers.
+`SessionManager::reset` stops the container and then writes, with the
+session held, so the reset is already queued while it waits for a permit,
+and it waits on no other session while it holds one. A turn sent to a
+session whose reset waits for a permit waits for it, as it would for the
+reset itself.
+
+SQLite has one writer, so more permits add no throughput and only park
+more of the pool's connections in the busy handler. A throwaway probe
+measured it: a file database in WAL mode, 2,000 sessions reset at once,
+and a `ping` and an unrelated one-row `UPDATE` every 5 ms meanwhile, three
+rounds of each cap in a debug build on 4 shared, loaded CPUs. The cap of 8
+before this change was applied in the probe around each write, the cap of
+2 is the store's own.
+
+| Cap | Reset of 2,000 | `ping` p99 | `ping` max | Unrelated write p99 | Unrelated write max |
+| --- | --- | --- | --- | --- | --- |
+| None | 3.8-5.1 s | 12 ms-1.4 s | 3.0-3.6 s | 0.06-2.1 s | 2.8-3.7 s |
+| 8 | 4.7-5.5 s | 1.0-5.5 ms | 4-34 ms | 0.63-1.04 s | 0.93-2.1 s |
+| 2 | 4.4-5.0 s | 1.6-3.7 ms | 8-32 ms | 0.43-0.53 s | 0.63-2.0 s |
+
+A reset takes as long with 2 as with 8. A `ping` reads, which WAL lets it
+do while a write is open, so it waits only for a connection, and both caps
+leave it some; 2 leaves 8 of the 10 free rather than 2. An unrelated write
+still waits about half a second at p99: SQLite's busy handler retries after
+sleeps of up to 100 ms and loses to resets that write back to back, which
+no cap on resets alone makes fair. A single reset can queue for a permit
+behind another owner's mass reset: at these rates one of about 10,000
+sessions holds the permits for 20-25 seconds. That is accepted.
+
+Waiting for the resets to end is the command's `FollowUp`: the intake
+releases the member's command order once the reply is sent and then runs
+the follow-up in the same task, so the owner's next command goes ahead. If
+a reset fails (a container that can't be stopped isn't reset, T21), the
+owner is told in a direct message from the manager bot, with the command
+to send again. At shutdown the intake waits
+for follow-ups as for commands, within the drain; one still waiting when the
+drain ends is dropped with the intake's tasks. A reset still queued behind
+its session's turns then leaves the queue without resetting. One that holds
+its session goes on: `with_slot` runs the work in a task of its own, as for
+a turn, and dropping the caller drops only its `JoinHandle`. It keeps the
+runner's `Inner` alive until it ends, within one container stop, and it can
+reach the store after `Store::close`. That is harmless: `close` waits for a
+transaction in progress, and one begun after it fails at once, leaving the
+session unreset with its container stopped, as any failed reset does, and
+the process's exit ends the task anyway. Stopping the task with its caller
+would cancel a container stop part way or thread a cancellation into the
+write, for no gain. The follow-up lives only in memory: if the instance
+dies, the queued resets die with it and nothing is reset, which the owner
+sees in `sessions` and can send again.
+
+The follow-up isn't polled while the reply is being sent. A reset queued on
+a busy session whose turn ends in that window is handed the session's lock,
+but runs only once the reply is sent, so the session's next turn waits for
+the reply's round trip too. Driving the follow-up alongside the reply would
+need the failure DM held back until the reply is out, and the resets task
+aborted with the intake at shutdown, which isn't worth a delay of one
+reply.
+
+## T25: Skills and the agentctl skill
+
+### Hosts are confirmed with a command of their own
+
+**Issue.** The plan says the owner confirms a skill's `allowed-hosts` when
+adding it, but `/agent` has no dialog: a reply can't ask and wait. Adding the
+skill at once with its files but without its hosts would leave a skill that
+fails when used, and asking the owner to run `skill add` again means
+uploading or cloning twice.
+
+**Solution.** A skill that declares hosts is fetched and checked once, and
+kept outside what sandboxes mount (`<data>/skills-pending/<agent>/<name>/`)
+with a `pending` row; the reply lists the hosts and asks for
+`skill confirm <name> <skill>` within an hour (`PENDING_TTL`). Confirming
+moves the files into the agent's skills and makes the row `active`, which is
+when its hosts count. A confirmation after the hour finds the skill dropped;
+the sweeper drops expired ones every minute, with their files, and startup
+too. The parser gained `SkillCommand::Confirm`, and the design's command
+table lists it.
+
+### Skills are rows, their files are directories
+
+**Issue.** The egress extension reads a session's hosts at every `CONNECT`,
+and `skill rm` has to find what to remove, after restarts and on every
+instance, so the hosts can't live in memory; parsing every agent's
+`SKILL.md` files at each `CONNECT` would trust files over the store.
+
+**Solution.** A migration adds `agent_skills` (`agent_id`, `name`, `state`
+of `pending` or `active`, `source`, `hosts`, `added_by`, `added_at`), keyed
+by agent, name and state, so a pending skill can wait next to the active
+one it would replace. `Store::skill_hosts_for_session` joins `sessions` and
+`agents` (deleted agents get none) and `SkillHosts` parses each host with
+`HostRule` again, so a row that no longer parses allows nothing. Files stay
+on disk, moved into place with a rename so a session sees a skill whole or
+not at all. Replacing one moves the old directory aside first, so a session
+starting between the two renames sees neither; `renameat2` with
+`RENAME_EXCHANGE` would close that, but needs a fallback for file systems
+without it, and the window is two renames.
+
+The row and the files change in the order that never grants hosts to files
+the owner didn't confirm them for. `skill add` records the row first: an
+active row carries no hosts and replaces any row that did, and a pending
+row's hosts don't count. `skill confirm` moves the files into place, then
+makes the row active; a failed move leaves it pending, and the old skill is
+moved back. `skill rm` deletes the rows, then the directories. A failure
+between the two steps can leave directories no row records, so startup
+removes work directories and skill directories, pending or live, whose name
+has no row in either state (the bundled one aside). A row of either state
+keeps both of its name's directories, so a confirmation moving one from
+pending to live on another instance is never taken for left over. Startup
+also leaves anything changed (by status change time) within `STALE_AFTER`,
+the clone timeout and three minutes, since in a blue-green deploy the old
+instance may still be cloning into a work directory. The 32-skill cap is
+checked inside `put_skill`'s transaction.
+
+`skill rm` refuses new connections to the skill's hosts at once, but the
+egress proxy has no hook to close one agent's tunnels to one host, and
+revoking the agent's sessions would restart its conversations. Tunnels
+already open end on their own, within the 5-minute idle timeout or the
+1-hour lifetime, and the reply says so.
+
+### A clone reaches agentd's own network unless the host is checked
+
+**Issue.** T08's parser keeps options, other transports and credentials out
+of the source, but not its host: `https://169.254.169.254/…`,
+`https://10.0.0.5/…` or `https://rocketchat:3000/…` (a single-label Compose
+name) parse, and agentd clones from its own network, next to Rocket.Chat and
+MongoDB. `git` would also follow a redirect anywhere, and resolve the name
+again after any check.
+
+**Solution.** The host must be a DNS name (`cred_proxy::normalize_host`:
+two labels or more, no IP forms). agentd resolves it itself (5 seconds) and
+refuses it if any address is one the egress proxy never reaches, reusing
+`EgressPolicy::unreachable`, now public, with agentd's own addresses and the
+sandbox subnet. `git` is then pinned to the checked addresses with
+`http.curloptResolve` (Git 2.37 or later), follows no redirect
+(`http.followRedirects=false`; a moved repository has to be given by its new
+URL), may use only `https` (`protocol.allow=never`,
+`protocol.https.allow=always`), and runs with an empty environment, no
+system or global configuration, no credential helper or prompt, no hooks or
+templates, no bundle URIs (`transfer.bundleURI=false`, `fetch.bundleURI=`)
+or file system monitor, `transfer.fsckObjects`, and `core.symlinks=false`.
+The empty environment also means an operator's `HTTPS_PROXY` never reaches
+a clone: it connects directly, from agentd's own network. The clone is
+`--depth=1 --single-branch --no-recurse-submodules --no-tags`, the ref only
+as `--branch=<ref>` and the URL after `--`. It runs in its own process group,
+killed whole after 2 minutes or once its directory passes 40 MB. Tests serve
+a local repository through `Git::serving_prefix_from_directory_for_tests`,
+which rewrites one `https://` prefix to a `file://` directory and skips the
+lookup; it and the `file://` configuration exist only in test builds.
+
+A clone runs inside the owner's command, and one member's commands run one
+at a time, so a clone that takes its full 2 minutes holds that owner's
+other commands for as long; other members aren't held up.
+
+### The URL git gets names the host as the pin does
+
+**Issue.** agentd checked and pinned the normalized host, but gave `git`
+the URL as the owner wrote it. curl matches `http.curloptResolve` entries
+by name, without dropping a trailing dot, so `https://evil.example./r`
+missed the pin for `evil.example`, and curl resolved the name again,
+reopening DNS rebinding into agentd's network.
+
+**Solution.** `git` gets a URL rebuilt from what was checked,
+`https://<normalized host>:<port><path>`, so its host and port are exactly
+the pin's; a test runs a stand-in `git` and compares the two, `GitHub.com.`
+included. The egress proxy has no such gap: it connects to the addresses it
+checked, never to a name.
+
+### Measuring a clone's directory can't stop one file
+
+**Issue.** The 40 MB cap was checked by measuring the directory every
+250 ms. A small pack of a highly compressible blob checks out hundreds of
+megabytes between two measurements, onto the volume that also holds the
+store; a test cloning an 8 MB blob of zeros under a 1 MB cap finished
+before any measurement saw it.
+
+**Solution.** No file `git` or its helpers write may pass 40 MB:
+`RLIMIT_FSIZE`. The workspace forbids `unsafe`, so `pre_exec` can't set it,
+and `prlimit` on the child's pid after `spawn` races `git` starting
+`git-remote-https`, which would not inherit it. `git` starts through
+`/bin/sh -c 'ulimit -f "$1" && shift && exec "$@"'`, which sets the limit
+before `exec`, so every process of the clone has it; `compose-test.sh`
+checks that the image runs `git` that way. A write past the limit kills
+the writer with `SIGXFSZ`, and `git` killed by it is `TooLarge`. When a
+helper such as `index-pack` is the one killed, `git` exits with an error
+and removes the clone, and the owner gets the generic "Git couldn't clone
+that" reply. The directory is still measured, for the total.
+
+### The agentd image needs git
+
+**Issue.** agentd clones skills itself, on the egress network, as the plan
+says, and the distroless image has no `git`. A Rust Git client would be a
+large dependency for one shallow clone.
+
+**Solution.** The runtime stage is `debian:trixie-slim` (the digest the
+sandbox image pins) with `git` and `ca-certificates`, and Debian's `/bin/sh`
+for `ulimit -f`; it still runs as 10001. Trixie's Git is 2.47, above the 2.37 `http.curloptResolve` needs.
+`compose-test.sh` checks that `git` runs in the image. The image couldn't be
+built here (Debian's mirror is blocked); CI builds it.
+
+### What a skill package may hold
+
+**Issue.** The plan asks for a size cap and a `SKILL.md` with `name` and
+`description`. An upload or a repository is the owner's, fetched from
+anywhere, and ends up mounted into sandboxes.
+
+**Solution.** `skills::package` checks every skill the same way, whatever
+it came from: at most 10 MB of files, 1,000 files and directories, 16
+levels and paths of 1,024 bytes (so a deep tree of long names is refused
+before the file system answers `ENAMETOOLONG`); names without an empty, `.`
+or `..` part, `\`, control or invisible formatting characters; only regular
+files and directories (a symlink or a special file in a zip is refused; a
+clone checks symlinks out as plain files holding their targets, and a
+symlink found in any tree is refused); modes rewritten to
+`0755` for directories and `0644`, or `0755` with an execute bit, for files.
+A `.zip` is read with the `zip` crate (MIT) with only
+`deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`
+and `typed-path`: stored or deflated entries, none encrypted, each counted
+as it inflates against its declared size, so a small archive can't unpack
+past the cap. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
+top or in the only top-level directory (anything else, a lone file at the
+top included, is "no SKILL.md"), at most 256 KB of UTF-8; its front
+matter, at most 16 KB between `---` lines (YAML's `...` doesn't close it), is read with `serde_norway`
+(now a normal dependency of agentd) into the three keys agentd needs, so
+other keys are skipped rather than built: a "billion laughs" document under
+a key agentd doesn't read parses at once, and one under `allowed-hosts` or
+`description` fails on its type. The name follows Claude Code's
+`[a-z0-9-]{1,64}` and can't be `agentctl`; the description has 1 to 1,024
+characters; `allowed-hosts` is a list or a comma-separated line of at most
+16 `HostRule`s, so `api.anthropic.com`, IP addresses and single labels are
+refused before the owner is asked. A skill may not declare a wildcard: a
+built-in list of public suffixes would always miss some (`*.github.io`,
+`*.herokuapp.com` and the rest of the Public Suffix List's private
+section), any agent's owner can add a skill, and naming each host costs a
+skill little within 16 entries. Hosts on a port other than 443 are named
+again in the reply that asks for confirmation. Error replies are fixed sentences that
+never repeat the content. An agent has at most 32 skills besides
+`agentctl`.
+
+### The bundled skill and the mount
+
+**Issue.** The bundled skill must always be present, and Docker refuses a
+bind mount whose source doesn't exist, while the runner's own tests start
+sessions for agents agentd never prepared.
+
+**Solution.** The pipeline writes `<data>/skills/<agent>/agentctl/SKILL.md`
+before every turn, next to the persona and with the same
+write-only-when-changed helper (`runner::write_if_changed`, which
+`write_persona` now uses), so an upgrade of agentd updates it. The runner
+sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
+directory exists as the container starts. A skill added, replaced or removed
+reaches a conversation when its process next starts, as a persona does.
+
+### Files from both manager DMs reach the handlers
+
+**Issue.** T30 left the Slack DM's files unpassed and T14 read attachments
+only in the Rocket.Chat DM, and `WebApi::download_file` reported a file over
+the limit as `SurfaceError::Api`, where Rocket.Chat's download says
+`TooLarge`.
+
+**Solution.** `commands::slack::dm_command` returns the event's files and
+the Slack inbound submits them with the command. `Commands::download` reads
+an attachment from either manager's DM (and nowhere else), and both
+`persona` and `skill add` use it, so `persona <name>` with a `persona.md`
+attached works on Slack too. `download_file` answers `TooLarge` past its
+limit.
+
+### Skills reach the model only with the Skill tool
+
+**Issue.** The launch flags gave `--tools "Bash,Read,Edit,Write,Glob,Grep"`.
+Claude Code 2.1.285 lists the skills it finds in
+`$CLAUDE_CONFIG_DIR/skills` to the model only when the `Skill` tool is
+among the enabled tools; a probe against a fake API showed a mounted skill
+never appeared in the request without it. Every skill, the bundled
+`agentctl` one included, was mounted and never seen.
+
+**Solution.** `runner`'s `TOOLS`, and the design's launch flags, add
+`Skill`. A runner test fails if `--tools` lacks it, and the fakes and
+tests that spell the flags out follow.
+
+With `Skill` enabled, Claude Code also loads
+`$CLAUDE_CONFIG_DIR/commands/*.md` as commands, and `CLAUDE_CONFIG_DIR`
+(`sessions/<id>/claude`) is the session's to write, so an agent can plant
+commands that last for that session; that grants nothing new, since it can
+already write `CLAUDE.md` and `settings.json` there. Under
+`--setting-sources user` a project's `.claude/skills` and `CLAUDE.md` in
+the working directory are not loaded.
+
+### Commands always have skills
+
+**Issue.** `Commands` took its `Skills` through an optional
+`with_skills`, only so that tests could build one without it, which needed
+`Arc::make_mut` and a "not available" branch agentd never took.
+
+**Solution.** `Commands::new` takes the `Skills`. Tests that never run a
+skill command pass one over a data directory that doesn't exist, which
+nothing reads until a skill command runs.
+
+### Replacing a waiting skill drops the old one first
+
+**Issue.** `skill add` of a skill with hosts upserted the pending row (the
+new hosts and source) before moving the new files into
+`skills-pending/<agent>/<name>`. If that move failed, or agentd died in
+between, the owner got an error, not a prompt naming the new hosts, and a
+later `skill confirm` meant for the first prompt made the new hosts active
+on the old files. `confirm` also made active whatever pending row of the
+name it found at the end, which another instance could have replaced since
+`confirm` read it; and when that row was gone it removed the whole skill,
+an unrelated active version included. The sweeper could drop a pending row
+in the middle of a confirmation that began just before the hour was up.
+
+**Solution.** A pending add first deletes the name's pending row and
+removes its pending directory, then records the new row and moves the new
+files in, so a failure anywhere leaves either nothing waiting or a row
+without files, which `confirm` refuses. `Store::confirm_skill` takes the
+row `confirm` read and makes it active only while its hosts and `added_at`
+are unchanged. When it isn't, `confirm` undoes only its own move: the
+active skill it set aside goes back, or, with none, the files it moved are
+removed, unless something else has taken their place since (checked by
+inode). `confirm` first renames the pending directory into its own work
+directory, where no concurrent add can replace it, and takes the inode
+there. It also reads the moved `SKILL.md` again and confirms only when its
+hosts are the row's: two adds of one name racing can leave one's row with
+the other's files, and those go back to wait, unconfirmable, until the
+skill is added again or expires. A test confirms a stale copy of the row
+(`added_at` a second earlier) while an active version exists: reverting
+the undo to removing the skill by name fails it. The sweeper drops pending rows `PENDING_TTL` plus one
+`SWEEP_INTERVAL` after they were added, while `confirm` still calls a skill
+expired after `PENDING_TTL`. A test replaces a waiting skill with one
+declaring another host while the pending directory can't be written, then
+confirms: before the fix the confirmation made the new host active.
+
+Startup's purge keeps both directories of a name that has a row in either
+state, so it no longer depends on a rename updating the moved directory's
+status change time. A pending directory an active add failed to remove is
+then left until the skill is next added or removed.
+
+### Tests stop the processes they hold
+
+**Issue.** Declaring `child` before `stdin` in `ClaudeProcess` and
+`ChildIo` stopped a drop from closing a process's input before killing
+it, but a drop still sends `SIGKILL` to a child `try_wait` reports as
+running. A child that is already exiting, as `fake-claude` is while it
+writes its coverage profile, can still be cut short and leave a truncated
+`.profraw`. Two runner tests dropped a warm `ClaudeProcess` at their end.
+
+**Solution.** Every test that holds a `ClaudeProcess` stops it before
+dropping it: `stop()` closes its stdin and waits up to `EXIT_GRACE`, so
+`fake-claude` exits on end of input and writes its whole profile. The
+runner reaps every exit it sees, a crash, a refused resume or a failed
+write, before the turn returns. What is left for a drop to kill is a
+warm process a `SessionManager` holds when a test ends, which waits for
+input and has nothing to write; the tests wait for the stops they start,
+and agentd's drain for the turns in flight. `ProcessChild::drop` keeps
+killing at once: waiting there would block a runtime thread.
+
+### A stand-in `git` is written by a child process
+
+**Issue.** A `git` stand-in test wrote an executable script with
+`std::fs::write` and then ran it, while other tests in the agentd library
+binary spawn processes (`git` for fixture repositories, clones). A
+process forked during the write inherits the descriptor open for writing
+until it runs its own program, and running the script meanwhile fails with
+`ETXTBSY`, as the runner's tests did on aarch64.
+
+**Solution.** `stand_in` has `/bin/sh` write the script, so this binary
+never holds a descriptor open for writing it and none can be inherited.
+No lock is needed, in the tests or around production spawns. It is the
+agentd tests' only file written and then run.
+
+## T26: Requester-pays routing
+
+### The community key lives in one sealed row, read on every request
+
+**Issue.** The plan makes `/agent admin api-key set` the key's only
+source and asks for it sealed, never logged and never reachable from a
+sandbox but through the proxy's swap. It doesn't say how the proxy gets
+it, how a change reaches a running agentd (or a second instance), or what
+an operator can read back about it.
+
+**Solution.** `community_settings` holds one row (`id` is 1 by a `CHECK`,
+inserted by the migration) with `api_key_enc`, sealed with
+`community_settings/api_key_enc/1` as its associated data, and
+`api_key_changed_by` (a member key's string form) and
+`api_key_changed_at`, which record who last set or cleared it; `me` shows
+them to admins. `StoreCommunityKey`, the proxy's `CommunityKey`, reads and
+opens the row on every request, with no cache, so a key set or cleared on
+one instance applies at once on every instance sharing the store. The
+router's view reads only whether the column is set
+(`community_api_key_set`), without opening it or reading who changed it,
+so a bad value in the audit columns breaks `me` for admins, not every
+turn's routing.
+The key reaches memory only in the proxy's request and in the `admin
+api-key set` command, both as `SecretString`; commands are logged by name,
+and a captured-log test at `trace` finds the key in neither the log nor
+any reply. Sandboxes get an `agentd-key-…` placeholder, as T18 made it,
+and a test shows the proxy swaps in the stored key, refuses with 401 once
+it is cleared, and with 403 between turns.
+
+### Admins are identities, matched exactly
+
+**Issue.** "Admins are listed in configuration, by `MemberKey`" names no
+section or key, and says nothing about members with identities on two
+surfaces.
+
+**Solution.** `[community] admins` is a list of member keys in their string
+form, `<surface>:<team>:<user>`, checked at load with the key named in the
+error. It is empty by default, so nobody is an admin until the operator
+says so. An identity is matched exactly, surface and team included: the
+same user id on another Rocket.Chat server or Slack workspace is not the
+admin, and an admin who uses both surfaces is listed twice. A non-admin
+gets one line saying only admins can change the key, and a key they sent
+privately is dropped unstored; a key sent where others can read it is
+refused first, admin or not, as T13 does. T27's `admin ban` and `unban`
+should use the same list.
+
+### A key is only checked for being a header value
+
+**Issue.** Nothing said whether `admin api-key set` validates the key.
+
+**Solution.** It must be 1 to 512 bytes of visible ASCII, which is what an
+`x-api-key` header value can carry; anything else is refused without
+being repeated. agentd doesn't try the key against Anthropic before
+storing it: that would send it upstream outside any turn and make the
+command depend on the network. A key Anthropic refuses shows up on the
+first community turn, whose thread and requester are told the community
+key was refused and an admin can set a working one.
+
+### Whose account hit the limit, and who is told
+
+**Issue.** T26 asks that usage-limit and auth errors be "shown to the
+requester, never the owner, and name whose account hit the limit". T23b
+posts a failure message in the thread, where everyone, the owner
+included, reads it, and its texts said "the Claude account this request
+runs on". `Surface::render` has no way to mention a member by id, so the
+thread text can't name the requester as a mention.
+
+**Solution.** Two messages. The thread gets the turn's recorded reply,
+naming the account by whose it is: "the Claude account of the person who
+asked" or "the community API key", for a usage limit or a refusal
+(`USAGE_LIMIT_TEXT`, `LOGIN_EXPIRED_TEXT`, `COMMUNITY_USAGE_LIMIT_TEXT`,
+`COMMUNITY_KEY_REFUSED_TEXT`). The requester, and only the requester,
+also gets a direct message from the manager bot through the same
+`Replies::dm` the link prompt uses, saying it was their account (or, with
+no account linked, the community key) and what to do. The owner is never
+messaged unless they asked; for a hop the requester is the inherited one.
+In the requester's own DM with the agent the reply there is private
+already, so no second message is sent. A refused login whose link is
+already marked broken gets none either: the relink notice (T13) tells the
+member once. A test refuses
+bob's refresh mid-thread and sees the thread told, the link broken and no
+message from the pipeline.
+
+The direct message is also rate-limited, since a credential that keeps
+failing without its link being marked broken (an upstream 401 on a token
+the refresh didn't reject, a usage limit that holds for hours) would
+otherwise message the requester on every turn. The thread is still told
+every time. The requester gets at most one message per
+`FAILURE_DM_INTERVAL` (an hour) for each kind of failure and whose
+credential it was: `usage_limit/member`, `refused/member`,
+`usage_limit/community` and `refused/community`. The last time is kept in
+a `failure_notices` table keyed by the requester's identity, since a
+community-key turn may have no member, and claimed with one conditional
+upsert before sending, so it holds across restarts and instances. A
+message that then fails to send releases the claim, deleting the row only
+if it still holds the time claimed, so the next failure of that kind tries
+again. If the claim itself fails, the requester is told anyway.
+
+### The pipeline also refuses a private scope for anyone but the owner
+
+**Issue.** The router never gives a non-owner `ScopeKind::Private` (its
+invariant grid checks it), and the hooks refuse the owner's side outside
+the private session, but the pipeline mapped whatever scope the decision
+named to a `ScopeKey`, so a router change could put a non-owner's turn,
+with the requester's own credential and the public side, on the agent's
+`Private` volume, where the owner's `shared/` is.
+
+**Solution.** `turn_scope` resolves the private scope only for the owner's
+own turn on the owner's side and credential, answering the owner's own
+message in a one-to-one DM: the event is a DM, its sender is the
+requester's identity, and it isn't flagged as a bot's. A channel message
+or another agent's hop never gets it, whatever the decision says. The
+conversation's own scope is resolved only for a public-side turn; any
+other combination fails the turn before a session is looked up, logged as
+an error. A unit test walks every requester, credential, scope kind, side,
+conversation kind, sender and bot flag, and finds exactly one combination
+that resolves to the private scope. A pipeline test runs a non-owner's DM
+on its `Dm` scope with no private volume created.
+
+### A plan read at a refresh counts from the next turn
+
+**Issue.** The model is picked from the requester's plan before the turn
+starts, and `auth` reads the profile after it has handed the refreshed
+token out (T09), so the turn whose request triggered the refresh can't
+use a plan that refresh found.
+
+**Solution.** As the plan says, the change takes effect on the next turn:
+the pipeline reads `claude_links.plan` again for every turn, and the
+runner restarts the process when the model differs. A test refreshes bob's
+token mid-thread with a profile that moves him to Claude Max, and sees the
+first turn on the refreshed token with the old model, the next on the new
+model, in a new process.
+
+### Seeing a process restart from a test
+
+**Issue.** The acceptance wants a process restart between a linked
+member's turn and the community key's, but nothing outside the runner
+says which process ran a turn: every process of a session sends the same
+`x-claude-code-session-id`.
+
+**Solution.** The tests' scripted turns run `sh -c 'echo $PPID >> pids'`
+through `fake-claude`, which records the pid of the `claude` process that
+ran each turn. A change of credential kind or model shows as a new pid,
+and a test with two linked members on one model shows the same pid for
+both turns, with each turn's own bearer token upstream: the warm process's
+placeholder follows the requester.
+
+### A broken link asks for a new login, never the community key
+
+**Issue.** The router's view counted a link as linked only when
+`claude_links.broken_at` was empty, and the router sent anyone not linked
+to the community key when one was set. So a member whose link broke was
+silently billed to the community key, on the default model, and a failure
+there told them they had no Claude account linked. The plan says only
+that an unlinked member runs on the community key.
+
+**Solution.** A member whose link broke is still a linked member, not an
+unlinked one: nothing runs for them on the community key, and they are
+asked to log in again. `RouterView::link_state` answers `Unlinked`, `Linked` or
+`Broken` in place of `is_linked`, and `route` returns
+`Decision::RelinkPrompt { requester }` for a broken link, the owner's
+included, whether or not a community key is set. The pipeline sends it
+through the same manager-bot DM as the link prompt and the relink notice
+(T13), saying the link stopped working and to send `login` again; nothing
+runs and the thread gets nothing. The community key is for a requester
+with no link at all, or no member. The requester's failure messages no
+longer say "you have no Claude account linked". Router tests, and the
+invariant grid with an owner and a member whose links may be broken, check
+that a broken link never runs, and a pipeline test sets the community key,
+marks bob's link broken, and sees bob's channel message and DM make no
+upstream request and each get the relink prompt, while carol, unlinked,
+still runs on the community key.
+
 ## T28: Slack ingress
 
 ### The manager binding needs a `BindingId`
@@ -4734,460 +5916,6 @@ tokens that T08's parser reads. agentd's image build context leaves out
 `include_str!` and parse it with `serde_norway` (MIT OR Apache-2.0, a
 maintained fork of the deprecated `serde_yaml`; with `unsafe-libyaml-norway`,
 MIT, it is a dev-dependency of agentd only).
-
-## T23: Turn pipeline end to end
-
-### One row per session and one attribution per post
-
-**Issue.** The plan made `message_refs` unique on `(surface, team_id,
-conversation, platform_ref)` and gave every row a per-session short id. A
-message then has at most one row, in one session, but an inbound message
-mentioning two agents is shown to both agents' sessions, and a private
-task's result, posted from the private session, is later shown to the
-channel session. Only the first session could have given the model a short
-id for it.
-
-**Solution.** A row belongs to its session: `(session_id, short_id)` is the
-key, and `(session_id, surface, team_id, conversation, platform_ref)` is
-unique, so a message has at most one short id per session and keeps it.
-What must be unique across sessions is the attribution, so a partial unique
-index covers `(surface, team_id, conversation, platform_ref)` where
-`agent_id` is set: agentd records each message it posts once, with the
-agent, turn, requester and hop, and `Store::posted_message_ref` reads that
-row. A session that is shown a message agentd posted elsewhere records its
-own row without `agent_id`. A session shown its own post before recording
-it as posted keeps that row and short id, and recording the post gives the
-row the agent, turn, requester and hop in the same transaction rather than
-returning it unchanged, which would lose the attribution; the partial index
-still refuses it when another session's row attributes the message. An
-inbound row's requester is the message's sender, with hop 0, so the columns
-the plan lists stay required. The next
-short id is taken inside the insert, in one `BEGIN IMMEDIATE` transaction;
-a test with sixteen concurrent inserts on a file database gets 1 to 16.
-`Store::posted_elsewhere` finds the agent's posts in a thread that the
-session hasn't recorded yet, which is what the turn message builder (T23b)
-shows once and then records.
-
-### `process_stopping` revokes the process, not the session
-
-**Issue.** The plan has `process_stopping` call `Registry::revoke_session`.
-T21 gave every hook the process's own `Process` value so that a late call
-for an old process, as when Docker reports an old container's death after
-the session started a new one, never touches the new one.
-`revoke_session` would revoke the new process's placeholder too.
-
-**Solution.** `process_stopping` revokes the process's own placeholder with
-`Registry::revoke(PlaceholderId)` and its own agentctl token. A session
-runs one process at a time, so this is the session's last placeholder,
-and `revoke` then drops the session's watch sender, which closes its
-egress tunnels exactly as `revoke_session` would. A test stops an old
-process after a new one started and the new placeholder still works. A
-second call is harmless: both revocations find nothing.
-
-### The hooks check the turn's side
-
-**Issue.** The hooks took `TurnRequest::side` as given, but the owner's
-side, which agentctl's target rules and the private volume's mounts grant
-more to, belongs to the agent's private session only (the owner's DM and
-the owner's private tasks). A wrong side from the pipeline would have
-granted it in a channel.
-
-**Solution.** `turn_starting` refuses `Side::Owner` unless the session's
-scope is `ScopeKey::Private`, before it points the placeholder or records
-the turn, so the turn fails and its `turn_finished` finds nothing to clear.
-`turn_finished` unpoints the placeholder, which can't fail, before it
-awaits `Ctl::end_turn`, so the credential stops being reachable first.
-
-### A resumed process restores the session's total cost
-
-**Issue.** T20 left open whether the first result of a `--resume`d process
-reports a `total_cost_usd` counted from 0; the runner's per-turn `cost_usd`
-assumed so, and T23's live check was to find out.
-
-**Solution.** It doesn't. The native 2.1.285 build in a stand-in for the
-sandbox image (Debian with `/opt/claude-code/bin/claude` copied in, since
-the real image's download is blocked here), run by
-`docker_real_claude_starts` against `fake_anthropic()`, reported 0.0001 for
-a turn, and 0.0002 for the same usage on the first turn after the process
-was stopped and the session resumed. The CLI appends a line
-`{"type":"cost-state","totalCostUSD":…,"modelUsage":{…}}` to the transcript
-when a process exits, none while it runs (a warm process's second turn left
-none), and on `--resume` restores the total from the last one. A process
-that is killed writes none, so the restored total is the session's total as
-of its last clean exit.
-
-The runner's `cost_usd` for such a turn therefore holds the restored total
-too. Nothing reads it yet, so the runner only says so in its rustdoc, and
-the Docker test pins the behavior: it fails if the resumed total stops
-being the sum. T27, which meters cost, takes the restored total off, from
-the transcript's last `cost-state` line (read without following links, with
-its size capped: the transcript is agent-writable, but the CLI restores
-from the same line, so the difference is still the turn's cost) or from a
-total the runner keeps in `sessions` when a process exits cleanly. The
-plan's T27 says so.
-
-### The real `claude` test serves the proxy on the network's gateway
-
-**Issue.** The plan's `docker_real_claude_starts` used a network that isn't
-internal and `host-gateway`, so the container could reach the proxy in the
-test process. `DockerSandbox` refuses a network that isn't internal unless
-told otherwise for tests, and gives the container no `extra_hosts`.
-
-**Solution.** The test creates an internal network without `inhibit_ipv4`,
-on whose bridge the host holds the gateway address (T16's note on internal
-networks), and serves the proxy there, as T19's Docker test does.
-`ANTHROPIC_BASE_URL` names the gateway's address, and `NO_PROXY` names it
-too, since the hooks set the egress proxy variables. Nothing else routes
-out, so the test also shows that the CLI needs no direct traffic. The CLI
-runs through the runner and agentd's hooks, with a community API key
-placeholder, and the test asserts the read-only root, the transcript at
-`$CLAUDE_CONFIG_DIR/projects/<id>/<id>.jsonl` holding both turns, a
-`--resume` start for the second, and that every request the fake saw came
-through the proxy with the swapped key. On CI the sandbox runs as the test
-process's own uid, which has no entry in the image's `/etc/passwd`, and the
-CLI ran there all the same; locally, as root, it ran as 10001.
-
-### The native CLI honors `NO_PROXY`
-
-**Issue.** T19 saw the npm build send `ANTHROPIC_BASE_URL` traffic straight
-to the base URL when `NO_PROXY` named it, and left the native build to
-T23's live check.
-
-**Solution.** In the same stand-in image, with `HTTP_PROXY` pointing at the
-unresolvable `cred-proxy.internal:8080`, the native 2.1.285 build reached
-the base URL directly when `NO_PROXY` named its address, and when
-`NO_PROXY` named only `cred-proxy.internal,agentctl.internal` it sent the
-request to the proxy and retried until the turn timed out. So the proxy
-variables reach it, and agentd's sandboxes, whose base URL is
-`cred-proxy.internal`, work as T19 expects.
-
-### Sandboxes reach agentd by name, not by configuration
-
-**Issue.** `runner::ProcessConfig` takes `ANTHROPIC_BASE_URL`, and agentctl
-reads `AGENTCTL_URL`. As configuration, a base URL whose host isn't in the
-egress environment's `NO_PROXY` would send the CLI's API traffic to the
-egress proxy, which refuses it.
-
-**Solution.** `[runner]` has only `claude_bin`, `turn_timeout_secs` and the
-pool's keys. Processes always get `cred_proxy::PROXY_URL`
-(`http://cred-proxy.internal:8080`) and `pipeline::AGENTCTL_URL`
-(`http://agentctl.internal:8081`), the names `NO_PROXY` lists, so the
-deployment gives agentd those aliases on the sandbox network and keeps
-those ports, as the Compose file does; the example configuration and the
-README say so. Tests, which serve the listeners on port 0, build
-`TurnSettings` themselves with the bound addresses and a `NO_PROXY` naming
-them, and name `fake-claude`'s script and `agentctl`'s directory in
-`TurnSettings::env`, which is added after the egress variables and holds
-no secret. agentd sets nothing there.
-
-With `[sandbox]` set, the ports are therefore not a choice:
-`internal.proxy_listen` must use `cred_proxy::PROXY_URL`'s port and
-`internal.ctl_listen` `pipeline::AGENTCTL_URL`'s, both read from the
-constants, or the configuration is refused naming the key. Any other port,
-0 included, would be one sandboxes never try and `isolate-sandbox.sh`
-doesn't let through. Tests that bind port 0 have no `[sandbox]`.
-
-### Plain HTTP upstreams only on loopback
-
-**Issue.** `[proxy] upstream` took any `http://` URL, so a mistyped
-upstream would send members' real credentials over the network
-unencrypted.
-
-**Solution.** `Upstream::parse`, behind both `CredProxy::new` and
-`check_upstream`, takes `http` only when the host is a loopback IP address
-(IPv4-mapped included), which is where tests' fakes listen, and `https`
-otherwise. `localhost` is refused as a name that could resolve anywhere.
-`Routers::new` logs a warning, with the upstream, when it isn't
-`DEFAULT_UPSTREAM`, so a gateway in front of the API is never silent.
-
-### `[sandbox]` is optional
-
-**Issue.** The plan has agentd build a `DockerSandbox` and reap orphans at
-startup, but most tests start agentd without Docker, and an operator may
-run agentd for commands alone.
-
-**Solution.** Without `[sandbox]`, `serve` logs a warning and runs no
-turns. With it, `serve` connects to the Docker daemon, which must answer,
-stops what a previous run of the same `instance` left (`reap_orphans`),
-and starts the runner (`pipeline::Turns`) after the listeners are bound.
-The example configuration has the section, with the image the Compose file
-builds; the Compose README adds `host_data_dir`, which depends on where the
-checkout is. `docker_startup_reaps_only_this_instances_sandboxes` plants a
-container labeled with the configured instance and a session, and one
-without labels, and checks that `connect_docker` removes only the first.
-
-### A process sandbox gives every container one address
-
-**Issue.** `ProcessSandbox::ip` answers `127.0.0.1` for every container,
-and minting a placeholder for an address revokes other sessions'
-placeholders there (T18). Tests that run turns on two sessions would find
-the first session's warm process holding a revoked placeholder.
-
-**Solution.** The tests set `global_container_cap = 1`, so a second
-session's turn stops the first session's idle container, and with it its
-placeholder, before minting. Docker gives each container its own address,
-so production is unaffected.
-
-### agentctl for scripted turns
-
-**Issue.** `fake-claude` runs a script's commands from its `PATH`, and
-agentd's tests need `agentctl` there, but cargo sets `CARGO_BIN_EXE_*`
-only for a package's own tests.
-
-**Solution.** `testkit::agentctl_path()` builds it the way
-`fake_claude_path()` builds `fake-claude`, with the package named, and the
-tests put its directory on the script's `PATH`.
-
-### No community key until T26
-
-**Issue.** `CredProxy::new` takes a `CommunityKey`, which T26 implements
-over the store.
-
-**Solution.** agentd's proxy uses `pipeline::NoCommunityKey`, which always
-answers `NotConfigured`, so a placeholder pointed at the community key gets
-401 from the proxy. The router never picks the community key before T26
-either, since `community_key_configured` answers false until then.
-
-### Surfaces take reactions back and say where the bot may post
-
-**Issue.** The working indicator on Rocket.Chat is a reaction put up at
-turn start and taken off at the end, but `Surface` could only add one.
-And a reply there is a `chat.postMessage`, which joins the poster to a
-public channel it isn't in, while Rocket.Chat delivers a message once for
-every bot in the room, so a mention of an agent that isn't in the room can
-arrive through another bot's connection (T14's note). The pipeline had no
-way to tell before it ran the turn.
-
-**Solution.** `Surface` gains `unreact` (Rocket.Chat's `chat.react` with
-`shouldReact: false`, Slack's `reactions.remove`) and `can_post`. On
-Rocket.Chat `can_post` asks `subscriptions.getOne?roomId=` (whose answer
-is `{"subscription": null}` for a room the user isn't in, per
-`@rocket.chat/rest-typings`) every time. A first version trusted a listing
-of `subscriptions.get` for a minute, and a bot removed from a room in that
-minute posted there and was added back by the post; asking room by room
-also spares the full listing, and finds a DM the manager bot just opened.
-`post` and `upload` refuse a
-room the bot isn't in with `SurfaceError::Forbidden`, which also gives
-agentctl's owner-side posts the refusal T15 left to the surface. Slack
-never joins a poster to a conversation and refuses the post itself
-(`not_in_channel`), so its `can_post` only checks the workspace. The
-pipeline asks `can_post` before it runs a turn, so an agent whose bot isn't
-in the room neither answers nor spends a turn. `MockSurface` records
-`unreact` and has `keep_out_of` for a conversation the bot isn't in. The
-design's trait is updated.
-
-### The pipeline takes `Acknowledge`'s place only with turns
-
-**Issue.** The plan has the pipeline replace T14's `Acknowledge` as every
-Rocket.Chat connection's onward sender, but without `[sandbox]` agentd runs
-no turns, and T14's tests watch for the `:eyes:` reaction.
-
-**Solution.** `Server::run` passes messages to the pipeline when it has
-`Turns` and to `Acknowledge` otherwise, so an agentd without sandboxes
-still shows which bot a mention reached. The plan's T14 bullet says so.
-
-### Short ids are `#` and a number
-
-**Issue.** T15 accepts platform message ids, and T23 resolves the short
-ids the turn message shows. A bare number would be ambiguous: nothing
-stops a platform id from being all digits, and T15's own tests use `1`,
-`2` and `3` as Slack-style ids.
-
-**Solution.** The turn message shows `[#7]`, and `agentctl react` and
-`agentctl history --before` take `#7`: `#` and one to nine digits, which no
-platform id starts with, resolved in the calling token's session through
-`Store::message_ref_by_short_id`. A short id of another conversation is
-refused as `react`'s rule refuses any, and `--before` must name a message
-in the turn's conversation. A short id the session doesn't have is
-`not_found`. Anything else is read as a platform id, as before.
-
-### The turn message shows what the session has no row for
-
-**Issue.** "Thread messages since the agent's last reply" read as the
-agent's bot's last message in the history. But a private task's result is
-posted as the same bot from another session, and would then count as the
-agent's reply, hiding both the result and what came before it from the
-channel session. A first version started after the last message the
-session itself posted instead, and that still hid what people said while a
-turn ran: such a message comes before the turn's reply in the thread, so
-the next turn skipped it. It also recorded what it showed before the turn
-ran, so a turn that failed before reaching the model hid its own request
-from every later turn.
-
-**Solution.** The builder reads up to 50 messages of the thread before the
-event and shows every one the session has no row for: a person's message,
-said before or during an earlier turn, or the agent's own post from outside
-the session, marked as such when it is attributed to a turn (see the next
-note for the bot's posts that aren't). The session's own replies and what
-it was shown have rows and are left out. Each message shown is recorded in
-the session, which gives it its short id and keeps it out of the next turn;
-the builder returns the short ids it recorded, and the pipeline deletes
-those rows (`Store::forget_message_refs`, inbound rows only) when
-`run_turn` fails, which covers every failure before the CLI read the
-message, a `SessionReset` included, so the next turn shows them again. A
-failed write the CLI still read would be shown twice, which is better than
-never. Building that fails halfway forgets what it recorded too. Posts from
-other sessions that the 50 messages didn't reach come from
-`Store::posted_elsewhere`, listed by short id for `agentctl history`, since
-`message_refs` keeps no text. The event's own message is shown last, with
-the requester when it isn't the sender (a hop). Message text is kept to one
-line in the context block, so a message can't forge its structure; the
-event's own text keeps its line breaks, since a request often holds code,
-but every line after the first is indented, so none of it starts where a
-`[#N] name:` entry or a block would. A carriage return, a vertical tab, a
-form feed, NEL and U+2028 and U+2029 break a line there as `\n` does, since
-the model may read any of them as one; each becomes `\n`. A thread the
-event starts has no history to read.
-
-### Notices have no message ref
-
-**Issue.** `message_refs` rows belong to a session, and a refused message
-starts none. A turn that failed before reaching the model has a session,
-but a row with `agent_id` set would attribute the notice to a turn that
-never ran.
-
-**Solution.** agentd's own notices are posted without a row: a refusal,
-a failure before the turn reached the model (a second `SessionReset`
-included), the busy line, the notice that part of a reply was lost, and
-the one a shutdown posts. Nothing reads one: no turn is billed for it, and
-a reply in its thread replies to the thread's root, not to the notice. A
-turn's own failure message (a usage limit, a login that expired, a crash, a
-timeout) comes from a turn that ran, and is recorded as its reply.
-
-The files a turn uploads have no row either: `Surface::upload` returns no
-message, and Slack's `files.completeUploadExternal` doesn't say which
-message shares the files, so the trait wasn't changed for Rocket.Chat
-alone. An attributed upload would also be a second message of one turn
-that another agent's thread could answer. The next turn then shows a
-notice or an upload of the agent's bot as `you`, and only an attributed
-post as `you, outside this session`, since an unattributed one may be the
-session's own. The attribution of an agent's post is waited for only when
-the router reads it (see "An agent's post can arrive before its
-attribution"), so an upload, which mentions no one, holds up no other
-agent's lane.
-
-### `SurfaceLookup` is asynchronous, and the pipeline posts through it
-
-**Issue.** T15's `SurfaceLookup` was synchronous, but finding an agent's
-surface means reading its binding and token from the store.
-
-**Solution.** It is an `async_trait` now, and `StoreSurfaces` implements
-it: each agent's active binding on the conversation's surface and team,
-with a `RocketChatSurface` built from the manager's configuration and the
-bot's token, or a `SlackSurface` over the manager app's `TeamDirectory`,
-kept per binding. Each Slack lookup also gives the directory the
-workspace's active agents' bot users with `set_managed_bots`. `App` builds
-it and hands the same lookup to the agentctl API and the pipeline; tests
-pass their own through `App::with_surfaces`. Slack agents' messages still
-reach no pipeline until T31 routes them, as T30's note says, but their
-replies would already go out through this lookup.
-
-### Each agent answers a thread's messages in order, in the pipeline's tasks
-
-**Issue.** A turn takes minutes, and a Rocket.Chat connection hands each
-message to its onward sender and waits. A first version spawned a task per
-message and per candidate: two messages in one thread could reach the
-session's queue in either order, and since each built its turn message
-before queueing, the later one could show the earlier as history and the
-earlier then run too, answered twice. Nothing bounded the tasks, and
-`Server::run` neither waited for them nor stopped them: a shutdown returned
-at once mid-turn, and the late reply was posted with the store already
-closed.
-
-**Solution.** The sink looks the candidates up and queues the message for
-each in a lane per agent and thread, whose task answers its messages one at
-a time in arrival order, so the turn message is built only once the turn
-before it has delivered. A lane holds at most 8 waiting messages, and the
-pipeline at most 64 waiting or running; a person's message past either gets
-one line in its thread saying the agent is busy, posted from the sink,
-which also slows the connection down. A bot's message gets none, whether
-the surface flags the bot or agentd knows it as an agent's or the manager
-bot: the router ignores most of them anyway, and two bots could otherwise
-answer each other's busy lines. The lanes' tasks run in a `JoinSet` of the
-pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
-panicking message doesn't stop its lane. The set is behind a
-`std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
-a Rocket.Chat connection's is on every reconnect, can't leave a lane
-created without its task. Queueing checks that the pipeline is open under
-that lock and never starts a task once it is closed. `drain` polls the set
-under the lock without holding it across a wait, so a drain cut off by its
-timeout leaves the tasks for `cut_short`, which takes the set and shuts it
-down. On shutdown `Server::run` stops the public listener and the chat
-connections, closes the pipeline, and gives the turns taken the drain
-timeout while the proxy and ctl listeners, which a running turn's CLI and
-agentctl need, still serve; only then do those stop, and the pipeline is
-dropped before the store is closed. Turns still running or delivering their
-reply at the timeout are aborted, their working emoji taken off and their
-threads told to ask again, within five seconds: the guard that holds a
-turn's working emoji is kept until its reply, or its failure notice, has
-gone out, so a reply stuck on a slow post isn't lost without a word. That
-is the simplest option that tells people: the turns and their queue stay in
-memory rather than the store, so a crash, unlike a shutdown, still loses
-them silently, and messages still waiting in a lane at the timeout are
-dropped without a word, since no decision was made about them. The working
-emoji is held by a guard, so a panicking turn takes it off too.
-
-### An agent's post can arrive before its attribution
-
-**Issue.** agentd records a post's `message_refs` row just after
-`chat.postMessage` returns, and the platform may deliver the post to
-another agent's connection first. The router then saw a managed bot's
-message with no attribution and ignored it, dropping the hop.
-
-**Solution.** When the sender is another agent's bot, the message mentions
-the candidate, and it has no attribution yet, the view reads it again,
-with pauses doubling from 25 ms, for up to two seconds before routing. Only
-that candidate's lane waits. The router reads the attribution in that case
-only, so any other post of an agent's bot, such as an upload, which never
-gets one, is routed at once.
-
-### Delivery goes on past a failed part
-
-**Issue.** A failed post of the reply ended the delivery: the directives'
-reactions, the outbox's reactions and the queued agentctl posts were lost,
-and so were the chunks after a failed one. The reply had no size cap,
-while `agentctl post` caps its text at `MAX_POST_BYTES`.
-
-**Solution.** Each chunk, the upload, each reaction and each queued post is
-tried whatever happened to the others; a chunk refused with a rate limit is
-posted once more after the wait the platform asks for, up to five seconds.
-If any part was lost, the thread gets one line saying so. The reply is cut
-at `MAX_POST_BYTES` on a character boundary, with a note that it was cut; a
-backtick or tilde code fence the cut leaves open is closed first, so the
-note isn't rendered as code. Failures before the turn reached the model
-(writing the persona, reading the plan's model, building the turn message,
-starting the process) post the short failure notice too, once the bot is
-known to be able to post; a link prompt waits for the same check. The
-usage-limit and login texts name "the Claude account this request runs on"
-rather than "your", since a turn may run on the community key.
-
-### A turn whose start hook failed stops the process
-
-**Issue.** When `turn_starting` fails, the runner keeps the process warm
-(T21). A placeholder that can't be pointed, because it was revoked when a
-new container took its address, would fail every later turn the same way.
-
-**Solution.** The pipeline stops the session's process after a turn that
-failed in `turn_starting`, so the next turn mints anew.
-
-### Who counts as a managed bot
-
-**Issue.** `RouterView::managed_bot` must know every bot user agentd made,
-whatever the binding's state, but `Store::agent_for_bot` finds active
-bindings only.
-
-**Solution.** `Store::agent_of_bot_user` finds the agent of a bot user on a
-binding in any state, and the view asks it for the sender and each
-mention, besides the manager bots' identities from the configuration.
-Candidates still come from active bindings.
-
-### `fake-claude` still counts cost from 0 on resume
-
-**Issue.** The real CLI restores a resumed session's total cost (see above),
-and `fake-claude` counts each process from 0, as T04 wrote it.
-
-**Solution.** Left as it is: the runner's tests rely on it, and changing
-both belongs with T27's correction, which the plan's T27 now names.
 
 ## T31: Slack agent apps from manifests
 

@@ -14,6 +14,7 @@ use store::{Sealer, Store};
 use surface_rocketchat::realtime::RealtimeOptions;
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
 use surface_rocketchat::{BotRoles, DEDUP_SOURCE, Dedup, RocketChatConfig, RocketChatSurface};
+use testkit::Held;
 use testkit::rocketchat::{FakeDdp, FakeRest, NOTIFY_USER, realtime_message, subscription_doc};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -884,12 +885,9 @@ async fn room_changes_while_the_rooms_are_listed_apply_on_top_of_the_list() {
         "update": [listed("GENERAL"), listed("GONE"), listed("LEFT")],
         "remove": [],
     });
+    let (held, mut hold) = Held::new(ResponseTemplate::new(200).set_body_json(stale));
     Mock::given(path("/api/v1/subscriptions.get"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(stale)
-                .set_delay(Duration::from_millis(500)),
-        )
+        .respond_with(held)
         .with_priority(1)
         .mount(h.rest.server())
         .await;
@@ -898,6 +896,7 @@ async fn room_changes_while_the_rooms_are_listed_apply_on_top_of_the_list() {
     h.ddp
         .wait_for_subscription(&bot.id, NOTIFY_USER, &notices)
         .await;
+    hold.arrived().await;
     h.ddp.notify_subscription(
         &bot.id,
         "removed",
@@ -910,6 +909,8 @@ async fn room_changes_while_the_rooms_are_listed_apply_on_top_of_the_list() {
         "inserted",
         &subscription_doc(&bot.id, "NEW", "c", "new"),
     );
+    settled(&h, &bot).await;
+    hold.release();
     h.ddp.wait_for_room(&bot.id, "GENERAL").await;
     h.ddp.wait_for_room(&bot.id, "NEW").await;
     settled(&h, &bot).await;

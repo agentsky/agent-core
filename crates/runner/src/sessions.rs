@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use crate::hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
 use crate::{
     ClaudeProcess, LaunchSpec, PoolConfig, ProcessConfig, Result, RunnerError, SessionStart,
-    TurnOutcome, persona_dir,
+    TurnOutcome, persona_dir, skills_dir,
 };
 
 /// How long the event follower waits before subscribing again when a
@@ -47,7 +47,7 @@ pub struct SessionConfig {
     /// The sandbox image, normally `[sandbox] image`.
     pub image: String,
     /// agentd's data directory, which holds each agent's persona directory
-    /// ([`persona_dir`]).
+    /// ([`persona_dir`]) and skills directory ([`skills_dir`]).
     pub data_dir: PathBuf,
 }
 
@@ -201,6 +201,11 @@ impl<H: TurnHooks> Tracked<H> {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether `slot` holds a container, or is locked for a turn or a stop.
+fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
+    slot.try_lock().map_or(true, |warm| warm.held.is_some())
 }
 
 /// Sessions, their turn queues, and the warm pool: one container and one
@@ -400,6 +405,10 @@ impl<H: TurnHooks> SessionManager<H> {
     /// reset. Turns queued after the reset fail with
     /// [`RunnerError::SessionReset`].
     ///
+    /// The store write waits for one of [`store::RESETS_AT_ONCE`] permits
+    /// with the session held, so the reset stays queued on its session and
+    /// waits on no other session while it holds one.
+    ///
     /// # Errors
     ///
     /// - [`RunnerError::Sandbox`] if the warm container couldn't be
@@ -433,7 +442,20 @@ impl<H: TurnHooks> SessionManager<H> {
     /// Whether `session` has a warm container, or a turn running.
     pub fn is_warm(&self, session: SessionId) -> bool {
         let slot = lock(&self.inner.slots).get(&session).cloned();
-        slot.is_some_and(|slot| slot.try_lock().map_or(true, |warm| warm.held.is_some()))
+        slot.is_some_and(|slot| is_warm(&slot))
+    }
+
+    /// The sessions that have a warm container, or a turn running.
+    pub fn warm_sessions(&self) -> Vec<SessionId> {
+        let slots: Vec<(SessionId, Slot<H>)> = lock(&self.inner.slots)
+            .iter()
+            .map(|(session, slot)| (*session, Arc::clone(slot)))
+            .collect();
+        slots
+            .into_iter()
+            .filter(|(_, slot)| is_warm(slot))
+            .map(|(session, _)| session)
+            .collect()
     }
 
     /// Runs one turn on `session`, after the turns queued before it.
@@ -516,9 +538,7 @@ impl<H: TurnHooks> Inner<H> {
     /// Forgets slots nobody uses that hold no container, and scope caps
     /// nobody holds or waits for.
     fn prune(&self) {
-        lock(&self.slots).retain(|_, slot| {
-            Arc::strong_count(slot) > 1 || slot.try_lock().map_or(true, |warm| warm.held.is_some())
-        });
+        lock(&self.slots).retain(|_, slot| Arc::strong_count(slot) > 1 || is_warm(slot));
         let cap = self.config.pool.scope_container_cap;
         lock(&self.scope_caps).retain(|_, semaphore| {
             Arc::strong_count(semaphore) > 1 || semaphore.available_permits() < cap
@@ -807,6 +827,13 @@ impl<H: TurnHooks> Inner<H> {
         );
         spec.shared = mounts.shared;
         spec.memory = mounts.memory;
+        let skills = skills_dir(&self.config.data_dir, session.agent);
+        if tokio::fs::metadata(&skills)
+            .await
+            .is_ok_and(|meta| meta.is_dir())
+        {
+            spec.skills_dir = Some(skills);
+        }
         let container = self.sandbox.start(&spec).await?;
         let tracked = Arc::new(Tracked {
             container: container.id().clone(),

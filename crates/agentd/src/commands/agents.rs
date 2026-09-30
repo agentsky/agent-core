@@ -43,6 +43,16 @@ pub(super) fn persona_problem(persona: &str) -> Option<String> {
     }
 }
 
+/// What [`Commands::download`] got.
+pub(super) enum Download {
+    /// The file's bytes.
+    Bytes(Vec<u8>),
+    /// The file is over the limit.
+    TooLarge,
+    /// The command came from somewhere agentd doesn't read files from.
+    NotHere,
+}
+
 pub(super) fn no_such_agent(name: &str) -> String {
     format!("You have no agent named `{name}`. Only an agent's owner can change it.")
 }
@@ -57,7 +67,11 @@ impl Commands {
     }
 
     /// `member`'s agent named `name`, if they have one.
-    async fn own_agent(&self, member: &MemberKey, name: &str) -> Result<Option<Agent>, Failure> {
+    pub(super) async fn own_agent(
+        &self,
+        member: &MemberKey,
+        name: &str,
+    ) -> Result<Option<Agent>, Failure> {
         let Some(owner) = self.member(member).await? else {
             return Ok(None);
         };
@@ -236,32 +250,63 @@ impl Commands {
     ) -> Result<Result<String, String>, Failure> {
         let how = "Put the persona after the name, or attach it as a `persona.md` file to that \
                    command in a direct message with me.";
-        let (Origin::RocketChatDm { .. }, Some(agents), [file]) =
-            (origin, self.agents_for(key), files)
-        else {
+        let [file] = files else {
             return Ok(Err(how.to_owned()));
         };
         if !file.name.to_ascii_lowercase().ends_with(".md") {
             return Ok(Err(format!("The persona file must be a `.md` file. {how}")));
         }
-        let too_large = format!(
-            "That file is over the {} KB limit.",
-            PERSONA_MAX_BYTES / 1024
-        );
-        if file
-            .size
-            .is_some_and(|size| size > u64::try_from(PERSONA_MAX_BYTES).unwrap_or(u64::MAX))
-        {
-            return Ok(Err(too_large));
-        }
         let max = u64::try_from(PERSONA_MAX_BYTES).unwrap_or(u64::MAX);
-        let bytes = match agents.download(&file.id, &file.name, max).await {
-            Ok(bytes) => bytes,
-            Err(SurfaceError::TooLarge(_)) => return Ok(Err(too_large)),
-            Err(err) => return Err(err.into()),
+        let bytes = match self.download(key, origin, file, max).await? {
+            Download::Bytes(bytes) => bytes,
+            Download::TooLarge => {
+                return Ok(Err(format!(
+                    "That file is over the {} KB limit.",
+                    PERSONA_MAX_BYTES / 1024
+                )));
+            }
+            Download::NotHere => return Ok(Err(how.to_owned())),
         };
-        Ok(String::from_utf8(bytes.to_vec())
-            .map_err(|_| "The persona file must be UTF-8 text.".to_owned()))
+        Ok(String::from_utf8(bytes).map_err(|_| "The persona file must be UTF-8 text.".to_owned()))
+    }
+
+    /// Downloads `file`, attached to a command from `key` in a direct
+    /// message with a manager bot, reading at most `max` bytes: with the
+    /// Rocket.Chat manager's credentials in its DM, and with the Slack
+    /// manager app's bot token in its DM. Files anywhere else aren't read.
+    pub(super) async fn download(
+        &self,
+        key: &MemberKey,
+        origin: &Origin,
+        file: &InFile,
+        max: u64,
+    ) -> Result<Download, Failure> {
+        if file.size.is_some_and(|size| size > max) {
+            return Ok(Download::TooLarge);
+        }
+        let downloaded = match origin {
+            Origin::RocketChatDm { .. } => match self.agents_for(key) {
+                Some(agents) => agents
+                    .download(&file.id, &file.name, max)
+                    .await
+                    .map(|bytes| bytes.to_vec()),
+                None => return Ok(Download::NotHere),
+            },
+            Origin::SlackDm { .. } => match &self.inner.slack {
+                Some(slack) if key.surface == SurfaceKind::Slack => {
+                    slack.surface().api().download_file(file, max).await
+                }
+                _ => return Ok(Download::NotHere),
+            },
+            Origin::SlackSlash { .. } | Origin::RocketChatChannel { .. } => {
+                return Ok(Download::NotHere);
+            }
+        };
+        match downloaded {
+            Ok(bytes) => Ok(Download::Bytes(bytes)),
+            Err(SurfaceError::TooLarge(_)) => Ok(Download::TooLarge),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub(super) async fn list(
@@ -305,7 +350,7 @@ impl Commands {
             });
         }
         let slack = key.surface == SurfaceKind::Slack;
-        if slack && let Some(agents) = &self.inner.slack_agents {
+        if slack && let Some(agents) = &self.slack_agents {
             agents.name_managed().await;
         }
         let mut reply = String::from("Agents:");

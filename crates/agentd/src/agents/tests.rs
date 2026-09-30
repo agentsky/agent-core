@@ -1,8 +1,8 @@
 //! [`RocketChatAgents`], the [`Supervisor`] and [`Acknowledge`] against
 //! `testkit`'s fake Rocket.Chat and an in-memory store.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -15,11 +15,12 @@ use serde_json::json;
 use store::{AgentCreation, AgentState, BindingState, NewAgent, Sealer, Store, Visibility};
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
 use surface_rocketchat::{BotRoles, RocketChatConfig};
+use testkit::Held;
 use testkit::rocketchat::{FakeDdp, FakeRest, realtime_message};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use wiremock::matchers::path;
-use wiremock::{Mock, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
 use super::*;
 use crate::commands::intake::CommandIntake;
@@ -161,36 +162,16 @@ async fn a_creation_abandoned_before_it_starts_makes_no_bot() {
     assert!(h.fake.requests("users.create").await.is_empty());
 }
 
-struct Held {
-    response: ResponseTemplate,
-    arrived: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
-}
-
-impl Respond for Held {
-    fn respond(&self, _: &Request) -> ResponseTemplate {
-        if let Some(arrived) = self.arrived.lock().unwrap().take() {
-            let _ = arrived.send(());
-        }
-        let _ = self.release.lock().unwrap().recv();
-        self.response.clone()
-    }
-}
-
 #[tokio::test]
 async fn a_bot_made_after_its_creation_was_abandoned_owes_retirement() {
     let h = harness().await;
     let made = h.fake.add_user("helper");
-    let (arrived, asked) = tokio::sync::oneshot::channel();
-    let (release, held) = std::sync::mpsc::channel();
+    let (held, mut hold) =
+        Held::new(ResponseTemplate::new(200).set_body_json(
+            json!({ "success": true, "user": { "_id": made, "username": "helper" } }),
+        ));
     Mock::given(path("/api/v1/users.create"))
-        .respond_with(Held {
-            response: ResponseTemplate::new(200).set_body_json(
-                json!({ "success": true, "user": { "_id": made, "username": "helper" } }),
-            ),
-            arrived: Mutex::new(Some(arrived)),
-            release: Mutex::new(held),
-        })
+        .respond_with(held)
         .up_to_n_times(1)
         .with_priority(1)
         .mount(h.fake.server())
@@ -204,10 +185,10 @@ async fn a_bot_made_after_its_creation_was_abandoned_owes_retirement() {
     let binding = h.creating("helper", OffsetDateTime::now_utc()).await;
     let agents = h.agents.clone();
     let creating = tokio::spawn(async move { agents.create_bot(binding, "helper", "owner").await });
-    asked.await.unwrap();
+    hold.arrived().await;
     let now = OffsetDateTime::now_utc();
     assert!(h.store.abandon_creation(binding, now, now).await.unwrap());
-    release.send(()).unwrap();
+    hold.release();
     let err = creating.await.unwrap().unwrap_err();
     assert!(matches!(err, CreateError::Abandoned), "{err:?}");
 
@@ -576,7 +557,16 @@ fn new_supervisor(
     onward: Option<Sender<InboundEvent>>,
 ) -> (Supervisor, CommandIntake) {
     let auth = Arc::new(auth::Auth::new(auth::OAuthConfig::default(), h.store.clone()).unwrap());
-    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None, None);
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(h.store.clone(), "/nonexistent/agentd".into(), git);
+    let commands = Commands::new(
+        h.store.clone(),
+        auth,
+        Replies::default(),
+        None,
+        None,
+        skills,
+    );
     let manager = core_types::Binding {
         id: BindingId::new_v4(),
         agent: None,
