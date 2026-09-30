@@ -5482,9 +5482,13 @@ billed as 0) when its result or the process's previous one has no
 plausible total (so a result without one leaves the next turn unknown
 too, and the one after is known again), when the total falls, or when it
 rises by more than `MAX_TURN_COST_USD` ($1,000). An unknown restored total
-makes only the first turn's cost unknown. Even so, the agent can write the transcript and the CLI's stdout
+makes only the first turn's cost unknown. When that first result has no
+total either, `no_total` wins and the restored total's reason isn't
+counted. Even so, the agent can write the transcript and the CLI's stdout
 (it runs as the same user), so `cost_usd` is a record, never something a
-limit is enforced with: no cap reads it.
+limit is enforced with: no cap reads it. The same holds for the reasons:
+an agent can move a turn from one to another, so their counts are a
+lower-trust figure than the turns and tokens.
 
 `fake-claude` now appends a `cost-state` line shaped as 2.1.285 writes
 it, starting with the same bytes, when its input ends, and none when it

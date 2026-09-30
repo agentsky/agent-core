@@ -1435,8 +1435,7 @@ fn turn_usage(outcome: &TurnOutcome) -> TurnUsage {
             .input_tokens
             .saturating_add(usage.cache_creation_input_tokens),
         output_tokens: usage.output_tokens,
-        cost_usd: cost.unwrap_or(0.0),
-        cost_unknown: cost.err(),
+        cost,
     }
 }
 

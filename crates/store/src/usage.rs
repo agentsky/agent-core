@@ -21,17 +21,16 @@ const SECONDS_PER_HOUR: i64 = 3_600;
 const MAX_TOKENS_PER_TURN: u64 = u32::MAX as u64;
 
 /// What one turn used, as the meter bills it.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TurnUsage {
     /// Input the model read fresh: uncached input and cache writes.
     pub input_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
-    /// The turn's cost in US dollars, as the CLI reckons it.
-    pub cost_usd: f64,
-    /// Why the turn's cost isn't known, when it isn't: the turn is then
-    /// billed no cost, and recorded as unbilled for this reason.
-    pub cost_unknown: Option<CostUnknown>,
+    /// The turn's cost in US dollars, as the CLI reckons it, or why it
+    /// isn't known: the turn is then billed no cost, and recorded as
+    /// unbilled for this reason.
+    pub cost: Result<f64, CostUnknown>,
 }
 
 /// Why a turn's cost isn't known. The meter bills such a turn no cost and
@@ -82,20 +81,24 @@ impl std::fmt::Display for CostUnknown {
     }
 }
 
-impl TurnUsage {
-    /// Input and output tokens together.
-    pub fn tokens(&self) -> u64 {
-        self.input_tokens.saturating_add(self.output_tokens)
-    }
-}
-
 /// What was billed to a member over some days: turns, and what they used.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UsageTotals {
     /// Turns billed to them.
     pub turns: u64,
-    /// Their tokens and cost, added up.
-    pub used: TurnUsage,
+    /// Input their turns' models read fresh.
+    pub input_tokens: u64,
+    /// Their turns' output tokens.
+    pub output_tokens: u64,
+    /// Their turns' known costs in US dollars, added up.
+    pub cost_usd: f64,
+}
+
+impl UsageTotals {
+    /// Input and output tokens together.
+    pub fn tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 /// What was billed to a member today and this month, from
@@ -174,7 +177,7 @@ impl Store {
     /// `for_owner`, requested by the agent's owner, isn't one its daily cap
     /// counts ([`capped_turns_on`](Self::capped_turns_on)).
     ///
-    /// A turn whose [cost is unknown](TurnUsage::cost_unknown) is billed
+    /// A turn whose [cost is unknown](TurnUsage::cost) is billed
     /// no cost in the member's day row for that reason, apart from the
     /// turns whose cost is known. A cost that isn't a finite number of at
     /// least 0 counts as 0, and a turn's tokens are capped far above what
@@ -193,13 +196,11 @@ impl Store {
         for_owner: bool,
         at: OffsetDateTime,
     ) -> Result<()> {
-        let cost =
-            if usage.cost_unknown.is_none() && usage.cost_usd.is_finite() && usage.cost_usd > 0.0 {
-                usage.cost_usd
-            } else {
-                0.0
-            };
-        let unknown = usage.cost_unknown.map_or("", CostUnknown::as_str);
+        let cost = match usage.cost {
+            Ok(cost) if cost.is_finite() && cost > 0.0 => cost,
+            _ => 0.0,
+        };
+        let unknown = usage.cost.err().map_or("", CostUnknown::as_str);
         let (input, output) = (tokens(usage.input_tokens), tokens(usage.output_tokens));
         let [surface, team, conversation, root] = thread_columns(thread);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -266,14 +267,11 @@ impl Store {
         .bind(month)
         .fetch_one(&self.pool)
         .await?;
-        let totals = |turns, input, output, cost| UsageTotals {
+        let totals = |turns, input, output, cost_usd| UsageTotals {
             turns: unsigned(turns),
-            used: TurnUsage {
-                input_tokens: unsigned(input),
-                output_tokens: unsigned(output),
-                cost_usd: cost,
-                cost_unknown: None,
-            },
+            input_tokens: unsigned(input),
+            output_tokens: unsigned(output),
+            cost_usd,
         };
         let (turns, input, output, cost, month_turns, month_input, month_output, month_cost) = row;
         Ok(MemberUsage {
@@ -445,8 +443,7 @@ mod tests {
         TurnUsage {
             input_tokens: input,
             output_tokens: output,
-            cost_usd: cost,
-            cost_unknown: None,
+            cost: Ok(cost),
         }
     }
 
@@ -493,12 +490,14 @@ mod tests {
             billed.today,
             UsageTotals {
                 turns: 1,
-                used: usage(1, 2, 1.0),
+                input_tokens: 1,
+                output_tokens: 2,
+                cost_usd: 1.0,
             }
         );
         let month = billed.month;
         assert_eq!(
-            (month.turns, month.used.tokens(), month.used.cost_usd),
+            (month.turns, month.tokens(), month.cost_usd),
             (3, 333, 1.75)
         );
         assert_eq!(
@@ -544,8 +543,8 @@ mod tests {
         }
         let totals = store.member_usage(alice, at(5)).await.unwrap().today;
         assert_eq!(totals.turns, 3);
-        assert_eq!(totals.used.cost_usd, 0.0);
-        assert_eq!(totals.used.input_tokens, 3 * MAX_TOKENS_PER_TURN);
+        assert_eq!(totals.cost_usd, 0.0);
+        assert_eq!(totals.input_tokens, 3 * MAX_TOKENS_PER_TURN);
         assert_eq!(
             store.thread_spend(&t, at(5)).await.unwrap().tokens_today,
             6 * MAX_TOKENS_PER_TURN
@@ -559,16 +558,16 @@ mod tests {
         let helper = agent(&store, alice, "helper").await;
         let t = thread(None);
         let turns = [
-            (None, 0.5),
-            (Some(CostUnknown::TranscriptTooLarge), 3.0),
-            (Some(CostUnknown::TranscriptTooLarge), 0.0),
-            (Some(CostUnknown::ReusedContainer), 0.0),
-            (None, 0.25),
+            Ok(0.5),
+            Err(CostUnknown::TranscriptTooLarge),
+            Err(CostUnknown::TranscriptTooLarge),
+            Err(CostUnknown::ReusedContainer),
+            Ok(0.25),
         ];
-        for (cost_unknown, cost) in turns {
+        for cost in turns {
             let used = TurnUsage {
-                cost_unknown,
-                ..usage(100, 10, cost)
+                cost,
+                ..usage(100, 10, 0.0)
             };
             store
                 .record_turn_usage(alice, helper, &t, used, false, at(5))
@@ -577,8 +576,8 @@ mod tests {
         }
         let totals = store.member_usage(alice, at(5)).await.unwrap().today;
         assert_eq!(totals.turns, 5);
-        assert_eq!(totals.used.cost_usd, 0.75);
-        assert_eq!(totals.used.input_tokens, 500);
+        assert_eq!(totals.cost_usd, 0.75);
+        assert_eq!(totals.input_tokens, 500);
         let unbilled: Vec<(String, i64, i64, f64)> = sqlx::query_as(
             "SELECT cost_unknown, turns, input_tokens + output_tokens, cost_usd FROM usage \
              WHERE cost_unknown != '' ORDER BY cost_unknown",
@@ -593,6 +592,46 @@ mod tests {
                 ("transcript_too_large".to_owned(), 2, 220, 0.0),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn every_reason_a_cost_is_unknown_is_one_the_table_takes() {
+        use CostUnknown::*;
+        let store = memory_store().await;
+        let alice = member(&store, "alice").await;
+        let helper = agent(&store, alice, "helper").await;
+        let reasons = [
+            NoResult,
+            NoTotal,
+            TotalOutOfRange,
+            ReusedContainer,
+            TranscriptTooLarge,
+            TranscriptUnreadable,
+            TranscriptUnrecognized,
+        ];
+        for reason in reasons {
+            let used = TurnUsage {
+                cost: Err(reason),
+                ..usage(1, 1, 0.0)
+            };
+            store
+                .record_turn_usage(alice, helper, &thread(None), used, false, at(5))
+                .await
+                .unwrap_or_else(|error| panic!("{reason}: {error}"));
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage WHERE cost_unknown != ''")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 7);
+        let other = sqlx::query(
+            "INSERT INTO usage (member_id, day, turns, input_tokens, output_tokens, cost_usd, \
+             cost_unknown) VALUES (?, 0, 1, 0, 0, 0, 'other')",
+        )
+        .bind(alice.to_string())
+        .execute(&store.pool)
+        .await;
+        assert!(other.is_err(), "the table takes only the reasons it names");
     }
 
     #[tokio::test]

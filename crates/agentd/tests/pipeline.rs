@@ -1043,15 +1043,11 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         .await;
     let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
     assert_eq!(
-        (
-            billed.turns,
-            billed.used.input_tokens,
-            billed.used.output_tokens
-        ),
+        (billed.turns, billed.input_tokens, billed.output_tokens),
         (1, 10, 1),
         "fake-claude's usage for one reply"
     );
-    assert_eq!(billed.used.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
     assert_eq!(
         store
             .member_usage(stack.alice, pinned_now())
@@ -1097,15 +1093,11 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         .await;
     let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
     assert_eq!(
-        (
-            billed.turns,
-            billed.used.input_tokens,
-            billed.used.output_tokens
-        ),
+        (billed.turns, billed.input_tokens, billed.output_tokens),
         (2, 20, 2),
         "a turn whose CLI the agent killed is billed what its messages used"
     );
-    assert_eq!(billed.used.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
     assert_eq!(
         stack.unbilled_turns().await,
         [("no_result".to_owned(), 1)],

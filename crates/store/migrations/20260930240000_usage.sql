@@ -39,7 +39,9 @@ CREATE TABLE usage (
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     cost_usd REAL NOT NULL,
-    cost_unknown TEXT NOT NULL DEFAULT '',
+    cost_unknown TEXT NOT NULL DEFAULT '' CHECK (cost_unknown IN ('', 'no_result', 'no_total',
+        'total_out_of_range', 'reused_container', 'transcript_too_large',
+        'transcript_unreadable', 'transcript_unrecognized')),
     PRIMARY KEY (member_id, day, cost_unknown)
 ) STRICT;
 

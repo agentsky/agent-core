@@ -2336,7 +2336,7 @@ Deliverables:
 
 - A migration `…_usage.sql` with five tables:
   - `usage` (`member_id`, `day`, `turns`, `input_tokens`, `output_tokens`,
-    `cost_usd`), keyed `(member_id, day)`.
+    `cost_usd`, `cost_unknown`), keyed `(member_id, day, cost_unknown)`.
   - `agent_policies` (`agent_id`, `turns_per_day`, `max_hops`, `allow_json`,
     `deny_json`).
   - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
