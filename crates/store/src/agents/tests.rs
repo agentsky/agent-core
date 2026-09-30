@@ -5,6 +5,9 @@ use crate::test_util::*;
 
 const TEAM: &str = "chat.example.org";
 
+/// A per-owner limit no test reaches unless it means to.
+const MAX: u32 = 100;
+
 fn team() -> TeamId {
     TeamId::new(TEAM)
 }
@@ -34,21 +37,21 @@ async fn create(store: &Store, owner: MemberId, name: &str, at_secs: i64) -> (Ag
         surface: SurfaceKind::RocketChat,
         team: &team,
     };
-    store
-        .create_agent(&new, at(at_secs))
-        .await
-        .unwrap()
-        .expect("the name is free")
+    match store.create_agent(&new, MAX, at(at_secs)).await.unwrap() {
+        AgentCreation::Created(agent, binding) => (agent, binding),
+        other => panic!("the name is free: {other:?}"),
+    }
 }
 
 /// Creates an agent whose binding is active as bot user `user`.
 async fn active(store: &Store, owner: MemberId, name: &str, user: &str) -> (Agent, BindingId) {
     let (agent, binding) = create(store, owner, name, 1_000).await;
-    assert!(
+    assert_eq!(
         store
             .set_binding_bot_user(binding, &UserId::new(user), user)
             .await
-            .unwrap()
+            .unwrap(),
+        Some(true)
     );
     let token = SecretString::from(format!("token-of-{user}"));
     assert!(
@@ -96,22 +99,19 @@ async fn names_are_unique_per_owner_until_deleted() {
         surface: SurfaceKind::RocketChat,
         team: &team,
     };
-    assert!(
-        store
-            .create_agent(&again, at(1_001))
-            .await
-            .unwrap()
-            .is_none()
+    assert_eq!(
+        store.create_agent(&again, MAX, at(1_001)).await.unwrap(),
+        AgentCreation::NameTaken
     );
     create(&store, bob, "helper", 1_002).await;
 
     assert!(store.delete_agent(first.id, at(1_003)).await.unwrap());
     assert_eq!(store.agent_by_name(ada, "helper").await.unwrap(), None);
-    let (second, _) = store
-        .create_agent(&again, at(1_004))
-        .await
-        .unwrap()
-        .unwrap();
+    let AgentCreation::Created(second, _) =
+        store.create_agent(&again, MAX, at(1_004)).await.unwrap()
+    else {
+        panic!("the name is free again");
+    };
     assert_ne!(second.id, first.id);
     assert_eq!(
         store.agent(first.id).await.unwrap().unwrap().state,
@@ -131,7 +131,7 @@ async fn an_unknown_owner_is_a_database_error() {
         surface: SurfaceKind::RocketChat,
         team: &team,
     };
-    let err = store.create_agent(&new, at(1_000)).await.unwrap_err();
+    let err = store.create_agent(&new, MAX, at(1_000)).await.unwrap_err();
     assert!(matches!(err, StoreError::Database(_)), "{err:?}");
 }
 
@@ -148,11 +148,12 @@ async fn activation_needs_a_creating_binding_with_a_bot_user() {
             .unwrap(),
         "no bot user yet"
     );
-    assert!(
+    assert_eq!(
         store
             .set_binding_bot_user(binding, &UserId::new("bot1"), "helper")
             .await
-            .unwrap()
+            .unwrap(),
+        Some(true)
     );
     assert!(
         store
@@ -172,11 +173,129 @@ async fn activation_needs_a_creating_binding_with_a_bot_user() {
             .unwrap(),
         "already active"
     );
-    assert!(
-        !store
+    assert_eq!(
+        store
             .set_binding_bot_user(binding, &UserId::new("bot2"), "other")
             .await
+            .unwrap(),
+        None,
+        "it has a bot user"
+    );
+    assert_eq!(
+        store
+            .set_binding_bot_user(BindingId::new_v4(), &UserId::new("bot3"), "x")
+            .await
+            .unwrap(),
+        None,
+        "no such binding"
+    );
+}
+
+#[tokio::test]
+async fn an_owner_has_at_most_the_limit_of_live_agents() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    let bob = owner(&store, "bob").await;
+    let team = team();
+    let named = |name| NewAgent {
+        owner: ada,
+        name,
+        persona: "p",
+        visibility: Visibility::Public,
+        surface: SurfaceKind::RocketChat,
+        team: &team,
+    };
+    let AgentCreation::Created(first, _) = store
+        .create_agent(&named("one"), 2, at(1_000))
+        .await
+        .unwrap()
+    else {
+        panic!("under the limit");
+    };
+    assert!(matches!(
+        store
+            .create_agent(&named("two"), 2, at(1_001))
+            .await
+            .unwrap(),
+        AgentCreation::Created(..)
+    ));
+    assert_eq!(
+        store
+            .create_agent(&named("three"), 2, at(1_002))
+            .await
+            .unwrap(),
+        AgentCreation::LimitReached
+    );
+    assert_eq!(store.agent_by_name(ada, "three").await.unwrap(), None);
+    let bobs = NewAgent {
+        owner: bob,
+        ..named("three")
+    };
+    assert!(matches!(
+        store.create_agent(&bobs, 2, at(1_003)).await.unwrap(),
+        AgentCreation::Created(..)
+    ));
+    assert!(store.delete_agent(first.id, at(1_004)).await.unwrap());
+    assert!(matches!(
+        store
+            .create_agent(&named("three"), 2, at(1_005))
+            .await
+            .unwrap(),
+        AgentCreation::Created(..)
+    ));
+}
+
+#[tokio::test]
+async fn a_bot_user_is_recorded_on_an_abandoned_binding_and_then_owes_retirement() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    let (_, binding) = create(&store, ada, "helper", 1_000).await;
+    assert!(
+        store
+            .set_binding_bot_username(binding, "helper")
+            .await
             .unwrap()
+    );
+    assert_eq!(
+        store
+            .binding(binding)
+            .await
+            .unwrap()
+            .unwrap()
+            .bot_username
+            .as_deref(),
+        Some("helper")
+    );
+    assert!(
+        store
+            .abandon_creation(binding, at(1_000), at(1_001))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .set_binding_bot_username(binding, "ada.helper")
+            .await
+            .unwrap(),
+        "not creating any more"
+    );
+    assert_eq!(
+        store
+            .set_binding_bot_user(binding, &UserId::new("bot1"), "helper")
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    let pending = store
+        .pending_retirements(SurfaceKind::RocketChat, &team(), at(1_002), 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending,
+        [PendingRetirement {
+            binding,
+            bot_user: UserId::new("bot1"),
+        }]
     );
 }
 
@@ -227,6 +346,20 @@ async fn active_bots_are_the_active_bindings_of_live_agents() {
     );
     assert_eq!(bots[0].binding, helper_binding);
     assert_eq!(bots[0].bot, bot("bot1"));
+    sqlx::query("UPDATE agent_bindings SET bot_token_enc = x'00' WHERE id = ?")
+        .bind(helper_binding.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let readable = store
+        .active_bots(SurfaceKind::RocketChat, &team())
+        .await
+        .unwrap();
+    assert_eq!(
+        readable.iter().map(|b| b.agent).collect::<Vec<_>>(),
+        [paused.id],
+        "a row whose token doesn't decrypt is left out"
+    );
     assert!(
         store
             .active_bots(SurfaceKind::Slack, &team())
@@ -426,11 +559,12 @@ async fn a_stale_creation_is_abandoned_once_and_frees_the_name() {
     let (old, old_binding) = create(&store, ada, "old", 1_000).await;
     let (_, fresh) = create(&store, ada, "fresh", 1_500).await;
     active(&store, ada, "done", "bot9").await;
-    assert!(
+    assert_eq!(
         store
             .set_binding_bot_user(old_binding, &UserId::new("bot1"), "old")
             .await
-            .unwrap()
+            .unwrap(),
+        Some(true)
     );
 
     let stale = store

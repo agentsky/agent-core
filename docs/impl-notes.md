@@ -3842,18 +3842,32 @@ or a bot user nobody records, with the agent's name taken for good.
 **Solution.** `create_agent` stores the agent with a binding in state
 `creating` in one transaction; the unique index on `(owner_id, name)` only
 covers agents that aren't deleted, so the name is reserved from then on.
-The bot user is recorded on the binding (`set_binding_bot_user`) as soon as
-`users.create` returns, and `activate_binding` stores the token and makes
-the binding `active` only while it is still `creating`. Any failure
-abandons the creation (`abandon_creation`): the binding is disabled, the
-agent deleted and the name freed, and a recorded bot user is deactivated. A
-creation still `creating` after `CREATION_LEASE` (ten minutes, far longer
-than its REST calls with their 30-second timeouts can take) is abandoned by
-the next supervisor pass, which covers a crash. If that races a slow
-creation, the creation's own `activate_binding` fails and it gives up. The
-one gap left is a crash between `users.create` answering and the bot user
-being recorded: that bot user has no token and no password anyone knows, so
-it can't be used, but it keeps its username until an admin removes it.
+Before each `users.create` the binding notes the username it asks for
+(`set_binding_bot_username`), and the bot user is recorded on the binding
+(`set_binding_bot_user`) as soon as `users.create` returns, whatever the
+binding's state by then: a creation abandoned meanwhile leaves a disabled
+binding with a bot user, which owes retirement like a deleted agent's and
+gets its leased, backed-off retries, rather than one best-effort
+deactivation. `activate_binding` stores the token and makes the binding
+`active` only while it is still `creating`. Any failure abandons the
+creation (`abandon_creation`): the binding is disabled, the agent deleted
+and the name freed, and a recorded bot user is deactivated. If recording
+the bot user fails in the store, it is deactivated at once, before the
+error is reported. A creation still `creating` after `CREATION_LEASE` (ten
+minutes, far longer than its REST calls with their 30-second timeouts can
+take) is abandoned by the next supervisor pass, which covers a crash. If
+that races a slow creation, the creation's own `activate_binding` fails and
+it gives up.
+
+A crash, or a store failure, between `users.create` answering and the bot
+user being recorded leaves a bot user no binding records. Abandoning a
+creation therefore looks the noted username up with `users.info` and, if
+that user's email is the binding's (`agent-<binding id>@agent-core.invalid`),
+records it, so it is retired. That needs the manager's
+`view-full-other-user-info`, without which `users.info` leaves the emails
+out, and it is tried once, when the creation is abandoned. A bot user
+still missed has no token and no password anyone knows, so it can't be
+used, but it keeps its username until an admin removes it.
 
 ### Deactivating a deleted agent's bot is owed until it happens
 
@@ -3871,7 +3885,12 @@ ten-minute lease (`retire_attempts`, `retire_next_attempt_at`), success sets
 `retired_at`, and a failure defers the next attempt by a backoff from a
 minute doubling to six hours, for 20 attempts (about three days). `delete`
 tries once at once and says whether it worked; the supervisor retries every
-pass. A bot user Rocket.Chat no longer knows counts as retired.
+pass. A bot user Rocket.Chat no longer knows counts as retired, but only
+when it says so with `error-invalid-user` or `error-user-not-found`: a bare
+HTTP 404, such as a reverse proxy's, defers the attempt like any other
+failure. `delete` reports the deletion even when looking up or retiring the
+bindings afterwards fails in the store; that failure is logged and left to
+the supervisor.
 
 ### Connections follow the store
 
@@ -3884,14 +3903,21 @@ instance would be heard only there until a restart.
 the store: each pass starts one for every `active` binding of an active or
 paused agent and stops the rest. A pass runs at startup, whenever a
 command pokes it (`create`, `delete`), and every minute, so another
-instance's changes are picked up within a minute. It also abandons stale
-creations and retires what is owed. The command handlers never hold a
+instance's changes are picked up within a minute. After the connections,
+so slow REST calls don't delay them, it abandons stale creations and
+retires what is owed. A binding whose row doesn't read (a token that no
+longer decrypts) is logged and skipped, and the other bots keep listening. The command handlers never hold a
 `CommandFeed`, only the poke: the intake runs until every feed is dropped,
 and it owns the handlers, so a feed held there would keep it running
 forever. The supervisor drops its feed when agentd stops, after stopping its
 connections. A connection that ends on its own (a revoked token, a
-deactivated bot) is logged and started again by the next pass, so a broken
-bot logs an error once a minute until it is fixed or deleted.
+deactivated bot) or panics is logged and started again by a later pass: the
+supervisor maps each connection task's id to its binding, so a panic, which
+returns no value, still frees the binding. A connection that keeps ending
+waits longer each time, kept in memory per binding: the next pass after its
+first end, then one interval, doubling up to 32 intervals (32 minutes), and
+one that ran that long starts over. A broken bot so logs an error about
+twice an hour, not every minute, until it is fixed or deleted.
 
 ### Before turns, a bot reacts instead of replying
 
@@ -3920,9 +3946,14 @@ their user id as display name.
 
 **Solution.**
 
-- The username is `<name>`, then `<owner>-<name>`, where `<owner>` is the
+- The username is `<name>`, then `<owner>.<name>`, where `<owner>` is the
   owner's username from `users.info`. If both are taken, the agent isn't
-  created and the owner is asked for another name. `all` and `here` go
+  created and the owner is asked for another name. The separator is a dot
+  because agent names can't contain one (they are `a-z`, `0-9` and `-`),
+  while Rocket.Chat usernames can: with `-`, alice could name an agent
+  `bob-helper` and take the username bob's `helper` would fall back to.
+  Now no agent name, and no other owner's fallback, can be
+  `bob.helper`. `all` and `here` go
   straight to the prefixed form, since Rocket.Chat reads `@all` and `@here`
   as broadcasts and nobody could mention such a bot.
 - The display name is the agent's name. The email is
@@ -3933,8 +3964,10 @@ their user id as display name.
   without a lookup.
 - `create` stores the owner's username as their display name, which `list`
   shows as the owner.
-- A deleted agent's bot user stays, deactivated, so creating an agent of
-  the same name again gets the prefixed username.
+- A deleted agent's bot user stays, deactivated, and keeps its username
+  for good: creating an agent of the same name again gets the prefixed
+  username, and once that one is deleted too, the name can't be created
+  again by that owner until an admin removes the old bot users.
 
 ### Agent names are the owner's
 
@@ -3974,9 +4007,38 @@ client fills is for the live check. The file is downloaded from
 `<base>/file-upload/<id>/<name>` with the manager's `X-User-Id` and
 `X-Auth-Token` headers (Rocket.Chat's `requestCanAccessFiles` accepts them),
 never with the token in the URL, and refused past 64 KB by its
-`Content-Length` or while it is read. Only a file attached in the manager
+`Content-Length` or while it is read, as `SurfaceError::TooLarge`, a
+variant added so callers don't match on error text.
+
+With the Amazon S3 or Google Cloud Storage file store, Rocket.Chat answers
+the download with a 302 to a presigned URL in the bucket (the default,
+`FileUpload_S3_Proxy_Uploads` off). reqwest follows redirects and drops
+`Authorization` and `Cookie` on a cross-origin hop, but not custom headers,
+so the manager's `X-User-Id` and `X-Auth-Token` would reach the object
+store. `RestClient` now follows redirects only within the origin it called
+(scheme, host and port; `http` to `https` on the same host counts as
+another origin), up to 10, and stops at any other, for every REST call, so
+the headers never leave the server. `download` then fetches a cross-origin
+`Location` once, with a separate client that sends no Rocket.Chat header
+and follows no redirect, and applies the same size limit: the presigned URL
+authorizes itself. A file message's text falls back to the attachment's
+`description` only when the message has files and an empty `msg`, so a
+message without files, such as one quoting another, keeps its own text. Only a file attached in the manager
 bot's DM is read: a persona uploaded to a room would be public anyway, but
 the manager may not be able to read files there.
+
+### A member's agents are capped
+
+**Issue.** Each agent is a Rocket.Chat user with a token and a realtime
+connection agentd keeps open, and nothing stopped one member from creating
+hundreds of them.
+
+**Solution.** `[agents] max_per_owner` (default 10, at least 1) caps the
+agents that aren't deleted per member. `create_agent` counts them inside
+its `BEGIN IMMEDIATE` transaction, so concurrent creations can't both slip
+under the cap, and returns `LimitReached`; `create` then tells the member
+the limit and to delete one first. Deleted agents don't count, but their
+bot users stay, deactivated.
 
 ### The manager's permissions on the Community Edition are still open
 

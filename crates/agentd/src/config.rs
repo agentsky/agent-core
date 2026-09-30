@@ -46,6 +46,8 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
 use store::Sealer;
+
+use crate::agents::DEFAULT_MAX_PER_OWNER;
 use tracing_subscriber::EnvFilter;
 
 use crate::net::Cidr;
@@ -96,6 +98,8 @@ pub struct Config {
     pub store: StoreConfig,
     /// `[limits]`: caps on what agents may do.
     pub limits: LimitsConfig,
+    /// `[agents]`: caps on members' agents.
+    pub agents: AgentsConfig,
     /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
     /// accounts. Every key has a default, so the section is optional.
     pub claude_oauth: OAuthConfig,
@@ -118,6 +122,8 @@ struct File {
     store: StoreConfig,
     #[serde(default)]
     limits: LimitsConfig,
+    #[serde(default)]
+    agents: AgentsConfig,
     #[serde(default)]
     claude_oauth: OAuthConfig,
     rocketchat: Option<RocketChatConfig>,
@@ -221,6 +227,24 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             attach_max_bytes: DEFAULT_ATTACH_MAX_BYTES,
+        }
+    }
+}
+
+/// `[agents]`. Every key has a default, so the section is optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct AgentsConfig {
+    /// `max_per_owner`: how many agents that aren't deleted one member may
+    /// have. `create` refuses more.
+    pub max_per_owner: u32,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            max_per_owner: DEFAULT_MAX_PER_OWNER,
         }
     }
 }
@@ -342,6 +366,7 @@ impl Config {
             internal: file.internal,
             store: file.store,
             limits: file.limits,
+            agents: file.agents,
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
             secrets,
@@ -488,6 +513,9 @@ impl File {
         }
         if self.limits.attach_max_bytes == 0 {
             return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
+        }
+        if self.agents.max_per_owner == 0 {
+            return Err(invalid("agents.max_per_owner", "must be at least 1"));
         }
         self.claude_oauth
             .validate()
@@ -759,6 +787,7 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(config.store.url, "sqlite::memory:");
         assert_eq!(config.store.data_dir, Path::new("/nonexistent/agentd"));
         assert_eq!(config.limits.attach_max_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.agents.max_per_owner, 10);
         assert!(config.secrets.rc_manager_token.is_none());
         assert!(config.secrets.slack_manager.is_empty());
         assert!(config.unknown_env.is_empty());
@@ -1220,6 +1249,14 @@ manager_user_id = "manager-id"
         assert_eq!(with(&text, env()).unwrap().limits.attach_max_bytes, 1024);
         let err = file_err(&format!("{MINIMAL}\n[limits]\nattach_max_bytes = 0\n"));
         assert_eq!(err.key(), Some("limits.attach_max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_limit_is_configurable_and_positive() {
+        let text = format!("{MINIMAL}\n[agents]\nmax_per_owner = 3\n");
+        assert_eq!(with(&text, env()).unwrap().agents.max_per_owner, 3);
+        let err = file_err(&format!("{MINIMAL}\n[agents]\nmax_per_owner = 0\n"));
+        assert_eq!(err.key(), Some("agents.max_per_owner"), "{err}");
     }
 
     #[test]

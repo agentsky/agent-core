@@ -39,6 +39,8 @@ pub struct FakeUser {
     pub avatar_url: Option<String>,
     /// Whether `users.create` was asked for a verified email.
     pub verified: bool,
+    /// The email `users.create` was given.
+    pub email: Option<String>,
     password: Option<String>,
 }
 
@@ -99,14 +101,18 @@ impl State {
 
     fn user_json(&self, id: &str) -> Value {
         self.users.get(id).map_or(Value::Null, |u| {
-            json!({
+            let mut user = json!({
                 "_id": u.id,
                 "username": u.username,
                 "name": u.name,
                 "roles": u.roles,
                 "active": u.active,
                 "type": "user",
-            })
+            });
+            if let Some(email) = &u.email {
+                user["emails"] = json!([{ "address": email, "verified": u.verified }]);
+            }
+            user
         })
     }
 
@@ -161,8 +167,9 @@ impl State {
 ///
 /// It starts with one user, the manager ([`FakeRest::MANAGER_ID`],
 /// authenticated by [`FakeRest::MANAGER_TOKEN`]), and no rooms.
-/// `users.info` includes `roles` only for the caller itself and for the
-/// manager, which the fake treats as holding `view-full-other-user-info`.
+/// `users.info` includes `roles` and `emails` only for the caller itself
+/// and for the manager, which the fake treats as holding
+/// `view-full-other-user-info`.
 pub struct FakeRest {
     server: MockServer,
     state: Arc<Mutex<State>>,
@@ -189,6 +196,7 @@ impl FakeRest {
                 active: true,
                 avatar_url: None,
                 verified: false,
+                email: None,
                 password: None,
             },
         );
@@ -236,6 +244,7 @@ impl FakeRest {
                 active: true,
                 avatar_url: None,
                 verified: false,
+                email: None,
                 password: None,
             },
         );
@@ -536,6 +545,7 @@ impl Respond for Router {
                     && let Some(user) = user.as_object_mut()
                 {
                     user.remove("roles");
+                    user.remove("emails");
                 }
                 ok(json!({ "user": user }))
             }
@@ -809,7 +819,7 @@ fn login(state: &mut State, body: &Value) -> ResponseTemplate {
 
 fn create_user(state: &mut State, body: &Value) -> ResponseTemplate {
     let field = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
-    let (Some(username), Some(name), Some(_email), Some(password)) = (
+    let (Some(username), Some(name), Some(email), Some(password)) = (
         field("username"),
         field("name"),
         field("email"),
@@ -849,6 +859,7 @@ fn create_user(state: &mut State, body: &Value) -> ResponseTemplate {
                 .get("verified")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            email: Some(email),
             password: Some(password),
         },
     );

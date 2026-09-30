@@ -981,11 +981,13 @@ async fn agent_commands_without_rocketchat_agents() {
         surface: SurfaceKind::RocketChat,
         team: &team,
     };
-    h.store
-        .create_agent(&new, OffsetDateTime::now_utc())
-        .await
-        .unwrap()
-        .unwrap();
+    assert!(matches!(
+        h.store
+            .create_agent(&new, 10, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        store::AgentCreation::Created(..)
+    ));
     h.dm("bob", "list").await;
     assert_eq!(
         h.last_reply("bob"),

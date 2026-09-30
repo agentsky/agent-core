@@ -45,8 +45,8 @@ mod seal;
 mod volumes;
 
 pub use agents::{
-    ActiveBot, Agent, AgentBinding, AgentState, BindingState, DirectoryEntry, NewAgent,
-    PendingRetirement, Visibility,
+    ActiveBot, Agent, AgentBinding, AgentCreation, AgentState, BindingState, DirectoryEntry,
+    NewAgent, PendingRetirement, Visibility,
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};

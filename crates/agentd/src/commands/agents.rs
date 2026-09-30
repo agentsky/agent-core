@@ -7,8 +7,8 @@
 //! apps (T31).
 
 use commands::UserRef;
-use core_types::{InFile, MemberKey, SurfaceError, SurfaceKind, UserId};
-use store::{Agent, AgentState, BindingState, NewAgent, Visibility};
+use core_types::{AgentId, InFile, MemberKey, SurfaceError, SurfaceKind, UserId};
+use store::{Agent, AgentCreation, AgentState, BindingState, NewAgent, StoreError, Visibility};
 use time::OffsetDateTime;
 
 use super::{Commands, Failure, Origin};
@@ -106,13 +106,24 @@ impl Commands {
             surface: SurfaceKind::RocketChat,
             team: agents.team(),
         };
-        let Some((agent, binding)) = self
+        let max = agents.max_per_owner();
+        let (agent, binding) = match self
             .inner
             .store
-            .create_agent(&new, OffsetDateTime::now_utc())
+            .create_agent(&new, max, OffsetDateTime::now_utc())
             .await?
-        else {
-            return Ok(format!("You already have an agent named `{name}`."));
+        {
+            AgentCreation::Created(agent, binding) => (agent, binding),
+            AgentCreation::NameTaken => {
+                return Ok(format!("You already have an agent named `{name}`."));
+            }
+            AgentCreation::LimitReached => {
+                return Ok(format!(
+                    "You already have as many agents as one member may have ({max}), so I \
+                     didn't create `{name}`. Delete one first with {}.",
+                    origin.command("delete <name>")
+                ));
+            }
         };
         let bot = match agents.create_bot(binding, name, &owner).await {
             Ok(bot) => bot,
@@ -227,9 +238,7 @@ impl Commands {
         let max = u64::try_from(PERSONA_MAX_BYTES).unwrap_or(u64::MAX);
         let bytes = match agents.download(&file.id, &file.name, max).await {
             Ok(bytes) => bytes,
-            Err(SurfaceError::Api(message)) if message.contains("limit") => {
-                return Ok(Err(too_large));
-            }
+            Err(SurfaceError::TooLarge(_)) => return Ok(Err(too_large)),
             Err(err) => return Err(err.into()),
         };
         Ok(String::from_utf8(bytes.to_vec())
@@ -348,17 +357,13 @@ impl Commands {
         let Some(agents) = self.agents_for(key) else {
             return Ok(format!("Deleted `{name}`."));
         };
-        let mut retired = true;
-        for binding in store.bindings_of(agent.id).await? {
-            if binding.state == BindingState::Disabled
-                && binding.bot_user.is_some()
-                && binding.retired_at.is_none()
-            {
-                let ours =
-                    binding.surface == SurfaceKind::RocketChat && binding.team == *agents.team();
-                retired &= ours && agents.retire(binding.id).await?;
+        let retired = match retire_bots(agents, agent.id).await {
+            Ok(retired) => retired,
+            Err(err) => {
+                tracing::warn!(agent = %agent.id, error = %err, "couldn't retire a deleted agent's bot users");
+                false
             }
-        }
+        };
         agents.poke();
         Ok(if retired {
             format!("Deleted `{name}` and deactivated its bot user.")
@@ -368,6 +373,22 @@ impl Commands {
             )
         })
     }
+}
+
+/// Retires the bot users of the deleted `agent` on `agents`' server, and
+/// returns whether every bot user it had anywhere is retired now.
+async fn retire_bots(agents: &RocketChatAgents, agent: AgentId) -> Result<bool, StoreError> {
+    let mut retired = true;
+    for binding in agents.store().bindings_of(agent).await? {
+        if binding.state == BindingState::Disabled
+            && binding.bot_user.is_some()
+            && binding.retired_at.is_none()
+        {
+            let ours = binding.surface == SurfaceKind::RocketChat && binding.team == *agents.team();
+            retired &= ours && agents.retire(binding.id).await?;
+        }
+    }
+    Ok(retired)
 }
 
 #[cfg(test)]

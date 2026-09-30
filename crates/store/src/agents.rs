@@ -1,9 +1,10 @@
 //! `agents` and `agent_bindings`.
 //!
 //! An agent is created together with one binding in state
-//! [`creating`](BindingState::Creating). The caller then creates the bot
-//! user on the platform, [records it](Store::set_binding_bot_user), obtains
-//! its token and [activates](Store::activate_binding) the binding. A
+//! [`creating`](BindingState::Creating). The caller then notes the username
+//! it asks for ([`set_binding_bot_username`](Store::set_binding_bot_username)),
+//! creates the bot user on the platform, [records it](Store::set_binding_bot_user),
+//! obtains its token and [activates](Store::activate_binding) the binding. A
 //! creation that never finishes, because the caller failed or died, is
 //! [abandoned](Store::abandon_creation): the binding is disabled and the
 //! agent deleted, which frees its name.
@@ -170,7 +171,8 @@ pub struct AgentBinding {
     pub team: TeamId,
     /// The bot user's id, once the platform created it.
     pub bot_user: Option<UserId>,
-    /// The bot user's username, once the platform created it.
+    /// The bot user's username once the platform created it, and before
+    /// that the username a creation last asked the platform for.
     pub bot_username: Option<String>,
     /// Where it is in its life.
     pub state: BindingState,
@@ -189,6 +191,17 @@ pub struct DirectoryEntry {
     pub owner_name: String,
     /// The username of its active bot on the surface and team asked for.
     pub bot_username: Option<String>,
+}
+
+/// What [`Store::create_agent`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentCreation {
+    /// It stored the agent and its `creating` binding.
+    Created(Agent, BindingId),
+    /// The owner already has an agent of that name that isn't deleted.
+    NameTaken,
+    /// The owner already has as many agents that aren't deleted as they may.
+    LimitReached,
 }
 
 /// An active binding agentd listens as, with its token, from
@@ -312,8 +325,8 @@ macro_rules! retirable {
 impl Store {
     /// Creates an agent in state `active` at `now`, with one binding on
     /// `new.surface` and `new.team` in state `creating`, in one
-    /// transaction. Returns the agent and the binding's id, or `None` if
-    /// the owner already has an agent of that name that isn't deleted.
+    /// transaction, unless the owner already has `max_per_owner` agents that
+    /// aren't deleted, or one of that name.
     ///
     /// # Errors
     ///
@@ -321,8 +334,9 @@ impl Store {
     pub async fn create_agent(
         &self,
         new: &NewAgent<'_>,
+        max_per_owner: u32,
         now: OffsetDateTime,
-    ) -> Result<Option<(Agent, BindingId)>> {
+    ) -> Result<AgentCreation> {
         let agent = Agent {
             id: AgentId::new_v4(),
             owner: new.owner,
@@ -334,6 +348,15 @@ impl Store {
         };
         let binding = BindingId::new_v4();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let owned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agents WHERE owner_id = ? AND state <> 'deleted'",
+        )
+        .bind(agent.owner.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if owned >= i64::from(max_per_owner) {
+            return Ok(AgentCreation::LimitReached);
+        }
         let inserted = sqlx::query(
             "INSERT INTO agents (id, owner_id, name, persona, visibility, state, created_at) \
              VALUES (?, ?, ?, ?, ?, 'active', ?)",
@@ -348,7 +371,9 @@ impl Store {
         .await;
         match inserted {
             Ok(_) => {}
-            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => return Ok(None),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                return Ok(AgentCreation::NameTaken);
+            }
             Err(err) => return Err(err.into()),
         }
         sqlx::query(
@@ -363,7 +388,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(Some((agent, binding)))
+        Ok(AgentCreation::Created(agent, binding))
     }
 
     /// The agent `id`, deleted or not.
@@ -539,9 +564,38 @@ impl Store {
         rows.into_iter().map(BindingRow::into_binding).collect()
     }
 
-    /// Records the bot user the platform created for a `creating` binding.
-    /// Returns false if the binding isn't `creating` any more, for example
-    /// because its creation was abandoned.
+    /// Notes the username a creation is about to ask the platform for on
+    /// the `creating` binding, which has no bot user yet, so that the bot
+    /// user of a creation that dies before
+    /// [recording it](Self::set_binding_bot_user) can be found. Returns
+    /// false, noting nothing, if the binding isn't `creating` any more or
+    /// has a bot user.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn set_binding_bot_username(
+        &self,
+        binding: BindingId,
+        bot_username: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE agent_bindings SET bot_username = ? \
+             WHERE id = ? AND state = 'creating' AND bot_user_id IS NULL",
+        )
+        .bind(bot_username)
+        .bind(binding.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Records the bot user the platform created for `binding`, which has
+    /// none yet, whatever the binding's state: a creation abandoned
+    /// meanwhile leaves a disabled binding whose bot user then owes
+    /// retirement. Returns whether the binding is still `creating`, or
+    /// `None`, recording nothing, if it doesn't exist or already has a bot
+    /// user.
     ///
     /// # Errors
     ///
@@ -552,17 +606,16 @@ impl Store {
         binding: BindingId,
         bot_user: &UserId,
         bot_username: &str,
-    ) -> Result<bool> {
-        let result = sqlx::query(
+    ) -> Result<Option<bool>> {
+        Ok(sqlx::query_scalar(
             "UPDATE agent_bindings SET bot_user_id = ?, bot_username = ? \
-             WHERE id = ? AND state = 'creating'",
+             WHERE id = ? AND bot_user_id IS NULL RETURNING state = 'creating'",
         )
         .bind(bot_user.as_str())
         .bind(bot_username)
         .bind(binding.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// Stores the bot token of a `creating` binding whose bot user is
@@ -655,13 +708,12 @@ impl Store {
 
     /// Every `active` binding on `surface` and `team` whose agent is active
     /// or paused, with its bot token, oldest first: the bots agentd listens
-    /// as.
+    /// as. A row whose ids don't parse or whose token doesn't decrypt is
+    /// logged and left out, so one bad row doesn't silence every bot.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
-    /// if a row doesn't parse, [`StoreError::Seal`] if a token doesn't
-    /// decrypt.
+    /// [`StoreError::Database`] if the query fails.
     pub async fn active_bots(&self, surface: SurfaceKind, team: &TeamId) -> Result<Vec<ActiveBot>> {
         let rows: Vec<(String, String, String, Vec<u8>)> = sqlx::query_as(
             "SELECT b.id, b.agent_id, b.bot_user_id, b.bot_token_enc \
@@ -675,20 +727,29 @@ impl Store {
         .bind(team.as_str())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|(binding, agent, user, token)| {
-                Ok(ActiveBot {
-                    binding: parse_column(&binding, BINDINGS, "id")?,
-                    agent: parse_column(&agent, BINDINGS, "agent_id")?,
-                    bot: MemberKey {
-                        surface,
-                        team: team.clone(),
-                        user: user.into(),
-                    },
-                    token: self.open_sealed(token_aad(&binding), &token)?,
-                })
+        let read = |(binding, agent, user, token): (String, String, String, Vec<u8>)| {
+            Ok::<_, StoreError>(ActiveBot {
+                binding: parse_column(&binding, BINDINGS, "id")?,
+                agent: parse_column(&agent, BINDINGS, "agent_id")?,
+                bot: MemberKey {
+                    surface,
+                    team: team.clone(),
+                    user: user.into(),
+                },
+                token: self.open_sealed(token_aad(&binding), &token)?,
             })
-            .collect()
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let binding = row.0.clone();
+                read(row)
+                    .inspect_err(|err| {
+                        tracing::error!(%binding, error = %err, "skipping an active binding that doesn't read");
+                    })
+                    .ok()
+            })
+            .collect())
     }
 
     /// The agent whose `active` binding is the bot user `bot`, with the

@@ -76,6 +76,11 @@ data_dir = "/var/lib/agentd"
 # The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
 attach_max_bytes = 52428800
 
+[agents]
+# How many agents one member may have (deleted ones don't count). `create`
+# refuses more. Default 10.
+max_per_owner = 10
+
 [claude_oauth]
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every

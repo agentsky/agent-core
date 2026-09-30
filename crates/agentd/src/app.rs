@@ -201,7 +201,8 @@ fn rocketchat_manager(
         rest.clone(),
         identity.team.clone(),
         settings.avatar_url.clone(),
-    );
+    )
+    .with_max_per_owner(config.agents.max_per_owner);
     let bot = Arc::new(ManagerBot::new(
         identity,
         surface.clone(),

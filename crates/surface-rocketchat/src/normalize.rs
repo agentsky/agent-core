@@ -265,6 +265,15 @@ mod tests {
         assert_eq!(typed.text, "persona helper");
         let no_file = message(json!({ "msg": "", "attachments": [{ "description": "quoted" }] }));
         assert_eq!(no_file.text, "");
+        let no_text_no_file =
+            message(json!({ "msg": null, "attachments": [{ "description": "q" }] }));
+        assert_eq!(no_text_no_file.text, "");
+        let no_text = message(json!({
+            "msg": null,
+            "files": [file],
+            "attachments": [{ "description": "persona helper" }],
+        }));
+        assert_eq!(no_text.text, "persona helper");
         let no_description = message(json!({ "msg": null, "files": [file] }));
         assert_eq!(no_description.text, "");
     }

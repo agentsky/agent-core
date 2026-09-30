@@ -58,8 +58,13 @@ impl Chat {
     }
 
     fn config(&self, db_url: &str) -> Config {
+        self.config_with(db_url, "")
+    }
+
+    /// The configuration, with the sections `extra` added.
+    fn config_with(&self, db_url: &str, extra: &str) -> Config {
         let text = format!(
-            "{}\n[rocketchat]\nbase_url = \"{}\"\nwebsocket_url = \"{}\"\nteam = \"{TEAM}\"\n\
+            "{}{extra}\n[rocketchat]\nbase_url = \"{}\"\nwebsocket_url = \"{}\"\nteam = \"{TEAM}\"\n\
              manager_user_id = \"{}\"\n",
             CONFIG.replace("sqlite::memory:", db_url),
             self.fake.uri(),
@@ -214,7 +219,11 @@ struct Running {
 
 impl Running {
     async fn start(chat: &Chat, db_url: &str) -> Self {
-        let app = App::open(chat.config(db_url)).await.unwrap();
+        Self::start_with(chat, chat.config(db_url)).await
+    }
+
+    async fn start_with(chat: &Chat, config: Config) -> Self {
+        let app = App::open(config).await.unwrap();
         let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.run(
@@ -367,37 +376,60 @@ async fn create_makes_a_bot_user_and_starts_its_connection() {
 }
 
 #[tokio::test]
+async fn a_member_has_at_most_max_per_owner_agents() {
+    let chat = Chat::start().await;
+    let config = chat.config_with("sqlite::memory:", "\n[agents]\nmax_per_owner = 1\n");
+    let running = Running::start_with(&chat, config).await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+
+    let refused = chat.command("alice", "create writer").await;
+    assert_eq!(
+        refused,
+        "You already have as many agents as one member may have (1), so I didn't create \
+         `writer`. Delete one first with `delete <name>`."
+    );
+    assert!(chat.fake.user("writer").is_none());
+    assert!(running.agent(&chat.alice, "writer").await.is_none());
+
+    chat.command("alice", "delete helper").await;
+    let created = chat.command("alice", "create writer").await;
+    assert!(created.starts_with("Created `writer`."), "{created}");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn a_taken_username_gets_the_owners_prefix() {
     let chat = Chat::start().await;
     chat.fake.add_user("helper");
     chat.fake.add_user("coder");
-    chat.fake.add_user("alice-coder");
+    chat.fake.add_user("alice.coder");
     let running = Running::start(&chat, "sqlite::memory:").await;
     running.link(&chat.alice).await;
 
     let reply = chat.command("alice", "create helper").await;
     assert!(
         reply.starts_with(
-            "Created `helper`. Its bot user is @alice-helper, since the username `helper` \
+            "Created `helper`. Its bot user is @alice.helper, since the username `helper` \
              isn't available."
         ),
         "{reply}"
     );
-    let bot = chat.fake.user("alice-helper").unwrap();
+    let bot = chat.fake.user("alice.helper").unwrap();
     assert_eq!(bot.name, "helper");
     chat.ddp.wait_for_logins(&bot.id, 1).await;
 
     let taken = chat.command("alice", "create coder").await;
     assert_eq!(
         taken,
-        "The usernames `coder` and `alice-coder` are taken on this server, so I didn't create \
+        "The usernames `coder` and `alice.coder` are taken on this server, so I didn't create \
          `coder`. Pick another name."
     );
     assert!(running.agent(&chat.alice, "coder").await.is_none());
 
     let broadcast = chat.command("alice", "create all").await;
     assert!(
-        broadcast.starts_with("Created `all`. Its bot user is @alice-all"),
+        broadcast.starts_with("Created `all`. Its bot user is @alice.all"),
         "{broadcast}"
     );
     running.stop().await;
@@ -572,7 +604,7 @@ async fn delete_deactivates_the_bot_and_stops_its_connection() {
     let ignored = chat.say("bob", "GENERAL", "hi @helper", mention(&[&helper]));
     let again = chat.command("alice", "create helper").await;
     assert!(
-        again.starts_with("Created `helper`. Its bot user is @alice-helper"),
+        again.starts_with("Created `helper`. Its bot user is @alice.helper"),
         "{again}"
     );
     assert!(chat.reactors(&ignored).is_empty());

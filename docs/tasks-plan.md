@@ -1217,8 +1217,10 @@ Deliverables:
 - Store methods for agents and bindings.
 - Handlers:
   - `create <name> [persona]` requires a linked member.
-    1. Create the Rocket.Chat bot user named `<name>` (or `<owner>-<name>` when
-       taken; tell the member which).
+    1. Create the Rocket.Chat bot user named `<name>` (or `<owner>.<name>` when
+       taken; tell the member which;
+       [impl-notes](impl-notes.md#bot-usernames)). A member has at most
+       `[agents] max_per_owner` agents that aren't deleted (default 10).
     2. Obtain its token. An avatar is optional; set one only from an
        `avatar_url` in configuration.
     3. Store the binding.
