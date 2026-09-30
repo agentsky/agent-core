@@ -1005,13 +1005,15 @@ the link broken. Taken literally, a network blip, a timeout or a 5xx from the
 token endpoint would force every member who happened to refresh then to log
 in again.
 
-**Solution.** Only a refusal marks the link broken: HTTP 400 (`invalid_grant`
-and the like), 401 or 403 from the token endpoint. Any other failure leaves
-the link as it is. If the current access token hasn't expired yet (a refresh
-starts 5 minutes early) it is returned; otherwise the error is. A broken link
-returns `RelinkRequired` at once, without calling the endpoint again, until
-the member logs in. `RelinkRequired { newly_broken }` carries what
-`mark_claude_link_broken` returned, so T13 sends one notice per failure.
+**Solution.** Only a response saying the refresh token is dead marks the
+link broken; which responses say so is in
+[A 4xx from the token endpoint is not always a dead token](#a-4xx-from-the-token-endpoint-is-not-always-a-dead-token).
+Any other failure leaves the link as it is. If the current access token
+hasn't expired yet (a refresh starts 5 minutes early) it is returned;
+otherwise the error is. A broken link returns `RelinkRequired` at once,
+without calling the endpoint again, until the member logs in. The member is
+told once per failure through the relink notices described in
+[A cancelled caller lost the refresh](#a-cancelled-caller-lost-the-refresh).
 
 ### `put_claude_link` would let a refresh undo a logout
 
@@ -1023,10 +1025,11 @@ result and link the member again.
 login, logout) holds that member's lock from the `KeyedLocks` the
 single-flight refresh uses, so a logout waits for a refresh in flight and then
 deletes its result. And a refresh stores through a new store method,
-`update_claude_link`, a plain `UPDATE` that returns false when there is no
-row, so even a delete that bypasses `auth` isn't undone; `auth` then revokes
-the orphaned refresh token and returns `NotLinked`. A login still upserts,
-since it is meant to create the link.
+`update_claude_tokens`, a plain `UPDATE` that returns false when there is no
+row (or, since the generation fix below, a newer login's row), so even a
+delete that bypasses `auth` isn't undone; `auth` then revokes the orphaned
+refresh token and returns `NotLinked`. A login still upserts, since it is
+meant to create the link.
 
 ### Error values could leak what they describe
 
@@ -1052,7 +1055,9 @@ logins, pastes someone else's code, or when the profile can't be read.
 
 - A member has at most one pending login: `start_login` drops the earlier
   ones, so only the newest link works, and the table can't be filled by
-  repeated `login` commands.
+  repeated `login` commands. See
+  [Two logins started at once both stayed pending](#two-logins-started-at-once-both-stayed-pending)
+  for why that is one store transaction.
 - `take_pending_login` deletes the row before the member check, so a code
   pasted by the wrong member is used up. The owner's code has leaked, so they
   have to start again, and the error (`UnknownLogin`) doesn't reveal that the
@@ -1064,6 +1069,159 @@ logins, pastes someone else's code, or when the profile can't be read.
   backticks, quotes and angle brackets around the text, accepts a pasted
   callback URL (including Slack's `<url|label>` form), and rejects input over
   4 KiB.
+
+### A cancelled caller lost the refresh
+
+**Issue.** `access_token` refreshed inside the caller's future. If the caller
+was dropped after the token endpoint answered but before the store was
+updated, the rotated refresh token was lost, and with it the member's link
+(Anthropic rotates refresh tokens, so the stored one may no longer work). A
+test with a 100 ms timeout around a 300 ms token endpoint showed it. The same
+drop could lose `newly_broken` after `mark_claude_link_broken` had set
+`broken_at`, so no relink notice would ever be sent. T18's proxy drops
+request futures whenever a client disconnects, so this would happen in
+normal use.
+
+**Solution.** A refresh runs in a task of its own, spawned by the first
+caller that needs it. The task takes the member's lock, refreshes, stores
+the tokens or marks the link broken, and publishes its result on a
+`tokio::sync::watch` channel; every caller, the first included, only waits
+on that channel, so dropping a caller cancels nothing. A guard removes the
+member's entry from the in-flight map however the task ends, and a caller
+whose task died without a result gets `AuthError::RefreshInterrupted`.
+
+The relink notice no longer depends on a caller either. `RelinkRequired`
+lost its `newly_broken` field; instead, when `mark_claude_link_broken`
+returns true, the task sends the member on an unbounded channel whose
+receiver agentd takes once with `Auth::take_relink_notices()` and turns into
+the DM (T13). Notices queue until received. Tests cancel the caller mid-refresh
+and check that the store ends up with the rotated tokens, and that the
+broken mark and the notice both arrive.
+
+### A failed refresh was retried by every waiter
+
+**Issue.** Refreshes were single-flight only when they succeeded: a waiter
+that got the lock after a failed refresh found the token still stale and
+refreshed again, so ten callers during a 503 sent ten requests one after
+another (about 2 s), and with a token endpoint that hangs up to the 30 s
+timeout, up to 300 s.
+
+**Solution.** Waiters share the refresh task's result, failure included, so
+one refresh sends one request whatever it returns. After a failure that
+doesn't break the link, the member's failure time is kept in memory (it is
+disposable: a restart only means one extra attempt), and for
+`REFRESH_BACKOFF` (30 s) a still-valid token is handed out without trying
+again. An expired token is always retried, one request at a time, since there
+is nothing to hand out instead. `AuthError` became `Clone` for this (its
+`reqwest::Error` and `StoreError` are behind `Arc`). A test sends ten
+concurrent calls during a delayed 503 and sees one request, and one more
+call right after still sends none.
+
+### A 4xx from the token endpoint is not always a dead token
+
+**Issue.** Any HTTP 400, 401 or 403 from the token endpoint broke the link,
+including a 403 HTML page such as a Cloudflare challenge, which says nothing
+about the refresh token.
+
+**Solution.** Claude Code 2.1.285's rule, read from the binary
+(`grep -aoE 'function Vce\([a-z]+\)\{.{0,400}'` and the functions next to
+it, `a5n`, `fLo`, `bBt`, `tl` and the caller `_5o`): it reads the OAuth
+error code as `error` when that is a string and `error.type` when it is an
+object, and treats a refresh token as dead (`known_dead_refresh_token`) only
+for HTTP 400 or 401 with `invalid_grant`. It treats an account as on hold
+for HTTP 400, 401 or 403 whose body is `{error: "invalid_grant" |
+"access_denied", error_description: "account_on_hold"}`. `invalid_client`,
+`invalid_scope` and `unauthorized_client` on a 400 are "expected" failures it
+logs without reporting. Everything else is a plain `refresh_failed` it tries
+again later.
+
+`auth` marks the link broken for HTTP 400 or 401 with `invalid_grant`,
+`invalid_client`, `invalid_scope` or `unauthorized_client`, and for an
+account on hold on 400, 401 or 403. Any other 4xx, with or without a body,
+is transient. Two deviations: Claude Code doesn't mark a token dead for the
+three "expected" codes, but none of them can pass on retry (a wrong client
+ID, or `scopes` widened after members linked), so `auth` asks the member to
+log in again rather than retrying forever; and the plan's wording ("HTTP
+400, 401 or 403") is narrowed to these codes. Tests cover each code, the
+account-on-hold body, and 4xx responses that must not break the link.
+
+### The plan was read while holding the member's lock
+
+**Issue.** After a refresh, the profile request (10 s timeout) ran while the
+member's lock was held, so a logout, a login, or the next refresh waited on
+it, and every caller of `access_token` waited for it too.
+
+**Solution.** The refresh task stores the tokens with
+`update_claude_tokens`, hands the token to its callers and releases the
+lock, then reads the profile and stores only the plan with
+`update_claude_plan`, an `UPDATE` of the plan columns for the link's
+generation. A failed read keeps the old plan. Tests show the caller and a
+logout both finish while the profile is still answering, and that the late
+plan write doesn't bring back a link deleted meanwhile.
+
+### A stale refresh could break a newer login
+
+**Issue.** A refresh that read the link, then waited on the token endpoint
+while the member logged in again (from another instance, or through the
+store directly), could mark the new login's link broken when its old
+refresh token was refused, so T13 would send a wrong relink notice. A
+successful one could overwrite the new login's tokens with the old grant's.
+
+**Solution.** A new migration adds `claude_links.generation` and a one-row
+`claude_link_generations` counter. `put_claude_link` takes the next value
+from the counter and stores it with the link in one `BEGIN IMMEDIATE`
+transaction and returns it. The counter never goes back, so a link deleted
+by a logout and stored again gets a new generation too (a per-row counter
+would restart). `update_claude_tokens`, `update_claude_plan` and
+`mark_claude_link_broken` take the generation the refresh read and change
+nothing unless it still matches. When one of them finds the link replaced,
+`auth` revokes any refresh token it no longer needs and hands out whatever
+the store now holds. Store and `auth` tests cover a mark after a new login
+(nothing changes) and a new login after a mark (the new link is not broken),
+and a refresh finishing after a new login.
+
+### Two logins started at once both stayed pending
+
+**Issue.** `start_login` deleted the member's pending logins and then
+inserted the new one in two statements, so two concurrent starts could
+interleave and leave both.
+
+**Solution.** `put_pending_login` itself deletes the member's other pending
+logins and inserts the new one in one `BEGIN IMMEDIATE` transaction, so
+there is no separate step to forget. A store test with six concurrent puts
+over ten rounds on a file database, and an `auth` test with six concurrent
+`start_login` calls, each leave exactly one.
+
+### An expired token could be handed out after a failed refresh
+
+**Issue.** After a failed refresh, whether the current token was still valid
+was checked against the time read before the request, which can take up to
+30 s, so a token that expired during the request was still handed out.
+
+**Solution.** The clock is read again after the attempt. A test lets a token
+with 2 s left wait 2.5 s for a 503 and gets the error, not the token.
+
+### `me` needs the link state without the tokens
+
+**Issue.** T13's `me` only needs whether the member is linked, the plan and
+whether the link is broken, and reading the link decrypted both tokens for
+that.
+
+**Solution.** `Auth::status(member) -> LinkStatus { linked, plan, broken }`
+over a new store method, `claude_link_status`, that selects only `plan`,
+`rate_limit_tier` and `broken_at`. A test reads the status of a link whose
+tokens no longer decrypt.
+
+### Store methods read the clock themselves
+
+**Issue.** `ensure_member`, `mark_event_processed` and `put_claude_link`
+(and the old `update_claude_link`) called `OffsetDateTime::now_utc()`
+inside, unlike `sweep_expired` and `mark_claude_link_broken`, which take the
+time. Their tests couldn't pin the stored timestamps.
+
+**Solution.** They take a `now: OffsetDateTime`, as do the new
+`update_claude_tokens`; callers pass the current time, and the store tests
+pass fixed times and check them.
 
 ### sqlx's sha2 0.10 next to auth's sha2 0.11
 
