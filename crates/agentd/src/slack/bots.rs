@@ -103,10 +103,13 @@ impl SlackBots {
                 let Some(token) = store.bot_token(binding).await? else {
                     return Ok(None);
                 };
-                let surface = Arc::new(SlackSurface::new(
-                    self.inner.client.bot(token),
-                    Arc::clone(&self.inner.directory),
-                ));
+                let surface = Arc::new(
+                    SlackSurface::new(
+                        self.inner.client.bot(token),
+                        Arc::clone(&self.inner.directory),
+                    )
+                    .with_bot_user(row.bot_user.clone()),
+                );
                 Arc::clone(self.built().entry(binding).or_insert(surface))
             }
         };

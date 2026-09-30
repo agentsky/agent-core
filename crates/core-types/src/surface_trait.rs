@@ -71,17 +71,19 @@ pub trait Surface: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Msg>>;
 
-    /// Whether the platform has `event`'s message as the event describes
-    /// it: that message, in that conversation and thread, from that sender,
-    /// with that text.
+    /// The platform's own copy of `event`'s message, normalized as the
+    /// surface normalizes events, or `None` when the platform doesn't have
+    /// it, or has it in a form the surface wouldn't deliver. Only the
+    /// binding, the event id and the arrival time come from `event`;
+    /// everything routing reads comes from the platform.
     ///
     /// A surface whose events arrive over a connection only the platform
-    /// can speak on answers true without asking. One whose events someone
-    /// else could forge, such as Slack's, where an agent's owner holds the
-    /// app's signing secret, reads the message back from the platform. The
-    /// pipeline asks before a turn that someone other than the agent's owner
-    /// pays for.
-    async fn confirm(&self, event: &InboundEvent) -> Result<bool>;
+    /// can speak on returns `event` itself without asking. One whose events
+    /// someone else could forge, such as Slack's, where an agent's owner
+    /// holds the app's signing secret, reads the message back from the
+    /// platform. The pipeline asks before acting on a message for anyone
+    /// but the agent's owner, and routes the copy instead of the event.
+    async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>>;
 
     /// Converts Markdown to the surface's format and splits it into
     /// messages that each fit [`Caps::message_limit`].
@@ -442,8 +444,8 @@ mod tests {
             ])
         }
 
-        async fn confirm(&self, event: &InboundEvent) -> Result<bool> {
-            Ok(event.text != "forged")
+        async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
+            Ok((event.text != "forged").then(|| event.clone()))
         }
 
         fn render(&self, markdown: &str) -> Vec<String> {
@@ -515,9 +517,9 @@ mod tests {
         assert_eq!(history[0].id.as_str(), "1.0");
         assert_eq!(history[0].text, "2.0");
         let mut forged = event(BindingId::new_v4());
-        assert_eq!(ready(surface.confirm(&forged)), Ok(true));
+        assert_eq!(ready(surface.confirm(&forged)), Ok(Some(forged.clone())));
         forged.text = "forged".into();
-        assert_eq!(ready(surface.confirm(&forged)), Ok(false));
+        assert_eq!(ready(surface.confirm(&forged)), Ok(None));
         assert_eq!(surface.render("**x**"), ["**x**"]);
         assert_eq!(surface.caps().message_limit.unit, LengthUnit::Utf16);
         assert_eq!(surface.caps().message_limit.max, 5000);

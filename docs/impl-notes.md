@@ -5273,10 +5273,10 @@ surface calls `SlackSurface::refresh_in_background`, which starts
 running. A turn's reply renders with what the directory has then; the read
 starts when the lane looks the surface up, before the turn, which takes
 longer than `users.list` in all but the largest workspaces, so the first
-reply after a restart normally resolves names. The busy line and the
-refusals, which the pipeline may post from the worker that hands messages
-on, never wait for it. `StoreSurfaces` takes Slack surfaces
-from `SlackBots` and still gives the directory the workspace's agents' bot
+reply after a restart normally resolves names. The busy line, which the
+pipeline posts in a task of its own, and the refusals never wait for it.
+`StoreSurfaces` takes Slack surfaces from `SlackBots`, each with its
+binding's bot user, and still gives the directory the workspace's agents' bot
 users on every lookup (`Store::active_bot_users`, which reads no token),
 which also picks up agents another instance installed; an install and a
 deletion do it too.
@@ -5285,30 +5285,125 @@ deletion do it too.
 
 **Issue.** An agent's app is created with its owner's configuration token,
 so the owner can read the app's signing secret at api.slack.com and sign a
-`message` event with any `user`: a linked member's, to run a turn on that
-member's plan in a thread the owner can read; one in another member's DM
-with the agent, to resume that member's scope; or an agent's post with a
-recorded requester, to inherit it. The signature proves only that the
-event came from someone holding the secret.
+`message` event with any content. The signature proves only that the event
+came from someone holding the secret. A first fix read the message back and
+compared its `ts`, sender and text, but the router decides on more than
+that, so an owner could still bill any member V for a message V posted
+where the bot can read it: add a `blocks` mention of the bot (V's real
+message, unaddressed, was dropped at ingress before deduplication, so
+nothing stopped the copy); claim `channel_type: im`; send the copy to a
+second agent of theirs, which never deduplicated it; take another agent's
+real post and add a mention, inheriting its recorded requester; attach
+files; or point `thread_ts` at an agent's reply, since
+`conversations.replies` with a reply's `ts` returns the whole thread.
 
-**Solution.** `Surface::confirm` asks whether the platform has a message as
-it arrived. Rocket.Chat answers true: its messages come over agentd's own
-realtime login. `SlackSurface::confirm` reads the message back with the
-binding's bot token, `conversations.history` with `oldest` and `latest` at
-its `ts`, `inclusive`, or `conversations.replies` in its thread for a
-reply, and requires a message at exactly that `ts` from the same sender (a
-bot known only by its bot id named by its user, as `fill_bot_sender` names
-it) with the same text. The pipeline asks before a turn unless the agent's
-owner asked for it and pays for it (their subscription or the community
-key): an owner forging their own message gains nothing they couldn't post.
-A mismatch, an error or a rate limit that outlasts the client's retries
-drops the message with a warning, before the turn prepares anything. The
-manager app isn't involved: its secret is the operators', and it starts no
-turns. Slack lowered `conversations.history` and `conversations.replies`
-limits in 2025 for commercially distributed apps outside the Marketplace;
-agent apps are internal apps of their own workspace, which that change
-doesn't cover, but the live check should confirm the lookups aren't
-throttled.
+**Solution.** Slack's copy is the source of truth, not the event.
+`Surface::confirm` returns the platform's own copy of the message as an
+`InboundEvent`, or `None`. `SlackSurface::confirm` reads it back with the
+binding's bot token (`conversations.history` with `oldest` and `latest` at
+its `ts`, `inclusive`, or `conversations.replies` in the thread the event
+named), gets the conversation's kind from `conversations.info` (`is_im`,
+`is_mpim`, else a channel; an id's prefix can't tell a group DM or a
+private channel from a public one), and normalizes the raw message with
+`normalize::read_back`, the same code the ingress runs on events: subtypes,
+sender, mentions from `text` and `blocks`, `thread_ts`, files and the
+addressing rule, with the binding's bot user, which `SlackSurface` now
+carries. Only the binding, event id and arrival time come from the event.
+A bot known by its bot id is named by `bots.info` as at ingress.
+Rocket.Chat returns the event itself: its messages come over agentd's own
+realtime login.
+
+All of it happens in one place, `Pipeline::candidate`. It routes the
+candidate's message once as it arrived. An ignore ends there. Anything
+else waits for the copy unless it is something only the agent's owner
+could gain from (`needs_confirming`): a turn the owner asks for and pays
+for (their subscription or the community key), a link prompt to the
+owner, or a refusal of a message whose sender is the owner, since forging
+those gains nothing they couldn't post. The copy must have the event's
+conversation and `ts`, and be in the thread the event's lane is for, which
+keeps each lane to one thread. Unless it equals the event, as Rocket.Chat's
+always does, it is routed again with a view of the store loaded for it,
+and the message is acted on only if that decision is the one the event
+got, and then on the copy: its text and files are what the turn sees.
+Anything else, a copy Slack doesn't have, one the ingress wouldn't keep,
+one in another thread, or one that routes differently (no longer
+addressed, another requester, another scope), is dropped with a warning
+and no word to the thread. So for anyone but the owner, the forged
+payload's sender, conversation kind, thread, mentions and files decide
+nothing. Confirming comes before link prompts and refusals too, so a
+made-up message can't make the manager DM a member or the agent post
+refusals.
+
+The confirmation window, `CONFIRM_WINDOW` (15 minutes), refuses without a
+lookup a message whose `ts` is older than that when its event arrived.
+Slack retries a failed delivery three times, the last about five minutes
+after the first, so a real event is always well inside it. Deduplication
+keeps an event for seven days, and a message older than the bot's
+membership never had one, so without the window either could be replayed.
+
+A lookup that fails without saying anything about the message (a Slack
+5xx or an unreachable Slack, `SurfaceError::Transport`, or a rate limit
+that outlasts the client's retries, `SurfaceError::RateLimited`) drops the
+message and tells the thread "Sorry, I couldn't check this message with
+Slack. Try again in a moment." (`UNCONFIRMED_TEXT`), so a real member isn't
+left without an answer. A refusal that is about the message, such as
+`channel_not_found`, `thread_not_found` or `not_in_channel` for a made-up
+conversation or thread, stays silent like a mismatch.
+
+The copy is read when the lane reaches the message, which may be minutes
+after it arrived. An edit in between runs the turn once on the text as it
+is then: the `message_changed` event is dropped at ingress, as before, and
+the message's first event holds its place in the lane. A message deleted
+meanwhile is gone from Slack, or a `tombstone`, and is dropped. A bot's
+post that was edited isn't confirmed at all (`Skip::EditedByBot`, in the
+normalization the ingress shares, where no plain event has `edited`):
+agentd never edits its
+agents' posts, so the edit came from someone else holding the bot's token,
+such as the owner, who holds their agents' tokens and could otherwise edit
+a mention into another agent's recorded post and inherit its requester.
+That Slack marks a bot's `chat.update` with `edited` is read from the
+SDKs' message shape, like the rest, and not yet seen against real Slack.
+
+Costs and limits:
+
+- One `conversations.history` or `conversations.replies` call per message
+  that isn't the owner's, and one `conversations.info` per channel per
+  `CONV_KIND_TTL` (an hour; a group DM can be converted to a private
+  channel), cached in the workspace's `TeamDirectory` for every binding.
+  All three are Tier 3 (about 50 a minute per app). Past that, the client
+  waits out `Retry-After`, at most a minute each time and three times,
+  and then the thread gets the "try again" line; that lane waits
+  meanwhile, and other agents' and threads' lanes go on. Owners' own
+  messages cost no lookup. Agent apps need
+  `channels:read`, `groups:read`, `im:read` and `mpim:read` for
+  `conversations.info`, so the manifest asks for them beyond the plan's
+  list. Slack lowered the history limits in 2025 for commercially
+  distributed apps outside the Marketplace; agent apps are internal apps of
+  their own workspace, which that change doesn't cover, but the live check
+  should confirm the lookups aren't throttled.
+- A real, addressed message that Slack never delivered (posted in a public
+  channel before the bot joined, or during an outage past Slack's retries)
+  can be delivered by the owner within the window. It runs as its sender
+  asked, on their account.
+- A lookup failure can't tell a real message from a forged one, so an
+  owner who exhausts the app's rate limit can make the agent post the
+  "try again" line in threads it can post in, at `chat.postMessage`'s pace.
+  No turn runs and no one is billed.
+- An owner forging a message as themselves in member V's DM with the agent
+  runs an owner-side turn there and can reset V's DM session continuity.
+  They hold the bot token, which reads that DM anyway, so nothing else is
+  gained.
+- The manager app isn't involved: its secret is the operators', and it
+  starts no turns.
+
+The busy line, which a message past the queue bounds gets without being
+confirmed, is now posted in a task of its own, among the pipeline's tasks
+so a shutdown drains it, rather than in the one worker that hands agents'
+messages to the pipeline, so a slow post holds up no other agent's
+messages; the messages still reach their lanes in the order they came.
+`Pipeline::handle` still waits for it. At most `MAX_BUSY_LINES` (8) are
+posted at once; a message past the bounds while that many are gets none,
+which also caps what forged events can make the agent say this way.
 
 ### Bots don't join channels by posting
 
@@ -5331,9 +5426,13 @@ would let a bot post in any public channel, is off unless
 - The install link carries `redirect_uri`, and `oauth.v2.access` repeats it.
 - The owner's display name, for the default persona and `list`, comes from
   `users.info` through the manager app. `list` shows owners' names as code
-  spans, so a display name like `[Admin](https://evil)` stays text, and on
-  Slack names each agent's bot by its user id, which the directory resolves
-  to a mention for managed bots only (`MemberDirectory::lookup`): names are
+  spans, so a display name like `[Admin](https://evil)` stays text, less
+  backticks, control characters and what `ctl::is_invisible` (the check on
+  agentctl's file names) lists: bidirectional overrides and isolates
+  (U+202A to U+202E, U+2066 to U+2069), zero-width characters and the like,
+  which could make a name read as another or reorder the line around it;
+  and on Slack names each agent's bot by its user id, which the directory
+  resolves to a mention for managed bots only (`MemberDirectory::lookup`): names are
   unique per owner only, so `@helper` can be ambiguous. The installed DM
   names the bot the same way, and the create reply, which comes before the
   bot exists, says that DM will.

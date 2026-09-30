@@ -3,6 +3,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, MemberKey, Msg, MsgRef, OutFile,
@@ -13,7 +14,7 @@ use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
 use crate::directory::{MemberDirectory, TeamDirectory};
-use crate::normalize::KEPT_SUBTYPES;
+use crate::normalize::{self, Context, KEPT_SUBTYPES};
 use crate::web::{Message, PageRequest, Result, WebApi};
 
 /// The page size history reads ask for.
@@ -21,6 +22,13 @@ const PAGE_SIZE: usize = 200;
 
 /// The most pages a history read follows.
 const MAX_PAGES: usize = 1000;
+
+/// How long before its event arrived a message may have been posted and
+/// still be read back by [`Surface::confirm`]. Slack's last retry of a
+/// delivery comes about five minutes after the first; deduplication
+/// forgets an event after seven days, and a message older than the bot's
+/// membership never had one, so without it either could be replayed.
+pub const CONFIRM_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// What [`SlackSurface::caps`] returns: a 3,000-character message limit
 /// ([`MESSAGE_LIMIT`]), edits, buttons and threads, and a copy of every
@@ -61,6 +69,7 @@ pub const CAPS: Caps = Caps {
 pub struct SlackSurface {
     api: WebApi,
     directory: Arc<TeamDirectory>,
+    bot_user: Option<UserId>,
 }
 
 impl SlackSurface {
@@ -68,7 +77,19 @@ impl SlackSurface {
     /// workspace `directory` belongs to. Share one [`TeamDirectory`] among
     /// the bindings of a workspace.
     pub fn new(api: WebApi, directory: Arc<TeamDirectory>) -> Self {
-        Self { api, directory }
+        Self {
+            api,
+            directory,
+            bot_user: None,
+        }
+    }
+
+    /// Sets the binding's bot user, which [`Surface::confirm`] needs to
+    /// tell whether a channel message mentions the bot, as the ingress
+    /// does. Without one, only thread replies and DMs are confirmed.
+    pub fn with_bot_user(mut self, bot_user: Option<UserId>) -> Self {
+        self.bot_user = bot_user;
+        self
     }
 
     /// The Web API client, for the calls the [`Surface`] trait doesn't
@@ -372,24 +393,57 @@ impl Surface for SlackSurface {
         }
     }
 
-    /// Reads the message back with [`WebApi::message`], with this binding's
-    /// bot token, and compares it with the event: the same `ts`, in the
-    /// event's thread, from the same sender (a bot known only by its bot id
-    /// is named by its user, as [`fill_bot_sender`](Self::fill_bot_sender)
-    /// names it) with the same text. A message Slack doesn't have, or that
-    /// isn't content, doesn't match.
-    async fn confirm(&self, event: &InboundEvent) -> Result<bool> {
+    /// Slack's copy of the message, with this binding's bot token, so that
+    /// nothing a forger put in the event decides anything:
+    ///
+    /// 1. A message whose `ts` is more than [`CONFIRM_WINDOW`] before the
+    ///    event arrived is refused without a lookup.
+    /// 2. The conversation's kind comes from `conversations.info`, cached
+    ///    per channel ([`TeamDirectory::conv_kind`]), never from the event's
+    ///    `channel_type`.
+    /// 3. The message is read back whole with [`WebApi::message`], in the
+    ///    thread the event names, and normalized with
+    ///    [`normalize::read_back`], the ingress's rules, with this binding's
+    ///    bot user: subtypes, sender, mentions from `text` and `blocks`,
+    ///    thread, files and whether a channel message is addressed. A bot
+    ///    known only by its bot id is named by its user, as
+    ///    [`fill_bot_sender`](Self::fill_bot_sender) names it.
+    ///
+    /// The binding, event id and arrival time are the event's. `None` when
+    /// Slack doesn't have the message, or has it in a form the ingress
+    /// would drop.
+    async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
         let channel = self.channel(&event.conv)?;
-        let Some(message) = self
+        let fresh = ts_time(event.message.id.as_str())
+            .is_some_and(|sent| sent >= event.received_at - CONFIRM_WINDOW);
+        if !fresh {
+            tracing::warn!(binding = %event.binding, message = %event.message.id, "a message older than the confirmation window; not reading it back");
+            return Ok(None);
+        }
+        let conv_kind = self.directory.conv_kind(&self.api, channel).await?;
+        let Some(raw) = self
             .api
             .message(channel, event.thread_root.as_ref(), &event.message.id)
             .await?
         else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(self.msg(message).await.is_some_and(|msg| {
-            msg.id == event.message.id && msg.sender == event.sender && msg.text == event.text
-        }))
+        let context = Context {
+            binding: event.binding,
+            bot_user: self.bot_user.as_ref(),
+            team: self.directory.team(),
+            event_id: &event.event_id,
+            received_at: event.received_at,
+        };
+        let mut copy = match normalize::read_back(&context, channel, conv_kind, &raw) {
+            Ok(copy) => copy,
+            Err(skip) => {
+                tracing::debug!(binding = %event.binding, message = %event.message.id, reason = %skip, "Slack's copy of a message isn't one the ingress keeps");
+                return Ok(None);
+            }
+        };
+        self.fill_bot_sender(&mut copy).await?;
+        Ok(Some(copy))
     }
 
     /// Converts with the member cache as last read, and, when that is

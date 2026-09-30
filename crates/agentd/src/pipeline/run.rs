@@ -14,7 +14,7 @@ use core_types::{
 };
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
-use router::{Decision, ModelPolicy, RefuseReason};
+use router::{Decision, ModelPolicy, RefuseReason, RouterView as _};
 use runner::{ErrorKind, RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
 use store::{Agent, NewMessageRef, Store, StoreError};
 use time::OffsetDateTime;
@@ -51,6 +51,11 @@ pub const DELIVERY_FAILED_TEXT: &str = "Sorry, part of this reply couldn't be de
 /// it finished.
 pub const RESTARTING_TEXT: &str =
     "Sorry, I'm restarting and couldn't finish this. Please ask again in a minute.";
+/// What the thread is told when a message that needed confirming couldn't
+/// be checked with the platform: it failed or asked to slow down past the
+/// client's retries.
+pub const UNCONFIRMED_TEXT: &str =
+    "Sorry, I couldn't check this message with Slack. Try again in a moment.";
 /// Appended to a reply cut at [`MAX_POST_BYTES`].
 pub const TRUNCATED_NOTE: &str = "\n\n*(The reply was cut here: it was too long to post.)*";
 
@@ -60,6 +65,10 @@ pub const DEFAULT_QUEUE_PER_THREAD: usize = 8;
 /// How many messages may wait or be answered at once across every agent
 /// and thread, unless the settings say otherwise.
 pub const DEFAULT_MAX_PENDING: usize = 64;
+
+/// How many busy lines may be being posted at once. A message past the
+/// queue bounds while that many are gets none.
+const MAX_BUSY_LINES: usize = 8;
 
 /// How long the notices of turns cut short by a shutdown may take.
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,16 +112,25 @@ pub struct PipelineSettings {
 ///    wait for one agent in one thread, and
 ///    [`max_pending`](PipelineSettings::max_pending) wait or run in all; a
 ///    person's message past either gets one line saying the agent is busy,
-///    and a bot's gets nothing, so two bots can't answer each other's busy
+///    posted in a task of its own, at most [`MAX_BUSY_LINES`] at once, and
+///    a bot's gets nothing, so two bots can't answer each other's busy
 ///    lines.
 /// 3. **Routing.** [`router::route`] for the candidate, with a view of the
 ///    store loaded for it.
-/// 4. **The turn.** On [`Decision::Run`], only when the agent's bot may
+/// 4. **Confirming.** Unless the decision is to ignore, or it is one only
+///    the agent's owner could gain from (a turn the owner asks for and
+///    pays for, a link prompt to the owner, a refusal of the owner's own
+///    message), the platform's copy of the message
+///    ([`Surface::confirm`]) replaces the event, and is routed again. The
+///    decision stands only if the copy's is the same, in the same
+///    conversation, message and thread; anything else drops the message
+///    silently. A confirmation that fails, the platform being down or
+///    asking to slow down, tells the thread to try again
+///    ([`UNCONFIRMED_TEXT`]). So what an event claims decides nothing for
+///    anyone but the owner.
+/// 5. **The turn.** On [`Decision::Run`], only when the agent's bot may
 ///    post in the conversation without joining it
-///    ([`Surface::can_post`]), and, unless the agent's owner asked and
-///    pays, only once the surface confirmed the message is the platform's
-///    as it arrived ([`Surface::confirm`]; a refusal or an error drops it):
-///    the persona file is written from the store,
+///    ([`Surface::can_post`]): the persona file is written from the store,
 ///    the thread's session looked up (a DM has one for the conversation, a
 ///    channel one per thread, rooted at the message when it starts one),
 ///    the turn message built with what the session's transcript lacks, and
@@ -121,7 +139,7 @@ pub struct PipelineSettings {
 ///    once more, on the session looked up again. What the turn message
 ///    recorded as shown is forgotten when the turn never reached the model,
 ///    so the next turn shows it again.
-/// 5. **Delivery**, as the agent's bot, in the thread: the directives are
+/// 6. **Delivery**, as the agent's bot, in the thread: the directives are
 ///    taken out of the reply, the turn's staged attachments uploaded, the
 ///    reply cut at [`MAX_POST_BYTES`] (closing a code block the cut left
 ///    open), rendered, split and posted, and a `message_refs` row recorded
@@ -131,7 +149,7 @@ pub struct PipelineSettings {
 ///    thread is told part of the reply was lost. A failed turn posts a
 ///    short message that says why when the runner could tell: a usage
 ///    limit, or a login that expired.
-/// 6. [`Decision::LinkPrompt`] sends the requester a DM from the manager
+/// 7. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, when the agent's bot may post in
 ///    the conversation; [`Decision::Refuse`] posts one line in the thread,
 ///    and [`Decision::Ignore`] does nothing.
@@ -166,6 +184,7 @@ struct Inner {
     settings: PipelineSettings,
     lanes: Mutex<HashMap<LaneKey, VecDeque<Job>>>,
     pending: Arc<Semaphore>,
+    busy_lines: Arc<Semaphore>,
     tasks: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
@@ -269,6 +288,7 @@ impl Pipeline {
                 settings,
                 lanes: Mutex::new(HashMap::new()),
                 pending,
+                busy_lines: Arc::new(Semaphore::new(MAX_BUSY_LINES)),
                 tasks: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
@@ -393,7 +413,9 @@ impl Pipeline {
             } else if from_bot {
                 tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; dropping a bot's message");
             } else {
-                self.busy(&event, agent, caps).await;
+                let (done, finished) = oneshot::channel();
+                self.busy(Arc::clone(&event), agent, caps, done);
+                waiting.push(finished);
             }
         }
         waiting
@@ -468,10 +490,35 @@ impl Pipeline {
         }
     }
 
-    /// Tells `event`'s thread that `agent` has too many messages to take
-    /// this one.
-    async fn busy(&self, event: &InboundEvent, agent: AgentId, caps: Caps) {
+    /// Tells `event`'s thread, in a task of its own, that `agent` has too
+    /// many messages to take this one, unless [`MAX_BUSY_LINES`] are being
+    /// posted already or the pipeline is closed. `done` is dropped once
+    /// the line is posted or given up on.
+    fn busy(
+        &self,
+        event: Arc<InboundEvent>,
+        agent: AgentId,
+        caps: Caps,
+        done: oneshot::Sender<()>,
+    ) {
         tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; not taking this one");
+        let Ok(permit) = Arc::clone(&self.inner.busy_lines).try_acquire_owned() else {
+            tracing::warn!(%agent, message = %event.message.id, "too many busy lines being posted; not posting another");
+            return;
+        };
+        let mut tasks = lock(&self.inner.tasks);
+        if self.is_closed() {
+            return;
+        }
+        let pipeline = self.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let _done = done;
+            pipeline.say_busy(&event, agent, caps).await;
+        });
+    }
+
+    async fn say_busy(&self, event: &InboundEvent, agent: AgentId, caps: Caps) {
         let told = async {
             let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
                 return Ok(());
@@ -541,17 +588,101 @@ impl Pipeline {
         Ok((candidates, from_bot))
     }
 
-    /// Routes `event` for `agent` and acts on the decision.
+    /// Routes `event` for `agent`, confirms it with the platform when the
+    /// decision needs it, and acts on the decision.
     async fn candidate(&self, event: &InboundEvent, agent: AgentId, caps: Caps) {
+        let Some((decision, needs_confirming)) = self.decide(event, agent).await else {
+            return;
+        };
+        if !needs_confirming {
+            self.act(event, agent, caps, decision).await;
+            return;
+        }
+        let Some(copy) = self.confirmed(event, agent, caps).await else {
+            return;
+        };
+        if copy == *event {
+            self.act(event, agent, caps, decision).await;
+            return;
+        }
+        let Some((confirmed, _)) = self.decide(&copy, agent).await else {
+            return;
+        };
+        if confirmed != decision {
+            tracing::warn!(%agent, message = %event.message.id, "the platform's copy of a message routes differently from its event; dropped it");
+            return;
+        }
+        self.act(&copy, agent, caps, confirmed).await;
+    }
+
+    /// The router's decision on `event` for `agent`, and whether it needs
+    /// the platform's copy ([`needs_confirming`]). `None` when the store
+    /// can't be read.
+    async fn decide(&self, event: &InboundEvent, agent: AgentId) -> Option<(Decision, bool)> {
         let store = &self.inner.store;
         let view = match StoreView::load(store, event, agent, &self.inner.settings.managers).await {
             Ok(view) => view,
             Err(err) => {
                 tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't load what routing needs");
-                return;
+                return None;
             }
         };
         let decision = router::route(event, agent, &view);
+        let needs = needs_confirming(&decision, event, agent, &view);
+        Some((decision, needs))
+    }
+
+    /// The platform's copy of `event`'s message, if it is the same message
+    /// in the same thread. On a failure that says nothing about the message
+    /// (the platform unreachable, or asking to slow down past the client's
+    /// retries), the thread is told to try again, if `agent`'s bot may post
+    /// there; a copy the platform doesn't have, or has elsewhere, is
+    /// dropped without a word.
+    async fn confirmed(
+        &self,
+        event: &InboundEvent,
+        agent: AgentId,
+        caps: Caps,
+    ) -> Option<InboundEvent> {
+        let surface = self.inner.surfaces.surface(agent, &event.conv).await?;
+        match surface.confirm(event).await {
+            Ok(Some(copy))
+                if copy.message == event.message
+                    && thread_of(&copy, caps) == thread_of(event, caps) =>
+            {
+                Some(copy)
+            }
+            Ok(_) => {
+                tracing::warn!(%agent, message = %event.message.id, "the platform doesn't have this message as it arrived; dropped it");
+                None
+            }
+            Err(err @ (SurfaceError::RateLimited { .. } | SurfaceError::Transport(_))) => {
+                tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't confirm a message with the platform; asking to try again");
+                let told = async {
+                    if surface.can_post(&event.conv).await? {
+                        say(
+                            surface.as_ref(),
+                            &reply_target(event, caps),
+                            UNCONFIRMED_TEXT,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, SurfaceError>(())
+                };
+                if let Err(err) = told.await {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't ask a thread to try again");
+                }
+                None
+            }
+            Err(err) => {
+                tracing::warn!(%agent, message = %event.message.id, error = %err, "the platform refused to confirm a message; dropped it");
+                None
+            }
+        }
+    }
+
+    /// Acts on `decision` for `agent` on `event`.
+    async fn act(&self, event: &InboundEvent, agent: AgentId, caps: Caps, decision: Decision) {
         let result = match decision {
             Decision::Ignore(reason) => {
                 tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
@@ -638,27 +769,6 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Whether `agent`'s owner asked for `turn` and pays for it: on their
-    /// own subscription or the community key. Such a message needs no
-    /// confirming ([`Surface::confirm`]), since the owner could have sent
-    /// it for real.
-    async fn paid_by_owner(&self, agent: AgentId, turn: &Run) -> Result<bool, StoreError> {
-        let Some(owner) = self
-            .inner
-            .store
-            .agent(agent)
-            .await?
-            .map(|agent| agent.owner)
-        else {
-            return Ok(false);
-        };
-        Ok(turn.requester.member == Some(owner)
-            && match &turn.credential {
-                CredentialRef::Member(member) => *member == owner,
-                CredentialRef::Community => true,
-            })
-    }
-
     async fn agent_name(&self, agent: AgentId) -> Result<String, StoreError> {
         Ok(self
             .inner
@@ -685,19 +795,6 @@ impl Pipeline {
         if !surface.can_post(&event.conv).await? {
             tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
             return Ok(());
-        }
-        if !self.paid_by_owner(agent, &turn).await? {
-            match surface.confirm(event).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(%agent, message = %event.message.id, "the platform doesn't have this message as it arrived; dropped it");
-                    return Ok(());
-                }
-                Err(err) => {
-                    tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't confirm a message with the platform; dropped it");
-                    return Ok(());
-                }
-            }
         }
         let target = reply_target(event, caps);
         let (working, ran) = match self.prepare(agent, event, turn.credential).await {
@@ -914,6 +1011,40 @@ struct Run {
 struct Prepared {
     bot: MemberKey,
     model: Option<String>,
+}
+
+/// Whether acting on `decision` for `agent` needs the platform's copy of
+/// `event`'s message first. Not to ignore it, and not for what only the
+/// agent's owner could gain from, since the owner could have posted it:
+/// a turn the owner asks for and pays for (their subscription or the
+/// community key), a link prompt to the owner, or a refusal of a message
+/// the owner sent. Everything else could bill, prompt or answer someone
+/// else on a forged event's word.
+fn needs_confirming(
+    decision: &Decision,
+    event: &InboundEvent,
+    agent: AgentId,
+    view: &StoreView,
+) -> bool {
+    let Some(owner) = view.agent_owner(agent) else {
+        return !matches!(decision, Decision::Ignore(_));
+    };
+    match decision {
+        Decision::Ignore(_) => false,
+        Decision::Run {
+            requester,
+            credential,
+            ..
+        } => {
+            requester.member != Some(owner)
+                || match credential {
+                    CredentialRef::Member(member) => *member != owner,
+                    CredentialRef::Community => false,
+                }
+        }
+        Decision::LinkPrompt { requester } => requester.member != Some(owner),
+        Decision::Refuse(_) => view.member_for(&event.sender) != Some(owner),
+    }
 }
 
 /// The thread a turn on `event` runs and replies in: a DM's conversation,

@@ -947,6 +947,12 @@ struct MessagesResponse {
 }
 
 #[derive(Deserialize)]
+struct RawMessagesResponse {
+    #[serde(default)]
+    messages: Vec<Value>,
+}
+
+#[derive(Deserialize)]
 struct UsersResponse {
     #[serde(default)]
     members: Vec<User>,
@@ -1191,20 +1197,24 @@ impl WebApi {
         self.messages(Method::ConversationsReplies, form).await
     }
 
-    /// The message `ts` in `channel`, in the thread rooted at `root` when
-    /// it is a thread reply, read with `conversations.replies` there or
-    /// `conversations.history` at the top level, between `ts` and `ts`
-    /// inclusive. `None` if Slack has no message with exactly that `ts`.
+    /// The message `ts` in `channel`, as Slack stores it, in the thread
+    /// rooted at `root` when it is a thread reply, read with
+    /// `conversations.replies` there or `conversations.history` at the top
+    /// level, between `ts` and `ts` inclusive. `None` if Slack has no
+    /// message with exactly that `ts`.
+    ///
+    /// The message is returned whole, `blocks`, `files`, `thread_ts`,
+    /// `edited` and all, for [`normalize::read_back`](crate::normalize::read_back).
     ///
     /// # Errors
     ///
-    /// See [`map_error`].
+    /// See [`map_error`]; `thread_not_found` is [`SurfaceError::NotFound`].
     pub async fn message(
         &self,
         channel: &ConversationId,
         root: Option<&MessageId>,
         ts: &MessageId,
-    ) -> Result<Option<Message>> {
+    ) -> Result<Option<Value>> {
         let mut form = vec![("channel", channel.to_string())];
         let method = match root {
             Some(root) => {
@@ -1219,8 +1229,11 @@ impl WebApi {
             ("inclusive", "true".to_owned()),
             ("limit", "2".to_owned()),
         ]);
-        let page = self.messages(method, form).await?;
-        Ok(page.messages.into_iter().find(|message| message.ts == *ts))
+        let page: RawMessagesResponse = self.call(method, Body::Form(form), None).await?;
+        Ok(page
+            .messages
+            .into_iter()
+            .find(|message| message.get("ts").and_then(Value::as_str) == Some(ts.as_str())))
     }
 
     async fn messages(

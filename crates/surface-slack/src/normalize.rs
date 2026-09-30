@@ -25,12 +25,19 @@
 //!   block is not scanned: a literal `<@U…>` there is not a mention.
 //! - The team is the envelope's `team_id`, for the sender and the
 //!   conversation alike.
+//! - A bot's message that was `edited` is dropped: agentd never edits its
+//!   agents' posts, so someone else holding the bot's token did.
+//!
+//! [`read_back`] runs the same rules on a message read back from
+//! `conversations.history` or `conversations.replies`, which carries no
+//! `channel` or `channel_type`: the caller names the channel and its kind,
+//! as `conversations.info` gives it.
 
 use std::collections::HashSet;
 
 use core_types::{
-    BindingId, ConvKind, ConvRef, InFile, InboundEvent, MemberKey, MsgRef, SurfaceKind, TeamId,
-    UserId,
+    BindingId, ConvKind, ConvRef, ConversationId, InFile, InboundEvent, MemberKey, MsgRef,
+    SurfaceKind, TeamId, UserId,
 };
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -74,6 +81,9 @@ pub enum Skip {
     /// thread.
     #[error("a channel message that neither mentions the bot nor replies in a thread")]
     NotAddressed,
+    /// A bot's message that was edited.
+    #[error("a bot's message was edited")]
+    EditedByBot,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +100,7 @@ struct MessageEvent {
     thread_ts: Option<String>,
     blocks: Option<Value>,
     files: Option<Vec<SlackFile>>,
+    edited: Option<IgnoredAny>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -112,15 +123,51 @@ pub(crate) struct SlackFile {
 /// A [`Skip`] saying why the message is not for the router.
 pub fn message(context: &Context<'_>, event: &Value) -> Result<InboundEvent, Skip> {
     let event = MessageEvent::deserialize(event).map_err(|_| Skip::Malformed)?;
+    let conv_kind = match event.channel_type.as_deref() {
+        Some("im") => ConvKind::Dm,
+        Some("mpim") => ConvKind::GroupDm,
+        _ => ConvKind::Channel,
+    };
+    let channel = event.channel.clone().ok_or(Skip::Malformed)?;
+    normalized(context, event, channel.into(), conv_kind)
+}
+
+/// Normalizes `message`, read back from `conversations.history` or
+/// `conversations.replies` in `channel`, a conversation of kind
+/// `conv_kind`, as [`message`] normalizes an event. A `channel` or
+/// `channel_type` in `message` is ignored.
+///
+/// # Errors
+///
+/// A [`Skip`] saying why the message is not for the router.
+pub fn read_back(
+    context: &Context<'_>,
+    channel: &ConversationId,
+    conv_kind: ConvKind,
+    message: &Value,
+) -> Result<InboundEvent, Skip> {
+    let message = MessageEvent::deserialize(message).map_err(|_| Skip::Malformed)?;
+    normalized(context, message, channel.clone(), conv_kind)
+}
+
+fn normalized(
+    context: &Context<'_>,
+    event: MessageEvent,
+    channel: ConversationId,
+    conv_kind: ConvKind,
+) -> Result<InboundEvent, Skip> {
     if let Some(subtype) = &event.subtype
         && !KEPT_SUBTYPES.contains(&subtype.as_str())
     {
         return Err(Skip::Subtype(subtype.clone()));
     }
-    let (Some(channel), Some(ts)) = (event.channel, event.ts) else {
+    let Some(ts) = event.ts else {
         return Err(Skip::Malformed);
     };
     let is_bot = event.bot_id.is_some() || event.bot_profile.is_some();
+    if is_bot && event.edited.is_some() {
+        return Err(Skip::EditedByBot);
+    }
     let (sender, sender_bot_user) = match (event.user, event.bot_id) {
         (Some(user), _) => {
             let user = UserId::from(user);
@@ -129,11 +176,6 @@ pub fn message(context: &Context<'_>, event: &Value) -> Result<InboundEvent, Ski
         }
         (None, Some(bot_id)) => (UserId::from(bot_id), None),
         (None, None) => return Err(Skip::NoSender),
-    };
-    let conv_kind = match event.channel_type.as_deref() {
-        Some("im") => ConvKind::Dm,
-        Some("mpim") => ConvKind::GroupDm,
-        _ => ConvKind::Channel,
     };
     let text = event.text.unwrap_or_default();
     let mentions = mentions(&text, event.blocks.as_ref());
@@ -147,7 +189,7 @@ pub fn message(context: &Context<'_>, event: &Value) -> Result<InboundEvent, Ski
     let conv = ConvRef {
         surface: SurfaceKind::Slack,
         team: context.team.clone(),
-        conversation: channel.into(),
+        conversation: channel,
     };
     let reply_to = thread_root.as_ref().map(|root| MsgRef {
         conv: conv.clone(),
@@ -603,11 +645,104 @@ mod tests {
         );
     }
 
+    fn read(kind: ConvKind, message: Value) -> Result<InboundEvent, Skip> {
+        let bot = UserId::from(BOT);
+        let team = TeamId::from("T0TEAM");
+        let context = Context {
+            binding: BindingId::from_uuid(uuid::Uuid::nil()),
+            bot_user: Some(&bot),
+            team: &team,
+            event_id: "Ev1",
+            received_at: datetime!(2026-09-30 12:00 UTC),
+        };
+        read_back(&context, &ConversationId::from("C9"), kind, &message)
+    }
+
+    #[test]
+    fn a_read_back_message_takes_its_channel_and_kind_from_the_caller() {
+        let claims_dm =
+            channel_message(json!({"channel": "D1", "channel_type": "im", "text": "hi"}));
+        assert_eq!(
+            read(ConvKind::Channel, claims_dm.clone()),
+            Err(Skip::NotAddressed)
+        );
+        let dm = read(ConvKind::Dm, claims_dm).unwrap();
+        assert_eq!(dm.conv_kind, ConvKind::Dm);
+        assert_eq!(dm.conv.conversation.as_str(), "C9");
+        assert_eq!(dm.message.conv.conversation.as_str(), "C9");
+
+        let mut unnamed = channel_message(json!({}));
+        unnamed.as_object_mut().unwrap().remove("channel");
+        let mention = read(ConvKind::Channel, unnamed).unwrap();
+        assert_eq!(
+            mention,
+            normalize(channel_message(json!({"channel": "C9"}))).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_read_back_message_is_addressed_by_its_own_blocks_thread_and_files() {
+        let blocks = json!([{"type": "rich_text", "elements": [
+            {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]},
+        ]}]);
+        let mentioned = read(
+            ConvKind::Channel,
+            channel_message(json!({"text": "", "blocks": blocks})),
+        )
+        .unwrap();
+        assert_eq!(mentioned.mentions, [UserId::from(BOT)]);
+        let reply = read(
+            ConvKind::Channel,
+            channel_message(json!({"text": "x", "thread_ts": "1727697500.000050"})),
+        )
+        .unwrap();
+        assert_eq!(
+            reply.reply_to.map(|msg| msg.id),
+            Some("1727697500.000050".into())
+        );
+        let files = read(
+            ConvKind::Channel,
+            channel_message(json!({
+                "subtype": "file_share",
+                "files": [{"id": "F1", "url_private": "https://files.slack.com/F1"}],
+            })),
+        )
+        .unwrap();
+        assert_eq!(files.files.len(), 1);
+        for subtype in ["tombstone", "message_changed"] {
+            let gone = channel_message(json!({"subtype": subtype}));
+            assert_eq!(
+                read(ConvKind::Channel, gone),
+                Err(Skip::Subtype(subtype.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn an_edited_message_counts_as_edited_only_for_bots() {
+        let edited =
+            json!({"edited": {"user": "U1", "ts": "1727697700.000000"}, "text": "now <@U0BOT>"});
+        let human = read(ConvKind::Channel, channel_message(edited.clone())).unwrap();
+        assert_eq!(human.text, "now <@U0BOT>");
+        let mut by_bot = channel_message(edited);
+        by_bot["bot_id"] = json!("B0OTHER");
+        assert_eq!(
+            read(ConvKind::Channel, by_bot.clone()),
+            Err(Skip::EditedByBot)
+        );
+        assert_eq!(normalize(by_bot), Err(Skip::EditedByBot));
+    }
+
     #[test]
     fn skips_never_carry_message_text() {
         let text = Skip::Subtype("message_changed".into()).to_string();
         assert_eq!(text, "message subtype message_changed is ignored");
-        for skip in [Skip::Malformed, Skip::NoSender, Skip::NotAddressed] {
+        for skip in [
+            Skip::Malformed,
+            Skip::NoSender,
+            Skip::NotAddressed,
+            Skip::EditedByBot,
+        ] {
             assert!(!skip.to_string().is_empty());
         }
     }

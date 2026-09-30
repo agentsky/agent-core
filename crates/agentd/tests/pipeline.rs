@@ -1152,11 +1152,21 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
     sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b4", None, &[BOT]))
         .await
         .unwrap();
-    let busy: Vec<_> = posts(&stack.mock.calls())
+    let line = "helper is busy with other requests. Ask again in a few minutes.".to_owned();
+    wait_until("the busy lines are posted", || {
+        posts(&stack.mock.calls())
+            .iter()
+            .filter(|(_, text, _)| *text == line)
+            .count()
+            == 2
+    })
+    .await;
+    let mut busy: Vec<_> = posts(&stack.mock.calls())
         .into_iter()
         .map(|(to, text, _)| (to, text))
+        .filter(|(_, text)| *text == line)
         .collect();
-    let line = "helper is busy with other requests. Ask again in a few minutes.".to_owned();
+    busy.sort_by_key(|(to, _)| to.thread_root.clone());
     assert_eq!(
         busy,
         [

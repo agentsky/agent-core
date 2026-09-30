@@ -2621,11 +2621,14 @@ Notes from implementing it
   `CREATION_LEASE` and sends the install reminder. A configuration token
   Slack refuses is marked broken; `/agent delete` always names an app it
   couldn't delete.
-- Before a turn someone other than the agent's owner asks for or pays for,
-  the pipeline confirms the message with the platform
-  (`Surface::confirm`): the owner holds their app's signing secret, so on
-  Slack the message is read back with the bot token and dropped unless
-  Slack has it from that sender with that text.
+- Before acting on a message for anyone but the agent's owner (a turn
+  someone else asks for or pays for, a link prompt, a refusal), the
+  pipeline takes the platform's copy of it (`Surface::confirm`) and routes
+  that instead: the owner holds their app's signing secret, so on Slack
+  the message is read back with the bot token, its conversation's kind
+  taken from `conversations.info`, and it is normalized as the ingress
+  normalizes events. It is acted on only if the copy routes as the event
+  did; a message older than 15 minutes when its event arrived is refused.
 - `slack::Inbound` drops requests to any binding from another workspace,
   and queues agents' messages without waiting in `slack::Messages`, whose
   worker looks bot senders up and hands them to the pipeline once

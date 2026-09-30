@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 
 use super::{Commands, Failure, Origin};
 use crate::agents::{CreateError, RocketChatAgents};
+use crate::ctl::is_invisible;
 
 /// The largest persona, in bytes: 64 KB.
 pub const PERSONA_MAX_BYTES: usize = 64 * 1024;
@@ -407,11 +408,12 @@ impl Commands {
 
 /// `text` as a Markdown code span, so a member's display name shows as
 /// written and can't form a link, a mention or any other formatting.
-/// Backticks and control characters are left out.
+/// Backticks, control characters and characters that change how it reads
+/// without showing ([`is_invisible`]) are left out.
 fn code_span(text: &str) -> String {
     let text: String = text
         .chars()
-        .filter(|c| *c != '`' && !c.is_control())
+        .filter(|c| *c != '`' && !c.is_control() && !is_invisible(*c))
         .collect();
     let text = text.trim();
     if text.is_empty() {
@@ -449,6 +451,15 @@ mod tests {
         assert!(!rendered.contains('<'), "{rendered}");
         assert_eq!(code_span("a`b\n@here"), "`ab@here`");
         assert_eq!(code_span(" ` "), "someone");
+        assert_eq!(
+            code_span("ad\u{202E}nimda\u{202C} \u{2066}x\u{2069}"),
+            "`adnimda x`"
+        );
+        assert_eq!(
+            code_span("a\u{200B}d\u{200D}a\u{FEFF}\u{200F}\u{2060}"),
+            "`ada`"
+        );
+        assert_eq!(code_span("\u{200B}\u{202E}"), "someone");
     }
 
     struct NoNames;

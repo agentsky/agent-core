@@ -1,5 +1,6 @@
 //! What agentd caches about a Slack workspace: its members, for mentions,
-//! and which bot user each bot id belongs to.
+//! which bot user each bot id belongs to, and what kind of conversation
+//! each channel is.
 //!
 //! Every binding in a workspace shares one [`TeamDirectory`], so a team's
 //! members are listed once however many agents are installed there. The
@@ -11,7 +12,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use core_types::{SurfaceError, TeamId, UserId};
+use core_types::{ConvKind, ConversationId, SurfaceError, TeamId, UserId};
 use render::MentionDirectory;
 use tokio::time::Instant;
 
@@ -30,6 +31,13 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 /// The most bot ids remembered before the cache starts over.
 const MAX_BOTS: usize = 10_000;
 
+/// How long a conversation's kind is remembered. A group DM can be
+/// converted to a private channel.
+pub const CONV_KIND_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// The most conversation kinds remembered before the cache starts over.
+const MAX_CONV_KINDS: usize = 10_000;
+
 /// A workspace's caches, shared by every binding in it.
 ///
 /// `Debug` shows the team and how much is cached, never names.
@@ -39,6 +47,7 @@ pub struct TeamDirectory {
     members: RwLock<Members>,
     refreshing: tokio::sync::Mutex<()>,
     bots: Mutex<HashMap<String, Option<UserId>>>,
+    conv_kinds: Mutex<HashMap<ConversationId, (ConvKind, Instant)>>,
 }
 
 /// The member list, and when `users.list` may be read again.
@@ -73,6 +82,7 @@ impl TeamDirectory {
             members: RwLock::new(Members::default()),
             refreshing: tokio::sync::Mutex::new(()),
             bots: Mutex::new(HashMap::new()),
+            conv_kinds: Mutex::new(HashMap::new()),
         }
     }
 
@@ -229,6 +239,45 @@ impl TeamDirectory {
         Ok(user)
     }
 
+    /// What kind of conversation `channel` is, from `conversations.info`
+    /// (`is_im`, then `is_mpim`, else a channel), remembered for
+    /// [`CONV_KIND_TTL`]. A channel id's prefix can't tell a group DM or a
+    /// private channel from a public one.
+    ///
+    /// # Errors
+    ///
+    /// The `conversations.info` error. Nothing is cached then.
+    pub async fn conv_kind(&self, api: &WebApi, channel: &ConversationId) -> Result<ConvKind> {
+        let now = Instant::now();
+        if let Some((kind, until)) = self.lock_conv_kinds().get(channel)
+            && *until > now
+        {
+            return Ok(*kind);
+        }
+        let info = api.conversation_info(channel).await?;
+        let kind = if info.is_im {
+            ConvKind::Dm
+        } else if info.is_mpim {
+            ConvKind::GroupDm
+        } else {
+            ConvKind::Channel
+        };
+        let mut kinds = self.lock_conv_kinds();
+        if kinds.len() >= MAX_CONV_KINDS {
+            kinds.clear();
+        }
+        kinds.insert(channel.clone(), (kind, now + CONV_KIND_TTL));
+        Ok(kind)
+    }
+
+    fn lock_conv_kinds(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<ConversationId, (ConvKind, Instant)>> {
+        self.conv_kinds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn lock_bots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<UserId>>> {
         self.bots.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -243,6 +292,7 @@ impl fmt::Debug for TeamDirectory {
             .field("names", &directory.len())
             .field("managed_bots", &directory.managed.len())
             .field("bots", &self.lock_bots().len())
+            .field("conv_kinds", &self.lock_conv_kinds().len())
             .finish_non_exhaustive()
     }
 }

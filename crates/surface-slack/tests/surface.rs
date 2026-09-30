@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use core_types::{
-    Binding, BindingId, ConvRef, Cursor, InboundEvent, LengthUnit, MemberKey, MsgRef, OutFile,
-    ReplyTarget, SendError, Sender, Sink, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
+    Binding, BindingId, ConvKind, ConvRef, Cursor, InboundEvent, LengthUnit, MemberKey, MsgRef,
+    OutFile, ReplyTarget, SendError, Sender, Sink, Surface, SurfaceError, SurfaceKind, ThreadKey,
+    UserId,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
@@ -875,6 +876,14 @@ async fn fill_bot_sender_leaves_humans_known_bots_and_other_teams_alone() {
     assert!(requests(&server).await.is_empty());
 }
 
+/// `event`, as if it arrived a second after it was posted.
+fn arrived_now(mut event: InboundEvent) -> InboundEvent {
+    let (seconds, _) = event.message.id.as_str().split_once('.').unwrap();
+    let posted = time::OffsetDateTime::from_unix_timestamp(seconds.parse().unwrap()).unwrap();
+    event.received_at = posted + Duration::from_secs(1);
+    event
+}
+
 fn event_from(fixture: &str) -> InboundEvent {
     let envelope: Value = serde_json::from_str(fixture).unwrap();
     let bot = UserId::from(BOT_USER);
@@ -886,43 +895,88 @@ fn event_from(fixture: &str) -> InboundEvent {
         event_id: "Ev0CONFIRM",
         received_at: time::OffsetDateTime::now_utc(),
     };
-    normalize::message(&context, &envelope["event"]).unwrap()
+    arrived_now(normalize::message(&context, &envelope["event"]).unwrap())
+}
+
+async fn confirming_setup(kind: Value) -> (MockServer, SlackSurface) {
+    let (server, surface) = setup().await;
+    let mut channel = kind;
+    channel["id"] = json!(CHANNEL);
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": channel})),
+    )
+    .await;
+    (server, surface.with_bot_user(Some(BOT_USER.into())))
+}
+
+fn public_channel() -> Value {
+    json!({"is_channel": true, "is_member": true})
+}
+
+async fn lookups(server: &MockServer, name: &str) -> Vec<Request> {
+    requests(server)
+        .await
+        .into_iter()
+        .filter(|request| request.url.path() == format!("/api/{name}"))
+        .collect()
 }
 
 #[tokio::test]
-async fn a_top_level_message_is_confirmed_when_slack_has_it_as_it_arrived() {
+async fn a_top_level_message_is_confirmed_as_slack_has_it() {
     let event = event_from(testkit::slack::MESSAGE_MENTION);
     let ts = event.message.id.as_str().to_owned();
+    let mention = format!("<@{BOT_USER}> hi");
     let cases = [
-        (json!([{"ts": ts, "user": USER, "text": event.text}]), true),
         (
-            json!([{"ts": ts, "user": "U0HUMAN02", "text": event.text}]),
-            false,
+            json!([{"ts": ts, "user": USER, "text": event.text}]),
+            Some((USER, event.text.as_str())),
         ),
         (
-            json!([{"ts": ts, "user": USER, "text": "something else"}]),
-            false,
+            json!([{"ts": ts, "user": "U0HUMAN02", "text": mention}]),
+            Some(("U0HUMAN02", mention.as_str())),
+        ),
+        (
+            json!([{"ts": ts, "user": USER, "text": "no mention"}]),
+            None,
         ),
         (
             json!([{"ts": "1727697500.000100", "user": USER, "text": event.text}]),
-            false,
+            None,
         ),
         (
             json!([{"ts": ts, "user": USER, "text": event.text, "subtype": "channel_join"}]),
-            false,
+            None,
         ),
-        (json!([]), false),
+        (
+            json!([{"ts": ts, "subtype": "tombstone", "text": "This message was deleted."}]),
+            None,
+        ),
+        (json!([]), None),
     ];
-    for (messages, confirmed) in cases {
-        let (server, surface) = setup().await;
+    for (messages, expected) in cases {
+        let (server, surface) = confirming_setup(public_channel()).await;
         mount(
             &server,
             "conversations.history",
             ok(json!({"messages": messages})),
         )
         .await;
-        assert_eq!(surface.confirm(&event).await, Ok(confirmed), "{messages}");
-        let sent = requests(&server).await;
+        let copy = surface.confirm(&event).await.unwrap();
+        match expected {
+            Some((user, text)) => {
+                let copy = copy.unwrap();
+                assert_eq!(copy.sender.user.as_str(), user, "{messages}");
+                assert_eq!(copy.text, text);
+                assert_eq!(copy.message, event.message);
+                assert_eq!(copy.event_id, event.event_id);
+                assert_eq!(copy.binding, event.binding);
+                assert_eq!(copy.received_at, event.received_at);
+            }
+            None => assert_eq!(copy, None, "{messages}"),
+        }
+        let sent = lookups(&server, "conversations.history").await;
         assert_eq!(sent.len(), 1);
         let form = form(&sent[0]);
         assert_eq!(form["channel"], CHANNEL);
@@ -934,53 +988,170 @@ async fn a_top_level_message_is_confirmed_when_slack_has_it_as_it_arrived() {
 }
 
 #[tokio::test]
-async fn a_thread_reply_is_confirmed_in_its_thread() {
+async fn nothing_but_slacks_copy_decides_what_the_event_is() {
+    let mut forged = event_from(testkit::slack::MESSAGE_MENTION);
+    forged.conv_kind = ConvKind::Dm;
+    forged.files = vec![];
+    let (server, surface) = confirming_setup(public_channel()).await;
+    let ts = forged.message.id.as_str();
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{
+            "ts": ts,
+            "user": USER,
+            "text": format!("<@{BOT_USER}> see attached"),
+            "subtype": "file_share",
+            "files": [{"id": "F1", "name": "a.txt", "url_private": "https://files.slack.com/F1"}],
+            "channel_type": "im",
+        }]})),
+    )
+    .await;
+    let copy = surface.confirm(&forged).await.unwrap().unwrap();
+    assert_eq!(copy.conv_kind, ConvKind::Channel);
+    assert_eq!(copy.mentions, [UserId::from(BOT_USER)]);
+    assert_eq!(copy.files.len(), 1);
+    assert_eq!(copy.files[0].id, "F1");
+    assert_eq!(copy.text, format!("<@{BOT_USER}> see attached"));
+}
+
+#[tokio::test]
+async fn blocks_count_only_as_slack_has_them() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str();
+    let blocks = json!([{"type": "rich_text", "elements": [
+        {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT_USER}]},
+    ]}]);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "hi", "blocks": blocks}]})),
+    )
+    .await;
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert_eq!(copy.mentions, [UserId::from(BOT_USER)]);
+
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "hi"}]})),
+    )
+    .await;
+    assert_eq!(
+        surface.confirm(&event).await,
+        Ok(None),
+        "the event's blocks don't count"
+    );
+}
+
+#[tokio::test]
+async fn the_conversation_kind_comes_from_conversations_info_once_an_hour() {
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    event.conv_kind = ConvKind::Channel;
+    let ts = event.message.id.as_str();
+    let (server, surface) = confirming_setup(json!({"is_im": true, "user": USER})).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "no mention"}]})),
+    )
+    .await;
+    for _ in 0..2 {
+        let copy = surface.confirm(&event).await.unwrap().unwrap();
+        assert_eq!(copy.conv_kind, ConvKind::Dm);
+    }
+    assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
+
+    let (server, surface) = confirming_setup(json!({"is_mpim": true, "is_group": true})).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "no mention"}]})),
+    )
+    .await;
+    assert_eq!(
+        surface.confirm(&event).await.unwrap().unwrap().conv_kind,
+        ConvKind::GroupDm
+    );
+    let form = form(&lookups(&server, "conversations.info").await[0]);
+    assert_eq!(form["channel"], CHANNEL);
+}
+
+#[tokio::test]
+async fn a_message_older_than_the_window_is_not_read_back() {
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    event.received_at += surface_slack::surface::CONFIRM_WINDOW + Duration::from_secs(1);
+    assert_eq!(surface.confirm(&event).await, Ok(None));
+    event.message.id = "not a ts".into();
+    assert_eq!(surface.confirm(&event).await, Ok(None));
+    assert!(requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_thread_reply_is_read_back_in_the_thread_the_event_names() {
     let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
     let root = event.thread_root.clone().unwrap();
-    let (server, surface) = setup().await;
+    let (server, surface) = confirming_setup(public_channel()).await;
     mount(
         &server,
         "conversations.replies",
         ok(json!({"messages": [
             {"ts": root.as_str(), "user": BOT_USER, "text": "the root", "thread_ts": root.as_str()},
-            {"ts": event.message.id.as_str(), "user": USER, "text": event.text, "thread_ts": root.as_str()},
+            {"ts": event.message.id.as_str(), "user": USER, "text": event.text, "thread_ts": "1727697600.000001"},
         ]})),
     )
     .await;
-    assert_eq!(surface.confirm(&event).await, Ok(true));
-    let form = form(&requests(&server).await[0]);
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert_eq!(copy.thread_root, Some("1727697600.000001".into()));
+    assert_eq!(copy.reply_to.unwrap().id.as_str(), "1727697600.000001");
+    let form = form(&lookups(&server, "conversations.replies").await[0]);
     assert_eq!(form["ts"], root.as_str());
     assert_eq!(form["oldest"], event.message.id.as_str());
 }
 
 #[tokio::test]
-async fn a_bot_known_by_its_bot_id_is_confirmed_by_its_user() {
-    let (server, surface) = setup().await;
+async fn a_bot_known_by_its_bot_id_is_named_by_its_user_and_an_edited_bot_post_is_refused() {
+    let (server, surface) = confirming_setup(public_channel()).await;
     mount(
         &server,
         "bots.info",
         ok(json!({"bot": {"id": "B0LEGACY1", "user_id": "U0DEPLOY1"}})),
     )
     .await;
-    let mut event = bot_event();
-    surface.fill_bot_sender(&mut event).await.unwrap();
+    let event = arrived_now(bot_event());
+    let ts = event.message.id.as_str();
+    let root = event.thread_root.clone().unwrap();
+    let post =
+        json!({"ts": ts, "bot_id": "B0LEGACY1", "text": event.text, "thread_ts": root.as_str()});
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.replies"))
+        .respond_with(ok(json!({"messages": [post]})))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert_eq!(copy.sender.user.as_str(), "U0DEPLOY1");
+    assert_eq!(copy.sender_bot_user, Some("U0DEPLOY1".into()));
+    assert!(copy.sender_is_bot);
+
+    let mut edited = post;
+    edited["edited"] = json!({"user": "U0DEPLOY1", "ts": "1727698400.000000"});
     mount(
         &server,
         "conversations.replies",
-        ok(json!({"messages": [
-            {"ts": event.message.id.as_str(), "bot_id": "B0LEGACY1", "text": event.text},
-        ]})),
+        ok(json!({"messages": [edited]})),
     )
     .await;
-    assert_eq!(surface.confirm(&event).await, Ok(true));
-    event.sender.user = UserId::from("U0HUMAN01");
-    assert_eq!(surface.confirm(&event).await, Ok(false));
+    assert_eq!(surface.confirm(&event).await, Ok(None));
 }
 
 #[tokio::test]
 async fn a_message_that_cannot_be_read_back_is_an_error() {
     let event = event_from(testkit::slack::MESSAGE_MENTION);
-    let (server, surface) = setup().await;
+    let (server, surface) = confirming_setup(public_channel()).await;
     mount(
         &server,
         "conversations.history",
@@ -992,10 +1163,18 @@ async fn a_message_that_cannot_be_read_back_is_an_error() {
         surface.confirm(&event).await,
         Err(SurfaceError::NotFound("channel_not_found".into()))
     );
-    let mut elsewhere = event;
+    let mut elsewhere = event.clone();
     elsewhere.conv.team = "T0OTHER01".into();
     assert!(matches!(
         surface.confirm(&elsewhere).await,
         Err(SurfaceError::Api(_))
     ));
+
+    let (server, surface) = setup().await;
+    mount(&server, "conversations.info", ResponseTemplate::new(503)).await;
+    assert!(matches!(
+        surface.confirm(&event).await,
+        Err(SurfaceError::Transport(_))
+    ));
+    assert!(lookups(&server, "conversations.history").await.is_empty());
 }

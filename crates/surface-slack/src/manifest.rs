@@ -36,13 +36,19 @@ pub const BOT_EVENTS: [&str; 4] = [
 ];
 
 /// The bot scopes every agent app asks for. `chat:write.public` is added
-/// only when [`AgentApp::public_posting`] is on.
-pub const BOT_SCOPES: [&str; 11] = [
+/// only when [`AgentApp::public_posting`] is on. The `*:read` scopes let
+/// `conversations.info` tell what kind of conversation a message is in
+/// when it is confirmed.
+pub const BOT_SCOPES: [&str; 15] = [
     "chat:write",
     "channels:history",
     "groups:history",
     "im:history",
     "mpim:history",
+    "channels:read",
+    "groups:read",
+    "im:read",
+    "mpim:read",
     "im:write",
     "reactions:write",
     "files:read",
@@ -204,7 +210,8 @@ mod tests {
                     "redirect_urls": ["https://agentd.example.com/slack/oauth/callback"],
                     "scopes": {"bot": [
                         "chat:write", "channels:history", "groups:history", "im:history",
-                        "mpim:history", "im:write", "reactions:write", "files:read",
+                        "mpim:history", "channels:read", "groups:read", "im:read",
+                        "mpim:read", "im:write", "reactions:write", "files:read",
                         "files:write", "users:read", "channels:join",
                     ]},
                 },
