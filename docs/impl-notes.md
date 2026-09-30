@@ -1192,7 +1192,8 @@ them.
 
 **Solution.** `AgentPolicy::permits`: a requester any deny rule covers is
 refused. Otherwise an empty allow list allows everyone, and a non-empty one
-allows only requesters one of its rules covers, by member key or by room.
+allows only requesters one of its rules covers, by member or by room (see
+[below](#member-rules-matched-one-surface-only)).
 Rules apply to the requester, so a hop is checked against the inherited
 requester. The owner is exempt, so `deny everyone` can't lock the owner out
 of their own agent. `AgentPolicy` also carries `max_hops`, since T27's
@@ -1202,14 +1203,76 @@ cap, the global one lowered by the agent's. Until T27, the default is
 
 ### Surface flags aren't trusted for managed agents
 
-**Issue.** The router asks `is_managed_bot` only when `sender_is_bot` is
-true, per T22. A surface that failed to flag a managed agent's post as a bot
-would have had it routed as a person's message: billed to the bot's own key,
-most likely on the community key, and able to loop.
+**Issue.** The router asked for the managed agent only when
+`sender_is_bot` was true, per T22. A surface that failed to flag a managed
+agent's post as a bot would have had it routed as a person's message:
+billed to the bot's own key, most likely on the community key, and able to
+loop.
 
-**Solution.** The router asks `is_managed_bot(sender)` for every sender, and
+**Solution.** The router asks `managed_bot(sender)` for every sender, and
 a managed agent's post takes the agent path whatever the flags say. A sender
 flagged as a bot whose `sender_bot_user` isn't `sender.user` (a Slack bot
 known only by its bot id, or a surface bug) is an unmanaged bot without any
 lookup, so a bot id never matches a binding even by accident. A
 `sender_bot_user` alone marks the sender as a bot.
+
+### A reply naming another agent ran two turns
+
+**Issue.** A person's reply in agent A's thread counted as addressed to A
+whatever it mentioned. A reply there that mentioned only agent B ran B, as
+the mention asked, and also A, as a reply to A, so the person paid for two
+turns and got an answer they didn't ask A for.
+
+**Solution.** A reply to an agent counts only if it mentions no other
+managed agent. Mentioning nobody, A itself, the manager bot or a person
+still counts; mentioning B and not A is addressed to B alone. Mentioning
+both runs both, since both were named. A DM still counts for the agent
+whose DM it is, whatever it mentions, since no other agent can answer
+there. `design.md`'s Routing section says so, and the invariant grid gains
+a "mentions B" axis that asserts a message naming only B never engages A
+outside A's DM.
+
+### Member rules matched one surface only
+
+**Issue.** `PolicyTarget::Member(MemberKey)` matched the requester's surface
+identity only. Bans and the owner check go by `MemberId`, so a member
+denied through their Slack identity could still use the agent through
+their linked Rocket.Chat identity.
+
+**Solution.** `PolicyTarget::Member { key, member }` holds the identity the
+rule named and the member it belonged to when the rule was set.
+`AgentPolicy::permits` takes the whole `Requester`: a member rule covers a
+requester with the same key, or, when the rule has a member, a requester
+with the same member on any surface. Key equality always counts, so a rule
+set while the identity had no member still covers that identity after it
+joins one. T27 stores the member with the rule.
+
+### The manager bot had no identity in the view
+
+**Issue.** `is_managed_bot` answered only for agents' bot users. A manager
+bot post that the surface didn't flag as a bot, and that mentioned an agent,
+was routed as a person's message: the manager bot's key has no member, so
+it ran on the community key.
+
+**Solution.** The lookup is `managed_bot(key) -> Option<ManagedBot>`, where
+`ManagedBot` is `Agent(AgentId)` or `Manager`. The manager bot's posts are
+`Ignore(ManagerBot)` whatever the flags say, and a mention of the manager
+bot addresses no agent.
+
+### A synchronous view over an asynchronous store failed open
+
+**Issue.** `RouterView` is synchronous so that `route` stays pure, and the
+store is asynchronous, so T23 has to load the view's answers before calling
+`route`. Anything it forgot fell back permissively: `is_banned` answered
+false and a missing policy was `AgentPolicy::default()`, which allows
+everyone. A banned or denied requester would have been run.
+
+**Solution.** The lookups that grant or withhold permission fail closed.
+`is_banned` returns `Option<bool>` and `policy` returns
+`Option<AgentPolicy>`; `None` means the view doesn't know, and `route`
+refuses with `RefuseReason::PolicyUnavailable`, after the paused check and
+a known ban, and before the credential. The owner is refused too, since
+the policy also holds the hop cap. Every other lookup already withholds a
+turn when it has no answer. The trait's rustdoc lists every lookup `route`
+may make for an event, in order, so T23 knows what to load, and T23's and
+T27's plan text say what they fill.

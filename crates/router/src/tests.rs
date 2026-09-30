@@ -25,7 +25,7 @@ fn conv(id: &str) -> ConvRef {
 
 #[derive(Default)]
 struct FakeView {
-    bots: HashMap<MemberKey, AgentId>,
+    bots: HashMap<MemberKey, ManagedBot>,
     bindings: HashMap<BindingId, AgentId>,
     refs: HashMap<MsgRef, Attribution>,
     members: HashMap<MemberKey, MemberId>,
@@ -37,10 +37,11 @@ struct FakeView {
     policies: HashMap<AgentId, AgentPolicy>,
     banned_members: HashSet<MemberId>,
     banned_keys: HashSet<MemberKey>,
+    bans_unavailable: bool,
 }
 
 impl RouterView for FakeView {
-    fn is_managed_bot(&self, bot: &MemberKey) -> Option<AgentId> {
+    fn managed_bot(&self, bot: &MemberKey) -> Option<ManagedBot> {
         self.bots.get(bot).copied()
     }
 
@@ -76,15 +77,16 @@ impl RouterView for FakeView {
         self.agent_posts.contains(&(msg.clone(), agent))
     }
 
-    fn policy(&self, agent: AgentId) -> AgentPolicy {
-        self.policies.get(&agent).cloned().unwrap_or_default()
+    fn policy(&self, agent: AgentId) -> Option<AgentPolicy> {
+        self.policies.get(&agent).cloned()
     }
 
-    fn is_banned(&self, requester: &Requester) -> bool {
-        requester
+    fn is_banned(&self, requester: &Requester) -> Option<bool> {
+        let banned = requester
             .member
             .is_some_and(|member| self.banned_members.contains(&member))
-            || self.banned_keys.contains(&requester.key)
+            || self.banned_keys.contains(&requester.key);
+        (!self.bans_unavailable).then_some(banned)
     }
 }
 
@@ -123,8 +125,11 @@ impl World {
         );
         let (owner_key, linked_key, known_key) = (key("UOWNER"), key("ULINKED"), key("UKNOWN"));
 
-        view.bots.insert(a_bot.clone(), a);
-        view.bots.insert(b_bot.clone(), b);
+        view.bots.insert(a_bot.clone(), ManagedBot::Agent(a));
+        view.bots.insert(b_bot.clone(), ManagedBot::Agent(b));
+        view.bots.insert(key("UMANAGER"), ManagedBot::Manager);
+        view.policies.insert(a, AgentPolicy::default());
+        view.policies.insert(b, AgentPolicy::default());
         view.bindings.insert(a_binding, a);
         view.bindings.insert(b_binding, b);
         view.owners.insert(a, owner);
@@ -230,6 +235,14 @@ impl World {
         route(event, self.a, &self.view)
     }
 
+    /// A rule naming `key`, and the member it belongs to, if any.
+    fn member_target(&self, key: &MemberKey) -> PolicyTarget {
+        PolicyTarget::Member {
+            key: key.clone(),
+            member: self.view.member_for(key),
+        }
+    }
+
     fn set_policy(&mut self, policy: AgentPolicy) {
         self.view.policies.insert(self.a, policy);
     }
@@ -277,7 +290,7 @@ fn bot_known_only_by_bot_id_is_ignored_as_unmanaged() {
     event.sender_bot_user = None;
     assert_eq!(w.route(&event), ignored(IgnoreReason::UnmanagedBot));
 
-    w.view.bots.insert(bot_id, w.b);
+    w.view.bots.insert(bot_id, ManagedBot::Agent(w.b));
     assert_eq!(
         w.route(&event),
         ignored(IgnoreReason::UnmanagedBot),
@@ -452,6 +465,31 @@ fn managed_bot_flagged_as_person_is_still_treated_as_the_agent() {
         ignored(IgnoreReason::UnattributedManagedBot),
         "an agent's post never runs as a person's, whatever the surface flagged"
     );
+}
+
+#[test]
+fn manager_bot_post_is_ignored_even_when_not_flagged_as_a_bot() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    let manager = key("UMANAGER");
+    let mut event = w.mention(&manager);
+    assert_eq!(w.route(&event), ignored(IgnoreReason::ManagerBot));
+
+    event.sender_is_bot = true;
+    event.sender_bot_user = Some(manager.user.clone());
+    assert_eq!(w.route(&event), ignored(IgnoreReason::ManagerBot));
+
+    event.conv_kind = ConvKind::Dm;
+    event.binding = w.a_binding;
+    assert_eq!(w.route(&event), ignored(IgnoreReason::ManagerBot));
+}
+
+#[test]
+fn mention_of_the_manager_bot_addresses_no_agent() {
+    let w = World::new();
+    let mut event = w.message(&w.linked_key);
+    event.mentions.push("UMANAGER".into());
+    assert_eq!(w.route(&event), ignored(IgnoreReason::NotAddressed));
 }
 
 #[test]
@@ -671,6 +709,73 @@ fn reply_to_agents_message_in_another_conversation_does_not_count() {
     assert_eq!(w.route(&event), ignored(IgnoreReason::NotAddressed));
 }
 
+/// A reply in a thread A started, from the linked member.
+fn reply_in_as_thread(w: &mut World) -> InboundEvent {
+    let mut event = w.message(&w.linked_key);
+    let root = MsgRef {
+        conv: conv("C1"),
+        id: "50.0".into(),
+    };
+    w.view.agent_posts.insert((root.clone(), w.a));
+    event.thread_root = Some(root.id.clone());
+    event.reply_to = Some(root);
+    event
+}
+
+#[test]
+fn reply_in_agents_thread_mentioning_only_another_agent_runs_that_agent_alone() {
+    let mut w = World::new();
+    let mut event = reply_in_as_thread(&mut w);
+    event.mentions.push(w.b_bot.user.clone());
+    assert_eq!(
+        w.route(&event),
+        ignored(IgnoreReason::NotAddressed),
+        "the reply is addressed to B, so A doesn't bill the person a second turn"
+    );
+    assert_eq!(
+        route(&event, w.b, &w.view),
+        run(
+            w.requester(&w.linked_key),
+            Hop::ZERO,
+            CredentialRef::Member(w.linked),
+            ScopeKind::Channel
+        )
+    );
+}
+
+#[test]
+fn reply_in_agents_thread_mentioning_nobody_the_agent_or_no_agent_still_counts() {
+    let mut w = World::new();
+    let base = reply_in_as_thread(&mut w);
+    let expected = run(
+        w.requester(&w.linked_key),
+        Hop::ZERO,
+        CredentialRef::Member(w.linked),
+        ScopeKind::Channel,
+    );
+    let mentioning = |users: &[&str]| {
+        let mut event = base.clone();
+        event.mentions = users.iter().map(|user| (*user).into()).collect();
+        event
+    };
+    for users in [
+        &[][..],
+        &["UBOTA"],
+        &["UBOTA", "UBOTB"],
+        &["UKNOWN"],
+        &["UMANAGER"],
+    ] {
+        assert_eq!(w.route(&mentioning(users)), expected, "mentions {users:?}");
+    }
+    assert!(
+        matches!(
+            route(&mentioning(&["UBOTA", "UBOTB"]), w.b, &w.view),
+            Decision::Run { .. }
+        ),
+        "naming both agents runs both"
+    );
+}
+
 #[test]
 fn dm_through_another_bots_binding_is_ignored_even_with_a_mention() {
     let w = World::new();
@@ -874,7 +979,7 @@ fn deny_rule_refuses_and_deny_wins_over_allow() {
     let mut w = World::new();
     w.set_policy(AgentPolicy {
         allow: vec![PolicyTarget::Everyone],
-        deny: vec![PolicyTarget::Member(w.linked_key.clone())],
+        deny: vec![w.member_target(&w.linked_key)],
         ..AgentPolicy::default()
     });
     assert_eq!(
@@ -883,7 +988,7 @@ fn deny_rule_refuses_and_deny_wins_over_allow() {
     );
 
     w.set_policy(AgentPolicy {
-        allow: vec![PolicyTarget::Member(w.linked_key.clone())],
+        allow: vec![w.member_target(&w.linked_key)],
         deny: vec![PolicyTarget::Room(conv("C1"))],
         ..AgentPolicy::default()
     });
@@ -902,7 +1007,7 @@ fn allow_list_admits_only_the_members_and_rooms_it_names() {
     let mut w = World::new();
     w.set_policy(AgentPolicy {
         allow: vec![
-            PolicyTarget::Member(w.linked_key.clone()),
+            w.member_target(&w.linked_key),
             PolicyTarget::Room(conv("C2")),
         ],
         ..AgentPolicy::default()
@@ -955,12 +1060,164 @@ fn deny_everyone_never_locks_out_the_owner() {
 fn deny_rule_applies_to_the_inherited_requester_of_a_hop() {
     let mut w = World::new();
     w.set_policy(AgentPolicy {
-        deny: vec![PolicyTarget::Member(w.linked_key.clone())],
+        deny: vec![w.member_target(&w.linked_key)],
         ..AgentPolicy::default()
     });
     let requester = w.requester(&w.linked_key.clone());
     let event = w.b_mentions_a(requester, Hop::ZERO);
     assert_eq!(w.route(&event), refused(RefuseReason::Denied));
+}
+
+/// The linked member's identity on a Rocket.Chat server, and a mention of
+/// agent A's bot there.
+fn rocketchat_mention(w: &mut World) -> InboundEvent {
+    let rc = |user: &str| MemberKey {
+        surface: SurfaceKind::RocketChat,
+        team: "chat.example.com".into(),
+        user: user.into(),
+    };
+    let (rc_linked, rc_a_bot) = (rc("rc-linked"), rc("rc-bot-a"));
+    w.view.members.insert(rc_linked.clone(), w.linked);
+    w.view.bots.insert(rc_a_bot.clone(), ManagedBot::Agent(w.a));
+    let conv = ConvRef {
+        surface: SurfaceKind::RocketChat,
+        team: "chat.example.com".into(),
+        conversation: "GENERAL".into(),
+    };
+    let mut event = w.mention(&rc_linked);
+    event.conv = conv.clone();
+    event.message = MsgRef {
+        conv,
+        id: "rc-msg-1".into(),
+    };
+    event.mentions = vec![rc_a_bot.user];
+    event
+}
+
+#[test]
+fn member_rule_covers_the_same_member_on_another_surface() {
+    let mut w = World::new();
+    let event = rocketchat_mention(&mut w);
+    assert!(matches!(w.route(&event), Decision::Run { .. }));
+
+    w.set_policy(AgentPolicy {
+        deny: vec![w.member_target(&w.linked_key)],
+        ..AgentPolicy::default()
+    });
+    assert_eq!(
+        w.route(&event),
+        refused(RefuseReason::Denied),
+        "a deny on the Slack identity covers the linked Rocket.Chat identity"
+    );
+
+    w.set_policy(AgentPolicy {
+        allow: vec![w.member_target(&w.linked_key)],
+        ..AgentPolicy::default()
+    });
+    assert!(matches!(w.route(&event), Decision::Run { .. }));
+    assert_eq!(
+        w.route(&w.mention(&w.known_key)),
+        refused(RefuseReason::Denied)
+    );
+}
+
+#[test]
+fn member_rule_without_a_member_covers_only_its_identity() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    let event = rocketchat_mention(&mut w);
+    w.set_policy(AgentPolicy {
+        deny: vec![PolicyTarget::Member {
+            key: w.linked_key.clone(),
+            member: None,
+        }],
+        ..AgentPolicy::default()
+    });
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::Denied),
+        "the identity it names is covered, whoever it belongs to now"
+    );
+    assert!(matches!(w.route(&event), Decision::Run { .. }));
+
+    w.set_policy(AgentPolicy {
+        deny: vec![PolicyTarget::Member {
+            key: w.stranger_key.clone(),
+            member: None,
+        }],
+        ..AgentPolicy::default()
+    });
+    assert_eq!(
+        w.route(&w.mention(&w.stranger_key)),
+        refused(RefuseReason::Denied),
+        "a requester with no member is matched by identity"
+    );
+    assert!(matches!(
+        w.route(&w.mention(&w.linked_key)),
+        Decision::Run { .. }
+    ));
+}
+
+#[test]
+fn missing_ban_answer_refuses_instead_of_allowing() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    w.view.bans_unavailable = true;
+    for event in [
+        w.mention(&w.linked_key),
+        w.mention(&w.stranger_key),
+        w.dm(&w.owner_key),
+    ] {
+        assert_eq!(w.route(&event), refused(RefuseReason::PolicyUnavailable));
+    }
+    let requester = w.requester(&w.linked_key.clone());
+    let hop = w.b_mentions_a(requester, Hop::ZERO);
+    assert_eq!(w.route(&hop), refused(RefuseReason::PolicyUnavailable));
+}
+
+#[test]
+fn missing_policy_refuses_instead_of_allowing_even_for_the_owner() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    w.view.policies.remove(&w.a);
+    for event in [
+        w.mention(&w.linked_key),
+        w.mention(&w.stranger_key),
+        w.dm(&w.owner_key),
+        w.mention(&w.owner_key),
+    ] {
+        assert_eq!(w.route(&event), refused(RefuseReason::PolicyUnavailable));
+    }
+}
+
+#[test]
+fn precedence_missing_policy_after_ignores_paused_and_bans() {
+    let mut w = World::new();
+    w.view.policies.remove(&w.a);
+    w.view.bans_unavailable = true;
+    assert_eq!(
+        w.route(&w.message(&w.linked_key)),
+        ignored(IgnoreReason::NotAddressed),
+        "an unaddressed message draws no notice, even with nothing loaded"
+    );
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::PolicyUnavailable)
+    );
+
+    w.view.bans_unavailable = false;
+    w.view.banned_members.insert(w.linked);
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::Banned),
+        "a known ban is reported before a missing policy"
+    );
+
+    w.view.states.insert(w.a, AgentState::Paused);
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::Paused)
+    );
 }
 
 #[test]
@@ -1075,6 +1332,7 @@ fn reasons_have_distinct_log_text() {
         IgnoreReason::AgentDeleted,
         IgnoreReason::OwnMessage,
         IgnoreReason::UnmanagedBot,
+        IgnoreReason::ManagerBot,
         IgnoreReason::NotThisAgentsDm,
         IgnoreReason::NotMentionedByAgent,
         IgnoreReason::UnattributedManagedBot,
@@ -1085,6 +1343,7 @@ fn reasons_have_distinct_log_text() {
         RefuseReason::Banned,
         RefuseReason::Denied,
         RefuseReason::HopCap { max: Hop(2) },
+        RefuseReason::PolicyUnavailable,
     ];
     let texts: HashSet<String> = ignores
         .iter()
@@ -1104,6 +1363,7 @@ struct Case {
     binding_is_a: bool,
     mentioned: bool,
     replied: bool,
+    mentions_b: bool,
     sender: Who,
     recorded_member: bool,
 }
@@ -1116,7 +1376,7 @@ enum Who {
 }
 
 /// Every combination of sender, conversation, linking, community key,
-/// binding, mention and reply, checked against the billing and privacy
+/// binding, mentions and reply, checked against the billing and privacy
 /// rules rather than against expected decisions.
 #[test]
 fn no_combination_breaks_the_billing_and_privacy_invariants() {
@@ -1136,18 +1396,21 @@ fn no_combination_breaks_the_billing_and_privacy_invariants() {
                 for binding_is_a in bools {
                     for mentioned in bools {
                         for replied in bools {
-                            for sender in senders {
-                                for recorded_member in bools {
-                                    runs += check_invariants(Case {
-                                        owner_linked,
-                                        community_key,
-                                        kind,
-                                        binding_is_a,
-                                        mentioned,
-                                        replied,
-                                        sender,
-                                        recorded_member,
-                                    });
+                            for mentions_b in bools {
+                                for sender in senders {
+                                    for recorded_member in bools {
+                                        runs += check_invariants(Case {
+                                            owner_linked,
+                                            community_key,
+                                            kind,
+                                            binding_is_a,
+                                            mentioned,
+                                            replied,
+                                            mentions_b,
+                                            sender,
+                                            recorded_member,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -1204,6 +1467,9 @@ fn check_invariants(case: Case) -> usize {
     if case.mentioned || case.sender == Who::AgentB {
         event.mentions.push(w.a_bot.user.clone());
     }
+    if case.mentions_b {
+        event.mentions.push(w.b_bot.user.clone());
+    }
     if case.replied {
         let root = MsgRef {
             conv: event.conv.clone(),
@@ -1215,6 +1481,12 @@ fn check_invariants(case: Case) -> usize {
 
     let decision = w.route(&event);
     let from_person = matches!(case.sender, Who::Person(_));
+    if from_person && case.mentions_b && !case.mentioned && case.kind != ConvKind::Dm {
+        assert!(
+            matches!(decision, Decision::Ignore(_)),
+            "a message naming only B never engages A outside A's DM: {case:?}"
+        );
+    }
     let Decision::Run {
         requester,
         hop,

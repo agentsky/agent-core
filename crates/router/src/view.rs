@@ -11,20 +11,66 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 /// over the store (T23), tests over plain maps.
 ///
 /// Every method is a synchronous lookup, so the router stays pure. The
-/// pipeline loads whatever the view needs before calling
-/// [`route`](crate::route), and retries a missing [`message_ref`] briefly
-/// itself (T34).
+/// store is asynchronous, so the pipeline loads whatever the view needs
+/// before calling [`route`](crate::route), and retries a missing
+/// [`message_ref`] briefly itself (T34).
 ///
+/// # Lookups, in order
+///
+/// For one event and one candidate `agent`, [`route`](crate::route) makes
+/// at most these lookups, in this order, and stops at the first answer that
+/// decides. A view that preloads all of them for every candidate answers
+/// every call.
+///
+/// 1. [`agent_owner`] and [`agent_state`] for `agent`.
+/// 2. [`managed_bot`] for `event.sender`, unless the sender is flagged as a
+///    bot with a `sender_bot_user` other than `sender.user`.
+/// 3. For a one-to-one DM, [`binding_agent`] for `event.binding`.
+/// 4. [`managed_bot`] for each of `event.mentions`, keyed by the
+///    conversation's surface and team.
+/// 5. For a person's message: [`is_reply_to_agent`] for `event.reply_to`
+///    when it is in the same conversation, then [`member_for`] for
+///    `event.sender`. For a managed agent's message: [`message_ref`] for
+///    `event.message`, then [`member_for`] for the recorded requester's key
+///    if no member was recorded.
+/// 6. [`is_banned`] for the requester.
+/// 7. [`policy`] for `agent`.
+/// 8. [`is_linked`] for the owner, or for the requester's member, then
+///    [`community_key_configured`].
+///
+/// # Missing answers
+///
+/// The lookups that grant or withhold permission fail closed. [`is_banned`]
+/// and [`policy`] return `None` when the view doesn't have the answer, for
+/// example because the pipeline didn't preload it, and the router then
+/// refuses with [`RefuseReason::PolicyUnavailable`] instead of assuming the
+/// requester is allowed. A missing answer anywhere else can only withhold a
+/// turn: an unknown agent is ignored, an unknown mention or reply doesn't
+/// address the agent, and an unknown link or community key gives a link
+/// prompt.
+///
+/// [`agent_owner`]: RouterView::agent_owner
+/// [`agent_state`]: RouterView::agent_state
+/// [`managed_bot`]: RouterView::managed_bot
+/// [`binding_agent`]: RouterView::binding_agent
+/// [`is_reply_to_agent`]: RouterView::is_reply_to_agent
+/// [`member_for`]: RouterView::member_for
 /// [`message_ref`]: RouterView::message_ref
+/// [`is_banned`]: RouterView::is_banned
+/// [`policy`]: RouterView::policy
+/// [`is_linked`]: RouterView::is_linked
+/// [`community_key_configured`]: RouterView::community_key_configured
+/// [`RefuseReason::PolicyUnavailable`]: crate::RefuseReason::PolicyUnavailable
 pub trait RouterView {
-    /// The managed agent whose bot user is `bot`, or `None`.
+    /// Which bot agentd manages as `bot`, or `None` for anyone else.
     ///
     /// The key is the full `(surface, team, user)`, so a matching user id
-    /// from another team or server is never taken for a managed agent. It
-    /// must answer for every bot user agentd created, whatever the agent's
-    /// or binding's state, so that a paused or deleted agent's bot is never
-    /// mistaken for a person.
-    fn is_managed_bot(&self, bot: &MemberKey) -> Option<AgentId>;
+    /// from another team or server is never taken for a managed bot. It
+    /// must answer for every bot user agentd created, the manager bot's
+    /// included, whatever the agent's or binding's state, so that a paused
+    /// or deleted agent's bot, or the manager bot, is never mistaken for a
+    /// person.
+    fn managed_bot(&self, bot: &MemberKey) -> Option<ManagedBot>;
 
     /// The agent whose binding `binding` is, or `None` for the manager bot's
     /// and unknown bindings.
@@ -57,13 +103,25 @@ pub trait RouterView {
     /// reply the router asks about the thread root.
     fn is_reply_to_agent(&self, msg: &MsgRef, agent: AgentId) -> bool;
 
-    /// The agent's allow and deny rules and hop cap.
-    /// [`AgentPolicy::default`] allows everyone.
-    fn policy(&self, agent: AgentId) -> AgentPolicy;
+    /// The agent's allow and deny rules and effective hop cap, or `None` if
+    /// the view doesn't have them. An agent with no rules set has
+    /// [`AgentPolicy::default`], which allows everyone; `None` refuses.
+    fn policy(&self, agent: AgentId) -> Option<AgentPolicy>;
 
     /// Whether a community admin banned the requester: the member it names,
-    /// or the member its key belongs to.
-    fn is_banned(&self, requester: &Requester) -> bool;
+    /// or the member its key belongs to. `None` if the view doesn't know,
+    /// which refuses.
+    fn is_banned(&self, requester: &Requester) -> Option<bool>;
+}
+
+/// A bot user agentd manages: an agent's, or the manager bot's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ManagedBot {
+    /// The bot user of this agent's binding.
+    Agent(AgentId),
+    /// The manager bot. Its posts are never routed, and a mention of it
+    /// addresses no agent.
+    Manager,
 }
 
 /// An agent's lifecycle state, as `agents.state` holds it (T14).
@@ -91,8 +149,19 @@ pub struct Attribution {
 /// Who an allow or deny rule covers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PolicyTarget {
-    /// One member's identity on one surface.
-    Member(MemberKey),
+    /// One member, named by one of their surface identities.
+    ///
+    /// It covers a requester with that identity, and, when `member` is
+    /// set, any requester with the same member, whichever surface they
+    /// come from. So a rule written against someone's Slack identity also
+    /// covers their linked Rocket.Chat identity.
+    Member {
+        /// The identity the rule named.
+        key: MemberKey,
+        /// The member that identity belonged to when the rule was set, if
+        /// any.
+        member: Option<MemberId>,
+    },
     /// Every requester in one conversation.
     Room(ConvRef),
     /// Every requester everywhere.
@@ -100,9 +169,11 @@ pub enum PolicyTarget {
 }
 
 impl PolicyTarget {
-    fn covers(&self, requester: &MemberKey, conv: &ConvRef) -> bool {
+    fn covers(&self, requester: &Requester, conv: &ConvRef) -> bool {
         match self {
-            Self::Member(member) => member == requester,
+            Self::Member { key, member } => {
+                *key == requester.key || (member.is_some() && *member == requester.member)
+            }
             Self::Room(room) => room == conv,
             Self::Everyone => true,
         }
@@ -138,8 +209,10 @@ impl AgentPolicy {
     ///
     /// Deny wins: a requester any deny rule covers is refused. Otherwise an
     /// empty allow list allows everyone, and a non-empty one allows only the
-    /// requesters one of its rules covers, by member or by room.
-    pub fn permits(&self, requester: &MemberKey, conv: &ConvRef) -> bool {
+    /// requesters one of its rules covers, by member or by room. A member
+    /// rule matches the requester's identity, or their member on any
+    /// surface (see [`PolicyTarget::Member`]).
+    pub fn permits(&self, requester: &Requester, conv: &ConvRef) -> bool {
         let covered = |rules: &[PolicyTarget]| rules.iter().any(|r| r.covers(requester, conv));
         !covered(&self.deny) && (self.allow.is_empty() || covered(&self.allow))
     }

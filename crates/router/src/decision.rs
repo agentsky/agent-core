@@ -54,6 +54,9 @@ pub enum IgnoreReason {
     /// A bot agentd doesn't manage sent it, or a bot known only by its bot
     /// id, which never matches a managed agent.
     UnmanagedBot,
+    /// The manager bot sent it. The manager bot never starts a turn, and
+    /// nobody is billed for what it posts.
+    ManagerBot,
     /// A one-to-one DM that came in through another bot's binding, so it is
     /// not this agent's DM.
     NotThisAgentsDm,
@@ -64,7 +67,8 @@ pub enum IgnoreReason {
     /// posting that message for that agent, so nobody can be billed.
     UnattributedManagedBot,
     /// A person's message that neither mentions the agent, replies to one of
-    /// its messages, nor is a DM with it.
+    /// its messages, nor is a DM with it. A reply that mentions another
+    /// managed agent but not this one is addressed to that agent only.
     NotAddressed,
 }
 
@@ -76,6 +80,7 @@ impl IgnoreReason {
             Self::AgentDeleted => "agent deleted",
             Self::OwnMessage => "own message",
             Self::UnmanagedBot => "unmanaged bot",
+            Self::ManagerBot => "manager bot",
             Self::NotThisAgentsDm => "another bot's dm",
             Self::NotMentionedByAgent => "managed bot did not mention the agent",
             Self::UnattributedManagedBot => "unattributed managed bot",
@@ -106,6 +111,10 @@ pub enum RefuseReason {
         /// The largest hop the agent accepts.
         max: Hop,
     },
+    /// The view couldn't say whether the requester is banned, or what the
+    /// agent's rules are, so the router refuses rather than assume the
+    /// requester is allowed.
+    PolicyUnavailable,
 }
 
 impl RefuseReason {
@@ -116,6 +125,7 @@ impl RefuseReason {
             Self::Banned => "requester banned",
             Self::Denied => "denied by agent policy",
             Self::HopCap { .. } => "hop cap reached",
+            Self::PolicyUnavailable => "agent policy unavailable",
         }
     }
 }

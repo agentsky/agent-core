@@ -15,19 +15,22 @@
 //! 2. **The sender.** A bot whose `sender_bot_user` is not `sender.user`
 //!    (a Slack bot known only by its bot id) is
 //!    [`IgnoreReason::UnmanagedBot`] without a lookup. Otherwise the sender
-//!    is looked up with [`RouterView::is_managed_bot`], whatever
-//!    `sender_is_bot` says, so a managed agent's post is never taken for a
+//!    is looked up with [`RouterView::managed_bot`], whatever
+//!    `sender_is_bot` says, so a managed bot's post is never taken for a
 //!    person's. This agent: [`IgnoreReason::OwnMessage`], even if it
-//!    mentions itself. A bot that isn't managed:
-//!    [`IgnoreReason::UnmanagedBot`].
+//!    mentions itself. The manager bot: [`IgnoreReason::ManagerBot`]. A bot
+//!    that isn't managed: [`IgnoreReason::UnmanagedBot`].
 //! 3. **Whose DM.** A one-to-one DM that didn't come in through one of this
 //!    agent's bindings: [`IgnoreReason::NotThisAgentsDm`], even if it
 //!    mentions the agent.
 //! 4. **Gating.** Another managed agent must mention this agent
 //!    ([`IgnoreReason::NotMentionedByAgent`]). A person must mention it,
 //!    reply to one of its messages in the same conversation, or be in its
-//!    DM ([`IgnoreReason::NotAddressed`]). Mentions are user ids in the
-//!    conversation's own surface and team.
+//!    DM ([`IgnoreReason::NotAddressed`]). A reply counts only if it
+//!    mentions no other managed agent, so a reply in this agent's thread
+//!    that names another agent runs that agent alone, and the person pays
+//!    for one turn, not two. Mentions are user ids in the conversation's
+//!    own surface and team.
 //! 5. **Attribution.** A managed agent's message must have a
 //!    [`RouterView::message_ref`] recorded for that same agent:
 //!    [`IgnoreReason::UnattributedManagedBot`]. The turn inherits its
@@ -36,8 +39,11 @@
 //! 6. **Paused**: [`RefuseReason::Paused`].
 //! 7. **Banned requester**: [`RefuseReason::Banned`]. For a hop that is the
 //!    inherited requester, so a ban can't be sidestepped through an agent.
+//!    If the view can't say: [`RefuseReason::PolicyUnavailable`].
 //! 8. **Allow and deny rules**, for anyone but the owner:
-//!    [`RefuseReason::Denied`].
+//!    [`RefuseReason::Denied`]. If the view has no policy for the agent:
+//!    [`RefuseReason::PolicyUnavailable`], for the owner too, since the
+//!    policy also holds the hop cap.
 //! 9. **Hop cap**: [`RefuseReason::HopCap`], also when the hop counter
 //!    would overflow.
 //! 10. **Credential.** The owner runs on their own credential, or gets
@@ -53,6 +59,9 @@
 //! be refused anyway. Refusals follow the plan's order: the agent, then the
 //! person, then the rules, then the chain. None of them spends anything, so
 //! their order only decides which notice is shown.
+//!
+//! [`RouterView`] documents which lookups [`route`] makes for an event, in
+//! order, so a store-backed view knows what to load first.
 //!
 //! # Scope and side
 //!
@@ -75,7 +84,9 @@ use core_types::{
 
 pub use decision::{Decision, IgnoreReason, RefuseReason};
 pub use model::ModelPolicy;
-pub use view::{AgentPolicy, AgentState, Attribution, DEFAULT_MAX_HOPS, PolicyTarget, RouterView};
+pub use view::{
+    AgentPolicy, AgentState, Attribution, DEFAULT_MAX_HOPS, ManagedBot, PolicyTarget, RouterView,
+};
 
 /// Decides whether `agent` answers `event`, and how. See the
 /// [crate docs](crate#precedence) for the order of the checks.
@@ -98,11 +109,13 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
 
     let (requester, hop) = match sender {
         Sender::Person => {
-            let addressed = mentions(event, agent, view)
+            let mentions = mentions(event, agent, view);
+            let addressed = mentions == Mentions::ThisAgent
                 || event.is_dm()
-                || event.reply_to.as_ref().is_some_and(|msg| {
-                    msg.conv == event.conv && view.is_reply_to_agent(msg, agent)
-                });
+                || (mentions == Mentions::NoAgent
+                    && event.reply_to.as_ref().is_some_and(|msg| {
+                        msg.conv == event.conv && view.is_reply_to_agent(msg, agent)
+                    }));
             if !addressed {
                 return Decision::Ignore(IgnoreReason::NotAddressed);
             }
@@ -113,7 +126,7 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
             (requester, Some(Hop::ZERO))
         }
         Sender::Agent(posted_by) => {
-            if !mentions(event, agent, view) {
+            if mentions(event, agent, view) != Mentions::ThisAgent {
                 return Decision::Ignore(IgnoreReason::NotMentionedByAgent);
             }
             let Some(attribution) = view
@@ -131,12 +144,16 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
     if state == AgentState::Paused {
         return Decision::Refuse(RefuseReason::Paused);
     }
-    if view.is_banned(&requester) {
-        return Decision::Refuse(RefuseReason::Banned);
+    match view.is_banned(&requester) {
+        Some(false) => {}
+        Some(true) => return Decision::Refuse(RefuseReason::Banned),
+        None => return Decision::Refuse(RefuseReason::PolicyUnavailable),
     }
+    let Some(policy) = view.policy(agent) else {
+        return Decision::Refuse(RefuseReason::PolicyUnavailable);
+    };
     let is_owner = requester.member == Some(owner);
-    let policy = view.policy(agent);
-    if !is_owner && !policy.permits(&requester.key, &event.conv) {
+    if !is_owner && !policy.permits(&requester, &event.conv) {
         return Decision::Refuse(RefuseReason::Denied);
     }
     let Some(hop) = hop.filter(|hop| *hop <= policy.max_hops) else {
@@ -178,25 +195,45 @@ fn classify_sender(
     if is_bot && event.sender_bot_user.as_ref() != Some(&event.sender.user) {
         return Err(IgnoreReason::UnmanagedBot);
     }
-    match view.is_managed_bot(&event.sender) {
-        Some(sender) if sender == agent => Err(IgnoreReason::OwnMessage),
-        Some(sender) => Ok(Sender::Agent(sender)),
+    match view.managed_bot(&event.sender) {
+        Some(ManagedBot::Agent(sender)) if sender == agent => Err(IgnoreReason::OwnMessage),
+        Some(ManagedBot::Agent(sender)) => Ok(Sender::Agent(sender)),
+        Some(ManagedBot::Manager) => Err(IgnoreReason::ManagerBot),
         None if is_bot => Err(IgnoreReason::UnmanagedBot),
         None => Ok(Sender::Person),
     }
 }
 
-/// Whether the event mentions one of `agent`'s bot users. Mentions are user
-/// ids in the conversation's own surface and team.
-fn mentions(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> bool {
-    event.mentions.iter().any(|user| {
+/// Which managed agents an event mentions, from one agent's point of view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mentions {
+    /// It mentions the agent, and maybe others.
+    ThisAgent,
+    /// It mentions other managed agents, but not this one.
+    OtherAgentsOnly,
+    /// It mentions no managed agent.
+    NoAgent,
+}
+
+/// Which managed agents the event mentions. Mentions are user ids in the
+/// conversation's own surface and team. The manager bot is no agent.
+fn mentions(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Mentions {
+    let mut found = Mentions::NoAgent;
+    for user in &event.mentions {
         let key = MemberKey {
             surface: event.conv.surface,
             team: event.conv.team.clone(),
             user: user.clone(),
         };
-        view.is_managed_bot(&key) == Some(agent)
-    })
+        match view.managed_bot(&key) {
+            Some(ManagedBot::Agent(mentioned)) if mentioned == agent => {
+                return Mentions::ThisAgent;
+            }
+            Some(ManagedBot::Agent(_)) => found = Mentions::OtherAgentsOnly,
+            Some(ManagedBot::Manager) | None => {}
+        }
+    }
+    found
 }
 
 /// The credential a turn runs on, or `None` for a link prompt. `owner` is

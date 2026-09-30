@@ -1624,12 +1624,15 @@ Deliverables:
 
 - A pure function `route(event, agent, view: &dyn RouterView) -> Decision`.
   `RouterView` answers:
-  - `is_managed_bot(MemberKey) -> Option<AgentId>`, keyed by surface, team
-    and user as every identity is, so a matching user id from another team or
-    server is never taken for a managed agent. The router asks it for
-    `event.sender`, and for every sender, whatever `sender_is_bot` says, so a
-    managed agent's post is never routed as a person's
-    ([impl-notes](impl-notes.md#surface-flags-arent-trusted-for-managed-agents)).
+  - `managed_bot(MemberKey) -> Option<ManagedBot>`, where `ManagedBot` is
+    `Agent(AgentId)` or `Manager`, keyed by surface, team and user as every
+    identity is, so a matching user id from another team or server is never
+    taken for a managed bot. The router asks it for `event.sender`, and for
+    every sender, whatever `sender_is_bot` says, so a managed agent's post is
+    never routed as a person's
+    ([impl-notes](impl-notes.md#surface-flags-arent-trusted-for-managed-agents)),
+    and the manager bot's posts are ignored
+    ([impl-notes](impl-notes.md#the-manager-bot-had-no-identity-in-the-view)).
     Surfaces put the bot's user id in both `sender.user` and
     `sender_bot_user`, so the router needs only `sender`; a bot known only by
     its bot id is an unmanaged bot without a lookup. Mentions are looked up
@@ -1644,9 +1647,15 @@ Deliverables:
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
-  - `policy(agent)`, which returns allow and deny and the effective hop cap
-    (T27 fills it; the default allows, with a cap of 3).
-  - `is_banned(requester)` (T27 fills it; the default is false).
+  - `policy(agent) -> Option<AgentPolicy>`, which returns allow and deny and
+    the effective hop cap (T27 fills it; an agent with no rules has
+    `AgentPolicy::default()`, which allows, with a cap of 3).
+  - `is_banned(requester) -> Option<bool>` (T27 fills it).
+  - `policy` and `is_banned` fail closed: `None` means the view doesn't
+    know, and the router refuses with `RefuseReason::PolicyUnavailable`. The
+    trait's rustdoc lists every lookup `route` may make for an event, in
+    order
+    ([impl-notes](impl-notes.md#a-synchronous-view-over-an-asynchronous-store-failed-open)).
 - `Decision` is one of:
   - `Ignore(reason)`.
   - `LinkPrompt { requester }`, naming who should link: the sender, or a
@@ -1674,7 +1683,9 @@ Deliverables:
   - Unlinked with the community key, community credential.
   - Unlinked without it, a link prompt.
   - A thread reply that doesn't mention the agent and isn't a reply to it,
-    ignored.
+    ignored. A reply to the agent that mentions only another managed agent,
+    ignored too
+    ([impl-notes](impl-notes.md#a-reply-naming-another-agent-ran-two-turns)).
   - Over the hop cap, refused.
 - The model is chosen from the requester's plan by a `ModelPolicy`
   (configuration maps a plan to a model, with a default).
@@ -1711,8 +1722,14 @@ Deliverables:
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
-     `RouterView`. The candidates are every managed agent mentioned, the
-     agent whose DM it is, and the agent that posted the thread root
+     `RouterView`. The store is asynchronous and the view is not, so first
+     load everything the lookups listed in `RouterView`'s rustdoc need for
+     the event and every candidate, the manager bot's identities included.
+     Until T27, `policy` answers `AgentPolicy::default()` and `is_banned`
+     answers `Some(false)`. A lookup the view can't answer withholds the
+     turn: `None` from `is_banned` or `policy` is refused as
+     `PolicyUnavailable`. The candidates are every managed agent mentioned,
+     the agent whose DM it is, and the agent that posted the thread root
      (`reply_to`, looked up in `message_refs`). When the surface has
      `per_binding_delivery`, only the receiving binding's agent is a
      candidate, since each other agent gets its own copy.
@@ -1889,9 +1906,15 @@ Deliverables:
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
   `AgentPolicy::max_hops` is the effective cap, the global one lowered by the
-  agent's, and allow and deny follow `AgentPolicy::permits` (T22).
+  agent's, and allow and deny follow `AgentPolicy::permits` (T22). This task
+  extends T22's `AgentPolicy` with the daily turn cap and `RefuseReason`
+  with a variant for it, and fills `policy` and `is_banned` from these
+  tables, returning `None` only when a lookup fails, never for an agent or
+  member with no rows.
 - `/agent allow|deny <name> <target>`. A target is a member (`@user`), a
-  channel (`#room`), or `everyone`. Deny wins, and the default allows
+  channel (`#room`), or `everyone`. A member rule stores the identity and
+  the member it belongs to, as `PolicyTarget::Member { key, member }`, so it
+  covers the member on every surface. Deny wins, and the default allows
   everyone.
 - Thread caps from `[limits]`:
   - Agent turns per thread per hour.
