@@ -2327,9 +2327,10 @@ twice an hour, not every minute, until it is fixed or deleted.
 **Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
 failed under CPU load, always at "the pass retired the bot": 1 of 200
 runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
-server to count no connections, then read the binding once. A pass stops a connection by signalling its task, which
-closes the socket on its own while the pass goes on to `abandon_stale` and
-`retire_pending`, so the socket can close before `mark_retired` runs.
+server to count no connections, then read the binding once. A pass stops a
+connection by signalling its task, which closes the socket on its own while
+the pass goes on to `abandon_stale` and `retire_pending`, so the socket can
+close before `mark_retired` runs.
 Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
 The order can also flip: a delete that lands between a pass's `reconcile`
 and its `retire_pending` is retired by that pass and disconnected by the
@@ -2349,8 +2350,36 @@ and sent `users.create`", and a 300 ms response delay for "the abandonment
 lands before the response". Adding 150 ms before the username is recorded
 failed it 10 of 10 runs. Its `users.create` response is now held until the
 test has abandoned the creation, so the abandonment always lands while the
-request is in flight; it passes 10 of 10 with the 150 ms added. The tests install no tracing subscriber, so
-`RUST_LOG` doesn't change their timing.
+request is in flight; it passes 10 of 10 with the 150 ms added.
+
+The hold is `testkit::Held`, and the other tests that slept and assumed a
+delayed response was still on its way now use it too: the auth tests that
+act during a refresh, the command test that expects a second member's reply
+while the first member's login is out, and the Slack test that changes the
+managed bots during a member refresh. Each waits for its request to arrive,
+acts, then releases the response, and fails after 30 seconds rather than
+hanging when the request never comes. The logout test only waits for its
+refresh to arrive: logout queues behind that refresh on the member's lock,
+so holding the response would deadlock, and either order ends the same.
+
+`concurrent_callers_share_a_failed_refresh_of_an_expired_token` needed more
+than a hold. Its five callers must all join the refresh before the 503
+lands; one that joins later finds no refresh in flight and starts its own,
+which sends a second request. That is the intended behaviour, not a
+bug: T09's notes say an expired token is always retried because there is
+nothing to hand out instead, and the backoff only covers a still-valid
+token. `Auth` had no observable point where every caller had joined, so the
+200 ms response delay was the only margin, and 300 ms added before callers
+2 to 5 start failed the test 10 of 10 runs. The in-flight map now holds the
+refresh's `watch::Sender` rather than a receiver, and a doc-hidden
+`Auth::refresh_waiters(member)` returns its receiver count, which is the
+number of callers waiting. The test holds the 503, waits until that count
+reaches 5, then releases it. It passes 10 of 10 runs with the 300 ms added
+and 200 of 200 with 8 busy loops. The map's sender would keep the channel
+open if the refresh task were dropped before it first ran, so the guard that
+removes the map entry now goes into the task when it is spawned, not on its
+first poll. Waiters of such a task get `RefreshInterrupted`, and the next
+caller starts a new refresh.
 
 ### Before turns, a bot reacts instead of replying
 
