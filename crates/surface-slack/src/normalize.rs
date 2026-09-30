@@ -8,9 +8,8 @@
 //! - Only plain messages and the `file_share` and `thread_broadcast`
 //!   subtypes are kept. Edits, deletions, joins, `bot_message` posts from
 //!   classic integrations and the other subtypes are dropped.
-//! - Mentions are the first [`MAX_MENTIONS`] users a message mentions
-//!   ([`mentions`]), since the router looks each one up and a forged event
-//!   can carry a megabyte of them.
+//! - What is kept is bounded, since an agent's owner can sign an event
+//!   with anything in it (see [Bounds](#bounds)).
 //! - In a channel (`channel_type` other than `im` and `mpim`), a message is
 //!   kept only if it mentions the binding's bot user among those, or replies
 //!   in a thread.
@@ -36,6 +35,26 @@
 //! `conversations.history` or `conversations.replies`, which carries no
 //! `channel` or `channel_type`: the caller names the channel and its kind,
 //! as `conversations.info` gives it.
+//!
+//! # Bounds
+//!
+//! Every id a message is kept with must be shaped like Slack's, or the
+//! message is [`Skip::Malformed`]: its `channel` ([`is_channel_id`]), its
+//! `ts` and `thread_ts` ([`is_ts`]), its `user` ([`is_user_id`]) and its
+//! `bot_id` ([`is_bot_id`]). The ingress refuses an event whose ids aren't
+//! with 400 before it is acknowledged, so this only drops what the Web API
+//! answered. The rest is cut to Slack's own limits:
+//!
+//! - `text` to its first [`MAX_TEXT_CHARS`] characters.
+//! - Mentions to the first [`MAX_MENTIONS`] different users, each an id
+//!   [`is_user_id`] accepts; the router looks each one up.
+//! - Files to the first [`MAX_FILES`] the bot can download, each with an id
+//!   [`is_file_id`] accepts and a URL of at most [`MAX_FILE_URL_BYTES`],
+//!   its name cut to [`MAX_FILE_NAME_CHARS`] characters and a MIME type
+//!   longer than [`MAX_MIME_TYPE_BYTES`] left out.
+//!
+//! So a kept message is at most about 220 KB, whatever the event held:
+//! 160 KB of text, 55 KB of files and 2 KB of mentions.
 
 use std::collections::HashSet;
 
@@ -51,6 +70,25 @@ use time::OffsetDateTime;
 /// The `message` subtypes that are kept. A message with no subtype is kept
 /// too.
 pub const KEPT_SUBTYPES: [&str; 2] = ["file_share", "thread_broadcast"];
+
+/// The most characters of a message's `text` kept: Slack's own limit.
+pub const MAX_TEXT_CHARS: usize = 40_000;
+
+/// The most files a message is kept with: Slack's own limit.
+pub const MAX_FILES: usize = 10;
+
+/// The most characters of a file's name kept.
+pub const MAX_FILE_NAME_CHARS: usize = 255;
+
+/// The longest download URL a kept file may have, in bytes. Slack's hold
+/// the team, the file id and the file's name, URL-encoded.
+pub const MAX_FILE_URL_BYTES: usize = 4096;
+
+/// The longest MIME type a kept file carries, in bytes.
+pub const MAX_MIME_TYPE_BYTES: usize = 255;
+
+/// The most bytes of an ignored subtype that [`Skip::Subtype`] carries.
+const MAX_SUBTYPE_BYTES: usize = 64;
 
 /// What [`message`] needs besides the event.
 #[derive(Debug, Clone, Copy)]
@@ -132,7 +170,11 @@ pub fn message(context: &Context<'_>, event: &Value) -> Result<InboundEvent, Ski
         Some("mpim") => ConvKind::GroupDm,
         _ => ConvKind::Channel,
     };
-    let channel = event.channel.clone().ok_or(Skip::Malformed)?;
+    let channel = event
+        .channel
+        .clone()
+        .filter(|channel| is_channel_id(channel))
+        .ok_or(Skip::Malformed)?;
     normalized(context, event, channel.into(), conv_kind)
 }
 
@@ -163,11 +205,19 @@ fn normalized(
     if let Some(subtype) = &event.subtype
         && !KEPT_SUBTYPES.contains(&subtype.as_str())
     {
-        return Err(Skip::Subtype(subtype.clone()));
+        return Err(Skip::Subtype(
+            truncated(subtype, MAX_SUBTYPE_BYTES).to_owned(),
+        ));
     }
-    let Some(ts) = event.ts else {
+    let Some(ts) = event.ts.filter(|ts| is_ts(ts)) else {
         return Err(Skip::Malformed);
     };
+    let shaped = event.user.as_deref().is_none_or(is_user_id)
+        && event.bot_id.as_deref().is_none_or(is_bot_id)
+        && event.thread_ts.as_deref().is_none_or(is_ts);
+    if !shaped {
+        return Err(Skip::Malformed);
+    }
     let is_bot = event.bot_id.is_some() || event.bot_profile.is_some();
     if is_bot && event.edited.is_some() {
         return Err(Skip::EditedByBot);
@@ -181,7 +231,8 @@ fn normalized(
         (None, Some(bot_id)) => (UserId::from(bot_id), None),
         (None, None) => return Err(Skip::NoSender),
     };
-    let text = event.text.unwrap_or_default();
+    let mut text = event.text.unwrap_or_default();
+    text.truncate(char_boundary(&text, MAX_TEXT_CHARS));
     let mentions = mentions(&text, event.blocks.as_ref());
     let thread_root = event.thread_ts.filter(|root| *root != ts);
     if conv_kind == ConvKind::Channel
@@ -219,30 +270,59 @@ fn normalized(
         text,
         mentions,
         reply_to,
-        files: event
-            .files
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(in_file)
-            .collect(),
+        files: in_files(event.files.unwrap_or_default()),
         received_at: context.received_at,
     })
 }
 
-/// A file the bot can download: one with an id and a private URL. Files
-/// Slack withholds (`hidden_by_limit`, or Slack Connect files that need
-/// `files.info` first) carry neither and are left out.
-pub(crate) fn in_file(file: SlackFile) -> Option<InFile> {
-    let id = file.id?;
-    let url = file.url_private_download.or(file.url_private)?;
-    let name = file.name.or(file.title).unwrap_or_else(|| id.clone());
+/// The first [`MAX_FILES`] of `files` the bot can download, bounded as
+/// [Bounds](self#bounds) says.
+pub(crate) fn in_files(files: Vec<SlackFile>) -> Vec<InFile> {
+    files
+        .into_iter()
+        .filter_map(in_file)
+        .take(MAX_FILES)
+        .collect()
+}
+
+/// A file the bot can download: one with an id shaped like Slack's and a
+/// private URL of at most [`MAX_FILE_URL_BYTES`]. Files Slack withholds
+/// (`hidden_by_limit`, or Slack Connect files that need `files.info`
+/// first) carry neither and are left out.
+fn in_file(file: SlackFile) -> Option<InFile> {
+    let id = file.id.filter(|id| is_file_id(id))?;
+    let url = file
+        .url_private_download
+        .or(file.url_private)
+        .filter(|url| url.len() <= MAX_FILE_URL_BYTES)?;
+    let mut name = file.name.or(file.title).unwrap_or_else(|| id.clone());
+    name.truncate(char_boundary(&name, MAX_FILE_NAME_CHARS));
     Some(InFile {
         id,
         name,
-        mime_type: file.mimetype,
+        mime_type: file
+            .mimetype
+            .filter(|mime| mime.len() <= MAX_MIME_TYPE_BYTES),
         size: file.size,
         url,
     })
+}
+
+/// The byte offset of `text`'s `chars`th character, or its length when it
+/// has no more.
+fn char_boundary(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(at, _)| at)
+}
+
+/// `text`, cut to at most `max` bytes at a character boundary.
+fn truncated(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Decodes the three entities Slack writes in message and slash command
@@ -339,13 +419,71 @@ fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
     }
 }
 
-/// Whether `id` looks like a Slack user id: `U` or `W`, then uppercase
-/// letters and digits.
-pub(crate) fn is_user_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    matches!(chars.next(), Some('U' | 'W'))
-        && id.len() >= 2
-        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+/// The most characters a Slack id has after its prefix, as this crate
+/// checks them. Slack's are about ten.
+pub const MAX_ID_TAIL: usize = 20;
+
+/// Whether `id` is one of `prefixes` and then 1 to `max` uppercase ASCII
+/// letters or digits, as Slack's ids are.
+fn is_slack_id(id: &str, prefixes: &[&str], max: usize) -> bool {
+    prefixes.iter().any(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|rest| {
+            (1..=max).contains(&rest.len())
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+    })
+}
+
+/// Whether `id` is shaped like a Slack user id: `U` or `W`, then 1 to
+/// [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_user_id(id: &str) -> bool {
+    is_slack_id(id, &["U", "W"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack bot id: `B`, then 1 to
+/// [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_bot_id(id: &str) -> bool {
+    is_slack_id(id, &["B"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack file id: `F`, then 1 to
+/// [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_file_id(id: &str) -> bool {
+    is_slack_id(id, &["F"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack team id: `T`, or `E` for an
+/// Enterprise Grid organization, then 1 to [`MAX_ID_TAIL`] uppercase
+/// letters or digits.
+pub fn is_team_id(id: &str) -> bool {
+    is_slack_id(id, &["T", "E"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack conversation id: `C`, `D` or `G`,
+/// then 1 to [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_channel_id(id: &str) -> bool {
+    is_slack_id(id, &["C", "D", "G"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack `event_id`: `Ev`, then 1 to 32
+/// uppercase letters or digits.
+pub fn is_event_id(id: &str) -> bool {
+    is_slack_id(id, &["Ev"], 32)
+}
+
+/// Whether `ts` is a message timestamp as Slack writes one: 10 digits of
+/// seconds, a dot and 6 of microseconds.
+pub fn is_ts(ts: &str) -> bool {
+    ts.split_once('.').is_some_and(|(seconds, micros)| {
+        seconds.len() == 10
+            && micros.len() == 6
+            && seconds
+                .bytes()
+                .chain(micros.bytes())
+                .all(|b| b.is_ascii_digit())
+    })
 }
 
 #[cfg(test)]
@@ -481,7 +619,7 @@ mod tests {
         };
         let mention = channel_message(json!({}));
         assert_eq!(message(&context, &mention), Err(Skip::NotAddressed));
-        let reply = channel_message(json!({"thread_ts": "1.1"}));
+        let reply = channel_message(json!({"thread_ts": "1727697500.000050"}));
         assert!(message(&context, &reply).is_ok());
         let dm = channel_message(json!({"channel_type": "im", "text": "hi"}));
         assert!(message(&context, &dm).is_ok());
@@ -599,6 +737,93 @@ mod tests {
         assert_eq!(
             normalize(channel_message(json!({"user": 7}))),
             Err(Skip::Malformed)
+        );
+    }
+
+    #[test]
+    fn ids_not_shaped_like_slacks_make_a_message_malformed() {
+        let long = "A".repeat(21);
+        for extra in [
+            json!({"user": format!("U{long}")}),
+            json!({"user": "u0lower"}),
+            json!({"user": "B0BOT"}),
+            json!({"bot_id": format!("B{long}")}),
+            json!({"bot_id": "U0HUMAN"}),
+            json!({"channel": format!("C{long}")}),
+            json!({"channel": "X0CHAN"}),
+            json!({"ts": "1.1"}),
+            json!({"thread_ts": "1727697500.00005"}),
+        ] {
+            assert_eq!(
+                normalize(channel_message(extra.clone())),
+                Err(Skip::Malformed),
+                "{extra}"
+            );
+        }
+        let mut userless = channel_message(json!({"bot_id": format!("B{long}")}));
+        userless.as_object_mut().unwrap().remove("user");
+        assert_eq!(normalize(userless), Err(Skip::Malformed));
+        assert!(
+            normalize(channel_message(
+                json!({"user": format!("W{}", "A".repeat(20))})
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn text_files_and_mentions_are_cut_to_slacks_limits() {
+        let long_user = format!("U{}", "A".repeat(21));
+        let files: Vec<Value> = (0..MAX_FILES + 5)
+            .map(|n| json!({"id": format!("F{n}"), "url_private": format!("https://files.slack.com/F{n}")}))
+            .collect();
+        let event = normalize(channel_message(json!({
+            "text": format!("<@{long_user}> <@U0BOT> {}", "é".repeat(MAX_TEXT_CHARS)),
+            "files": files,
+        })))
+        .unwrap();
+        assert_eq!(event.text.chars().count(), MAX_TEXT_CHARS);
+        assert!(
+            event
+                .text
+                .starts_with(&format!("<@{long_user}> <@U0BOT> é"))
+        );
+        assert_eq!(event.mentions, [UserId::from(BOT)]);
+        assert_eq!(event.files.len(), MAX_FILES);
+        assert_eq!(event.files[MAX_FILES - 1].id, format!("F{}", MAX_FILES - 1));
+    }
+
+    #[test]
+    fn a_files_fields_are_bounded() {
+        let url = "https://files.slack.com/F1";
+        let event = normalize(channel_message(json!({
+            "files": [
+                {"id": format!("F{}", "A".repeat(21)), "url_private": url},
+                {"id": "f0lower", "url_private": url},
+                {"id": "F2", "url_private": format!("{url}/{}", "x".repeat(MAX_FILE_URL_BYTES))},
+                {
+                    "id": "F3",
+                    "name": "ñ".repeat(MAX_FILE_NAME_CHARS + 1),
+                    "mimetype": "x".repeat(MAX_MIME_TYPE_BYTES + 1),
+                    "url_private": url,
+                },
+                {"id": "F4", "mimetype": "text/plain", "url_private": url},
+            ],
+        })))
+        .unwrap();
+        let ids: Vec<&str> = event.files.iter().map(|file| file.id.as_str()).collect();
+        assert_eq!(ids, ["F3", "F4"]);
+        assert_eq!(event.files[0].name, "ñ".repeat(MAX_FILE_NAME_CHARS));
+        assert_eq!(event.files[0].mime_type, None);
+        assert_eq!(event.files[1].mime_type.as_deref(), Some("text/plain"));
+    }
+
+    #[test]
+    fn an_ignored_subtype_is_carried_cut_short() {
+        let subtype = "x".repeat(10_000);
+        assert_eq!(
+            normalize(channel_message(json!({"subtype": subtype}))),
+            Err(Skip::Subtype("x".repeat(MAX_SUBTYPE_BYTES)))
         );
     }
 

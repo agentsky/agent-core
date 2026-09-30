@@ -40,7 +40,7 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
-use crate::normalize::{SlackFile, in_file};
+use crate::normalize::{SlackFile, in_files};
 
 /// The result type of the Web API client.
 pub type Result<T, E = SurfaceError> = std::result::Result<T, E>;
@@ -898,7 +898,7 @@ impl From<RawMessage> for Message {
             subtype: raw.subtype,
             text: raw.text.unwrap_or_default(),
             thread_ts: raw.thread_ts.map(Into::into),
-            files: raw.files.into_iter().filter_map(in_file).collect(),
+            files: in_files(raw.files),
         }
     }
 }

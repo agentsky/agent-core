@@ -269,10 +269,12 @@ fn signed(uri: &str, secret: &str, body: &str) -> Request<Body> {
     signed_at(uri, secret, body, fixtures::now())
 }
 
+/// `body`, made [`fresh`], signed at `timestamp`.
 fn signed_at(uri: &str, secret: &str, body: &str, timestamp: i64) -> Request<Body> {
+    let body = fresh(body);
     request(
         uri,
-        body,
+        &body,
         &fixtures::signed_headers(secret, timestamp, body.as_bytes()),
     )
 }
@@ -299,7 +301,7 @@ async fn a_validly_signed_mention_is_acked_and_normalized() {
     assert_eq!(event.sender.team.as_str(), TEAM);
     assert_eq!(event.conv.conversation.as_str(), fixtures::CHANNEL);
     assert_eq!(event.conv_kind, ConvKind::Channel);
-    assert_eq!(event.message.id.as_str(), "1727697600.000100");
+    assert_eq!(event.message.id.as_str(), fresh("1727697600.000100"));
     let mentions: Vec<&str> = event.mentions.iter().map(UserId::as_str).collect();
     assert_eq!(mentions, [BOT_USER, fixtures::OTHER_USER]);
     assert!(!event.sender_is_bot);
@@ -646,19 +648,19 @@ async fn a_retried_event_is_delivered_once() {
         .send(signed(&uri, AGENT_SECRET, fixtures::MESSAGE_MENTION))
         .await;
     assert_eq!(status, StatusCode::OK);
-    let body = fixtures::MESSAGE_MENTION;
+    let body = fresh(fixtures::MESSAGE_MENTION);
     let mut headers =
         fixtures::signed_headers(AGENT_SECRET, fixtures::now(), body.as_bytes()).to_vec();
     headers.push(("x-slack-retry-num", "1".to_owned()));
     headers.push(("x-slack-retry-reason", "http_timeout".to_owned()));
-    let (status, _) = harness.send(request(&uri, body, &headers)).await;
+    let (status, _) = harness.send(request(&uri, &body, &headers)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(harness.message().await.event_id, "Ev0MENTION1");
     harness.assert_nothing_delivered().await;
     assert!(harness.recorded(&format!("slack:{}", agent())).is_empty());
     let messages = harness.recorded(&format!("slack:{}:message", agent()));
     assert!(
-        messages.contains(&format!("{}:1727697600.000100", fixtures::CHANNEL)),
+        messages.contains(&fresh(&format!("{}:1727697600.000100", fixtures::CHANNEL))),
         "{messages:?}"
     );
 }
@@ -734,11 +736,11 @@ async fn each_message_fixture_normalizes_as_the_plan_says() {
     assert_eq!(reply.conv_kind, ConvKind::Channel);
     assert_eq!(
         reply.thread_root.as_ref().map(|root| root.as_str()),
-        Some("1727697650.000150")
+        Some(fresh("1727697650.000150").as_str())
     );
     assert_eq!(
         reply.reply_to.as_ref().map(|to| to.id.as_str()),
-        Some("1727697650.000150")
+        Some(fresh("1727697650.000150").as_str())
     );
     assert!(reply.mentions.is_empty());
 
@@ -746,9 +748,9 @@ async fn each_message_fixture_normalizes_as_the_plan_says() {
     let broadcast = harness.message().await;
     assert_eq!(
         broadcast.thread_root.as_ref().map(|root| root.as_str()),
-        Some("1727697650.000150")
+        Some(fresh("1727697650.000150").as_str())
     );
-    assert_eq!(broadcast.message.id.as_str(), "1727697800.000400");
+    assert_eq!(broadcast.message.id.as_str(), fresh("1727697800.000400"));
 
     harness.send(send(fixtures::MESSAGE_IM)).await;
     let dm = harness.message().await;
@@ -1376,4 +1378,182 @@ async fn ids_not_shaped_like_slacks_are_refused_and_nothing_is_written() {
         StatusCode::OK,
         "only a message's channel is a key, so only a message's is checked"
     );
+}
+
+/// `body` with every `ts`-shaped value (10 digits of seconds and a dot)
+/// from 2024 moved by one offset, so that the earliest fixture's is a
+/// minute old: Slack's fixtures date from 2024, and an agent's app ignores
+/// a message older than the confirmation window. Later values are left as
+/// they are, so a fresh body stays as it is.
+fn fresh(body: &str) -> String {
+    static OFFSET: std::sync::LazyLock<i64> =
+        std::sync::LazyLock::new(|| fixtures::now() - 60 - 1_727_697_600);
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let starts = !at
+            .checked_sub(1)
+            .is_some_and(|before| bytes[before].is_ascii_digit());
+        let seconds = bytes.get(at..at + 10);
+        if starts
+            && seconds.is_some_and(|digits| digits.iter().all(u8::is_ascii_digit))
+            && bytes.get(at + 10) == Some(&b'.')
+        {
+            let seconds: i64 = body[at..at + 10].parse().unwrap();
+            let moved = if seconds < 1_735_689_600 {
+                seconds + *OFFSET
+            } else {
+                seconds
+            };
+            out.push_str(&moved.to_string());
+            at += 10;
+            continue;
+        }
+        let ch = body[at..].chars().next().unwrap();
+        out.push(ch);
+        at += ch.len_utf8();
+    }
+    out
+}
+
+/// A fresh DM to an agent's app, changed by `edit`.
+fn fresh_dm(event_id: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String {
+    edited(
+        &fresh(&fixtures::with_event_id(fixtures::MESSAGE_IM, event_id)),
+        edit,
+    )
+}
+
+#[tokio::test]
+async fn a_sender_not_shaped_like_slacks_is_refused_and_nothing_is_written() {
+    let mut harness = Harness::start();
+    let huge = "A".repeat(900_000);
+    let mut bodies = Vec::new();
+    for bot_id in [
+        format!("B{huge}"),
+        format!("B{}", "A".repeat(21)),
+        "B".to_owned(),
+        "b0lower".to_owned(),
+        "U0HUMAN01".to_owned(),
+    ] {
+        bodies.push(fresh_dm("Ev0BADBOT", |body| {
+            let event = body["event"].as_object_mut().unwrap();
+            event.remove("user");
+            event.insert("bot_id".into(), bot_id.clone().into());
+        }));
+        bodies.push(fresh_dm("Ev0BADBOT", |body| {
+            body["event"]["bot_id"] = bot_id.into();
+        }));
+    }
+    for user in [
+        format!("U{huge}"),
+        format!("W{}", "A".repeat(21)),
+        "U".to_owned(),
+        "u0lower".to_owned(),
+        "B0LEGACY1".to_owned(),
+    ] {
+        bodies.push(fresh_dm("Ev0BADUSER", |body| {
+            body["event"]["user"] = user.into();
+        }));
+    }
+    for body in &bodies {
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{:.200}", body);
+    }
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+
+    let bot = fresh_dm("Ev0GOODBOT", |body| {
+        let event = body["event"].as_object_mut().unwrap();
+        event.remove("user");
+        event.insert("bot_id".into(), "B0LEGACY1".into());
+    });
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &bot))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.message().await.sender.user.as_str(), "B0LEGACY1");
+}
+
+#[tokio::test]
+async fn a_message_keeps_ten_files_40000_characters_and_short_mention_ids() {
+    let mut harness = Harness::start();
+    let long_user = format!("U{}", "A".repeat(21));
+    let body = fresh_dm("Ev0BIG", |body| {
+        let files: Vec<serde_json::Value> = (0..5_000)
+            .map(|n| {
+                serde_json::json!({
+                    "id": format!("F0FILE{n}"),
+                    "url_private": format!("https://files.slack.com/F0FILE{n}"),
+                })
+            })
+            .collect();
+        body["event"]["files"] = files.into();
+        body["event"]["subtype"] = "file_share".into();
+        body["event"]["text"] = format!("<@{long_user}> <@U0SHORT1> {}", "é".repeat(50_000)).into();
+    });
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &body))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let event = harness.message().await;
+    assert_eq!(event.files.len(), 10);
+    assert_eq!(event.files[9].id, "F0FILE9");
+    assert_eq!(event.text.chars().count(), 40_000);
+    assert_eq!(event.mentions, [UserId::from("U0SHORT1")]);
+}
+
+#[tokio::test]
+async fn an_agents_apps_other_requests_are_acked_and_write_nothing() {
+    let mut harness = Harness::start();
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, fixtures::USER_CHANGE))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = harness
+        .send(signed(
+            &path(agent(), "commands"),
+            AGENT_SECRET,
+            fixtures::SLASH_COMMAND,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = harness
+        .send(signed(
+            &path(agent(), "interactivity"),
+            AGENT_SECRET,
+            &fixtures::interactivity_body(fixtures::BLOCK_ACTIONS),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+}
+
+#[tokio::test]
+async fn an_agents_message_older_than_the_window_is_acked_and_writes_nothing() {
+    let mut harness = Harness::start();
+    let stale = format!("{}.000100", fixtures::now() - 16 * 60);
+    let body = fresh_dm("Ev0STALE", |body| {
+        body["event"]["ts"] = stale.into();
+    });
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &body))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+
+    let recent = format!("{}.000100", fixtures::now() - 10 * 60);
+    let body = fresh_dm("Ev0RECENT", |body| {
+        body["event"]["ts"] = recent.into();
+    });
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &body))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(harness.message().await.event_id, "Ev0RECENT");
 }

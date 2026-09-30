@@ -1269,3 +1269,28 @@ async fn a_channel_id_slack_spells_otherwise_is_refused() {
     ));
     assert!(lookups(&server, "conversations.history").await.is_empty());
 }
+
+#[tokio::test]
+async fn a_bot_id_not_shaped_like_slacks_is_never_looked_up() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0MADEUP", "user_id": "U0MADEUP"}})),
+    )
+    .await;
+    for bot_id in [
+        format!("B{}", "A".repeat(900_000)),
+        format!("B{}", "A".repeat(21)),
+        "B".to_owned(),
+        "b0lower".to_owned(),
+        "U0HUMAN01".to_owned(),
+    ] {
+        let mut event = bot_event();
+        event.sender.user = bot_id.as_str().into();
+        let before = event.clone();
+        surface.fill_bot_sender(&mut event).await.unwrap();
+        assert_eq!(event, before);
+    }
+    assert!(lookups(&server, "bots.info").await.is_empty());
+}

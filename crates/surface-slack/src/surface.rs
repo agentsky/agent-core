@@ -26,8 +26,10 @@ const MAX_PAGES: usize = 1000;
 /// How long before its event arrived a message may have been posted and
 /// still be read back by [`Surface::confirm`]. Slack's last retry of a
 /// delivery comes about five minutes after the first; deduplication
-/// forgets an event after seven days, and a message older than the bot's
-/// membership never had one, so without it either could be replayed.
+/// forgets a message after [`DEDUP_RETENTION`](crate::ingress::DEDUP_RETENTION),
+/// and a message older than the bot's membership never had one, so without
+/// it either could be replayed. The ingress acknowledges and drops an
+/// agent's message this old before it records it.
 pub const CONFIRM_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// What [`SlackSurface::caps`] returns: a 3,000-character message limit
@@ -439,10 +441,8 @@ impl Surface for SlackSurface {
     /// would drop.
     async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
         let channel = self.channel(&event.conv)?;
-        let fresh = ts_time(event.message.id.as_str())
-            .is_some_and(|sent| sent >= event.received_at - CONFIRM_WINDOW);
-        if !fresh {
-            tracing::warn!(binding = %event.binding, message = %event.message.id, "a message older than the confirmation window; not reading it back");
+        if !within_window(event.message.id.as_str(), event.received_at) {
+            tracing::debug!(binding = %event.binding, message = %event.message.id, "a message older than the confirmation window; not reading it back");
             return Ok(None);
         }
         let api = self.api.without_waiting();
@@ -512,6 +512,12 @@ fn ts_parts(ts: &str) -> Option<(i64, u32)> {
     }
     let micros = format!("{fraction:0<6}").parse().ok()?;
     Some((seconds.parse().ok()?, micros))
+}
+
+/// Whether a message with this `ts` was posted at most [`CONFIRM_WINDOW`]
+/// before `received_at`, when its event arrived.
+pub(crate) fn within_window(ts: &str, received_at: OffsetDateTime) -> bool {
+    ts_time(ts).is_some_and(|sent| sent >= received_at - CONFIRM_WINDOW)
 }
 
 /// When a message with this `ts` was sent.

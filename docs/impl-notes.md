@@ -5478,8 +5478,10 @@ The confirmation window, `CONFIRM_WINDOW` (15 minutes), refuses without a
 lookup a message whose `ts` is older than that when its event arrived.
 Slack retries a failed delivery three times, the last about five minutes
 after the first, so a real event is always well inside it. Deduplication
-keeps an event for seven days, and a message older than the bot's
+keeps a message for an hour, and a message older than the bot's
 membership never had one, so without the window either could be replayed.
+The ingress now applies the window too, before it records anything (see
+"What one owner can make agentd keep").
 
 A lookup that fails without saying anything about the message (a Slack
 5xx or an unreachable Slack, `SurfaceError::Transport`, or a rate limit,
@@ -5599,9 +5601,10 @@ Costs and limits:
   Deduplication is per binding, so this reaches only the owner's own
   agent, never another agent's delivery of the same message.
 - `TeamDirectory` remembers which bot ids have no bot user apart from
-  those that have one, each set bounded at 10,000. Made-up bot ids are
-  remembered as having none, so they only churn that set, never pushing
-  out a real bot's user, which would cost other agents' `bots.info` calls.
+  those that have one, each set bounded at 10,000 ids shaped like Slack's.
+  Made-up bot ids are remembered as having none, so they only churn that
+  set, never pushing out a real bot's user, which would cost other agents'
+  `bots.info` calls.
 
 The busy line, which a message past the queue bounds gets without being
 confirmed, is posted in a task of its own, among the pipeline's tasks so a
@@ -5672,8 +5675,8 @@ above.
   events an hour for one app. Past it, 503, before the deduplication
   write; a request refused for its places takes no token. The bucket is in
   memory, since a restart only gives each app one more burst; the manager
-  app has none. So one app adds at most 8 rows a second of a few dozen
-  bytes each, and one owner at most that for each of their agents.
+  app has none. One owner's agents' apps together have a second bucket of
+  twice that (see "What one owner can make agentd keep").
 - One owner's agents' apps together have `MAX_IN_FLIGHT_PER_OWNER` (64)
   places, twice one app's, rather than 32 for each of up to
   `agents.max_per_owner` agents: with its default of 10, one owner held
@@ -5693,7 +5696,7 @@ above.
   per binding too, so one app's flood hides no other's refusals): the
   ingress's 400s and `app_rate_limited` notices, the pipeline's "too many
   messages waiting" and "too many notices being posted", and the lanes'
-  "couldn't look a bot sender up".
+  "couldn't look a bot sender up". The next section adds the rest.
 - The pipeline reaps finished tasks when it spawns a notice, as it does
   when it spawns a lane; a flood of notices on an otherwise quiet
   pipeline kept every finished one until the next lane. A lane in
@@ -5720,6 +5723,97 @@ change. So did the ingress tests that an id not shaped like Slack's
 (among them 900 KB ones) gets 400 with nothing recorded, and that an
 agent's burst past its bucket gets 503 while another agent's app and the
 manager's are answered.
+
+### What one owner can make agentd keep
+
+**Issue.** A sixth review found no way past the places, buckets or shapes,
+but found what one owner could still make agentd hold in memory, in its
+logs and on disk. A signed DM with no `user` and a 900 KB `bot_id` got 200:
+`fill_bot_sender` called `bots.info` with it on the agent's token, and a
+`bot_not_found` was cached in the workspace's shared set of bots without a
+user, 10,000 ids but no bound in bytes, about 10 GB. `files` had no bound:
+a 999 KB DM with 34,000 files became a 9.9 MB `InboundEvent`, and one
+owner's apps may have 64 in flight. A body that passed the handler's
+`IgnoredAny` check but not the queue's full parse (`"\ud800"`, `1e400`,
+deep nesting) logged an unthrottled warning, and so did the pipeline's
+warnings a forged message reaches when confirmed, Slack's retry header
+(which isn't signed) at info, and a failed notice. Agents' apps' other
+events, commands and interactions, which agentd drops, still wrote a
+deduplication row each, and every row was kept seven days, 8 a second for
+each of an owner's agents. The unsigned challenge probe parsed a
+`challenge` of any JSON, so a megabyte of `[0,0,…]` took 16 to 32 MB before
+verification.
+
+**Solution.** One place bounds what is kept, and the ingress refuses what
+it would refuse, before the ack:
+
+- `normalize` holds every shape check (`is_user_id`, `is_bot_id`,
+  `is_file_id`, `is_channel_id`, `is_team_id`, `is_event_id`, `is_ts`),
+  each at most 20 characters after its prefix (32 for an `event_id`), and
+  the ingress's pre-parse uses them. A message whose `channel`, `ts`,
+  `thread_ts`, `user` or `bot_id` isn't shaped like Slack's is
+  `Skip::Malformed`, whether it came as an event or was read back; the
+  ingress answers such an event with 400 before the ack. Mentions are
+  `U…`/`W…` ids of at most 21 characters, from `text` and `blocks` alike.
+- A kept message is cut to Slack's limits: `text` to its first 40,000
+  characters (`MAX_TEXT_CHARS`), files to the first 10 the bot can
+  download (`MAX_FILES`), each with an `F…` id, a URL of at most 4 KB, a
+  name cut to 255 characters and a MIME type of at most 255 bytes, and
+  mentions to 100 as before. So an `InboundEvent` is at most about 220 KB,
+  whatever the body held, and the 64 an owner's apps may have in flight
+  at most about 14 MB. Files in history read back are cut the same way.
+  An ignored subtype is carried, and logged, cut to 64 bytes.
+- `TeamDirectory::bot_user` answers `None` for an id not shaped like a
+  bot id, without calling `bots.info` or caching it, however it is
+  reached (`fill_bot_sender`, `confirm` and history), so its caches hold
+  only short ids.
+- The ingress acknowledges and drops, without a deduplication row or a
+  place, what an agent's app doesn't need: its events other than
+  messages, its slash commands, its interactions, and a message whose
+  `ts` is more than `CONFIRM_WINDOW` before it arrived, which `confirm`
+  refuses anyway (`surface::within_window`, shared by both). The manager
+  app's requests are handled as before.
+- Slack's deduplication keys are kept an hour (`DEDUP_RETENTION`), not
+  seven days: longer than Slack retries (about five minutes), than a
+  signature is accepted (five minutes) and than the confirmation window
+  (15 minutes), so a replay after it expires is refused by the window for
+  an agent and by the signature for the manager. `processed_events` gains
+  an `expires_at` column, set from the retention each caller passes to
+  `mark_event_processed`, which the sweeper deletes by; Rocket.Chat keeps
+  its week (`PROCESSED_EVENT_RETENTION`). The column, its backfill for
+  existing rows and its index replacing `seen_at`'s are in T31's own
+  migration.
+- One owner's agents' apps together have a token bucket too, `OWNER_BURST`
+  (200) then `OWNER_REQUESTS_PER_SECOND` (16), twice one app's like their
+  places. So one owner adds at most 16 rows a second, each a few dozen
+  bytes and kept an hour: about 60,000 rows, some 15 MB with the indexes,
+  where before one owner's ten agents could add 80 a second for a week.
+  A bucket that is full while its app or owner has nothing in flight is
+  forgotten, being the same as none. The owner is no longer optional for
+  an agent's seat: an agent's app whose lookup names no owner (the store
+  always names one) gets 503 rather than be counted apart.
+- Every log line the ingress writes for what a forger can repeat goes
+  through one per-binding throttle, keyed by kind: refusals, including
+  400s for a malformed signed body, which take no token since they write
+  nothing; `app_rate_limited`; answered challenges, now counted per
+  binding rather than all together; Slack's retry headers; and a queued
+  body that no longer parses, which only a signed, crafted body can be.
+  The pipeline's warnings for a message confirming dropped or couldn't
+  check (older than the window, not at Slack, routing differently,
+  refused, or Slack unreachable) share a new `Flood::Unconfirmed` kind, and
+  a notice that fails to post shares `Flood::Notice`; `confirm`'s own line
+  for a message older than the window is at debug level.
+- The challenge probe reads `type` and `challenge` as strings only
+  (`Cow<str>`), in two parses that skip everything else, so a non-string
+  challenge is refused as malformed without being built, and the
+  interactivity check reads the payload with `IgnoredAny` once it starts
+  with `{`, allocating no keys.
+- The pipeline reaps finished tasks through one helper that logs a task
+  that panicked, as `drain` does, where it used to drop the error.
+
+The ingress's burst test still runs on the clock, with bounds that allow
+for the refill while it runs; the buckets' own tests take the time as an
+argument, and one checks an owner's bucket at a fixed time.
 
 ### Bots don't join channels by posting
 

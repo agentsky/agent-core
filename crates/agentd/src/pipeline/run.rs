@@ -204,13 +204,16 @@ struct Inner {
     floods: Throttle<(AgentId, Flood)>,
 }
 
-/// What an agent's flood makes the pipeline refuse, each warned about
-/// apart.
+/// What an agent's flood makes the pipeline refuse or drop, each warned
+/// about apart: a message not taken, a notice not posted or failed, and a
+/// message that confirming dropped or couldn't check, which is what a
+/// forged event reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Flood {
     BotMessage,
     Message,
     Notice,
+    Unconfirmed,
 }
 
 /// One agent in one thread: its messages are answered in arrival order.
@@ -306,6 +309,16 @@ impl Drop for WorkingGuard {
         drop(working);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move { indicator.clear().await });
+        }
+    }
+}
+
+/// Takes the pipeline's finished tasks off `tasks`, logging any that
+/// panicked, as [`Pipeline::drain`] does.
+fn reap(tasks: &mut JoinSet<()>) {
+    while let Some(joined) = tasks.try_join_next() {
+        if let Err(err) = joined {
+            tracing::error!(error = %err, "a pipeline task failed");
         }
     }
 }
@@ -522,7 +535,7 @@ impl Pipeline {
             lock(&self.inner.lanes).remove(&key);
             return true;
         }
-        while tasks.try_join_next().is_some() {}
+        reap(&mut tasks);
         tasks.spawn(self.clone().lane(key, first));
         true
     }
@@ -587,7 +600,7 @@ impl Pipeline {
         if self.is_closed() {
             return;
         }
-        while tasks.try_join_next().is_some() {}
+        reap(&mut tasks);
         let pipeline = self.clone();
         let event = Arc::clone(event);
         tasks.spawn(async move {
@@ -615,8 +628,10 @@ impl Pipeline {
             say(surface.as_ref(), &reply_target(event, caps), &text).await?;
             Ok::<_, PipelineError>(())
         };
-        if let Err(err) = told.await {
-            tracing::warn!(%agent, message = %event.message.id, ?notice, error = %err, "couldn't post a notice");
+        if let Err(err) = told.await
+            && let Some(quiet) = self.flooded(agent, Flood::Notice)
+        {
+            tracing::warn!(%agent, message = %event.message.id, ?notice, error = %err, failed_since_last_warning = quiet, "couldn't post a notice");
         }
     }
 
@@ -696,7 +711,9 @@ impl Pipeline {
             return;
         };
         if confirmed != decision {
-            tracing::warn!(%agent, message = %event.message.id, "the platform's copy of a message routes differently from its event; dropped it");
+            if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message routes differently from its event; dropped it");
+            }
             return;
         }
         self.act(&copy, agent, caps, confirmed).await;
@@ -734,11 +751,15 @@ impl Pipeline {
                 Some(copy)
             }
             Ok(_) => {
-                tracing::warn!(%agent, message = %event.message.id, "the platform doesn't have this message as it arrived; dropped it");
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform doesn't have this message as it arrived; dropped it");
+                }
                 None
             }
             Err(err @ (SurfaceError::RateLimited { .. } | SurfaceError::Transport(_))) => {
-                tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't confirm a message with the platform; asking to try again");
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, unconfirmed_since_last_warning = quiet, "couldn't confirm a message with the platform; asking to try again");
+                }
                 self.notice(
                     &job.event,
                     agent,
@@ -750,7 +771,9 @@ impl Pipeline {
                 None
             }
             Err(err) => {
-                tracing::warn!(%agent, message = %event.message.id, error = %err, "the platform refused to confirm a message; dropped it");
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, unconfirmed_since_last_warning = quiet, "the platform refused to confirm a message; dropped it");
+                }
                 None
             }
         }

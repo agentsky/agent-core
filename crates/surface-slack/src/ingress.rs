@@ -36,29 +36,37 @@
 //!    probes gets 401.
 //! 5. 400 if a verified body can't be parsed, or names an id that isn't
 //!    shaped like Slack's (see [Shapes](#shapes)).
-//! 6. 503 if the binding has too many requests in flight: acknowledged, and
+//! 6. An empty 200, and nothing more, for what an agent's app doesn't need
+//!    (see [Agents' apps](#agents-apps)).
+//! 7. 503 if the binding has too many requests in flight: acknowledged, and
 //!    not yet handed on (see [`InFlight`]). Each agent's app may have
 //!    [`MAX_IN_FLIGHT_PER_AGENT`] at once, the apps of one owner's agents
 //!    together [`MAX_IN_FLIGHT_PER_OWNER`], and agents' apps together the
 //!    `capacity` given to [`ingress`]; the manager app has a `capacity` of
 //!    its own, so no agent's traffic can take its places, and one agent's
 //!    can't take another's. 503 too if an agent's app sends faster than
-//!    Slack delivers to one app: [`AGENT_BURST`] at once, then
-//!    [`AGENT_REQUESTS_PER_SECOND`]. Slack retries events, and the forger
-//!    of a flood is its app's owner, whose own app is the one refused.
-//! 7. An empty 200 as soon as the request is on the queue. Slack retries
+//!    Slack delivers to one app, [`AGENT_BURST`] at once, then
+//!    [`AGENT_REQUESTS_PER_SECOND`], or one owner's agents' apps together
+//!    faster than [`OWNER_BURST`], then [`OWNER_REQUESTS_PER_SECOND`], and
+//!    if an agent's app has no owner. Slack retries events, and the forger
+//!    of a flood is its app's owner, whose own apps are the ones refused.
+//! 8. An empty 200 as soon as the request is on the queue. Slack retries
 //!    an event that got 503, but not a slash command or an interaction:
 //!    its user sees Slack's error and can try again. The handler never
 //!    waits for the queue. Slash commands and interactivity reply later
 //!    through their `response_url`.
 //!
 //! Anyone can send requests that are refused before verification (steps 2
-//! to 4) or challenges, so at most one refusal per binding per
-//! [`WARNING_INTERVAL`] is logged as a warning and one challenge as info;
-//! the rest are logged at debug level. A request refused at step 5 or 6,
-//! and Slack's `app_rate_limited` notice, are logged the same way, since
-//! an agent's owner can sign as many as they like; each binding's are
-//! counted apart, so one app's flood hides no other's.
+//! to 4) or challenges, and an agent's owner can sign as many requests as
+//! they like, so the ingress logs each of these at most once per binding
+//! per [`WARNING_INTERVAL`] as a warning (as info for an answered
+//! challenge and a delivery Slack says it retried), and the rest at debug
+//! level, the next warning saying how many there were: a refusal at any
+//! step, Slack's `app_rate_limited` notice, a retried delivery, an
+//! answered challenge, and a queued body that no longer parses. Each
+//! binding's are counted apart, so one app's flood hides no other's. A
+//! request refused with 400 takes none of the bucket's tokens, since it
+//! writes nothing and its log is throttled like the rest.
 //!
 //! The queue holds each request's body as it arrived, at most
 //! [`MAX_BODY_BYTES`], so what waits is bounded in bytes, not only in
@@ -70,30 +78,51 @@
 //!   unaddressed channel messages every agent app receives cost no store
 //!   write. A kept message is deduplicated by `<channel>:<ts>`, under
 //!   `slack:<binding>:message`, which drops Slack's retries and a message
-//!   that reached the same app twice with different event ids.
+//!   that reached the same app twice with different event ids. What it is
+//!   handed on with is bounded too, at most about 220 KB (see
+//!   [`normalize`]'s Bounds), so what an agent's messages hold after the
+//!   queue is bounded in bytes as well. An agent's app's other requests
+//!   never reach the queue (see [Agents' apps](#agents-apps)); the manager
+//!   app's, which only its operators can sign, are handed on as they came.
 //! - Other events by `event_id`, under the source `slack:<binding>`, which
 //!   drops Slack's retries.
 //! - Slash commands and interactivity by their signature, under
 //!   `slack:<binding>:request`. Slack doesn't retry them, so a second copy is
 //!   a replay inside the five-minute window.
 //!
+//! Each key is kept for [`DEDUP_RETENTION`].
+//!
 //! # Shapes
 //!
 //! An agent's owner can sign any body, and each event the queue keeps is a
-//! deduplication row for seven days, so the ids that make up its key must
-//! be shaped like Slack's. A body whose id isn't gets 400 and writes
-//! nothing:
+//! deduplication row, so the ids that make up its key must be shaped like
+//! Slack's, and so must the sender a message is kept with. A body whose id
+//! isn't gets 400 and writes nothing. The checks are
+//! [`normalize`]'s, which checks the same ids again when it keeps a
+//! message:
 //!
 //! - `event_id`: `Ev` and 1 to 32 uppercase letters or digits.
 //! - `team_id`, when there is one: `T` (or `E`, an Enterprise Grid
 //!   organization) and 1 to 20 uppercase letters or digits.
 //! - A `message` event's `channel`: `C`, `D` or `G` and 1 to 20 uppercase
 //!   letters or digits; its `ts` and `thread_ts`: 10 digits, a dot and 6
-//!   digits.
+//!   digits; its `user`: `U` or `W` and 1 to 20 uppercase letters or
+//!   digits; its `bot_id`: `B` and as many.
 //!
 //! Slash commands and interactions are keyed by their signature, whose
 //! shape verification fixes.
+//!
+//! # Agents' apps
+//!
+//! An agent's app is only a way to reach the agent, so of what it is sent
+//! only `message` events are queued. Its other events, its slash commands
+//! and its interactions get an empty 200 and are dropped, and so is a
+//! message whose `ts` is more than
+//! [`CONFIRM_WINDOW`](crate::surface::CONFIRM_WINDOW) before it arrived,
+//! which [`Surface::confirm`](core_types::Surface::confirm) would refuse.
+//! None of them writes a deduplication row or takes a place.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -119,7 +148,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
-use crate::normalize;
+use crate::normalize::{
+    self, is_bot_id, is_channel_id, is_event_id, is_team_id, is_ts, is_user_id,
+};
+use crate::surface::within_window;
 use crate::verify::{self, SIGNATURE_HEADER};
 
 /// The largest request body accepted, in bytes. Slack's payloads are a few
@@ -151,6 +183,19 @@ pub const AGENT_BURST: u32 = 100;
 /// [`AGENT_BURST`] is used up: about Slack's own ceiling of 30,000 events
 /// an hour for one app. Past it, the app's requests get 503.
 pub const AGENT_REQUESTS_PER_SECOND: u32 = 8;
+/// How many requests the apps of one owner's agents may send together at
+/// once before [`OWNER_REQUESTS_PER_SECOND`] applies, however many agents
+/// they have.
+pub const OWNER_BURST: u32 = 2 * AGENT_BURST;
+/// How many requests a second the apps of one owner's agents may send
+/// together once their [`OWNER_BURST`] is used up.
+pub const OWNER_REQUESTS_PER_SECOND: u32 = 2 * AGENT_REQUESTS_PER_SECOND;
+/// How long a deduplication key must be remembered: longer than Slack
+/// retries a delivery (the last retry comes about five minutes after the
+/// first), than a signature is accepted (five minutes), and than the
+/// [`CONFIRM_WINDOW`](crate::surface::CONFIRM_WINDOW) within which an
+/// agent's message is kept.
+pub const DEDUP_RETENTION: time::Duration = time::Duration::hours(1);
 /// The header in which Slack numbers a retried delivery.
 pub const RETRY_NUM_HEADER: &str = "x-slack-retry-num";
 /// The header in which Slack says why it retried.
@@ -219,8 +264,9 @@ pub struct SlackApp {
     /// mention it.
     pub bot_user: Option<UserId>,
     /// The owner of the agent whose app this is, whose agents' apps
-    /// together have [`MAX_IN_FLIGHT_PER_OWNER`] places. `None` for the
-    /// manager app.
+    /// together have [`MAX_IN_FLIGHT_PER_OWNER`] places and one bucket.
+    /// `None` for the manager app; an agent's app without one gets 503
+    /// rather than be counted apart from its owner's.
     pub owner: Option<MemberId>,
 }
 
@@ -244,8 +290,8 @@ pub trait SigningSecrets: Send + Sync {
 /// with the store's `processed_events`.
 #[async_trait::async_trait]
 pub trait Dedup: Send + Sync {
-    /// Records `key` under `source`. Returns true the first time, and false
-    /// when it was already recorded.
+    /// Records `key` under `source` for at least [`DEDUP_RETENTION`].
+    /// Returns true the first time, and false when it was already recorded.
     ///
     /// # Errors
     ///
@@ -263,6 +309,7 @@ pub trait Dedup: Send + Sync {
 /// [`Queue::run`] returns once it has handled what was queued.
 pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Queue) {
     let (sender, receiver) = mpsc::unbounded_channel();
+    let notes = Arc::new(Throttle::new(WARNING_INTERVAL));
     let state = Ingress {
         secrets,
         queue: sender,
@@ -270,16 +317,34 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
             capacity,
             taken: Mutex::default(),
         }),
-        refusals: Arc::new(Throttle::new(WARNING_INTERVAL)),
-        rate_limits: Arc::new(Throttle::new(WARNING_INTERVAL)),
-        challenges: Arc::new(Throttle::new(WARNING_INTERVAL)),
+        notes: Arc::clone(&notes),
     };
     let router = Router::new()
         .route("/slack/b/{binding}/events", post(events))
         .route("/slack/b/{binding}/interactivity", post(interactivity))
         .route("/slack/b/{binding}/commands", post(commands))
         .with_state(state);
-    (router, Queue { receiver })
+    (router, Queue { receiver, notes })
+}
+
+/// What the ingress logs at most once per binding per
+/// [`WARNING_INTERVAL`], each kind counted apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Note {
+    Refused,
+    RateLimited,
+    Challenge,
+    Retry,
+    Reparsed,
+}
+
+/// The throttle of every [`Note`].
+type Notes = Throttle<(BindingRef, Note)>;
+
+/// Whether `binding`'s `note` is due as a warning (or info): `Some` of how
+/// many went quiet since the last.
+fn note(notes: &Notes, binding: BindingRef, note: Note) -> Option<u64> {
+    notes.record((binding, note), Instant::now())
 }
 
 #[derive(Clone)]
@@ -287,14 +352,11 @@ struct Ingress {
     secrets: Arc<dyn SigningSecrets>,
     queue: mpsc::UnboundedSender<Queued>,
     places: Arc<Places>,
-    refusals: Arc<Throttle<BindingRef>>,
-    rate_limits: Arc<Throttle<BindingRef>>,
-    challenges: Arc<Throttle>,
+    notes: Arc<Notes>,
 }
 
 impl Ingress {
-    /// Logs a request refused before verification, for a body that doesn't
-    /// parse, or for having too many in flight or coming too fast.
+    /// Logs a refused request.
     fn refused(
         &self,
         binding: BindingRef,
@@ -303,7 +365,7 @@ impl Ingress {
         reason: &dyn fmt::Display,
     ) {
         let (kind, status) = (kind.as_str(), status.as_u16());
-        match self.refusals.record(binding, Instant::now()) {
+        match note(&self.notes, binding, Note::Refused) {
             Some(quiet) => tracing::warn!(
                 %binding,
                 kind,
@@ -318,7 +380,7 @@ impl Ingress {
 
     /// Logs Slack's notice that it is rate limiting `binding`'s events.
     fn rate_limited(&self, binding: BindingRef, minute_rate_limited: Option<i64>) {
-        match self.rate_limits.record(binding, Instant::now()) {
+        match note(&self.notes, binding, Note::RateLimited) {
             Some(quiet) => tracing::warn!(
                 %binding,
                 minute_rate_limited,
@@ -333,13 +395,45 @@ impl Ingress {
 
     /// Logs an answered `url_verification` challenge.
     fn challenged(&self, binding: BindingRef) {
-        match self.challenges.record((), Instant::now()) {
+        match note(&self.notes, binding, Note::Challenge) {
             Some(quiet) => tracing::info!(
                 %binding,
                 answered_since_last_info = quiet,
                 "answered Slack's url_verification challenge"
             ),
             None => tracing::debug!(%binding, "answered Slack's url_verification challenge"),
+        }
+    }
+
+    /// Logs Slack's retry headers, which say that an earlier delivery wasn't
+    /// acknowledged in time. They aren't signed, so they are only logged.
+    fn retried(&self, binding: BindingRef, kind: Kind, headers: &HeaderMap) {
+        let Some(retry_num) = headers.get(RETRY_NUM_HEADER) else {
+            return;
+        };
+        let retry_num = retry_num
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok());
+        let retry_reason = headers
+            .get(RETRY_REASON_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|reason| {
+                reason.len() <= 64 && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            });
+        let kind = kind.as_str();
+        match note(&self.notes, binding, Note::Retry) {
+            Some(quiet) => tracing::info!(
+                %binding,
+                kind,
+                retry_num,
+                retry_reason,
+                retried_since_last_info = quiet,
+                "Slack retried a delivery"
+            ),
+            None => {
+                tracing::debug!(%binding, kind, retry_num, retry_reason, "Slack retried a delivery")
+            }
         }
     }
 }
@@ -364,7 +458,7 @@ impl InFlight {
 impl fmt::Debug for InFlight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            Some((seat, _)) => f.debug_tuple("InFlight").field(&seat.binding).finish(),
+            Some((seat, _)) => f.debug_tuple("InFlight").field(&seat.binding()).finish(),
             None => f.write_str("InFlight(untracked)"),
         }
     }
@@ -373,16 +467,36 @@ impl fmt::Debug for InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         if let Some((seat, places)) = self.0.take() {
-            places.give_back(seat);
+            places.give_back(seat, Instant::now());
         }
     }
 }
 
-/// Whose place an [`InFlight`] holds.
+/// Whose place an [`InFlight`] holds: the manager app's, or an agent's app
+/// and its owner's.
 #[derive(Debug, Clone, Copy)]
-struct Seat {
-    binding: BindingRef,
-    owner: Option<MemberId>,
+enum Seat {
+    Manager,
+    Agent { binding: BindingId, owner: MemberId },
+}
+
+impl Seat {
+    /// The seat of a request to `binding`, whose app's owner is `owner`, or
+    /// `None` for an agent's app without one.
+    fn of(binding: BindingRef, owner: Option<MemberId>) -> Option<Self> {
+        match (binding, owner) {
+            (BindingRef::Manager, _) => Some(Self::Manager),
+            (BindingRef::Agent(binding), Some(owner)) => Some(Self::Agent { binding, owner }),
+            (BindingRef::Agent(_), None) => None,
+        }
+    }
+
+    fn binding(self) -> BindingRef {
+        match self {
+            Self::Manager => BindingRef::Manager,
+            Self::Agent { binding, .. } => BindingRef::Agent(binding),
+        }
+    }
 }
 
 /// Why a request got no place.
@@ -392,14 +506,18 @@ enum Busy {
     InFlight,
     #[error("too many of the owner's agents' requests in flight")]
     Owner,
-    #[error("the agent's app is sending faster than its rate")]
+    #[error(
+        "the agent's app, or its owner's agents' apps together, are sending faster than their rate"
+    )]
     Rate,
+    #[error("the agent's app has no owner")]
+    Ownerless,
 }
 
 /// The places in flight: `capacity` for the manager app, and `capacity`
 /// for agents' apps, [`MAX_IN_FLIGHT_PER_AGENT`] for each and
-/// [`MAX_IN_FLIGHT_PER_OWNER`] for each owner's; and each agent app's
-/// [`Bucket`].
+/// [`MAX_IN_FLIGHT_PER_OWNER`] for each owner's; and the [`Bucket`] of each
+/// agent's app and of each owner.
 #[derive(Debug)]
 struct Places {
     capacity: usize,
@@ -412,13 +530,32 @@ struct Taken {
     agents: usize,
     by_agent: HashMap<BindingId, usize>,
     by_owner: HashMap<MemberId, usize>,
-    buckets: HashMap<BindingId, Bucket>,
+    agent_buckets: HashMap<BindingId, Bucket>,
+    owner_buckets: HashMap<MemberId, Bucket>,
 }
 
-/// A token bucket: [`AGENT_BURST`] tokens, refilled at
-/// [`AGENT_REQUESTS_PER_SECOND`], one taken by each request let through.
-/// It lives only in memory: after a restart every app starts with a full
-/// one, which costs at most one more burst.
+/// How fast a [`Bucket`] lets requests through.
+#[derive(Debug, Clone, Copy)]
+struct Rate {
+    burst: u32,
+    per_second: u32,
+}
+
+const AGENT_RATE: Rate = Rate {
+    burst: AGENT_BURST,
+    per_second: AGENT_REQUESTS_PER_SECOND,
+};
+
+const OWNER_RATE: Rate = Rate {
+    burst: OWNER_BURST,
+    per_second: OWNER_REQUESTS_PER_SECOND,
+};
+
+/// A token bucket: a [`Rate`]'s burst of tokens, refilled at its rate, one
+/// taken by each request let through. It lives only in memory: after a
+/// restart every app and owner starts with a full one, which costs at most
+/// one more burst. A full bucket is the same as none, so one is forgotten
+/// once it is full and its binding or owner has nothing in flight.
 #[derive(Debug)]
 struct Bucket {
     tokens: f64,
@@ -426,87 +563,114 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn full(now: Instant) -> Self {
+    fn full(rate: Rate, now: Instant) -> Self {
         Self {
-            tokens: f64::from(AGENT_BURST),
+            tokens: f64::from(rate.burst),
             at: now,
         }
     }
 
-    /// Takes a token at `now`, if there is one.
-    fn take(&mut self, now: Instant) -> bool {
+    /// Refills the bucket up to `now`, and says whether it has a token.
+    fn refill(&mut self, rate: Rate, now: Instant) -> bool {
         let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * f64::from(AGENT_REQUESTS_PER_SECOND))
-            .min(f64::from(AGENT_BURST));
+        self.tokens =
+            (self.tokens + elapsed * f64::from(rate.per_second)).min(f64::from(rate.burst));
         self.at = self.at.max(now);
-        if self.tokens < 1.0 {
-            return false;
-        }
-        self.tokens -= 1.0;
-        true
+        self.tokens >= 1.0
+    }
+
+    fn is_full(&self, rate: Rate) -> bool {
+        self.tokens >= f64::from(rate.burst)
     }
 }
 
 impl Places {
-    /// A place at `now` for a request to `binding`, whose agent's owner is
-    /// `owner`, or why there is none.
-    fn take(
-        self: &Arc<Self>,
-        binding: BindingRef,
-        owner: Option<MemberId>,
-        now: Instant,
-    ) -> Result<InFlight, Busy> {
+    /// A place at `now` for a request on `seat`, or why there is none.
+    fn take(self: &Arc<Self>, seat: Seat, now: Instant) -> Result<InFlight, Busy> {
         let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
         let taken = &mut *taken;
-        match binding {
-            BindingRef::Manager if taken.manager >= self.capacity => return Err(Busy::InFlight),
-            BindingRef::Manager => taken.manager += 1,
-            BindingRef::Agent(id) => {
-                let held = taken.by_agent.get(&id).copied().unwrap_or_default();
+        match seat {
+            Seat::Manager if taken.manager >= self.capacity => return Err(Busy::InFlight),
+            Seat::Manager => taken.manager += 1,
+            Seat::Agent { binding, owner } => {
+                let held = taken.by_agent.get(&binding).copied().unwrap_or_default();
                 if taken.agents >= self.capacity || held >= MAX_IN_FLIGHT_PER_AGENT {
                     return Err(Busy::InFlight);
                 }
-                if let Some(owner) = owner
-                    && taken.by_owner.get(&owner).copied().unwrap_or_default()
-                        >= MAX_IN_FLIGHT_PER_OWNER
+                if taken.by_owner.get(&owner).copied().unwrap_or_default()
+                    >= MAX_IN_FLIGHT_PER_OWNER
                 {
                     return Err(Busy::Owner);
                 }
-                let bucket = taken.buckets.entry(id).or_insert_with(|| Bucket::full(now));
-                if !bucket.take(now) {
+                let agent = taken
+                    .agent_buckets
+                    .entry(binding)
+                    .or_insert_with(|| Bucket::full(AGENT_RATE, now));
+                let owners = taken
+                    .owner_buckets
+                    .entry(owner)
+                    .or_insert_with(|| Bucket::full(OWNER_RATE, now));
+                let (agent_has, owner_has) = (
+                    agent.refill(AGENT_RATE, now),
+                    owners.refill(OWNER_RATE, now),
+                );
+                if !(agent_has && owner_has) {
                     return Err(Busy::Rate);
                 }
+                agent.tokens -= 1.0;
+                owners.tokens -= 1.0;
                 taken.agents += 1;
-                *taken.by_agent.entry(id).or_default() += 1;
-                if let Some(owner) = owner {
-                    *taken.by_owner.entry(owner).or_default() += 1;
-                }
+                *taken.by_agent.entry(binding).or_default() += 1;
+                *taken.by_owner.entry(owner).or_default() += 1;
             }
         }
-        Ok(InFlight(Some((Seat { binding, owner }, Arc::clone(self)))))
+        Ok(InFlight(Some((seat, Arc::clone(self)))))
     }
 
-    fn give_back(&self, seat: Seat) {
+    fn give_back(&self, seat: Seat, now: Instant) {
         let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
-        let BindingRef::Agent(id) = seat.binding else {
+        let taken = &mut *taken;
+        let Seat::Agent { binding, owner } = seat else {
             taken.manager -= 1;
             return;
         };
         taken.agents -= 1;
-        release(&mut taken.by_agent, id);
-        if let Some(owner) = seat.owner {
-            release(&mut taken.by_owner, owner);
+        if release(&mut taken.by_agent, binding) {
+            forget_if_full(&mut taken.agent_buckets, binding, AGENT_RATE, now);
+        }
+        if release(&mut taken.by_owner, owner) {
+            forget_if_full(&mut taken.owner_buckets, owner, OWNER_RATE, now);
         }
     }
 }
 
-/// Gives back one of `key`'s places, forgetting it once it holds none.
-fn release<K: Eq + std::hash::Hash>(held: &mut HashMap<K, usize>, key: K) {
-    if let Some(count) = held.get_mut(&key) {
-        *count -= 1;
-        if *count == 0 {
-            held.remove(&key);
-        }
+/// Gives back one of `key`'s places, forgetting it once it holds none, and
+/// says whether it holds none.
+fn release<K: Eq + std::hash::Hash>(held: &mut HashMap<K, usize>, key: K) -> bool {
+    let Some(count) = held.get_mut(&key) else {
+        return true;
+    };
+    *count -= 1;
+    if *count > 0 {
+        return false;
+    }
+    held.remove(&key);
+    true
+}
+
+/// Forgets `key`'s bucket if it is full at `now`.
+fn forget_if_full<K: Eq + std::hash::Hash>(
+    buckets: &mut HashMap<K, Bucket>,
+    key: K,
+    rate: Rate,
+    now: Instant,
+) {
+    let full = buckets.get_mut(&key).is_some_and(|bucket| {
+        bucket.refill(rate, now);
+        bucket.is_full(rate)
+    });
+    if full {
+        buckets.remove(&key);
     }
 }
 
@@ -625,14 +789,14 @@ async fn handle(
     if let Some(challenge) = challenge {
         return answer_challenge(ingress, binding, challenge.as_deref());
     }
-    log_retry(binding, kind, headers);
+    ingress.retried(binding, kind, headers);
 
     let signature = headers
         .get(SIGNATURE_HEADER)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match check(kind, &body) {
+    match check(binding, kind, &body, received_at) {
         Ok(Checked::Queue) => {}
         Ok(Checked::RateLimited {
             minute_rate_limited,
@@ -640,8 +804,8 @@ async fn handle(
             ingress.rate_limited(binding, minute_rate_limited);
             return StatusCode::OK.into_response();
         }
-        Ok(Checked::Ignore(envelope_type)) => {
-            tracing::debug!(%binding, envelope_type, "ignored a Slack envelope");
+        Ok(Checked::Ignore(reason)) => {
+            tracing::debug!(%binding, kind = kind.as_str(), reason, "ignored a Slack request");
             return StatusCode::OK.into_response();
         }
         Err(reason) => {
@@ -649,7 +813,8 @@ async fn handle(
             return StatusCode::BAD_REQUEST.into_response();
         }
     }
-    let place = match ingress.places.take(binding, app.owner, Instant::now()) {
+    let seat = Seat::of(binding, app.owner).ok_or(Busy::Ownerless);
+    let place = match seat.and_then(|seat| ingress.places.take(seat, Instant::now())) {
         Ok(place) => place,
         Err(busy) => {
             ingress.refused(binding, kind, StatusCode::SERVICE_UNAVAILABLE, &busy);
@@ -732,51 +897,44 @@ fn ssl_check(body: &[u8]) -> bool {
         .is_ok_and(|form| form.ssl_check.as_deref() == Some("1"))
 }
 
+/// An events body's `type`, which must be a string. Everything else is
+/// skipped, so a body that isn't a probe allocates no more than its
+/// `type`.
 #[derive(Deserialize)]
-struct Probe {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    challenge: Option<Value>,
+struct ProbeType<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+}
+
+/// A `url_verification` body's `challenge`, which must be a string, so
+/// no other JSON is ever built from an unsigned body.
+#[derive(Deserialize)]
+struct ProbeChallenge<'a> {
+    #[serde(borrow)]
+    challenge: Option<Cow<'a, str>>,
 }
 
 /// `None` unless the body is a JSON object whose `type` is
 /// `url_verification`. Then `Some` of its challenge, or `Some(None)` if the
-/// challenge is missing, empty, longer than [`MAX_CHALLENGE_BYTES`], or not
-/// printable ASCII.
+/// challenge is missing, not a string, empty, longer than
+/// [`MAX_CHALLENGE_BYTES`], or not printable ASCII.
 fn url_verification(body: &[u8]) -> Option<Option<String>> {
-    let probe: Probe = serde_json::from_slice(body).ok()?;
+    let probe: ProbeType<'_> = serde_json::from_slice(body).ok()?;
     if probe.kind.as_deref() != Some("url_verification") {
         return None;
     }
-    Some(match probe.challenge {
-        Some(Value::String(challenge))
-            if !challenge.is_empty()
-                && challenge.len() <= MAX_CHALLENGE_BYTES
-                && challenge.bytes().all(|b| b.is_ascii_graphic()) =>
-        {
-            Some(challenge)
-        }
-        _ => None,
-    })
-}
-
-/// Logs Slack's retry headers, which say that an earlier delivery wasn't
-/// acknowledged in time.
-fn log_retry(binding: BindingRef, kind: Kind, headers: &HeaderMap) {
-    let Some(retry_num) = headers.get(RETRY_NUM_HEADER) else {
-        return;
-    };
-    let retry_num = retry_num
-        .to_str()
+    let challenge = serde_json::from_slice::<ProbeChallenge<'_>>(body)
         .ok()
-        .and_then(|value| value.parse::<u32>().ok());
-    let retry_reason = headers
-        .get(RETRY_REASON_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|reason| {
-            reason.len() <= 64 && reason.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-        });
-    tracing::info!(%binding, kind = kind.as_str(), retry_num, retry_reason, "Slack retried a delivery");
+        .and_then(|probe| probe.challenge);
+    Some(
+        challenge
+            .filter(|challenge| {
+                !challenge.is_empty()
+                    && challenge.len() <= MAX_CHALLENGE_BYTES
+                    && challenge.bytes().all(|b| b.is_ascii_graphic())
+            })
+            .map(Cow::into_owned),
+    )
 }
 
 /// What of an Events API envelope is checked before it is queued. Other
@@ -797,7 +955,7 @@ struct EventHead {
     kind: Option<String>,
 }
 
-/// The ids of a `message` event that make up its deduplication key.
+/// The ids a `message` event is deduplicated and kept by.
 #[derive(Deserialize)]
 struct MessageHead {
     event: MessageIds,
@@ -808,6 +966,8 @@ struct MessageIds {
     channel: Option<String>,
     ts: Option<String>,
     thread_ts: Option<String>,
+    user: Option<String>,
+    bot_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -834,6 +994,11 @@ struct InteractivityForm {
     payload: String,
 }
 
+/// Whether `payload` is a JSON object, checked without keeping any of it.
+fn is_json_object(payload: &str) -> bool {
+    payload.trim_start().starts_with('{') && serde_json::from_str::<IgnoredAny>(payload).is_ok()
+}
+
 enum Checked {
     Queue,
     RateLimited { minute_rate_limited: Option<i64> },
@@ -850,25 +1015,46 @@ struct Queued {
     place: InFlight,
 }
 
-/// Checks that a verified body parses, and that the ids an event is
-/// deduplicated by are shaped like Slack's (see [Shapes](self#shapes)),
-/// without keeping what it parsed. The error names what was wrong, never
+/// Checks that a verified body to `binding` parses, and that the ids an
+/// event is deduplicated and kept by are shaped like Slack's (see
+/// [Shapes](self#shapes)), without keeping what it parsed; and whether it
+/// is one to queue, received at `received_at` (see
+/// [Agents' apps](self#agents-apps)). The error names what was wrong, never
 /// what was sent.
-fn check(kind: Kind, body: &[u8]) -> Result<Checked, &'static str> {
+fn check(
+    binding: BindingRef,
+    kind: Kind,
+    body: &[u8],
+    received_at: OffsetDateTime,
+) -> Result<Checked, &'static str> {
+    let agent = binding != BindingRef::Manager;
     match kind {
         Kind::Events => {
             let head: EnvelopeHead =
                 serde_json::from_slice(body).map_err(|_| "not an Events API envelope")?;
             match head.kind.as_str() {
-                "event_callback" => {
-                    check_callback(&head, body)?;
-                    Ok(Checked::Queue)
-                }
+                "event_callback" => Ok(match check_callback(&head, body)? {
+                    None if agent => Checked::Ignore("an agent's app's event other than a message"),
+                    Some(ts)
+                        if agent
+                            && ts
+                                .as_deref()
+                                .is_some_and(|ts| !within_window(ts, received_at)) =>
+                    {
+                        Checked::Ignore(
+                            "an agent's app's message older than the confirmation window",
+                        )
+                    }
+                    _ => Checked::Queue,
+                }),
                 "app_rate_limited" => Ok(Checked::RateLimited {
                     minute_rate_limited: head.minute_rate_limited,
                 }),
-                _ => Ok(Checked::Ignore("other")),
+                _ => Ok(Checked::Ignore("an envelope of another type")),
             }
+        }
+        Kind::Commands | Kind::Interactivity if agent => {
+            Ok(Checked::Ignore("an agent's app's command or interaction"))
         }
         Kind::Commands => {
             command_form(body)?;
@@ -877,14 +1063,20 @@ fn check(kind: Kind, body: &[u8]) -> Result<Checked, &'static str> {
         Kind::Interactivity => {
             let form: InteractivityForm =
                 serde_urlencoded::from_bytes(body).map_err(|_| "not an interactivity form")?;
-            serde_json::from_str::<std::collections::BTreeMap<String, IgnoredAny>>(&form.payload)
-                .map_err(|_| "the interactivity payload is not a JSON object")?;
+            if !is_json_object(&form.payload) {
+                return Err("the interactivity payload is not a JSON object");
+            }
             Ok(Checked::Queue)
         }
     }
 }
 
-fn check_callback(head: &EnvelopeHead, body: &[u8]) -> Result<(), &'static str> {
+/// Checks an `event_callback`'s ids. `Some` of its `ts`, if it has one,
+/// for a `message` event, and `None` for any other.
+fn check_callback(
+    head: &EnvelopeHead,
+    body: &[u8],
+) -> Result<Option<Option<String>>, &'static str> {
     let Some(event) = &head.event else {
         return Err("an event_callback without an event");
     };
@@ -895,17 +1087,27 @@ fn check_callback(head: &EnvelopeHead, body: &[u8]) -> Result<(), &'static str> 
         return Err("the team_id isn't shaped like Slack's");
     }
     if event.kind.as_deref() != Some("message") {
-        return Ok(());
+        return Ok(None);
     }
     let MessageHead { event: ids } =
         serde_json::from_slice(body).map_err(|_| "a message event whose ids aren't strings")?;
     if !ids.channel.as_deref().is_none_or(is_channel_id) {
         return Err("the message's channel isn't shaped like Slack's");
     }
-    if ![ids.ts, ids.thread_ts].iter().flatten().all(|ts| is_ts(ts)) {
+    if ![&ids.ts, &ids.thread_ts]
+        .into_iter()
+        .flatten()
+        .all(|ts| is_ts(ts))
+    {
         return Err("the message's ts or thread_ts isn't shaped like Slack's");
     }
-    Ok(())
+    if !ids.user.as_deref().is_none_or(is_user_id) {
+        return Err("the message's user isn't shaped like Slack's");
+    }
+    if !ids.bot_id.as_deref().is_none_or(is_bot_id) {
+        return Err("the message's bot_id isn't shaped like Slack's");
+    }
+    Ok(Some(ids.ts))
 }
 
 fn command_form(body: &[u8]) -> Result<CommandForm, &'static str> {
@@ -924,48 +1126,11 @@ fn command_form(body: &[u8]) -> Result<CommandForm, &'static str> {
     Ok(form)
 }
 
-/// Whether `id` is one of `prefixes` and then 1 to `max` uppercase ASCII
-/// letters or digits.
-fn is_slack_id(id: &str, prefixes: &[&str], max: usize) -> bool {
-    prefixes.iter().any(|prefix| {
-        id.strip_prefix(prefix).is_some_and(|rest| {
-            (1..=max).contains(&rest.len())
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-        })
-    })
-}
-
-fn is_event_id(id: &str) -> bool {
-    is_slack_id(id, &["Ev"], 32)
-}
-
-fn is_team_id(id: &str) -> bool {
-    is_slack_id(id, &["T", "E"], 20)
-}
-
-fn is_channel_id(id: &str) -> bool {
-    is_slack_id(id, &["C", "D", "G"], 20)
-}
-
-/// Whether `ts` is a message timestamp as Slack writes one: 10 digits of
-/// seconds, a dot and 6 of microseconds.
-fn is_ts(ts: &str) -> bool {
-    ts.split_once('.').is_some_and(|(seconds, micros)| {
-        seconds.len() == 10
-            && micros.len() == 6
-            && seconds
-                .bytes()
-                .chain(micros.bytes())
-                .all(|b| b.is_ascii_digit())
-    })
-}
-
 /// The receiving end of the ingress: requests that were acknowledged and
 /// still have to be deduplicated, normalized and handed on.
 pub struct Queue {
     receiver: mpsc::UnboundedReceiver<Queued>,
+    notes: Arc<Notes>,
 }
 
 impl fmt::Debug for Queue {
@@ -984,7 +1149,7 @@ impl Queue {
     /// closed, dropping what is left.
     pub async fn run(mut self, dedup: Arc<dyn Dedup>, out: Sender<SlackInbound>) {
         while let Some(queued) = self.receiver.recv().await {
-            let Some(inbound) = process(queued, dedup.as_ref()).await else {
+            let Some(inbound) = process(queued, dedup.as_ref(), &self.notes).await else {
                 continue;
             };
             let (binding, kind) = (inbound.binding(), inbound.kind());
@@ -996,7 +1161,7 @@ impl Queue {
     }
 }
 
-async fn process(queued: Queued, dedup: &dyn Dedup) -> Option<SlackInbound> {
+async fn process(queued: Queued, dedup: &dyn Dedup, notes: &Notes) -> Option<SlackInbound> {
     let Queued {
         binding,
         bot_user,
@@ -1006,8 +1171,17 @@ async fn process(queued: Queued, dedup: &dyn Dedup) -> Option<SlackInbound> {
         signature,
         place,
     } = queued;
-    let reparsed = |what: &'static str| {
-        tracing::warn!(%binding, kind = kind.as_str(), what, "a queued Slack request no longer parses; dropped it");
+    let reparsed = |what: &'static str| match note(notes, binding, Note::Reparsed) {
+        Some(quiet) => tracing::warn!(
+            %binding,
+            kind = kind.as_str(),
+            what,
+            dropped_since_last_warning = quiet,
+            "a queued Slack request no longer parses; dropped it"
+        ),
+        None => {
+            tracing::debug!(%binding, kind = kind.as_str(), what, "a queued Slack request no longer parses; dropped it")
+        }
     };
     match kind {
         Kind::Events => {
@@ -1223,52 +1397,169 @@ mod tests {
         }
     }
 
+    fn take(bucket: &mut Bucket, now: Instant) -> bool {
+        let has = bucket.refill(AGENT_RATE, now);
+        if has {
+            bucket.tokens -= 1.0;
+        }
+        has
+    }
+
     #[test]
     fn an_agents_bucket_lets_a_burst_through_then_its_rate() {
         let start = Instant::now();
-        let mut bucket = Bucket::full(start);
+        let mut bucket = Bucket::full(AGENT_RATE, start);
         for n in 0..AGENT_BURST {
-            assert!(bucket.take(start), "request {n} of the burst");
+            assert!(take(&mut bucket, start), "request {n} of the burst");
         }
-        assert!(!bucket.take(start));
+        assert!(!take(&mut bucket, start));
         let tick = Duration::from_secs(1) / AGENT_REQUESTS_PER_SECOND;
-        assert!(bucket.take(start + tick));
-        assert!(!bucket.take(start + tick));
+        assert!(take(&mut bucket, start + tick));
+        assert!(!take(&mut bucket, start + tick));
         let later = start + Duration::from_secs(3600);
         for _ in 0..AGENT_BURST {
-            assert!(bucket.take(later));
+            assert!(take(&mut bucket, later));
         }
-        assert!(!bucket.take(later), "an idle hour refills only the burst");
         assert!(
-            !bucket.take(start),
+            !take(&mut bucket, later),
+            "an idle hour refills only the burst"
+        );
+        assert!(
+            !take(&mut bucket, start),
             "a time before the last take refills nothing"
         );
     }
 
+    fn places(capacity: usize) -> Arc<Places> {
+        Arc::new(Places {
+            capacity,
+            taken: Mutex::default(),
+        })
+    }
+
+    fn seat(binding: BindingId, owner: MemberId) -> Seat {
+        Seat::Agent { binding, owner }
+    }
+
     #[test]
     fn a_busy_binding_holds_no_other_bindings_places() {
-        let places = Arc::new(Places {
-            capacity: 4,
-            taken: Mutex::default(),
-        });
+        let places = places(4);
         let now = Instant::now();
         let (a, b) = (BindingId::new_v4(), BindingId::new_v4());
-        let owner = MemberId::new_v4();
+        let (owner, other) = (MemberId::new_v4(), MemberId::new_v4());
         let mut held = Vec::new();
         for _ in 0..4 {
-            held.push(places.take(BindingRef::Agent(a), Some(owner), now).unwrap());
+            held.push(places.take(seat(a, owner), now).unwrap());
         }
         assert_eq!(
-            places.take(BindingRef::Agent(b), None, now).unwrap_err(),
+            places.take(seat(b, other), now).unwrap_err(),
             Busy::InFlight
         );
-        assert!(places.take(BindingRef::Manager, None, now).is_ok());
+        assert!(places.take(Seat::Manager, now).is_ok());
         held.pop();
-        assert!(places.take(BindingRef::Agent(b), None, now).is_ok());
+        assert!(places.take(seat(b, other), now).is_ok());
         drop(held);
         let taken = places.taken.lock().unwrap();
         assert_eq!((taken.manager, taken.agents), (0, 0));
         assert!(taken.by_agent.is_empty() && taken.by_owner.is_empty());
+    }
+
+    #[test]
+    fn an_agent_app_without_an_owner_has_no_seat() {
+        let binding = BindingId::new_v4();
+        assert!(Seat::of(BindingRef::Agent(binding), None).is_none());
+        assert!(matches!(
+            Seat::of(BindingRef::Manager, None),
+            Some(Seat::Manager)
+        ));
+    }
+
+    #[test]
+    fn one_owners_agents_share_a_bucket_at_a_fixed_time() {
+        let places = places(4096);
+        let now = Instant::now() + Duration::from_secs(3600);
+        let ada = MemberId::new_v4();
+        let mut let_through = 0;
+        for _ in 0..4 {
+            let agent = BindingId::new_v4();
+            while places.take(seat(agent, ada), now).is_ok() {
+                let_through += 1;
+            }
+            assert_eq!(places.take(seat(agent, ada), now).unwrap_err(), Busy::Rate);
+        }
+        assert_eq!(let_through, OWNER_BURST);
+        assert!(
+            places
+                .take(seat(BindingId::new_v4(), MemberId::new_v4()), now)
+                .is_ok(),
+            "another owner has a bucket of their own"
+        );
+        let later = now + Duration::from_secs(1);
+        let refilled = (0..OWNER_BURST)
+            .filter(|_| places.take(seat(BindingId::new_v4(), ada), later).is_ok())
+            .count();
+        assert_eq!(
+            refilled,
+            usize::try_from(OWNER_REQUESTS_PER_SECOND).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_full_bucket_with_nothing_in_flight_is_forgotten() {
+        let places = places(64);
+        let now = Instant::now();
+        let earlier = now.checked_sub(Duration::from_secs(60)).unwrap();
+        let (idle, busy) = (BindingId::new_v4(), BindingId::new_v4());
+        let (ada, bob) = (MemberId::new_v4(), MemberId::new_v4());
+        drop(places.take(seat(idle, ada), earlier).unwrap());
+        let held = places.take(seat(busy, bob), now).unwrap();
+        let second = places.take(seat(busy, bob), now).unwrap();
+        drop(second);
+        {
+            let taken = places.taken.lock().unwrap();
+            assert!(!taken.agent_buckets.contains_key(&idle));
+            assert!(!taken.owner_buckets.contains_key(&ada));
+            assert!(taken.agent_buckets.contains_key(&busy), "one is in flight");
+            assert!(taken.owner_buckets.contains_key(&bob));
+        }
+        drop(held);
+        let taken = places.taken.lock().unwrap();
+        assert!(
+            taken.agent_buckets.contains_key(&busy),
+            "not full again yet"
+        );
+    }
+
+    #[test]
+    fn a_challenge_is_a_short_printable_string_and_nothing_else_is_built() {
+        let array = format!(
+            r#"{{"type":"url_verification","challenge":[{}0]}}"#,
+            "0,".repeat(100_000)
+        );
+        assert_eq!(url_verification(array.as_bytes()), Some(None));
+        assert_eq!(
+            url_verification(br#"{"challenge":"abc","type":"url_verification"}"#),
+            Some(Some("abc".to_owned()))
+        );
+        assert_eq!(
+            url_verification(br#"{"type":"url_verification","challenge":7}"#),
+            Some(None)
+        );
+        assert_eq!(
+            url_verification(br#"{"type":"event_callback","challenge":"abc"}"#),
+            None
+        );
+        assert_eq!(url_verification(br#"{"type":7,"challenge":"abc"}"#), None);
+    }
+
+    #[test]
+    fn an_interaction_payload_must_be_an_object() {
+        for payload in ["{}", " {\"type\":\"block_actions\"}"] {
+            assert!(is_json_object(payload), "{payload}");
+        }
+        for payload in ["[]", "[{}]", "{\"a\":", "\"{}\"", "1", ""] {
+            assert!(!is_json_object(payload), "{payload}");
+        }
     }
 
     #[test]

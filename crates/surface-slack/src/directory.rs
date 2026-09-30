@@ -16,7 +16,7 @@ use core_types::{ConvKind, ConversationId, SurfaceError, TeamId, UserId};
 use render::MentionDirectory;
 use tokio::time::Instant;
 
-use crate::normalize::is_user_id;
+use crate::normalize::{is_bot_id, is_user_id};
 use crate::web::{Result, User, WebApi};
 
 /// How long a member list is used before `users.list` is read again.
@@ -29,7 +29,8 @@ pub const MAX_MEMBER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
 /// The most bot ids remembered with a user, and apart from them the most
-/// remembered without one, before that cache starts over.
+/// remembered without one, before that cache starts over. Each is shaped
+/// like a bot id, so the cache holds at most a few hundred kilobytes.
 const MAX_BOTS: usize = 10_000;
 
 /// How long a conversation's kind is remembered. A group DM can be
@@ -255,12 +256,17 @@ impl TeamDirectory {
     /// cached per bot id. `None` for a bot with no user, such as a legacy
     /// integration, or one Slack doesn't know (`bot_not_found`); that answer
     /// is cached too, apart from the bots that have a user, so bot ids made
-    /// up in forged events never push those out.
+    /// up in forged events never push those out. `None` at once, without a
+    /// call and without caching it, for an id not shaped like a bot id
+    /// ([`is_bot_id`]), so each cached id is a few bytes.
     ///
     /// # Errors
     ///
     /// Any other `bots.info` error. Nothing is cached then.
     pub async fn bot_user(&self, api: &WebApi, bot_id: &str) -> Result<Option<UserId>> {
+        if !is_bot_id(bot_id) {
+            return Ok(None);
+        }
         if let Some(known) = self.lock_bots().get(bot_id) {
             return Ok(known);
         }

@@ -40,7 +40,7 @@ use core_types::{BindingId, InboundEvent, SendError, Sender, Sink, TeamId, Throt
 use futures::FutureExt as _;
 use secrecy::SecretString;
 use store::Store;
-use surface_slack::ingress::WARNING_INTERVAL;
+use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
     BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
@@ -357,8 +357,8 @@ async fn hand_on(shared: &Shared, (mut event, _place): Waiting) {
     }
 }
 
-/// Deduplication in the store's `processed_events`, which the sweeper
-/// empties after [`store::PROCESSED_EVENT_RETENTION`].
+/// Deduplication in the store's `processed_events`, each key kept for
+/// [`DEDUP_RETENTION`], after which the sweeper deletes it.
 #[derive(Debug, Clone)]
 pub struct StoreDedup(pub Store);
 
@@ -367,7 +367,7 @@ impl Dedup for StoreDedup {
     async fn first_time(&self, source: &str, key: &str) -> Result<bool, BoxError> {
         Ok(self
             .0
-            .mark_event_processed(source, key, OffsetDateTime::now_utc())
+            .mark_event_processed(source, key, OffsetDateTime::now_utc(), DEDUP_RETENTION)
             .await?)
     }
 }
@@ -511,5 +511,21 @@ mod tests {
         let none = ConfigSigningSecrets::new(None, None);
         assert!(none.lookup(BindingRef::Manager).await.unwrap().is_none());
         assert!(!format!("{secrets:?}").contains("manager-secret"));
+    }
+
+    #[tokio::test]
+    async fn slack_deduplication_forgets_a_key_after_an_hour() {
+        let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
+        let store = Store::open_in_memory(sealer).await.unwrap();
+        let dedup = StoreDedup(store.clone());
+        let (source, key) = ("slack:manager:message", "D0DM00001:1727697900.000500");
+        assert!(dedup.first_time(source, key).await.unwrap());
+        assert!(!dedup.first_time(source, key).await.unwrap());
+        let within = OffsetDateTime::now_utc() + time::Duration::minutes(50);
+        store.sweep_expired(within).await.unwrap();
+        assert!(!dedup.first_time(source, key).await.unwrap());
+        let past = OffsetDateTime::now_utc() + time::Duration::minutes(61);
+        store.sweep_expired(past).await.unwrap();
+        assert!(dedup.first_time(source, key).await.unwrap());
     }
 }
