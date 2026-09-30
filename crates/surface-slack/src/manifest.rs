@@ -152,13 +152,17 @@ pub fn agent_manifest(app: &AgentApp<'_>) -> Value {
 
 /// The link that installs an app: Slack's OAuth consent page for
 /// `client_id` with `scopes`, redirecting to `redirect_url` with `state`.
+///
+/// `state` comes first and `redirect_uri` last, so the link ends with the
+/// letters of [`OAUTH_CALLBACK_PATH`]: a renderer that trims trailing
+/// punctuation off a bare URL can't cut a `state` ending in `_` or `-`.
 pub fn install_url(client_id: &str, scopes: &[&str], redirect_url: &str, state: &str) -> String {
     let scope = scopes.join(",");
     let query = serde_urlencoded::to_string([
+        ("state", state),
         ("client_id", client_id),
         ("scope", &scope),
         ("redirect_uri", redirect_url),
-        ("state", state),
     ])
     .unwrap_or_default();
     format!("{OAUTH_AUTHORIZE_URL}?{query}")
@@ -277,14 +281,50 @@ mod tests {
         assert_eq!(
             pairs,
             [
+                ("state".to_owned(), "a.b+c/d".to_owned()),
                 ("client_id".to_owned(), "123.456".to_owned()),
                 ("scope".to_owned(), "chat:write,im:history".to_owned()),
                 (
                     "redirect_uri".to_owned(),
                     "https://agentd.example.com/slack/oauth/callback".to_owned()
                 ),
-                ("state".to_owned(), "a.b+c/d".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_state_ending_in_punctuation_survives_rendering_the_link() {
+        let redirect = "https://agentd.example.com/slack/oauth/callback";
+        for state in ["abc.def_", "abc.def-", "abc.de_."] {
+            let url = install_url("1.2", &["chat:write"], redirect, state);
+            for markdown in [
+                format!("Install it:\n{url}"),
+                format!("[Install it]({url})"),
+            ] {
+                let rendered = render::slack::to_mrkdwn(&markdown, &NoNames);
+                let linked = rendered
+                    .split('<')
+                    .nth(1)
+                    .and_then(|rest| rest.split(['>', '|']).next())
+                    .unwrap()
+                    .replace("&amp;", "&");
+                let parsed = Url::parse(&linked).unwrap();
+                let pairs: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+                assert_eq!(
+                    pairs[0],
+                    ("state".to_owned(), state.to_owned()),
+                    "{rendered}"
+                );
+                assert_eq!(pairs[3].1, redirect, "{rendered}");
+            }
+        }
+    }
+
+    struct NoNames;
+
+    impl render::MentionDirectory for NoNames {
+        fn resolve(&self, _name: &str) -> Option<String> {
+            None
+        }
     }
 }

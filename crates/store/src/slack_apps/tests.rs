@@ -49,6 +49,7 @@ fn app(id: &str) -> NewSlackApp {
         client_secret: SecretString::from(format!("{id}-client-secret")),
         signing_secret: SecretString::from(format!("{id}-signing-secret")),
         scopes: "chat:write,im:history".to_owned(),
+        redirect_url: "https://agentd.example.com/slack/oauth/callback".to_owned(),
     }
 }
 
@@ -112,7 +113,7 @@ async fn a_binding_is_known_to_the_ingress_from_its_creation_to_its_deletion() {
             app_id: Some("A1".to_owned()),
             client_id: Some("A1.client".to_owned()),
             scopes: Some("chat:write,im:history".to_owned()),
-            bot_user: None,
+            redirect_url: Some("https://agentd.example.com/slack/oauth/callback".to_owned()),
         }
     );
     assert_eq!(
@@ -305,7 +306,7 @@ async fn an_install_state_names_its_binding_and_nothing_else_passes() {
 async fn an_owner_is_reminded_once_of_an_app_still_waiting_for_its_install() {
     let store = memory_store().await;
     let ada = owner(&store, "ada").await;
-    let (agent, binding) = pending(&store, ada, "helper").await;
+    let (_, binding) = pending(&store, ada, "helper").await;
     let (_, installed) = pending(&store, ada, "done").await;
     assert!(
         store
@@ -339,11 +340,11 @@ async fn an_owner_is_reminded_once_of_an_app_still_waiting_for_its_install() {
         due(2_000, 5_000).await.unwrap(),
         [InstallReminder {
             binding,
-            agent,
             agent_name: "helper".to_owned(),
             owner: ada,
             client_id: "Ahelper.client".to_owned(),
             scopes: "chat:write,im:history".to_owned(),
+            redirect_url: "https://agentd.example.com/slack/oauth/callback".to_owned(),
         }]
     );
 

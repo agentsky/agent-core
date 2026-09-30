@@ -124,7 +124,9 @@ declares `/agent`. Install it once:
 1. Put agentd's public listener behind a TLS terminator at a public HTTPS
    URL, such as `https://agentd.example.com`, and set it as
    `[slack] public_url`. Slack sends every event, command and interaction
-   there, and agents' apps are created with request URLs under it.
+   there, and agents' apps are created with request URLs under it. The URL
+   is baked into each agent's app when it is created, so changing it later
+   leaves existing apps, and their install links, on the old one.
 2. Fill in the manifest template with that URL:
 
    ```bash
@@ -165,8 +167,12 @@ back to `<public_url>/slack/oauth/callback`, which stores the app's bot token
 and tells the member. In a workspace that requires app approval the click
 sends an admin a request instead, and agentd reminds the member once if the
 app still isn't installed after `[slack] install_reminder_secs` (default an
-hour). Members invite the agent to a channel with `/invite @<name>` and
-mention it there. `/agent delete` deletes the app with the member's
+hour). Once it is installed, the manager app tells the member which bot
+user to invite to a channel (names are unique per owner only, so it names the
+bot by mention), and they mention it there. Before a turn that someone other
+than the agent's owner asks for or pays for, agentd reads the message back
+from Slack with the agent's bot token, since the owner holds the app's
+signing secret and could otherwise forge messages from other members. `/agent delete` deletes the app with the member's
 configuration token, or, without a working one, stops answering as it and
 says to delete the app at <https://api.slack.com/apps>. Apps ask for
 `chat:write.public` only with `[slack] public_posting = true`. On the free

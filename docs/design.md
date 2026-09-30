@@ -160,10 +160,12 @@ Each agent is its own Slack app, created from a manifest.
   verified with its own `signing_secret`, a `v0` HMAC-SHA256 over the raw body
   compared in constant time, with a timestamp at most five minutes from now.
   Unknown bindings get 404.
-- **The challenge is answered unsigned.** Slack sends `url_verification` while
-  `apps.manifest.create` is still running, before agentd has the new app's
-  signing secret, so agentd echoes the challenge for any binding it knows
-  (including one still being created) without checking the signature. That is
+- **The challenge is answered unsigned while an app is created.** Slack sends
+  `url_verification` while `apps.manifest.create` is still running, before
+  agentd has the new app's signing secret, so agentd echoes the challenge for a
+  binding it knows but has no secret for yet (one still being created) without
+  checking the signature. A binding with a secret, the manager app's included,
+  answers a challenge only once it verified. That is
   safe because the echo has no side effects: it reads no state beyond the
   binding's existence, writes nothing and queues nothing, and returns only the
   string the caller sent, as `text/plain` with `nosniff`. A forger learns only
@@ -736,8 +738,9 @@ for Rocket.Chat bindings.
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
-| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals are logged as warnings at most once a minute. |
+| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo, for a binding still being created, and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals are logged as warnings at most once a minute. |
 | Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel messages at ingress and never logs message content. |
+| An agent's owner forges its app's events | Each agent's app is created with its owner's configuration token, so the owner can read the app's signing secret, client secret and bot token at api.slack.com. With the signing secret they can sign a `message` event naming any sender, conversation and `ts`: a linked member's message, to run a turn on that member's Claude plan in a thread they can read; a message in another member's DM with the agent, to resume that member's scope; or an agent's post, to inherit the requester recorded for it. The bot token reads what the bot hears, and the client secret only matters until the app is installed. So before a turn that someone other than the owner asks for or pays for (a non-owner's subscription or the community key), agentd reads the message back from Slack over TLS with the app's bot token (`conversations.history`, or `conversations.replies` in a thread, at exactly that `ts`) and runs the turn only if Slack has it from that sender with that text. A mismatch, a Slack error or a rate limit drops the message. The owner's own messages on their own account or the community key aren't looked up: forging those gains nothing they couldn't post. The manager app's secret stays with the operators, so its requests aren't looked up. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 
 ## Crate layout

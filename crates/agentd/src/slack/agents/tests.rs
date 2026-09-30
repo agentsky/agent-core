@@ -267,7 +267,7 @@ async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
     );
     let bindings = h.store.bindings_of(agent).await.unwrap();
     assert_eq!(
-        h.agents.delete_apps(h.owner, &bindings).await.unwrap(),
+        h.agents.delete_apps(h.owner, &bindings).await,
         [AppDeletion::Deleted]
     );
 
@@ -404,52 +404,270 @@ async fn an_agents_message_reaches_the_pipeline_with_its_bot_sender_looked_up() 
         panic!("created");
     };
     let binding = h.binding().await.unwrap();
-    let auth = Arc::new(auth::Auth::new(auth::OAuthConfig::default(), h.store.clone()).unwrap());
-    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None, None);
-    let (_intake, submitter) = CommandIntake::new(commands);
-    let messages = Messages::default();
-    let inbound = Inbound::new(
-        h.store.clone(),
-        Some(h.agents.inner.manager.identity().clone()),
-        submitter,
-    )
-    .with_agents(h.agents.bots().clone(), messages.clone());
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    messages.connect(Sender::new(Collect(tx)));
-
-    inbound
-        .send(SlackInbound::Message(Box::new(bot_message(binding, TEAM))))
+    let Creation::Created { .. } = h
+        .agents
+        .create(h.owner, &ada(), "waiting", "You wait.")
         .await
-        .unwrap();
-    assert!(rx.try_recv().is_err(), "not installed yet: dropped");
-
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let waiting = h
+        .store
+        .bindings_of(
+            h.store
+                .agent_by_name(h.owner, "waiting")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+        )
+        .await
+        .unwrap()[0]
+        .id;
     let query = format!("code={CODE}&state={}", state_of(&install_url));
     assert_eq!(
         h.agents.callback(Some(&query)).await.status(),
         StatusCode::OK
     );
-    inbound
-        .send(SlackInbound::Message(Box::new(bot_message(
-            binding,
-            "T0OTHER01",
-        ))))
-        .await
-        .unwrap();
-    assert!(rx.try_recv().is_err(), "another workspace: dropped");
-    inbound
-        .send(SlackInbound::Message(Box::new(bot_message(
-            BindingId::new_v4(),
-            TEAM,
-        ))))
-        .await
-        .unwrap();
-    assert!(rx.try_recv().is_err(), "an unknown binding: dropped");
-
+    let auth = Arc::new(auth::Auth::new(auth::OAuthConfig::default(), h.store.clone()).unwrap());
+    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None, None);
+    let (_intake, submitter) = CommandIntake::new(commands);
+    let (messages, worker) = Messages::new(h.agents.bots().clone());
+    let inbound = Inbound::new(
+        h.store.clone(),
+        Some(h.agents.inner.manager.identity().clone()),
+        submitter,
+    )
+    .with_agents(messages.clone());
     inbound
         .send(SlackInbound::Message(Box::new(bot_message(binding, TEAM))))
         .await
         .unwrap();
-    let event = rx.try_recv().expect("handed on");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    messages.connect(Sender::new(Collect(tx)));
+    let worker = tokio::spawn(worker);
+
+    for (event_id, event) in [
+        ("Ev1", bot_message(waiting, TEAM)),
+        ("Ev2", bot_message(binding, "T0OTHER01")),
+        ("Ev3", bot_message(BindingId::new_v4(), TEAM)),
+        ("Ev4", bot_message(binding, TEAM)),
+    ] {
+        let event = InboundEvent {
+            event_id: event_id.to_owned(),
+            ..event
+        };
+        inbound
+            .send(SlackInbound::Message(Box::new(event)))
+            .await
+            .unwrap();
+    }
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("handed on")
+        .unwrap();
+    assert_eq!(
+        event.event_id, "Ev4",
+        "dropped: before the pipeline was connected, not installed yet, another workspace, an \
+         unknown binding"
+    );
     assert_eq!(event.sender.user, UserId::new("U0OTHERBOT"));
     assert_eq!(event.sender_bot_user, Some(UserId::new("U0OTHERBOT")));
+
+    drop((inbound, messages));
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker ends with its queue")
+        .unwrap();
+    assert!(rx.try_recv().is_err());
+}
+
+async fn installed(h: &Harness) -> BindingId {
+    let Creation::Created { install_url, .. } = h.create().await else {
+        panic!("created");
+    };
+    let query = format!("code={CODE}&state={}", state_of(&install_url));
+    assert_eq!(
+        h.agents.callback(Some(&query)).await.status(),
+        StatusCode::OK
+    );
+    h.binding().await.unwrap()
+}
+
+async fn deleted_bindings(h: &Harness) -> Vec<store::AgentBinding> {
+    let agent = h
+        .store
+        .agent_by_name(h.owner, "helper")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let bindings = h.store.bindings_of(agent).await.unwrap();
+    assert!(
+        h.store
+            .delete_agent(agent, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+    );
+    bindings
+}
+
+#[tokio::test]
+async fn an_installed_bot_is_named_as_a_managed_agent() {
+    let h = harness().await;
+    let directory = Arc::clone(h.agents.inner.manager.surface().directory());
+    assert!(directory.members().lookup("U0HELPER1").is_none());
+    installed(&h).await;
+    assert_eq!(
+        directory.members().lookup("U0HELPER1"),
+        Some(&UserId::new("U0HELPER1"))
+    );
+    let bindings = deleted_bindings(&h).await;
+    h.agents.delete_apps(h.owner, &bindings).await;
+    assert!(directory.members().lookup("U0HELPER1").is_none());
+}
+
+#[tokio::test]
+async fn an_app_slack_says_is_gone_counts_as_deleted() {
+    let h = harness().await;
+    let binding = installed(&h).await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.delete"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "app_not_found"})),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    let bindings = deleted_bindings(&h).await;
+    assert_eq!(
+        h.agents.delete_apps(h.owner, &bindings).await,
+        [AppDeletion::Deleted]
+    );
+    let row = h.store.binding(binding).await.unwrap().unwrap();
+    assert!(row.retired_at.is_some());
+}
+
+#[tokio::test]
+async fn a_configuration_token_slack_refuses_is_marked_broken() {
+    let h = harness().await;
+    let binding = installed(&h).await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.delete"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "token_revoked"})),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    let bindings = deleted_bindings(&h).await;
+    assert_eq!(
+        h.agents.delete_apps(h.owner, &bindings).await,
+        [AppDeletion::NoToken("A0HELPER1".to_owned())]
+    );
+    let row = h.store.binding(binding).await.unwrap().unwrap();
+    assert!(row.retired_at.is_none());
+    let status = h
+        .store
+        .slack_config_token_status(h.owner, &TeamId::new(TEAM))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.broken);
+}
+
+#[tokio::test]
+async fn a_refused_token_at_creation_is_marked_broken_and_an_expired_one_waits_for_renewal() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.create"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    assert_eq!(h.create().await, Creation::TokenRefused);
+    assert_eq!(h.create().await, Creation::NoConfigToken, "broken now");
+
+    let now = OffsetDateTime::now_utc();
+    h.store
+        .put_slack_config_token(
+            h.owner,
+            &TeamId::new(TEAM),
+            &NewSlackConfigToken {
+                token: SecretString::from(CONFIG_TOKEN),
+                refresh_token: SecretString::from("refresh-SECRET"),
+                expires_at: now - Duration::from_secs(60),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.create().await, Creation::TokenRenewing);
+    assert!(h.binding().await.is_none());
+}
+
+#[tokio::test]
+async fn an_install_granting_a_scope_the_app_does_not_ask_for_is_refused() {
+    let h = harness().await;
+    let Creation::Created { install_url, .. } = h.create().await else {
+        panic!("created");
+    };
+    Mock::given(method("POST"))
+        .and(path("/api/oauth.v2.access"))
+        .respond_with(ok(json!({
+            "app_id": "A0HELPER1",
+            "token_type": "bot",
+            "scope": "chat:write,admin",
+            "access_token": AGENT_TOKEN,
+            "bot_user_id": "U0HELPER1",
+            "team": {"id": TEAM},
+        })))
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    let query = format!("code={CODE}&state={}", state_of(&install_url));
+    let response = h.agents.callback(Some(&query)).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let binding = h.binding().await.unwrap();
+    assert!(h.store.bot_token(binding).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
+    let h = harness().await;
+    let Creation::Created { install_url, .. } = h.create().await else {
+        panic!("created");
+    };
+    Mock::given(method("POST"))
+        .and(path("/api/oauth.v2.access"))
+        .respond_with(
+            ok(json!({
+                "app_id": "A0HELPER1",
+                "token_type": "bot",
+                "access_token": AGENT_TOKEN,
+                "bot_user_id": "U0HELPER1",
+                "team": {"id": TEAM},
+            }))
+            .set_delay(Duration::from_millis(500)),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    let binding = h.binding().await.unwrap();
+    let installing = {
+        let agents = h.agents.clone();
+        let query = format!("code={CODE}&state={}", state_of(&install_url));
+        tokio::spawn(async move { agents.callback(Some(&query)).await.status() })
+    };
+    while h.calls("oauth.v2.access").await == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    deleted_bindings(&h).await;
+    assert_eq!(installing.await.unwrap(), StatusCode::CONFLICT);
+    assert!(h.store.bot_token(binding).await.unwrap().is_none());
 }

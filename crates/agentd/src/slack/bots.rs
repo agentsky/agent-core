@@ -13,12 +13,12 @@ use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 /// built from the store on first use and kept. Every binding shares the
 /// workspace's one [`TeamDirectory`], the manager app's.
 ///
-/// - [`surface`](Self::surface) is what the Slack queue needs for each
-///   message: the receiving binding's surface, to look bot senders up with
-///   [`SlackSurface::fill_bot_sender`].
-/// - [`started`](Self::started) is what a reply needs: the first time in
-///   this process, it also awaits the member list, so the binding's first
-///   reply already resolves `@Name` mentions.
+/// - [`surface`](Self::surface) is the binding's surface, for looking bot
+///   senders up with [`SlackSurface::fill_bot_sender`] and for replies. It
+///   never waits for the workspace's member list: when the directory has
+///   none, or a stale one, it starts reading it in the background
+///   ([`SlackSurface::refresh_in_background`]), which a turn's reply then
+///   renders with.
 /// - [`name_managed`](Self::name_managed) passes the workspace's active
 ///   agents' bot users to [`TeamDirectory::set_managed_bots`]. agentd calls
 ///   it whenever those change here (an install, a deletion) and on every
@@ -37,12 +37,7 @@ struct Inner {
     store: Store,
     client: SlackClient,
     directory: Arc<TeamDirectory>,
-    built: Mutex<HashMap<BindingId, Built>>,
-}
-
-struct Built {
-    surface: Arc<SlackSurface>,
-    started: bool,
+    built: Mutex<HashMap<BindingId, Arc<SlackSurface>>>,
 }
 
 impl fmt::Debug for SlackBots {
@@ -73,7 +68,7 @@ impl SlackBots {
         self.inner.directory.team()
     }
 
-    fn built(&self) -> MutexGuard<'_, HashMap<BindingId, Built>> {
+    fn built(&self) -> MutexGuard<'_, HashMap<BindingId, Arc<SlackSurface>>> {
         self.inner
             .built
             .lock()
@@ -81,7 +76,8 @@ impl SlackBots {
     }
 
     /// The surface of `binding`, if it is an active Slack binding in this
-    /// workspace with a bot token.
+    /// workspace with a bot token. Starts reading the member list in the
+    /// background when the directory has none or a stale one.
     ///
     /// # Errors
     ///
@@ -100,47 +96,21 @@ impl SlackBots {
         {
             return Ok(None);
         }
-        if let Some(built) = self.built().get(&binding) {
-            return Ok(Some(Arc::clone(&built.surface)));
-        }
-        let Some(token) = store.bot_token(binding).await? else {
-            return Ok(None);
+        let built = self.built().get(&binding).map(Arc::clone);
+        let surface = match built {
+            Some(surface) => surface,
+            None => {
+                let Some(token) = store.bot_token(binding).await? else {
+                    return Ok(None);
+                };
+                let surface = Arc::new(SlackSurface::new(
+                    self.inner.client.bot(token),
+                    Arc::clone(&self.inner.directory),
+                ));
+                Arc::clone(self.built().entry(binding).or_insert(surface))
+            }
         };
-        let surface = Arc::new(SlackSurface::new(
-            self.inner.client.bot(token),
-            Arc::clone(&self.inner.directory),
-        ));
-        let mut built = self.built();
-        let entry = built.entry(binding).or_insert(Built {
-            surface,
-            started: false,
-        });
-        Ok(Some(Arc::clone(&entry.surface)))
-    }
-
-    /// Like [`surface`](Self::surface), and the first time this process
-    /// uses the binding for a reply, awaits
-    /// [`SlackSurface::refresh_members`], so the reply resolves names. A
-    /// failed refresh is logged; rendering then uses what the directory
-    /// has.
-    ///
-    /// # Errors
-    ///
-    /// As for [`surface`](Self::surface).
-    pub async fn started(
-        &self,
-        binding: BindingId,
-    ) -> Result<Option<Arc<SlackSurface>>, StoreError> {
-        let Some(surface) = self.surface(binding).await? else {
-            return Ok(None);
-        };
-        let first = self
-            .built()
-            .get_mut(&binding)
-            .is_some_and(|built| !std::mem::replace(&mut built.started, true));
-        if first && let Err(err) = surface.refresh_members().await {
-            tracing::warn!(%binding, error = %err, "couldn't read the Slack member list for a new binding");
-        }
+        surface.refresh_in_background();
         Ok(Some(surface))
     }
 
@@ -155,11 +125,9 @@ impl SlackBots {
         let bots = self
             .inner
             .store
-            .active_bots(SurfaceKind::Slack, self.team())
+            .active_bot_users(SurfaceKind::Slack, self.team())
             .await?;
-        self.inner
-            .directory
-            .set_managed_bots(bots.into_iter().map(|bot| bot.bot.user));
+        self.inner.directory.set_managed_bots(bots);
         Ok(())
     }
 }

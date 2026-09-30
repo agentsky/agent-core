@@ -191,6 +191,8 @@ pub struct DirectoryEntry {
     pub owner_name: String,
     /// The username of its active bot on the surface and team asked for.
     pub bot_username: Option<String>,
+    /// The user id of that bot.
+    pub bot_user: Option<UserId>,
 }
 
 /// What [`Store::create_agent`] did.
@@ -447,11 +449,12 @@ impl Store {
             agent: AgentRow,
             owner_name: String,
             bot_username: Option<String>,
+            bot_user_id: Option<String>,
         }
         let rows: Vec<Row> = sqlx::query_as(concat!(
             "SELECT ",
             agent_columns!(),
-            ", m.display_name AS owner_name, b.bot_username \
+            ", m.display_name AS owner_name, b.bot_username, b.bot_user_id \
              FROM agents a JOIN members m ON m.id = a.owner_id \
              LEFT JOIN agent_bindings b ON b.agent_id = a.id AND b.surface = ? \
              AND b.team_id = ? AND b.state = 'active' \
@@ -470,6 +473,7 @@ impl Store {
                     agent: row.agent.into_agent()?,
                     owner_name: row.owner_name,
                     bot_username: row.bot_username,
+                    bot_user: row.bot_user_id.map(UserId::from),
                 })
             })
             .collect()
@@ -705,6 +709,31 @@ impl Store {
         };
         tx.commit().await?;
         Ok(abandoned)
+    }
+
+    /// The bot users of [`active_bots`](Self::active_bots), without reading
+    /// their tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn active_bot_users(
+        &self,
+        surface: SurfaceKind,
+        team: &TeamId,
+    ) -> Result<Vec<UserId>> {
+        let users: Vec<String> = sqlx::query_scalar(
+            "SELECT b.bot_user_id FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
+             WHERE b.surface = ? AND b.team_id = ? AND b.state = 'active' \
+             AND a.state IN ('active', 'paused') \
+             AND b.bot_user_id IS NOT NULL AND b.bot_token_enc IS NOT NULL \
+             ORDER BY b.state_changed_at, b.rowid",
+        )
+        .bind(surface.as_str())
+        .bind(team.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(users.into_iter().map(UserId::from).collect())
     }
 
     /// Every `active` binding on `surface` and `team` whose agent is active

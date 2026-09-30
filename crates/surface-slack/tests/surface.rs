@@ -874,3 +874,128 @@ async fn fill_bot_sender_leaves_humans_known_bots_and_other_teams_alone() {
     }
     assert!(requests(&server).await.is_empty());
 }
+
+fn event_from(fixture: &str) -> InboundEvent {
+    let envelope: Value = serde_json::from_str(fixture).unwrap();
+    let bot = UserId::from(BOT_USER);
+    let team = TEAM.into();
+    let context = Context {
+        binding: BindingId::new_v4(),
+        bot_user: Some(&bot),
+        team: &team,
+        event_id: "Ev0CONFIRM",
+        received_at: time::OffsetDateTime::now_utc(),
+    };
+    normalize::message(&context, &envelope["event"]).unwrap()
+}
+
+#[tokio::test]
+async fn a_top_level_message_is_confirmed_when_slack_has_it_as_it_arrived() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str().to_owned();
+    let cases = [
+        (json!([{"ts": ts, "user": USER, "text": event.text}]), true),
+        (
+            json!([{"ts": ts, "user": "U0HUMAN02", "text": event.text}]),
+            false,
+        ),
+        (
+            json!([{"ts": ts, "user": USER, "text": "something else"}]),
+            false,
+        ),
+        (
+            json!([{"ts": "1727697500.000100", "user": USER, "text": event.text}]),
+            false,
+        ),
+        (
+            json!([{"ts": ts, "user": USER, "text": event.text, "subtype": "channel_join"}]),
+            false,
+        ),
+        (json!([]), false),
+    ];
+    for (messages, confirmed) in cases {
+        let (server, surface) = setup().await;
+        mount(
+            &server,
+            "conversations.history",
+            ok(json!({"messages": messages})),
+        )
+        .await;
+        assert_eq!(surface.confirm(&event).await, Ok(confirmed), "{messages}");
+        let sent = requests(&server).await;
+        assert_eq!(sent.len(), 1);
+        let form = form(&sent[0]);
+        assert_eq!(form["channel"], CHANNEL);
+        assert_eq!(form["oldest"], ts);
+        assert_eq!(form["latest"], ts);
+        assert_eq!(form["inclusive"], "true");
+        assert!(!form.contains_key("ts"));
+    }
+}
+
+#[tokio::test]
+async fn a_thread_reply_is_confirmed_in_its_thread() {
+    let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
+    let root = event.thread_root.clone().unwrap();
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "conversations.replies",
+        ok(json!({"messages": [
+            {"ts": root.as_str(), "user": BOT_USER, "text": "the root", "thread_ts": root.as_str()},
+            {"ts": event.message.id.as_str(), "user": USER, "text": event.text, "thread_ts": root.as_str()},
+        ]})),
+    )
+    .await;
+    assert_eq!(surface.confirm(&event).await, Ok(true));
+    let form = form(&requests(&server).await[0]);
+    assert_eq!(form["ts"], root.as_str());
+    assert_eq!(form["oldest"], event.message.id.as_str());
+}
+
+#[tokio::test]
+async fn a_bot_known_by_its_bot_id_is_confirmed_by_its_user() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0LEGACY1", "user_id": "U0DEPLOY1"}})),
+    )
+    .await;
+    let mut event = bot_event();
+    surface.fill_bot_sender(&mut event).await.unwrap();
+    mount(
+        &server,
+        "conversations.replies",
+        ok(json!({"messages": [
+            {"ts": event.message.id.as_str(), "bot_id": "B0LEGACY1", "text": event.text},
+        ]})),
+    )
+    .await;
+    assert_eq!(surface.confirm(&event).await, Ok(true));
+    event.sender.user = UserId::from("U0HUMAN01");
+    assert_eq!(surface.confirm(&event).await, Ok(false));
+}
+
+#[tokio::test]
+async fn a_message_that_cannot_be_read_back_is_an_error() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "conversations.history",
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"ok": false, "error": "channel_not_found"})),
+    )
+    .await;
+    assert_eq!(
+        surface.confirm(&event).await,
+        Err(SurfaceError::NotFound("channel_not_found".into()))
+    );
+    let mut elsewhere = event;
+    elsewhere.conv.team = "T0OTHER01".into();
+    assert!(matches!(
+        surface.confirm(&elsewhere).await,
+        Err(SurfaceError::Api(_))
+    ));
+}

@@ -251,8 +251,10 @@ api_url = "https://slack.com/api/"
 # agentd's public HTTPS URL, as Slack reaches the public listener through the
 # TLS terminator. Every agent's Slack app is created with request URLs under
 # it (/slack/b/<binding>/events and /interactivity) and with
-# <public_url>/slack/oauth/callback as its OAuth redirect URL. Without it,
-# `/agent create` on Slack is refused. No default.
+# <public_url>/slack/oauth/callback as its OAuth redirect URL. The URL is baked
+# into each app when it is created: changing it later doesn't move existing
+# apps, whose install links keep the old one. Without it, `/agent create` on
+# Slack is refused. No default.
 # public_url = "https://agentd.example.com"
 
 # Whether agents' apps ask for chat:write.public, which lets a bot post in

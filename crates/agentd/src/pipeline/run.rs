@@ -109,7 +109,10 @@ pub struct PipelineSettings {
 ///    store loaded for it.
 /// 4. **The turn.** On [`Decision::Run`], only when the agent's bot may
 ///    post in the conversation without joining it
-///    ([`Surface::can_post`]): the persona file is written from the store,
+///    ([`Surface::can_post`]), and, unless the agent's owner asked and
+///    pays, only once the surface confirmed the message is the platform's
+///    as it arrived ([`Surface::confirm`]; a refusal or an error drops it):
+///    the persona file is written from the store,
 ///    the thread's session looked up (a DM has one for the conversation, a
 ///    channel one per thread, rooted at the message when it starts one),
 ///    the turn message built with what the session's transcript lacks, and
@@ -635,6 +638,27 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Whether `agent`'s owner asked for `turn` and pays for it: on their
+    /// own subscription or the community key. Such a message needs no
+    /// confirming ([`Surface::confirm`]), since the owner could have sent
+    /// it for real.
+    async fn paid_by_owner(&self, agent: AgentId, turn: &Run) -> Result<bool, StoreError> {
+        let Some(owner) = self
+            .inner
+            .store
+            .agent(agent)
+            .await?
+            .map(|agent| agent.owner)
+        else {
+            return Ok(false);
+        };
+        Ok(turn.requester.member == Some(owner)
+            && match &turn.credential {
+                CredentialRef::Member(member) => *member == owner,
+                CredentialRef::Community => true,
+            })
+    }
+
     async fn agent_name(&self, agent: AgentId) -> Result<String, StoreError> {
         Ok(self
             .inner
@@ -661,6 +685,19 @@ impl Pipeline {
         if !surface.can_post(&event.conv).await? {
             tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
             return Ok(());
+        }
+        if !self.paid_by_owner(agent, &turn).await? {
+            match surface.confirm(event).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(%agent, message = %event.message.id, "the platform doesn't have this message as it arrived; dropped it");
+                    return Ok(());
+                }
+                Err(err) => {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't confirm a message with the platform; dropped it");
+                    return Ok(());
+                }
+            }
         }
         let target = reply_target(event, caps);
         let (working, ran) = match self.prepare(agent, event, turn.credential).await {

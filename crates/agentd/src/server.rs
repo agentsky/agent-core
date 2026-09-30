@@ -78,9 +78,9 @@ pub struct Routers {
     /// manager bot's connection. [`Server::run`] holds it until shutdown,
     /// so the intake runs as long as the listeners.
     pub commands: CommandSubmitter,
-    /// Where the Slack queue sends agents' messages.
-    /// [`Server::with_pipeline`] connects it to the turn pipeline.
-    pub slack_messages: slack::Messages,
+    /// Where the Slack queue sends agents' messages, when agentd serves
+    /// Slack. [`Server::with_pipeline`] connects it to the turn pipeline.
+    pub slack_messages: Option<slack::Messages>,
 }
 
 impl Routers {
@@ -98,14 +98,18 @@ impl Routers {
     pub fn new(app: &App) -> anyhow::Result<Self> {
         let (slack_routes, slack_queue) = slack::routes(app);
         let (intake, commands) = CommandIntake::new(app.commands().clone());
-        let slack_messages = slack::Messages::default();
         let mut inbound = slack::Inbound::new(
             app.store().clone(),
             app.slack().map(|slack| slack.identity().clone()),
             commands.clone(),
         );
+        let mut slack_messages = None;
+        let mut message_worker = None;
         if let Some(agents) = app.slack_agents() {
-            inbound = inbound.with_agents(agents.bots().clone(), slack_messages.clone());
+            let (messages, worker) = slack::Messages::new(agents.bots().clone());
+            inbound = inbound.with_agents(messages.clone());
+            slack_messages = Some(messages);
+            message_worker = Some(Worker::new("Slack agents' messages", worker));
         }
         let tokens: Arc<dyn TokenSource> = app.auth().clone();
         let upstream = &app.config().proxy.upstream;
@@ -128,10 +132,12 @@ impl Routers {
             public: public_router(app.clone()).merge(slack_routes),
             proxy: proxy.into_router(),
             ctl: app.ctl().router(),
-            workers: vec![Worker::new(
+            workers: std::iter::once(Worker::new(
                 "Slack queue",
                 slack::run_queue(slack_queue, app.store().clone(), Sender::new(inbound)),
-            )],
+            ))
+            .chain(message_worker)
+            .collect(),
             intake,
             commands,
             slack_messages,
@@ -256,9 +262,9 @@ impl Server {
     /// receive, to `pipeline`, which runs turns, while serving. Without it
     /// agentd runs none.
     pub fn with_pipeline(mut self, pipeline: Pipeline) -> Self {
-        self.routers
-            .slack_messages
-            .connect(pipeline.sink(surface_slack::surface::CAPS));
+        if let Some(messages) = &self.routers.slack_messages {
+            messages.connect(pipeline.sink(surface_slack::surface::CAPS));
+        }
         self.pipeline = Some(pipeline);
         self
     }
@@ -310,6 +316,7 @@ impl Server {
             addrs,
             pipeline,
         } = self;
+        drop(routers.slack_messages);
         let drain_timeout = app.config().server.drain_timeout();
         let (stop, stopping) = watch::channel(false);
         let (stop_internal, internal_stopping) = watch::channel(false);

@@ -2,7 +2,7 @@
 //! (see [`SlackAgents`](crate::slack::agents::SlackAgents)).
 
 use core_types::{MemberKey, SurfaceKind};
-use store::Agent;
+use store::{Agent, AgentBinding};
 
 use super::agents::{default_persona, persona_problem};
 use super::{Commands, Failure, Origin};
@@ -32,12 +32,11 @@ impl Commands {
         else {
             return Ok("Creating agents here isn't available yet.".to_owned());
         };
-        if !agents.can_create() {
-            return Ok(
-                "Creating agents on Slack needs agentd's public URL, which isn't set. Ask whoever \
-                 runs agentd to set `[slack] public_url`."
-                    .to_owned(),
-            );
+        if render::slack::BROADCASTS.contains(&name) {
+            return Ok(format!(
+                "Slack reads `@{name}` as a message to everyone, so an agent can't be called \
+                 `{name}` here. Pick another name."
+            ));
         }
         let member = match self.linked_owner(key, origin).await? {
             Ok(member) => member,
@@ -53,21 +52,18 @@ impl Commands {
             .await?;
         let persona = persona.unwrap_or_else(|| default_persona(name, &owner));
         let register = origin.command("slack-token <token> <refresh token>");
-        let invite = format!(
-            "Once it is installed, invite it to a channel with `/invite @{name}` and mention it \
-             there: it only hears the channels it's in. You can also send it a direct message."
-        );
+        let installed = "Once it is installed, I'll tell you how to invite it to a channel.";
         Ok(match agents.create(member, key, name, &persona).await? {
             Creation::Created { dm_sent: true, .. } => format!(
                 "Created `{name}` as a Slack app. I sent you a direct message with the link that \
-                 installs it. {invite}"
+                 installs it. {installed}"
             ),
             Creation::Created {
                 install_url,
                 dm_sent: false,
             } => format!(
-                "Created `{name}` as a Slack app. Install it with this link:\n{install_url}\n\n\
-                 {invite}"
+                "Created `{name}` as a Slack app. [Install {name}]({install_url}) in this \
+                 workspace. {installed}"
             ),
             Creation::NameTaken => format!("You already have an agent named `{name}`."),
             Creation::LimitReached => format!(
@@ -76,14 +72,27 @@ impl Commands {
                 agents.max_per_owner(),
                 origin.command("delete <name>")
             ),
+            Creation::NoPublicUrl => "Creating agents on Slack needs agentd's public URL, which \
+                                      isn't set. Ask whoever runs agentd to set \
+                                      `[slack] public_url`."
+                .to_owned(),
             Creation::NoConfigToken => format!(
                 "Each agent on Slack is an app I create as you, with your app configuration \
                  token, and I don't have one that works. Generate one at {APPS_PAGE} (\"Your App \
                  Configuration Tokens\"), send it with {register}, then create `{name}` again."
             ),
+            Creation::TokenRenewing => format!(
+                "Your app configuration token expired, and I'm renewing it, so I didn't create \
+                 `{name}` yet. Try again in a minute."
+            ),
             Creation::TokenRefused => format!(
                 "Slack refused your configuration token, so I didn't create `{name}`. Generate a \
                  new one at {APPS_PAGE}, send it with {register}, and try again."
+            ),
+            Creation::Refused(code) if code == "invalid_manifest" => format!(
+                "Slack refused to create an app for `{name}` (`invalid_manifest`), so I didn't \
+                 create it. Slack checks that it can reach agentd while it creates the app: ask \
+                 whoever runs agentd to check that `[slack] public_url` is reachable from Slack."
             ),
             Creation::Refused(code) => format!(
                 "Slack refused to create an app for `{name}` (`{}`), so I didn't create it.",
@@ -96,42 +105,39 @@ impl Commands {
         })
     }
 
-    /// The reply to deleting `agent`, named `name`, when it was on Slack:
-    /// its apps are deleted with its owner's configuration token, or the
-    /// owner is told to delete them. `None` for an agent with no Slack
-    /// binding.
+    /// The reply to deleting `agent`, named `name`, whose `bindings` were
+    /// read before it was deleted, when it was on Slack: its apps are
+    /// deleted with its owner's configuration token, or the owner is told
+    /// to delete them. `None` for an agent with no Slack binding.
     pub(super) async fn delete_on_slack(
         &self,
         agent: &Agent,
         name: &str,
-    ) -> Result<Option<String>, Failure> {
-        let bindings = self.inner.store.bindings_of(agent.id).await?;
+        bindings: &[AgentBinding],
+    ) -> Option<String> {
         if !bindings
             .iter()
             .any(|binding| binding.surface == SurfaceKind::Slack)
         {
-            return Ok(None);
+            return None;
         }
         let Some(agents) = &self.inner.slack_agents else {
-            return Ok(Some(format!(
+            return Some(format!(
                 "Deleted `{name}`. Delete its Slack app yourself at {APPS_PAGE}."
-            )));
+            ));
         };
-        let deletions = agents.delete_apps(agent.owner, &bindings).await?;
-        let left: Vec<(&String, bool)> = deletions
-            .iter()
-            .filter_map(|deletion| match deletion {
-                AppDeletion::Deleted => None,
-                AppDeletion::NoToken(app) => Some((app, true)),
-                AppDeletion::Failed(app) => Some((app, false)),
-            })
-            .collect();
-        let Some(&(app, no_token)) = left.first() else {
-            return Ok(Some(if deletions.is_empty() {
+        let deletions = agents.delete_apps(agent.owner, bindings).await;
+        let left = deletions.iter().find_map(|deletion| match deletion {
+            AppDeletion::Deleted => None,
+            AppDeletion::NoToken(app) => Some((Some(app), true)),
+            AppDeletion::Failed(app) => Some((app.as_ref(), false)),
+        });
+        let Some((app, no_token)) = left else {
+            return Some(if deletions.is_empty() {
                 format!("Deleted `{name}`.")
             } else {
                 format!("Deleted `{name}` and its Slack app.")
-            }));
+            });
         };
         let why = if no_token {
             "deleting its Slack app needs your configuration token, and I don't have one that \
@@ -139,11 +145,14 @@ impl Commands {
         } else {
             "deleting its Slack app failed"
         };
-        Ok(Some(format!(
+        let page = match app {
+            Some(app) => format!("{APPS_PAGE}/{}", shown(app)),
+            None => APPS_PAGE.to_owned(),
+        };
+        Some(format!(
             "Deleted `{name}`: it no longer answers, but {why}. Delete the app yourself at \
-             {APPS_PAGE}/{}.",
-            shown(app)
-        )))
+             {page}."
+        ))
     }
 }
 

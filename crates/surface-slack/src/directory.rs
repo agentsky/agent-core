@@ -259,7 +259,8 @@ impl fmt::Debug for TeamDirectory {
 /// A name two members share resolves to no one, since a missed mention is
 /// better than pinging the wrong person, unless exactly one of them is a
 /// managed agent's bot user ([`TeamDirectory::set_managed_bots`]): then it
-/// resolves to that agent, so a human can't take an agent's name.
+/// resolves to that agent, so a human can't take an agent's name. A managed
+/// agent's bot user id resolves to it too, which names it unambiguously.
 ///
 /// `Debug` shows counts, never names.
 #[derive(Default)]
@@ -296,8 +297,13 @@ impl MemberDirectory {
     }
 
     /// The member called `name`: the only one, or the only managed agent
-    /// among several.
+    /// among several. A managed agent's bot user is also called by its
+    /// user id, exactly as written, so agentd can name one agent among
+    /// several that share a name.
     pub fn lookup(&self, name: &str) -> Option<&UserId> {
+        if let Some(bot) = self.managed.iter().find(|bot| bot.as_str() == name) {
+            return Some(bot);
+        }
         let ids = self.names.get(&fold(name))?;
         let mut agents = ids.iter().filter(|id| self.managed.contains(*id));
         match (agents.next(), agents.next()) {
@@ -445,6 +451,9 @@ mod tests {
 
         let two = plain.with_managed(Arc::new(HashSet::from(["U2".into(), "U3".into()])));
         assert_eq!(two.resolve("helper"), None);
+        assert_eq!(two.resolve("U3").as_deref(), Some("U3"), "by its id");
+        assert_eq!(two.resolve("u3"), None);
+        assert_eq!(two.resolve("U1"), None, "a human isn't named by id");
 
         let absent = plain.with_managed(Arc::new(HashSet::from(["U9".into()])));
         assert_eq!(absent.resolve("helper"), None);

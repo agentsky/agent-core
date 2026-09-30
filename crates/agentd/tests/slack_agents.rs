@@ -31,7 +31,7 @@ use testkit::{Turn, agentctl_path, fake_anthropic, fake_claude_path};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use wiremock::matchers::{header, method, path, path_regex};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use common::{Response, TempDir, env};
@@ -410,9 +410,10 @@ impl Harness {
     }
 }
 
-/// The install link's `state` in `text`.
+/// The install link's `state` in `text`: the first query parameter of the
+/// `<url|label>` link the manager app posted.
 fn state_in(text: &str) -> String {
-    let start = text.find("state=").expect("an install link") + "state=".len();
+    let start = text.find("?state=").expect("an install link") + "?state=".len();
     text[start..]
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || "-_.%".contains(*c))
@@ -428,12 +429,13 @@ async fn create(harness: &mut Harness) -> (String, String) {
         .manager_posts()
         .await
         .into_iter()
-        .find(|text| text.contains("Install `helper`"))
+        .find(|text| text.contains("|Install helper>"))
         .expect("an install DM");
     assert!(
-        dm.contains("https://slack.com/oauth/v2/authorize?client_id=1111.2222"),
+        dm.starts_with("<https://slack.com/oauth/v2/authorize?state="),
         "{dm}"
     );
+    assert!(dm.contains("&amp;client_id=1111.2222&amp;"), "{dm}");
     (reply, state_in(&dm))
 }
 
@@ -445,7 +447,7 @@ async fn create_install_and_callback_make_an_active_agent_app() {
         reply.starts_with("Created `helper` as a Slack app."),
         "{reply}"
     );
-    assert!(reply.contains("/invite @helper"), "{reply}");
+    assert!(reply.contains("I'll tell you how to invite it"), "{reply}");
 
     let challenges: Vec<(u16, String)> = harness
         .challenges
@@ -508,17 +510,25 @@ async fn create_install_and_callback_make_an_active_agent_app() {
     );
     let app = harness.store().slack_app(binding).await.unwrap().unwrap();
     assert_eq!(app.state, BindingState::Active);
-    assert_eq!(app.bot_user, Some(UserId::new(AGENT_BOT)));
+    let row = harness.store().binding(binding).await.unwrap().unwrap();
+    assert_eq!(row.bot_user, Some(UserId::new(AGENT_BOT)));
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !harness
-        .manager_posts()
-        .await
-        .iter()
-        .any(|text| text.contains("`helper` is installed"))
-    {
+    let told = loop {
+        if let Some(told) = harness
+            .manager_posts()
+            .await
+            .into_iter()
+            .find(|text| text.contains("`helper` is installed"))
+        {
+            break told;
+        }
         assert!(Instant::now() < deadline, "the owner wasn't told");
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    assert!(
+        told.contains(&format!("installed as <@{AGENT_BOT}>")),
+        "the bot is mentioned, since several agents may share a name: {told}"
+    );
 
     let replayed = harness.get(&callback).await;
     assert_eq!(
@@ -595,6 +605,7 @@ async fn a_refused_creation_frees_the_name_and_says_why() {
         .await;
     let reply = harness.slash("create helper").await;
     assert!(reply.contains("`invalid_manifest`"), "{reply}");
+    assert!(reply.contains("`[slack] public_url`"), "{reply}");
     assert!(
         harness
             .store()
@@ -613,6 +624,18 @@ async fn a_refused_creation_frees_the_name_and_says_why() {
     let reply = harness.slash("create helper").await;
     assert!(reply.contains("/agent slack-token"), "{reply}");
     assert_eq!(harness.requests("apps.manifest.create").await.len(), 1);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_is_never_named_after_a_broadcast() {
+    let mut harness = Harness::start("").await;
+    harness.creates_apps().await;
+    for name in ["here", "channel", "everyone"] {
+        let reply = harness.slash(&format!("create {name}")).await;
+        assert!(reply.contains("message to everyone"), "{name}: {reply}");
+    }
+    assert!(harness.requests("apps.manifest.create").await.is_empty());
     harness.stop().await;
 }
 
@@ -711,183 +734,450 @@ async fn delete_without_a_configuration_token_disables_the_binding_and_says_what
     harness.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_channel_mention_of_an_agent_is_answered_with_its_bot_token() {
-    let claude = fake_claude_path();
-    let agentctl = agentctl_path();
-    let dir = TempDir::new();
-    let fake = fake_anthropic().await;
-    let slack = fake_slack().await;
-    let text = format!(
-        "{}\n[proxy]\nupstream = \"{}\"\n",
-        config_text(&slack, "")
-            .replace("/nonexistent/agentd", &dir.path().display().to_string())
-            .replace(
-                "sqlite::memory:",
-                &format!("sqlite://{}", dir.path().join("agentd.db").display())
-            ),
-        fake.uri()
-    );
-    let config = Config::parse(&text, slack_env()).unwrap();
-    let app = App::open(config).await.unwrap();
-    let store = app.store().clone();
-    let ada = link(&store, &ada()).await;
-    let team = TeamId::new(fixtures::TEAM);
-    let AgentCreation::Created(_, binding) = store
-        .create_agent(
-            &NewAgent {
-                owner: ada,
-                name: "helper",
-                persona: "You are helper.",
-                visibility: Visibility::Public,
-                surface: SurfaceKind::Slack,
-                team: &team,
-            },
-            10,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("created");
-    };
-    assert!(
-        store
-            .set_slack_app(
-                binding,
-                &NewSlackApp {
-                    app_id: APP_ID.to_owned(),
-                    client_id: CLIENT_ID.to_owned(),
-                    client_secret: SecretString::from(CLIENT_SECRET),
-                    signing_secret: SecretString::from(SIGNING_SECRET),
-                    scopes: "chat:write".to_owned(),
-                },
-                "helper",
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .install_slack_app(
-                binding,
-                APP_ID,
-                &UserId::new(AGENT_BOT),
-                &SecretString::from(AGENT_TOKEN),
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap()
-    );
+/// An agent's installed app, for [`Turned`].
+struct AgentSpec {
+    name: &'static str,
+    app_id: &'static str,
+    bot: &'static str,
+    token: &'static str,
+    secret: &'static str,
+    posted_ts: &'static str,
+}
 
-    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
-        .await
-        .unwrap();
-    let addrs = server.addrs();
-    let script = dir.path().join("script.json");
-    testkit::write_script(&script, &vec![Turn::reply("Hello from helper."); 4]).unwrap();
-    let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
-    let mut vars = BTreeMap::from([
-        (
-            testkit::claude::SCRIPT_ENV.to_owned(),
-            script.display().to_string(),
-        ),
-        ("PATH".to_owned(), path),
-    ]);
-    for name in ["NO_PROXY", "no_proxy"] {
-        vars.insert(name.to_owned(), addrs.proxy.ip().to_string());
+const HELPER: AgentSpec = AgentSpec {
+    name: "helper",
+    app_id: APP_ID,
+    bot: AGENT_BOT,
+    token: AGENT_TOKEN,
+    secret: SIGNING_SECRET,
+    posted_ts: "1727700001.000200",
+};
+
+const SCOUT: AgentSpec = AgentSpec {
+    name: "scout",
+    app_id: "A0SCOUT01",
+    bot: "U0SCOUT01",
+    token: "xoxb-scout-SECRET",
+    secret: "signing-SECRET-scout",
+    posted_ts: "1727700002.000300",
+};
+
+/// agentd running turns, with ada's installed agents and bob linked too.
+struct Turned {
+    slack: MockServer,
+    fake: testkit::FakeAnthropic,
+    store: Store,
+    public: SocketAddr,
+    bindings: Vec<BindingId>,
+    ada: MemberId,
+    bob: MemberId,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<anyhow::Result<()>>,
+    _dir: TempDir,
+}
+
+fn bob() -> MemberKey {
+    MemberKey {
+        user: UserId::new(fixtures::OTHER_USER),
+        ..ada()
     }
-    let settings = TurnSettings {
-        process: ProcessConfig {
-            claude_bin: claude.display().to_string(),
-            anthropic_base_url: format!("http://{}", addrs.proxy),
-            turn_timeout_secs: 60,
-        },
-        pool: PoolConfig {
-            global_container_cap: 1,
-            ..PoolConfig::default()
-        },
-        image: "unused".to_owned(),
-        data_dir: dir.path().to_owned(),
-        agentctl_url: format!("http://{}", addrs.ctl),
-        env: vars,
-    };
-    let sandbox = ProcessSandbox::new(store.clone(), dir.path()).unwrap();
-    let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
-    let server = server.with_pipeline(Pipeline::for_app(&app, turns));
-    let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.run(
-        async {
-            let _ = stopped.await;
-        },
-        std::future::pending(),
-    ));
+}
 
-    let events = format!("/slack/b/{binding}/events");
-    let post = |body: String| {
-        let headers =
-            fixtures::signed_headers(SIGNING_SECRET, fixtures::now(), body.as_bytes()).to_vec();
-        let (addr, events) = (addrs.public, events.clone());
+/// A channel message from `user` at `ts` with `text`, as an agent's app
+/// receives it.
+fn channel_message(user: &str, ts: &str, event_id: &str, text: &str) -> String {
+    let mut envelope: Value = serde_json::from_str(fixtures::MESSAGE_MENTION).unwrap();
+    envelope["event_id"] = json!(event_id);
+    let event = &mut envelope["event"];
+    event["user"] = json!(user);
+    event["ts"] = json!(ts);
+    event["event_ts"] = json!(ts);
+    event["text"] = json!(text);
+    event.as_object_mut().unwrap().remove("blocks");
+    envelope.to_string()
+}
+
+impl Turned {
+    async fn start(agents: &[AgentSpec]) -> Self {
+        let claude = fake_claude_path();
+        let agentctl = agentctl_path();
+        let dir = TempDir::new();
+        let fake = fake_anthropic().await;
+        let slack = fake_slack().await;
+        for agent in agents.iter().skip(1) {
+            for (name, body) in [
+                ("chat.postMessage", json!({"ts": agent.posted_ts})),
+                ("reactions.add", json!({})),
+                ("reactions.remove", json!({})),
+                ("conversations.replies", json!({"messages": []})),
+                ("conversations.history", json!({"messages": []})),
+                ("users.list", json!({"members": []})),
+            ] {
+                mount(&slack, name, agent.token, body).await;
+            }
+        }
+        let text = format!(
+            "{}\n[proxy]\nupstream = \"{}\"\n",
+            config_text(&slack, "")
+                .replace("/nonexistent/agentd", &dir.path().display().to_string())
+                .replace(
+                    "sqlite::memory:",
+                    &format!("sqlite://{}", dir.path().join("agentd.db").display())
+                ),
+            fake.uri()
+        );
+        let config = Config::parse(&text, slack_env()).unwrap();
+        let app = App::open(config).await.unwrap();
+        let store = app.store().clone();
+        let ada = link(&store, &ada()).await;
+        let bob = link(&store, &bob()).await;
+        let team = TeamId::new(fixtures::TEAM);
+        let mut bindings = Vec::new();
+        for agent in agents {
+            let AgentCreation::Created(_, binding) = store
+                .create_agent(
+                    &NewAgent {
+                        owner: ada,
+                        name: agent.name,
+                        persona: "You help.",
+                        visibility: Visibility::Public,
+                        surface: SurfaceKind::Slack,
+                        team: &team,
+                    },
+                    10,
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("created");
+            };
+            assert!(
+                store
+                    .set_slack_app(
+                        binding,
+                        &NewSlackApp {
+                            app_id: agent.app_id.to_owned(),
+                            client_id: CLIENT_ID.to_owned(),
+                            client_secret: SecretString::from(CLIENT_SECRET),
+                            signing_secret: SecretString::from(agent.secret),
+                            scopes: "chat:write".to_owned(),
+                            redirect_url: format!("{PUBLIC_URL}/slack/oauth/callback"),
+                        },
+                        agent.name,
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                store
+                    .install_slack_app(
+                        binding,
+                        agent.app_id,
+                        &UserId::new(agent.bot),
+                        &SecretString::from(agent.token),
+                        OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .unwrap()
+            );
+            bindings.push(binding);
+        }
+
+        let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+            .await
+            .unwrap();
+        let addrs = server.addrs();
+        let script = dir.path().join("script.json");
+        testkit::write_script(&script, &vec![Turn::reply("Hello from helper."); 4]).unwrap();
+        let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
+        let mut vars = BTreeMap::from([
+            (
+                testkit::claude::SCRIPT_ENV.to_owned(),
+                script.display().to_string(),
+            ),
+            ("PATH".to_owned(), path),
+        ]);
+        for name in ["NO_PROXY", "no_proxy"] {
+            vars.insert(name.to_owned(), addrs.proxy.ip().to_string());
+        }
+        let settings = TurnSettings {
+            process: ProcessConfig {
+                claude_bin: claude.display().to_string(),
+                anthropic_base_url: format!("http://{}", addrs.proxy),
+                turn_timeout_secs: 60,
+            },
+            pool: PoolConfig {
+                global_container_cap: 1,
+                ..PoolConfig::default()
+            },
+            image: "unused".to_owned(),
+            data_dir: dir.path().to_owned(),
+            agentctl_url: format!("http://{}", addrs.ctl),
+            env: vars,
+        };
+        let sandbox = ProcessSandbox::new(store.clone(), dir.path()).unwrap();
+        let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
+        let server = server.with_pipeline(Pipeline::for_app(&app, turns));
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(server.run(
+            async {
+                let _ = stopped.await;
+            },
+            std::future::pending(),
+        ));
+        Self {
+            slack,
+            fake,
+            store,
+            public: addrs.public,
+            bindings,
+            ada,
+            bob,
+            stop,
+            task,
+            _dir: dir,
+        }
+    }
+
+    /// Posts `body` to the events URL of the agent at `index`, signed with
+    /// its secret.
+    async fn post(&self, index: usize, secret: &str, body: String) -> u16 {
+        let events = format!("/slack/b/{}/events", self.bindings[index]);
+        let headers = fixtures::signed_headers(secret, fixtures::now(), body.as_bytes()).to_vec();
+        let addr = self.public;
         tokio::task::spawn_blocking(move || common::post(addr, &events, &headers, &body).unwrap())
-    };
-    let elsewhere = fixtures::MESSAGE_MENTION
-        .replace("U0BOT0001", AGENT_BOT)
-        .replace("T0TEAM001", "T0OTHER01")
-        .replace("Ev0MENTION1", "Ev0ELSEWHERE")
-        .replace("1727697600.000100", "1727697500.000100");
-    assert_eq!(post(elsewhere).await.unwrap().status, 200);
-    let mention = fixtures::MESSAGE_MENTION.replace("U0BOT0001", AGENT_BOT);
-    assert_eq!(post(mention).await.unwrap().status, 200);
+            .await
+            .unwrap()
+            .status
+    }
 
-    let agent_posts = || async {
-        slack
+    async fn requests(&self, name: &str, token: &str) -> Vec<Request> {
+        let wanted = format!("/api/{name}");
+        self.slack
             .received_requests()
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|request| {
-                request.url.path() == "/api/chat.postMessage"
+                request.url.path() == wanted
                     && request.headers.get("authorization").unwrap()
-                        == format!("Bearer {AGENT_TOKEN}").as_str()
+                        == format!("Bearer {token}").as_str()
             })
+            .collect()
+    }
+
+    /// What the agent whose bot token is `token` posted.
+    async fn posts(&self, token: &str) -> Vec<Value> {
+        self.requests("chat.postMessage", token)
+            .await
+            .into_iter()
             .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
-            .collect::<Vec<_>>()
-    };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let posts = loop {
-        let posts = agent_posts().await;
-        if !posts.is_empty() {
-            break posts;
+            .collect()
+    }
+
+    /// Waits until the agent whose bot token is `token` posted `count`
+    /// messages.
+    async fn wait_for_posts(&self, token: &str, count: usize) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let posts = self.posts(token).await;
+            if posts.len() >= count {
+                return posts;
+            }
+            assert!(Instant::now() < deadline, "the agent never replied");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(Instant::now() < deadline, "the agent never replied");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    }
+
+    /// The record of the agent's post `ts`, once the pipeline made it.
+    async fn posted(&self, ts: &str) -> store::MessageRef {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(posted) = self.store.posted_message_ref(&reply_ref(ts)).await.unwrap() {
+                return posted;
+            }
+            assert!(Instant::now() < deadline, "the post was never recorded");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The lookups that confirmed a message with Slack, with `token`.
+    async fn confirmations(&self, token: &str) -> Vec<Request> {
+        self.requests("conversations.history", token)
+            .await
+            .into_iter()
+            .filter(|request| String::from_utf8_lossy(&request.body).contains("oldest="))
+            .collect()
+    }
+
+    /// Waits until a message was looked up with `token`, and a moment more
+    /// for what would follow.
+    async fn wait_for_confirmation(&self, token: &str) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.confirmations(token).await.is_empty() {
+            assert!(Instant::now() < deadline, "the message was never looked up");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    /// Makes Slack answer a lookup of the message at `ts` with `response`.
+    async fn answer_lookup(&self, ts: &str, response: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.history"))
+            .and(body_string_contains(format!("oldest={ts}").as_str()))
+            .respond_with(response)
+            .with_priority(1)
+            .mount(&self.slack)
+            .await;
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+fn reply_ref(ts: &str) -> core_types::MsgRef {
+    core_types::MsgRef {
+        conv: core_types::ConvRef {
+            surface: SurfaceKind::Slack,
+            team: TeamId::new(fixtures::TEAM),
+            conversation: fixtures::CHANNEL.into(),
+        },
+        id: ts.into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_channel_mention_of_an_agent_is_answered_with_its_bot_token() {
+    let turned = Turned::start(&[HELPER]).await;
+    let elsewhere = fixtures::MESSAGE_MENTION
+        .replace("U0BOT0001", AGENT_BOT)
+        .replace("T0TEAM001", "T0OTHER01")
+        .replace("Ev0MENTION1", "Ev0ELSEWHERE")
+        .replace("1727697600.000100", "1727697500.000100");
+    assert_eq!(turned.post(0, SIGNING_SECRET, elsewhere).await, 200);
+    let mention = fixtures::MESSAGE_MENTION.replace("U0BOT0001", AGENT_BOT);
+    assert_eq!(turned.post(0, SIGNING_SECRET, mention).await, 200);
+
+    let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
     assert_eq!(posts.len(), 1, "{posts:?}");
     assert_eq!(posts[0]["text"], "Hello from helper.");
     assert_eq!(posts[0]["channel"], fixtures::CHANNEL);
     assert_eq!(posts[0]["thread_ts"], "1727697600.000100");
-    let reply = core_types::MsgRef {
-        conv: core_types::ConvRef {
-            surface: SurfaceKind::Slack,
-            team: team.clone(),
-            conversation: fixtures::CHANNEL.into(),
-        },
-        id: "1727700001.000200".into(),
-    };
-    let posted = store.posted_message_ref(&reply).await.unwrap().unwrap();
-    assert_eq!(posted.requester.member, Some(ada));
+    let posted = turned.posted(HELPER.posted_ts).await;
+    assert_eq!(posted.requester.member, Some(turned.ada));
     assert!(posted.agent.is_some());
     assert_eq!(
-        fake.message_requests().await.len(),
+        turned.fake.message_requests().await.len(),
         1,
         "one turn: the message from another workspace was dropped"
     );
+    assert!(
+        turned.confirmations(AGENT_TOKEN).await.is_empty(),
+        "the owner's own message on their own account needs no lookup"
+    );
+    turned.stop().await;
+}
 
-    stop.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(20), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_from_another_member_that_slack_does_not_have_is_dropped() {
+    let turned = Turned::start(&[HELPER]).await;
+    let text = format!("<@{AGENT_BOT}> spend bob's plan");
+    let forged = channel_message(
+        fixtures::OTHER_USER,
+        "1727697610.000100",
+        "Ev0FORGED",
+        &text,
+    );
+    turned
+        .answer_lookup(
+            "1727697610.000100",
+            ok(json!({"messages": [
+                {"ts": "1727697610.000100", "user": fixtures::OTHER_USER, "text": "something else"},
+            ]})),
+        )
+        .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, forged).await, 200);
+    turned.wait_for_confirmation(AGENT_TOKEN).await;
+    assert!(turned.posts(AGENT_TOKEN).await.is_empty());
+    assert!(turned.fake.message_requests().await.is_empty(), "no turn");
+    let form: HashMap<String, String> =
+        serde_urlencoded::from_bytes(&turned.confirmations(AGENT_TOKEN).await[0].body).unwrap();
+    assert_eq!(form["channel"], fixtures::CHANNEL);
+    assert_eq!(form["latest"], "1727697610.000100");
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_from_another_member_that_slack_confirms_runs_on_their_account() {
+    let turned = Turned::start(&[HELPER]).await;
+    let text = format!("<@{AGENT_BOT}> what's new?");
+    let genuine = channel_message(
+        fixtures::OTHER_USER,
+        "1727697620.000100",
+        "Ev0GENUINE",
+        &text,
+    );
+    turned
+        .answer_lookup(
+            "1727697620.000100",
+            ok(json!({"messages": [
+                {"ts": "1727697620.000100", "user": fixtures::OTHER_USER, "text": text},
+            ]})),
+        )
+        .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, genuine).await, 200);
+    let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    assert_eq!(posts[0]["thread_ts"], "1727697620.000100");
+    assert_eq!(turned.confirmations(AGENT_TOKEN).await.len(), 1);
+    let posted = turned.posted(HELPER.posted_ts).await;
+    assert_eq!(posted.requester.member, Some(turned.bob));
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_slack_cannot_confirm_is_dropped() {
+    let turned = Turned::start(&[HELPER]).await;
+    let text = format!("<@{AGENT_BOT}> hello");
+    let message = channel_message(
+        fixtures::OTHER_USER,
+        "1727697630.000100",
+        "Ev0UNSURE",
+        &text,
+    );
+    turned
+        .answer_lookup("1727697630.000100", ResponseTemplate::new(500))
+        .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, message).await, 200);
+    turned.wait_for_confirmation(AGENT_TOKEN).await;
+    assert!(turned.posts(AGENT_TOKEN).await.is_empty());
+    assert!(turned.fake.message_requests().await.is_empty(), "no turn");
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_agents_in_a_channel_each_answer_a_message_once() {
+    let turned = Turned::start(&[HELPER, SCOUT]).await;
+    let text = format!("<@{}> <@{}> compare notes", HELPER.bot, SCOUT.bot);
+    for (index, agent) in [HELPER, SCOUT].iter().enumerate() {
+        for event_id in ["Ev0BOTH1", "Ev0BOTH1RETRY"] {
+            let body = channel_message(fixtures::USER, "1727697640.000100", event_id, &text);
+            assert_eq!(turned.post(index, agent.secret, body).await, 200);
+        }
+    }
+    turned.wait_for_posts(HELPER.token, 1).await;
+    turned.wait_for_posts(SCOUT.token, 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(turned.posts(HELPER.token).await.len(), 1);
+    assert_eq!(turned.posts(SCOUT.token).await.len(), 1);
+    assert_eq!(turned.fake.message_requests().await.len(), 2);
+    turned.stop().await;
 }

@@ -209,16 +209,20 @@ async fn without_a_signing_secret_the_manager_urls_are_404() {
 }
 
 #[tokio::test]
-async fn the_manager_answers_the_challenge_and_verifies_everything_else() {
+async fn the_manager_answers_a_signed_challenge_and_verifies_everything_else() {
     let slack = fake_slack().await;
     let app = App::open(config(Some(&slack))).await.unwrap();
     let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
-    let challenge = running
+    let unsigned = running
         .post(
             "/slack/b/manager/events",
             Vec::new(),
             fixtures::URL_VERIFICATION,
         )
+        .await;
+    assert_eq!(unsigned.status, 401);
+    let challenge = running
+        .signed("/slack/b/manager/events", fixtures::URL_VERIFICATION)
         .await;
     assert_eq!(
         (challenge.status, challenge.body.as_str()),

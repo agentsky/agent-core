@@ -509,7 +509,7 @@ async fn a_refused_upload_shares_nothing() {
         .unwrap_err();
     assert_eq!(
         err,
-        SurfaceError::Api("the file upload was refused (HTTP 500)".into())
+        SurfaceError::Transport("the file upload failed (HTTP 500)".into())
     );
     let sent = requests(&server).await;
     assert!(
@@ -680,7 +680,7 @@ async fn http_failures_and_unreadable_bodies_are_errors() {
 
     assert_eq!(
         api.auth_test().await.unwrap_err(),
-        SurfaceError::Api("HTTP 503".into())
+        SurfaceError::Transport("HTTP 503".into())
     );
     assert!(matches!(
         api.user_info(&"U1".into()).await.unwrap_err(),
@@ -785,11 +785,11 @@ mod response_url {
             ),
             (
                 ResponseTemplate::new(500).set_body_string("Internal <b>error</b>"),
-                SurfaceError::Api("unknown_error".into()),
+                SurfaceError::Transport("HTTP 500".into()),
             ),
             (
                 ResponseTemplate::new(502),
-                SurfaceError::Api("HTTP 502".into()),
+                SurfaceError::Transport("HTTP 502".into()),
             ),
             (
                 ResponseTemplate::new(200).set_body_json(json!({"ok": false})),
@@ -1234,6 +1234,70 @@ mod apps {
     }
 
     #[tokio::test]
+    async fn an_app_that_is_gone_already_is_not_found() {
+        for code in ["app_not_found", "invalid_app_id"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/apps.manifest.delete"))
+                .respond_with(failed(code))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .await
+                .delete_app(&SecretString::from(CONFIG_TOKEN), "A0AGENT01")
+                .await
+                .unwrap_err();
+            assert_eq!(err, SurfaceError::NotFound(code.to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_created_app_whose_answer_does_not_read_is_deleted_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.create"))
+            .respond_with(ok(json!({
+                "app_id": "A0AGENT01",
+                "credentials": {"client_id": "1111.2222"},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.delete"))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .create_app(&SecretString::from(CONFIG_TOKEN), &manifest())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+        let deleted: Vec<_> = requests(&server)
+            .await
+            .into_iter()
+            .filter(|request| request.url.path() == "/api/apps.manifest.delete")
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(form(&deleted[0])["app_id"], "A0AGENT01");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_creating_an_app_can_be_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .create_app(&SecretString::from(CONFIG_TOKEN), &manifest())
+            .await
+            .unwrap_err();
+        assert_eq!(err, SurfaceError::Transport("HTTP 503".into()));
+    }
+
+    #[tokio::test]
     async fn install_app_exchanges_the_code_with_the_apps_own_credentials() {
         let server = MockServer::start().await;
         let basic = format!(
@@ -1270,7 +1334,7 @@ mod apps {
         assert_eq!(installed.team.as_str(), "T0TEAM001");
         assert_eq!(installed.bot_user.as_str(), "U0HELPER1");
         assert_eq!(installed.bot_token.expose_secret(), BOT_TOKEN);
-        assert_eq!(installed.installer, Some(UserId::new("U0ADA0001")));
+        assert_eq!(installed.scopes, ["chat:write", "im:history"]);
         assert_no_secret(&format!("{installed:?}"));
 
         let sent = requests(&server).await;

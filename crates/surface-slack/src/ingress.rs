@@ -22,9 +22,11 @@
 //!    nothing and changes nothing, and each is answered only for bindings
 //!    agentd already knows, so it tells a forger nothing a 401 wouldn't (see
 //!    the design's Slack transport notes):
-//!    - On `/events`, a `url_verification` body gets its challenge back.
-//!      Slack sends it while `apps.manifest.create` runs, before agentd has
-//!      the new app's signing secret.
+//!    - On `/events`, a `url_verification` body gets its challenge back
+//!      while the binding has no signing secret yet: Slack sends it while
+//!      `apps.manifest.create` runs, before agentd has the new app's signing
+//!      secret. A binding that has one answers a challenge only once it
+//!      verified, after step 4.
 //!    - On `/commands`, a form whose `ssl_check` is `1` gets an empty 200.
 //!      Slack sends it, unsigned, to check the certificate of a slash
 //!      command's URL.
@@ -380,23 +382,14 @@ async fn handle(
     };
     let received_at = OffsetDateTime::now_utc();
 
-    if kind == Kind::Events
-        && let Some(challenge) = url_verification(&body)
+    let challenge = match kind {
+        Kind::Events => url_verification(&body),
+        _ => None,
+    };
+    if let Some(challenge) = &challenge
+        && app.signing_secret.is_none()
     {
-        return match challenge {
-            Some(challenge) => {
-                ingress.challenged(binding);
-                (
-                    [
-                        (CONTENT_TYPE, "text/plain; charset=utf-8"),
-                        (X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                    ],
-                    challenge,
-                )
-                    .into_response()
-            }
-            None => StatusCode::BAD_REQUEST.into_response(),
-        };
+        return answer_challenge(ingress, binding, challenge.as_deref());
     }
     if kind == Kind::Commands && ssl_check(&body) {
         tracing::debug!(%binding, "answered Slack's ssl_check");
@@ -415,6 +408,9 @@ async fn handle(
     if let Err(rejection) = verify::verify(secret, headers, &body, received_at.unix_timestamp()) {
         ingress.refused(binding, kind, StatusCode::UNAUTHORIZED, &rejection);
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(challenge) = challenge {
+        return answer_challenge(ingress, binding, challenge.as_deref());
     }
     log_retry(binding, kind, headers);
 
@@ -456,6 +452,24 @@ async fn handle(
             tracing::warn!(%binding, kind = kind.as_str(), "the Slack queue is closed");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
+    }
+}
+
+/// Echoes a `url_verification` challenge, or refuses a malformed one.
+fn answer_challenge(ingress: &Ingress, binding: BindingRef, challenge: Option<&str>) -> Response {
+    match challenge {
+        Some(challenge) => {
+            ingress.challenged(binding);
+            (
+                [
+                    (CONTENT_TYPE, "text/plain; charset=utf-8"),
+                    (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                challenge.to_owned(),
+            )
+                .into_response()
+        }
+        None => StatusCode::BAD_REQUEST.into_response(),
     }
 }
 

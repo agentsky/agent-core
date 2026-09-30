@@ -93,9 +93,9 @@ impl SlackSurface {
     }
 
     /// Starts a member refresh on the current Tokio runtime when the cache
-    /// is stale and no refresh is running. Outside a runtime it does
-    /// nothing.
-    fn refresh_in_background(&self) {
+    /// is missing or stale and no refresh is running, without waiting for
+    /// it. Outside a runtime it does nothing.
+    pub fn refresh_in_background(&self) {
         if !self.directory.needs_refresh() {
             return;
         }
@@ -370,6 +370,26 @@ impl Surface for SlackSurface {
             Some(root) => self.thread_history(channel, root, before, limit).await,
             None => self.channel_history(channel, before, limit).await,
         }
+    }
+
+    /// Reads the message back with [`WebApi::message`], with this binding's
+    /// bot token, and compares it with the event: the same `ts`, in the
+    /// event's thread, from the same sender (a bot known only by its bot id
+    /// is named by its user, as [`fill_bot_sender`](Self::fill_bot_sender)
+    /// names it) with the same text. A message Slack doesn't have, or that
+    /// isn't content, doesn't match.
+    async fn confirm(&self, event: &InboundEvent) -> Result<bool> {
+        let channel = self.channel(&event.conv)?;
+        let Some(message) = self
+            .api
+            .message(channel, event.thread_root.as_ref(), &event.message.id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(self.msg(message).await.is_some_and(|msg| {
+            msg.id == event.message.id && msg.sender == event.sender && msg.text == event.text
+        }))
     }
 
     /// Converts with the member cache as last read, and, when that is

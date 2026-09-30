@@ -51,6 +51,9 @@ pub struct NewSlackApp {
     /// The bot scopes its manifest asks for, comma-separated, which its
     /// install link must ask for too.
     pub scopes: String,
+    /// The OAuth redirect URL its manifest names, which its install link
+    /// and the code exchange must name too.
+    pub redirect_url: String,
 }
 
 /// What the ingress needs to verify a Slack binding's requests, from
@@ -81,8 +84,8 @@ pub struct SlackAppBinding {
     pub client_id: Option<String>,
     /// The app's bot scopes, comma-separated, once created.
     pub scopes: Option<String>,
-    /// The app's bot user, once installed.
-    pub bot_user: Option<UserId>,
+    /// The app's OAuth redirect URL, once created.
+    pub redirect_url: Option<String>,
 }
 
 /// A Slack binding whose owner is owed the reminder to install its app,
@@ -91,8 +94,6 @@ pub struct SlackAppBinding {
 pub struct InstallReminder {
     /// The binding.
     pub binding: BindingId,
-    /// Its agent.
-    pub agent: AgentId,
     /// The agent's name.
     pub agent_name: String,
     /// The agent's owner, who is reminded.
@@ -101,6 +102,8 @@ pub struct InstallReminder {
     pub client_id: String,
     /// The app's bot scopes, comma-separated, for the install link.
     pub scopes: String,
+    /// The app's OAuth redirect URL, for the install link.
+    pub redirect_url: String,
 }
 
 fn aad<'a>(column: &'static str, binding: &'a str) -> Aad<'a> {
@@ -188,7 +191,7 @@ impl Store {
         let signing_secret = self.seal(aad(SIGNING_SECRET, &key), &app.signing_secret)?;
         let result = sqlx::query(
             "UPDATE agent_bindings SET app_id = ?, client_id = ?, client_secret_enc = ?, \
-             signing_secret_enc = ?, app_scopes = ?, bot_username = ?, \
+             signing_secret_enc = ?, app_scopes = ?, app_redirect_url = ?, bot_username = ?, \
              state = 'pending_install', state_changed_at = ? \
              WHERE id = ? AND surface = 'slack' AND state = 'creating'",
         )
@@ -197,6 +200,7 @@ impl Store {
         .bind(client_secret)
         .bind(signing_secret)
         .bind(&app.scopes)
+        .bind(&app.redirect_url)
         .bind(bot_username)
         .bind(to_unix(now))
         .bind(&key)
@@ -221,10 +225,10 @@ impl Store {
             app_id: Option<String>,
             client_id: Option<String>,
             app_scopes: Option<String>,
-            bot_user_id: Option<String>,
+            app_redirect_url: Option<String>,
         }
         let row: Option<Row> = sqlx::query_as(
-            "SELECT agent_id, team_id, state, app_id, client_id, app_scopes, bot_user_id \
+            "SELECT agent_id, team_id, state, app_id, client_id, app_scopes, app_redirect_url \
              FROM agent_bindings WHERE id = ? AND surface = 'slack'",
         )
         .bind(binding.to_string())
@@ -239,7 +243,7 @@ impl Store {
                 app_id: row.app_id,
                 client_id: row.client_id,
                 scopes: row.app_scopes,
-                bot_user: row.bot_user_id.map(UserId::from),
+                redirect_url: row.app_redirect_url,
             })
         })
         .transpose()
@@ -353,10 +357,10 @@ impl Store {
         max_attempts: u32,
     ) -> Result<Vec<InstallReminder>> {
         let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(concat!(
-            "SELECT b.id, b.agent_id, a.name, a.owner_id, b.client_id, b.app_scopes \
+            "SELECT b.id, a.name, a.owner_id, b.client_id, b.app_scopes, b.app_redirect_url \
              FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
              WHERE b.team_id = ? AND a.state <> 'deleted' AND b.client_id IS NOT NULL \
-             AND b.app_scopes IS NOT NULL AND ",
+             AND b.app_scopes IS NOT NULL AND b.app_redirect_url IS NOT NULL AND ",
             reminder_due!(),
             " ORDER BY b.state_changed_at, b.rowid"
         ))
@@ -367,16 +371,18 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(binding, agent, agent_name, owner, client_id, scopes)| {
-                Ok(InstallReminder {
-                    binding: parse_column(&binding, BINDINGS, "id")?,
-                    agent: parse_column(&agent, BINDINGS, "agent_id")?,
-                    agent_name,
-                    owner: parse_column(&owner, "agents", "owner_id")?,
-                    client_id,
-                    scopes,
-                })
-            })
+            .map(
+                |(binding, agent_name, owner, client_id, scopes, redirect_url)| {
+                    Ok(InstallReminder {
+                        binding: parse_column(&binding, BINDINGS, "id")?,
+                        agent_name,
+                        owner: parse_column(&owner, "agents", "owner_id")?,
+                        client_id,
+                        scopes,
+                        redirect_url,
+                    })
+                },
+            )
             .collect()
     }
 

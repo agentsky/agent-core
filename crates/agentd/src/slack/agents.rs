@@ -8,13 +8,15 @@
 //!    state `creating`, so the ingress answers the `url_verification`
 //!    challenge Slack sends for it, calls `apps.manifest.create` with a
 //!    manifest whose URLs name that binding, stores the app's credentials
-//!    sealed (`pending_install`), and DMs the owner an install link whose
-//!    `state` is sealed for the binding. If creating the app fails, the
-//!    creation is abandoned, which frees the name.
+//!    sealed, with the scopes and the OAuth redirect URL its manifest names
+//!    (`pending_install`), and DMs the owner an install link whose `state`
+//!    is sealed for the binding. If creating the app fails, the creation is
+//!    abandoned, which frees the name.
 //! 2. The install link leads to Slack's consent page, which redirects to
 //!    [`OAUTH_CALLBACK_PATH`](surface_slack::manifest::OAUTH_CALLBACK_PATH).
 //!    [`callback`](SlackAgents::callback) checks the `state`, exchanges the
-//!    code with `oauth.v2.access` and the app's own credentials, stores the
+//!    code with `oauth.v2.access` and the app's own credentials, checks
+//!    that the install granted no scope the app doesn't ask for, stores the
 //!    bot token sealed, makes the binding `active` and tells the owner.
 //! 3. When the workspace requires app approval, the click becomes a request
 //!    and Slack never calls back, so the sweeper ([`run`](SlackAgents::run))
@@ -42,7 +44,8 @@ use core_types::{BindingId, MemberId, MemberKey, SurfaceError, SurfaceKind, Team
 use secrecy::SecretString;
 use serde::Deserialize;
 use store::{
-    AgentBinding, AgentCreation, BindingState, NewAgent, NewSlackApp, Store, StoreError, Visibility,
+    AgentBinding, AgentCreation, BindingState, NewAgent, NewSlackApp, SlackConfigToken, Store,
+    StoreError, Visibility,
 };
 use surface_slack::manifest::{AgentApp, agent_manifest, install_url};
 use time::OffsetDateTime;
@@ -66,9 +69,15 @@ pub const REMINDER_LEASE: Duration = Duration::from_secs(10 * 60);
 pub const REMINDER_MAX_ATTEMPTS: u32 = 5;
 
 /// How long creating or deleting an app may take, rate-limit waits
-/// included. Well within [`CREATION_LEASE`], so the sweeper never abandons
-/// a creation still waiting on Slack.
-pub const APP_CALL_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// included: longer than one `apps.manifest.*` request may take
+/// ([`MANIFEST_TIMEOUT`](surface_slack::web::MANIFEST_TIMEOUT)), and well
+/// within [`CREATION_LEASE`], so the sweeper never abandons a creation still
+/// waiting on Slack.
+pub const APP_CALL_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+
+/// What the install callback's pages call agentd when the manager app has
+/// no name.
+const DEFAULT_SERVICE_NAME: &str = "agent-core";
 
 /// Where members manage their apps.
 pub const APPS_PAGE: &str = "https://api.slack.com/apps";
@@ -114,14 +123,20 @@ pub enum Creation {
     NameTaken,
     /// The owner already has as many agents as they may.
     LimitReached,
+    /// agentd's public URL isn't set, so apps can't be created.
+    NoPublicUrl,
     /// The owner has no configuration token that can be used: none, or one
-    /// Slack refused to renew, or one that expired.
+    /// Slack refused to renew.
     NoConfigToken,
-    /// Slack refused the configuration token.
+    /// The owner's configuration token expired, and the rotator is about to
+    /// renew it, as after agentd was down for a while.
+    TokenRenewing,
+    /// Slack refused the configuration token, which is now marked broken.
     TokenRefused,
     /// Slack refused to create the app, with this code.
     Refused(String),
-    /// Something else failed; it was logged.
+    /// Something else failed, such as Slack answering with a server error
+    /// or not in time; it was logged.
     Failed,
 }
 
@@ -133,8 +148,9 @@ pub enum AppDeletion {
     /// The app `app_id` is still there: the owner has no configuration
     /// token that can be used, or Slack refused it.
     NoToken(String),
-    /// Deleting the app `app_id` failed; it was logged.
-    Failed(String),
+    /// Deleting the app failed; it was logged. The app's id, if the store
+    /// could say.
+    Failed(Option<String>),
 }
 
 /// What one sweeper pass did.
@@ -204,11 +220,6 @@ impl SlackAgents {
         &self.inner.bots
     }
 
-    /// Whether agent apps can be created: agentd knows its public URL.
-    pub fn can_create(&self) -> bool {
-        self.inner.settings.public_url.is_some()
-    }
-
     /// How many agents that aren't deleted one member may have.
     pub fn max_per_owner(&self) -> u32 {
         self.inner.settings.max_per_owner
@@ -253,13 +264,21 @@ impl SlackAgents {
     ) -> Result<Creation, StoreError> {
         let store = &self.inner.store;
         let Some(public_url) = self.inner.settings.public_url.as_deref() else {
-            return Ok(Creation::Failed);
+            return Ok(Creation::NoPublicUrl);
         };
         let Some(token) = store
             .usable_slack_config_token(owner, self.team(), now())
             .await?
         else {
-            return Ok(Creation::NoConfigToken);
+            let renewing = store
+                .slack_config_token_status(owner, self.team())
+                .await?
+                .is_some_and(|status| !status.broken);
+            return Ok(if renewing {
+                Creation::TokenRenewing
+            } else {
+                Creation::NoConfigToken
+            });
         };
         let new = NewAgent {
             owner,
@@ -274,6 +293,13 @@ impl SlackAgents {
             AgentCreation::Created(_, binding) => binding,
             AgentCreation::NameTaken => return Ok(Creation::NameTaken),
             AgentCreation::LimitReached => return Ok(Creation::LimitReached),
+        };
+        let state = match store.install_state(binding) {
+            Ok(state) => state,
+            Err(err) => {
+                self.abandon(binding).await;
+                return Err(err);
+            }
         };
         let app = AgentApp {
             name,
@@ -298,7 +324,10 @@ impl SlackAgents {
                 tracing::info!(%owner, %binding, error = %err, "Slack didn't create an agent's app");
                 self.abandon(binding).await;
                 return Ok(match err {
-                    SurfaceError::Unauthorized => Creation::TokenRefused,
+                    SurfaceError::Unauthorized => {
+                        self.token_refused(&token).await;
+                        Creation::TokenRefused
+                    }
                     SurfaceError::Api(code)
                     | SurfaceError::Forbidden(code)
                     | SurfaceError::NotFound(code) => Creation::Refused(code),
@@ -307,8 +336,9 @@ impl SlackAgents {
             }
         };
         let app_id = created.app_id.clone();
-        let client_id = created.client_id.clone();
-        let scopes = app.scopes().join(",");
+        let scopes = app.scopes();
+        let redirect_url = app.redirect_url();
+        let install = install_url(&created.client_id, &scopes, &redirect_url, &state);
         let stored = store
             .set_slack_app(
                 binding,
@@ -317,38 +347,33 @@ impl SlackAgents {
                     client_id: created.client_id,
                     client_secret: created.client_secret,
                     signing_secret: created.signing_secret,
-                    scopes: scopes.clone(),
+                    scopes: scopes.join(","),
+                    redirect_url,
                 },
                 name,
                 now(),
             )
             .await;
-        let install = match stored {
-            Ok(true) => self.install_link(binding, &client_id, &scopes),
+        match stored {
+            Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(%binding, "an agent's creation was abandoned while Slack created its app");
-                Err(None)
+                self.delete_created(&token.token, &app_id).await;
+                return Ok(Creation::Failed);
             }
-            Err(err) => Err(Some(err)),
-        };
-        let install = match install {
-            Ok(url) => url,
             Err(err) => {
-                if let Some(err) = err {
-                    tracing::warn!(%binding, error = %err, "couldn't store an agent's new Slack app");
-                }
+                tracing::warn!(%binding, error = %err, "couldn't store an agent's new Slack app");
                 self.delete_created(&token.token, &app_id).await;
                 self.abandon(binding).await;
                 return Ok(Creation::Failed);
             }
-        };
+        }
         tracing::info!(%owner, %binding, app_id, "created an agent's Slack app");
         let text = format!(
-            "Install `{name}`, your new agent, in this workspace:\n{install}\n\nIf your workspace \
-             requires app approval, your click sends an admin a request instead, and I'll remind \
-             you if `{name}` still isn't installed in a while. Once it is installed, invite it to \
-             a channel with `/invite @{name}` and mention it there: it only hears the channels \
-             it's in. You can also send it a direct message."
+            "[Install {name}]({install}), your new agent, in this workspace.\n\nIf your \
+             workspace requires app approval, your click sends an admin a request instead, and \
+             I'll remind you if `{name}` still isn't installed in a while. Once it is installed, \
+             I'll tell you how to invite it to a channel."
         );
         let dm_sent = match self.inner.manager.manager_bot().dm(key, &text).await {
             Ok(()) => true,
@@ -363,26 +388,17 @@ impl SlackAgents {
         })
     }
 
-    /// The install link of `binding`'s app `client_id`, asking for
-    /// `scopes`, with a new sealed `state`.
-    fn install_link(
-        &self,
-        binding: BindingId,
-        client_id: &str,
-        scopes: &str,
-    ) -> Result<String, Option<StoreError>> {
-        let state = self.inner.store.install_state(binding).map_err(Some)?;
-        let redirect = self.redirect_url().ok_or(None)?;
-        let scopes: Vec<&str> = scopes.split(',').collect();
-        Ok(install_url(client_id, &scopes, &redirect, &state))
-    }
-
-    fn redirect_url(&self) -> Option<String> {
-        self.inner
-            .settings
-            .public_url
-            .as_deref()
-            .map(|url| format!("{url}{}", surface_slack::manifest::OAUTH_CALLBACK_PATH))
+    /// Marks `token` broken because Slack refused it, so its owner is told
+    /// to register a new one and nothing uses it again.
+    async fn token_refused(&self, token: &SlackConfigToken) {
+        if let Err(err) = self
+            .inner
+            .store
+            .mark_slack_config_token_broken(&token.row, now())
+            .await
+        {
+            tracing::warn!(member = %token.row.member, error = %err, "couldn't mark a refused configuration token broken");
+        }
     }
 
     /// Abandons the creation of `binding`, freeing the agent's name.
@@ -412,78 +428,98 @@ impl SlackAgents {
         }
     }
 
-    /// Deletes the Slack apps of `owner`'s agent, whose `bindings` were
-    /// disabled when the agent was deleted, with `apps.manifest.delete` and
-    /// the owner's configuration token. Each app deleted is recorded as
-    /// retired. Bindings on another surface or team, without an app, or
-    /// already retired are left alone.
+    /// Deletes the Slack apps of `owner`'s deleted agent, whose `bindings`
+    /// were read before it was deleted, with `apps.manifest.delete` and the
+    /// owner's configuration token. Each app deleted, or found gone
+    /// already, is recorded as retired. Bindings on another surface or team,
+    /// without an app, or already retired are left alone.
     ///
-    /// # Errors
-    ///
-    /// If the store fails; what was done stays done.
+    /// It never fails: the agent is deleted already, so whatever goes wrong
+    /// for one app is logged and reported in its [`AppDeletion`], with the
+    /// app's id whenever the store could read it, for the owner to delete
+    /// it by hand.
     pub async fn delete_apps(
         &self,
         owner: MemberId,
         bindings: &[AgentBinding],
-    ) -> Result<Vec<AppDeletion>, StoreError> {
+    ) -> Vec<AppDeletion> {
         let store = &self.inner.store;
         let mut done = Vec::new();
         for binding in bindings {
             if binding.surface != SurfaceKind::Slack
                 || binding.team != *self.team()
-                || binding.state != BindingState::Disabled
                 || binding.retired_at.is_some()
             {
                 continue;
             }
-            let Some(app_id) = store
-                .slack_app(binding.id)
-                .await?
-                .and_then(|app| app.app_id)
-            else {
-                continue;
-            };
-            let Some(token) = store
-                .usable_slack_config_token(owner, self.team(), now())
-                .await?
-            else {
-                done.push(AppDeletion::NoToken(app_id));
-                continue;
-            };
-            let deleted = tokio::time::timeout(
-                APP_CALL_TIMEOUT,
-                self.inner
-                    .manager
-                    .client()
-                    .delete_app(&token.token, &app_id),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                Err(SurfaceError::Transport(
-                    "apps.manifest.delete took too long".into(),
-                ))
-            });
-            match deleted {
-                Ok(()) | Err(SurfaceError::NotFound(_)) => {
-                    store.mark_retired(binding.id, now()).await?;
-                    tracing::info!(binding = %binding.id, app_id, "deleted a deleted agent's Slack app");
-                    done.push(AppDeletion::Deleted);
-                }
-                Err(SurfaceError::Unauthorized) => {
-                    tracing::info!(binding = %binding.id, app_id, "Slack refused the configuration token deleting an app");
-                    done.push(AppDeletion::NoToken(app_id));
-                }
+            let app_id = match store.slack_app(binding.id).await {
+                Ok(app) => app.and_then(|app| app.app_id),
                 Err(err) => {
-                    tracing::warn!(binding = %binding.id, app_id, error = %err, "couldn't delete a deleted agent's Slack app");
-                    done.push(AppDeletion::Failed(app_id));
+                    tracing::warn!(binding = %binding.id, error = %err, "couldn't read a deleted agent's Slack app");
+                    done.push(AppDeletion::Failed(None));
+                    continue;
                 }
-            }
+            };
+            let Some(app_id) = app_id else {
+                continue;
+            };
+            done.push(self.delete_app(owner, binding.id, app_id).await);
         }
         self.name_managed().await;
-        Ok(done)
+        done
     }
 
-    async fn name_managed(&self) {
+    /// Deletes the app `app_id` of the deleted agent's `binding`.
+    async fn delete_app(&self, owner: MemberId, binding: BindingId, app_id: String) -> AppDeletion {
+        let store = &self.inner.store;
+        let token = match store
+            .usable_slack_config_token(owner, self.team(), now())
+            .await
+        {
+            Ok(Some(token)) => token,
+            Ok(None) => return AppDeletion::NoToken(app_id),
+            Err(err) => {
+                tracing::warn!(%binding, app_id, error = %err, "couldn't read the configuration token to delete an app");
+                return AppDeletion::Failed(Some(app_id));
+            }
+        };
+        let deleted = tokio::time::timeout(
+            APP_CALL_TIMEOUT,
+            self.inner
+                .manager
+                .client()
+                .delete_app(&token.token, &app_id),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(SurfaceError::Transport(
+                "apps.manifest.delete took too long".into(),
+            ))
+        });
+        match deleted {
+            Ok(()) | Err(SurfaceError::NotFound(_)) => {
+                if let Err(err) = store.mark_retired(binding, now()).await {
+                    tracing::warn!(%binding, app_id, error = %err, "deleted a deleted agent's Slack app, but couldn't record it");
+                } else {
+                    tracing::info!(%binding, app_id, "deleted a deleted agent's Slack app");
+                }
+                AppDeletion::Deleted
+            }
+            Err(SurfaceError::Unauthorized) => {
+                tracing::info!(%binding, app_id, "Slack refused the configuration token deleting an app");
+                self.token_refused(&token).await;
+                AppDeletion::NoToken(app_id)
+            }
+            Err(err) => {
+                tracing::warn!(%binding, app_id, error = %err, "couldn't delete a deleted agent's Slack app");
+                AppDeletion::Failed(Some(app_id))
+            }
+        }
+    }
+
+    /// Gives the workspace's directory its active agents' bot users
+    /// ([`SlackBots::name_managed`]), logging a failure.
+    pub async fn name_managed(&self) {
         if let Err(err) = self.inner.bots.name_managed().await {
             tracing::warn!(error = %err, "couldn't read the workspace's agent bots");
         }
@@ -517,19 +553,38 @@ impl SlackAgents {
             .into_response()
     }
 
-    async fn install(&self, query: &str) -> (StatusCode, &'static str) {
-        const INVALID: &str = "This install link isn't valid. Use the link agent-core sent you \
-                               in Slack.";
+    /// What agentd calls itself on the callback's pages: the manager app's
+    /// name, if it has one.
+    fn service_name(&self) -> &str {
+        self.inner
+            .manager
+            .identity()
+            .app_name
+            .as_deref()
+            .unwrap_or(DEFAULT_SERVICE_NAME)
+    }
+
+    async fn install(&self, query: &str) -> (StatusCode, String) {
         const TRY_AGAIN: &str = "Something went wrong finishing the install. Please try the link \
                                  again in a minute.";
+        const NOT_WAITING: &str = "This agent isn't waiting to be installed: it is installed \
+                                   already, or was deleted.";
         #[derive(Deserialize)]
         struct Callback {
             code: Option<String>,
             state: Option<String>,
             error: Option<String>,
         }
+        let service = self.service_name();
+        let invalid = || {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("This install link isn't valid. Use the link {service} sent you in Slack."),
+            )
+        };
+        let page = |status: StatusCode, text: &str| (status, text.to_owned());
         let Ok(callback) = serde_urlencoded::from_str::<Callback>(query) else {
-            return (StatusCode::BAD_REQUEST, INVALID);
+            return invalid();
         };
         let store = &self.inner.store;
         let Some(binding) = callback
@@ -538,45 +593,43 @@ impl SlackAgents {
             .and_then(|state| store.binding_of_install_state(state))
         else {
             tracing::debug!("refused an install callback whose state isn't agentd's");
-            return (StatusCode::BAD_REQUEST, INVALID);
+            return invalid();
         };
         let app = match store.slack_app(binding).await {
             Ok(Some(app)) if app.team == *self.team() => app,
-            Ok(_) => return (StatusCode::BAD_REQUEST, INVALID),
+            Ok(_) => return invalid(),
             Err(err) => {
                 tracing::warn!(%binding, error = %err, "couldn't read a binding for its install");
-                return (StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
+                return page(StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
             }
         };
         if app.state != BindingState::PendingInstall {
             tracing::info!(%binding, state = app.state.as_str(), "refused an install callback for a binding that isn't waiting for one");
-            return (
-                StatusCode::CONFLICT,
-                "This agent isn't waiting to be installed: it is installed already, or was deleted.",
-            );
+            return page(StatusCode::CONFLICT, NOT_WAITING);
         }
         if callback.error.is_some() {
             tracing::info!(%binding, "an install was cancelled or refused at Slack");
-            return (
+            return page(
                 StatusCode::OK,
                 "The install was cancelled. The link in your Slack DM still works.",
             );
         }
-        let (Some(code), Some(app_id), Some(client_id)) =
-            (callback.code, app.app_id, app.client_id)
-        else {
-            return (StatusCode::BAD_REQUEST, INVALID);
+        let (Some(code), Some(app_id), Some(client_id), Some(scopes), Some(redirect)) = (
+            callback.code,
+            app.app_id,
+            app.client_id,
+            app.scopes,
+            app.redirect_url,
+        ) else {
+            return invalid();
         };
         let secret = match store.slack_client_secret(binding).await {
             Ok(Some(secret)) => secret,
-            Ok(None) => return (StatusCode::CONFLICT, INVALID),
+            Ok(None) => return page(StatusCode::CONFLICT, NOT_WAITING),
             Err(err) => {
                 tracing::warn!(%binding, error = %err, "couldn't read an app's client secret");
-                return (StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
+                return page(StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
             }
-        };
-        let Some(redirect) = self.redirect_url() else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
         };
         let installed = tokio::time::timeout(
             APP_CALL_TIMEOUT,
@@ -597,7 +650,7 @@ impl SlackAgents {
             Ok(installed) => installed,
             Err(err) => {
                 tracing::warn!(%binding, error = %err, "Slack didn't complete an install");
-                return (
+                return page(
                     StatusCode::BAD_GATEWAY,
                     "Slack didn't complete the install. Please try the link again.",
                 );
@@ -607,7 +660,20 @@ impl SlackAgents {
             tracing::warn!(%binding, team = %installed.team, "refused an install of another app or in another workspace");
             return (
                 StatusCode::BAD_REQUEST,
-                "That install is for another app or workspace than agent-core serves.",
+                format!("That install is for another app or workspace than {service} serves."),
+            );
+        }
+        let asked: Vec<&str> = scopes.split(',').collect();
+        if let Some(extra) = installed
+            .scopes
+            .iter()
+            .find(|scope| !asked.contains(&scope.as_str()))
+        {
+            tracing::warn!(%binding, scope = extra.as_str(), "refused an install granting a scope the app doesn't ask for");
+            return page(
+                StatusCode::BAD_REQUEST,
+                "That install granted permissions the agent's app doesn't ask for, so it wasn't \
+                 stored.",
             );
         }
         match store
@@ -621,29 +687,27 @@ impl SlackAgents {
             .await
         {
             Ok(true) => {}
-            Ok(false) => {
-                return (
-                    StatusCode::CONFLICT,
-                    "This agent isn't waiting to be installed: it is installed already, or was \
-                     deleted.",
-                );
-            }
+            Ok(false) => return page(StatusCode::CONFLICT, NOT_WAITING),
             Err(err) => {
                 tracing::warn!(%binding, error = %err, "couldn't store an installed app's bot token");
-                return (StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
+                return page(StatusCode::INTERNAL_SERVER_ERROR, TRY_AGAIN);
             }
         }
         tracing::info!(%binding, app_id, bot_user = %installed.bot_user, "installed an agent's Slack app");
         self.name_managed().await;
-        self.tell_installed(binding, app.agent).await;
-        (
+        self.tell_installed(binding, app.agent, &installed.bot_user)
+            .await;
+        page(
             StatusCode::OK,
             "Installed. You can close this page and go back to Slack.",
         )
     }
 
-    /// Tells the owner of `agent` that its app is installed.
-    async fn tell_installed(&self, binding: BindingId, agent: core_types::AgentId) {
+    /// Tells the owner of `agent` that its app, whose bot user is `bot`, is
+    /// installed. The bot is named by its user id, which the manager's
+    /// renderer turns into a mention of it, since several agents can share
+    /// a name.
+    async fn tell_installed(&self, binding: BindingId, agent: core_types::AgentId, bot: &UserId) {
         let told = async {
             let Some(agent) = self.inner.store.agent(agent).await? else {
                 return Ok(());
@@ -653,9 +717,9 @@ impl SlackAgents {
             };
             let name = &agent.name;
             let text = format!(
-                "`{name}` is installed. Invite it to a channel with `/invite @{name}` and mention \
-                 it there: it only hears the channels it's in. You can also send it a direct \
-                 message."
+                "`{name}` is installed as @{bot}. To use it in a channel, invite it there (run \
+                 `/invite` in the channel and pick @{bot}) and mention it: it only hears the \
+                 channels it's in. You can also send it a direct message."
             );
             if let Err(err) = self.inner.manager.manager_bot().dm(&owner, &text).await {
                 tracing::warn!(%binding, error = %err, "couldn't tell an owner their agent is installed");
@@ -727,6 +791,9 @@ impl SlackAgents {
             tracing::debug!(binding = %due.binding, "an install reminder's owner has no identity here");
             return Ok(false);
         };
+        let state = store.install_state(due.binding)?;
+        let scopes: Vec<&str> = due.scopes.split(',').collect();
+        let link = install_url(&due.client_id, &scopes, &due.redirect_url, &state);
         let at = now();
         let Some(attempt) = store
             .claim_install_reminder(
@@ -740,16 +807,11 @@ impl SlackAgents {
         else {
             return Ok(false);
         };
-        let link = match self.install_link(due.binding, &due.client_id, &due.scopes) {
-            Ok(link) => link,
-            Err(Some(err)) => return Err(err),
-            Err(None) => return Ok(false),
-        };
         let name = &due.agent_name;
         let text = format!(
             "`{name}` still isn't installed. If your workspace requires app approval, an admin has \
-             to approve it first; once they have, or if you haven't tried yet, install it here:\n\
-             {link}"
+             to approve it first; once they have, or if you haven't tried yet, \
+             [install {name}]({link})."
         );
         match self.inner.manager.manager_bot().dm(&owner, &text).await {
             Ok(()) => {

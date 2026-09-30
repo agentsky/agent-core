@@ -19,8 +19,9 @@ use crate::slack::bots::SlackBots;
 /// - On Rocket.Chat, a [`RocketChatSurface`] with the bot's token, on the
 ///   server the manager bot's configuration names, sharing its
 ///   [`BotRoles`].
-/// - On Slack, the binding's surface from [`SlackBots`], which the first
-///   time also awaits the workspace's member list. Every lookup gives the
+/// - On Slack, the binding's surface from [`SlackBots`], which starts
+///   reading the workspace's member list in the background when it has
+///   none or a stale one, and never waits for it. Every lookup gives the
 ///   directory the workspace's managed agents' bot users
 ///   ([`SlackBots::name_managed`]), so an agent keeps a name a human
 ///   shares, and an agent installed since, here or on another instance, is
@@ -92,7 +93,7 @@ impl StoreSurfaces {
                 return Ok(None);
             };
             bots.name_managed().await?;
-            let surface = bots.started(binding.id).await?;
+            let surface = bots.surface(binding.id).await?;
             return Ok(surface.map(|surface| surface as Arc<dyn Surface>));
         }
         if let Some(surface) = self.built().get(&binding.id) {

@@ -357,33 +357,43 @@ async fn missing_repeated_and_malformed_headers_are_refused() {
 }
 
 #[tokio::test]
-async fn the_challenge_is_echoed_for_known_bindings_only() {
+async fn the_challenge_is_echoed_unsigned_only_while_a_binding_has_no_secret() {
     let mut harness = Harness::start();
-    for binding in [
-        BindingRef::Manager,
-        BindingRef::Agent(agent()),
-        BindingRef::Agent(creating_agent()),
+    let uri = path(BindingRef::Agent(creating_agent()), "events");
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request(&uri, fixtures::URL_VERIFICATION, &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers();
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body, CHALLENGE);
+
+    for (binding, secret) in [
+        (BindingRef::Manager, MANAGER_SECRET),
+        (BindingRef::Agent(agent()), AGENT_SECRET),
     ] {
         let uri = path(binding, "events");
-        let response = harness
-            .router
-            .clone()
-            .oneshot(request(&uri, fixtures::URL_VERIFICATION, &[]))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{binding}");
-        let headers = response.headers();
-        assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
-        assert_eq!(headers["x-content-type-options"], "nosniff");
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(body, CHALLENGE, "{binding}");
+        let (status, body) = harness
+            .send(request(&uri, fixtures::URL_VERIFICATION, &[]))
+            .await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::UNAUTHORIZED, ""),
+            "{binding} has a secret"
+        );
+        assert_eq!(
+            harness
+                .send(signed(&uri, secret, fixtures::URL_VERIFICATION))
+                .await,
+            (StatusCode::OK, CHALLENGE.to_owned()),
+            "{binding}"
+        );
     }
-
-    let signed_challenge = signed_events(agent(), AGENT_SECRET, fixtures::URL_VERIFICATION);
-    assert_eq!(
-        harness.send(signed_challenge).await,
-        (StatusCode::OK, CHALLENGE.to_owned())
-    );
 
     for unknown in [
         BindingId::new_v4().to_string(),
@@ -417,7 +427,7 @@ async fn the_challenge_is_answered_only_on_events_and_only_when_well_formed() {
             .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{kind}");
     }
-    let uri = path(agent(), "events");
+    let uri = path(creating_agent(), "events");
     for bad in [
         r#"{"type":"url_verification"}"#.to_owned(),
         r#"{"type":"url_verification","challenge":""}"#.to_owned(),

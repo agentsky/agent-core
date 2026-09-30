@@ -303,11 +303,18 @@ impl Commands {
                 ),
             });
         }
+        let slack = key.surface == SurfaceKind::Slack;
+        if slack && let Some(agents) = &self.inner.slack_agents {
+            agents.name_managed().await;
+        }
         let mut reply = String::from("Agents:");
         for entry in entries {
-            let bot = entry
-                .bot_username
-                .map_or_else(|| "no bot here".to_owned(), |u| format!("@{u}"));
+            let bot = if slack {
+                entry.bot_user.map(|u| u.to_string())
+            } else {
+                entry.bot_username
+            };
+            let bot = bot.map_or_else(|| "no bot here".to_owned(), |u| format!("@{u}"));
             let paused = if entry.agent.state == AgentState::Paused {
                 ", paused"
             } else {
@@ -315,7 +322,8 @@ impl Commands {
             };
             reply.push_str(&format!(
                 "\n- `{}` ({bot}), owned by {}{paused}",
-                entry.agent.name, entry.owner_name
+                entry.agent.name,
+                code_span(&entry.owner_name)
             ));
         }
         Ok(reply)
@@ -365,6 +373,7 @@ impl Commands {
             return Ok(no_such_agent(name));
         };
         let store = &self.inner.store;
+        let bindings = store.bindings_of(agent.id).await?;
         if !store
             .delete_agent(agent.id, OffsetDateTime::now_utc())
             .await?
@@ -372,7 +381,7 @@ impl Commands {
             return Ok(no_such_agent(name));
         }
         tracing::info!(agent = %agent.id, "deleted an agent");
-        if let Some(reply) = self.delete_on_slack(&agent, name).await? {
+        if let Some(reply) = self.delete_on_slack(&agent, name, &bindings).await {
             return Ok(reply);
         }
         let Some(agents) = self.agents_for(key) else {
@@ -396,6 +405,22 @@ impl Commands {
     }
 }
 
+/// `text` as a Markdown code span, so a member's display name shows as
+/// written and can't form a link, a mention or any other formatting.
+/// Backticks and control characters are left out.
+fn code_span(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .filter(|c| *c != '`' && !c.is_control())
+        .collect();
+    let text = text.trim();
+    if text.is_empty() {
+        "someone".to_owned()
+    } else {
+        format!("`{text}`")
+    }
+}
+
 /// Retires the bot users of the deleted `agent` on `agents`' server, and
 /// returns whether every bot user it had anywhere is retired now.
 async fn retire_bots(agents: &RocketChatAgents, agent: AgentId) -> Result<bool, StoreError> {
@@ -415,6 +440,24 @@ async fn retire_bots(agents: &RocketChatAgents, agent: AgentId) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_names_are_shown_as_code_that_forms_nothing() {
+        let shown = code_span("[Admin](https://evil.example)");
+        assert_eq!(shown, "`[Admin](https://evil.example)`");
+        let rendered = render::slack::to_mrkdwn(&format!("owned by {shown}"), &NoNames);
+        assert!(!rendered.contains('<'), "{rendered}");
+        assert_eq!(code_span("a`b\n@here"), "`ab@here`");
+        assert_eq!(code_span(" ` "), "someone");
+    }
+
+    struct NoNames;
+
+    impl render::MentionDirectory for NoNames {
+        fn resolve(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
 
     #[test]
     fn a_persona_is_non_empty_text_of_at_most_64_kb() {

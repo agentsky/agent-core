@@ -373,7 +373,7 @@ async fn create_makes_a_bot_user_and_starts_its_connection() {
     let again = chat.command("alice", "create helper").await;
     assert_eq!(again, "You already have an agent named `helper`.");
     let listed = chat.command("bob", "list").await;
-    assert_eq!(listed, "Agents:\n- `helper` (@helper), owned by alice");
+    assert_eq!(listed, "Agents:\n- `helper` (@helper), owned by `alice`");
     running.stop().await;
 }
 
@@ -543,7 +543,7 @@ async fn a_paused_agent_ignores_messages_until_resumed() {
     let listed = chat.command("bob", "list @alice").await;
     assert_eq!(
         listed,
-        "Agents:\n- `helper` (@helper), owned by alice, paused\n- `writer` (@writer), owned by alice"
+        "Agents:\n- `helper` (@helper), owned by `alice`, paused\n- `writer` (@writer), owned by `alice`"
     );
     assert_eq!(
         chat.command("alice", "resume helper").await,

@@ -333,7 +333,7 @@ impl Commands {
             .await?;
         let start = self.inner.auth.start_login(member).await?;
         Ok(format!(
-            "To link your Claude account, open this link and approve:\n{}\n\n\
+            "To link your Claude account, [open the Claude login page]({}) and approve.\n\n\
              The page then shows a code. Send it {} as {}. The link works once, \
              for {} minutes.",
             start.url,

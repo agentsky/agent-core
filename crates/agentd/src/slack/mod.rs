@@ -11,9 +11,9 @@
 //! - [`Inbound`]: where verified requests go. Commands to the manager app
 //!   go to the [`CommandIntake`](crate::commands::intake::CommandIntake),
 //!   and a `user_change` saying a member left deletes their configuration
-//!   token. Messages to agents' apps go to the turn pipeline, through
-//!   [`Messages`], once their bot senders are looked up. The rest is logged
-//!   by kind and dropped.
+//!   token. Messages to agents' apps go to [`Messages`], which looks their
+//!   bot senders up and hands them to the turn pipeline outside the Slack
+//!   queue. The rest is logged by kind and dropped.
 //! - [`manager`]: the manager app itself.
 //! - [`agents`]: agents' apps, created from manifests and installed through
 //!   `GET /slack/oauth/callback`.
@@ -27,6 +27,7 @@ pub mod agents;
 pub mod bots;
 pub mod manager;
 
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 use axum::Router;
@@ -39,6 +40,8 @@ use surface_slack::{
     BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, SlackEvent, SlackInbound, ingress,
 };
 use time::OffsetDateTime;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::app::App;
 use crate::commands::intake::CommandSubmitter;
@@ -50,6 +53,10 @@ use manager::ManagerIdentity;
 /// that, requests get 503: Slack retries events, but not slash commands or
 /// interactions.
 pub const QUEUE_CAPACITY: usize = 1024;
+
+/// How many agents' messages may wait for [`Messages`] to hand them to the
+/// turn pipeline. Beyond that, they are dropped with a warning.
+pub const MESSAGES_CAPACITY: usize = 256;
 
 /// The router serving the Slack request URLs, and the queue behind it, and
 /// with agent apps, their OAuth callback. Run the queue with
@@ -151,24 +158,92 @@ impl SigningSecrets for StoreSigningSecrets {
     }
 }
 
-/// Where the Slack queue sends agents' messages: the turn pipeline, once
-/// [`connect`](Self::connect)ed. Until then, and in an agentd that runs no
-/// turns, they are dropped.
+/// Where the Slack queue sends agents' messages, so it never waits for
+/// them: they wait here, at most [`MESSAGES_CAPACITY`], for the worker
+/// [`new`](Self::new) returns, which looks each one's binding up, fills in
+/// its bot sender with [`SlackSurface::fill_bot_sender`], and hands it to the
+/// turn pipeline once [`connect`](Self::connect)ed, one at a time in the
+/// order they came. Until then, and in an agentd that runs no turns, they
+/// are dropped, as are messages to a binding that isn't active (still
+/// waiting for its install, or deleted).
 ///
-/// Cloning is cheap and shares the connection.
-#[derive(Debug, Clone, Default)]
-pub struct Messages(Arc<OnceLock<Sender<InboundEvent>>>);
+/// Cloning is cheap and shares the queue and the connection.
+///
+/// [`SlackSurface::fill_bot_sender`]: surface_slack::SlackSurface::fill_bot_sender
+#[derive(Debug, Clone)]
+pub struct Messages {
+    queue: mpsc::Sender<InboundEvent>,
+    onward: Arc<OnceLock<Sender<InboundEvent>>>,
+}
 
 impl Messages {
-    /// Sends messages to `onward` from now on. Only the first call counts.
+    /// Messages to the agents whose bots are `bots`, and the worker that
+    /// hands them on. The worker ends once every clone is dropped and the
+    /// messages waiting are handed on.
+    pub fn new(bots: SlackBots) -> (Self, impl Future<Output = ()> + Send + 'static) {
+        let (queue, waiting) = mpsc::channel(MESSAGES_CAPACITY);
+        let onward: Arc<OnceLock<Sender<InboundEvent>>> = Arc::default();
+        let worker = forward(bots, waiting, Arc::clone(&onward));
+        (Self { queue, onward }, worker)
+    }
+
+    /// Hands messages to `onward` from now on. Only the first call counts.
     pub fn connect(&self, onward: Sender<InboundEvent>) {
-        if self.0.set(onward).is_err() {
+        if self.onward.set(onward).is_err() {
             tracing::warn!("Slack messages are connected already; ignored another connection");
         }
     }
 
-    fn onward(&self) -> Option<&Sender<InboundEvent>> {
-        self.0.get()
+    /// Queues `event` for the worker without waiting: dropped with a
+    /// warning when the queue is full, and with a debug line when agentd
+    /// runs no turns.
+    fn hand(&self, event: InboundEvent) {
+        let binding = event.binding;
+        if self.onward.get().is_none() {
+            tracing::debug!(%binding, "agentd runs no turns; dropped a message to an agent");
+            return;
+        }
+        match self.queue.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(%binding, "too many agents' messages waiting; dropped one");
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::warn!(%binding, "agents' messages aren't handled any more; dropped one");
+            }
+        }
+    }
+}
+
+/// The worker of [`Messages`].
+async fn forward(
+    bots: SlackBots,
+    mut waiting: mpsc::Receiver<InboundEvent>,
+    onward: Arc<OnceLock<Sender<InboundEvent>>>,
+) {
+    while let Some(mut event) = waiting.recv().await {
+        let binding = event.binding;
+        let Some(onward) = onward.get() else {
+            tracing::debug!(%binding, "agentd runs no turns; dropped a message to an agent");
+            continue;
+        };
+        let surface = match bots.surface(binding).await {
+            Ok(Some(surface)) => surface,
+            Ok(None) => {
+                tracing::debug!(%binding, "a message to an agent's app that isn't active; dropped it");
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!(%binding, error = %err, "couldn't look an agent's binding up; dropped its message");
+                continue;
+            }
+        };
+        if let Err(err) = surface.fill_bot_sender(&mut event).await {
+            tracing::warn!(%binding, error = %err, "couldn't look a bot sender up; its message goes on as it is");
+        }
+        if onward.send(event).await.is_err() {
+            tracing::warn!(%binding, "the turn pipeline is gone; dropped a message");
+        }
     }
 }
 
@@ -195,18 +270,14 @@ impl Dedup for StoreDedup {
 /// - To the manager app: an `/agent` slash command or a DM to the app goes
 ///   to the command intake, and a `user_change` whose user is `deleted`
 ///   deletes that member's configuration token for the workspace.
-/// - To an agent's app, whose binding is active: a message goes to
-///   [`Messages`], after [`SlackSurface::fill_bot_sender`] of the binding
-///   looked its bot sender up.
+/// - To an agent's app: a message goes to [`Messages`], without waiting.
 ///
 /// Everything else is logged by binding and kind and dropped.
-///
-/// [`SlackSurface::fill_bot_sender`]: surface_slack::SlackSurface::fill_bot_sender
 #[derive(Debug, Clone)]
 pub struct Inbound {
     store: Store,
     manager: Option<(ManagerIdentity, CommandSubmitter)>,
-    agents: Option<(SlackBots, Messages)>,
+    agents: Option<Messages>,
 }
 
 impl Inbound {
@@ -221,43 +292,10 @@ impl Inbound {
         }
     }
 
-    /// Also hands messages to agents' apps, whose bots are `bots`, to
-    /// `messages`.
-    pub fn with_agents(mut self, bots: SlackBots, messages: Messages) -> Self {
-        self.agents = Some((bots, messages));
+    /// Also hands messages to agents' apps to `messages`.
+    pub fn with_agents(mut self, messages: Messages) -> Self {
+        self.agents = Some(messages);
         self
-    }
-
-    /// Hands a message an agent's app received on.
-    async fn agent_message(&self, mut event: InboundEvent) {
-        let Some((bots, messages)) = &self.agents else {
-            return;
-        };
-        let binding = event.binding;
-        let surface = match bots.surface(binding).await {
-            Ok(Some(surface)) => surface,
-            Ok(None) => {
-                tracing::debug!(%binding, "a message to an agent's app that isn't active; dropped it");
-                return;
-            }
-            Err(err) => {
-                tracing::warn!(%binding, error = %err, "couldn't look an agent's binding up; dropped its message");
-                return;
-            }
-        };
-        if let Err(err) = surface.fill_bot_sender(&mut event).await {
-            tracing::warn!(%binding, error = %err, "couldn't look a bot sender up; its message goes on as it is");
-        }
-        match messages.onward() {
-            Some(onward) => {
-                if onward.send(event).await.is_err() {
-                    tracing::warn!(%binding, "the turn pipeline is gone; dropped a message");
-                }
-            }
-            None => {
-                tracing::debug!(%binding, "agentd runs no turns; dropped a message to an agent")
-            }
-        }
     }
 
     async fn member_left(&self, event: &SlackEvent) {
@@ -299,7 +337,12 @@ impl Sink<SlackInbound> for Inbound {
                 return Ok(());
             }
             match item {
-                SlackInbound::Message(event) => self.agent_message(*event).await,
+                SlackInbound::Message(event) => match &self.agents {
+                    Some(messages) => messages.hand(*event),
+                    None => {
+                        tracing::debug!(%binding, "agentd doesn't serve agents' apps; dropped a message")
+                    }
+                },
                 _ => {
                     tracing::debug!(%binding, kind, "a request to an agent's app that isn't a message; dropped it")
                 }
