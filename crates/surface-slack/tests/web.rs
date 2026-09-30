@@ -1015,7 +1015,7 @@ mod downloads {
             .download_file(&file(url(&server), Some(100)), 10)
             .await
             .unwrap_err();
-        assert!(matches!(err, SurfaceError::Api(_)), "{err:?}");
+        assert!(matches!(err, SurfaceError::TooLarge(_)), "{err:?}");
         assert!(
             requests(&server).await.is_empty(),
             "the declared size is checked first"
@@ -1025,7 +1025,7 @@ mod downloads {
             .download_file(&file(url(&server), None), 10)
             .await
             .unwrap_err();
-        assert!(matches!(err, SurfaceError::Api(_)), "{err:?}");
+        assert!(matches!(err, SurfaceError::TooLarge(_)), "{err:?}");
         assert!(!err.to_string().contains("files-pri"));
     }
 

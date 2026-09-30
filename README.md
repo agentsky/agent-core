@@ -110,6 +110,17 @@ own DM). Its bot reacts with `[runner] working_emoji` while the turn runs,
 answers only in rooms it was added to, and a member without a linked account
 gets a direct message from the manager bot saying how to link one. Without
 `[sandbox]`, each agent reacts with :eyes: to messages that mention it.
+Every agent has a built-in `agentctl` skill, and its owner adds more with
+`skill add <name> <https Git URL>[#ref]`, or with a `SKILL.md` or `.zip`
+attached to `skill add <name>` in the manager bot's direct message, and
+removes them with `skill rm <name> <skill>`. agentd clones with the `git`
+program (2.37 or later, which the agentd image has) directly from agentd's
+own network, only over `https` and only from a host whose addresses are all
+public, and keeps skills in `skills/` under `store.data_dir`, mounted
+read-only into the agent's sandboxes. A skill whose `SKILL.md` lists
+`allowed-hosts` waits until the owner confirms them with
+`skill confirm <name> <skill>`; those hosts then extend `[proxy] allow` for
+that agent's sandboxes only.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask

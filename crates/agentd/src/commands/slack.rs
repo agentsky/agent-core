@@ -5,7 +5,8 @@
 //!   conversation, so it is private wherever it was run, and its reply goes
 //!   back through its `response_url`.
 //! - A direct message to the manager app (`message.im`), parsed as a whole,
-//!   as on Rocket.Chat. Its reply goes to the same DM.
+//!   as on Rocket.Chat. Its reply goes to the same DM, and the files
+//!   attached to it go with the command, for `persona` and `skill add`.
 //! - A `user_change` event whose user is `deleted`: the member left the
 //!   workspace, and their configuration token for it is deleted.
 //!
@@ -14,7 +15,7 @@
 //! member typed it. Messages from bots, the manager's own replies included,
 //! are never commands.
 
-use core_types::{ConvKind, InboundEvent, MemberKey, SurfaceKind, UserId};
+use core_types::{ConvKind, InFile, InboundEvent, MemberKey, SurfaceKind, UserId};
 use serde_json::Value;
 use surface_slack::normalize::unescape;
 use surface_slack::{SlackEvent, SlashCommand};
@@ -39,13 +40,14 @@ pub fn slash_command(command: SlashCommand) -> Option<(MemberKey, String, Origin
     Some((command.sender, text, origin))
 }
 
-/// The member, command text and origin of a direct message to the manager
-/// app, which `manager` is; `None` for a message from a bot or the manager
-/// itself, or one that isn't in a one-to-one DM.
+/// The member, command text, origin and attached files of a direct message
+/// to the manager app, which `manager` is; `None` for a message from a bot
+/// or the manager itself, or one that isn't in a one-to-one DM. The files
+/// feed `persona` and `skill add`.
 pub fn dm_command(
     event: &InboundEvent,
     manager: &ManagerIdentity,
-) -> Option<(MemberKey, String, Origin)> {
+) -> Option<(MemberKey, String, Origin, Vec<InFile>)> {
     if event.sender_is_bot
         || event.sender_bot_user.is_some()
         || event.sender.user == manager.bot_user
@@ -58,7 +60,7 @@ pub fn dm_command(
     let origin = Origin::SlackDm {
         channel: event.conv.conversation.clone(),
     };
-    Some((event.sender.clone(), text, origin))
+    Some((event.sender.clone(), text, origin, event.files.clone()))
 }
 
 /// The member a `user_change` event says was deleted (left the workspace or

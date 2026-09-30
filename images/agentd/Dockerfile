@@ -1,7 +1,8 @@
-# The agentd image: the release binary on distroless's glibc base, run as
-# uid 10001, the sandbox user, so the volume directories agentd creates are
-# the sandbox's to write (docs/impl-notes.md, "Agent-writable directories
-# are given to the sandbox user").
+# The agentd image: the release binary on Debian slim with git, which
+# agentd runs to clone skills (`/agent skill add`), and CA certificates for
+# it. It runs as uid 10001, the sandbox user, so the volume directories
+# agentd creates are the sandbox's to write (docs/impl-notes.md,
+# "Agent-writable directories are given to the sandbox user").
 #
 # Build it from the repository root, or with `docker compose build` in
 # deploy/compose:
@@ -22,7 +23,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -m 0755 target/release/agentd /usr/local/bin/agentd \
     && install -d -m 0700 /rootfs/var/lib/agentd
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/agentd /usr/local/bin/agentd
 COPY --from=build --chown=10001:10001 /rootfs/var/lib/agentd /var/lib/agentd
 USER 10001:10001

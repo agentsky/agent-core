@@ -5085,3 +5085,136 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
+
+## T25: Skills and the agentctl skill
+
+### Hosts are confirmed with a command of their own
+
+**Issue.** The plan says the owner confirms a skill's `allowed-hosts` when
+adding it, but `/agent` has no dialog: a reply can't ask and wait. Adding the
+skill at once with its files but without its hosts would leave a skill that
+fails when used, and asking the owner to run `skill add` again means
+uploading or cloning twice.
+
+**Solution.** A skill that declares hosts is fetched and checked once, and
+kept outside what sandboxes mount (`<data>/skills-pending/<agent>/<name>/`)
+with a `pending` row; the reply lists the hosts and asks for
+`skill confirm <name> <skill>` within an hour (`PENDING_TTL`). Confirming
+moves the files into the agent's skills and makes the row `active`, which is
+when its hosts count. A confirmation after the hour finds the skill dropped;
+startup drops expired ones and any pending files without a row. The parser
+gained `SkillCommand::Confirm`, and the design's command table lists it.
+
+### Skills are rows, their files are directories
+
+**Issue.** The egress extension reads a session's hosts at every `CONNECT`,
+and `skill rm` has to find what to remove, after restarts and on every
+instance, so the hosts can't live in memory; parsing every agent's
+`SKILL.md` files at each `CONNECT` would trust files over the store.
+
+**Solution.** A migration adds `agent_skills` (`agent_id`, `name`, `state`
+of `pending` or `active`, `source`, `hosts`, `added_by`, `added_at`), keyed
+by agent, name and state, so a pending skill can wait next to the active
+one it would replace. `Store::skill_hosts_for_session` joins `sessions` and
+`agents` (deleted agents get none) and `SkillHosts` parses each host with
+`HostRule` again, so a row that no longer parses allows nothing. Files stay
+on disk, moved into place with a rename so a session sees a skill whole or
+not at all; `skill rm` deletes the row first, which takes the hosts away at
+once, then the directories.
+
+### A clone reaches agentd's own network unless the host is checked
+
+**Issue.** T08's parser keeps options, other transports and credentials out
+of the source, but not its host: `https://169.254.169.254/…`,
+`https://10.0.0.5/…` or `https://rocketchat:3000/…` (a single-label Compose
+name) parse, and agentd clones from its own network, next to Rocket.Chat and
+MongoDB. `git` would also follow a redirect anywhere, and resolve the name
+again after any check.
+
+**Solution.** The host must be a DNS name (`cred_proxy::normalize_host`:
+two labels or more, no IP forms). agentd resolves it itself (5 seconds) and
+refuses it if any address is one the egress proxy never reaches, reusing
+`EgressPolicy::unreachable`, now public, with agentd's own addresses and the
+sandbox subnet. `git` is then pinned to the checked addresses with
+`http.curloptResolve` (Git 2.37 or later), follows no redirect
+(`http.followRedirects=false`; a moved repository has to be given by its new
+URL), may use only `https` (`protocol.allow=never`,
+`protocol.https.allow=always`), and runs with an empty environment, no
+system or global configuration, no credential helper or prompt, no hooks or
+templates, `transfer.fsckObjects`, and `core.symlinks=false`. The clone is
+`--depth=1 --single-branch --no-recurse-submodules --no-tags`, the ref only
+as `--branch=<ref>` and the URL after `--`. It runs in its own process group,
+killed whole after 2 minutes or once its directory passes 40 MB. Tests serve
+a local repository through `Git::serving_prefix_from_directory_for_tests`,
+which rewrites one `https://` prefix to a `file://` directory and skips the
+lookup; nothing in agentd's configuration reaches it.
+
+### The agentd image needs git
+
+**Issue.** agentd clones skills itself, on the egress network, as the plan
+says, and the distroless image has no `git`. A Rust Git client would be a
+large dependency for one shallow clone.
+
+**Solution.** The runtime stage is `debian:trixie-slim` (the digest the
+sandbox image pins) with `git` and `ca-certificates`; it still runs as
+10001. Trixie's Git is 2.47, above the 2.37 `http.curloptResolve` needs.
+`compose-test.sh` checks that `git` runs in the image. The image couldn't be
+built here (Debian's mirror is blocked); CI builds it.
+
+### What a skill package may hold
+
+**Issue.** The plan asks for a size cap and a `SKILL.md` with `name` and
+`description`. An upload or a repository is the owner's, fetched from
+anywhere, and ends up mounted into sandboxes.
+
+**Solution.** `skills::package` checks every skill the same way, whatever
+it came from: at most 10 MB of files, 1,000 files and directories and 16
+levels; names without an empty, `.` or `..` part, `\`, control or invisible
+formatting characters; only regular files and directories (a symlink or a
+special file is refused, in a zip and in a clone); modes rewritten to
+`0755` for directories and `0644`, or `0755` with an execute bit, for files.
+A `.zip` is read with the `zip` crate (MIT) with only
+`deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`
+and `typed-path`: stored or deflated entries, none encrypted, each counted
+as it inflates against its declared size, so a small archive can't unpack
+past the cap. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
+top or in the only top-level directory, at most 256 KB of UTF-8; its front
+matter, at most 16 KB between `---` lines, is read with `serde_norway`
+(now a normal dependency of agentd) into the three keys agentd needs, so
+other keys are skipped rather than built: a "billion laughs" document under
+a key agentd doesn't read parses at once, and one under `allowed-hosts` or
+`description` fails on its type. The name follows Claude Code's
+`[a-z0-9-]{1,64}` and can't be `agentctl`; the description has 1 to 1,024
+characters; `allowed-hosts` is a list or a comma-separated line of at most
+16 `HostRule`s, so `api.anthropic.com`, IP addresses and single labels are
+refused before the owner is asked. Error replies are fixed sentences that
+never repeat the content. An agent has at most 32 skills besides
+`agentctl`.
+
+### The bundled skill and the mount
+
+**Issue.** The bundled skill must always be present, and Docker refuses a
+bind mount whose source doesn't exist, while the runner's own tests start
+sessions for agents agentd never prepared.
+
+**Solution.** The pipeline writes `<data>/skills/<agent>/agentctl/SKILL.md`
+before every turn, next to the persona and with the same
+write-only-when-changed helper (`runner::write_if_changed`, which
+`write_persona` now uses), so an upgrade of agentd updates it. The runner
+sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
+directory exists as the container starts. A skill added, replaced or removed
+reaches a conversation when its process next starts, as a persona does.
+
+### Files from both manager DMs reach the handlers
+
+**Issue.** T30 left the Slack DM's files unpassed and T14 read attachments
+only in the Rocket.Chat DM, and `WebApi::download_file` reported a file over
+the limit as `SurfaceError::Api`, where Rocket.Chat's download says
+`TooLarge`.
+
+**Solution.** `commands::slack::dm_command` returns the event's files and
+the Slack inbound submits them with the command. `Commands::download` reads
+an attachment from either manager's DM (and nowhere else), and both
+`persona` and `skill add` use it, so `persona <name>` with a `persona.md`
+attached works on Slack too. `download_file` answers `TooLarge` past its
+limit.

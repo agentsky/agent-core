@@ -70,7 +70,8 @@ const RETRY_WAIT_CAP: Duration = Duration::from_secs(5);
 /// How the pipeline runs, besides the store and the runner.
 #[derive(Debug, Clone)]
 pub struct PipelineSettings {
-    /// agentd's data directory, which holds the agents' persona files.
+    /// agentd's data directory, which holds the agents' persona files and
+    /// skills.
     pub data_dir: PathBuf,
     /// The manager bots' identities, whose posts start no turn.
     pub managers: Vec<MemberKey>,
@@ -110,6 +111,7 @@ pub struct PipelineSettings {
 /// 4. **The turn.** On [`Decision::Run`], only when the agent's bot may
 ///    post in the conversation without joining it
 ///    ([`Surface::can_post`]): the persona file is written from the store,
+///    and the bundled `agentctl` skill into the agent's skills,
 ///    the thread's session looked up (a DM has one for the conversation, a
 ///    channel one per thread, rooted at the message when it starts one),
 ///    the turn message built with what the session's transcript lacks, and
@@ -703,8 +705,8 @@ impl Pipeline {
     }
 
     /// What a turn of `agent` needs before its session: its bot's identity
-    /// and model, with the persona file written. `None` when the agent or
-    /// its bot is gone.
+    /// and model, with the persona file and the bundled skill written.
+    /// `None` when the agent or its bot is gone.
     async fn prepare(
         &self,
         agent: AgentId,
@@ -718,6 +720,7 @@ impl Pipeline {
             return Ok(None);
         };
         runner::write_persona(&self.inner.settings.data_dir, agent, &row.persona).await?;
+        crate::skills::write_bundled(&self.inner.settings.data_dir, agent).await?;
         let model = self.model_for(credential).await?;
         Ok(Some(Prepared { bot, model }))
     }

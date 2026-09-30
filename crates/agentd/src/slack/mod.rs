@@ -177,7 +177,8 @@ impl Sink<SlackInbound> for Inbound {
             return Ok(());
         }
         let command = match item {
-            SlackInbound::Command(command) => slash_command(command),
+            SlackInbound::Command(command) => slash_command(command)
+                .map(|(member, text, origin)| (member, text, origin, Vec::new())),
             SlackInbound::Message(event) => dm_command(&event, identity),
             SlackInbound::Event(event) => {
                 self.member_left(&event).await;
@@ -186,7 +187,9 @@ impl Sink<SlackInbound> for Inbound {
             SlackInbound::Interaction(_) => None,
         };
         match command {
-            Some((member, text, origin)) => commands.submit(member, text, origin, Vec::new()).await,
+            Some((member, text, origin, files)) => {
+                commands.submit(member, text, origin, files).await
+            }
             None => {
                 tracing::debug!(
                     kind,

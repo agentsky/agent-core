@@ -52,6 +52,7 @@ use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
 use crate::pipeline::{NoCommunityKey, Pipeline};
+use crate::skills::SkillHosts;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -85,7 +86,9 @@ impl Routers {
     /// commands to the command intake; the credential proxy on the proxy
     /// listener, forwarding to `proxy.upstream` with the placeholders in
     /// [`App::registry`] and answering `CONNECT` with the egress proxy
-    /// `[proxy]` describes; and the agentctl API on the ctl listener.
+    /// `[proxy]` describes, extended for each session by its agent's
+    /// skills' confirmed hosts ([`SkillHosts`]); and the agentctl API on
+    /// the ctl listener.
     ///
     /// # Errors
     ///
@@ -114,7 +117,11 @@ impl Routers {
             Arc::new(NoCommunityKey),
         )
         .context("proxy.upstream")?
-        .with_egress(app.config().egress_proxy()?);
+        .with_egress(
+            app.config()
+                .egress_proxy()?
+                .with_extension(Arc::new(SkillHosts(app.store().clone()))),
+        );
         Ok(Self {
             public: public_router(app.clone()).merge(slack_routes),
             proxy: proxy.into_router(),

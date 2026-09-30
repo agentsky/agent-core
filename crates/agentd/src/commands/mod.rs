@@ -1,5 +1,6 @@
-//! `/agent` command dispatch, the account commands, and the agent commands
-//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`).
+//! `/agent` command dispatch, the account commands, the agent commands
+//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), and the
+//! skill commands (`skill add`, `skill confirm`, `skill rm`).
 //!
 //! Every surface turns a command into `(MemberKey, text, Origin, files)` and hands
 //! it to [`Commands::handle_text`], which parses it with
@@ -35,6 +36,7 @@ pub mod intake;
 pub mod relink;
 pub mod reply;
 pub mod rocketchat;
+mod skills;
 pub mod slack;
 pub mod slack_tokens;
 
@@ -54,6 +56,7 @@ use store::{Store, StoreError};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::skills::Skills;
 use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
@@ -154,13 +157,14 @@ pub struct Commands {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Inner {
     store: Store,
     auth: Arc<Auth>,
     replies: Replies,
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
+    skills: Option<Skills>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -172,6 +176,8 @@ enum Failure {
     Auth(#[from] AuthError),
     #[error(transparent)]
     Surface(#[from] core_types::SurfaceError),
+    #[error(transparent)]
+    Skill(#[from] crate::skills::SkillError),
 }
 
 fn now() -> OffsetDateTime {
@@ -197,8 +203,17 @@ impl Commands {
                 replies,
                 rocketchat,
                 slack,
+                skills: None,
             }),
         }
+    }
+
+    /// Runs the skill commands with `skills`; without it they answer that
+    /// they aren't available.
+    #[must_use]
+    pub fn with_skills(mut self, skills: Skills) -> Self {
+        Arc::make_mut(&mut self.inner).skills = Some(skills);
+        self
     }
 
     /// The private reply plumbing.
@@ -295,6 +310,10 @@ impl Commands {
                     self.set_paused(member, name.as_str(), false, origin).await
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
+                Command::Skill(command) => match &self.inner.skills {
+                    Some(skills) => self.skill(skills, member, command, origin, files).await,
+                    None => Ok(format!("`{name}` isn't available yet.")),
+                },
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         };

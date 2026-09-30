@@ -890,9 +890,12 @@ Deliverables:
   - `Login { code: Option<SecretString> }`, `Logout`, `Me`.
   - `SlackToken { token, refresh }`, both `SecretString`.
   - `Create { name, persona }`, `Persona { name, text }`.
-  - `Skill(Add { name, source } | Rm { name, skill })`. `name` is the agent;
-    `skill rm` names the skill, since an owner may have several agents
+  - `Skill(Add { name, source } | Confirm { name, skill } | Rm { name, skill })`.
+    `name` is the agent; `skill rm` names the skill, since an owner may have
+    several agents
     ([impl-notes](impl-notes.md#skill-rm-needs-the-agent-and-the-skill)).
+    `skill confirm` came with T25
+    ([impl-notes](impl-notes.md#hosts-are-confirmed-with-a-command-of-their-own)).
   - `Allow` and `Deny { name, target }`.
   - `Limits { name, turns_per_day, hops }`.
   - `Pause`, `Resume` and `Delete { name }`.
@@ -2230,6 +2233,25 @@ Acceptance: tests for add from a local Git fixture repo, add from an uploaded
 file, validation failures, rm, mounting (the path is visible in a
 `ProcessSandbox` session), and the allowlist extension.
 
+Notes from implementing it
+([impl-notes](impl-notes.md#t25-skills-and-the-agentctl-skill)):
+
+- A skill whose `SKILL.md` declares `allowed-hosts` waits, outside what
+  sandboxes mount, until the owner sends `skill confirm <name> <skill>`
+  within an hour; only then are its files and hosts in use. The
+  `agent_skills` table records every skill with its state, source and
+  hosts, and `SkillHosts` reads a session's agent's confirmed hosts from it.
+- The bundled `agentctl` skill is written before every turn, like the
+  persona; the name `agentctl` can't be added or removed. The runner mounts
+  `<data>/skills/<agent>` when it exists.
+- The clone refuses a Git host that isn't a DNS name or resolves to an
+  address the egress proxy never reaches, and pins `git` to the addresses
+  checked, with no redirects, `https` only and a size and time cap. The
+  agentd image moves from distroless to Debian slim for `git`.
+- An upload is a `.md` (up to 256 KB) or a `.zip` (up to 10 MB, unpacked
+  too); both surfaces' manager DMs pass their files to the handlers, so a
+  `persona.md` attached on Slack works now too.
+
 ## Phase 3: requester-pays (design milestone 3)
 
 ### T26
@@ -2524,7 +2546,7 @@ Notes from implementing it
   `surface_slack::normalize::unescape` before parsing.
 - Files attached to the manager DM aren't passed on yet, since `persona`
   (T14) and `skill add` (T25) aren't in place; `WebApi::download_file` is
-  the download they use.
+  the download they use. T25 passes them on, for both.
 - The manifest's tests use `serde_norway`, a dev-dependency (MIT or
   Apache-2.0).
 

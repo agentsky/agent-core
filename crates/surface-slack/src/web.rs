@@ -936,16 +936,17 @@ impl WebApi {
     ///
     /// # Errors
     ///
-    /// [`SurfaceError::Api`] if the URL isn't Slack's, the file is larger
-    /// than `max_bytes`, or Slack answers anything but 200;
-    /// [`SurfaceError::Transport`] if the download fails. No error repeats
-    /// the URL.
+    /// [`SurfaceError::TooLarge`] if the file is larger than `max_bytes`;
+    /// [`SurfaceError::Api`] if the URL isn't Slack's, or Slack answers
+    /// anything but 200; [`SurfaceError::Transport`] if the download fails.
+    /// No error repeats the URL.
     pub async fn download_file(&self, file: &InFile, max_bytes: u64) -> Result<Vec<u8>> {
         let url = Url::parse(&file.url)
             .ok()
             .filter(|url| self.client.may_send_token_to(url))
             .ok_or_else(|| SurfaceError::Api("the file's URL is not a Slack URL".into()))?;
-        let too_large = || SurfaceError::Api(format!("the file is larger than {max_bytes} bytes"));
+        let too_large =
+            || SurfaceError::TooLarge(format!("the file is larger than {max_bytes} bytes"));
         if file.size.is_some_and(|size| size > max_bytes) {
             return Err(too_large());
         }

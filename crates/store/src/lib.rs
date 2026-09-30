@@ -25,7 +25,8 @@
 //! [`message_refs`](Store::record_message_ref),
 //! [`slack_config_tokens`](Store::put_slack_config_token), and
 //! [`agents`](Store::create_agent) with their bindings and
-//! [retirements](Store::claim_retirement).
+//! [retirements](Store::claim_retirement), and
+//! [`agent_skills`](Store::put_skill).
 
 #![warn(missing_docs)]
 
@@ -47,6 +48,7 @@ mod pending_logins;
 mod relink_notices;
 mod seal;
 mod sessions;
+mod skills;
 mod slack_config_tokens;
 mod volumes;
 
@@ -62,6 +64,7 @@ pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use sessions::{Session, SessionKind, ThreadSession};
+pub use skills::{AgentSkill, NewSkill, SkillState};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
@@ -355,6 +358,7 @@ mod tests {
             [
                 "_sqlx_migrations",
                 "agent_bindings",
+                "agent_skills",
                 "agents",
                 "claude_link_generations",
                 "claude_links",
