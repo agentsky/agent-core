@@ -2263,10 +2263,12 @@ started are reparented to the container's init and end when the container
 stops. If the pid line hasn't arrived within 2 seconds, `kill` returns an
 error instead of `Ok`: nothing was signalled, so `wait` could hang, and the
 caller must stop the container. `ProcessSandbox` kills the child's whole
-process group instead, through the `kill` command, since a direct
-`kill(2)` would need `unsafe`; it runs the command with `tokio::process`,
-and from `Drop`, which can't wait, in a spawned task (or blocking, off a
-runtime).
+process group instead, with rustix's safe `kill_process_group`, as
+agentctl does. It used to run the `kill` command, from `Drop` in a
+spawned task, which a current-thread runtime whose `block_on` returned,
+or any runtime shutting down, dropped unpolled, so the process group
+lived on. `kill(2)` returns at once, so `Drop` now sends the signal
+itself.
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -2276,7 +2278,8 @@ writable in the container.
 
 **Solution.** `shared/`, `memory/`, each session's `work/`, `claude/`,
 `home/` and `tmp/`, and `settings.json` are given to the configured
-`uid:gid` with `lchown` when their owner differs. That works when agentd
+`uid:gid` when their owner differs, through handles that follow no
+symlink (below). That works when agentd
 runs as root or as the sandbox user itself, and fails with an error naming
 the cause otherwise. T16's agentd image should therefore run as uid 10001
 (the plan's T16 says so).
@@ -2303,11 +2306,10 @@ root) would write through it.
 
 **Solution.** Nothing on the host follows a symlink inside an
 agent-writable tree. Before each start, each of `work/`, `claude/`,
-`home/` and `tmp/` that isn't a real directory (checked with
-`symlink_metadata`) is removed and created again, as is `claude/skills`
-when there are skills to mount there. It is rewritten on every start, so
-an agent can't lower `cleanupPeriodDays` and lose its transcripts.
-Ownership changes use `lchown`.
+`home/` and `tmp/` that isn't a real directory is removed and created
+again, as is `claude/skills` when there are skills to mount there. It is
+rewritten on every start, so an agent can't lower `cleanupPeriodDays` and
+lose its transcripts.
 
 The plan made this step a public `prepare_session_dirs` on the trait. Run
 while the session's container was up, the agent could swap `claude` for a
@@ -2317,14 +2319,34 @@ crate-private and runs only in `start`, before the container is created;
 `start`'s rustdoc says the session must have no running container, and the
 runner never runs two containers of one session.
 
-`settings.json` doesn't rely on that. std has no `openat` (`std::fs::Dir`
-is unstable), so the sandbox crate adds `rustix`, whose `openat` and
-`renameat` are safe functions. `claude/` is opened with `O_NOFOLLOW |
-O_DIRECTORY`, its owner checked on the handle, and the new file is created
-relative to that handle with `O_EXCL | O_NOFOLLOW`, given away with
-`fchown`, and renamed over `settings.json` within the same directory,
-which replaces a symlink instead of following it. A directory in its place
-is renamed aside to a random name first, then removed.
+The steps don't rely on that either. std has no `openat` (`std::fs::Dir`
+is unstable), so the sandbox crate adds `rustix`, whose `*at` functions
+are safe. The session directory, whose parent no sandbox reaches, is
+opened by path; every entry in it is inspected (`statat` without
+following), removed (`unlinkat`), created (`mkdirat`) and opened relative
+to that handle, with `O_NOFOLLOW | O_DIRECTORY`. `settings.json` and
+`claude/skills` are then written relative to the `claude/` handle, not
+its path: a new file is created with `O_EXCL | O_NOFOLLOW`, given away
+with `fchown`, and renamed over `settings.json` within the same
+directory, which replaces a symlink instead of following it. A directory
+in its place is renamed aside to a random name first, then removed. So a
+`claude` swapped after its repair only means agentd writes into the
+directory it repaired.
+
+The agent can also `chmod` what it owns. With `claude` at `555`, or the
+session directory at `0`, agentd running as the sandbox user (without
+root's `CAP_DAC_OVERRIDE`) failed every later start with `EACCES`, so the
+agent could break its own session for good. The session directory,
+`shared/`, `memory/` and each directory repaired above therefore get mode
+`0755` again, after their owner. A directory at mode `0` can't be opened
+for reading, so the handles are opened with `O_PATH`, which needs no
+permission on the directory itself. Linux has no `fchmod` on an
+`O_PATH` handle (`fchmodat2` with `AT_EMPTY_PATH` needs Linux 6.6), so
+modes are set through `/proc/self/fd/<handle>`, which the kernel
+resolves to the handle's directory, not to what its path names now;
+owners are changed, and the aside directory removed, the same way. agentd therefore needs
+`/proc`, which every container has. `ProcessSandbox` links `claude/skills`
+through the same handle.
 
 ### Several agentd, or test runs, on one Docker host
 
@@ -2406,7 +2428,28 @@ network, but `[sandbox] network` now refuses `bridge`, along with `host`,
 `none`, `default` and anything with a `:` (`container:<id>`): those are
 Docker network modes, not the internal sandbox network, and `validate`
 had only checked that the name wasn't empty. `container_config`, which is
-public, validates the configuration too.
+public, validates the configuration too. The control's network isn't
+internal, so its sandbox opts in (next entry).
+
+### `[sandbox] network` by ID, or not internal
+
+**Issue.** Docker finds a network by name, by ID and by ID prefix, so
+`validate` refusing the name `bridge` didn't keep out the default
+bridge's ID, which attaches the sandbox with a route out. Nothing checked
+that the network was `internal` at all, and with an ID, `ip` (which looks
+the container's address up under the configured name) returned
+`NoAddress`.
+
+**Solution.** `DockerSandbox::start` inspects the network before it
+touches the disk and refuses, with `SandboxError::Config` for the
+`network` key, unless Docker's name for it equals the configured value
+and it is `internal`. It does so on every start, so a network that was
+recreated without `internal` is caught too, for one request per start.
+The Docker tests' control, which needs a route out, calls
+`DockerSandbox::allowing_an_open_network_for_tests`, which skips only the
+`internal` check; agentd never calls it and no configuration key reaches
+it. A Docker test checks that the bridge's ID and ID prefix, an internal
+network's ID, an open network and a missing one are all refused.
 
 ### A `ChildStdin` closes only when dropped
 

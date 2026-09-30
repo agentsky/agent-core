@@ -25,11 +25,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::layout::Layout;
+use crate::layout::{Layout, SkillsEntry};
 use crate::{
-    ChildHandle, ChildInner, ChildIo, Container, ContainerEvent, ContainerId, ExitStatus,
-    ManagedContainer, PERSONA_FILE, Result, Sandbox, SandboxConfig, SandboxError, SessionPaths,
-    SessionSpec, SharedAccess, VolumeRef, check_exec, check_spec, config,
+    ChildHandle, ChildInner, ChildIo, ConfigError, Container, ContainerEvent, ContainerId,
+    ExitStatus, ManagedContainer, PERSONA_FILE, Result, Sandbox, SandboxConfig, SandboxError,
+    SessionPaths, SessionSpec, SharedAccess, VolumeRef, check_exec, check_spec, config,
 };
 
 /// Where the volume's directories appear in a container.
@@ -377,6 +377,7 @@ pub struct DockerSandbox {
     docker: Docker,
     config: SandboxConfig,
     layout: Layout,
+    open_network_allowed: bool,
 }
 
 impl DockerSandbox {
@@ -430,7 +431,46 @@ impl DockerSandbox {
             },
             docker,
             config,
+            open_network_allowed: false,
         })
+    }
+
+    /// Lets [`start`](Sandbox::start) use a network with a route out, for
+    /// tests that need one as a control. agentd never calls it, and no
+    /// configuration key reaches it.
+    #[doc(hidden)]
+    pub fn allowing_an_open_network_for_tests(mut self) -> Self {
+        self.open_network_allowed = true;
+        self
+    }
+
+    /// Checks that [`SandboxConfig::network`] is the name, not an ID or an
+    /// ID prefix, of an existing network that is `internal`, so it has no
+    /// route out. Docker looks a network up by ID and ID prefix too, so the
+    /// name check keeps an ID of the default `bridge` network out, and
+    /// [`ip`](Sandbox::ip) finds the container's address under that name.
+    async fn check_network(&self) -> Result<()> {
+        let refused = || {
+            SandboxError::Config(ConfigError {
+                key: "network",
+                message: "must be the name of an existing internal Docker network",
+            })
+        };
+        let network = self
+            .docker
+            .inspect_network(&self.config.network, None)
+            .await
+            .map_err(|err| match status_of(&err) {
+                Some(404) => refused(),
+                _ => docker_err("inspect network", true)(err),
+            })?;
+        let named = network.name.as_deref() == Some(self.config.network.as_str());
+        let internal = network.internal == Some(true) || self.open_network_allowed;
+        if named && internal {
+            Ok(())
+        } else {
+            Err(refused())
+        }
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
@@ -452,20 +492,15 @@ impl Sandbox for DockerSandbox {
 
     async fn start(&self, spec: &SessionSpec) -> Result<Container> {
         let body = container_config(&self.config, &self.layout.data_dir, spec)?;
-        let dir = self
-            .layout
-            .prepare_session_dirs(&spec.volume, spec.session)
+        self.check_network().await?;
+        let skills = if spec.skills_dir.is_some() {
+            SkillsEntry::MountPoint
+        } else {
+            SkillsEntry::Untouched
+        };
+        self.layout
+            .prepare_session_dirs(&spec.volume, spec.session, skills)
             .await?;
-        if spec.skills_dir.is_some() {
-            let layout = self.layout.clone();
-            let mount_point = dir.join("claude").join("skills");
-            tokio::task::spawn_blocking(move || layout.repair_dir(&mount_point))
-                .await
-                .map_err(|_| SandboxError::Io {
-                    what: "filesystem task",
-                    source: std::io::Error::other("the task panicked or was cancelled"),
-                })??;
-        }
         let created = self
             .docker
             .create_container(None, body)
@@ -651,6 +686,7 @@ impl Sandbox for DockerSandbox {
                 }
             }
         })
+        .fuse()
         .boxed()
     }
 }

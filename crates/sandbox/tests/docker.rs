@@ -36,7 +36,16 @@ struct Fixture {
     sandbox: DockerSandbox,
     config: SandboxConfig,
     network: String,
-    owns_network: bool,
+    dir: PathBuf,
+    _leftovers: Leftovers,
+}
+
+/// What a fixture leaves on the Docker host and on disk, removed on drop.
+/// It exists before any of it, so a fixture that panics halfway still
+/// cleans up.
+struct Leftovers {
+    instance: String,
+    network: Option<String>,
     dir: PathBuf,
 }
 
@@ -84,6 +93,12 @@ impl Fixture {
             Network::Internal => (format!("agentd-test-{tag}"), Some(true)),
             Network::Open => (format!("agentd-test-open-{tag}"), Some(false)),
         };
+        let dir = std::env::temp_dir().join(format!("sandbox-docker-{tag}"));
+        let leftovers = Leftovers {
+            instance: format!("test-{tag}"),
+            network: internal.is_some().then(|| network.clone()),
+            dir: dir.clone(),
+        };
         if internal.is_some() {
             docker
                 .create_network(NetworkCreateRequest {
@@ -94,12 +109,11 @@ impl Fixture {
                 .await
                 .unwrap();
         }
-        let dir = std::env::temp_dir().join(format!("sandbox-docker-{tag}"));
         std::fs::create_dir(&dir).unwrap();
         let me = std::fs::metadata(&dir).unwrap();
         let mut config = SandboxConfig::new(IMAGE);
         config.network = network.clone();
-        config.instance = format!("test-{tag}");
+        config.instance = leftovers.instance.clone();
         config.memory_mb = 256;
         config.cpus = 0.5;
         config.pids_limit = 128;
@@ -110,7 +124,10 @@ impl Fixture {
         }
         let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
         let store = Store::open_in_memory(sealer).await.unwrap();
-        let sandbox = DockerSandbox::new(docker.clone(), store, &dir, config.clone()).unwrap();
+        let mut sandbox = DockerSandbox::new(docker.clone(), store, &dir, config.clone()).unwrap();
+        if internal == Some(false) {
+            sandbox = sandbox.allowing_an_open_network_for_tests();
+        }
         std::fs::create_dir_all(dir.join("agents/a1")).unwrap();
         std::fs::write(dir.join("agents/a1/persona.md"), "You are a test.\n").unwrap();
         std::fs::create_dir_all(dir.join("skills/a1/s1")).unwrap();
@@ -120,8 +137,8 @@ impl Fixture {
             sandbox,
             config,
             network,
-            owns_network: internal.is_some(),
             dir,
+            _leftovers: leftovers,
         }
     }
 
@@ -170,10 +187,10 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
+impl Drop for Leftovers {
     fn drop(&mut self) {
-        let instance = self.config.instance.clone();
-        let network = self.owns_network.then(|| self.network.clone());
+        let instance = self.instance.clone();
+        let network = self.network.clone();
         let cleanup = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -489,4 +506,49 @@ async fn docker_a_killed_container_produces_a_die_event() {
             session: Some(spec.session),
         }
     );
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn docker_start_refuses_a_network_that_is_open_or_not_named() {
+    let fx = Fixture::new().await;
+    let open = Fixture::new_on(Network::Open).await;
+    let id_of = |name: String| {
+        let docker = fx.docker.clone();
+        async move {
+            docker
+                .inspect_network(&name, None)
+                .await
+                .unwrap()
+                .id
+                .unwrap()
+        }
+    };
+    let bridge = id_of("bridge".into()).await;
+    let internal = id_of(fx.network.clone()).await;
+    let volume = fx.volume(AgentId::new_v4(), channel()).await;
+    let spec = fx.spec(&volume);
+    for network in [
+        bridge.clone(),
+        bridge[..12].to_string(),
+        internal,
+        open.network.clone(),
+        format!("agentd-test-missing-{}", uuid::Uuid::new_v4().simple()),
+    ] {
+        let mut config = fx.config.clone();
+        config.network = network.clone();
+        let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
+        let store = Store::open_in_memory(sealer).await.unwrap();
+        let sandbox = DockerSandbox::new(fx.docker.clone(), store, &fx.dir, config).unwrap();
+        let err = sandbox.start(&spec).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                sandbox::SandboxError::Config(sandbox::ConfigError { key: "network", .. })
+            ),
+            "{network}: {err:?}"
+        );
+    }
+    assert!(fx.sandbox.list_managed().await.unwrap().is_empty());
+    fx.start(&spec).await;
 }

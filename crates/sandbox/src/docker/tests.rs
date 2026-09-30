@@ -484,9 +484,84 @@ async fn events_from(body: String) -> Vec<Result<ContainerEvent>> {
     let docker = fake_docker(body).await;
     let store = crate::test_util::memory_store().await;
     let sandbox = DockerSandbox::new(docker, store, DATA, SandboxConfig::new("img")).unwrap();
-    tokio::time::timeout(Duration::from_secs(10), sandbox.events().collect())
+    let mut events = sandbox.events();
+    let items = tokio::time::timeout(Duration::from_secs(10), events.by_ref().collect())
         .await
-        .unwrap()
+        .unwrap();
+    assert!(events.next().await.is_none());
+    items
+}
+
+async fn sandbox_seeing_network(body: serde_json::Value, data_dir: &Path) -> DockerSandbox {
+    let docker = fake_docker(body.to_string()).await;
+    let store = crate::test_util::memory_store().await;
+    DockerSandbox::new(docker, store, data_dir, SandboxConfig::new("img")).unwrap()
+}
+
+#[tokio::test]
+async fn the_network_must_be_internal_and_named_by_its_name() {
+    let data = Path::new(DATA);
+    let ok = serde_json::json!({"Name": "sandbox", "Id": "0123abcd", "Internal": true});
+    sandbox_seeing_network(ok, data)
+        .await
+        .check_network()
+        .await
+        .unwrap();
+    let refused = [
+        serde_json::json!({"Name": "sandbox", "Internal": false}),
+        serde_json::json!({"Name": "sandbox"}),
+        serde_json::json!({"Name": "bridge", "Id": "sandbox", "Internal": false}),
+        serde_json::json!({"Name": "sandbox-internal", "Internal": true}),
+    ];
+    for body in refused {
+        let err = sandbox_seeing_network(body.clone(), data)
+            .await
+            .check_network()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SandboxError::Config(ConfigError { key: "network", .. })
+            ),
+            "{body}: {err:?}"
+        );
+    }
+
+    let open = serde_json::json!({"Name": "sandbox", "Internal": false});
+    let sandbox = sandbox_seeing_network(open, data).await;
+    sandbox
+        .allowing_an_open_network_for_tests()
+        .check_network()
+        .await
+        .unwrap();
+    let other = serde_json::json!({"Name": "other", "Internal": false});
+    let sandbox = sandbox_seeing_network(other, data).await;
+    assert!(matches!(
+        sandbox
+            .allowing_an_open_network_for_tests()
+            .check_network()
+            .await,
+        Err(SandboxError::Config(_))
+    ));
+}
+
+#[tokio::test]
+async fn start_refuses_an_open_network_before_touching_the_disk() {
+    let dir = crate::test_util::TempDir::new();
+    let open = serde_json::json!({"Name": "sandbox", "Internal": false});
+    let sandbox = sandbox_seeing_network(open, &dir.0).await;
+    let spec = SessionSpec::new(
+        SessionId::new_v4(),
+        volume(&dir.0, AgentId::new_v4(), ScopeKey::Private),
+        "img",
+        dir.0.join("agents/a1"),
+    );
+    assert!(matches!(
+        sandbox.start(&spec).await,
+        Err(SandboxError::Config(ConfigError { key: "network", .. }))
+    ));
+    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
 }
 
 #[tokio::test]
