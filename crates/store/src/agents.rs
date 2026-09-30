@@ -609,7 +609,7 @@ impl Store {
     ) -> Result<Vec<BindingId>> {
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT id FROM agent_bindings WHERE surface = ? AND team_id = ? \
-             AND state = 'creating' AND state_changed_at <= ? ORDER BY state_changed_at, id",
+             AND state = 'creating' AND state_changed_at <= ? ORDER BY state_changed_at, rowid",
         )
         .bind(surface.as_str())
         .bind(team.as_str())
@@ -669,7 +669,7 @@ impl Store {
              WHERE b.surface = ? AND b.team_id = ? AND b.state = 'active' \
              AND a.state IN ('active', 'paused') \
              AND b.bot_user_id IS NOT NULL AND b.bot_token_enc IS NOT NULL \
-             ORDER BY b.state_changed_at, b.id",
+             ORDER BY b.state_changed_at, b.rowid",
         )
         .bind(surface.as_str())
         .bind(team.as_str())
@@ -783,7 +783,7 @@ impl Store {
         let rows: Vec<(String, String)> = sqlx::query_as(concat!(
             "SELECT id, bot_user_id FROM agent_bindings WHERE surface = ? AND team_id = ? AND ",
             retirable!(),
-            " ORDER BY state_changed_at, id"
+            " ORDER BY state_changed_at, rowid"
         ))
         .bind(surface.as_str())
         .bind(team.as_str())
