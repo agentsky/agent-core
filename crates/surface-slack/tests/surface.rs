@@ -1117,10 +1117,11 @@ async fn the_conversation_kind_comes_from_conversations_info_once_an_hour() {
     assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
 
     let (server, surface) = confirming_setup(json!({"is_mpim": true, "is_group": true})).await;
+    let mention = format!("<@{BOT_USER}> in a group DM");
     mount(
         &server,
         "conversations.history",
-        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "no mention"}]})),
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": mention}]})),
     )
     .await;
     assert_eq!(
@@ -1140,6 +1141,34 @@ async fn a_message_older_than_the_window_is_not_read_back() {
     event.message.id = "not a ts".into();
     assert_eq!(surface.confirm(&event).await, Ok(None));
     assert!(requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_thread_reply_is_confirmed_only_under_a_root_the_bot_may_have_posted() {
+    let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
+    let root = event.thread_root.clone().unwrap();
+    for (parent, confirmed) in [
+        (json!(BOT_USER), true),
+        (Value::Null, true),
+        (json!("not a user"), true),
+        (json!(USER), false),
+    ] {
+        let (server, surface) = confirming_setup(public_channel()).await;
+        mount(
+            &server,
+            "conversations.replies",
+            ok(json!({"messages": [{
+                "ts": event.message.id.as_str(),
+                "user": USER,
+                "text": event.text,
+                "thread_ts": root.as_str(),
+                "parent_user_id": parent,
+            }]})),
+        )
+        .await;
+        let copy = surface.confirm(&event).await.unwrap();
+        assert_eq!(copy.is_some(), confirmed, "{parent}");
+    }
 }
 
 #[tokio::test]

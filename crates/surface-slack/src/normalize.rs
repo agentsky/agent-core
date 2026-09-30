@@ -10,11 +10,18 @@
 //!   classic integrations and the other subtypes are dropped.
 //! - What is kept is bounded, since an agent's owner can sign an event
 //!   with anything in it (see [Bounds](#bounds)).
-//! - In a channel (`channel_type` other than `im` and `mpim`), a message is
-//!   kept only if it mentions the binding's bot user among those, or replies
-//!   in a thread.
-//!   Whether the thread's root is the agent's own message is the router's
-//!   question; it needs the thread root, which is in `reply_to`.
+//! - Outside a one-to-one DM (`channel_type` other than `im`), a message
+//!   is kept only if it mentions the binding's bot user among those, or
+//!   replies in a thread whose root the bot may have posted: one whose
+//!   `parent_user_id` is the bot user, or whose root's author isn't known,
+//!   because the reply has no `parent_user_id` shaped like a user id or the
+//!   bot user isn't known. The router answers a person in a channel or a
+//!   group DM only for a mention of the agent or a reply under one of the
+//!   agent's own messages, and another agent only for a mention, so what is
+//!   dropped here is what it would ignore. Whether the root is the agent's
+//!   own message stays the router's question, answered from `reply_to` and
+//!   the messages agentd recorded; `parent_user_id` only drops replies
+//!   under a root that can't be.
 //! - `thread_ts` becomes both `thread_root` and `reply_to`, unless it equals
 //!   the message's own `ts`, which makes the message the root itself.
 //! - A bot sender (`bot_id` or `bot_profile`) with a `user` field has that
@@ -41,12 +48,15 @@
 //! Every id a message is kept with must be shaped like Slack's, or the
 //! message is [`Skip::Malformed`]: its `channel` ([`is_channel_id`]), its
 //! `ts` and `thread_ts` ([`is_ts`]), its `user` ([`is_user_id`]) and its
-//! `bot_id` ([`is_bot_id`]). Each shape leaves room for Slack's ids to
-//! grow, up to [`MAX_ID_TAIL`] characters after the prefix. The ingress
-//! refuses an event whose `channel`, `ts` or `thread_ts` isn't shaped so
-//! with 400 before it is acknowledged, since they make up its
-//! deduplication key; a sender that isn't is dropped here, after the 200,
-//! before any row. The rest is cut to Slack's own limits:
+//! `bot_id` ([`is_bot_id`]). A `parent_user_id` isn't kept, only compared
+//! with the bot user, so one that isn't a string shaped like a user id is
+//! taken as missing, which keeps the reply. Each shape leaves room for
+//! Slack's ids to grow, up to [`MAX_ID_TAIL`] characters after the
+//! prefix. The ingress refuses an event whose `channel`, `ts` or
+//! `thread_ts` isn't shaped so with 400 before it is acknowledged, since
+//! they make up its deduplication key; a sender that isn't is dropped
+//! here, after the 200, before any row. The rest is cut to Slack's own
+//! limits:
 //!
 //! - `text` to at most [`MAX_TEXT_BYTES`], at a character boundary: as
 //!   many bytes as Slack's limit of 40,000 characters can take. Slack's
@@ -105,8 +115,9 @@ const MAX_SUBTYPE_BYTES: usize = 64;
 pub struct Context<'a> {
     /// The binding whose app received the event.
     pub binding: BindingId,
-    /// The binding's bot user, if known. Without it, channel messages are
-    /// kept only when they reply in a thread.
+    /// The binding's bot user, if known. Without it, messages outside
+    /// one-to-one DMs are kept only when they reply in a thread, whoever
+    /// posted its root.
     pub bot_user: Option<&'a UserId>,
     /// The envelope's `team_id`.
     pub team: &'a TeamId,
@@ -129,9 +140,9 @@ pub enum Skip {
     /// The event names neither a `user` nor a `bot_id`.
     #[error("the message has no sender")]
     NoSender,
-    /// A channel message that neither mentions the bot nor replies in a
-    /// thread.
-    #[error("a channel message that neither mentions the bot nor replies in a thread")]
+    /// A message outside a one-to-one DM that neither mentions the bot nor
+    /// replies in a thread whose root the bot may have posted.
+    #[error("a message outside a DM that neither mentions the bot nor replies under its root")]
     NotAddressed,
     /// A bot's message that was edited.
     #[error("a bot's message was edited")]
@@ -150,6 +161,7 @@ struct MessageEvent {
     text: Option<String>,
     ts: Option<String>,
     thread_ts: Option<String>,
+    parent_user_id: Option<Value>,
     blocks: Option<Value>,
     files: Option<Vec<SlackFile>>,
     edited: Option<IgnoredAny>,
@@ -245,8 +257,15 @@ fn normalized(
     text.truncate(truncated(&text, MAX_TEXT_BYTES).len());
     let mentions = mentions(&text, event.blocks.as_ref());
     let thread_root = event.thread_ts.filter(|root| *root != ts);
-    if conv_kind == ConvKind::Channel
-        && thread_root.is_none()
+    let root_by_someone_else = event
+        .parent_user_id
+        .as_ref()
+        .and_then(Value::as_str)
+        .filter(|parent| is_user_id(parent))
+        .zip(context.bot_user)
+        .is_some_and(|(parent, bot)| parent != bot.as_str());
+    if conv_kind != ConvKind::Dm
+        && (thread_root.is_none() || root_by_someone_else)
         && !context.bot_user.is_some_and(|bot| mentions.contains(bot))
     {
         return Err(Skip::NotAddressed);
@@ -618,6 +637,8 @@ mod tests {
         assert_eq!(normalize(private), Err(Skip::NotAddressed));
         let untyped = channel_message(json!({"text": "hi", "channel_type": null}));
         assert_eq!(normalize(untyped), Err(Skip::NotAddressed));
+        let group_dm = channel_message(json!({"text": "hi", "channel_type": "mpim"}));
+        assert_eq!(normalize(group_dm), Err(Skip::NotAddressed));
     }
 
     #[test]
@@ -632,10 +653,68 @@ mod tests {
         };
         let mention = channel_message(json!({}));
         assert_eq!(message(&context, &mention), Err(Skip::NotAddressed));
-        let reply = channel_message(json!({"thread_ts": "1727697500.000050"}));
+        let reply = channel_message(json!({
+            "thread_ts": "1727697500.000050",
+            "parent_user_id": "U0SOMEONE",
+        }));
         assert!(message(&context, &reply).is_ok());
         let dm = channel_message(json!({"channel_type": "im", "text": "hi"}));
         assert!(message(&context, &dm).is_ok());
+    }
+
+    #[test]
+    fn a_thread_reply_is_kept_only_under_a_root_the_bot_may_have_posted() {
+        let reply = |extra: Value| {
+            let mut event = channel_message(json!({
+                "text": "no mention",
+                "thread_ts": "1727697500.000050",
+            }));
+            for (key, value) in extra.as_object().unwrap() {
+                event[key] = value.clone();
+            }
+            event
+        };
+        let foreign = json!({"parent_user_id": "U0HUMAN"});
+        for kind in ["channel", "group", "mpim"] {
+            let under_foreign = reply(json!({"parent_user_id": "U0HUMAN", "channel_type": kind}));
+            assert_eq!(normalize(under_foreign), Err(Skip::NotAddressed), "{kind}");
+            let under_other_bot = reply(json!({"parent_user_id": "U0BOT2", "channel_type": kind}));
+            assert_eq!(
+                normalize(under_other_bot),
+                Err(Skip::NotAddressed),
+                "{kind}"
+            );
+            let under_own = reply(json!({"parent_user_id": BOT, "channel_type": kind}));
+            assert!(normalize(under_own).is_ok(), "{kind}");
+        }
+        let dm = reply(json!({"parent_user_id": "U0HUMAN", "channel_type": "im"}));
+        assert!(normalize(dm).is_ok());
+        let mentioned = reply(json!({"parent_user_id": "U0HUMAN", "text": "<@U0BOT> too"}));
+        assert_eq!(normalize(mentioned).unwrap().mentions, [UserId::from(BOT)]);
+        for unknown in [
+            json!({}),
+            json!({"parent_user_id": null}),
+            json!({"parent_user_id": ""}),
+            json!({"parent_user_id": "u0human"}),
+            json!({"parent_user_id": "B0HUMAN"}),
+            json!({"parent_user_id": format!("U{}", "A".repeat(MAX_ID_TAIL + 1))}),
+            json!({"parent_user_id": 7}),
+            json!({"parent_user_id": {"id": "U0HUMAN"}}),
+        ] {
+            let kept = normalize(reply(unknown.clone()));
+            assert!(kept.is_ok(), "{unknown}: {kept:?}");
+        }
+        assert_eq!(
+            read(ConvKind::Channel, reply(foreign.clone())),
+            Err(Skip::NotAddressed)
+        );
+        assert_eq!(
+            read(ConvKind::GroupDm, reply(foreign.clone())),
+            Err(Skip::NotAddressed)
+        );
+        assert!(read(ConvKind::Dm, reply(foreign)).is_ok());
+        assert!(read(ConvKind::Channel, reply(json!({"parent_user_id": BOT}))).is_ok());
+        assert!(read(ConvKind::Channel, reply(json!({}))).is_ok());
     }
 
     #[test]
@@ -679,10 +758,8 @@ mod tests {
             let event = normalize(channel_message(json!({"channel_type": channel_type})));
             assert_eq!(event.unwrap().conv_kind, kind, "{channel_type}");
         }
-        for channel_type in ["im", "mpim"] {
-            let unaddressed = channel_message(json!({"channel_type": channel_type, "text": "x"}));
-            assert!(normalize(unaddressed).is_ok(), "{channel_type}");
-        }
+        let unaddressed = channel_message(json!({"channel_type": "im", "text": "x"}));
+        assert!(normalize(unaddressed).is_ok());
     }
 
     #[test]

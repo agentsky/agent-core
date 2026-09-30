@@ -5897,6 +5897,50 @@ column without a default to a table that has rows, and rebuilding
 `processed_events` for it isn't worth it, since every writer goes through
 `mark_event_processed`, which always sets it.
 
+### Thread replies under someone else's root aren't kept
+
+**Issue.** An eighth review found that busy threads still drained the
+owner's bucket. `normalize` kept every channel thread reply, whether or
+not it could address the bot, so each of one owner's agents' apps kept,
+and charged, every reply in every thread of every channel it was in; the
+router then ignored nearly all of them, since it answers a person there
+only for a mention of the agent or a reply under one of the agent's own
+messages. A new test, one owner's ten agents taking a thread reply each
+in 40 rounds and then a mention, kept 210 replies before the change and
+dropped the mention after its 200. Group DMs were kept whole, though the
+router applies the channel rule to them too (only a one-to-one DM is
+addressed by being one), and a message `normalize` found malformed was
+logged at debug only, so a change in Slack's ids would drop messages
+without a word.
+
+**Solution.**
+
+- Outside a one-to-one DM, `normalize` drops a thread reply that doesn't
+  mention the bot when its `parent_user_id`, which Slack sends on every
+  thread reply, names a user other than the binding's bot user. A reply
+  is kept when either is missing, and a `parent_user_id` that isn't a
+  string shaped like a user id counts as missing rather than making the
+  message malformed, since it is only compared, never kept. The router
+  stays the judge of whether the root is the agent's own: `parent_user_id`
+  drops only replies under a root the bot can't have posted, which the
+  router would ignore, while hops need a mention and `reply_to` is still
+  the thread root. `read_back` runs the same rule on Slack's copy, whose
+  `conversations.replies` messages carry `parent_user_id` too.
+- Group DMs follow the same rule as channels, top-level messages included.
+- A kept message's owner's token is taken before deduplication, as before,
+  and the module docs now say why: finding a retry a duplicate is a store
+  write too.
+- `Skip::Malformed` goes through the ingress's throttle as
+  `Note::Malformed`: a warning once a minute per binding.
+- The owner-rate test no longer needs its 270 messages sent within about
+  4.3 seconds: it sends rounds until one of the owner's messages is
+  dropped, and bounds what was kept by the burst plus what the measured
+  time refilled.
+- An agent whose app is replaced by one with another bot user would keep
+  replies in the threads its old bot started only when they mention it.
+  No flow replaces an agent's app today: a binding gets its bot user once,
+  at install.
+
 ### Bots don't join channels by posting
 
 Slack refuses a post to a conversation the bot isn't in (T23b), and the

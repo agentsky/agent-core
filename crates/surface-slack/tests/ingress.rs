@@ -258,6 +258,23 @@ impl Harness {
         }
     }
 
+    /// Sends the `n`th marker to the fourth agent's app, and returns the
+    /// messages delivered before it, since the queue keeps order.
+    async fn delivered_before_marker(&mut self, n: usize) -> Vec<core_types::InboundEvent> {
+        let (status, _) = self
+            .send(signed_events(fourth_agent(), FOURTH_SECRET, &nth_dm(n)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "marker {n}");
+        let mut delivered = Vec::new();
+        loop {
+            let event = self.message().await;
+            if event.binding == fourth_agent() {
+                return delivered;
+            }
+            delivered.push(event);
+        }
+    }
+
     async fn message(&mut self) -> core_types::InboundEvent {
         match self.next().await {
             SlackInbound::Message(event, _) => *event,
@@ -713,7 +730,13 @@ async fn one_message_under_two_event_ids_is_delivered_once_per_binding() {
     assert_eq!(harness.message().await.event_id, "Ev0MENTION1");
     harness.assert_nothing_delivered().await;
 
-    let for_other = fixtures::MESSAGE_THREAD_REPLY;
+    let for_other = edited(fixtures::MESSAGE_THREAD_REPLY, |body| {
+        body["event"]
+            .as_object_mut()
+            .unwrap()
+            .remove("parent_user_id");
+    });
+    let for_other = for_other.as_str();
     for binding in [agent(), other_agent()] {
         let secret = if binding == agent() {
             AGENT_SECRET
@@ -732,16 +755,15 @@ async fn one_message_under_two_event_ids_is_delivered_once_per_binding() {
 #[tokio::test]
 async fn each_message_fixture_normalizes_as_the_plan_says() {
     let mut harness = Harness::start();
-    let send = |body: &'static str| signed_events(agent(), AGENT_SECRET, body);
+    let send = |body: &str| signed_events(agent(), AGENT_SECRET, body);
 
-    assert_eq!(
-        harness.send(send(fixtures::MESSAGE_PLAIN)).await.0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        harness.send(send(fixtures::MESSAGE_CHANGED)).await.0,
-        StatusCode::OK
-    );
+    for dropped in [
+        fixtures::MESSAGE_PLAIN,
+        fixtures::MESSAGE_CHANGED,
+        fixtures::MESSAGE_MPIM,
+    ] {
+        assert_eq!(harness.send(send(dropped)).await.0, StatusCode::OK);
+    }
     harness.assert_nothing_delivered().await;
 
     harness.send(send(fixtures::MESSAGE_THREAD_REPLY)).await;
@@ -771,8 +793,13 @@ async fn each_message_fixture_normalizes_as_the_plan_says() {
     assert!(dm.is_dm());
     assert!(dm.mentions.is_empty());
 
-    harness.send(send(fixtures::MESSAGE_MPIM)).await;
-    assert_eq!(harness.message().await.conv_kind, ConvKind::GroupDm);
+    let group_dm_mention = edited(fixtures::MESSAGE_MPIM, |body| {
+        body["event"]["text"] = format!("<@{BOT_USER}> can you check the build?").into();
+    });
+    harness.send(send(&group_dm_mention)).await;
+    let group_dm = harness.message().await;
+    assert_eq!(group_dm.conv_kind, ConvKind::GroupDm);
+    assert_eq!(group_dm.mentions, [UserId::from(BOT_USER)]);
 
     harness.send(send(fixtures::MESSAGE_GROUP)).await;
     let group = harness.message().await;
@@ -1441,6 +1468,7 @@ fn fresh_dm(event_id: &str, edit: impl FnOnce(&mut serde_json::Value)) -> String
 
 #[tokio::test]
 async fn a_sender_not_shaped_like_slacks_is_acked_and_dropped_with_nothing_written() {
+    let logs = Logs::global();
     let mut harness = Harness::start();
     let huge = "A".repeat(900_000);
     let mut bodies = Vec::new();
@@ -1487,6 +1515,12 @@ async fn a_sender_not_shaped_like_slacks_is_acked_and_dropped_with_nothing_writt
     }
     harness.assert_nothing_delivered().await;
     assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+    let malformed = logs
+        .snapshot()
+        .matching("dropped a Slack message not shaped like Slack's")
+        .matching(&format!("binding={}", agent()));
+    malformed.assert_has("WARN");
+    malformed.assert_has("DEBUG");
 
     let longer = format!("B0{}", "A".repeat(MAX_ID_TAIL - 1));
     let bot = fresh_dm("Ev0GOODBOT", |body| {
@@ -1647,6 +1681,134 @@ async fn one_owners_agents_in_busy_channels_miss_no_mention() {
     assert_eq!(harness.recorded_anywhere(), markers + 1);
 }
 
+/// A thread reply in a channel, the `n`th of its kind, under a root that
+/// `parent` posted: its own event id, `ts` and thread.
+fn nth_thread_reply(n: usize, parent: &str) -> String {
+    edited(fixtures::MESSAGE_THREAD_REPLY, |body| {
+        body["event_id"] = format!("Ev0REPLY{n}").into();
+        let event = &mut body["event"];
+        event["ts"] = format!("1727697700.{n:06}").into();
+        event["thread_ts"] = format!("1727697650.{n:06}").into();
+        event["parent_user_id"] = parent.into();
+    })
+}
+
+#[tokio::test]
+async fn one_owners_agents_in_busy_threads_miss_no_mention() {
+    let ada = owner(1);
+    let mut agents = vec![(agent(), AGENT_SECRET.to_owned(), BOT_USER.to_owned())];
+    let mut secrets = Secrets::default();
+    secrets
+        .agents
+        .insert(agent(), agent_app(AGENT_SECRET, BOT_USER, ada));
+    for n in 1..10_u128 {
+        let binding = BindingId::from_uuid(uuid::Uuid::from_u128(0xB05E_0000 + n));
+        let secret = format!("busy-agent-signing-secret-{n}");
+        let bot = format!("U0BUSY{n:03}");
+        secrets
+            .agents
+            .insert(binding, agent_app(&secret, &bot, ada));
+        agents.push((binding, secret, bot));
+    }
+    secrets.agents.insert(
+        fourth_agent(),
+        agent_app(FOURTH_SECRET, "U0BOT0004", owner(2)),
+    );
+    let mut harness = Harness::with(secrets, MemoryDedup::default());
+    let rounds = 40;
+    let mut kept = Vec::new();
+    let mut expected = Vec::new();
+    for round in 0..rounds {
+        let root_by = if round % 2 == 0 {
+            fixtures::OTHER_USER
+        } else {
+            let (binding, _, bot) = &agents[(round / 2) % agents.len()];
+            expected.push((*binding, fresh(&format!("1727697700.{round:06}"))));
+            bot.as_str()
+        };
+        let reply = nth_thread_reply(round, root_by);
+        for (binding, secret, _) in &agents {
+            let (status, _) = harness.send(signed_events(*binding, secret, &reply)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "round {round}: {binding}'s thread reply"
+            );
+        }
+        kept.extend(
+            harness
+                .delivered_before_marker(round)
+                .await
+                .into_iter()
+                .map(|event| (event.binding, event.message.id.as_str().to_owned())),
+        );
+    }
+    assert!(agents.len() * rounds >= 2 * usize::try_from(OWNER_BURST).unwrap());
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_MENTION,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "the mention");
+    let after = harness.delivered_before_marker(rounds).await;
+    assert!(
+        after.iter().any(|event| event.event_id == "Ev0MENTION1"),
+        "the mention was dropped after {} thread replies were kept",
+        kept.len()
+    );
+    assert_eq!(
+        kept, expected,
+        "only a reply under an agent's own root is kept, by that agent's app"
+    );
+    let rows: usize = agents
+        .iter()
+        .map(|(binding, _, _)| harness.recorded(&format!("slack:{binding}:message")).len())
+        .sum();
+    assert_eq!(rows, expected.len() + 1);
+}
+
+#[tokio::test]
+async fn a_thread_reply_under_the_agents_own_root_is_kept() {
+    let mut harness = Harness::start();
+    let root = fresh("1727697650.000150");
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_THREAD_REPLY,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let reply = harness.message().await;
+    assert_eq!(reply.event_id, "Ev0THREAD01");
+    assert!(reply.mentions.is_empty());
+    assert_eq!(
+        reply.thread_root.as_ref().map(|root| root.as_str()),
+        Some(root.as_str())
+    );
+    assert_eq!(
+        reply.reply_to.as_ref().map(|to| to.id.as_str()),
+        Some(root.as_str())
+    );
+
+    let (status, _) = harness
+        .send(signed_events(
+            other_agent(),
+            OTHER_SECRET,
+            fixtures::MESSAGE_THREAD_REPLY,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "another agent's app");
+    harness.assert_nothing_delivered().await;
+    assert!(
+        harness
+            .recorded(&format!("slack:{}:message", other_agent()))
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn messages_one_owner_keeps_past_their_rate_are_acked_and_dropped_without_a_row() {
     let logs = Logs::global();
@@ -1659,30 +1821,20 @@ async fn messages_one_owner_keeps_past_their_rate_are_acked_and_dropped_without_
         (third_agent(), THIRD_SECRET),
     ];
     let started = Instant::now();
-    let rounds = 90;
-    let mut kept = 0;
-    for n in 0..rounds {
+    let (mut sent, mut kept, mut rounds) = (0, 0, 0);
+    while kept == sent {
+        assert!(rounds < 2_000, "{sent} messages were all kept");
         for (binding, secret) in adas {
             let (status, _) = harness
-                .send(signed_events(binding, secret, &nth_dm(n)))
+                .send(signed_events(binding, secret, &nth_dm(rounds)))
                 .await;
-            assert_eq!(status, StatusCode::OK, "{binding}'s message {n}");
+            assert_eq!(status, StatusCode::OK, "{binding}'s message {rounds}");
         }
-        let (status, _) = harness
-            .send(signed_events(fourth_agent(), FOURTH_SECRET, &nth_dm(n)))
-            .await;
-        assert_eq!(status, StatusCode::OK, "another owner's message {n}");
-        loop {
-            let event = harness.message().await;
-            if event.binding == fourth_agent() {
-                break;
-            }
-            kept += 1;
-        }
+        sent += adas.len();
+        kept += harness.delivered_before_marker(rounds).await.len();
+        rounds += 1;
     }
     let refilled = started.elapsed().as_secs_f64() * f64::from(OWNER_REQUESTS_PER_SECOND);
-    let sent = adas.len() * rounds;
-    assert!(sent as f64 > f64::from(OWNER_BURST) + refilled + 1.0);
     assert!(kept >= usize::try_from(OWNER_BURST).unwrap(), "{kept}");
     assert!(
         (kept as f64) <= f64::from(OWNER_BURST) + refilled + 1.0,

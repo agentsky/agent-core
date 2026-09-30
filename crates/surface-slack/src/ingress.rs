@@ -62,10 +62,11 @@
 //! level, the next warning saying how many there were: a refusal at any
 //! step, Slack's `app_rate_limited` notice, a retried delivery, an
 //! answered challenge, an agent's message older than the confirmation
-//! window, a message dropped for its owner's rate, and a queued body that
-//! no longer parses. Each binding's are counted apart, so one app's flood
-//! hides no other's. A request refused with 400 takes none of the bucket's
-//! tokens, since it writes nothing and its log is throttled like the rest.
+//! window, a message dropped for its owner's rate, a message [`normalize`]
+//! finds malformed, and a queued body that no longer parses. Each
+//! binding's are counted apart, so one app's flood hides no other's. A
+//! request refused with 400 takes none of the bucket's tokens, since it
+//! writes nothing and its log is throttled like the rest.
 //!
 //! The queue holds each request's body as it arrived, at most
 //! [`MAX_BODY_BYTES`], so what waits is bounded in bytes, not only in
@@ -81,9 +82,14 @@
 //!   write, a message to an agent's app takes a token from its owner's
 //!   bucket: the apps of one owner's agents together keep [`OWNER_BURST`]
 //!   messages at once, then [`OWNER_REQUESTS_PER_SECOND`], and a message
-//!   past that is dropped, after its 200, with no row. Only messages that
-//!   are kept count, so busy channels that one owner's agents share cost
-//!   that owner nothing, however many agents are in them. What it is
+//!   past that is dropped, after its 200, with no row. The token comes
+//!   before deduplication, so a retry of a kept message takes one too:
+//!   finding it a duplicate is a store write as well. Only messages that
+//!   are kept count, and outside one-to-one DMs an agent's app keeps only
+//!   mentions of its bot and replies in threads its bot may have started
+//!   (see [`normalize`]), so the traffic of busy channels and threads that
+//!   one owner's agents share costs that owner only what may be addressed
+//!   to one of those agents, however many agents are in them. What it is
 //!   handed on with is bounded too, at most about 220 KB (see
 //!   [`normalize`]'s Bounds), so what an agent's messages hold after the
 //!   queue is bounded in bytes as well. An agent's app's other requests
@@ -116,7 +122,8 @@
 //!
 //! A message's sender is no key, so it is not checked here: [`normalize`]
 //! drops a message whose `user` or `bot_id` isn't shaped like Slack's,
-//! after its 200 and before any row. Slash commands and interactions are
+//! after its 200 and before any row, with a warning at most once per
+//! binding per [`WARNING_INTERVAL`]. Slash commands and interactions are
 //! keyed by their signature, whose shape verification fixes.
 //!
 //! # Agents' apps
@@ -370,6 +377,7 @@ enum Note {
     Retry,
     Stale,
     OwnerRate,
+    Malformed,
     Reparsed,
 }
 
@@ -1394,6 +1402,22 @@ async fn process_event(
     };
     let message = match normalize::message(&context, &event) {
         Ok(message) => message,
+        Err(normalize::Skip::Malformed) => {
+            match note(notes, binding, Note::Malformed) {
+                Some(quiet) => tracing::warn!(
+                    %binding,
+                    event_id,
+                    dropped_since_last_warning = quiet,
+                    "dropped a Slack message not shaped like Slack's"
+                ),
+                None => tracing::debug!(
+                    %binding,
+                    event_id,
+                    "dropped a Slack message not shaped like Slack's"
+                ),
+            }
+            return None;
+        }
         Err(skip) => {
             tracing::debug!(%binding, event_id, reason = %skip, "dropped a Slack message");
             return None;
