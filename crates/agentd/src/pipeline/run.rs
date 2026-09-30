@@ -1666,6 +1666,44 @@ impl Sink<InboundEvent> for PipelineSink {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_a_limits_refusal_may_differ_between_an_event_and_its_copy() {
+        let requester = Requester {
+            member: None,
+            key: MemberKey {
+                surface: core_types::SurfaceKind::Slack,
+                team: "T1".into(),
+                user: "U1".into(),
+            },
+        };
+        let refuse = |reason| Decision::Refuse {
+            reason,
+            requester: requester.clone(),
+        };
+        for reason in [
+            RefuseReason::DailyCap { max: 1 },
+            RefuseReason::ThreadTurns { max: 1 },
+            RefuseReason::ThreadTokens { max: 1 },
+        ] {
+            assert!(limited(&refuse(reason)), "{reason}");
+            assert!(limit_window(reason).is_some(), "{reason}");
+        }
+        for reason in [
+            RefuseReason::Paused,
+            RefuseReason::Banned,
+            RefuseReason::Denied,
+            RefuseReason::HopCap { max: Hop(1) },
+            RefuseReason::PolicyUnavailable,
+        ] {
+            assert!(!limited(&refuse(reason)), "{reason}");
+            assert!(limit_window(reason).is_none(), "{reason}");
+        }
+        assert!(!limited(&Decision::LinkPrompt { requester }));
+        assert!(!limited(&Decision::Ignore(
+            router::IgnoreReason::NotAddressed
+        )));
+    }
+
     /// Whatever a decision says, only the owner's own turn, on the owner's
     /// side and credential, answering the owner's own message in a
     /// one-to-one DM, resolves to the agent's private scope, and an
