@@ -118,6 +118,7 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         store.clone(),
         Arc::clone(&auth),
         replies,
+        None,
         Some(manager.clone()),
     );
     SlackHarness {
@@ -144,7 +145,7 @@ impl SlackHarness {
         let (response_url, hook) = self.response_url();
         let origin = Origin::SlackSlash { response_url };
         self.commands
-            .handle_text(&slack_key(user), text, &origin)
+            .handle_text(&slack_key(user), text, &origin, &[])
             .await;
         self.requests()
             .await
@@ -463,6 +464,7 @@ async fn slack_token_needs_a_linked_member_on_slack() {
             &Origin::RocketChatDm {
                 room: "dm-alice".into(),
             },
+            &[],
         )
         .await;
     assert!(reply.contains("send it on Slack"), "{reply}");
@@ -476,7 +478,7 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
             .await
             .unwrap();
     let auth = Arc::new(Auth::new(OAuthConfig::default(), store.clone()).unwrap());
-    let commands = Commands::new(store, auth, Replies::default(), None);
+    let commands = Commands::new(store, auth, Replies::default(), None, None);
     let reply = commands
         .run(
             &slack_key("U0HUMAN01"),
@@ -484,6 +486,7 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
             &Origin::SlackDm {
                 channel: "D0DM00001".into(),
             },
+            &[],
         )
         .await;
     assert_eq!(reply, "Slack isn't set up on this agentd.");

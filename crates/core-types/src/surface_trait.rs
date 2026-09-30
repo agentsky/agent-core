@@ -191,6 +191,10 @@ pub enum SurfaceError {
     /// The receiver of [`Surface::events`] was dropped.
     #[error("the event receiver is closed")]
     Closed,
+    /// A file is larger than the limit the caller set, which the message
+    /// names.
+    #[error("too large: {0}")]
+    TooLarge(String),
     /// The platform answered with another error.
     #[error("platform error: {0}")]
     Api(String),

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use core_types::{MemberKey, SendError};
+use core_types::{InFile, MemberKey, SendError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -25,6 +25,7 @@ struct Heard {
     member: MemberKey,
     text: String,
     origin: Origin,
+    files: Vec<InFile>,
 }
 
 /// Runs the commands that every surface submits.
@@ -84,8 +85,8 @@ impl CommandIntake {
 }
 
 impl CommandSubmitter {
-    /// Hands `text` from `member`, sent from `origin`, to the intake, which
-    /// parses and runs it.
+    /// Hands `text` from `member`, sent from `origin` with `files`
+    /// attached, to the intake, which parses and runs it.
     ///
     /// # Errors
     ///
@@ -95,11 +96,13 @@ impl CommandSubmitter {
         member: MemberKey,
         text: String,
         origin: Origin,
+        files: Vec<InFile>,
     ) -> Result<(), SendError> {
         let heard = Heard {
             member,
             text,
             origin,
+            files,
         };
         self.tx.send(heard).await.map_err(|_| SendError)
     }
@@ -126,7 +129,7 @@ fn start(
             let _ = previous.await;
         }
         commands
-            .handle_text(&heard.member, &heard.text, &heard.origin)
+            .handle_text(&heard.member, &heard.text, &heard.origin, &heard.files)
             .await;
         let _ = done.send(());
     });

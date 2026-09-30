@@ -21,6 +21,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -41,10 +42,11 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
 use tower::Service as _;
 
+use crate::agents::{Acknowledge, Supervisor};
 use crate::app::App;
 use crate::commands::intake::{CommandIntake, CommandSubmitter};
 use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
-use crate::commands::rocketchat::{self, CommandFeed};
+use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
 use crate::slack;
@@ -225,9 +227,11 @@ impl Server {
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
     /// with the Slack manager app the configuration token rotator, and with
-    /// `[rocketchat]` the manager bot's connection, which feeds the
-    /// commands it hears to the intake like the Slack queue does. The
-    /// intake finishes the commands it received once both stop.
+    /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
+    /// the agents' connections. Every connection feeds the commands it hears
+    /// to the intake like the Slack queue does, and passes other messages to
+    /// [`Acknowledge`]. The intake finishes the commands it received once
+    /// they all stop.
     ///
     /// # Errors
     ///
@@ -308,10 +312,27 @@ impl Server {
         }
         if let Some(manager) = app.rocketchat() {
             let feed = CommandFeed::new(commands.clone(), manager.binding.clone());
+            let onward = Sender::new(Acknowledge::new(
+                manager.agents.clone(),
+                manager.binding.bot.clone(),
+            ));
+            let supervisor = Supervisor::new(
+                manager.agents.clone(),
+                manager.surface_config.clone(),
+                Arc::new(StoreDedup(app.store().clone())),
+                manager.bots.clone(),
+                feed.clone(),
+                Some(onward.clone()),
+            );
+            let supervising = stopping.clone();
+            tasks.spawn(async move {
+                supervisor.run(supervising).await;
+                "Rocket.Chat agent supervisor"
+            });
             let connection = rocketchat::listen(
                 manager.surface.clone(),
                 manager.binding.clone(),
-                feed.into_sender(None),
+                feed.into_sender(Some(onward)),
                 stopping,
             );
             tasks.spawn(async move {

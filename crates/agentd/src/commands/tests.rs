@@ -104,6 +104,7 @@ async fn harness() -> Harness {
         Arc::clone(&auth),
         Replies::new(Some(bot)),
         None,
+        None,
     );
     Harness {
         store,
@@ -143,7 +144,9 @@ impl Harness {
         let origin = Origin::RocketChatDm {
             room: dm_room(user).into(),
         };
-        self.commands.handle_text(&key(user), text, &origin).await;
+        self.commands
+            .handle_text(&key(user), text, &origin, &[])
+            .await;
     }
 
     /// Sends `!agent <text>` as `user` in a channel.
@@ -151,7 +154,9 @@ impl Harness {
         let origin = Origin::RocketChatChannel {
             room: "GENERAL".into(),
         };
-        self.commands.handle_text(&key(user), text, &origin).await;
+        self.commands
+            .handle_text(&key(user), text, &origin, &[])
+            .await;
     }
 
     /// Every text posted in `user`'s DM with the manager bot.
@@ -599,8 +604,8 @@ async fn a_failed_exchange_and_a_failed_store_get_generic_replies() {
 #[tokio::test]
 async fn commands_that_come_later_say_so() {
     let h = harness().await;
-    h.dm("alice", "create helper").await;
-    assert_eq!(h.last_reply("alice"), "`create` isn't available yet.");
+    h.dm("alice", "skill rm helper tool").await;
+    assert_eq!(h.last_reply("alice"), "`skill rm` isn't available yet.");
     h.dm("root", &format!("admin api-key set {API_KEY}")).await;
     assert_eq!(
         h.last_reply("root"),
@@ -700,7 +705,7 @@ async fn without_the_slack_manager_app_slack_and_unknown_workspaces_get_no_repli
         Err(ReplyError::NoManagerBot(SurfaceKind::RocketChat))
     ));
     assert!(!Replies::default().can_dm(&key("alice")));
-    h.commands.dispatch(&slack, Command::Me, &origin).await;
+    h.commands.dispatch(&slack, Command::Me, &origin, &[]).await;
     assert!(h.mock.posts().is_empty());
 }
 
@@ -940,4 +945,80 @@ async fn the_notifier_stops_when_its_sender_is_dropped() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn agent_commands_without_rocketchat_agents() {
+    let h = harness().await;
+    h.dm("alice", "create helper").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Creating agents here isn't available yet."
+    );
+    h.dm("alice", "list").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "There are no agents yet. Create one with `create <name>`."
+    );
+    h.dm("alice", "list @bob").await;
+    assert_eq!(h.last_reply("alice"), "I don't know that member.");
+    h.dm("alice", "list <@U1>").await;
+    assert_eq!(h.last_reply("alice"), "That member has no agents.");
+    for command in [
+        "pause helper",
+        "resume helper",
+        "delete helper",
+        "persona helper x",
+    ] {
+        h.dm("alice", command).await;
+        assert_eq!(
+            h.last_reply("alice"),
+            "You have no agent named `helper`. Only an agent's owner can change it.",
+            "{command}"
+        );
+    }
+
+    let (alice, _) = h.linked_member("alice", "claude_pro").await;
+    let team = TeamId::new(TEAM);
+    let new = store::NewAgent {
+        owner: alice,
+        name: "helper",
+        persona: "p",
+        visibility: store::Visibility::Private,
+        surface: SurfaceKind::RocketChat,
+        team: &team,
+    };
+    assert!(matches!(
+        h.store
+            .create_agent(&new, 10, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        store::AgentCreation::Created(..)
+    ));
+    h.dm("bob", "list").await;
+    assert_eq!(
+        h.last_reply("bob"),
+        "There are no agents yet. Create one with `create <name>`."
+    );
+    h.dm("alice", "list").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Agents:\n- `helper` (no bot here), owned by alice"
+    );
+    h.channel("alice", "persona helper").await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Put the persona after the name, or attach it"),
+        "{}",
+        h.last_reply("alice")
+    );
+    h.dm("alice", "persona helper   ").await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Put the persona after the name"),
+        "{}",
+        h.last_reply("alice")
+    );
+    h.dm("alice", "delete helper").await;
+    assert_eq!(h.last_reply("alice"), "Deleted `helper`.");
 }

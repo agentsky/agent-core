@@ -15,11 +15,11 @@
 //! manager bot's and each agent's, has to look for commands in what it
 //! delivers: through [`CommandFeed::into_sender`], which sends commands to
 //! the one [`CommandIntake`](super::intake::CommandIntake) and passes only
-//! other messages onward, so a
-//! command is never also taken as a turn. T13 has only the manager bot's
-//! connection; T14 feeds every agent's into the same intake. A room without the manager bot is
-//! heard by the agents' connections, and a command there is answered all the
-//! same.
+//! other messages onward, so a command is never also taken as a turn. The
+//! agents' connections, started by the
+//! [`Supervisor`](crate::agents::Supervisor), feed the same intake. A room
+//! without the manager bot is heard by the agents' connections, and a
+//! command there is answered all the same.
 
 use std::sync::Arc;
 
@@ -97,7 +97,12 @@ impl CommandFeed {
             return Ok(Some(event));
         };
         self.submitter
-            .submit(event.sender.clone(), text.to_owned(), origin)
+            .submit(
+                event.sender.clone(),
+                text.to_owned(),
+                origin,
+                event.files.clone(),
+            )
             .await?;
         Ok(None)
     }
@@ -107,9 +112,8 @@ impl CommandFeed {
     /// without one.
     ///
     /// The connection that records a message first delivers it for every
-    /// bot in the room, so once agents take turns, every connection, the
-    /// manager bot's included, passes the rest to where turns are taken.
-    /// Until then the manager bot's connection has nowhere to pass them.
+    /// bot in the room, so every connection, the manager bot's included,
+    /// passes the rest to the same place.
     pub fn into_sender(self, onward: Option<Sender<InboundEvent>>) -> Sender<InboundEvent> {
         Sender::new(Feeding { feed: self, onward })
     }

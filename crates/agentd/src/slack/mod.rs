@@ -186,7 +186,7 @@ impl Sink<SlackInbound> for Inbound {
             SlackInbound::Interaction(_) => None,
         };
         match command {
-            Some((member, text, origin)) => commands.submit(member, text, origin).await,
+            Some((member, text, origin)) => commands.submit(member, text, origin, Vec::new()).await,
             None => {
                 tracing::debug!(
                     kind,

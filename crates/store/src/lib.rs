@@ -21,8 +21,10 @@
 //! [`processed_events`](Store::mark_event_processed),
 //! [`ctl_tokens`](Store::put_ctl_token),
 //! [`scope_locks`](Store::acquire_scope_lock),
-//! [`volumes`](Store::put_volume) and
-//! [`slack_config_tokens`](Store::put_slack_config_token).
+//! [`volumes`](Store::put_volume), [`sessions`](Store::session_for_thread),
+//! [`slack_config_tokens`](Store::put_slack_config_token), and
+//! [`agents`](Store::create_agent) with their bindings and
+//! [retirements](Store::claim_retirement).
 
 #![warn(missing_docs)]
 
@@ -34,6 +36,7 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use time::OffsetDateTime;
 
+mod agents;
 mod claude_links;
 mod ctl;
 mod events;
@@ -41,15 +44,21 @@ mod members;
 mod pending_logins;
 mod relink_notices;
 mod seal;
+mod sessions;
 mod slack_config_tokens;
 mod volumes;
 
+pub use agents::{
+    ActiveBot, Agent, AgentBinding, AgentCreation, AgentState, BindingState, DirectoryEntry,
+    NewAgent, PendingRetirement, Visibility,
+};
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
+pub use sessions::{Session, SessionKind, ThreadSession};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
@@ -342,6 +351,8 @@ mod tests {
             table_names(&store).await,
             [
                 "_sqlx_migrations",
+                "agent_bindings",
+                "agents",
                 "claude_link_generations",
                 "claude_links",
                 "ctl_tokens",
@@ -349,6 +360,7 @@ mod tests {
                 "pending_logins",
                 "processed_events",
                 "scope_locks",
+                "sessions",
                 "slack_config_tokens",
                 "surface_identities",
                 "volumes",

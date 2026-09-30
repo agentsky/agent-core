@@ -2214,6 +2214,251 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   DM login, exchange included, and finds neither the code nor the pasted
   text, so reqwest, hyper and sqlx don't log request bodies either.
 
+## T14: Agent lifecycle on Rocket.Chat
+
+No Rocket.Chat server was run for this task; the tests use `testkit`'s fake
+server, and the server behavior below comes from the notes of T11 and T12.
+
+### A paused agent's bot keeps listening
+
+**Issue.** "Pause (events ignored)" could be read as stopping the paused
+agent's connection, or as dropping what it delivers. Rocket.Chat
+deduplication is global: whichever connection records a message first
+delivers it for every bot in the room. A paused bot that dropped what it
+recorded would lose messages for the other agents there, and a paused bot
+that stopped listening would leave `!agent resume` unheard in a room it
+alone shares with agentd.
+
+**Solution.** A paused agent's connection keeps running and feeding the
+command intake. "Ignored" is decided where messages go after the intake:
+before T23, [`Acknowledge`](#before-turns-a-bot-reacts-instead-of-replying)
+skips paused agents; from T23 the router refuses them, as T22 already does.
+Only `delete` stops a connection.
+
+### A creation can stop halfway
+
+**Issue.** Creating an agent is several steps on two systems: the store,
+then `users.create`, the bot's login and token, the avatar, then the store
+again. A failure or a crash in between would leave an agent without a bot,
+or a bot user nobody records, with the agent's name taken for good.
+
+**Solution.** `create_agent` stores the agent with a binding in state
+`creating` in one transaction; the unique index on `(owner_id, name)` only
+covers agents that aren't deleted, so the name is reserved from then on.
+Before each `users.create` the binding notes the username it asks for
+(`set_binding_bot_username`), and the bot user is recorded on the binding
+(`set_binding_bot_user`) as soon as `users.create` returns, whatever the
+binding's state by then: a creation abandoned meanwhile leaves a disabled
+binding with a bot user, which owes retirement like a deleted agent's and
+gets its leased, backed-off retries, rather than one best-effort
+deactivation. `activate_binding` stores the token and makes the binding
+`active` only while it is still `creating`. Any failure abandons the
+creation (`abandon_creation`): the binding is disabled, the agent deleted
+and the name freed, and a recorded bot user is deactivated. If recording
+the bot user fails in the store, it is deactivated at once, before the
+error is reported. A creation still `creating` after `CREATION_LEASE` (ten
+minutes, far longer than its REST calls with their 30-second timeouts can
+take) is abandoned by the next supervisor pass, which covers a crash. If
+that races a slow creation, the creation's own `activate_binding` fails and
+it gives up.
+
+A crash, or a store failure, between `users.create` answering and the bot
+user being recorded leaves a bot user no binding records. Abandoning a
+creation therefore looks the noted username up with `users.info` and, if
+that user's email is the binding's (`agent-<binding id>@agent-core.invalid`),
+records it, so it is retired. That needs the manager's
+`view-full-other-user-info`, without which `users.info` leaves the emails
+out, and it is tried once, when the creation is abandoned. A bot user
+still missed has no token and no password anyone knows, so it can't be
+used, but it keeps its username until an admin removes it.
+
+### Deactivating a deleted agent's bot is owed until it happens
+
+**Issue.** `delete` deactivates the bot user with the manager's
+`users.setActiveStatus`, which can fail: the manager lacks
+`edit-other-user-active-status`, Rocket.Chat is down, the rate limiter.
+Forgetting the failure would leave an active bot user whose personal access
+token still works.
+
+**Solution.** `delete_agent` disables the agent's bindings and forgets their
+tokens in the same transaction that marks the agent deleted. A disabled
+binding with a bot user and no `retired_at` owes its retirement, in columns
+modeled on the relink notices': a claim counts an attempt and holds a
+ten-minute lease (`retire_attempts`, `retire_next_attempt_at`), success sets
+`retired_at`, and a failure defers the next attempt by a backoff from a
+minute doubling to six hours, for 20 attempts (about three days). `delete`
+tries once at once and says whether it worked; the supervisor retries every
+pass. A bot user Rocket.Chat no longer knows counts as retired, but only
+when it says so with `error-invalid-user` or `error-user-not-found`: a bare
+HTTP 404, such as a reverse proxy's, defers the attempt like any other
+failure. `delete` reports the deletion even when looking up or retiring the
+bindings afterwards fails in the store; that failure is logged and left to
+the supervisor.
+
+### Connections follow the store
+
+**Issue.** agentd has to start a connection when an agent is created, stop
+it when the agent is deleted, and restore every connection at startup. With
+more than one instance (a blue-green deploy), an agent created on one
+instance would be heard only there until a restart.
+
+**Solution.** The `Supervisor` owns the connections and derives them from
+the store: each pass starts one for every `active` binding of an active or
+paused agent and stops the rest. A pass runs at startup, whenever a
+command pokes it (`create`, `delete`), and every minute, so another
+instance's changes are picked up within a minute. After the connections,
+so slow REST calls don't delay them, it abandons stale creations and
+retires what is owed. A binding whose row doesn't read (a token that no
+longer decrypts) is logged and skipped, and the other bots keep listening. The command handlers never hold a
+`CommandFeed`, only the poke: the intake runs until every feed is dropped,
+and it owns the handlers, so a feed held there would keep it running
+forever. The supervisor drops its feed when agentd stops, after stopping its
+connections. A connection that ends on its own (a revoked token, a
+deactivated bot) or panics is logged and started again by a later pass: the
+supervisor maps each connection task's id to its binding, so a panic, which
+returns no value, still frees the binding. A connection that keeps ending
+waits longer each time, kept in memory per binding: the next pass after its
+first end, then one interval, doubling up to 32 intervals (32 minutes), and
+one that ran that long starts over. A broken bot so logs an error about
+twice an hour, not every minute, until it is fixed or deleted.
+
+### Before turns, a bot reacts instead of replying
+
+**Issue.** The plan allows a fixed acknowledgement before T23, and the live
+check needs to see which bot a mention reaches. A reply is a
+`chat.postMessage`, which makes the bot join a public channel it isn't in
+(see T11's notes). Rocket.Chat deduplication is global, so a mention of an
+agent that isn't in the room can be delivered by another bot's connection,
+and replying would pull the mentioned bot into the channel. T23 has the
+same problem for real replies.
+
+**Solution.** Until T23, every connection passes the messages that aren't
+commands to `Acknowledge`, which makes each active agent a person's message
+mentions, and in a one-to-one DM the agent whose bot received it, react
+with `:eyes:` as its own bot. `chat.react` doesn't join the room. Messages
+from bots, the manager bot and managed agents are ignored whatever the
+surface flags say. T23 replaces `Acknowledge` with the pipeline, and should
+check that a mentioned agent is in the room before posting there.
+
+### Bot usernames
+
+**Issue.** The plan names the bot `<name>`, or `<owner>-<name>` when taken,
+but not what happens when both are taken, what email Rocket.Chat's required
+field gets, or how an owner's username is found; members are stored with
+their user id as display name.
+
+**Solution.**
+
+- The username is `<name>`, then `<owner>.<name>`, where `<owner>` is the
+  owner's username from `users.info`. If both are taken, the agent isn't
+  created and the owner is asked for another name. The separator is a dot
+  because agent names can't contain one (they are `a-z`, `0-9` and `-`),
+  while Rocket.Chat usernames can: with `-`, alice could name an agent
+  `bob-helper` and take the username bob's `helper` would fall back to.
+  Now no agent name, and no other owner's fallback, can be
+  `bob.helper`. `all` and `here` go
+  straight to the prefixed form, since Rocket.Chat reads `@all` and `@here`
+  as broadcasts and nobody could mention such a bot.
+- The display name is the agent's name. The email is
+  `agent-<binding id>@agent-core.invalid`: unique, unverified (T11), and in
+  a domain that can't receive mail.
+- `agent_bindings.bot_username` records the username, which the plan's
+  columns didn't have, so `list` and the create reply can show `@username`
+  without a lookup.
+- `create` stores the owner's username as their display name, which `list`
+  shows as the owner.
+- A deleted agent's bot user stays, deactivated, and keeps its username
+  for good: creating an agent of the same name again gets the prefixed
+  username, and once that one is deleted too, the name can't be created
+  again by that owner until an admin removes the old bot users.
+
+### Agent names are the owner's
+
+**Issue.** Names are unique per owner, so `persona helper …` from a member
+who isn't the owner can't name the owner's `helper` at all.
+
+**Solution.** Every owner-only command looks the agent up among the
+sender's own agents, so a non-owner gets "You have no agent named `helper`.
+Only an agent's owner can change it." The name is free again once the agent
+is deleted, since deleted agents keep their row for the volumes, sessions
+and message refs that name them. `visibility` is `public` or `private`;
+`list` shows private agents only to their owner, and nothing sets `private`
+yet.
+
+### A bot sets its own avatar
+
+**Issue.** Setting another user's avatar needs `edit-other-user-avatar`
+(T11's table), one more permission for the manager's role.
+
+**Solution.** The new bot sets `rocketchat.avatar_url` as its own avatar
+with its token, which Rocket.Chat allows while `Accounts_AllowUserAvatarChange`
+is on (the default). A failure is logged and the agent is created anyway.
+The Compose README's permission table drops `edit-other-user-avatar`, and
+`edit-other-user-info`, since agentd renames no bot.
+
+### The text of an upload
+
+**Issue.** A `persona.md` upload's command is the message's text. Depending
+on the client and version, Rocket.Chat puts the text typed with an upload
+in `msg` or in the file attachment's `description` (`sendFileMessage`
+builds the attachment from the upload's description and takes `msg` from
+the confirm body).
+
+**Solution.** `surface-rocketchat` takes the attachment's `description` as
+the text of a file message whose `msg` is empty. Which one a real 7.x
+client fills is for the live check. The file is downloaded from
+`<base>/file-upload/<id>/<name>` with the manager's `X-User-Id` and
+`X-Auth-Token` headers (Rocket.Chat's `requestCanAccessFiles` accepts them),
+never with the token in the URL, and refused past 64 KB by its
+`Content-Length` or while it is read, as `SurfaceError::TooLarge`, a
+variant added so callers don't match on error text.
+
+With the Amazon S3 or Google Cloud Storage file store, Rocket.Chat answers
+the download with a 302 to a presigned URL in the bucket (the default,
+`FileUpload_S3_Proxy_Uploads` off). reqwest follows redirects and drops
+`Authorization` and `Cookie` on a cross-origin hop, but not custom headers,
+so the manager's `X-User-Id` and `X-Auth-Token` would reach the object
+store. `RestClient` now follows redirects only within the origin it called
+(scheme, host and port; `http` to `https` on the same host counts as
+another origin), up to 10, and stops at any other, for every REST call, so
+the headers never leave the server. `download` then fetches a cross-origin
+`Location` once, with a separate client that sends no Rocket.Chat header
+and follows no redirect, and applies the same size limit: the presigned URL
+authorizes itself. A file message's text falls back to the attachment's
+`description` only when the message has files and an empty `msg`, so a
+message without files, such as one quoting another, keeps its own text. Only a file attached in the manager
+bot's DM is read: a persona uploaded to a room would be public anyway, but
+the manager may not be able to read files there.
+
+### A member's agents are capped
+
+**Issue.** Each agent is a Rocket.Chat user with a token and a realtime
+connection agentd keeps open, and nothing stopped one member from creating
+hundreds of them.
+
+**Solution.** `[agents] max_per_owner` (default 10, at least 1) caps the
+agents that aren't deleted per member. `create_agent` counts them inside
+its `BEGIN IMMEDIATE` transaction, so concurrent creations can't both slip
+under the cap, and returns `LimitReached`; `create` then tells the member
+the limit and to delete one first. Deleted agents don't count, but their
+bot users stay, deactivated.
+
+### The manager's permissions on the Community Edition are still open
+
+**Issue.** T16 found that custom roles need an Enterprise license. T14 adds
+nothing to the role T11 derived: `create-user`, `edit-other-user-active-status`
+for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
+`view-full-other-user-info` and `api-bypass-rate-limit`, plus
+`create-personal-access-tokens` on the `bot` role.
+
+**Solution.** Unresolved, as the design's open question says. On the
+Community Edition these permissions can only be added to a built-in role,
+and the built-in roles the manager would hold are shared (`user` with every
+member, `bot` with every agent), so granting them there grants them to
+everyone who holds that role. Until a live check settles it, the Compose
+README gives the manager `admin` for development. This task couldn't test
+it without a server.
+
 ## T15: agentctl
 
 ### The token needs the turn's thread and message
@@ -3104,6 +3349,181 @@ known without a live capture, and refusing one it needs would break turns.
 The plan's Deferred work has an entry for a path allowlist. Methods are
 limited already (see the refusal table).
 
+## T19: Credential proxy egress allowlist
+
+### The target comes from the request line, in one spelling
+
+**Issue.** A `CONNECT` names its target twice, in the request line and in
+`Host`, and the plan's rules (`api.anthropic.com` always denied, exact and
+`*.suffix` hosts) compare names. `API.Anthropic.COM.:443` is the same host
+as `api.anthropic.com:443` to every resolver, and forms such as `127.1`,
+`2130706433` or `0x7f.1` are addresses to `getaddrinfo` though they parse
+as no `IpAddr`.
+
+**Solution.** Only the request line counts, and it must be authority form,
+`host:port`, over HTTP/1: `Host` is ignored, and user info, a scheme, a
+path, a missing or zero port, and `CONNECT` over HTTP/2 are refused. The
+host is lowercased and loses one trailing dot before any comparison, and
+must be a DNS name of letters, digits and `-` with at least two labels, the
+last starting with a letter. That refuses every numeric form, and IP
+literals (bracketed IPv6 or dotted IPv4) are refused outright: a tunnel
+always goes to a named host that a rule allows. Rules go through the same
+function, so a rule and a request can't disagree on spelling.
+
+### Addresses are checked after resolution, and the tunnel goes to them
+
+**Issue.** The plan checks denial after DNS resolution so a rebind can't
+reach a denied address. Checking the name's addresses and then connecting
+by name would resolve twice, and a rebinding server answers the second
+lookup differently.
+
+**Solution.** The egress proxy resolves once, refuses the host if any
+address in the answer is unreachable (a mixed answer is what a rebinding
+attack looks like, and no legitimate public host answers with a metadata
+or private address), and then connects to those checked addresses, in
+order, never to the name. The system resolver is given the name with a
+trailing dot, so search domains don't apply: under Kubernetes' `ndots:5`,
+`github.com` would be tried as `github.com.<namespace>.svc.cluster.local`
+first. Resolution has a 5-second timeout and all connection attempts share
+the 10-second `CONNECT_TIMEOUT`, so a long answer of silent addresses can't
+hold a request.
+
+Never reachable, whatever resolves there and whichever rule allowed the
+host: agentd's own listener addresses and the sandbox subnet (agentd passes
+them from its configuration), the private ranges (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), loopback, link-local
+(`169.254.0.0/16`, the metadata address among them), the other clouds'
+metadata and platform addresses (AWS's `fd00:ec2::254`, GCP's
+`fd20:ce::254`, Oracle's `fd00:c1::a9fe:a9fe` and Azure's WireServer
+`168.63.129.16`, the last in public address space), `0.0.0.0/8`,
+`100.64.0.0/10` (Alibaba's metadata address `100.100.100.200` is in it),
+`192.0.0.0/24` (Oracle's `192.0.0.192`), documentation, benchmarking,
+multicast, reserved and broadcast ranges. For
+IPv6 only global unicast (`2000::/3`) is reachable, minus `2001::/23`
+(Teredo among it), `2002::/16` (6to4), `2001:db8::/32` and `3fff::/20`:
+that also refuses IPv4-compatible, NAT64 (`64:ff9b::/96`) and other forms
+that embed an IPv4 address, which would otherwise carry a private or
+metadata address past the IPv4 checks. IPv4-mapped addresses are checked as
+the IPv4 address they hold.
+
+### `Cidr` moved to core-types
+
+**Issue.** The egress policy needs subnets for agentd's own networks, and
+agentd's `net::Cidr` was the only implementation. cred-proxy can't depend
+on agentd.
+
+**Solution.** `Cidr` moved unchanged, with its tests, to
+`core_types::net`, which does no I/O. agentd imports it from there.
+
+### The CLI honors `NO_PROXY`, and needs it
+
+**Issue.** With `HTTP_PROXY` set, a client sends plain-HTTP requests to the
+proxy in absolute form, and the proxy refuses those with 403. If the CLI
+sent its `ANTHROPIC_BASE_URL` traffic that way, every turn would fail.
+
+**Solution.** `cred_proxy::EGRESS_ENV` sets `NO_PROXY` to
+`cred-proxy.internal,agentctl.internal`, as the plan says, and every
+variable in both cases: curl, and so git, reads only the lowercase
+`http_proxy`, and tools differ on the others. Against two local capture
+servers, the npm build of Claude Code 2.1.285 (the native build wasn't
+available here) sent `POST /v1/messages?beta=true` straight to the base URL
+when `NO_PROXY` named its host, and `POST http://localhost:…/v1/messages`
+to the proxy when it didn't. T23's live check should confirm it on the
+native build in the sandbox image.
+
+### Tunnels leave agentd's drain
+
+**Issue.** hyper hands an upgraded connection to the handler and stops
+tracking it, so a tunnel isn't part of agentd's graceful shutdown or its
+drain timeout, and nothing else would end one that stays open.
+
+**Solution.** A tunnel ends when either side closes, after 5 minutes with
+no byte in either direction, after an hour in any case, when its session
+has no live placeholder left, or when the `EgressProxy` is dropped, which
+happens once the listener and its connections are gone. Tunnel tasks hold
+only `watch` receivers, not the proxy.
+
+The session's receiver comes from the `Registry`, which drops the sender
+once the session's last placeholder is revoked, however that happens:
+`revoke`, `revoke_session`, or a mint for another session at the same
+address. T23's `process_stopping` already calls `revoke_session`, so a
+stopping container's tunnels close with no other call; an explicit
+`EgressProxy::close_session` would have needed T23 to keep a handle on a
+proxy that `CredProxy` owns. The receiver is taken with the session lookup,
+under the registry's lock, and checked again before the 200, so a session
+revoked while its `CONNECT` was being checked gets no tunnel.
+
+### Tunnels and lookups are capped
+
+**Issue.** Nothing bounded what one sandbox could hold: a review probe kept
+300 tunnels open from one session. Host lookups were worse. The system
+resolver (`getaddrinfo`, through `tokio::net::lookup_host`) blocks a thread
+of tokio's blocking pool, and the 5-second timeout only dropped the future:
+the lookup kept its thread, so a resolver that hangs let a sandbox fill the
+pool with lookups nobody waited for.
+
+**Solution.** `EgressLimits`, given to `EgressProxy::with_limits`:
+
+- A tunnel place is taken per `CONNECT` before the extension is asked or
+  the host looked up, and given back when its tunnel closes, or when the
+  `CONNECT` is refused and any lookup it started has returned: 32 per
+  session (429 past it) and 256 in all (503). agentd's
+  `[proxy] max_session_tunnels` and `max_tunnels` set them.
+- Lookups run under a semaphore of 32 places, and one session's under a
+  semaphore of its own with a quarter of that (at least one place). Each
+  runs in a task of its own that holds both places and the `CONNECT`'s
+  tunnel place until the resolver returns, even after the timeout refused
+  the `CONNECT`, and hands the tunnel place back when the lookup finishes
+  in time. A second review found that with the tunnel place dropped at
+  the 502 and a session allowed all 32 lookup places, a sandbox capped at
+  one tunnel held three lookup places, and a session capped at 32 could
+  hold them all and leave every other session with 503: now hung lookups
+  count against their own session's tunnels, and no session can hold more
+  than its share. Waiting for places counts toward the 5-second timeout;
+  a `CONNECT` that gets no session place is refused with 429, and one
+  that gets no proxy place with 503. The workspace has no asynchronous
+  resolver, and the semaphores need none.
+- The `EgressExtension` gets 2 seconds; past that the `CONNECT` is refused
+  with 503, since a lookup that can't answer denies.
+- A tunnel lives an hour at most, busy or not.
+
+### What the allowlist doesn't stop
+
+**Issue.** A byte tunnel can't see what goes through it.
+
+**Solution.** Recorded, not solved: a tunnel to an allowed host that shares
+a CDN front with other sites can reach them by SNI or `Host` inside TLS
+(domain fronting), so an allowlist entry is only as narrow as its host's
+front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
+sandbox pick any public address; and egress is gated on a live placeholder
+at the source address, not on a running turn, so a process left from an
+earlier turn can use the allowlist between turns (the plan's deferred
+"Killing leftover processes" entry covers that).
+
+### Testing without the network
+
+**Issue.** Every address a real test server has is loopback, which the
+policy never reaches, and tests don't touch the network. The log test
+also missed events under a scoped subscriber.
+
+**Solution.** `EgressProxy::with_network` takes a `Network` that resolves
+and connects; the tests' fake answers with public-looking addresses and
+connects them to local echo servers, and records what was resolved and
+dialed. The log test installs a global subscriber for its test binary and
+filters by its own source addresses: with `tracing::subscriber::set_default`,
+callsites first hit by other tests' threads, which have no subscriber,
+kept their "never" interest and dropped the test's events.
+
+The Docker test serves the proxy on an internal network's gateway address,
+which the host holds on the bridge, maps `cred-proxy.internal` to it with
+`extra_hosts`, and runs `alpine/git:2.54.0` with `EGRESS_ENV`: cloning
+`github.com/octocat/Hello-World` works, a GitLab clone gets
+`403 from proxy after CONNECT`, and a clone without the proxy fails. It
+needs a route to github.com, which the CI runner has, and it passes in CI's
+Docker tests job. Where outbound TLS is intercepted, as in the environment
+it was written in, it passes only with the intercepting proxy's CA mounted
+into the container.
+
 ## T20: runner process driver
 
 ### The placeholder is not an environment entry
@@ -3281,6 +3701,207 @@ serde_json's default float parser is not correctly rounded (its
 `0.00014000000000000001` parses one unit in the last place away from the
 literal, and the differences carry such errors too. That stays far below
 a cent in T27's daily sums; the fixture test compares with a tolerance.
+
+## T21: runner sessions, queue and warm pool
+
+### The hooks name the process, not only the session
+
+**Issue.** The plan's `process_stopping(session)` and `turn_finished(session,
+turn)` name only the session. The pool calls `process_stopping` from the
+sandbox's event stream when a container dies, without the session's lock,
+since a turn may be running for many minutes. A death reported for a
+session's old container could then land after the session had stopped it
+and started a new process, and revoke the new process's placeholder and
+agentctl token. T23 would also have had to keep a map from session to
+token to hand the turn's outbox back.
+
+**Solution.** `TurnHooks` has two associated types. `process_starting`
+returns `(ProcessEnv, Self::Process)`, and every later call for that
+process gets the `Process` back, so agentd can keep the placeholder's id
+and the agentctl token in it and a late call for an old process never
+touches a new one. `turn_finished` returns `Self::Finished`, which
+`run_turn` hands to the caller in `TurnReport::finished`: T23 returns the
+turn's `Outbox` there. `SessionManager` is generic over its hooks rather
+than holding a `dyn TurnHooks`.
+
+### A turn cut off before its outcome was recorded
+
+**Issue.** A session is marked started after a turn whose `init_seen` is
+true. If agentd dies after the CLI read an unstarted session's first
+message but before that was recorded, the next process starts with
+`--session-id`, which the CLI refuses because the transcript exists, and
+every later turn fails the same way: nothing would ever mark it started.
+
+**Solution.** `sessions` has a `maybe_started` column. It is set in the
+store before a turn goes to an unstarted session's CLI, and cleared when
+the turn's outcome says what happened (`init_seen`, or a refused
+`--resume`). A session with it set starts its next process with
+`--resume`; if there is no transcript after all the CLI refuses, and the
+plan's rerun with `--session-id` takes over. A `--session-id` start that
+crashes without `init_seen` leaves it set too, so a transcript that
+existed after all is resumed next time.
+
+### `lookup_or_create` needs the scope
+
+**Issue.** `lookup_or_create(agent, thread_key)` has no scope to record,
+and a `ThreadKey` can't give one: the router decides that the owner's DM is
+`Private` and another member's is `Dm`. If a thread's session were found
+whatever scope it was made on, a DM that stopped being the owner's (the
+agent changed hands) would keep running on the agent's `Private` volume.
+
+**Solution.** `lookup_or_create(agent, thread, scope)`. A thread's live
+session on another scope is reset and replaced in the same transaction,
+and its warm container stopped in the background, so a session never
+changes volume.
+
+### `create_private` needs the thread
+
+**Issue.** `create_private(agent, consent)` names no thread, but the row's
+thread columns are not null, and T33 posts the task's result to the thread
+recorded with the consent, whose table doesn't exist yet.
+
+**Solution.** `create_private(agent, consent, thread)`, and a `consent_id`
+column, set exactly for `private` rows. The thread columns of a private
+row hold where its result goes; the partial unique index covers normal
+rows only, so they never collide with the thread's own session. A private
+session takes only `TurnKind::PrivateTask` with its own consent, and a
+normal session only `TurnKind::Normal`.
+
+### Idle containers hold places under the caps
+
+**Issue.** With one warm container per active session, idle containers
+fill a scope's cap, and a new session would wait up to the idle timeout
+for the reaper.
+
+**Solution.** A session that needs a container when a cap is full first
+stops an idle one under that cap (a dead one first, then the one idle
+longest), and otherwise waits on the cap's semaphore until a place frees
+up or a turn ends and a container becomes idle. A container is idle when
+its session's lock is free; the pool takes it with `try_lock`, so it never
+waits on another session. The scope cap is per volume, `(agent, scope)`,
+so two agents in one channel don't share one. The global cap defaults to
+32; the Compose sandbox network leaves about 126 addresses.
+
+### Mounts come from the turn's side
+
+**Issue.** A container's mounts are fixed when it starts, and the plan
+doesn't say what decides them: `shared/` read-write or read-only, and
+whether `memory/` is mounted.
+
+**Solution.** The turn's `Side`, on the agent's `Private` volume: the
+owner's side gets `shared/` read-write and `memory/`, the public side (a
+private task a non-owner asked for) `shared/` read-only and no `memory/`.
+Every other volume mounts `shared/` read-write and no `memory/`. A turn
+whose mounts differ from the warm container's stops the container, like a
+credential kind or model change stops the process.
+
+### How turns queue and survive their caller
+
+**Issue.** The plan asks for a keyed queue in arrival order, and for
+`turn_finished` to finish before the slot is released even when the caller
+is cancelled. A task spawned per turn and then queued would queue in
+whatever order tokio runs the tasks.
+
+**Solution.** Each session's slot is a tokio mutex, which hands the lock
+out in the order it was asked for. `run_turn` asks for it in the caller's
+future, as its first await, and once it has it runs the turn in a spawned
+task that owns the lock guard, so dropping the caller no longer cancels
+anything; the lock is released only after `turn_finished` returns. A
+caller that stops waiting while its turn is still queued leaves the queue
+and its turn never runs. `reset` and `stop` queue the same way, so a reset
+runs after the turns queued before it; turns queued after it fail with
+`RunnerError::SessionReset`.
+
+### Hook failures
+
+**Issue.** The plan doesn't say what a failing hook does.
+
+**Solution.** A failed `process_starting` fails the turn and stops the
+container, and so does a process that fails to start. A failed
+`turn_starting` fails it without sending it, and `turn_finished` is still
+called, since the placeholder may have been pointed. A failed
+`turn_finished` is logged and returned in `TurnReport::finished`, and the
+process is stopped (with `process_stopping`), since the runner can't tell
+whether the placeholder is still pointed. A failed `process_stopping` is
+logged and the stop goes ahead.
+
+A panic in `process_starting` is taken for its failure, and one in
+`process_stopping` is logged and the stop goes ahead: otherwise a panic in
+`process_stopping` left the process it was stopping running, taken out of
+the session, and the next turn started a second process in the same
+container. It would also have ended the event follower or the reaper for
+good. A process that panics while starting has `process_stopping` called
+and its container stopped, since it may have been started, and the turn
+fails with `RunnerError::TurnTask`.
+
+A panic in a turn is caught at the turn: one in `turn_starting` or the send
+still has `turn_finished` called, and after any panic, `turn_finished`'s
+included, the turn is recorded if it has an outcome and the process is
+stopped as after a failed `turn_finished`. Only then does the panic resume,
+failing the turn with `RunnerError::TurnTask`. Otherwise the next turn would
+reuse a process whose placeholder may still be pointed, and the store would
+keep `maybe_started` for a turn whose outcome was known. The slot's release
+wakes waiters for an idle container from a drop guard, so a panic doesn't
+leave a session waiting on the caps until the idle timeout.
+
+### A container that fails to stop
+
+**Issue.** When `Sandbox::stop` failed, the pool forgot the container and
+freed its places under the caps, though it may still have been running with
+its process in it. The next turn of the session then started another
+container and another process on the same transcript, past the caps, and
+nothing tried the stop again.
+
+**Solution.** A container whose stop fails stays its session's, marked
+dead, with its places under the caps. A turn that finds it, and `reset`,
+try the stop again and fail with `RunnerError::Sandbox` if it still fails,
+so no second process resumes the transcript. The reaper tries every dead
+container each round, and eviction under a full cap tries it first. A
+container's address is read when a process starts in it, after the
+container is held, so a container whose address can't be read goes the
+same way.
+
+### A normal stop reported as a death
+
+**Issue.** Stopping a container makes the sandbox report it dead, and the
+event can arrive while `Sandbox::stop` is still returning. The pool forgot
+the container only once the stop returned, so the event follower found it
+still tracked and alive, and logged a container death, with a warning, on
+nearly every normal stop.
+
+**Solution.** A session marks its container dead before it stops it. The
+follower takes a dead container's death as already handled, and a stop that
+fails leaves the container marked dead, as before.
+
+### A refused `--resume` is known only on a resumed process
+
+**Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
+its shape: an `error_during_execution` error result before `system`/`init`.
+Acting on that shape for any process would mark a session unstarted, and
+run its turn again, after a `--session-id` start or a warm process's later
+turn ended that way for some other reason.
+
+**Solution.** The runner treats it as a refusal only on the first turn sent
+to a process started with `SessionStart::Resume`. Any other turn with that
+outcome is recorded like any turn without `init_seen`, which leaves
+`maybe_started` as it was. The process remembers that nothing was sent to it
+yet, and the send clears it: a resumed process whose first turn failed in
+`turn_starting` is kept warm, and the refusal comes on the next turn, which
+didn't start the process. Judged by whether the turn started the process,
+that refusal came back as an error result, the turn didn't run again, and
+its message was lost.
+
+### What is durable
+
+**Issue.** Queued and in-flight state must survive a restart if anything
+reads it back.
+
+**Solution.** What the runner reads back lives in `sessions`: the ids,
+`started`, `maybe_started`, `last_turn_at` and `reset_at`. The queue of
+waiting turns belongs to its callers' futures, and the warm pool to
+running processes and containers, neither of which survives a restart:
+agentd reaps every sandbox at startup (T17) and purges agentctl tokens
+(T15), and placeholders live in memory (T18). They stay in memory.
 
 ## T22: router
 
