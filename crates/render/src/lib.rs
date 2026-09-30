@@ -7,7 +7,9 @@
 //! 2. A surface renderer converts the rest: [`slack::to_mrkdwn`] produces
 //!    Slack mrkdwn, and [`rocketchat::to_markdown`] produces Rocket.Chat
 //!    Markdown. Both work on the `pulldown-cmark` parse tree, never with
-//!    regexes over the raw text.
+//!    regexes over the raw text. The one exception is Rocket.Chat's
+//!    broadcasts: the server finds them in the raw text, so the renderer
+//!    neutralizes them with a last pass over its whole output.
 //! 3. [`split()`] cuts the rendered text into messages that fit the
 //!    surface's limit, [`slack::MESSAGE_LIMIT`] or
 //!    [`rocketchat::DEFAULT_MESSAGE_LIMIT`].

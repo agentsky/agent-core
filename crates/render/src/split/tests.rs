@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::MentionDirectory;
+use crate::rocketchat::{self, server};
 use crate::slack::to_mrkdwn;
 
 fn chars(max: usize) -> Limit {
@@ -250,6 +251,55 @@ fn entities_are_not_cut() {
 }
 
 #[test]
+fn the_longest_entity_is_not_cut() {
+    let entity = "&CounterClockwiseContourIntegral;";
+    assert_eq!(entity.len(), 33);
+    let text = format!("ab {entity} cd");
+    for max in entity.len()..text.len() {
+        for cut in cuts(&text, chars(max)) {
+            assert!(
+                cut <= 3 || cut >= 3 + entity.len(),
+                "max {max} cut at {cut}"
+            );
+        }
+    }
+    let not_entity = format!("&{};", "a".repeat(32));
+    assert_eq!(cuts(&not_entity, chars(20)), [20]);
+}
+
+#[test]
+fn reference_links_are_not_cut_when_defined() {
+    let text = "aaaa[label][ref]\n\n[ref]: /url";
+    assert_eq!(
+        split_checked(text, chars(13)),
+        ["aaaa", "[label][ref]\n", "\n[ref]: /url"]
+    );
+    for (link, text) in [
+        ("[label][ref]", "aaaa [label][ref] b\n\n[REF]: /url"),
+        ("[Label][]", "aaaa [Label][] b\n\n[label]: /url"),
+        ("[a  label]", "aaaa [a  label] b\n\n> [A label]: /url"),
+        ("![alt][img]", "aaaa ![alt][img] b\n\n   [img]: i.png"),
+    ] {
+        let start = text.find(link).unwrap_or_default();
+        for max in link.len() + 1..text.len() {
+            for cut in cuts(text, chars(max)) {
+                assert!(
+                    cut <= start || cut >= start + link.len(),
+                    "max {max} cut {link} at {cut}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        cuts("aaaa [some label] b", chars(12)),
+        [11],
+        "without a definition brackets are plain text"
+    );
+    let nested = format!("{}x{}\n\n[x]: /u", "[".repeat(50_000), "]".repeat(50_000));
+    assert_eq!(rejoin(&nested, chars(3000)), nested);
+}
+
+#[test]
 fn markdown_links_and_images_are_not_cut() {
     let text = "go to [the docs page](https://x.io/a) or ![a chart](c.png) now";
     let link = 6..37;
@@ -282,6 +332,51 @@ fn mentions_are_not_cut() {
         split_checked("aaaaaaa @bob", chars(10)),
         ["aaaaaaa ", "@bob"]
     );
+    assert_eq!(
+        split_checked("aaaa x@allx", chars(9)),
+        ["aaaa ", "x@allx"],
+        "a mention after a letter is kept whole too"
+    );
+}
+
+#[test]
+fn a_cut_never_starts_a_chunk_with_a_new_mention() {
+    let text = format!("{}x@all", "a".repeat(4999));
+    let chunks = split_checked(&text, rocketchat::DEFAULT_MESSAGE_LIMIT);
+    assert_eq!(chunks, ["a".repeat(4999), "x@all".to_string()]);
+    assert!(chunks.iter().all(|c| server::broadcasts(c).is_empty()));
+    for (text, max) in [("abc>@here", 4), ("a b\t@all", 4), ("ab(@here", 4)] {
+        let expected_cut = text.find('@').unwrap_or_default();
+        let bounded = text[..expected_cut].ends_with([' ', '\t', '>']);
+        assert_eq!(
+            cuts(text, chars(max)).first() == Some(&expected_cut),
+            bounded,
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_forced_cut_never_shortens_a_mention() {
+    assert_eq!(split_checked("@herectic", chars(5)), ["@", "herec", "tic"]);
+    assert_eq!(
+        split_checked("```txt\n @herectic\n```", chars(16)),
+        [
+            "```txt\n \n```",
+            "```txt\n@\n```",
+            "```txt\nherec\n```",
+            "```txt\ntic\n```"
+        ]
+    );
+}
+
+#[test]
+fn rendered_rocketchat_chunks_hold_no_broadcast() {
+    let md = format!("{}x@all", "a".repeat(4999));
+    let rendered = rocketchat::to_markdown(&md, &Team);
+    for chunk in split_checked(&rendered, rocketchat::DEFAULT_MESSAGE_LIMIT) {
+        assert!(server::broadcasts(&chunk).is_empty(), "{chunk:?}");
+    }
 }
 
 #[test]
@@ -327,6 +422,49 @@ fn grapheme_extenders_stay_with_their_base() {
 
     let toned = "👍🏽👍🏽";
     assert_eq!(split_checked(toned, utf16(5)), ["👍🏽", "👍🏽"]);
+}
+
+#[test]
+fn marks_in_other_scripts_stay_with_their_base() {
+    let starts_with_mark = |chunks: &[String]| {
+        chunks.iter().any(|chunk| {
+            chunk
+                .chars()
+                .next()
+                .is_some_and(|c| graphemes::attaches('a', c))
+        })
+    };
+    let cases = [
+        ("Devanagari vowel sign", "कि".repeat(3000), 1001),
+        ("Devanagari conjunct", "क्षि ".repeat(700), 997),
+        ("Thai", "กิ่น้ำ".repeat(900), 1000),
+        ("Hangul jamo", "\u{1100}\u{1161}\u{11A8}".repeat(1000), 1001),
+        (
+            "Hangul old jamo",
+            "\u{A960}\u{D7B0}\u{D7CB}".repeat(1000),
+            1000,
+        ),
+        ("Arabic with harakat", "بِسْمِ ".repeat(1000), 999),
+        ("Hebrew points", "שָׁלוֹם".repeat(800), 1000),
+    ];
+    for (name, text, max) in cases {
+        let chunks = split_checked(&text, chars(max));
+        assert!(chunks.len() > 1, "{name}");
+        assert!(!starts_with_mark(&chunks), "{name}");
+        let doc = Doc::new(&text, chars(max));
+        for cut in cuts(&text, chars(max)) {
+            let k = doc.char_index(cut);
+            assert!(
+                !graphemes::attaches(doc.chars[k - 1], doc.chars[k]),
+                "{name}: cut at {cut} splits a cluster"
+            );
+        }
+    }
+    assert_eq!(
+        split_checked("क्षक्ष", chars(3)),
+        ["क्ष", "क्ष"],
+        "a virama joins the next consonant"
+    );
 }
 
 #[test]
@@ -745,6 +883,47 @@ fn property_render_then_split_keeps_slack_tokens_whole() {
                     &rendered[token.clone()]
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn property_rocketchat_chunks_hold_no_broadcast() {
+    const PARTS: &[&str] = &[
+        "@all",
+        "@here",
+        "x@all",
+        "@allé",
+        "@here.",
+        "`@all`",
+        "\n```\n@here\n```\n",
+        "> @all",
+        "[a](b)@all",
+        "@all@x",
+        "@Ada",
+        "word",
+        " ",
+        "\n",
+        "\n\n",
+        "é",
+        "😀",
+        "(",
+        ">",
+        "@",
+    ];
+    for seed in 1..=1500u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407));
+        let mut md = String::new();
+        for _ in 0..rng.below(60) {
+            md.push_str(rng.pick(PARTS));
+        }
+        let rendered = rocketchat::to_markdown(&md, &Team);
+        let limit = utf16(2 + rng.below(80));
+        for chunk in split_checked(&rendered, limit) {
+            assert!(
+                server::broadcasts(&chunk).is_empty(),
+                "seed {seed}, {limit:?}: {chunk:?} from {md:?}"
+            );
         }
     }
 }
