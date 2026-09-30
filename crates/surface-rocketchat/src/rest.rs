@@ -177,7 +177,7 @@ pub enum RoomType {
 }
 
 impl RoomType {
-    fn from_code(code: &str) -> Self {
+    pub(crate) fn from_code(code: &str) -> Self {
         match code {
             "c" => Self::Channel,
             "p" => Self::Group,
@@ -216,6 +216,20 @@ pub struct RoomInfo {
     /// The members of a direct message.
     #[serde(default)]
     pub uids: Vec<UserId>,
+}
+
+/// One room the user belongs to, from `subscriptions.get`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Subscription {
+    /// The room's id (`rid`).
+    #[serde(rename = "rid")]
+    pub room: ConversationId,
+    /// The room type.
+    #[serde(rename = "t")]
+    pub room_type: RoomType,
+    /// The room name, or the other member's username in a direct message.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Who sent a message.
@@ -262,6 +276,10 @@ pub struct Message {
     pub sender: UserRef,
     /// When it was sent (`ts`).
     pub sent_at: OffsetDateTime,
+    /// When it last changed (`_updatedAt`), when reported. A reaction, a
+    /// thread reply or an edit moves it; a new message has it equal to, or
+    /// a moment after, `sent_at`.
+    pub updated_at: Option<OffsetDateTime>,
     /// The thread root (`tmid`), for a reply in a thread.
     pub thread_root: Option<MessageId>,
     /// The system message type (`t`), such as `uj` for a user joining.
@@ -301,6 +319,8 @@ struct RawMessage {
     files: Vec<Value>,
     #[serde(default)]
     file: Option<Value>,
+    #[serde(default, rename = "_updatedAt")]
+    updated_at: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -325,6 +345,7 @@ impl TryFrom<RawMessage> for Message {
             text: raw.msg.unwrap_or_default(),
             sender: raw.u,
             sent_at,
+            updated_at: raw.updated_at.as_ref().and_then(parse_timestamp),
             thread_root: raw.tmid.map(MessageId::from),
             kind: raw.t,
             bot: raw
@@ -509,6 +530,12 @@ impl RestClient {
         &self.creds.user_id
     }
 
+    /// The credentials this client acts with. The realtime client logs in
+    /// with the same token.
+    pub fn credentials(&self) -> &Credentials {
+        &self.creds
+    }
+
     /// `GET me`: the user this client acts as.
     pub async fn me(&self) -> Result<User> {
         self.call(Call::get("me")).await
@@ -653,6 +680,24 @@ impl RestClient {
             .ok_or_else(|| SurfaceError::NotFound("room".into()))
     }
 
+    /// `GET subscriptions.get`: every room this client's user belongs to.
+    pub async fn subscriptions(&self) -> Result<Vec<Subscription>> {
+        let found: SubscriptionsEnvelope = self.call(Call::get("subscriptions.get")).await?;
+        Ok(found.update)
+    }
+
+    /// `GET users.info`: a user by id.
+    ///
+    /// Rocket.Chat includes `roles` only for the caller itself, or when the
+    /// caller has `view-full-other-user-info`; otherwise
+    /// [`User::roles`] comes back empty.
+    pub async fn user_info(&self, user: &UserId) -> Result<User> {
+        let found: UserEnvelope = self
+            .call(Call::get("users.info").query("userId", user.as_str()))
+            .await?;
+        Ok(found.user)
+    }
+
     /// `POST im.create`: opens (or finds) the direct message with the user
     /// named `username` and returns its room id.
     pub async fn create_dm(&self, username: &str) -> Result<ConversationId> {
@@ -704,6 +749,19 @@ impl RestClient {
             .call(Call::get("chat.getMessage").query("msgId", message.as_str()))
             .await?;
         Ok(found.message)
+    }
+
+    /// Where a message's file is downloaded from:
+    /// `<base>/file-upload/<id>/<name>`. The download needs this client's
+    /// credentials, as headers or cookies.
+    pub fn file_url(&self, file: &FileRef) -> String {
+        let mut url = self.base.clone();
+        if let Ok(mut segments) = url.path_segments_mut() {
+            segments
+                .pop_if_empty()
+                .extend(["file-upload", &file.id, &file.name]);
+        }
+        url.into()
     }
 
     /// Uploads a file to a room, in the thread under `thread_root` if given,
@@ -1084,6 +1142,11 @@ struct DmRoom {
 #[derive(Deserialize)]
 struct MessageEnvelope {
     message: Message,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionsEnvelope {
+    update: Vec<Subscription>,
 }
 
 #[derive(Deserialize)]

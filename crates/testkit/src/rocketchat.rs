@@ -1,5 +1,7 @@
 //! A fake Rocket.Chat server for tests.
 //!
+//! [`FakeDdp`] is the realtime side: a WebSocket server speaking DDP.
+//!
 //! [`FakeRest`] answers the REST endpoints `surface-rocketchat` uses, from
 //! wiremock, with shapes taken from the Rocket.Chat server source. It keeps
 //! users, tokens, rooms and messages in memory, so a test can create a bot,
@@ -13,6 +15,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 use wiremock::matchers::path_regex;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+mod ddp;
+
+pub use ddp::{
+    FakeDdp, LoginAttempt, NOTIFY_USER, ROOM_MESSAGES, realtime_message, subscription_doc,
+};
 
 /// A user the fake knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +160,8 @@ impl State {
 ///
 /// It starts with one user, the manager ([`FakeRest::MANAGER_ID`],
 /// authenticated by [`FakeRest::MANAGER_TOKEN`]), and no rooms.
+/// `users.info` includes `roles` only for the caller itself and for the
+/// manager, which the fake treats as holding `view-full-other-user-info`.
 pub struct FakeRest {
     server: MockServer,
     state: Arc<Mutex<State>>,
@@ -452,6 +462,38 @@ impl Respond for Router {
         let param = |key: &str| query.get(key).cloned().unwrap_or_default();
         match (post, segments.as_slice()) {
             (false, ["me"]) => ok(state.user_json(&caller)),
+            (false, ["users.info"]) => {
+                let id = param("userId");
+                if !state.users.contains_key(&id) {
+                    return failure("User not found.");
+                }
+                let mut user = state.user_json(&id);
+                if caller != id
+                    && caller != FakeRest::MANAGER_ID
+                    && let Some(user) = user.as_object_mut()
+                {
+                    user.remove("roles");
+                }
+                ok(json!({ "user": user }))
+            }
+            (false, ["subscriptions.get"]) => {
+                let update: Vec<Value> = state
+                    .rooms
+                    .iter()
+                    .filter(|(_, room)| room.members.contains(&caller))
+                    .map(|(id, room)| {
+                        json!({
+                            "_id": format!("{id}{caller}"),
+                            "rid": id,
+                            "t": room.t,
+                            "name": room.name.clone().unwrap_or_default(),
+                            "u": { "_id": caller },
+                            "open": true,
+                        })
+                    })
+                    .collect();
+                ok(json!({ "update": update, "remove": [] }))
+            }
             (true, ["logout"]) => {
                 let token = header(request, "x-auth-token");
                 state.tokens.remove(&token);

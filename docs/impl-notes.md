@@ -1109,3 +1109,174 @@ can't leak into the error.
   servers. To turn a `Cursor` (a message id) into a `latest` time for the
   top level, the client also has `chat.getMessage`, which the plan didn't
   list.
+
+## T12: Rocket.Chat realtime
+
+DDP and stream behavior below was read from the Rocket.Chat source on
+`develop` (commit `fad30ab`): `ee/apps/ddp-streamer/src/ddp/`,
+`packages/streamer/src/` and `apps/meteor/server/lib/notifyListener.ts`. No
+server was available, so none of it is verified live yet.
+
+### The store reaches the surface through a `Dedup` trait
+
+**Issue.** T12 deduplicates with `store.mark_event_processed("rocketchat",
+_id)`, but surface crates don't depend on the store, and agentd is what holds
+it.
+
+**Solution.** surface-rocketchat defines `Dedup`, one async method with the
+store's signature and contract, and `RocketChatSurface::new` takes an
+`Arc<dyn Dedup>`. agentd implements it with a one-line call to the store;
+`DEDUP_SOURCE` is `"rocketchat"`. The tests use a real in-memory `Store`
+(a dev-dependency) behind it. A copy is recorded only after it was
+normalized, and a failure to read the room or the sender's roles, or to
+record, skips that copy without recording it, so another bot's connection can
+still deliver the message. A copy recorded when the event receiver has just
+closed is lost, which only happens at shutdown.
+
+### Messages don't carry the sender's roles
+
+**Issue.** A sender with the `bot` role must set `sender_is_bot`, but a
+message's `u` holds only `_id`, `username` and `name`. `users.info` returns
+another user's `roles` only to a caller with `view-full-other-user-info`
+(`apps/meteor/server/lib/users/getFullUserData.ts`), which bots don't have.
+Since whichever connection records a message first delivers it, a lookup made
+with that connection's own token would classify agent A's post as a bot's
+when A's connection won and as a human's when B's did. The `bot` field
+doesn't help for agentd's own bots: `chat.postMessage` refuses it
+(`additionalProperties: false` in its schema), so only integrations and apps
+set it.
+
+**Solution.** `BotRoles` reads roles with `users.info` and remembers them for
+ten minutes. agentd builds one from the manager's client and shares it
+between every surface, so the manager's custom role also needs
+`view-full-other-user-info`; the design's Rocket.Chat section says so now. A
+sender is a bot when the message has a non-false `bot` field or the sender has
+the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
+only to the user itself and to the manager.
+
+### Room lists and room kinds come from REST
+
+**Issue.** Nothing in the realtime API lists the rooms a user is in without
+`__my_messages__`, and a `stream-room-messages` event has no room type, so it
+can't tell a DM from a group DM.
+
+**Solution.** Each connection lists rooms with REST `subscriptions.get`, and
+the surface reads a room's `t`, `usersCount` and `uids` with `rooms.info` the
+first time a message arrives from it, then keeps it for the surface's
+lifetime (a DM's members are fixed). `RestClient` gains `subscriptions`,
+`file_url` (`<base>/file-upload/<id>/<name>`, for `InFile::url`) and
+`credentials` (the realtime login reuses the token), and `FakeRest` answers
+`subscriptions.get`. Only channels, private groups and DMs are listened to:
+omnichannel rooms (`l`) and other types aren't agent conversations.
+
+### `stream-room-messages` resends a message whenever it changes
+
+**Issue.** `notifyOnMessageChange` broadcasts the whole message on every
+change: a reaction, a reply in its thread (the root's `tcount`), a link
+preview. Dedup by `_id` drops these for a message already recorded, but a
+message recorded by nobody, posted before the bot joined or while every
+connection was down, would look new when someone reacts to it, and would
+arrive with the mentions it had then. Only `editedAt` marks an edit.
+
+**Solution.** Besides `t` and `editedAt`, a message whose `_updatedAt` is
+more than two minutes after its `ts` is skipped as a change to an old
+message. The margin covers the `sendMessage` method, which accepts a client's
+`ts` up to 60 seconds off the server's clock.
+
+### `@all` and `@here` appear in `mentions[]`
+
+**Issue.** Rocket.Chat puts the broadcasts in `mentions[]` with `_id` `all`
+or `here`. They name no user.
+
+**Solution.** They are left out of `InboundEvent::mentions`, so a broadcast
+never counts as mentioning an agent. Repeated ids are kept once.
+
+### Personal access tokens work as resume tokens
+
+**Issue.** T12 logs in "with a `resume` token", and T11 issues personal
+access tokens.
+
+**Solution.** Rocket.Chat stores a personal access token as a hashed login
+token with `type: "personalAccessToken"`
+(`apps/meteor/imports/personal-access-tokens/server/api/methods/generateToken.ts`),
+where the resume handler finds it, so the realtime client sends the bot's
+token as `{"resume": token}`. A login error `403` ends `events` with
+`SurfaceError::Unauthorized` instead of reconnecting forever. A login that
+answers for another user id also ends it.
+
+### DDP details the client relies on
+
+- The server's first frame is `{"server_id": "0"}` from Meteor or
+  `{"msg": "server_id", …}` from the split-out streamer. The client ignores
+  anything it doesn't know.
+- The streamer pings a client that has been silent for 30 seconds and closes
+  the socket 30 seconds later (`TIMEOUT` in `ddp/constants.ts`). The client
+  answers pings with their id, pings after 20 seconds of silence itself, and
+  reconnects after 40 seconds without any frame.
+- A stream subscription is `sub` with `params: [event, false]`; the second
+  parameter turns off collection compatibility. A refused one gets `nosub`
+  with `error: "not-allowed"`. A refused room is dropped and the connection
+  stays up; a refused `subscriptions-changed` reconnects.
+- `subscriptions-changed` carries `[action, subscription]`. `updated` fires
+  on every unread-count change, so subscribing is idempotent. `removed` may
+  lack `rid`. The server also stops a room's message subscription itself when
+  the user is removed, without telling the client, and the client sends
+  `unsub` anyway.
+
+### Reconnecting lists the rooms again instead of remembering them
+
+**Issue.** Resubscribing to every room a connection knew would include rooms
+the bot was removed from while disconnected, and `stream-room-messages`
+lets any user with `view-c-room` read a public channel's messages
+(`canReadRoom`), so the bot would keep hearing a channel it left.
+
+**Solution.** Each connection subscribes to what `subscriptions.get` lists
+then, plus what `subscriptions-changed` adds, which also covers rooms joined
+while disconnected. Messages posted while a bot had no connection are not
+fetched; [Deferred work](tasks-plan.md#deferred-work) has a bullet for it.
+
+### Normalizing runs off the socket
+
+**Issue.** Normalizing a message can call `rooms.info` and `users.info`, and
+recording it hits the store. Doing that inline would delay answering the
+server's pings.
+
+**Solution.** The socket loop hands raw messages to the surface through a
+channel of 256, and the surface normalizes them in order on its own.
+
+### tokio-tungstenite uses rustls's default provider
+
+**Issue.** tokio-tungstenite builds its TLS configuration with
+`ClientConfig::builder()`, which takes the process-wide `CryptoProvider`, or
+the one crate features select when exactly one of `aws-lc-rs` and `ring` is
+enabled, and panics otherwise.
+
+**Solution.** reqwest's `rustls` feature enables `aws-lc-rs`, and nothing
+enables `ring`, so `wss://` connects work without installing a provider. A
+test connects to a local port that drops the TLS handshake and checks that
+the client retries instead of panicking, so a second provider appearing in
+the graph fails CI.
+
+### `Surface::render` has no mention directory
+
+**Issue.** `render::rocketchat::to_markdown` resolves `@Name` through a
+`MentionDirectory`, but `Surface::render(&self, markdown)` takes none, and
+T23 says the pipeline builds a directory snapshot per reply.
+
+**Solution.** `RocketChatSurface::render` passes a directory that resolves
+nothing, so `@Name` stays as written. On Rocket.Chat that loses little, since
+an `@username` in the text is already a mention and broadcasts are still
+neutralized. If T23 needs display names resolved, it has to add the
+directory to `Surface::render` (or render outside the trait).
+
+### Thread history includes the root
+
+**Issue.** `chat.getThreadMessages` returns replies only, newest first, and
+has no `latest`, but T23 and `agentctl history` want the thread as a whole,
+older than a cursor.
+
+**Solution.** `history` for a thread reads pages of 100 newest first, keeps
+messages older than the cursor message's `ts`, and adds the root once the
+replies run out, as Slack's `conversations.replies` would. It reads at most
+50 pages. Both thread and top-level history leave out system messages, so a
+call can return fewer than `limit`.

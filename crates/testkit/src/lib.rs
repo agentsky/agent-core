@@ -7,7 +7,7 @@
 //!   [`claude::Turn`]. [`claude`] documents what it checks and prints.
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.
-//! - [`rocketchat`]: a fake Rocket.Chat REST server.
+//! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 
 #![warn(missing_docs)]
 

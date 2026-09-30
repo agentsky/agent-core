@@ -180,7 +180,9 @@ default[^rc-perms].
 
 The custom role needs `create-user`, plus `edit-other-user-active-status` if
 agentd passes `active` on create, and the permission for creating the bot's
-token. A reviewer's reading of the current server source is that `users.create`
+token. It also needs `view-full-other-user-info`: messages don't carry
+the sender's roles, and `users.info` shows another user's roles only with it,
+which is how agentd tells bots from people. A reviewer's reading of the current server source is that `users.create`
 with `roles: ["bot"]` checks only those, and that `assign-roles` is checked on
 update only. That needs a test on the target server version.
 

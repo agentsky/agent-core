@@ -11,8 +11,11 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 core-types.workspace = true
+futures.workspace = true
 rand.workspace = true
+render.workspace = true
 reqwest = { workspace = true, features = ["rustls", "multipart"] }
 secrecy.workspace = true
 serde.workspace = true
@@ -20,8 +23,10 @@ serde_json.workspace = true
 sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+store.workspace = true
 testkit.workspace = true
 wiremock.workspace = true
