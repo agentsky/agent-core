@@ -2068,16 +2068,21 @@ Deliverables:
   1 MiB.
 - `url_verification`: echo the challenge for a known binding, without checking
   the signature. Slack sends it during `apps.manifest.create`, before agentd
-  has the new app's signing secret. The echo has no side effects. Every other
-  request type must verify.
+  has the new app's signing secret. The echo has no side effects. The one
+  other exception is Slack's `ssl_check`: a form whose `ssl_check` is `1`,
+  posted unsigned to the command URL, gets an empty 200 on the same terms.
+  Every other request type must verify.
   This PR adds that detail to the design's Slack transport bullet.
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
-  200 at once, or 503 when the queue is full, so Slack retries; they never
-  wait for the queue. Slash commands and interactivity return an empty 200 and
-  reply later through `response_url`.
+  200 at once, or 503 when the queue is full (Slack retries events, not
+  commands or interactions); they never wait for the queue. The secret lookup
+  and the body read share a 2-second timeout. Slash commands and
+  interactivity return an empty 200 and reply later through `response_url`.
 - Deduplication per binding: `store.mark_event_processed("slack:<binding>",
-  event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
-  a message that reached the same app twice. Slash commands and
+  event_id)` drops retried events, and messages are keyed by `(binding,
+  channel, ts)` instead, which drops a retry and a message that reached the
+  same app twice. Messages are normalized first, so a dropped one costs no
+  store write. Slash commands and
   interactivity, which have no event id, are deduplicated by signature, which
   drops a replay inside the 5-minute window. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:

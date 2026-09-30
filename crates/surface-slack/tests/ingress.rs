@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
 use core_types::{BindingId, ConvKind, SendError, Sender, Sink, UserId};
+use futures::StreamExt as _;
 use secrecy::{ExposeSecret as _, SecretString};
+use surface_slack::ingress::PRE_ACK_TIMEOUT;
 use surface_slack::{BindingRef, BoxError, Dedup, SigningSecrets, SlackApp, SlackInbound, ingress};
 use testkit::slack::{self as fixtures, BOT_USER, CHALLENGE, TEAM};
 use tokio::sync::{Notify, mpsc};
@@ -25,11 +27,13 @@ const OTHER_SECRET: &str = "other-agent-signing-secret";
 struct Secrets {
     apps: HashMap<BindingRef, SlackApp>,
     failing: bool,
+    delay: Duration,
 }
 
 #[async_trait::async_trait]
 impl SigningSecrets for Secrets {
     async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
+        tokio::time::sleep(self.delay).await;
         if self.failing {
             return Err("the store is down".into());
         }
@@ -115,7 +119,7 @@ fn secrets() -> Secrets {
             ),
             (BindingRef::Agent(creating_agent()), app(None, None)),
         ]),
-        failing: false,
+        ..Secrets::default()
     }
 }
 
@@ -123,6 +127,7 @@ struct Harness {
     router: Router,
     out: mpsc::UnboundedReceiver<SlackInbound>,
     worker: JoinHandle<()>,
+    dedup: Arc<MemoryDedup>,
 }
 
 impl Harness {
@@ -133,12 +138,29 @@ impl Harness {
     fn with(secrets: Secrets, dedup: MemoryDedup) -> Self {
         let (router, queue) = ingress(Arc::new(secrets), 64);
         let (tx, out) = mpsc::unbounded_channel();
-        let worker = tokio::spawn(queue.run(Arc::new(dedup), Sender::new(Collect(tx))));
+        let dedup = Arc::new(dedup);
+        let worker = tokio::spawn(queue.run(dedup.clone(), Sender::new(Collect(tx))));
         Self {
             router,
             out,
             worker,
+            dedup,
         }
+    }
+
+    /// The keys recorded under `source`.
+    fn recorded(&self, source: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .dedup
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(recorded, _)| recorded == source)
+            .map(|(_, key)| key.clone())
+            .collect();
+        keys.sort();
+        keys
     }
 
     async fn send(&self, request: Request<Body>) -> (StatusCode, String) {
@@ -432,6 +454,120 @@ async fn the_challenge_is_answered_only_on_events_and_only_when_well_formed() {
 }
 
 #[tokio::test]
+async fn ssl_check_is_answered_on_the_command_url_without_verification() {
+    let mut harness = Harness::start();
+    let body = "ssl_check=1&token=legacy-verification-token";
+    for binding in [
+        BindingRef::Manager,
+        BindingRef::Agent(agent()),
+        BindingRef::Agent(creating_agent()),
+    ] {
+        let uri = path(binding, "commands");
+        assert_eq!(
+            harness.send(request(&uri, body, &[])).await,
+            (StatusCode::OK, String::new()),
+            "{binding}"
+        );
+    }
+    let uri = path(BindingRef::Manager, "commands");
+    assert_eq!(
+        harness.send(signed(&uri, MANAGER_SECRET, body)).await,
+        (StatusCode::OK, String::new())
+    );
+
+    for kind in ["events", "interactivity"] {
+        let uri = path(BindingRef::Manager, kind);
+        let (status, _) = harness.send(request(&uri, body, &[])).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{kind}");
+    }
+    for not_a_check in [
+        "ssl_check=0&token=x",
+        "ssl_check=true",
+        "ssl_check=1&ssl_check=1",
+    ] {
+        let (status, _) = harness.send(request(&uri, not_a_check, &[])).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{not_a_check}");
+    }
+    let unknown = path(BindingId::new_v4(), "commands");
+    assert_eq!(
+        harness.send(request(&unknown, body, &[])).await.0,
+        StatusCode::NOT_FOUND
+    );
+    harness.assert_nothing_delivered().await;
+    assert!(harness.recorded("slack:manager:request").is_empty());
+}
+
+/// A request whose body sends its first bytes and then nothing more.
+fn stalled(uri: &str) -> Request<Body> {
+    let body = fixtures::MESSAGE_MENTION;
+    let headers = fixtures::signed_headers(AGENT_SECRET, fixtures::now(), body.as_bytes());
+    let first = Bytes::copy_from_slice(&body.as_bytes()[..10]);
+    let chunks =
+        futures::stream::iter([Ok::<_, std::io::Error>(first)]).chain(futures::stream::pending());
+    let mut builder = Request::post(uri).header("content-length", body.len());
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    builder.body(Body::from_stream(chunks)).unwrap()
+}
+
+#[tokio::test]
+async fn a_stalled_body_gets_408_after_the_pre_ack_timeout() {
+    let harness = Harness::start();
+    let begun = Instant::now();
+    let (status, body) = tokio::time::timeout(
+        PRE_ACK_TIMEOUT + Duration::from_secs(3),
+        harness.send(stalled(&path(agent(), "events"))),
+    )
+    .await
+    .expect("the stalled request was never answered");
+    let took = begun.elapsed();
+    assert_eq!((status, body.as_str()), (StatusCode::REQUEST_TIMEOUT, ""));
+    assert!(took >= PRE_ACK_TIMEOUT, "{took:?}");
+    assert!(took < PRE_ACK_TIMEOUT + Duration::from_secs(1), "{took:?}");
+}
+
+#[tokio::test]
+async fn a_slow_lookup_gets_503_and_shares_the_timeout_with_the_body() {
+    let hung = Secrets {
+        delay: Duration::from_secs(3600),
+        ..secrets()
+    };
+    let harness = Harness::with(hung, MemoryDedup::default());
+    let begun = Instant::now();
+    let (status, _) = tokio::time::timeout(
+        PRE_ACK_TIMEOUT + Duration::from_secs(3),
+        harness.send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_MENTION,
+        )),
+    )
+    .await
+    .expect("the request was never answered");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        begun.elapsed() < PRE_ACK_TIMEOUT + Duration::from_secs(1),
+        "{:?}",
+        begun.elapsed()
+    );
+
+    let slow = Secrets {
+        delay: PRE_ACK_TIMEOUT * 3 / 4,
+        ..secrets()
+    };
+    let harness = Harness::with(slow, MemoryDedup::default());
+    let begun = Instant::now();
+    let (status, _) = harness.send(stalled(&path(agent(), "events"))).await;
+    let took = begun.elapsed();
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert!(
+        took < PRE_ACK_TIMEOUT + Duration::from_millis(900),
+        "{took:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_binding_without_a_secret_verifies_nothing() {
     let harness = Harness::start();
     let uri = path(creating_agent(), "events");
@@ -460,6 +596,34 @@ async fn a_retried_event_is_delivered_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(harness.message().await.event_id, "Ev0MENTION1");
     harness.assert_nothing_delivered().await;
+    assert!(harness.recorded(&format!("slack:{}", agent())).is_empty());
+    let messages = harness.recorded(&format!("slack:{}:message", agent()));
+    assert!(
+        messages.contains(&format!("{}:1727697600.000100", fixtures::CHANNEL)),
+        "{messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn unaddressed_messages_are_dropped_without_a_dedup_write() {
+    let mut harness = Harness::start();
+    for body in [fixtures::MESSAGE_PLAIN, fixtures::MESSAGE_CHANGED] {
+        for _ in 0..2 {
+            let (status, _) = harness
+                .send(signed_events(agent(), AGENT_SECRET, body))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    }
+    harness.assert_nothing_delivered().await;
+    assert!(harness.recorded(&format!("slack:{}", agent())).is_empty());
+    let messages = harness.recorded(&format!("slack:{}:message", agent()));
+    assert!(
+        messages
+            .iter()
+            .all(|key| !key.starts_with(fixtures::CHANNEL)),
+        "{messages:?}"
+    );
 }
 
 #[tokio::test]
@@ -595,6 +759,7 @@ async fn other_events_are_handed_on_and_rate_limit_notices_are_acked() {
         ))
         .await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+    assert_eq!(harness.recorded("slack:manager"), ["Ev0USERCHG1"]);
     let unknown = r#"{"type":"something_new","token":"x"}"#;
     assert_eq!(
         harness

@@ -20,6 +20,10 @@
 //! - Anything else is ignored, and named in [`Config::unknown_env`] for
 //!   `serve` and `migrate` to log as a warning.
 //!
+//! A secret may be neither empty nor start or end with white space. The
+//! trailing newline of a secret mounted from a file would otherwise become
+//! part of it, and a signing secret with one fails every request.
+//!
 //! Every other `AGENTD_SLACK_MANAGER_*` secret requires
 //! [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
 //! so a misspelling of that name fails at startup too.
@@ -587,6 +591,13 @@ fn secret(name: &str, value: OsString) -> Result<SecretString, ConfigError> {
     if value.trim().is_empty() {
         return Err(invalid(name, "is set but empty"));
     }
+    if value.trim() != value {
+        return Err(invalid(
+            name,
+            "starts or ends with white space, such as the trailing newline of a mounted \
+             file; remove it",
+        ));
+    }
     Ok(SecretString::from(value))
 }
 
@@ -1044,6 +1055,46 @@ data_dir = "/nonexistent/agentd"
         }
         let err = with(MINIMAL, vec![(MASTER_KEY_VAR.to_owned(), String::new())]).unwrap_err();
         assert_eq!(err.key(), Some(MASTER_KEY_VAR), "{err}");
+    }
+
+    #[test]
+    fn secrets_with_surrounding_white_space_are_refused() {
+        let key = key();
+        for name in [
+            MASTER_KEY_VAR,
+            RC_MANAGER_TOKEN_VAR,
+            SLACK_MANAGER_SIGNING_SECRET_VAR,
+        ] {
+            for value in [
+                format!("{key}\n"),
+                format!("{key}\r\n"),
+                format!(" {key}"),
+                format!("{key}\t"),
+            ] {
+                let mut env = env();
+                env.retain(|(k, _)| k != name);
+                env.push((name.to_owned(), value.clone()));
+                let err = with(MINIMAL, env).unwrap_err();
+                assert_eq!(err.key(), Some(name), "{err}");
+                let message = err.to_string();
+                assert!(message.contains("white space"), "{message}");
+                assert!(!message.contains(&key), "{message}");
+            }
+        }
+        let mut env = env();
+        env.push((
+            SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
+            "inner space is kept".to_owned(),
+        ));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_signing_secret()
+                .unwrap()
+                .expose_secret(),
+            "inner space is kept"
+        );
     }
 
     #[test]

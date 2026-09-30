@@ -2504,8 +2504,9 @@ doesn't say what a full queue does.
 
 **Solution.** The handler does only what needs no I/O beyond the secret
 lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
-bounded queue. A full or closed queue answers 503, so Slack retries; the
-handler never waits for it. `Queue::run` then deduplicates through the
+bounded queue. A full or closed queue answers 503; Slack retries an event
+that gets one, but not a slash command or an interaction, whose user sees
+Slack's error. The handler never waits for the queue. `Queue::run` then deduplicates through the
 `Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
 and sends `SlackInbound` items, one at a time and in order, to a
 `core_types::Sender`. A failed dedup write drops the request rather than risk
@@ -2554,7 +2555,9 @@ literal as `&lt;@U123&gt;`).
 **Solution.** Mentions are the tokens in `text`, the `user` elements of
 `rich_text` blocks, and the tokens in `mrkdwn` text objects (section and
 context blocks, which bots post). `plain_text` and rich-text `text` elements
-are not scanned. Each user appears once, in order of first appearance.
+are not scanned. Each user appears once, in order of first appearance; the
+ids already seen are kept in a `HashSet`, since a 40,000-character message
+can carry thousands of mentions.
 
 ### A misspelled manager secret went unnoticed
 
@@ -2573,3 +2576,64 @@ the Slack prefix, because a Service named `agentd-slack-manager` would set
 `AGENTD_SLACK_MANAGER_PORT` and `…_SERVICE_HOST`; read as secrets, those
 would fail this check (or become junk entries next to the signing secret).
 No Slack secret's name ends like a service link.
+
+### Slack's `ssl_check` is unsigned
+
+**Issue.** The plan lets only `url_verification` skip the signature. Slack
+also posts `ssl_check=1` (with the legacy verification token) to a slash
+command's URL to check its certificate, unsigned; agentd answered it 401, or
+400 when signed, since it isn't a command form. Bolt for JavaScript and for
+Python answer it with 200 before verifying.
+
+**Solution.** On `/commands`, a known binding answers a form whose
+`ssl_check` is exactly `1` with an empty 200 before the signature check,
+reading nothing else and queueing nothing, like the challenge echo. The
+design's transport bullet and the plan name it as the second exception.
+
+### Unaddressed messages cost a store write each
+
+**Issue.** Agent apps receive every message in their channels, and
+`Queue::run` recorded each event's `event_id` in `processed_events` (kept for
+seven days) before normalization dropped the unaddressed ones: a store write
+per channel message per agent.
+
+**Solution.** `message` events are normalized first, which is pure, and a
+dropped one costs no I/O. A kept message is deduplicated only by
+`<channel>:<ts>` under `slack:<binding>:message`, which catches Slack's
+retries as well as the event_id key did, so messages no longer write an
+`event_id` row. Other events are still deduplicated by `event_id`.
+
+### A slow body held up shutdown
+
+**Issue.** Nothing bounded the secret lookup or the body read before the
+ack. A client that sent headers and then trickled or withheld the body kept
+its connection in flight, so a graceful shutdown waited the whole drain
+timeout for it.
+
+**Solution.** The handler every route goes through gives the lookup and the
+body read one shared deadline, `PRE_ACK_TIMEOUT` (2 seconds, inside Slack's
+3): 503 if the lookup is still running, 408 if the body hasn't arrived.
+
+### Refusals before verification are throttled in the log
+
+**Issue.** Anyone can send unsigned or forged requests and challenges, and
+each was logged at warn or info, so a flood of them floods the log.
+
+**Solution.** Like agentd's `RefuseSubnet`, the ingress logs such refusals
+(bad signature, no secret yet, body refused or too slow) as a warning at most
+once per `WARNING_INTERVAL` (a minute), with how many went quiet since, and
+the rest at debug level. Answered challenges are throttled the same way at
+info level. `ssl_check` is logged at debug level only.
+
+### A trailing newline in a secret failed every request
+
+**Issue.** T10's `secret()` refused only empty or all-white-space values. A
+signing secret mounted from a file with a trailing newline was accepted, and
+every Slack request then failed verification with 401.
+
+**Solution.** Every secret read from the environment (`AGENTD_MASTER_KEY`,
+`AGENTD_RC_MANAGER_TOKEN` and `AGENTD_SLACK_MANAGER_*`) is refused at startup
+when it starts or ends with white space; the error names the variable, never
+the value. That includes the master key, whose base64 decoding (T05) would
+have ignored the newline: the rule is simpler kept the same for all secrets,
+and `export AGENTD_MASTER_KEY="$(agentd gen-key)"` strips the newline anyway.

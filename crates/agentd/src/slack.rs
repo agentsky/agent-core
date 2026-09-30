@@ -24,7 +24,8 @@ use time::OffsetDateTime;
 use crate::app::App;
 
 /// How many acknowledged Slack requests may wait to be handled. Beyond
-/// that, requests get 503 and Slack retries them.
+/// that, requests get 503: Slack retries events, but not slash commands or
+/// interactions.
 pub const QUEUE_CAPACITY: usize = 1024;
 
 /// The router serving the Slack request URLs, and the queue behind it. Run

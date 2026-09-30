@@ -2485,6 +2485,7 @@ dependencies = [
  "async-trait",
  "axum",
  "core-types",
+ "futures",
  "hmac",
  "http-body-util",
  "secrecy",

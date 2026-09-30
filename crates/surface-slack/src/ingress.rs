@@ -15,37 +15,52 @@
 //!
 //! 1. 404 if the binding is unknown (or not a binding id at all), 503 if the
 //!    lookup failed.
-//! 2. 413 if the body is larger than [`MAX_BODY_BYTES`].
-//! 3. On `/events` only, a `url_verification` body is answered with its
-//!    challenge, without checking the signature. Slack sends it while
-//!    `apps.manifest.create` runs, before agentd has the new app's signing
-//!    secret. The echo reads nothing and changes nothing, and it is given
-//!    only for bindings agentd already knows, so it tells a forger nothing
-//!    a 401 wouldn't (see the design's Slack transport notes).
+//! 2. 413 if the body is larger than [`MAX_BODY_BYTES`]. The lookup and the
+//!    body together get [`PRE_ACK_TIMEOUT`]: 503 if the lookup is still
+//!    running then, 408 if the body hasn't all arrived.
+//! 3. Two probes are answered without checking the signature. Each reads
+//!    nothing and changes nothing, and each is answered only for bindings
+//!    agentd already knows, so it tells a forger nothing a 401 wouldn't (see
+//!    the design's Slack transport notes):
+//!    - On `/events`, a `url_verification` body gets its challenge back.
+//!      Slack sends it while `apps.manifest.create` runs, before agentd has
+//!      the new app's signing secret.
+//!    - On `/commands`, a form whose `ssl_check` is `1` gets an empty 200.
+//!      Slack sends it, unsigned, to check the certificate of a slash
+//!      command's URL.
 //! 4. 401 unless the request carries a valid `v0` signature (see
 //!    [`verify`](mod@crate::verify)) made with the binding's secret. A binding
 //!    whose secret isn't known yet can't be verified, so everything but the
-//!    challenge gets 401.
+//!    probes gets 401.
 //! 5. 400 if a verified body can't be parsed.
 //! 6. An empty 200 as soon as the request is on the queue, or 503 if the
-//!    queue is full, so Slack retries later. The handler never waits for
-//!    the queue. Slash commands and interactivity reply later through their
-//!    `response_url`.
+//!    queue is full. Slack retries an event that got 503, but not a slash
+//!    command or an interaction: its user sees Slack's error and can try
+//!    again. The handler never waits for the queue. Slash commands and
+//!    interactivity reply later through their `response_url`.
+//!
+//! Anyone can send requests that are refused before verification (steps 2
+//! to 4) or challenges, so at most one refusal per [`WARNING_INTERVAL`] is
+//! logged as a warning and one challenge as info; the rest are logged at
+//! debug level.
 //!
 //! [`Queue::run`] then deduplicates each request through [`Dedup`],
 //! normalizes it, and hands it on as a [`SlackInbound`]:
 //!
-//! - Events by `event_id`, under the source `slack:<binding>`, which drops
-//!   Slack's retries.
-//! - Normalized messages also by `<channel>:<ts>`, under
-//!   `slack:<binding>:message`, which drops a message that reached the same
-//!   app twice with different event ids.
+//! - `message` events are normalized first, which needs no I/O, so the
+//!   unaddressed channel messages every agent app receives cost no store
+//!   write. A kept message is deduplicated by `<channel>:<ts>`, under
+//!   `slack:<binding>:message`, which drops Slack's retries and a message
+//!   that reached the same app twice with different event ids.
+//! - Other events by `event_id`, under the source `slack:<binding>`, which
+//!   drops Slack's retries.
 //! - Slash commands and interactivity by their signature, under
 //!   `slack:<binding>:request`. Slack doesn't retry them, so a second copy is
 //!   a replay inside the five-minute window.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -75,6 +90,15 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// The longest `url_verification` challenge echoed, in bytes. Slack's are
 /// about 50 characters.
 pub const MAX_CHALLENGE_BYTES: usize = 256;
+/// How long the secret lookup and reading the body may take together.
+/// Slack wants its ack within three seconds, and a connection that holds
+/// either up would otherwise also hold up shutdown for the whole drain
+/// timeout.
+pub const PRE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a refusal before verification is logged as a warning, and an
+/// answered challenge as info, at most. The others are logged at debug
+/// level, and the next warning or info says how many there were.
+pub const WARNING_INTERVAL: Duration = Duration::from_secs(60);
 /// The header in which Slack numbers a retried delivery.
 pub const RETRY_NUM_HEADER: &str = "x-slack-retry-num";
 /// The header in which Slack says why it retried.
@@ -154,8 +178,9 @@ pub trait SigningSecrets: Send + Sync {
     ///
     /// # Errors
     ///
-    /// If the lookup itself fails. The request then gets 503, so Slack
-    /// retries it.
+    /// If the lookup itself fails. The request then gets 503, as it does
+    /// when the lookup takes longer than [`PRE_ACK_TIMEOUT`]; Slack retries
+    /// events, but not slash commands or interactions.
     async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError>;
 }
 
@@ -183,6 +208,8 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
     let state = Ingress {
         secrets,
         queue: sender,
+        refusals: Arc::new(Throttle::new(WARNING_INTERVAL)),
+        challenges: Arc::new(Throttle::new(WARNING_INTERVAL)),
     };
     let router = Router::new()
         .route("/slack/b/{binding}/events", post(events))
@@ -196,6 +223,76 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
 struct Ingress {
     secrets: Arc<dyn SigningSecrets>,
     queue: mpsc::Sender<Queued>,
+    refusals: Arc<Throttle>,
+    challenges: Arc<Throttle>,
+}
+
+impl Ingress {
+    /// Logs a request refused before verification.
+    fn refused(
+        &self,
+        binding: BindingRef,
+        kind: Kind,
+        status: StatusCode,
+        reason: &dyn fmt::Display,
+    ) {
+        let (kind, status) = (kind.as_str(), status.as_u16());
+        match self.refusals.record(Instant::now()) {
+            Some(quiet) => tracing::warn!(
+                %binding,
+                kind,
+                status,
+                %reason,
+                refused_since_last_warning = quiet,
+                "refused a Slack request"
+            ),
+            None => tracing::debug!(%binding, kind, status, %reason, "refused a Slack request"),
+        }
+    }
+
+    /// Logs an answered `url_verification` challenge.
+    fn challenged(&self, binding: BindingRef) {
+        match self.challenges.record(Instant::now()) {
+            Some(quiet) => tracing::info!(
+                %binding,
+                answered_since_last_info = quiet,
+                "answered Slack's url_verification challenge"
+            ),
+            None => tracing::debug!(%binding, "answered Slack's url_verification challenge"),
+        }
+    }
+}
+
+/// Lets through one event per interval and counts the rest.
+#[derive(Debug)]
+struct Throttle {
+    interval: Duration,
+    last: Mutex<Option<(Instant, u64)>>,
+}
+
+impl Throttle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Records an event at `now`. Returns how many events went quiet since
+    /// the last one let through if this one is let through, and `None` if
+    /// it should stay quiet.
+    fn record(&self, now: Instant) -> Option<u64> {
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((through, quiet)) = last.as_mut()
+            && now.saturating_duration_since(*through) < self.interval
+        {
+            *quiet += 1;
+            return None;
+        }
+        let quiet = last.map_or(0, |(_, quiet)| quiet);
+        *last = Some((now, 0));
+        Some(quiet)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,19 +349,33 @@ async fn handle(
     let Some(binding) = BindingRef::parse(segment) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let app = match ingress.secrets.lookup(binding).await {
-        Ok(Some(app)) => app,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => {
+    let deadline = tokio::time::Instant::now() + PRE_ACK_TIMEOUT;
+    let app = match tokio::time::timeout_at(deadline, ingress.secrets.lookup(binding)).await {
+        Ok(Ok(Some(app))) => app,
+        Ok(Ok(None)) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(err)) => {
             tracing::warn!(%binding, error = %err, "looking up a Slack binding failed");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        Err(_) => {
+            tracing::warn!(
+                %binding,
+                timeout_ms = PRE_ACK_TIMEOUT.as_millis(),
+                "looking up a Slack binding took too long"
+            );
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
-    let body = match read_body(body).await {
-        Ok(body) => body,
-        Err(status) => {
-            tracing::warn!(%binding, kind = kind.as_str(), status = status.as_u16(), "refused a Slack request body");
-            return status.into_response();
+    let body = match tokio::time::timeout_at(deadline, read_body(body)).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(refusal)) => {
+            ingress.refused(binding, kind, refusal.status(), &refusal);
+            return refusal.status().into_response();
+        }
+        Err(_) => {
+            let refusal = BodyRefusal::Slow;
+            ingress.refused(binding, kind, refusal.status(), &refusal);
+            return refusal.status().into_response();
         }
     };
     let received_at = OffsetDateTime::now_utc();
@@ -274,7 +385,7 @@ async fn handle(
     {
         return match challenge {
             Some(challenge) => {
-                tracing::info!(%binding, "answered Slack's url_verification challenge");
+                ingress.challenged(binding);
                 (
                     [
                         (CONTENT_TYPE, "text/plain; charset=utf-8"),
@@ -287,13 +398,22 @@ async fn handle(
             None => StatusCode::BAD_REQUEST.into_response(),
         };
     }
+    if kind == Kind::Commands && ssl_check(&body) {
+        tracing::debug!(%binding, "answered Slack's ssl_check");
+        return StatusCode::OK.into_response();
+    }
 
     let Some(secret) = app.signing_secret.as_ref() else {
-        tracing::warn!(%binding, kind = kind.as_str(), "refused a Slack request: the binding has no signing secret yet");
+        ingress.refused(
+            binding,
+            kind,
+            StatusCode::UNAUTHORIZED,
+            &"the binding has no signing secret yet",
+        );
         return StatusCode::UNAUTHORIZED.into_response();
     };
     if let Err(rejection) = verify::verify(secret, headers, &body, received_at.unix_timestamp()) {
-        tracing::warn!(%binding, kind = kind.as_str(), reason = %rejection, "refused a Slack request");
+        ingress.refused(binding, kind, StatusCode::UNAUTHORIZED, &rejection);
         return StatusCode::UNAUTHORIZED.into_response();
     }
     log_retry(binding, kind, headers);
@@ -329,7 +449,7 @@ async fn handle(
     match ingress.queue.try_send(queued) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(TrySendError::Full(_)) => {
-            tracing::warn!(%binding, kind = kind.as_str(), "the Slack queue is full; asking Slack to retry");
+            tracing::warn!(%binding, kind = kind.as_str(), "the Slack queue is full; refused a request");
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(TrySendError::Closed(_)) => {
@@ -339,15 +459,46 @@ async fn handle(
     }
 }
 
+/// Why a request body was refused before verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum BodyRefusal {
+    #[error("the body is larger than {MAX_BODY_BYTES} bytes")]
+    TooLarge,
+    #[error("the body could not be read")]
+    Unreadable,
+    #[error("the body did not arrive within the pre-ack timeout")]
+    Slow,
+}
+
+impl BodyRefusal {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Unreadable => StatusCode::BAD_REQUEST,
+            Self::Slow => StatusCode::REQUEST_TIMEOUT,
+        }
+    }
+}
+
 /// Reads the whole body, refusing more than [`MAX_BODY_BYTES`].
-async fn read_body(body: Body) -> Result<Bytes, StatusCode> {
+async fn read_body(body: Body) -> Result<Bytes, BodyRefusal> {
     match Limited::new(body, MAX_BODY_BYTES).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
-        Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => {
-            Err(StatusCode::PAYLOAD_TOO_LARGE)
-        }
-        Err(_) => Err(StatusCode::BAD_REQUEST),
+        Err(err) if err.downcast_ref::<LengthLimitError>().is_some() => Err(BodyRefusal::TooLarge),
+        Err(_) => Err(BodyRefusal::Unreadable),
     }
+}
+
+#[derive(Deserialize)]
+struct SslCheck {
+    ssl_check: Option<String>,
+}
+
+/// Whether the body is a form whose `ssl_check` is `1`: Slack's check of a
+/// slash command URL's certificate.
+fn ssl_check(body: &[u8]) -> bool {
+    serde_urlencoded::from_bytes::<SslCheck>(body)
+        .is_ok_and(|form| form.ssl_check.as_deref() == Some("1"))
 }
 
 #[derive(Deserialize)]
@@ -638,10 +789,6 @@ async fn process_event(
         event_id,
         event,
     } = callback;
-    if !first_time(dedup, &format!("slack:{binding}"), &event_id, binding).await {
-        tracing::debug!(%binding, event_id, "dropped a Slack event already handled");
-        return None;
-    }
     let team = team_id.filter(|team| !team.is_empty()).map(TeamId::from);
     let event_type = event
         .get("type")
@@ -650,6 +797,10 @@ async fn process_event(
         .to_owned();
     let event = Value::Object(event);
     if event_type != "message" {
+        if !first_time(dedup, &format!("slack:{binding}"), &event_id, binding).await {
+            tracing::debug!(%binding, event_id, "dropped a Slack event already handled");
+            return None;
+        }
         return Some(SlackInbound::Event(SlackEvent {
             binding: binding.id(),
             team,
@@ -691,6 +842,41 @@ async fn first_time(dedup: &dyn Dedup, source: &str, key: &str, binding: Binding
         Err(err) => {
             tracing::warn!(%binding, source, error = %err, "deduplicating a Slack request failed; dropping it");
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_throttle_lets_one_event_through_per_interval_and_counts_the_rest() {
+        let throttle = Throttle::new(Duration::from_secs(60));
+        let start = Instant::now();
+        assert_eq!(throttle.record(start), Some(0));
+        for seconds in [1, 30, 59] {
+            assert_eq!(throttle.record(start + Duration::from_secs(seconds)), None);
+        }
+        assert_eq!(throttle.record(start + Duration::from_secs(60)), Some(3));
+        assert_eq!(throttle.record(start + Duration::from_secs(61)), None);
+        assert_eq!(throttle.record(start + Duration::from_secs(200)), Some(1));
+        assert_eq!(throttle.record(start + Duration::from_secs(300)), Some(0));
+    }
+
+    #[test]
+    fn ssl_check_needs_exactly_one_ssl_check_of_1() {
+        assert!(ssl_check(b"ssl_check=1&token=x"));
+        assert!(ssl_check(b"token=x&ssl_check=1"));
+        for body in [
+            &b""[..],
+            b"ssl_check=0",
+            b"ssl_check=",
+            b"ssl_check=1&ssl_check=1",
+            b"{\"ssl_check\":\"1\"}",
+            b"team_id=T1&command=%2Fagent",
+        ] {
+            assert!(!ssl_check(body), "{}", String::from_utf8_lossy(body));
         }
     }
 }

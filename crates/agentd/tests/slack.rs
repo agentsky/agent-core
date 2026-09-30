@@ -3,8 +3,9 @@
 
 mod common;
 
-use std::net::SocketAddr;
-use std::time::Duration;
+use std::io::Write as _;
+use std::net::{SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
 
 use agentd::server::{Routers, Server, Worker, public_router};
 use agentd::{App, Config, slack};
@@ -208,4 +209,95 @@ async fn retries_are_dropped_through_the_store() {
         "the event id is not in processed_events"
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn only_kept_messages_reach_processed_events_and_only_by_channel_and_ts() {
+    let app = App::open(config(Some(SECRET))).await.unwrap();
+    let (tx, mut out) = mpsc::unbounded_channel();
+    let running = Running::start(app.clone(), routers_into(&app, tx)).await;
+
+    let events = "/slack/b/manager/events";
+    assert_eq!(
+        running.signed(events, fixtures::MESSAGE_PLAIN).await.status,
+        200
+    );
+    assert_eq!(
+        running.signed(events, fixtures::MESSAGE_IM).await.status,
+        200
+    );
+    let mut retry =
+        fixtures::signed_headers(SECRET, fixtures::now(), fixtures::MESSAGE_IM.as_bytes()).to_vec();
+    retry.push(("x-slack-retry-num", "1".to_owned()));
+    assert_eq!(
+        running
+            .post(events, retry, fixtures::MESSAGE_IM)
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        running
+            .signed("/slack/b/manager/commands", fixtures::SLASH_COMMAND)
+            .await
+            .status,
+        200
+    );
+    match next(&mut out).await {
+        SlackInbound::Message(message) => assert_eq!(message.event_id, "Ev0IM000001"),
+        other => panic!("expected the DM, got {other:?}"),
+    }
+    assert!(
+        matches!(next(&mut out).await, SlackInbound::Command(_)),
+        "the unaddressed message or the retried DM was delivered"
+    );
+
+    let now = OffsetDateTime::now_utc();
+    let store = app.store();
+    for (source, key) in [
+        ("slack:manager", "Ev0PLAIN001"),
+        ("slack:manager", "Ev0IM000001"),
+        ("slack:manager:message", "C0CHAN001:1727697610.000200"),
+    ] {
+        assert!(
+            store.mark_event_processed(source, key, now).await.unwrap(),
+            "{source} {key} is in processed_events"
+        );
+    }
+    assert!(
+        !store
+            .mark_event_processed("slack:manager:message", "D0DM00001:1727697900.000500", now)
+            .await
+            .unwrap(),
+        "the DM is not in processed_events"
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_stalled_body_does_not_hold_up_shutdown() {
+    let app = App::open(config(Some(SECRET))).await.unwrap();
+    let running = Running::start(app.clone(), Routers::new(&app)).await;
+    let addr = running.public;
+    let client = tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(
+                b"POST /slack/b/manager/events HTTP/1.1\r\nHost: agentd\r\n\
+                  Content-Length: 1000\r\n\r\n{\"type\":",
+            )
+            .unwrap();
+        common::read_response(&mut stream)
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let begun = Instant::now();
+    running.stop().await;
+    let took = begun.elapsed();
+    assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+    let response = client.await.unwrap().expect("no response");
+    assert_eq!(response.status, 408);
 }

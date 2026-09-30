@@ -28,5 +28,6 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 testkit.workspace = true
 tower = { workspace = true, features = ["util"] }
