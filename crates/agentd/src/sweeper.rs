@@ -1,4 +1,5 @@
-//! The background sweeper: deletes expired rows from the store every
+//! The background sweeper: deletes expired rows from the store, and skills
+//! that waited too long for their hosts to be confirmed, every
 //! [`SWEEP_INTERVAL`].
 
 use std::time::Duration;
@@ -8,14 +9,21 @@ use time::OffsetDateTime;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
+use crate::skills::Skills;
+
 /// How often the sweeper runs.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Calls [`Store::sweep_expired`] now and then every `every`, until
-/// `shutdown` becomes true or its sender is dropped. A sweep in progress
-/// finishes before it returns. A failed sweep is logged and retried at the
-/// next tick.
-pub async fn run(store: Store, every: Duration, mut shutdown: watch::Receiver<bool>) {
+/// Calls [`Store::sweep_expired`] and [`Skills::drop_expired`] now and
+/// then every `every`, until `shutdown` becomes true or its sender is
+/// dropped. A sweep in progress finishes before it returns. A failed sweep
+/// is logged and retried at the next tick.
+pub async fn run(
+    store: Store,
+    skills: Skills,
+    every: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut ticks = tokio::time::interval(every);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -27,12 +35,12 @@ pub async fn run(store: Store, every: Duration, mut shutdown: watch::Receiver<bo
         if stop {
             break;
         }
-        sweep_once(&store).await;
+        sweep_once(&store, &skills).await;
     }
 }
 
 /// Runs one sweep, logging what it deleted or why it failed.
-pub async fn sweep_once(store: &Store) {
+pub async fn sweep_once(store: &Store, skills: &Skills) {
     match store.sweep_expired(OffsetDateTime::now_utc()).await {
         Ok(swept) if swept == store::Swept::default() => {}
         Ok(swept) => tracing::debug!(
@@ -42,6 +50,9 @@ pub async fn sweep_once(store: &Store) {
         ),
         Err(err) => tracing::warn!(error = %err, "sweeping expired rows failed"),
     }
+    if let Err(err) = skills.drop_expired().await {
+        tracing::warn!(error = %err, "dropping expired pending skills failed");
+    }
 }
 
 #[cfg(test)]
@@ -50,8 +61,14 @@ mod tests {
     use secrecy::SecretString;
 
     use super::*;
+    use crate::skills::Git;
     use crate::telemetry::tests::Captured;
     use crate::telemetry::{LogFormat, subscriber};
+
+    fn skills(store: &Store) -> Skills {
+        let git = Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+        Skills::new(store.clone(), "/nonexistent/agentd".into(), git)
+    }
 
     async fn store_with_expired_login() -> Store {
         let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
@@ -84,7 +101,12 @@ mod tests {
     async fn sweeps_at_start_and_on_every_tick_until_shutdown() {
         let store = store_with_expired_login().await;
         let (stop, shutdown) = watch::channel(false);
-        let task = tokio::spawn(run(store.clone(), Duration::from_millis(20), shutdown));
+        let task = tokio::spawn(run(
+            store.clone(),
+            skills(&store),
+            Duration::from_millis(20),
+            shutdown,
+        ));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while store.take_pending_login("state").await.unwrap().is_some() {
@@ -102,7 +124,7 @@ mod tests {
     async fn stops_when_the_sender_is_dropped() {
         let store = store_with_expired_login().await;
         let (stop, shutdown) = watch::channel(false);
-        let task = tokio::spawn(run(store, SWEEP_INTERVAL, shutdown));
+        let task = tokio::spawn(run(store.clone(), skills(&store), SWEEP_INTERVAL, shutdown));
         drop(stop);
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -121,23 +143,28 @@ mod tests {
         );
         let _guard = tracing::subscriber::set_default(logs);
 
-        sweep_once(&store).await;
-        sweep_once(&store).await;
+        let skills = skills(&store);
+        sweep_once(&store, &skills).await;
+        sweep_once(&store, &skills).await;
         store.close().await;
-        sweep_once(&store).await;
+        sweep_once(&store, &skills).await;
 
         let out = captured.text();
         let lines: Vec<serde_json::Value> = out
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines.len(), 3, "{out}");
         assert_eq!(lines[0]["fields"]["message"], "swept expired rows");
         assert_eq!(lines[0]["fields"]["pending_logins"], 1);
         assert_eq!(
             lines[1]["fields"]["message"],
             "sweeping expired rows failed"
         );
-        assert_eq!(lines[1]["level"], "WARN");
+        assert_eq!(
+            lines[2]["fields"]["message"],
+            "dropping expired pending skills failed"
+        );
+        assert!(lines[1..].iter().all(|line| line["level"] == "WARN"));
     }
 }

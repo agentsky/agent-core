@@ -116,8 +116,10 @@ macro_rules! columns {
 
 impl Store {
     /// Records `skill` in `state`, replacing the agent's skill of that name
-    /// in that state. Recording an active skill also drops a pending one of
-    /// the same name, which it supersedes.
+    /// in that state, unless the agent already has `max_skills` skills of
+    /// other names, pending or active. Recording an active skill also drops
+    /// a pending one of the same name, which it supersedes. Returns whether
+    /// it recorded the skill.
     ///
     /// # Errors
     ///
@@ -127,8 +129,9 @@ impl Store {
         &self,
         skill: &NewSkill<'_>,
         state: SkillState,
+        max_skills: usize,
         now: OffsetDateTime,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if skill.hosts.iter().any(|host| host.contains(['\n', '\r'])) {
             return Err(StoreError::Database(sqlx::Error::Protocol(
                 "a skill's host holds a line break".into(),
@@ -136,6 +139,16 @@ impl Store {
         }
         let agent = skill.agent.to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let others: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT name) FROM agent_skills WHERE agent_id = ? AND name <> ?",
+        )
+        .bind(&agent)
+        .bind(skill.name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if usize::try_from(others).unwrap_or(usize::MAX) >= max_skills {
+            return Ok(false);
+        }
         if state == SkillState::Active {
             sqlx::query("DELETE FROM agent_skills WHERE agent_id = ? AND name = ?")
                 .bind(&agent)
@@ -159,7 +172,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Makes the agent's pending skill `name` active, replacing its active
@@ -355,11 +368,21 @@ mod tests {
         let none: Vec<String> = Vec::new();
         let hosts = vec!["api.github.com".to_owned(), "*.example.org:8443".to_owned()];
         store
-            .put_skill(&skill(a, "gh", &none, owner), SkillState::Active, at(10))
+            .put_skill(
+                &skill(a, "gh", &none, owner),
+                SkillState::Active,
+                32,
+                at(10),
+            )
             .await
             .unwrap();
         store
-            .put_skill(&skill(a, "gh", &hosts, owner), SkillState::Pending, at(20))
+            .put_skill(
+                &skill(a, "gh", &hosts, owner),
+                SkillState::Pending,
+                32,
+                at(20),
+            )
             .await
             .unwrap();
         let rows = store.agent_skills(a).await.unwrap();
@@ -391,11 +414,16 @@ mod tests {
         let a = agent(&store, owner, "helper").await;
         let hosts = vec!["api.github.com".to_owned()];
         store
-            .put_skill(&skill(a, "gh", &hosts, owner), SkillState::Pending, at(10))
+            .put_skill(
+                &skill(a, "gh", &hosts, owner),
+                SkillState::Pending,
+                32,
+                at(10),
+            )
             .await
             .unwrap();
         store
-            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, at(11))
+            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, 32, at(11))
             .await
             .unwrap();
         let rows = store.agent_skills(a).await.unwrap();
@@ -419,23 +447,29 @@ mod tests {
         let pypi = vec!["pypi.org".to_owned(), "api.github.com".to_owned()];
         let secret = vec!["secret.example".to_owned()];
         store
-            .put_skill(&skill(a, "gh", &gh, owner), SkillState::Active, at(1))
+            .put_skill(&skill(a, "gh", &gh, owner), SkillState::Active, 32, at(1))
             .await
             .unwrap();
         store
-            .put_skill(&skill(a, "py", &pypi, owner), SkillState::Active, at(1))
+            .put_skill(&skill(a, "py", &pypi, owner), SkillState::Active, 32, at(1))
             .await
             .unwrap();
         store
             .put_skill(
                 &skill(a, "wait", &secret, owner),
                 SkillState::Pending,
+                32,
                 at(1),
             )
             .await
             .unwrap();
         store
-            .put_skill(&skill(b, "b", &secret, owner), SkillState::Active, at(1))
+            .put_skill(
+                &skill(b, "b", &secret, owner),
+                SkillState::Active,
+                32,
+                at(1),
+            )
             .await
             .unwrap();
         let thread = ThreadKey {
@@ -483,17 +517,23 @@ mod tests {
         let a = agent(&store, owner, "helper").await;
         let hosts = vec!["api.github.com".to_owned()];
         store
-            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, at(1))
+            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, 32, at(1))
             .await
             .unwrap();
         store
-            .put_skill(&skill(a, "gh", &hosts, owner), SkillState::Pending, at(5))
+            .put_skill(
+                &skill(a, "gh", &hosts, owner),
+                SkillState::Pending,
+                32,
+                at(5),
+            )
             .await
             .unwrap();
         store
             .put_skill(
                 &skill(a, "late", &hosts, owner),
                 SkillState::Pending,
+                32,
                 at(50),
             )
             .await
@@ -525,6 +565,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_agent_has_at_most_max_skills_by_name() {
+        let store = memory_store().await;
+        let owner = store
+            .ensure_member(&member_key("o"), "o", at(1))
+            .await
+            .unwrap();
+        let a = agent(&store, owner, "helper").await;
+        let hosts = ["api.github.com".to_owned()];
+        for (name, hosts, state) in [
+            ("one", &[][..], SkillState::Active),
+            ("two", &hosts[..], SkillState::Pending),
+            ("one", &hosts[..], SkillState::Pending),
+            ("two", &[][..], SkillState::Active),
+        ] {
+            assert!(
+                store
+                    .put_skill(&skill(a, name, hosts, owner), state, 2, at(1))
+                    .await
+                    .unwrap(),
+                "{name} {state:?}"
+            );
+        }
+        assert!(
+            !store
+                .put_skill(&skill(a, "three", &[], owner), SkillState::Active, 2, at(1))
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.agent_skills(a).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn a_host_with_a_line_break_is_refused() {
         let store = memory_store().await;
         let owner = store
@@ -535,7 +607,7 @@ mod tests {
         let hosts = vec!["a.example\nb.example".to_owned()];
         assert!(
             store
-                .put_skill(&skill(a, "x", &hosts, owner), SkillState::Active, at(1))
+                .put_skill(&skill(a, "x", &hosts, owner), SkillState::Active, 32, at(1))
                 .await
                 .is_err()
         );

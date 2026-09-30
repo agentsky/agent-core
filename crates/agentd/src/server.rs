@@ -332,9 +332,10 @@ impl Server {
             });
         }
         let store = app.store().clone();
+        let skills = app.skills().clone();
         let sweeping = stopping.clone();
         tasks.spawn(async move {
-            sweeper::run(store, SWEEP_INTERVAL, sweeping).await;
+            sweeper::run(store, skills, SWEEP_INTERVAL, sweeping).await;
             "sweeper"
         });
         let notifier = RelinkNotifier::new(app.store().clone(), app.commands().replies().clone());

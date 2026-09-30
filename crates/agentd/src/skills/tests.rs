@@ -338,7 +338,7 @@ async fn adding_a_skill_again_replaces_it() {
 #[tokio::test]
 async fn declared_hosts_wait_for_confirmation_then_extend_the_allowlist() {
     let h = harness().await;
-    let text = skill_md("gh", &["api.github.com", "*.githubusercontent.com"]);
+    let text = skill_md("gh", &["api.github.com", "raw.githubusercontent.com"]);
     let Added::Pending(manifest) = h.upload("SKILL.md", &text).await.unwrap() else {
         panic!()
     };
@@ -354,12 +354,12 @@ async fn declared_hosts_wait_for_confirmation_then_extend_the_allowlist() {
     let Confirmed::Active(row) = h.skills.confirm(h.agent, "gh").await.unwrap() else {
         panic!()
     };
-    assert_eq!(row.hosts, ["api.github.com", "*.githubusercontent.com"]);
+    assert_eq!(row.hosts, ["api.github.com", "raw.githubusercontent.com"]);
     assert!(h.live("gh").join("SKILL.md").is_file());
     assert!(!h.pending("gh").exists());
     assert_eq!(
         h.hosts().await,
-        ["*.githubusercontent.com", "api.github.com"]
+        ["api.github.com", "raw.githubusercontent.com"]
     );
     assert_eq!(
         h.skills.confirm(h.agent, "gh").await.unwrap(),
@@ -394,6 +394,7 @@ async fn a_confirmation_after_the_wait_finds_it_expired() {
                 added_by: h.owner,
             },
             SkillState::Pending,
+            MAX_SKILLS,
             old,
         )
         .await
@@ -439,23 +440,175 @@ async fn an_agent_has_at_most_max_skills() {
     );
 }
 
+impl Harness {
+    /// Records `name` as a pending skill added longer ago than
+    /// [`PENDING_TTL`], with files waiting.
+    async fn expired(&self, name: &str) {
+        self.upload("SKILL.md", &skill_md(name, &["api.github.com"]))
+            .await
+            .unwrap();
+        let hosts = vec!["api.github.com".to_owned()];
+        let old = OffsetDateTime::now_utc() - PENDING_TTL - time::Duration::minutes(1);
+        let new = NewSkill {
+            agent: self.agent,
+            name,
+            source: "upload:SKILL.md",
+            hosts: &hosts,
+            added_by: self.owner,
+        };
+        self.store
+            .put_skill(&new, SkillState::Pending, MAX_SKILLS, old)
+            .await
+            .unwrap();
+    }
+
+    /// Puts a file where the agent's skills directory goes, so moving a
+    /// skill into it fails.
+    fn block_live(&self) -> PathBuf {
+        let dir = runner::skills_dir(&self.data, self.agent);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        std::fs::write(&dir, "in the way").unwrap();
+        dir
+    }
+}
+
 #[tokio::test]
-async fn startup_clears_work_expired_and_unrecorded_pending_skills() {
+async fn expired_pending_skills_are_dropped_with_their_files() {
+    let h = harness().await;
+    h.expired("old").await;
+    h.upload("SKILL.md", &skill_md("new", &["api.github.com"]))
+        .await
+        .unwrap();
+    h.skills.drop_expired().await.unwrap();
+    assert!(!h.pending("old").exists());
+    assert!(h.pending("new").join("SKILL.md").is_file());
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["new"]
+    );
+}
+
+#[tokio::test]
+async fn startup_clears_work_expired_and_unrecorded_skills() {
     let h = harness().await;
     h.upload("SKILL.md", &skill_md("keep", &["api.github.com"]))
         .await
         .unwrap();
+    h.upload("SKILL.md", &skill_md("live", &[])).await.unwrap();
+    h.expired("old").await;
+    write_bundled(&h.data, h.agent).await.unwrap();
     let stray_work = h.data.join(WORK_DIR).join("left-over");
     std::fs::create_dir_all(&stray_work).unwrap();
     let stray_pending = h.pending("nobody");
     std::fs::create_dir_all(&stray_pending).unwrap();
     let stray_agent = h.data.join(PENDING_DIR).join("not-an-agent");
     std::fs::create_dir_all(&stray_agent).unwrap();
+    let stray_live = h.live("removed");
+    std::fs::create_dir_all(&stray_live).unwrap();
+    let strays = [&stray_work, &stray_pending, &stray_agent, &stray_live];
+
     h.skills.purge().await.unwrap();
-    assert!(!stray_work.exists());
-    assert!(!stray_pending.exists());
-    assert!(!stray_agent.exists());
+    assert!(!h.pending("old").exists(), "expired skills go at once");
+    for stray in strays {
+        assert!(
+            stray.exists(),
+            "{} is too recent to be left over",
+            stray.display()
+        );
+    }
+
+    h.skills.purge_older_than(Duration::ZERO).await.unwrap();
+    for stray in strays {
+        assert!(!stray.exists(), "{}", stray.display());
+    }
     assert!(h.pending("keep").join("SKILL.md").is_file());
+    assert!(h.live("live").join("SKILL.md").is_file());
+    assert!(h.live(BUNDLED_NAME).join("SKILL.md").is_file());
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["keep", "live"]
+    );
+}
+
+#[tokio::test]
+async fn replacing_a_skill_takes_its_hosts_away_even_if_its_files_cant_move() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    h.skills.confirm(h.agent, "gh").await.unwrap();
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+    h.block_live();
+    assert!(
+        h.skills
+            .add(
+                h.agent,
+                Source::Upload {
+                    name: "SKILL.md",
+                    bytes: skill_md("gh", &[]).as_bytes(),
+                },
+                h.owner,
+            )
+            .await
+            .is_err()
+    );
+    assert!(h.hosts().await.is_empty());
+    assert!(h.work_is_empty());
+}
+
+#[tokio::test]
+async fn a_confirmation_whose_files_cant_move_leaves_the_skill_waiting() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    let blocked = h.block_live();
+    assert!(h.skills.confirm(h.agent, "gh").await.is_err());
+    assert!(h.hosts().await.is_empty());
+    assert!(h.pending("gh").join("SKILL.md").is_file());
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_eq!(rows[0].state, SkillState::Pending);
+
+    std::fs::remove_file(blocked).unwrap();
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn a_failed_replacement_puts_the_old_skill_back() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("notes", &[])).await.unwrap();
+    let work = h.data.join(WORK_DIR).join("w");
+    std::fs::create_dir_all(&work).unwrap();
+    let missing = h.data.join("missing");
+    assert!(move_into(&missing, &h.live("notes"), &work).await.is_err());
+    assert!(h.live("notes").join("SKILL.md").is_file());
+}
+
+#[tokio::test]
+async fn a_clone_of_a_highly_compressible_blob_stops_at_the_cap() {
+    let h = harness().await;
+    let blob = "0".repeat(8 * 1024 * 1024);
+    repo(
+        &h.repos,
+        "big.git",
+        &[("SKILL.md", &skill_md("big", &[])), ("blob", &blob)],
+    );
+    let git = Git::new(EgressPolicy::new(Vec::new(), Vec::new()))
+        .with_limits(Path::new("git"), git::CLONE_TIMEOUT, 1024 * 1024)
+        .serving_prefix_from_directory_for_tests(PREFIX, &h.repos);
+    let dest = h.data.join("clone/src");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    assert_eq!(
+        git.clone_into("https://git.test/big.git", &dest).await,
+        Err(CloneError::TooLarge)
+    );
 }
 
 #[tokio::test]
