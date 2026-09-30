@@ -44,6 +44,7 @@ dependencies = [
  "auth",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "clap",
  "commands",
  "core-types",
@@ -2496,6 +2497,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

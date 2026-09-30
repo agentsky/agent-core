@@ -50,6 +50,8 @@ use serde_path_to_error::Segment;
 use store::Sealer;
 use tracing_subscriber::EnvFilter;
 
+use crate::agents::DEFAULT_MAX_PER_OWNER;
+
 /// The master key for encryption at rest: 32 bytes, standard base64, as
 /// `agentd gen-key` prints it. Required.
 pub const MASTER_KEY_VAR: &str = "AGENTD_MASTER_KEY";
@@ -98,6 +100,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// `[proxy]`: what sandboxes may reach through the egress proxy.
     pub proxy: ProxyConfig,
+    /// `[agents]`: caps on members' agents.
+    pub agents: AgentsConfig,
     /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
     /// accounts. Every key has a default, so the section is optional.
     pub claude_oauth: OAuthConfig,
@@ -122,6 +126,8 @@ struct File {
     limits: LimitsConfig,
     #[serde(default)]
     proxy: ProxyConfig,
+    #[serde(default)]
+    agents: AgentsConfig,
     #[serde(default)]
     claude_oauth: OAuthConfig,
     rocketchat: Option<RocketChatConfig>,
@@ -206,6 +212,10 @@ pub struct RocketChatConfig {
     /// The manager bot's user `_id`, whose personal access token is
     /// `AGENTD_RC_MANAGER_TOKEN`.
     pub manager_user_id: String,
+    /// An `https://` (or `http://`) image URL each new agent's bot sets as
+    /// its avatar. Without it, bots keep Rocket.Chat's default avatar.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 /// `[limits]`. Every key has a default, so the section is optional.
@@ -252,6 +262,24 @@ impl Default for ProxyConfig {
             allow: Vec::new(),
             max_tunnels: limits.max_tunnels,
             max_session_tunnels: limits.max_session_tunnels,
+        }
+    }
+}
+
+/// `[agents]`. Every key has a default, so the section is optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct AgentsConfig {
+    /// `max_per_owner`: how many agents that aren't deleted one member may
+    /// have. `create` refuses more.
+    pub max_per_owner: u32,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            max_per_owner: DEFAULT_MAX_PER_OWNER,
         }
     }
 }
@@ -374,6 +402,7 @@ impl Config {
             store: file.store,
             limits: file.limits,
             proxy: file.proxy,
+            agents: file.agents,
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
             secrets,
@@ -572,6 +601,9 @@ impl File {
             ));
         }
         egress_policy(&self.proxy, &self.server, &self.internal)?;
+        if self.agents.max_per_owner == 0 {
+            return Err(invalid("agents.max_per_owner", "must be at least 1"));
+        }
         self.claude_oauth
             .validate()
             .map_err(|err| invalid(format!("claude_oauth.{}", err.key), err.reason))?;
@@ -596,6 +628,14 @@ impl RocketChatConfig {
             return Err(invalid(
                 "rocketchat.websocket_url",
                 "must be a ws:// or wss:// URL",
+            ));
+        }
+        if let Some(url) = &self.avatar_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(invalid(
+                "rocketchat.avatar_url",
+                "must be an http:// or https:// URL",
             ));
         }
         for (key, value) in [
@@ -834,6 +874,7 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(config.store.url, "sqlite::memory:");
         assert_eq!(config.store.data_dir, Path::new("/nonexistent/agentd"));
         assert_eq!(config.limits.attach_max_bytes, 50 * 1024 * 1024);
+        assert_eq!(config.agents.max_per_owner, 10);
         assert!(config.secrets.rc_manager_token.is_none());
         assert!(config.secrets.slack_manager.is_empty());
         assert!(config.unknown_env.is_empty());
@@ -992,6 +1033,20 @@ manager_user_id = "manager-id"
         assert_eq!(rocketchat.websocket_url, None);
         assert_eq!(rocketchat.team, "chat.example.com");
         assert_eq!(rocketchat.manager_user_id, "manager-id");
+        assert_eq!(rocketchat.avatar_url, None);
+        let text = format!(
+            "{MINIMAL}{}",
+            ROCKETCHAT.replacen(
+                "team =",
+                "avatar_url = \"https://img.example/a.png\"\nteam =",
+                1
+            )
+        );
+        let config = with(&text, with_rc_token()).unwrap();
+        assert_eq!(
+            config.rocketchat.unwrap().avatar_url.as_deref(),
+            Some("https://img.example/a.png")
+        );
     }
 
     #[test]
@@ -1022,6 +1077,11 @@ manager_user_id = "manager-id"
                 "team =",
                 "websocket_url = \"https://chat.example.com/websocket\"\nteam =",
                 "rocketchat.websocket_url",
+            ),
+            (
+                "team =",
+                "avatar_url = \"file:///etc/passwd\"\nteam =",
+                "rocketchat.avatar_url",
             ),
         ] {
             let text = format!("{MINIMAL}{}", ROCKETCHAT.replacen(from, to, 1));
@@ -1354,6 +1414,14 @@ manager_user_id = "manager-id"
         assert_eq!(with(&text, env()).unwrap().limits.attach_max_bytes, 1024);
         let err = file_err(&format!("{MINIMAL}\n[limits]\nattach_max_bytes = 0\n"));
         assert_eq!(err.key(), Some("limits.attach_max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_agent_limit_is_configurable_and_positive() {
+        let text = format!("{MINIMAL}\n[agents]\nmax_per_owner = 3\n");
+        assert_eq!(with(&text, env()).unwrap().agents.max_per_owner, 3);
+        let err = file_err(&format!("{MINIMAL}\n[agents]\nmax_per_owner = 0\n"));
+        assert_eq!(err.key(), Some("agents.max_per_owner"), "{err}");
     }
 
     #[test]

@@ -111,11 +111,13 @@ agentd makes, and give agentd that instead.
    | `create-user` | `/agent create` |
    | `view-full-other-user-info` | telling bots from people ([impl-notes](../../docs/impl-notes.md#messages-dont-carry-the-senders-roles)) |
    | `edit-other-user-active-status` | `/agent delete` |
-   | `edit-other-user-info` | renaming a bot |
-   | `edit-other-user-avatar` | setting a bot's avatar |
-   | `add-user-to-joined-room` | inviting a bot where the manager is a member |
+   | `add-user-to-joined-room` | `!agent create` in a room, which adds the bot there |
    | `api-bypass-rate-limit` | the manager's own REST calls |
    | `create-personal-access-tokens` | the manager's own token |
+
+   A new bot sets its avatar itself, so the manager needs no
+   `edit-other-user-avatar`
+   ([impl-notes](../../docs/impl-notes.md#a-bot-sets-its-own-avatar)).
 
    Creating a role is an Enterprise feature: `roles.create` needs the
    `custom-roles` license module
@@ -191,7 +193,10 @@ what was run and what was seen, with tokens and ids redacted.
   Update the Rocket.Chat section of `docs/design.md` with the result.
 - **T14, agent lifecycle.** Create two agents by DMing the manager bot
   `create <name>`, invite both to a channel, mention each, and record that
-  each mention arrives at its own bot.
+  each mention arrives at its own bot: until turns exist (T23), the bot
+  reacts with :eyes:. Then `pause` one and check it no longer reacts,
+  `delete` it and check its user is deactivated, and restart agentd and
+  check the other still reacts.
 - **T23, turn pipeline.** With a linked Claude account (`login` in a DM to
   the manager bot), mention an agent in a channel, run a turn that uses Bash
   and returns a file, `docker compose restart agentd`, and continue the
