@@ -13,11 +13,11 @@ use core_types::{
 use secrecy::SecretString;
 use serde_json::json;
 use store::{NewClaudeLink, Sealer, Store};
-use testkit::{MockSurface, Op};
+use testkit::{Held, MockSurface, Op};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use wiremock::matchers::{body_partial_json, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 use super::relink::{
     RELINK_BACKOFF_INITIAL, RELINK_BACKOFF_MAX, RELINK_LEASE, RELINK_MAX_ATTEMPTS, RelinkNotifier,
@@ -255,7 +255,16 @@ fn state_of(reply: &str) -> String {
         .to_owned()
 }
 
-async fn mount_exchange(oauth: &MockServer, state: &str, delay: Duration) {
+fn exchanged() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "token_type": "Bearer",
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+        "expires_in": 28800,
+    }))
+}
+
+async fn mount_exchange(oauth: &MockServer, state: &str, exchange: impl Respond + 'static) {
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
         .and(body_partial_json(json!({
@@ -263,16 +272,7 @@ async fn mount_exchange(oauth: &MockServer, state: &str, delay: Duration) {
             "code": CODE,
             "state": state,
         })))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({
-                    "token_type": "Bearer",
-                    "access_token": "new-access",
-                    "refresh_token": "new-refresh",
-                    "expires_in": 28800,
-                }))
-                .set_delay(delay),
-        )
+        .respond_with(exchange)
         .expect(1)
         .mount(oauth)
         .await;
@@ -301,7 +301,7 @@ async fn full_login_flow_from_a_dm_links_the_account_without_logging_the_code() 
     );
     assert!(started.contains("`login <code>`"), "{started}");
     let state = state_of(&started);
-    mount_exchange(&h.oauth, &state, Duration::ZERO).await;
+    mount_exchange(&h.oauth, &state, exchanged()).await;
 
     let pasted = format!("login {CODE}#{state}");
     h.mock
@@ -332,7 +332,8 @@ async fn one_members_commands_run_in_order_without_holding_up_others() {
     let h = harness().await;
     h.dm("alice", "login").await;
     let state = state_of(&h.last_reply("alice"));
-    mount_exchange(&h.oauth, &state, Duration::from_millis(300)).await;
+    let (held, mut hold) = Held::new(exchanged());
+    mount_exchange(&h.oauth, &state, held).await;
     let (_stop, stopping) = watch::channel(false);
     let task = serve(&h, stopping);
     let dm = dm_room("alice");
@@ -342,6 +343,9 @@ async fn one_members_commands_run_in_order_without_holding_up_others() {
     h.mock
         .inject(h.event("bob", ConvKind::Dm, &dm_room("bob"), "me"));
     h.mock.close_events(h.manager.id);
+    hold.arrived().await;
+    h.wait_for_replies("bob", 1).await;
+    hold.release();
     task.await.unwrap().unwrap();
 
     let texts: Vec<String> = h.mock.posts().into_iter().map(|(_, text)| text).collect();
