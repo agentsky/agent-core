@@ -1841,9 +1841,14 @@ store's signature and contract, and `RocketChatSurface::new` takes an
 `Arc<dyn Dedup>`. agentd implements it with a one-line call to the store;
 `DEDUP_SOURCE` is `"rocketchat"`. The tests use a real in-memory `Store`
 (a dev-dependency) behind it. A copy is recorded only after it was
-normalized, and a failure to read the room or the sender's roles, or to
-record, skips that copy without recording it, so another bot's connection can
-still deliver the message. A copy recorded when the event receiver has just
+normalized, and a failure to read the room or to record skips that copy
+without recording it, so another bot's connection can still deliver the
+message. A failure to read the sender's roles doesn't skip it: every surface
+shares one `BotRoles`, so every connection would fail alike and the message
+would be lost everywhere. The sender then counts as a person, with a warning
+logged, as history already did; the router looks every sender up as a
+managed agent whatever `sender_is_bot` says, so a managed agent's post still
+takes the agent path. A copy recorded when the event receiver has just
 closed is lost, which only happens at shutdown.
 
 ### Messages don't carry the sender's roles
@@ -1867,6 +1872,15 @@ sender is a bot when the message has a non-false `bot` field or the sender has
 the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
 only to the user itself and to the manager.
 
+Without the permission, `users.info` leaves `roles` out rather than
+failing, which would have classified every bot as a person without a word.
+Every Rocket.Chat user has at least one role, so `BotRoles::is_bot` treats
+an empty or missing list as `SurfaceError::Forbidden`, naming the missing
+permission and the manager's user id (never the token), and doesn't cache
+it. Messages still flow, as above, and each one logs the error, so a
+misconfigured manager is loud until it is fixed. The cache keeps at most
+10,000 users: making room drops expired entries, then the oldest.
+
 ### Room lists and room kinds come from REST
 
 **Issue.** Nothing in the realtime API lists the rooms a user is in without
@@ -1876,7 +1890,8 @@ can't tell a DM from a group DM.
 **Solution.** Each connection lists rooms with REST `subscriptions.get`, and
 the surface reads a room's `t`, `usersCount` and `uids` with `rooms.info` the
 first time a message arrives from it, then keeps it for the surface's
-lifetime (a DM's members are fixed). `RestClient` gains `subscriptions`,
+lifetime (a DM's members are fixed), for at most 10,000 rooms, dropping the
+oldest beyond that. `RestClient` gains `subscriptions`,
 `file_url` (`<base>/file-upload/<id>/<name>`, for `InFile::url`) and
 `credentials` (the realtime login reuses the token), and `FakeRest` answers
 `subscriptions.get`. Only channels, private groups and DMs are listened to:
@@ -1929,12 +1944,21 @@ answers for another user id also ends it.
 - A stream subscription is `sub` with `params: [event, false]`; the second
   parameter turns off collection compatibility. A refused one gets `nosub`
   with `error: "not-allowed"`. A refused room is dropped and the connection
-  stays up; a refused `subscriptions-changed` reconnects.
+  stays up; a refused `subscriptions-changed` reconnects. The refused room
+  is remembered until an `inserted` notice for it or the next connection,
+  since `updated` notices would otherwise ask for it again on every unread
+  change.
 - `subscriptions-changed` carries `[action, subscription]`. `updated` fires
   on every unread-count change, so subscribing is idempotent. `removed` may
-  lack `rid`. The server also stops a room's message subscription itself when
-  the user is removed, without telling the client, and the client sends
-  `unsub` anyway.
+  lack `rid`, so each connection keeps the subscription document `_id` of
+  each room, from `subscriptions.get` (`Subscription` gains `id`) and from
+  `inserted` and `updated` notices, and resolves such a removal through it.
+  The server also stops a room's message subscription itself when the user
+  is removed, without telling the client, and the client sends `unsub`
+  anyway. Because of that, `inserted` is authoritative: for a room already
+  subscribed, the client sends `unsub` for the old subscription and
+  subscribes again, so a removal it couldn't resolve doesn't leave the bot
+  deaf after it is added back.
 
 ### Reconnecting lists the rooms again instead of remembering them
 
@@ -1947,6 +1971,34 @@ lets any user with `view-c-room` read a public channel's messages
 then, plus what `subscriptions-changed` adds, which also covers rooms joined
 while disconnected. Messages posted while a bot had no connection are not
 fetched; [Deferred work](tasks-plan.md#deferred-work) has a bullet for it.
+
+### Changes that arrive while the rooms are listed
+
+**Issue.** `subscriptions.get` runs after the `subscriptions-changed`
+subscription is ready, so a notice can arrive while the listing is in
+flight. Applied at once, a removal found nothing to unsubscribe, and the
+listing, possibly read before the removal, then subscribed to the room
+anyway.
+
+**Solution.** Notices that arrive during the listing are kept, then applied
+in order to the listed rooms before anything is subscribed: a removal takes
+its room out (resolving a missing `rid` through the listing's document ids),
+and `inserted` or `updated` puts it in. A notice about a change the listing
+already reflects changes nothing.
+
+### The backoff starts over only after a healthy connection
+
+**Issue.** The backoff reset as soon as a connection had logged in and
+subscribed, so a server that accepted and subscribed and then dropped the
+socket, or refused `subscriptions-changed` right after, was reconnected at
+the initial wait forever.
+
+**Solution.** The backoff resets only when a connection stays up for the
+longer of `backoff_max` and twice `heartbeat` (60 s by default). That is
+long enough that reconnecting at once costs no more than waiting the
+longest backoff, and longer than it takes to notice a silent server, which
+is declared dead after twice `heartbeat`. A connection that drops sooner
+counts as a failed attempt and the next wait doubles.
 
 ### Normalizing runs off the socket
 
@@ -2082,29 +2134,74 @@ closed port.
 `now + ttl` really lasts between `ttl - 1` and `ttl` seconds, and a
 one-second lease can end almost at once.
 
-**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`) and agentctl
-renews it when a third of the remaining time has passed, at least every
-200 ms. A `ttl` below one second counts as one. Tests that renew use a
-3-second lease.
+**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`). agentctl
+relies on it only until one second before its expiry, since another command
+may take the lock at the expiry itself, and renews it when a third of that
+remaining time has passed, at least every 200 ms. A `ttl` below one second
+counts as one, and agentctl needs a lease of at least two seconds. Tests
+that renew use a 3-second lease.
 
 ### What agentctl does when it loses the lock
 
 **Issue.** The plan says the lease is renewed while the command runs, but
 not what happens when a renewal fails: agentd refused it (the lease
-expired, or the turn ended), or agentd couldn't be reached.
+expired, or the turn ended), or agentd couldn't be reached. A first version
+also awaited each renewal on its own, bounded only by the 30-second request
+timeout, so a renewal agentd never answered let the command keep writing
+past the lease's expiry, and delayed `SIGTERM` by as long.
 
-**Solution.** A refused renewal, or transport failures until the lease's
-expiry has passed, means another command may hold the lock, so agentctl
-kills its command and exits 1 with "lost the shared/ lock (…); stopped the
-command". On `SIGTERM`, `SIGINT` or `SIGHUP` it kills the command, releases
-the lease and exits with 128 plus the signal. Killing stops the command's
-own process only: processes it started in the background keep running, and
-an agentctl killed with `SIGKILL` leaves its command running once the lease
-expires. The lock is a guard for cooperating commands, as the design's
-"scope-level lock that `agentctl` takes for writes" is. agentctl waits at
-most 100 seconds for the lock by default (`--timeout`), below the 2 minutes
-Claude Code's Bash tool gives a command by default, so the model sees why it
-failed rather than a killed command.
+**Solution.** The renewal runs in the same `select!` as the command's exit,
+the stop signals and a deadline one second before the lease's expiry, and
+its request timeout is capped at the time left until that deadline. A
+refused renewal, or no successful renewal by the deadline, means another
+command may soon hold the lock, so agentctl kills its command and exits 1
+with "lost the shared/ lock (…); stopped the command". On `SIGTERM`,
+`SIGINT` or `SIGHUP` it kills the command, releases the lease and exits
+with 128 plus the signal. The signal handlers are installed before the
+lease is acquired and kept until the release is sent, so a signal is never
+lost in between, and the release waits at most two seconds, after which the
+lease expires on its own. agentctl waits at most 100 seconds for the lock
+by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
+a command by default, so the model sees why it failed rather than a killed
+command.
+
+### The command runs in its own process group
+
+**Issue.** Killing the command's process stopped only that process. With
+`sh -c '…'`, which the CLI help recommends, every process the shell started
+survived: it kept writing under the next holder, and it held agentctl's
+standard output and error open, so a caller reading them to the end hung.
+Tokio's `Child::kill` signals one process, and the standard library has no
+call to signal a process group.
+
+**Solution.** agentctl spawns the command with `process_group(0)` and kills
+the whole group with `SIGKILL`, through `rustix::process::kill_process_group`
+(rustix 1, the `process` feature only: safe, pure Rust, and it builds for the
+static musl target), before reaping the command. The group is signalled only
+while the command hasn't been reaped, so its id can't have been reused. A
+process that leaves the group (`setsid`, say) escapes, processes the
+command leaves running when it exits on its own are not stopped, and an
+agentctl killed with `SIGKILL` leaves its command running once the lease
+expires. Being in its own group, the command is not in the terminal's
+foreground group, so it can't read from a terminal; agentctl runs under the
+model's Bash tool, which gives it none. The lock is a guard for cooperating
+commands, as the design's "scope-level lock that `agentctl` takes for
+writes" is.
+
+### A lease outlived its turn
+
+**Issue.** Release goes through the same extractor as every command, which
+refuses a token between turns, and ending a turn or revoking a token left
+`scope_locks` alone. A lease taken in a turn that ended, or by a process
+whose token was revoked, held the lock until it expired, up to 30 seconds.
+
+**Solution.** The store deletes the session's leases in the same
+transaction that records or clears a token's turn (`set_ctl_turn`), deletes
+the token (`delete_ctl_token`), or replaces it with a new token for the
+session (`put_ctl_token`). A lease lasts no longer than the turn that took
+it, and the lock is free as soon as `end_turn` or `revoke_process_token`
+returns. An acquire authorized just before the turn ended can still land
+after the delete; that lease can't be renewed, and expires on its own.
 
 ### `lock` is refused inside private tasks
 
@@ -2126,8 +2223,10 @@ key named one.
 **Solution.** `store.data_dir`, required and absolute. Attachments go in
 `ctl-outbox/<random>/` under it, one directory per turn, created with mode
 0700, holding files named by random UUIDs; the model's file name is only
-display text and is refused if it holds `/`, `\`, a control character, or is
-`.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
+display text and is refused if it holds `/`, `\`, a control character, an
+invisible formatting character (bidirectional controls such as U+202E, which
+can make `exe.txt` read as `txt.exe`, zero-width characters, tag characters,
+or a line or paragraph separator), or is `.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
 directory, and startup empties `ctl-outbox/`. The cap is
 `limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
 files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in

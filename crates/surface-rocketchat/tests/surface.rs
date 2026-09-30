@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use core_types::{
     ConvRef, Cursor, LengthUnit, Limit, MsgRef, OutFile, ReplyTarget, Surface, SurfaceError,
-    SurfaceKind, ThreadKey,
+    SurfaceKind, ThreadKey, UserId,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
 use surface_rocketchat::{BotRoles, Dedup, RocketChatConfig, RocketChatSurface};
 use testkit::rocketchat::FakeRest;
@@ -287,4 +287,27 @@ async fn render_converts_and_splits_to_the_configured_limit() {
     assert_eq!(s.surface.caps().message_limit.max, 20);
     let s = setup().await;
     assert_eq!(s.surface.render("see @helper"), ["see @helper"]);
+}
+
+#[tokio::test]
+async fn roles_the_caller_cannot_see_fail_naming_the_missing_permission() {
+    let s = setup().await;
+    let roles = BotRoles::new(s.surface.rest().clone());
+    let err = roles
+        .is_bot(&UserId::from(s.alice.as_str()))
+        .await
+        .unwrap_err();
+    let SurfaceError::Forbidden(text) = &err else {
+        panic!("unexpected error {err:?}");
+    };
+    assert!(text.contains("view-full-other-user-info"), "{text}");
+    assert!(text.contains(&s.bot), "{text}");
+    let token = s.surface.rest().credentials().token.expose_secret();
+    assert!(!err.to_string().contains(token));
+    assert!(roles.is_bot(&UserId::from(s.bot.as_str())).await.unwrap());
+    let before = s.fake.requests("users.info").await.len();
+    assert!(roles.is_bot(&UserId::from(s.bot.as_str())).await.unwrap());
+    assert_eq!(s.fake.requests("users.info").await.len(), before);
+    assert!(roles.is_bot(&UserId::from(s.alice.as_str())).await.is_err());
+    assert_eq!(s.fake.requests("users.info").await.len(), before + 1);
 }
