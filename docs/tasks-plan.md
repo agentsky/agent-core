@@ -1130,7 +1130,9 @@ Deliverables:
 
 - `crates/agentd/src/commands/`: a dispatcher from `(MemberKey, Command,
   Origin)` to a handler. `Origin` is `SlackSlash { response_url }`,
-  `RocketChatDm` or `RocketChatChannel { room }`.
+  `RocketChatDm { room }` or `RocketChatChannel { room }`. The DM's room
+  saves a `users.info` and `im.create` per reply
+  ([impl-notes](impl-notes.md#a-dm-to-a-member-needs-their-username)).
 - Private reply plumbing: a `reply_private(origin, text)` helper. On Rocket.Chat
   it sends a manager-bot DM; the Slack arm is filled in T30.
 - Rocket.Chat wiring:
@@ -1153,7 +1155,11 @@ Deliverables:
   task sends a member exactly when it sets `claude_links.broken_at`, whoever
   asked for the token (a command, or T18's proxy on a session's behalf), so
   there is one notice per failure and none is lost when the caller goes away.
-  Callers that get `RelinkRequired` send nothing themselves.
+  Callers that get `RelinkRequired` send nothing themselves. The channel only
+  wakes the notifier: the notice owed is recorded in the store
+  (`claude_links.relink_notified_at`) and claimed there before sending, so it
+  survives a restart, is sent by one instance, and is retried when the DM
+  fails ([impl-notes](impl-notes.md#the-relink-channel-is-in-memory-the-notice-has-to-be-durable)).
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
@@ -1202,8 +1208,9 @@ Deliverables:
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
-  each surface with a store-backed `Dedup` and one `BotRoles` over the
-  manager's client, shared by every surface
+  each surface with a store-backed `Dedup` (T13's `StoreDedup`) and the one
+  `BotRoles` over the manager's client that T13 keeps in
+  `app::RocketChatManager`, shared by every surface
   ([impl-notes](impl-notes.md#messages-dont-carry-the-senders-roles)).
 
 Acceptance: tests with `FakeRest` and `FakeDdp` for create, a name collision,

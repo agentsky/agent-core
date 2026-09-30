@@ -7,6 +7,8 @@
 //!
 //! - [`config`]: the TOML file plus secret environment variables.
 //! - [`app`]: [`App`], the shared state.
+//! - [`commands`]: `/agent` command dispatch, the account commands, and
+//!   the relink notice.
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
 //! - [`sweeper`]: deleting expired rows every minute.
@@ -17,6 +19,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod ctl;
 pub mod net;

@@ -36,6 +36,8 @@ use tokio::task::{JoinError, JoinSet};
 use tower::Service as _;
 
 use crate::app::App;
+use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
+use crate::commands::rocketchat;
 use crate::net::RefuseSubnet;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -156,7 +158,9 @@ impl Server {
     ///    at once instead.
     /// 3. The store is closed.
     ///
-    /// The sweeper runs alongside, every [`SWEEP_INTERVAL`].
+    /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
+    /// relink notifier and, with `[rocketchat]`, the manager bot's
+    /// connection, which runs the commands it hears.
     ///
     /// # Errors
     ///
@@ -198,10 +202,29 @@ impl Server {
             stopping.clone(),
         ));
         let store = app.store().clone();
+        let sweeping = stopping.clone();
         tasks.spawn(async move {
-            sweeper::run(store, SWEEP_INTERVAL, stopping).await;
+            sweeper::run(store, SWEEP_INTERVAL, sweeping).await;
             "sweeper"
         });
+        let notifier = RelinkNotifier::new(app.store().clone(), app.commands().replies().clone());
+        let wake = app.auth().take_relink_notices();
+        let notifying = stopping.clone();
+        tasks.spawn(async move {
+            notifier.run(wake, RELINK_SWEEP_INTERVAL, notifying).await;
+            "relink notifier"
+        });
+        if let Some(manager) = app.rocketchat() {
+            let surface = manager.surface.clone();
+            let binding = manager.binding.clone();
+            let commands = app.commands().clone();
+            tasks.spawn(async move {
+                if let Err(err) = rocketchat::serve(surface, binding, commands, stopping).await {
+                    tracing::error!(error = %err, "the Rocket.Chat manager bot's connection ended");
+                }
+                "Rocket.Chat manager bot's connection"
+            });
+        }
         tracing::info!(
             public = %addrs.public,
             proxy = %addrs.proxy,

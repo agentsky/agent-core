@@ -50,6 +50,14 @@ The ctl listener serves the agentctl API that sandboxed agents call back
 through; at startup agentd deletes every agentctl token and scope lock and
 empties `ctl-outbox/` under `store.data_dir`, since the containers they
 belonged to are gone.
+With a `[rocketchat]` section and `AGENTD_RC_MANAGER_TOKEN` (the manager
+account's personal access token), agentd connects as the manager bot and takes
+commands: a direct message to it is a command as a whole (`login`, `me`), and
+a message in any other room that starts with `!agent` is one too. Replies
+always come as a direct message from the manager bot. A login code or API key
+posted outside that direct message is refused and the member is told to start
+again or revoke the key. Members whose Claude link breaks get one direct
+message saying so.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish; a second signal drops them at
 once. Logs go to standard error,

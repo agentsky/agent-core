@@ -70,3 +70,37 @@ data_dir = "/var/lib/agentd"
 [limits]
 # The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
 attach_max_bytes = 52428800
+
+[claude_oauth]
+# Claude Code's OAuth parameters, used to link members' Claude accounts. They
+# are Claude Code's, not a published API, so they are configuration. Every
+# key is optional; these are the defaults (Claude Code 2.1.285). URLs must be
+# https://, except http:// on a loopback host for local fakes.
+authorize_url = "https://claude.com/cai/oauth/authorize"
+token_url = "https://platform.claude.com/v1/oauth/token"
+revoke_url = "https://platform.claude.com/v1/oauth/token/revoke"
+redirect_uri = "https://platform.claude.com/oauth/code/callback"
+client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+scopes = "user:profile user:inference"
+profile_url = "https://api.anthropic.com/api/oauth/profile"
+
+# The Rocket.Chat server and its manager bot. Leave the section out to run
+# without Rocket.Chat. With it, AGENTD_RC_MANAGER_TOKEN must hold the manager
+# account's personal access token. The manager bot takes commands as direct
+# messages, and as messages starting with `!agent` in rooms it is in, and
+# answers every command in a direct message.
+[rocketchat]
+# The server's base URL.
+base_url = "https://chat.example.com"
+
+# The realtime (DDP) endpoint. Optional: by default <base_url>/websocket,
+# with wss:// for https:// and ws:// for http://.
+# websocket_url = "wss://chat.example.com/websocket"
+
+# The id agentd gives this server. Every Rocket.Chat member identity agentd
+# stores carries it, so don't change it once members have linked accounts.
+team = "chat.example.com"
+
+# The manager account's user _id (Administration > Users, or `me` in the
+# REST API with its token).
+manager_user_id = "aBcD1234eFgH5678"

@@ -101,7 +101,8 @@ fn aad<'a>(column: &'static str, key: &'a str) -> Aad<'a> {
 
 impl Store {
     /// Stores `link` as `member`'s Claude link at `now`, replacing any
-    /// existing one, and clears [`broken_at`](ClaudeLink::broken_at).
+    /// existing one, and clears [`broken_at`](ClaudeLink::broken_at) and the
+    /// [relink notice](Store::claim_relink_notice).
     ///
     /// Returns the link's new [`generation`](ClaudeLink::generation). It is
     /// one `BEGIN IMMEDIATE` transaction that takes the next generation and
@@ -137,6 +138,7 @@ impl Store {
              plan = excluded.plan, \
              rate_limit_tier = excluded.rate_limit_tier, \
              broken_at = NULL, \
+             relink_notified_at = NULL, \
              updated_at = excluded.updated_at, \
              generation = excluded.generation",
         )
@@ -155,8 +157,9 @@ impl Store {
     }
 
     /// Replaces the tokens of `member`'s link at `now` and clears
-    /// [`broken_at`](ClaudeLink::broken_at), if the link is still the one of
-    /// `generation`. The plan is left alone.
+    /// [`broken_at`](ClaudeLink::broken_at) and the
+    /// [relink notice](Store::claim_relink_notice), if the link is still the
+    /// one of `generation`. The plan is left alone.
     ///
     /// Returns false, and stores nothing, if the member has no link or a
     /// newer login replaced it. A token refresh stores its result this way,
@@ -180,7 +183,7 @@ impl Store {
         let refresh = self.seal(aad(REFRESH, &key), &tokens.refresh_token)?;
         let result = sqlx::query(
             "UPDATE claude_links SET access_token_enc = ?, refresh_token_enc = ?, \
-             expires_at = ?, broken_at = NULL, updated_at = ? \
+             expires_at = ?, broken_at = NULL, relink_notified_at = NULL, updated_at = ? \
              WHERE member_id = ? AND generation = ?",
         )
         .bind(access)

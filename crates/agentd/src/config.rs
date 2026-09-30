@@ -33,6 +33,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use auth::OAuthConfig;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
@@ -44,8 +45,8 @@ use crate::net::Cidr;
 /// The master key for encryption at rest: 32 bytes, standard base64, as
 /// `agentd gen-key` prints it. Required.
 pub const MASTER_KEY_VAR: &str = "AGENTD_MASTER_KEY";
-/// The Rocket.Chat manager's personal access token. Optional until the
-/// Rocket.Chat surface is configured.
+/// The Rocket.Chat manager's personal access token. Required when the
+/// `[rocketchat]` section is present.
 pub const RC_MANAGER_TOKEN_VAR: &str = "AGENTD_RC_MANAGER_TOKEN";
 /// The prefix of the Slack manager app's secrets, such as
 /// `AGENTD_SLACK_MANAGER_SIGNING_SECRET`. They are collected into
@@ -79,6 +80,12 @@ pub struct Config {
     pub store: StoreConfig,
     /// `[limits]`: caps on what agents may do.
     pub limits: LimitsConfig,
+    /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
+    /// accounts. Every key has a default, so the section is optional.
+    pub claude_oauth: OAuthConfig,
+    /// `[rocketchat]`: the Rocket.Chat server and its manager bot, if agentd
+    /// serves Rocket.Chat.
+    pub rocketchat: Option<RocketChatConfig>,
     /// Secrets from the environment.
     pub secrets: Secrets,
     /// Unknown `AGENTD_` variables that were ignored, by name, sorted.
@@ -95,6 +102,9 @@ struct File {
     store: StoreConfig,
     #[serde(default)]
     limits: LimitsConfig,
+    #[serde(default)]
+    claude_oauth: OAuthConfig,
+    rocketchat: Option<RocketChatConfig>,
 }
 
 /// `[server]`.
@@ -154,6 +164,28 @@ pub struct StoreConfig {
     /// `/var/lib/agentd`. Files agents attach are staged under
     /// `ctl-outbox/` in it until their turn's reply is posted.
     pub data_dir: PathBuf,
+}
+
+/// `[rocketchat]`. The manager bot's token comes from
+/// [`AGENTD_RC_MANAGER_TOKEN`](RC_MANAGER_TOKEN_VAR).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RocketChatConfig {
+    /// The server's base URL, `https://` (or `http://`), such as
+    /// `https://chat.example.com`.
+    pub base_url: String,
+    /// The realtime endpoint, `wss://` or `ws://`, when it isn't
+    /// `<base_url>/websocket`.
+    #[serde(default)]
+    pub websocket_url: Option<String>,
+    /// The id agentd gives the server, which every stored Rocket.Chat
+    /// identity carries, such as `chat.example.com`. Changing it later makes
+    /// every member a stranger.
+    pub team: String,
+    /// The manager bot's user `_id`, whose personal access token is
+    /// `AGENTD_RC_MANAGER_TOKEN`.
+    pub manager_user_id: String,
 }
 
 /// `[limits]`. Every key has a default, so the section is optional.
@@ -271,11 +303,19 @@ impl Config {
         let file = parse_file(text)?;
         file.validate()?;
         let (secrets, unknown_env) = Secrets::from_env(env)?;
+        if file.rocketchat.is_some() && secrets.rc_manager_token.is_none() {
+            return Err(invalid(
+                RC_MANAGER_TOKEN_VAR,
+                "must be set when [rocketchat] is configured",
+            ));
+        }
         Ok(Self {
             server: file.server,
             internal: file.internal,
             store: file.store,
             limits: file.limits,
+            claude_oauth: file.claude_oauth,
+            rocketchat: file.rocketchat,
             secrets,
             unknown_env,
         })
@@ -420,6 +460,40 @@ impl File {
         }
         if self.limits.attach_max_bytes == 0 {
             return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
+        }
+        self.claude_oauth
+            .validate()
+            .map_err(|err| invalid(format!("claude_oauth.{}", err.key), err.reason))?;
+        if let Some(rocketchat) = &self.rocketchat {
+            rocketchat.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl RocketChatConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        surface_rocketchat::realtime::websocket_url(&self.base_url).map_err(|_| {
+            invalid(
+                "rocketchat.base_url",
+                "must be an http:// or https:// URL, such as https://chat.example.com",
+            )
+        })?;
+        if let Some(url) = &self.websocket_url
+            && !(url.starts_with("wss://") || url.starts_with("ws://"))
+        {
+            return Err(invalid(
+                "rocketchat.websocket_url",
+                "must be a ws:// or wss:// URL",
+            ));
+        }
+        for (key, value) in [
+            ("rocketchat.team", &self.team),
+            ("rocketchat.manager_user_id", &self.manager_user_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(invalid(key, "must not be empty"));
+            }
         }
         Ok(())
     }
@@ -642,10 +716,12 @@ data_dir = "/nonexistent/agentd"
     #[test]
     fn the_example_file_loads() {
         let text = include_str!("../../../config/agentd.example.toml");
-        let config = with(text, env()).unwrap();
+        let config = with(text, with_rc_token()).unwrap();
         assert_eq!(config.server.listen.port(), 8443);
         assert_eq!(config.internal.proxy_listen.port(), 8080);
         assert_eq!(config.internal.ctl_listen.port(), 8081);
+        assert_eq!(config.claude_oauth, OAuthConfig::default());
+        assert_eq!(config.rocketchat.unwrap().team, "chat.example.com");
     }
 
     #[test]
@@ -687,6 +763,91 @@ data_dir = "/nonexistent/agentd"
         for secret in ["rc-token", "sig-value", "cli-value"] {
             assert!(!debug.contains(secret), "{debug}");
         }
+    }
+
+    const ROCKETCHAT: &str = r#"
+[rocketchat]
+base_url = "https://chat.example.com"
+team = "chat.example.com"
+manager_user_id = "manager-id"
+"#;
+
+    fn with_rc_token() -> Vec<(String, String)> {
+        let mut env = env();
+        env.push((RC_MANAGER_TOKEN_VAR.to_owned(), "rc-token".to_owned()));
+        env
+    }
+
+    #[test]
+    fn rocketchat_is_optional_and_loads_with_its_token() {
+        assert!(with(MINIMAL, env()).unwrap().rocketchat.is_none());
+        let config = with(&format!("{MINIMAL}{ROCKETCHAT}"), with_rc_token()).unwrap();
+        let rocketchat = config.rocketchat.unwrap();
+        assert_eq!(rocketchat.base_url, "https://chat.example.com");
+        assert_eq!(rocketchat.websocket_url, None);
+        assert_eq!(rocketchat.team, "chat.example.com");
+        assert_eq!(rocketchat.manager_user_id, "manager-id");
+    }
+
+    #[test]
+    fn rocketchat_needs_the_manager_token() {
+        let err = with(&format!("{MINIMAL}{ROCKETCHAT}"), env()).unwrap_err();
+        assert_eq!(err.key(), Some(RC_MANAGER_TOKEN_VAR), "{err}");
+    }
+
+    #[test]
+    fn rocketchat_values_are_checked() {
+        for (from, to, key) in [
+            (
+                "https://chat.example.com",
+                "ftp://chat.example.com",
+                "rocketchat.base_url",
+            ),
+            (
+                "team = \"chat.example.com\"",
+                "team = \" \"",
+                "rocketchat.team",
+            ),
+            (
+                "manager_user_id = \"manager-id\"",
+                "manager_user_id = \"\"",
+                "rocketchat.manager_user_id",
+            ),
+            (
+                "team =",
+                "websocket_url = \"https://chat.example.com/websocket\"\nteam =",
+                "rocketchat.websocket_url",
+            ),
+        ] {
+            let text = format!("{MINIMAL}{}", ROCKETCHAT.replacen(from, to, 1));
+            let err = with(&text, with_rc_token()).unwrap_err();
+            assert_eq!(err.key(), Some(key), "{err}");
+        }
+        let text = format!(
+            "{MINIMAL}{}",
+            ROCKETCHAT.replacen(
+                "team =",
+                "websocket_url = \"wss://rt.example.com/websocket\"\nteam =",
+                1
+            )
+        );
+        let config = with(&text, with_rc_token()).unwrap();
+        assert_eq!(
+            config.rocketchat.unwrap().websocket_url.as_deref(),
+            Some("wss://rt.example.com/websocket")
+        );
+    }
+
+    #[test]
+    fn claude_oauth_defaults_and_is_checked() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert_eq!(config.claude_oauth, OAuthConfig::default());
+        let text = format!("{MINIMAL}\n[claude_oauth]\ntoken_url = \"http://example.com/token\"\n");
+        let err = with(&text, env()).unwrap_err();
+        assert_eq!(err.key(), Some("claude_oauth.token_url"), "{err}");
+        let text = format!("{MINIMAL}\n[claude_oauth]\nbogus = 1\n");
+        let err = with(&text, env()).unwrap_err();
+        assert_eq!(err.key(), Some("claude_oauth.bogus"), "{err}");
     }
 
     #[test]
