@@ -248,6 +248,31 @@ jobs:
       - name: Check
         run: cargo check --all-targets --all-features
 
+  # Dependency policy in deny.toml: banned crates, licenses, advisories and
+  # sources. `--workspace` makes every workspace crate a root of the graph;
+  # the root manifest is a package, so without it only that package's
+  # dependencies would be checked. `--locked` checks the committed
+  # Cargo.lock instead of a re-resolved one. `-W unmaintained` reports
+  # unmaintained crates as warnings; vulnerabilities fail the job. The
+  # action's image ships an old Rust, so it switches to the current stable
+  # like the other jobs.
+  deny:
+    name: Dependency policy
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check dependencies
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          rust-version: stable
+          arguments: --workspace --locked
+          command-arguments: -W unmaintained
+
   # The one check to require in branch protection. A job skipped for a
   # docs-only change satisfies a required check, except a matrix job: it
   # reports under its unexpanded name, so a required `Format, lint, test,
@@ -256,7 +281,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv]
+    needs: [changes, rust, docs, coverage, msrv, deny]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
