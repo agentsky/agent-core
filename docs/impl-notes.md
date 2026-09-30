@@ -32,9 +32,7 @@ Consequences:
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
-  use that license; see
-  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
+  per-crate exception.
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -240,6 +238,61 @@ for every chunk after calling `render` itself.
 rustdoc says, and `Surface::render` does the converting and splitting. T29's
 acceptance is reworded to test `render` instead.
 
+### The scope lock had no lease id
+
+**Issue.** `LockResponse::Held` carried only an expiry, and renew and
+release named no lease: the server could match them only by session. Claude
+Code runs Bash tool calls in parallel, so one session can run two
+`agentctl lock -- …` at once. Both would get `Held`, and when the first
+command exited its `Release` would free the lock while the second command
+was still writing to `shared/`.
+
+**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
+on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
+`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
+`Release { lease }`, so a renew or release without a lease fails to
+deserialize. The lock is exclusive per lease, not per session: a second
+acquire, from any session, gets `Busy`, and a renew or release naming any
+lease but the current one answers `Released` and changes nothing. T15's
+`scope_locks` table takes `lease_id` as its primary key next to
+`holder_session`, and its acceptance tests the same-session case.
+
+### Scope keys are not file or Docker names
+
+**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
+segment" because it never contains `/`. It always contains `:`, and may
+contain `%` and any other character a platform id holds. A `:` splits a
+bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
+`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
+Docker volume after the key would break or be refused.
+
+**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
+is a key for columns, labels and logs, not a file or Docker object name. T17
+in the plan fixes how volumes are named and mounted: host directories at
+`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
+data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
+type `bind`), never `binds` strings or named Docker volumes. A digest was
+chosen over a reversible encoding of the key (hex or base32), which grows
+with the key and could pass the 255-byte file-name limit for a long
+Rocket.Chat team id; the `volumes` table records which key a directory holds.
+
+### A Slack bot message may name no user
+
+**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
+message may carry only a `bot_id` and no `user`, and the router's
+managed-bot lookup (T22) needs one key to look up. The plan did not say what
+`sender.user` holds then, or whether the router keys on `sender` or on
+`sender_bot_user`.
+
+**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
+surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
+so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
+`user`, or the `user_id` from `bots.info` (T29) when the event has only a
+`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
+has `sender_bot_user: None`; no binding has that id, so the router ignores
+it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
+section saying this, and T12, T22, T28 and T29 in the plan match it.
+
 ## T04: testkit
 
 ### `fake_claude_path` built outside `cargo llvm-cov`'s target directory
@@ -435,6 +488,118 @@ if the OS generator fails.
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
 
+## T06: Slack mrkdwn
+
+### Escaping applies inside code too
+
+**Issue.** T06 said to escape `&`, `<` and `>` "outside code", while its
+acceptance criterion says code must come out "untouched except for escaping".
+Slack reads its control sequences (`<!here>`, `<@U…>`, `<url|label>`) before
+it applies any formatting, so an unescaped `<!here>` inside a code block still
+notifies the channel. qm-core leaves code verbatim and has that hole.
+
+**Solution.** `to_mrkdwn` escapes the three characters everywhere, code
+included, and changes nothing else inside code: no mention resolution, no
+broadcast neutralization, no formatting. Slack shows `&lt;` as `<` inside code,
+so the reader sees the original text. The T06 bullet in the plan now says
+"everywhere".
+
+### Literal Slack tokens are escaped, not passed through
+
+**Issue.** qm-core passes literal wire tokens in model output through
+unchanged (`<@U123>`, `<!subteam^S1>`, `<!date^…>`, `<https://x.io|label>`),
+and only rewrites `<!here>`, `<!channel>` and `<!everyone>`. That lets model
+output ping a whole user group, and it conflicts with escaping `<`.
+
+**Solution.** The agent writes standard Markdown, and mentions go through the
+`MentionDirectory`, as the design says. So every literal `<` is escaped, and
+the tokens show as text. The broadcast forms still become qm-core's
+`@\u{200B}here` text rather than escaped brackets, since the plan asks for
+that. CommonMark parses `<https://x.io|label>` as an autolink whose URL
+contains `|`; link URLs percent-encode `|` (and spaces), so it becomes
+`<https://x.io%7Clabel>`. A link destination starting with `!`, `@` or `#` is
+percent-encoded too, because `[x](<!here>)` would otherwise render as the
+broadcast `<!here|x>`.
+
+### Typed broadcasts get a zero-width space
+
+**Issue.** qm-core leaves typed `@here`, `@channel` and `@everyone` alone. They
+are inert only because qm-core posts without Slack's `link_names` flag.
+
+**Solution.** `to_mrkdwn` inserts U+200B after the `@` (outside code, ignoring
+case, not after a letter or digit, so `me@here.com` is untouched), which
+matches what the wire forms become. These names are never offered to the
+directory, so a member called "here" can't be pinged through them.
+
+This does not make the output safe under every posting flag. With
+`link_names=1` (or `parse=full`) Slack would still link an unresolved `@devs`
+that stays text, and ping that user group, and code keeps a typed `@here`
+as written. Rewriting every unresolved `@word` would mangle ordinary text, so
+the renderer relies on the Slack surface never setting either flag. T29's
+deliverables and acceptance in the plan now say so.
+
+### Bare URLs get explicit bounds
+
+**Issue.** T06 said bare URLs are "left alone". qm-core wraps them in `<…>`
+because Slack's own URL detection pulled neighboring mrkdwn marks into the
+link: `*https://x.io/#/device*` linked to `…/device*` (qm-core's
+"device-code bug"). The Markdown parser strips the `**`, but the output puts
+Slack's `*` right back next to the URL.
+
+**Solution.** Bare `http://` and `https://` URLs in text become `<url>`, with
+trailing punctuation and unmatched closing brackets left outside, as qm-core's
+`trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
+still left to Slack. The T06 bullet in the plan now says so.
+
+### CommonMark disagrees with some qm-core regex cases
+
+**Issue.** qm-core converts with regexes; this renderer walks the
+`pulldown-cmark` tree, which follows CommonMark:
+
+- `above\n---\nbelow` is a setext heading, not a rule.
+- An unclosed fence runs to the end of the document instead of staying
+  verbatim.
+- A ```` ``` ```` run in the middle of a line is a code span, not a fence.
+- Block spacing isn't in the event stream.
+
+**Solution.** Follow the parse tree, and adapt the ported test cases, which
+name each difference. Blocks are separated by a blank line when the source had
+one between them (compared by source line numbers), and by a line break
+otherwise, so `### Deep\nbody` still gives `*Deep*\nbody`. Fenced blocks keep
+their info string, as qm-core and T07's fence reopening assume, even though
+Slack doesn't highlight syntax. A code body that itself holds ```` ``` ````
+still gets a backtick fence (see
+[Backtick runs close a Slack code block](#backtick-runs-close-a-slack-code-block)).
+
+### Unbounded nesting overflows the stack
+
+**Issue.** `pulldown-cmark` emits a flat event stream, but any tree walk over
+it recurses once per nesting level, and so does dropping the tree. A line of
+100,000 `>` (or `*`) aborted the process with a stack overflow.
+
+**Solution.** The tree builder keeps at most 64 levels (`MAX_DEPTH`). Elements
+nested deeper are flattened into their ancestor at the limit: their text
+stays, their markup is dropped. A test renders 100,000 levels on a test
+thread's default stack.
+
+### `@Name` grammar details
+
+**Issue.** qm-core's `PLAIN_MENTION` regex relies on backtracking. When the
+greedy one-to-three-word name runs into `/` or `@`, the regex retries shorter
+matches, down to part of a word (`@ankit/x` tries `anki`). When nothing
+resolves, it skips the whole matched run, so `@nobody https://x.io` never
+wraps the URL.
+
+**Solution.** `render::mention::scan` takes the greedy words, drops the last
+word when it runs into `/` or `@` (a lone word then isn't a mention), and tries
+the longest name first, as qm-core does, including its rule that a capitalized
+next word means somebody else (`@Ankit Torres` stays text when only "Ankit" is
+known). An unresolved name consumes only its first word, so the rest of the
+line is still scanned. Names are passed to the directory as written;
+`MentionDirectory` implementations own case folding. The scanner lives in
+`render::mention` so T07's Rocket.Chat renderer can reuse it with its own
+broadcast names.
+
 ### A link label can disguise its destination
 
 **Issue.** `[https://good.com](https://evil.com)` became
@@ -547,180 +712,6 @@ limit.
 closing inline code, and replacing the backtick with a look-alike would change
 the code's text. Agents rarely put backticks in inline code; a fenced block
 shows them correctly.
-
-### The scope lock had no lease id
-
-**Issue.** `LockResponse::Held` carried only an expiry, and renew and
-release named no lease: the server could match them only by session. Claude
-Code runs Bash tool calls in parallel, so one session can run two
-`agentctl lock -- …` at once. Both would get `Held`, and when the first
-command exited its `Release` would free the lock while the second command
-was still writing to `shared/`.
-
-**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
-on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
-`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
-`Release { lease }`, so a renew or release without a lease fails to
-deserialize. The lock is exclusive per lease, not per session: a second
-acquire, from any session, gets `Busy`, and a renew or release naming any
-lease but the current one answers `Released` and changes nothing. T15's
-`scope_locks` table takes `lease_id` as its primary key next to
-`holder_session`, and its acceptance tests the same-session case.
-
-### Scope keys are not file or Docker names
-
-**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
-segment" because it never contains `/`. It always contains `:`, and may
-contain `%` and any other character a platform id holds. A `:` splits a
-bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
-`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
-Docker volume after the key would break or be refused.
-
-**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
-is a key for columns, labels and logs, not a file or Docker object name. T17
-in the plan fixes how volumes are named and mounted: host directories at
-`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
-data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
-type `bind`), never `binds` strings or named Docker volumes. A digest was
-chosen over a reversible encoding of the key (hex or base32), which grows
-with the key and could pass the 255-byte file-name limit for a long
-Rocket.Chat team id; the `volumes` table records which key a directory holds.
-
-### A Slack bot message may name no user
-
-**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
-message may carry only a `bot_id` and no `user`, and the router's
-managed-bot lookup (T22) needs one key to look up. The plan did not say what
-`sender.user` holds then, or whether the router keys on `sender` or on
-`sender_bot_user`.
-
-**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
-surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
-so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
-`user`, or the `user_id` from `bots.info` (T29) when the event has only a
-`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
-has `sender_bot_user: None`; no binding has that id, so the router ignores
-it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
-section saying this, and T12, T22, T28 and T29 in the plan match it.
-
-## T06: Slack mrkdwn
-
-### Escaping applies inside code too
-
-**Issue.** T06 said to escape `&`, `<` and `>` "outside code", while its
-acceptance criterion says code must come out "untouched except for escaping".
-Slack reads its control sequences (`<!here>`, `<@U…>`, `<url|label>`) before
-it applies any formatting, so an unescaped `<!here>` inside a code block still
-notifies the channel. qm-core leaves code verbatim and has that hole.
-
-**Solution.** `to_mrkdwn` escapes the three characters everywhere, code
-included, and changes nothing else inside code: no mention resolution, no
-broadcast neutralization, no formatting. Slack shows `&lt;` as `<` inside code,
-so the reader sees the original text. The T06 bullet in the plan now says
-"everywhere".
-
-### Literal Slack tokens are escaped, not passed through
-
-**Issue.** qm-core passes literal wire tokens in model output through
-unchanged (`<@U123>`, `<!subteam^S1>`, `<!date^…>`, `<https://x.io|label>`),
-and only rewrites `<!here>`, `<!channel>` and `<!everyone>`. That lets model
-output ping a whole user group, and it conflicts with escaping `<`.
-
-**Solution.** The agent writes standard Markdown, and mentions go through the
-`MentionDirectory`, as the design says. So every literal `<` is escaped, and
-the tokens show as text. The broadcast forms still become qm-core's
-`@\u{200B}here` text rather than escaped brackets, since the plan asks for
-that. CommonMark parses `<https://x.io|label>` as an autolink whose URL
-contains `|`; link URLs percent-encode `|` (and spaces), so it becomes
-`<https://x.io%7Clabel>`. A link destination starting with `!`, `@` or `#` is
-percent-encoded too, because `[x](<!here>)` would otherwise render as the
-broadcast `<!here|x>`.
-
-### Typed broadcasts get a zero-width space
-
-**Issue.** qm-core leaves typed `@here`, `@channel` and `@everyone` alone. They
-are inert only because qm-core posts without Slack's `link_names` flag.
-
-**Solution.** `to_mrkdwn` inserts U+200B after the `@` (outside code, ignoring
-case, not after a letter or digit, so `me@here.com` is untouched). The output
-is harmless whatever flags the Slack surface posts with, and it matches what
-the wire forms become. These names are never offered to the directory, so a
-member called "here" can't be pinged through them.
-
-case, not after a letter or digit, so `me@here.com` is untouched), which
-matches what the wire forms become. These names are never offered to the
-directory, so a member called "here" can't be pinged through them.
-
-This does not make the output safe under every posting flag. With
-`link_names=1` (or `parse=full`) Slack would still link an unresolved `@devs`
-that stays text, and ping that user group, and code keeps a typed `@here`
-as written. Rewriting every unresolved `@word` would mangle ordinary text, so
-the renderer relies on the Slack surface never setting either flag. T29's
-deliverables and acceptance in the plan now say so.
-
-### Bare URLs get explicit bounds
-
-**Issue.** T06 said bare URLs are "left alone". qm-core wraps them in `<…>`
-because Slack's own URL detection pulled neighboring mrkdwn marks into the
-link: `*https://x.io/#/device*` linked to `…/device*` (qm-core's
-"device-code bug"). The Markdown parser strips the `**`, but the output puts
-Slack's `*` right back next to the URL.
-
-**Solution.** Bare `http://` and `https://` URLs in text become `<url>`, with
-trailing punctuation and unmatched closing brackets left outside, as qm-core's
-`trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
-still left to Slack. The T06 bullet in the plan now says so.
-
-### CommonMark disagrees with some qm-core regex cases
-
-**Issue.** qm-core converts with regexes; this renderer walks the
-`pulldown-cmark` tree, which follows CommonMark:
-
-- `above\n---\nbelow` is a setext heading, not a rule.
-- An unclosed fence runs to the end of the document instead of staying
-  verbatim.
-- A ```` ``` ```` run in the middle of a line is a code span, not a fence.
-- Block spacing isn't in the event stream.
-
-**Solution.** Follow the parse tree, and adapt the ported test cases, which
-name each difference. Blocks are separated by a blank line when the source had
-one between them (compared by source line numbers), and by a line break
-otherwise, so `### Deep\nbody` still gives `*Deep*\nbody`. Fenced blocks keep
-their info string, as qm-core and T07's fence reopening assume, even though
-Slack doesn't highlight syntax. A code body that itself holds ```` ``` ````
-keeps a `~~~` fence, like qm-core, because a backtick fence would close early.
-
-still gets a backtick fence (see
-[Backtick runs close a Slack code block](#backtick-runs-close-a-slack-code-block)).
-
-### Unbounded nesting overflows the stack
-
-**Issue.** `pulldown-cmark` emits a flat event stream, but any tree walk over
-it recurses once per nesting level, and so does dropping the tree. A line of
-100,000 `>` (or `*`) aborted the process with a stack overflow.
-
-**Solution.** The tree builder keeps at most 64 levels (`MAX_DEPTH`). Elements
-nested deeper are flattened into their ancestor at the limit: their text
-stays, their markup is dropped. A test renders 100,000 levels on a test
-thread's default stack.
-
-### `@Name` grammar details
-
-**Issue.** qm-core's `PLAIN_MENTION` regex relies on backtracking. When the
-greedy one-to-three-word name runs into `/` or `@`, the regex retries shorter
-matches, down to part of a word (`@ankit/x` tries `anki`). When nothing
-resolves, it skips the whole matched run, so `@nobody https://x.io` never
-wraps the URL.
-
-**Solution.** `render::mention::scan` takes the greedy words, drops the last
-word when it runs into `/` or `@` (a lone word then isn't a mention), and tries
-the longest name first, as qm-core does, including its rule that a capitalized
-next word means somebody else (`@Ankit Torres` stays text when only "Ankit" is
-known). An unresolved name consumes only its first word, so the rest of the
-line is still scanned. Names are passed to the directory as written;
-`MentionDirectory` implementations own case folding. The scanner lives in
-`render::mention` so T07's Rocket.Chat renderer can reuse it with its own
-broadcast names.
 
 ## T07: splitting and directives
 
