@@ -37,13 +37,6 @@ Consequences:
   [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
 - The plan's Libraries table and T02 are updated to match.
 
-### Toolchain
-
-The container's `stable` toolchain was 1.94, older than the workspace's
-`rust-version` (1.98.1), so `cargo` refused to build. Run
-`rustup default 1.98.1` (or newer) first. CI installs the current stable,
-which is newer.
-
 ### cargo-llvm-cov ignores `default-members`
 
 **Issue.** The plan relied on `default-members = [".", "crates/*"]` to make

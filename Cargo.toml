@@ -58,7 +58,7 @@ hyper = { version = "1.11.1", features = ["http1", "http2", "server", "client"] 
 hyper-util = { version = "0.1.21", features = ["full"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = "0.10.3"
-reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "form", "query"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

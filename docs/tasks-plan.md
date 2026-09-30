@@ -51,9 +51,13 @@ These close questions the design leaves open, so that parallel tasks agree.
   resolver = "3"
   ```
 
-  `default-members` makes plain `cargo test`, `cargo clippy` and
-  `cargo coverage` at the root cover every crate, so the existing CI commands
-  keep working without `--workspace`.
+  `default-members` makes plain `cargo test` and `cargo clippy` at the root
+  cover every crate, so the existing CI commands keep working without
+  `--workspace`. `cargo llvm-cov` ignores `default-members`, so the `coverage`
+  alias passes `--workspace` itself
+  ([impl-notes](impl-notes.md#cargo-llvm-cov-ignores-default-members)).
+- CI runs cargo with `--locked`, so a stale `Cargo.lock` fails instead of
+  being re-resolved on the runner.
 - Crates live in `crates/<name>/`, with the package name equal to the directory
   name. All crates set `publish = false`.
 - Shared metadata (`edition`, `rust-version`, `license-file`) and every
@@ -240,6 +244,11 @@ description, and must pass T02's policy.
 
 ### Testing
 
+- The workspace forbids `unsafe`, and in edition 2024 `std::env::set_var` is
+  unsafe. Code that reads the environment (configuration overrides, the
+  runner's launch environment) takes it as an injected map or iterator, so
+  tests pass their own instead of mutating the process. Process groups for
+  reaping use the safe `CommandExt::process_group`, not `pre_exec`.
 - Tests never touch the network or a real Docker daemon by default. HTTP peers
   are `wiremock` servers or fakes from `testkit`.
 - `testkit` ships a `fake-claude` binary. It accepts the design's launch flags,
