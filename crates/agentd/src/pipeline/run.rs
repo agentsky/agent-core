@@ -95,7 +95,9 @@ pub struct PipelineSettings {
 ///    [`queue_per_thread`](PipelineSettings::queue_per_thread) messages
 ///    wait for one agent in one thread, and
 ///    [`max_pending`](PipelineSettings::max_pending) wait or run in all; a
-///    message past either gets one line saying the agent is busy.
+///    person's message past either gets one line saying the agent is busy,
+///    and a bot's gets nothing, so two bots can't answer each other's busy
+///    lines.
 /// 3. **Routing.** [`router::route`] for the candidate, with a view of the
 ///    store loaded for it.
 /// 4. **The turn.** On [`Decision::Run`], only when the agent's bot may
@@ -104,27 +106,26 @@ pub struct PipelineSettings {
 ///    the thread's session looked up (a DM has one for the conversation, a
 ///    channel one per thread, rooted at the message when it starts one),
 ///    the turn message built with what the session's transcript lacks, and
-///    the turn run, with the working emoji on the message while it runs.
-///    Only the owner's own turn on the owner's side runs in the agent's
-///    private session; a decision that would put anyone else's there fails
-///    the turn before it starts. A turn refused with
+///    the turn run, with the working emoji on the message until its reply
+///    is delivered. Only the owner's own turn on the owner's side runs in
+///    the agent's private session; a decision that would put anyone else's
+///    there fails the turn before it starts. A turn refused with
 ///    [`RunnerError::SessionReset`] runs once more, on the session looked
-///    up again. What the turn message recorded as shown
-///    is forgotten when the turn never reached the model, so the next turn
-///    shows it again.
+///    up again. What the turn message recorded as shown is forgotten when
+///    the turn never reached the model, so the next turn shows it again.
 /// 5. **Delivery**, as the agent's bot, in the thread: the directives are
 ///    taken out of the reply, the turn's staged attachments uploaded, the
-///    reply cut at [`MAX_POST_BYTES`], rendered, split and posted, and a
-///    `message_refs` row recorded for every chunk with the turn's
-///    requester and hop; then the directives' reactions, and the reactions
-///    and posts the turn queued with agentctl. Each goes out even when
-///    another failed, and then the thread is told part of the reply was
-///    lost. A failed turn posts a short message that says why when the
-///    runner could tell. A usage limit or a refused login names whose
-///    account it was, the requester's or the community key's, and the
-///    requester alone is also told privately by the manager bot, unless
-///    the thread is their own DM with the agent; the agent's owner never
-///    is, unless they asked.
+///    reply cut at [`MAX_POST_BYTES`] (closing a code block the cut left
+///    open), rendered, split and posted, and a `message_refs` row recorded
+///    for every chunk with the turn's requester and hop; then the
+///    directives' reactions, and the reactions and posts the turn queued
+///    with agentctl. Each goes out even when another failed, and then the
+///    thread is told part of the reply was lost. A failed turn posts a
+///    short message that says why when the runner could tell. A usage
+///    limit or a refused login names whose account it was, the
+///    requester's or the community key's, and the requester alone is also
+///    told privately by the manager bot, unless the thread is their own DM
+///    with the agent; the agent's owner never is, unless they asked.
 /// 6. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, when the agent's bot may post in
 ///    the conversation; [`Decision::Refuse`] posts one line in the thread,
@@ -160,7 +161,7 @@ struct Inner {
     settings: PipelineSettings,
     lanes: Mutex<HashMap<LaneKey, VecDeque<Job>>>,
     pending: Arc<Semaphore>,
-    tasks: tokio::sync::Mutex<JoinSet<()>>,
+    tasks: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
 }
@@ -203,10 +204,11 @@ impl Indicator {
     }
 }
 
-/// Holds a turn's [`Indicator`] while the turn runs. [`finish`](Self::finish)
-/// takes the emoji off. Dropped without it, as when the turn panics, the
-/// emoji is taken off in the background; during a shutdown the turn is
-/// left for [`Pipeline::cut_short`] or [`Pipeline::drain`] to announce.
+/// Holds a turn's [`Indicator`] while the turn runs and its reply is
+/// delivered. [`finish`](Self::finish) takes the emoji off. Dropped without
+/// it, as when the turn panics, the emoji is taken off in the background;
+/// during a shutdown the turn is left for [`Pipeline::cut_short`] or
+/// [`Pipeline::drain`] to announce.
 struct WorkingGuard {
     pipeline: Pipeline,
     id: u64,
@@ -262,7 +264,7 @@ impl Pipeline {
                 settings,
                 lanes: Mutex::new(HashMap::new()),
                 pending,
-                tasks: tokio::sync::Mutex::new(JoinSet::new()),
+                tasks: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
             }),
@@ -299,26 +301,29 @@ impl Pipeline {
 
     /// Waits until every message taken is answered. Call it after
     /// [`close`](Self::close), or it may never end.
+    ///
+    /// Cancelling it leaves what is still running for
+    /// [`cut_short`](Self::cut_short).
     pub async fn drain(&self) {
+        while let Some(joined) =
+            std::future::poll_fn(|cx| lock(&self.inner.tasks).poll_join_next(cx)).await
         {
-            let mut tasks = self.inner.tasks.lock().await;
-            while let Some(joined) = tasks.join_next().await {
-                if let Err(err) = joined {
-                    tracing::error!(error = %err, "a pipeline task failed");
-                }
+            if let Err(err) = joined {
+                tracing::error!(error = %err, "a pipeline task failed");
             }
         }
         self.tell_cut().await;
     }
 
     /// Closes the pipeline and drops every message still waiting or being
-    /// answered. Each turn that was running has its working emoji taken
-    /// off and its thread told to ask again ([`RESTARTING_TEXT`]), within a
-    /// few seconds. Messages still waiting are dropped without a word:
-    /// no decision was made about them yet.
+    /// answered. Each turn that was running, or delivering its reply, has
+    /// its working emoji taken off and its thread told to ask again
+    /// ([`RESTARTING_TEXT`]), within a few seconds. Messages still waiting
+    /// are dropped without a word: no decision was made about them yet.
     pub async fn cut_short(&self) {
         self.close();
-        self.inner.tasks.lock().await.shutdown().await;
+        let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
+        tasks.shutdown().await;
         lock(&self.inner.lanes).clear();
         {
             let mut working = self.working();
@@ -366,8 +371,8 @@ impl Pipeline {
             tracing::info!(message = %event.message.id, "shutting down: not handling a message");
             return Vec::new();
         }
-        let candidates = match self.candidates(&event, caps).await {
-            Ok(candidates) => candidates,
+        let (candidates, from_bot) = match self.candidates(&event, caps).await {
+            Ok(found) => found,
             Err(err) => {
                 tracing::warn!(message = %event.message.id, error = %err, "couldn't look up the agents a message addresses");
                 return Vec::new();
@@ -378,11 +383,10 @@ impl Pipeline {
         let mut waiting = Vec::new();
         for agent in candidates {
             let (done, finished) = oneshot::channel();
-            if self
-                .enqueue((agent, thread.clone()), Arc::clone(&event), caps, done)
-                .await
-            {
+            if self.enqueue((agent, thread.clone()), Arc::clone(&event), caps, done) {
                 waiting.push(finished);
+            } else if from_bot {
+                tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; dropping a bot's message");
             } else {
                 self.busy(&event, agent, caps).await;
             }
@@ -391,8 +395,10 @@ impl Pipeline {
     }
 
     /// Queues `event` for the agent of `key`, starting the lane's task if
-    /// it has none. False when the lane or the pipeline is full.
-    async fn enqueue(
+    /// it has none. False when the lane or the pipeline is full. It never
+    /// waits, so a sender cancelled mid-dispatch can't leave a lane
+    /// without its task.
+    fn enqueue(
         &self,
         key: LaneKey,
         event: Arc<InboundEvent>,
@@ -422,7 +428,7 @@ impl Pipeline {
                 }
             }
         };
-        let mut tasks = self.inner.tasks.lock().await;
+        let mut tasks = lock(&self.inner.tasks);
         if self.is_closed() {
             lock(&self.inner.lanes).remove(&key);
             return true;
@@ -478,12 +484,13 @@ impl Pipeline {
         }
     }
 
-    /// The agents that may answer `event`, each once.
+    /// The agents that may answer `event`, each once, and whether a bot
+    /// sent it: one the surface flags, an agent's or a manager bot.
     async fn candidates(
         &self,
         event: &InboundEvent,
         caps: Caps,
-    ) -> Result<Vec<AgentId>, StoreError> {
+    ) -> Result<(Vec<AgentId>, bool), StoreError> {
         let store = &self.inner.store;
         let mut candidates = Vec::new();
         if caps.per_binding_delivery {
@@ -522,7 +529,11 @@ impl Pipeline {
             seen.push(*agent);
             keep
         });
-        Ok(candidates)
+        let from_bot = event.sender_is_bot
+            || event.sender_bot_user.is_some()
+            || sender.is_some()
+            || self.inner.settings.managers.contains(&event.sender);
+        Ok((candidates, from_bot))
     }
 
     /// Routes `event` for `agent` and acts on the decision.
@@ -650,19 +661,18 @@ impl Pipeline {
             return Ok(());
         }
         let target = reply_target(event, caps);
-        let ran = match self.prepare(agent, event, turn.credential).await {
+        let (working, ran) = match self.prepare(agent, event, turn.credential).await {
             Ok(None) => return Ok(()),
             Ok(Some(prepared)) => {
                 let working = self.show_working(&surface, event, &target).await;
                 let ran = self
                     .turn(event, agent, caps, &turn, surface.as_ref(), prepared)
                     .await;
-                working.finish().await;
-                ran
+                (Some(working), ran)
             }
-            Err(err) => Err(err),
+            Err(err) => (None, Err(err)),
         };
-        match ran {
+        let delivered = match ran {
             Ok((session, turn_id, report)) => {
                 let failure = CredentialFailure::of(&report.outcome);
                 let delivery = Delivery {
@@ -687,10 +697,15 @@ impl Pipeline {
             }
             Err(err) => {
                 tracing::warn!(%agent, message = %event.message.id, error = %err, "a turn failed before it reached the model");
-                say(surface.as_ref(), &target, FAILED_TEXT).await?;
-                Ok(())
+                say(surface.as_ref(), &target, FAILED_TEXT)
+                    .await
+                    .map_err(PipelineError::from)
             }
+        };
+        if let Some(working) = working {
+            working.finish().await;
         }
+        delivered
     }
 
     /// What a turn of `agent` needs before its session: its bot's identity
@@ -718,7 +733,8 @@ impl Pipeline {
     }
 
     /// Puts the working emoji on `event`'s message until the returned
-    /// guard is finished or dropped.
+    /// guard is finished or dropped. A shutdown tells the thread of a turn
+    /// whose guard is still held.
     async fn show_working(
         &self,
         surface: &Arc<dyn Surface>,
@@ -967,7 +983,8 @@ async fn post_chunk(
 }
 
 /// `text`, cut at [`MAX_POST_BYTES`] on a character boundary with
-/// [`TRUNCATED_NOTE`] after it when it is longer.
+/// [`TRUNCATED_NOTE`] after it when it is longer. A code block the cut
+/// leaves open is closed first, so the note isn't shown as code.
 fn capped(text: String) -> String {
     if text.len() <= MAX_POST_BYTES {
         return text;
@@ -976,7 +993,48 @@ fn capped(text: String) -> String {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{TRUNCATED_NOTE}", &text[..end])
+    let kept = &text[..end];
+    let close = match open_fence(kept) {
+        Some(fence) if kept.ends_with('\n') => fence.to_owned(),
+        Some(fence) => format!("\n{fence}"),
+        None => String::new(),
+    };
+    format!("{kept}{close}{TRUNCATED_NOTE}")
+}
+
+/// The fence of the code block Markdown `text` leaves open at its end, if
+/// any: the run of three or more backticks or tildes, indented by at most
+/// three spaces, that opened it. A block closes at a line holding only a
+/// run of the same character at least as long.
+fn open_fence(text: &str) -> Option<&str> {
+    let mut open: Option<&str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start_matches(' ');
+        if line.len() - trimmed.len() > 3 {
+            continue;
+        }
+        let Some(marker) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let rest = trimmed.trim_start_matches(marker);
+        let run = &trimmed[..trimmed.len() - rest.len()];
+        if run.len() < 3 {
+            continue;
+        }
+        match open {
+            None if marker == '`' && rest.contains('`') => {}
+            None => open = Some(run),
+            Some(fence)
+                if fence.starts_with(marker)
+                    && run.len() >= fence.len()
+                    && rest.trim().is_empty() =>
+            {
+                open = None;
+            }
+            Some(_) => {}
+        }
+    }
+    open
 }
 
 /// Delivers what one turn made, as the agent's bot.
@@ -1239,5 +1297,34 @@ mod tests {
         assert!(cut.ends_with(TRUNCATED_NOTE));
         let kept = cut.strip_suffix(TRUNCATED_NOTE).unwrap();
         assert_eq!(kept, "a".repeat(MAX_POST_BYTES - 1));
+    }
+
+    #[test]
+    fn a_reply_cut_inside_a_code_block_closes_it_before_the_note() {
+        let long = format!("Here:\n```rust\n{}", "x".repeat(MAX_POST_BYTES));
+        let cut = capped(long);
+        let kept = cut.strip_suffix(TRUNCATED_NOTE).unwrap();
+        assert!(kept.ends_with("xx\n```"), "{}", &kept[kept.len() - 10..]);
+        assert_eq!(open_fence(kept), None);
+
+        let at_a_line = format!("~~~~\n{}\n", "x".repeat(MAX_POST_BYTES - 6));
+        let cut = capped(format!("{at_a_line}more"));
+        assert_eq!(cut, format!("{at_a_line}~~~~{TRUNCATED_NOTE}"));
+
+        let closed = format!("```\ncode\n```\n{}", "y".repeat(MAX_POST_BYTES));
+        let cut = capped(closed);
+        assert!(cut.strip_suffix(TRUNCATED_NOTE).unwrap().ends_with('y'));
+    }
+
+    #[test]
+    fn open_fence_finds_the_block_left_open() {
+        assert_eq!(open_fence("a\n````md\n```\nstill code"), Some("````"));
+        assert_eq!(open_fence("~~~\n```\n"), Some("~~~"));
+        assert_eq!(open_fence("```\n``` not a close\n"), Some("```"));
+        assert_eq!(open_fence("  ```sh\nmake"), Some("```"));
+        assert_eq!(open_fence("```\ncode\n```"), None);
+        assert_eq!(open_fence("``\nx"), None);
+        assert_eq!(open_fence("    ```\nindented code"), None);
+        assert_eq!(open_fence("``` a`b\ninline"), None);
     }
 }

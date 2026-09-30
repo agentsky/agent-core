@@ -257,6 +257,39 @@ impl Stack {
         self.app.store()
     }
 
+    /// Alice's second agent, `name`, whose bot is `bot`.
+    async fn other_agent(&self, name: &str, bot: &str) -> AgentId {
+        let store = self.store();
+        let team = TEAM.into();
+        let AgentCreation::Created(agent, binding) = store
+            .create_agent(
+                &NewAgent {
+                    owner: self.alice,
+                    name,
+                    persona: "You write.",
+                    visibility: Visibility::Public,
+                    surface: SurfaceKind::RocketChat,
+                    team: &team,
+                },
+                10,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        store
+            .set_binding_bot_user(binding, &UserId::new(bot), name)
+            .await
+            .unwrap();
+        store
+            .activate_binding(binding, &SecretString::from("t"), OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        agent.id
+    }
+
     /// Makes every session's next turn, whichever it is, play `turn`.
     fn next_turn(&self, turn: Turn) {
         testkit::write_script(&self.script, &vec![turn; 8]).unwrap();
@@ -674,37 +707,7 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     let sent = posts(&stack.calls_since(before));
     assert_eq!(sent[0].1, agentd::pipeline::FAILED_TEXT);
 
-    let team = TEAM.into();
-    let AgentCreation::Created(writer, writer_binding) = store
-        .create_agent(
-            &NewAgent {
-                owner: stack.alice,
-                name: "writer",
-                persona: "You write.",
-                visibility: Visibility::Public,
-                surface: SurfaceKind::RocketChat,
-                team: &team,
-            },
-            10,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("created");
-    };
-    store
-        .set_binding_bot_user(writer_binding, &UserId::new("UWRITER"), "writer")
-        .await
-        .unwrap();
-    store
-        .activate_binding(
-            writer_binding,
-            &SecretString::from("t"),
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap();
+    let writer = stack.other_agent("writer", "UWRITER").await;
     let bob = store.member_for_identity(&key("bob")).await.unwrap();
     let by_writer = msg("GENERAL", "w1");
     let recording = store.clone();
@@ -716,7 +719,7 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
                     session: SessionId::new_v4(),
                     msg: &by_writer,
                     thread_root: None,
-                    agent: Some(writer.id),
+                    agent: Some(writer),
                     turn: None,
                     requester: &core_types::Requester {
                         member: bob,
@@ -1172,5 +1175,170 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
             == 2
     })
     .await;
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its_thread_told() {
+    let stack = start_with(Setup {
+        drain_timeout_secs: 1,
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Posted too late."));
+    stack.mock.delay_next(Op::Post, Duration::from_secs(20));
+    let event = stack.event("alice", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]);
+    stack
+        .pipeline
+        .sink(MockSurface::DEFAULT_CAPS)
+        .send(event)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while stack.fake.message_requests().await.is_empty() {
+        assert!(Instant::now() < deadline, "timed out waiting for the turn");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let Stack {
+        pipeline,
+        mock,
+        stop,
+        task,
+        ..
+    } = stack;
+    drop(pipeline);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&Call::Unreact {
+            msg: msg("GENERAL", "c2"),
+            emoji: "hourglass".into()
+        }),
+        "{calls:#?}"
+    );
+    let sent = posts(&calls);
+    assert_eq!(sent.len(), 1, "{calls:#?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("c2")));
+    assert_eq!(sent[0].1, RESTARTING_TEXT);
+}
+
+#[tokio::test]
+async fn a_bot_past_the_queue_bounds_gets_no_busy_line() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.max_pending = 0,
+        ..Setup::default()
+    })
+    .await;
+    let mut from_bot = stack.event("UOTHERBOT", "DM1", ConvKind::Dm, "o1", None, &[]);
+    from_bot.sender_is_bot = true;
+    stack.handle(from_bot).await;
+    stack.other_agent("writer", "UWRITER").await;
+    stack
+        .handle(stack.event("UWRITER", "GENERAL", ConvKind::Channel, "o2", None, &[BOT]))
+        .await;
+    assert!(
+        posts(&stack.mock.calls()).is_empty(),
+        "{:#?}",
+        stack.mock.calls()
+    );
+    stack
+        .handle(stack.event("alice", "DM1", ConvKind::Dm, "o3", None, &[]))
+        .await;
+    let sent = posts(&stack.mock.calls());
+    assert_eq!(sent.len(), 1, "a person still hears the agent is busy");
+    assert_eq!(
+        sent[0].1,
+        "helper is busy with other requests. Ask again in a few minutes."
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn an_agents_post_that_names_no_other_agent_holds_no_lane_up() {
+    let stack = start().await;
+    let first = stack.answered_root("r1", "First.").await;
+    stack.other_agent("writer", "UWRITER").await;
+    let before = stack.mock.calls().len();
+    let mut upload = stack.event(
+        "UWRITER",
+        "GENERAL",
+        ConvKind::Channel,
+        "f1",
+        Some(first.id.as_str()),
+        &[],
+    );
+    upload.sender_bot_user = Some(UserId::new("UWRITER"));
+    upload.text = String::new();
+    let started = Instant::now();
+    stack.handle(upload).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the unattributed post was ignored without waiting for its attribution: {:?}",
+        started.elapsed()
+    );
+    assert!(posts(&stack.calls_since(before)).is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn only_an_attributed_post_of_the_bot_is_shown_as_from_outside_the_session() {
+    let stack = start().await;
+    let first = stack.answered_root("r1", "First.").await;
+    let alice = stack
+        .store()
+        .member_for_identity(&key("alice"))
+        .await
+        .unwrap();
+    stack
+        .store()
+        .record_message_ref(
+            &store::NewMessageRef {
+                session: SessionId::new_v4(),
+                msg: &msg("GENERAL", "p1"),
+                thread_root: Some(&MessageId::new("r1")),
+                agent: Some(stack.agent),
+                turn: None,
+                requester: &core_types::Requester {
+                    member: alice,
+                    key: key("alice"),
+                },
+                hop: core_types::Hop::ZERO,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT hello"),
+            said(first.id.as_str(), BOT, "First."),
+            said("n1", BOT, "report.txt"),
+            said("p1", BOT, "a private task's result"),
+            said("r2", "alice", "@UBOT again"),
+        ],
+    );
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::reply("Second."));
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "r2",
+            Some("r1"),
+            &[BOT],
+        ))
+        .await;
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(bodies[0].contains("] you: report.txt"), "{}", bodies[0]);
+    assert!(
+        bodies[0].contains("] you, outside this session: a private task's result"),
+        "{}",
+        bodies[0]
+    );
     stack.stop().await;
 }

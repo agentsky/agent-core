@@ -19,19 +19,19 @@ pub(crate) const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
 const ATTRIBUTION_FIRST_PAUSE: Duration = Duration::from_millis(25);
 
 /// The row attributing `msg` to the agent agentd posted it as. When
-/// `from_agent`, the message was sent by an agent's bot, so its row is
-/// read again, with growing pauses, for up to [`ATTRIBUTION_WAIT`].
+/// `wait`, the row is read again, with growing pauses, for up to
+/// [`ATTRIBUTION_WAIT`].
 async fn attribution(
     store: &Store,
     msg: &MsgRef,
-    from_agent: bool,
+    wait: bool,
 ) -> Result<Option<MessageRef>, StoreError> {
     let deadline = Instant::now() + ATTRIBUTION_WAIT;
     let mut pause = ATTRIBUTION_FIRST_PAUSE;
     loop {
         let posted = store.posted_message_ref(msg).await?;
         let now = Instant::now();
-        if posted.is_some() || !from_agent || now >= deadline {
+        if posted.is_some() || !wait || now >= deadline {
             return Ok(posted);
         }
         tokio::time::sleep(pause.min(deadline - now)).await;
@@ -45,12 +45,16 @@ async fn attribution(
 /// It loads each lookup the [`RouterView`] rustdoc lists: the agent's owner
 /// and state, which bots the sender and every mention are (the manager
 /// bots included), whose binding received the event, the attribution of
-/// the event's message (waited for when an agent's bot sent it) and whether
-/// its reply-to message is the agent's,
+/// the event's message and whether its reply-to message is the agent's,
 /// the members of the sender and of an attributed requester, whether the
 /// owner and those members are linked, and whether a community admin has
 /// set the community API key. Until T27, `policy` answers
 /// [`AgentPolicy::default`] and `is_banned` `Some(false)`.
+///
+/// The attribution is waited for only when the router reads it: another
+/// agent's bot sent the message, mentioning this agent. A post of an
+/// agent's bot that has none, such as a file a turn uploaded, holds no lane
+/// up otherwise.
 #[derive(Debug, Default)]
 pub(crate) struct StoreView {
     agent: Option<(AgentId, MemberId, AgentState)>,
@@ -82,23 +86,34 @@ impl StoreView {
             view.agent = Some((row.id, row.owner, state));
             view.link(store, row.owner).await?;
         }
-        let mentions = event.mentions.iter().map(|user| MemberKey {
-            surface: event.conv.surface,
-            team: event.conv.team.clone(),
-            user: user.clone(),
-        });
-        for key in std::iter::once(event.sender.clone()).chain(mentions) {
-            if managers.contains(&key) {
-                view.bots.insert(key, ManagedBot::Manager);
-            } else if let Some(owner) = store.agent_of_bot_user(&key).await? {
-                view.bots.insert(key, ManagedBot::Agent(owner));
+        let mentions: Vec<_> = event
+            .mentions
+            .iter()
+            .map(|user| MemberKey {
+                surface: event.conv.surface,
+                team: event.conv.team.clone(),
+                user: user.clone(),
+            })
+            .collect();
+        for key in std::iter::once(&event.sender).chain(&mentions) {
+            if managers.contains(key) {
+                view.bots.insert(key.clone(), ManagedBot::Manager);
+            } else if let Some(owner) = store.agent_of_bot_user(key).await? {
+                view.bots.insert(key.clone(), ManagedBot::Agent(owner));
             }
         }
         if let Some(bound) = store.agent_for_binding(event.binding).await? {
             view.binding = Some((event.binding, bound.id));
         }
-        let from_agent = matches!(view.bots.get(&event.sender), Some(ManagedBot::Agent(_)));
-        if let Some(posted) = attribution(store, &event.message, from_agent).await?
+        let from_other_agent = matches!(
+            view.bots.get(&event.sender),
+            Some(ManagedBot::Agent(poster)) if *poster != agent
+        );
+        let mentions_agent = mentions
+            .iter()
+            .any(|key| view.bots.get(key) == Some(&ManagedBot::Agent(agent)));
+        let wait = from_other_agent && mentions_agent;
+        if let Some(posted) = attribution(store, &event.message, wait).await?
             && let Some(poster) = posted.agent
         {
             view.member(store, &posted.requester.key).await?;
