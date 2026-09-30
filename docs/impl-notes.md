@@ -3919,6 +3919,36 @@ first end, then one interval, doubling up to 32 intervals (32 minutes), and
 one that ran that long starts over. A broken bot so logs an error about
 twice an hour, not every minute, until it is fixed or deleted.
 
+### Retiring a bot and stopping its connection happen in either order
+
+**Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
+failed under CPU load, always at "the pass retired the bot": 1 of 200
+runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
+server to count no connections, then read the binding once. A pass stops a connection by signalling its task, which
+closes the socket on its own while the pass goes on to `abandon_stale` and
+`retire_pending`, so the socket can close before `mark_retired` runs.
+Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
+The order can also flip: a delete that lands between a pass's `reconcile`
+and its `retire_pending` is retired by that pass and disconnected by the
+next, and the `delete` command retires the bot before it pokes.
+
+**Solution.** The supervisor stays as it is. Both steps follow from the
+disabled binding, every pass does both, and a delete pokes after disabling
+it, so the end state is the same in either order within a pass: the bot
+user deactivated, `retired_at` set, and no connection. The test now waits
+for that whole end state through a shared `eventually` helper, and passed
+200 of 200 runs with 8 busy loops, 200 of 200 with 16, and 10 of 10 with
+the 300 ms added.
+
+`a_bot_made_after_its_creation_was_abandoned_owes_retirement` had the same
+shape: a 100 ms sleep stood in for "`create_bot` has recorded the username
+and sent `users.create`", and a 300 ms response delay for "the abandonment
+lands before the response". Adding 150 ms before the username is recorded
+failed it 10 of 10 runs. Its `users.create` response is now held until the
+test has abandoned the creation, so the abandonment always lands while the
+request is in flight; it passes 10 of 10 with the 150 ms added. The tests install no tracing subscriber, so
+`RUST_LOG` doesn't change their timing.
+
 ### Before turns, a bot reacts instead of replying
 
 **Issue.** The plan allows a fixed acknowledgement before T23, and the live
