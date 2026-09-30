@@ -323,7 +323,12 @@ async fn plays_a_turn_with_the_design_flags() {
         .iter()
         .map(|e| e["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["user", "assistant"]);
+    assert_eq!(
+        types,
+        ["user", "assistant", "cost-state"],
+        "the process saves its total when its input ends"
+    );
+    assert_eq!(entries[2]["totalCostUSD"], REPLY_COST_USD);
     assert_eq!(entries[0]["message"]["content"], "Say hello.");
     assert_eq!(entries[0]["sessionId"], setup.id.to_string());
     assert_eq!(entries[1]["message"]["content"][0]["text"], "Hello, world.");
@@ -476,8 +481,8 @@ async fn a_resumed_session_continues_the_script_and_the_transcript() {
         .collect();
     assert_eq!(
         totals,
-        [REPLY_COST_USD, 2.0 * REPLY_COST_USD],
-        "the cost is the process's running total, from 0 on a resumed process"
+        [2.0 * REPLY_COST_USD, 3.0 * REPLY_COST_USD],
+        "the cost is the process's running total, from the saved one on a resumed process"
     );
 
     let entries = transcript_entries(&setup.transcript());
@@ -487,6 +492,16 @@ async fn a_resumed_session_continues_the_script_and_the_transcript() {
         .map(|e| &e["message"]["content"])
         .collect();
     assert_eq!(users, ["one", "two", "three"]);
+    let saved: Vec<f64> = entries
+        .iter()
+        .filter(|e| e["type"] == "cost-state")
+        .map(|e| e["totalCostUSD"].as_f64().unwrap())
+        .collect();
+    assert_eq!(
+        saved,
+        [REPLY_COST_USD, 3.0 * REPLY_COST_USD],
+        "each process that ended its input saved its total"
+    );
     assert_eq!(api.message_requests().await.len(), 3);
 }
 
@@ -621,6 +636,12 @@ async fn a_crash_exits_mid_turn_without_a_result() {
         ]
     );
     assert_eq!(api.message_requests().await.len(), 2);
+    assert!(
+        transcript_entries(&setup.transcript())
+            .iter()
+            .all(|e| e["type"] != "cost-state"),
+        "a crash saves no total, as a killed CLI doesn't"
+    );
 }
 
 #[tokio::test]
@@ -834,5 +855,5 @@ async fn extra_lines_are_printed_verbatim_before_the_reply() {
     );
     let entries = transcript_entries(&setup.transcript());
     assert!(entries.iter().all(|e| e["type"] != "active_goal"));
-    assert_eq!(entries.len(), 4);
+    assert_eq!(entries.len(), 5, "two turns and the saved total");
 }

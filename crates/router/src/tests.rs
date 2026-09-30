@@ -39,6 +39,8 @@ struct FakeView {
     banned_members: HashSet<MemberId>,
     banned_keys: HashSet<MemberKey>,
     bans_unavailable: bool,
+    thread: ThreadBudget,
+    thread_unavailable: bool,
 }
 
 impl RouterView for FakeView {
@@ -94,6 +96,10 @@ impl RouterView for FakeView {
             .is_some_and(|member| self.banned_members.contains(&member))
             || self.banned_keys.contains(&requester.key);
         (!self.bans_unavailable).then_some(banned)
+    }
+
+    fn thread_budget(&self) -> Option<ThreadBudget> {
+        (!self.thread_unavailable).then_some(self.thread)
     }
 }
 
@@ -945,6 +951,219 @@ fn hop_counter_overflow_is_refused_as_hop_cap() {
 }
 
 #[test]
+fn past_the_daily_cap_is_refused_for_everyone_but_the_owner() {
+    let mut w = World::new();
+    w.set_policy(AgentPolicy {
+        turns_per_day: Some(5),
+        turns_today: 4,
+        ..AgentPolicy::default()
+    });
+    assert!(matches!(
+        w.route(&w.mention(&w.linked_key)),
+        Decision::Run { .. }
+    ));
+
+    w.set_policy(AgentPolicy {
+        turns_per_day: Some(5),
+        turns_today: 5,
+        ..AgentPolicy::default()
+    });
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::DailyCap { max: 5 })
+    );
+    assert_eq!(
+        w.route(&w.mention(&w.stranger_key)),
+        refused(RefuseReason::DailyCap { max: 5 }),
+        "refused before the link prompt"
+    );
+    let requester = w.requester(&w.linked_key.clone());
+    let hop = w.b_mentions_a(requester, Hop::ZERO);
+    assert_eq!(
+        w.route(&hop),
+        refused(RefuseReason::DailyCap { max: 5 }),
+        "a hop is one of the agent's turns too"
+    );
+    assert!(
+        matches!(w.route(&w.mention(&w.owner_key)), Decision::Run { .. }),
+        "the owner is never capped"
+    );
+    assert!(matches!(w.route(&w.dm(&w.owner_key)), Decision::Run { .. }));
+}
+
+#[test]
+fn a_daily_cap_of_zero_leaves_the_agent_to_its_owner() {
+    let mut w = World::new();
+    w.set_policy(AgentPolicy {
+        turns_per_day: Some(0),
+        ..AgentPolicy::default()
+    });
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::DailyCap { max: 0 })
+    );
+    assert!(matches!(
+        w.route(&w.mention(&w.owner_key)),
+        Decision::Run { .. }
+    ));
+    w.set_policy(AgentPolicy {
+        turns_today: u32::MAX,
+        ..AgentPolicy::default()
+    });
+    assert!(
+        matches!(w.route(&w.mention(&w.linked_key)), Decision::Run { .. }),
+        "no cap, however many turns"
+    );
+}
+
+#[test]
+fn past_the_thread_turn_cap_is_refused_for_everyone() {
+    let mut w = World::new();
+    w.view.thread = ThreadBudget {
+        turns_this_hour: 9,
+        max_turns_per_hour: Some(10),
+        ..ThreadBudget::default()
+    };
+    assert!(matches!(
+        w.route(&w.mention(&w.linked_key)),
+        Decision::Run { .. }
+    ));
+    w.view.thread.turns_this_hour = 10;
+    for event in [w.mention(&w.linked_key), w.mention(&w.owner_key)] {
+        assert_eq!(
+            w.route(&event),
+            refused(RefuseReason::ThreadTurns { max: 10 })
+        );
+    }
+    let requester = w.requester(&w.owner_key.clone());
+    let hop = w.b_mentions_a(requester, Hop::ZERO);
+    assert_eq!(
+        w.route(&hop),
+        refused(RefuseReason::ThreadTurns { max: 10 }),
+        "agents answering each other stop at the cap, whoever asked"
+    );
+}
+
+#[test]
+fn past_the_thread_token_budget_is_refused_for_everyone() {
+    let mut w = World::new();
+    w.view.thread = ThreadBudget {
+        tokens_today: 999,
+        max_tokens_per_day: Some(1_000),
+        ..ThreadBudget::default()
+    };
+    assert!(matches!(
+        w.route(&w.mention(&w.linked_key)),
+        Decision::Run { .. }
+    ));
+    w.view.thread.tokens_today = 1_000;
+    for event in [w.mention(&w.linked_key), w.mention(&w.owner_key)] {
+        assert_eq!(
+            w.route(&event),
+            refused(RefuseReason::ThreadTokens { max: 1_000 })
+        );
+    }
+    w.view.thread.max_turns_per_hour = Some(0);
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::ThreadTurns { max: 0 }),
+        "the turn cap is reported before the token budget"
+    );
+    w.view.thread = ThreadBudget {
+        turns_this_hour: u32::MAX,
+        tokens_today: u64::MAX,
+        ..ThreadBudget::default()
+    };
+    assert!(
+        matches!(w.route(&w.mention(&w.linked_key)), Decision::Run { .. }),
+        "no caps, however much was spent"
+    );
+}
+
+#[test]
+fn thread_caps_leave_one_to_one_dms_alone() {
+    let mut w = World::new();
+    w.view.thread = ThreadBudget {
+        turns_this_hour: 1,
+        max_turns_per_hour: Some(0),
+        tokens_today: 1,
+        max_tokens_per_day: Some(0),
+    };
+    w.view.thread_unavailable = true;
+    assert!(matches!(w.route(&w.dm(&w.owner_key)), Decision::Run { .. }));
+    assert!(matches!(
+        w.route(&w.dm(&w.linked_key)),
+        Decision::Run { .. }
+    ));
+    let mut group = w.mention(&w.linked_key);
+    group.conv_kind = ConvKind::GroupDm;
+    assert_eq!(
+        w.route(&group),
+        refused(RefuseReason::PolicyUnavailable),
+        "a group DM can hold several agents"
+    );
+    w.view.thread_unavailable = false;
+    assert_eq!(
+        w.route(&group),
+        refused(RefuseReason::ThreadTurns { max: 0 })
+    );
+}
+
+#[test]
+fn an_unknown_thread_budget_refuses() {
+    let mut w = World::new();
+    w.view.thread_unavailable = true;
+    assert_eq!(
+        w.route(&w.mention(&w.owner_key)),
+        refused(RefuseReason::PolicyUnavailable)
+    );
+    assert_eq!(
+        w.route(&w.message(&w.linked_key)),
+        ignored(IgnoreReason::NotAddressed),
+        "an unaddressed message draws no notice"
+    );
+}
+
+#[test]
+fn precedence_hop_cap_then_daily_cap_then_thread_caps_then_credential() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    w.set_policy(AgentPolicy {
+        max_hops: Hop::ZERO,
+        turns_per_day: Some(0),
+        ..AgentPolicy::default()
+    });
+    w.view.thread = ThreadBudget {
+        max_turns_per_hour: Some(0),
+        ..ThreadBudget::default()
+    };
+    let requester = w.requester(&w.stranger_key.clone());
+    let event = w.b_mentions_a(requester, Hop::ZERO);
+    assert_eq!(
+        w.route(&event),
+        refused(RefuseReason::HopCap { max: Hop::ZERO })
+    );
+    w.set_policy(AgentPolicy {
+        turns_per_day: Some(0),
+        ..AgentPolicy::default()
+    });
+    assert_eq!(w.route(&event), refused(RefuseReason::DailyCap { max: 0 }));
+    w.set_policy(AgentPolicy::default());
+    assert_eq!(
+        w.route(&event),
+        refused(RefuseReason::ThreadTurns { max: 0 })
+    );
+    w.view.thread = ThreadBudget::default();
+    assert!(matches!(
+        w.route(&event),
+        Decision::Run {
+            credential: CredentialRef::Community,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn paused_agent_is_refused() {
     let mut w = World::new();
     w.view.states.insert(w.a, AgentState::Paused);
@@ -1401,6 +1620,9 @@ fn reasons_have_distinct_log_text() {
         RefuseReason::Banned,
         RefuseReason::Denied,
         RefuseReason::HopCap { max: Hop(2) },
+        RefuseReason::DailyCap { max: 2 },
+        RefuseReason::ThreadTurns { max: 2 },
+        RefuseReason::ThreadTokens { max: 2 },
         RefuseReason::PolicyUnavailable,
     ];
     let texts: HashSet<String> = ignores

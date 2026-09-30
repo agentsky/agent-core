@@ -399,32 +399,54 @@ fn limits_in_any_order() {
             panic!()
         };
         assert_eq!(n, name("helper"));
-        assert_eq!((turns_per_day, hops), (Some(50), Some(2)), "{text}");
+        assert_eq!(
+            (turns_per_day, hops),
+            (Some(Setting::To(50)), Some(Setting::To(2))),
+            "{text}"
+        );
     }
     assert!(matches!(
         ok("limits helper hops=0"),
         Command::Limits {
             turns_per_day: None,
-            hops: Some(0),
+            hops: Some(Setting::To(0)),
             ..
         }
     ));
     assert!(matches!(
         ok("limits helper turns=4294967295/day"),
         Command::Limits {
-            turns_per_day: Some(u32::MAX),
+            turns_per_day: Some(Setting::To(u32::MAX)),
             hops: None,
             ..
         }
     ));
+    for text in [
+        "limits helper turns=off hops=off",
+        "limits helper TURNS=OFF/day Hops=Off",
+    ] {
+        assert!(
+            matches!(
+                ok(text),
+                Command::Limits {
+                    turns_per_day: Some(Setting::Off),
+                    hops: Some(Setting::Off),
+                    ..
+                }
+            ),
+            "{text}"
+        );
+    }
 }
 
 #[test]
 fn limits_rejects_malformed_settings() {
     let usage = "Usage: `limits <name> [turns=N/day] [hops=N]`";
-    let rule = "A setting is turns=N/day or hops=N, with N a whole number.";
+    let rule = "A setting is turns=N/day or hops=N, with N a whole number or off.";
     for text in [
         "limits helper turns=",
+        "limits helper turns=of",
+        "limits helper hops=none",
         "limits helper turns=-1/day",
         "limits helper turns=+5",
         "limits helper turns=5/week",

@@ -28,8 +28,11 @@
 //! [retirements](Store::claim_retirement) and
 //! [Slack apps](Store::set_slack_app),
 //! [`agent_skills`](Store::put_skill),
-//! [`community_settings`](Store::set_community_api_key), and
-//! [`failure_notices`](Store::claim_failure_notice).
+//! [`community_settings`](Store::set_community_api_key),
+//! [`failure_notices`](Store::claim_failure_notice), the usage meter
+//! ([`usage`](Store::record_turn_usage), with `thread_usage` and
+//! `limit_notices`), [`agent_policies`](Store::agent_settings) and
+//! [`bans`](Store::ban_member).
 
 #![warn(missing_docs)]
 
@@ -51,12 +54,14 @@ mod failure_notices;
 mod members;
 mod message_refs;
 mod pending_logins;
+mod policies;
 mod relink_notices;
 mod seal;
 mod sessions;
 mod skills;
 mod slack_apps;
 mod slack_config_tokens;
+mod usage;
 mod volumes;
 
 pub use agents::{
@@ -69,6 +74,7 @@ pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
+pub use policies::{AgentSettings, Ban, NO_RULES};
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use sessions::{RESETS_AT_ONCE, Session, SessionKind, ThreadSession};
@@ -77,6 +83,7 @@ pub use slack_apps::{InstallReminder, NewSlackApp, SlackAppBinding, SlackAppKeys
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
+pub use usage::{THREAD_USAGE_RETENTION, ThreadSpend, TurnUsage, UsageTotals};
 pub use volumes::Volume;
 
 use seal::Aad;
@@ -299,6 +306,27 @@ pub(crate) mod test_util {
         OffsetDateTime::from_unix_timestamp(seconds).unwrap()
     }
 
+    /// A new Rocket.Chat agent of `owner` named `name`.
+    pub(crate) async fn agent(
+        store: &Store,
+        owner: core_types::MemberId,
+        name: &str,
+    ) -> core_types::AgentId {
+        let team = TeamId::new("T1");
+        let new = crate::NewAgent {
+            owner,
+            name,
+            persona: "p",
+            visibility: crate::Visibility::Public,
+            surface: SurfaceKind::RocketChat,
+            team: &team,
+        };
+        match store.create_agent(&new, 10, at(1)).await.unwrap() {
+            crate::AgentCreation::Created(agent, _) => agent.id,
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// A directory under the system temp directory, removed on drop.
     pub(crate) struct TempDir(PathBuf);
 
@@ -369,13 +397,16 @@ mod tests {
             [
                 "_sqlx_migrations",
                 "agent_bindings",
+                "agent_policies",
                 "agent_skills",
                 "agents",
+                "bans",
                 "claude_link_generations",
                 "claude_links",
                 "community_settings",
                 "ctl_tokens",
                 "failure_notices",
+                "limit_notices",
                 "members",
                 "message_refs",
                 "pending_logins",
@@ -384,6 +415,8 @@ mod tests {
                 "sessions",
                 "slack_config_tokens",
                 "surface_identities",
+                "thread_usage",
+                "usage",
                 "volumes",
             ]
         );

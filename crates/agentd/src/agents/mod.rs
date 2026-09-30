@@ -213,6 +213,22 @@ impl RocketChatAgents {
         }
     }
 
+    /// The id of the room named `name`, such as `general` for `#general`,
+    /// or `None` if the manager finds no such room it may read.
+    ///
+    /// # Errors
+    ///
+    /// Any other [`SurfaceError`] from `rooms.info`.
+    pub async fn room_named(&self, name: &str) -> Result<Option<ConversationId>, SurfaceError> {
+        match self.inner.rest.room_by_name(name).await {
+            Ok(room) => Ok(Some(room.id)),
+            Err(SurfaceError::Api(_) | SurfaceError::NotFound(_) | SurfaceError::Forbidden(_)) => {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Downloads the file `id` named `name` from a message the manager
     /// received, refusing more than `max` bytes.
     ///

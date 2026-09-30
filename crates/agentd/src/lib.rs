@@ -16,6 +16,8 @@
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`pipeline`]: the runner's sessions and sandboxes, and the turn hooks
 //!   that give each process its placeholder and agentctl token.
+//! - [`policy`]: agents' limits and allow and deny rules, and the
+//!   community's caps on threads and hops.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
 //! - [`skills`]: agents' skills, the bundled `agentctl` skill, and the
 //!   egress hosts skills declare.
@@ -36,6 +38,7 @@ pub mod config;
 pub mod ctl;
 pub mod net;
 pub mod pipeline;
+pub mod policy;
 pub mod server;
 pub mod skills;
 pub mod slack;

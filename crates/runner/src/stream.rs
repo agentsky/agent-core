@@ -114,8 +114,10 @@ pub struct TurnResult {
     /// The turn's cost in US dollars, as the CLI reckons it: the rise in
     /// [`process_total_cost_usd`](Self::process_total_cost_usd) since the
     /// process's previous result, never below 0. The first result of a
-    /// process started with `--resume` rises from 0, so it holds the total
-    /// the CLI restored as well as the turn's own cost.
+    /// process started with `--resume` rises from the total the CLI
+    /// restored, when the process was told it
+    /// ([`ClaudeProcess::count_cost_from`](crate::ClaudeProcess::count_cost_from));
+    /// `None` when that total isn't known.
     pub cost_usd: Option<f64>,
     /// The line's `total_cost_usd`: the CLI's running total for its
     /// process, not the turn's cost. A process started with `--session-id`
@@ -265,11 +267,18 @@ impl ResultLine {
     /// `total_cost_usd` of the process's previous results, 0 on a new
     /// process; the turn's cost is what this line adds to it, and it is
     /// moved on to this line's total.
-    pub(crate) fn into_result(self, stats: TurnStats, process_total: &mut f64) -> TurnResult {
-        let cost_usd = self.total_cost_usd.map(|total| {
-            let cost = (total - *process_total).max(0.0);
-            *process_total = total;
-            cost
+    /// The result, with its cost the rise of the line's total over
+    /// `process_total`, the process's previous total, which becomes the
+    /// line's. The cost is `None` when either total is unknown.
+    pub(crate) fn into_result(
+        self,
+        stats: TurnStats,
+        process_total: &mut Option<f64>,
+    ) -> TurnResult {
+        let cost_usd = self.total_cost_usd.and_then(|total| {
+            process_total
+                .replace(total)
+                .map(|previous| (total - previous).max(0.0))
         });
         let error_kind = self.is_error.then(|| {
             ErrorKind::classify(
@@ -498,7 +507,7 @@ mod tests {
         let mut reader = capture.as_bytes();
         let mut buf = Vec::new();
         let mut results = Vec::new();
-        let mut process_total = 0.0;
+        let mut process_total = Some(0.0);
         loop {
             let mut stats = TurnStats::default();
             match read_turn(&mut reader, &mut buf, &mut stats).await {
@@ -630,7 +639,7 @@ mod tests {
         let line = br#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
         let mut read = note_line(line, &mut stats)
             .unwrap()
-            .into_result(stats, &mut 0.0);
+            .into_result(stats, &mut Some(0.0));
         assert!(TurnOutcome::Finished(read.clone()).resume_refused());
         read.stats.init_seen = true;
         assert!(
@@ -646,14 +655,14 @@ mod tests {
 
     #[test]
     fn a_turn_costs_what_it_adds_to_the_process_total() {
-        let result = |total: &str, process_total: &mut f64| {
+        let result = |total: &str, process_total: &mut Option<f64>| {
             let line = format!(r#"{{"type":"result","subtype":"success"{total}}}"#);
             let mut stats = TurnStats::default();
             note_line(line.as_bytes(), &mut stats)
                 .unwrap()
                 .into_result(stats, process_total)
         };
-        let mut process_total = 0.0;
+        let mut process_total = Some(0.0);
         let first = result(r#","total_cost_usd":0.5"#, &mut process_total);
         assert_eq!(first.cost_usd, Some(0.5));
         assert_eq!(first.process_total_cost_usd, Some(0.5));
@@ -663,14 +672,25 @@ mod tests {
         let none = result("", &mut process_total);
         assert_eq!(none.cost_usd, None);
         assert_eq!(
-            process_total, 0.75,
+            process_total,
+            Some(0.75),
             "a result without a total moves nothing"
         );
         let lower = result(r#","total_cost_usd":0.125"#, &mut process_total);
         assert_eq!(lower.cost_usd, Some(0.0), "a falling total costs nothing");
-        assert_eq!(process_total, 0.125);
+        assert_eq!(process_total, Some(0.125));
         let third = result(r#","total_cost_usd":0.25"#, &mut process_total);
         assert_eq!(third.cost_usd, Some(0.125));
+
+        let mut unknown = None;
+        let first = result(r#","total_cost_usd":3.5"#, &mut unknown);
+        assert_eq!(
+            first.cost_usd, None,
+            "without the total it started from, the first cost is unknown"
+        );
+        assert_eq!(first.process_total_cost_usd, Some(3.5));
+        let next = result(r#","total_cost_usd":4.0"#, &mut unknown);
+        assert_eq!(next.cost_usd, Some(0.5), "and the next one is known again");
     }
 
     #[test]
@@ -711,7 +731,7 @@ mod tests {
         let line = br#"{"type":"result","subtype":"error_max_turns","api_error_status":"x","usage":{"input_tokens":"n","output_tokens":3},"total_cost_usd":"free","session_id":"not-a-uuid","terminal_reason":"has space","extra":{"nested":[1]}}"#;
         let result = note_line(line, &mut stats)
             .unwrap()
-            .into_result(stats, &mut 0.0);
+            .into_result(stats, &mut Some(0.0));
         assert!(result.is_error, "no is_error and not success");
         assert_eq!(result.subtype.as_deref(), Some("error_max_turns"));
         assert_eq!(result.api_error_status, None);
@@ -730,7 +750,7 @@ mod tests {
 
         let mut stats = TurnStats::default();
         let ok = note_line(br#"{"type":"result","subtype":"success"}"#, &mut stats).unwrap();
-        let ok = ok.into_result(stats, &mut 0.0);
+        let ok = ok.into_result(stats, &mut Some(0.0));
         assert!(!ok.is_error);
         assert_eq!(ok.error_kind, None);
         assert_eq!(ok.usage, None);
@@ -838,7 +858,7 @@ mod tests {
         let result = read_turn(&mut reader, &mut Vec::new(), &mut stats)
             .await
             .unwrap()
-            .into_result(stats, &mut 0.0);
+            .into_result(stats, &mut Some(0.0));
         assert_eq!(result.result.as_deref(), Some("ok"));
         assert_eq!(result.stats.malformed_lines, 1);
     }
@@ -870,7 +890,7 @@ mod tests {
         let line = br#"{"type":"result","is_error":false,"result":"the password is hunter2"}"#;
         let result = note_line(line, &mut stats)
             .unwrap()
-            .into_result(stats, &mut 0.0);
+            .into_result(stats, &mut Some(0.0));
         let outcome = TurnOutcome::Finished(result);
         let debug = format!("{outcome:?}");
         assert!(!debug.contains("hunter2"), "{debug}");

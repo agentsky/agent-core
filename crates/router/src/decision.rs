@@ -120,6 +120,21 @@ pub enum RefuseReason {
         /// The largest hop the agent accepts.
         max: Hop,
     },
+    /// The agent has taken the turns its owner allows it a day.
+    DailyCap {
+        /// The turns it takes a day for anyone but its owner.
+        max: u32,
+    },
+    /// Agents have taken the most turns a thread allows in an hour.
+    ThreadTurns {
+        /// The turns agents may take in a thread in an hour.
+        max: u32,
+    },
+    /// Agents' turns have used the thread's token budget for the day.
+    ThreadTokens {
+        /// The tokens agents' turns may use in a thread in a day.
+        max: u64,
+    },
     /// The view couldn't say whether the requester is banned, or what the
     /// agent's rules are, so the router refuses rather than assume the
     /// requester is allowed.
@@ -134,6 +149,9 @@ impl RefuseReason {
             Self::Banned => "requester banned",
             Self::Denied => "denied by agent policy",
             Self::HopCap { .. } => "hop cap reached",
+            Self::DailyCap { .. } => "daily turn cap reached",
+            Self::ThreadTurns { .. } => "thread turn cap reached",
+            Self::ThreadTokens { .. } => "thread token budget used up",
             Self::PolicyUnavailable => "agent policy unavailable",
         }
     }

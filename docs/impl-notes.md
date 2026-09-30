@@ -6441,3 +6441,175 @@ would let a bot post in any public channel, is off unless
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
+
+## T27: Usage meter, limits, allow and deny
+
+### The base branch lacked T24 to T26
+
+**Issue.** T27 builds on T26 (community admins, the `admin` command group,
+`failure_notices`), but `claude/slack-agent-apps` (T31), which T27 was to
+be stacked on, and `claude/skills` (T25, on T26, on T24) both fork from
+`claude/turn-pipeline-delivery`, so neither holds the other.
+
+**Solution.** The branch merges `claude/skills` first, in a commit of its
+own, resolving the conflicts: `Commands` keeps T25's `Inner`, which isn't
+`Clone`, and carries T31's `SlackAgents` beside the admins; the pipeline
+keeps T31's confirm-then-act split with T26's relink prompt; the Slack
+inbound passes both T25's files and T31's in-flight place. The T27 commit
+comes after it, so it reads on its own once the stack is chained again.
+
+### The runner reads the restored total from the transcript
+
+**Issue.** The plan offers two ways to take the total a `--resume`d
+process restores off its first turn's cost: read the transcript's last
+`cost-state` line, or keep a total in `sessions` when a process exits
+cleanly. The second can't see what the CLI will actually restore: a
+leftover process in the container can append its own `cost-state` line
+after a clean exit, and the CLI restores that one.
+
+**Solution.** The first. `SessionManager` reads the line before it starts a
+`--resume`d process, off the async runtime, and hands it to
+`ClaudeProcess::count_cost_from`; `TurnResult::cost_usd` is then the turn's
+own on every turn. The transcript is agent-writable, so the read opens
+`claude/projects/<id>/<id>.jsonl` below the session's directory one
+component at a time with `O_NOFOLLOW` (rustix `openat`, a runner
+dependency now), accepts only a regular file, opened `O_NONBLOCK` so a
+FIFO can't hang it, and searches back from its end in 64 KiB chunks, at
+most 32 MiB, skipping lines longer than 64 KiB, for the last line whose
+`type` is `cost-state` with a finite `totalCostUSD` of at least 0. No line
+in the whole file means 0, as the CLI restores then. A file it can't read
+this way, or a line further back than the cap, makes the total unknown:
+the first turn's `cost_usd` is `None` and bills no cost, and the next
+turns' are known again. The CLI reads the same line, so a value the agent
+wrote there still leaves the difference right, unless something rewrites
+it between the two reads, which only a process left running in the
+container could do (Deferred work's "Killing leftover processes at turn
+end"). `fake-claude` now appends
+`{"type":"cost-state","totalCostUSD":…,"modelUsage":{}}` when its input
+ends, and none when it crashes, and restores the last one on `--resume`;
+a runner test checks the resumed turn's cost after a clean stop and after
+a crash, and the Docker test now checks the corrected cost against the real
+CLI in CI.
+
+### Cache reads aren't tokens the meter counts
+
+**Issue.** A result's `usage` has four counts. Every API call of a turn
+reads the whole conversation from the prompt cache, so cache reads grow
+with a thread's length, not its work: a token budget counting them would
+stop a long thread after a few turns.
+
+**Solution.** The meter's input tokens are uncached input plus cache
+writes, and its tokens are those plus output, for `usage`, `thread_usage`
+and `me`. `usage.cost_usd` keeps the CLI's own figure, which prices every
+kind. A turn that crashed or timed out is counted as a turn with no
+tokens.
+
+### One table counts threads and agents
+
+**Issue.** The plan's `thread_usage` has a day but no hour and no agent,
+while the caps are turns per thread per hour and turns per agent per day,
+and nothing else counts an agent's turns.
+
+**Solution.** `thread_usage` rows are keyed by thread, day, hour (UTC) and
+agent. The thread's turns this hour and tokens today, and the agent's
+turns today, are sums over it (an index on `(agent_id, day)` serves the
+latter). Rows older than two days are swept with the other expired rows.
+`usage` keeps a member's days for good, for `me`'s month.
+
+### Counts are read before a turn and written after it
+
+**Issue.** The router is pure, so the limits compare counts the view
+loaded before the turn, and a turn's tokens are known only after it.
+
+**Solution.** The pipeline meters each turn right after the runner returns
+it, before delivering the reply, in one transaction (`usage` and
+`thread_usage`). Turns of one agent in one thread run one at a time, so
+their counts are exact; turns running at once elsewhere (other threads,
+or other agents in the same thread) can each pass a cap the others are
+about to reach, so a cap can be passed by the turns in flight when it is
+reached. A turn is billed to its requester's member, created from the
+identity if the store has none yet (a community-key turn of someone never
+seen before). A failure to meter is logged; the turn has run.
+
+### The owner is never capped by their own agent's limit
+
+**Issue.** The plan doesn't say whether `turns=N/day` limits the owner.
+
+**Solution.** It limits requests from anyone but the owner, as allow and
+deny do, and counts every turn of the agent, the owner's and hops
+included. `turns=0` leaves the agent to its owner. `limits` takes `off`
+for either setting, which the parser now reads as `Setting::Off`; without
+it an owner couldn't remove a cap once set.
+
+### Thread caps count every agent and skip one-to-one DMs
+
+**Issue.** Loop protection needs caps across every agent in a thread, but
+an owner's long working session in their DM with their agent is no loop,
+and a one-to-one DM can't hold another agent.
+
+**Solution.** `RouterView::thread_budget` gives the thread's spend and the
+caps, and the router asks it only outside one-to-one DMs; `None` refuses
+as `PolicyUnavailable`. The caps apply to every requester, the owner
+included, since a chain the owner started loops as well as anyone's.
+Refusals come after the hop cap and the daily cap and before the
+credential. `[limits] thread_turns_per_hour` (default 30) and
+`thread_tokens_per_day` (default 2,000,000) turn off at 0, and
+`max_hops` (default 3) is the global hop cap.
+
+### A capped agent says so once per thread and window
+
+**Issue.** "Past the daily cap, reply once per thread per day" needs a
+record of the reply that other instances and a restart see, and the
+thread caps would otherwise answer every message with the same line.
+
+**Solution.** `limit_notices` holds one row per agent, thread, kind and
+window (the UTC day for the daily cap and the token budget, the hour for
+the turn cap), claimed with an insert before posting and released if the
+post fails, as `failure_notices` does. Other refusals still post each
+time, as before.
+
+### Allow and deny undo each other
+
+**Issue.** T22 fixed what the rules mean (deny wins; a non-empty allow
+list restricts), but no command removes a rule, so the owner had no way
+back from a mistake.
+
+**Solution.** `deny <target>` takes the target off the allow list and puts
+it on the deny list. `allow <target>` of a denied target only lifts the
+deny; otherwise it puts the target on the allow list, so the first
+`allow` limits the agent to its targets. `allow everyone` empties the
+allow list and takes `everyone` off the deny list; denies by name stay.
+Each list holds at most 100 rules. Rules are JSON agentd owns
+(`policy::Rule`), with the identity or conversation and how the owner
+wrote it; replies name them in code spans, which neither surface turns
+into a mention. A member is resolved as `list` does (Slack sends an id,
+Rocket.Chat a username the manager looks up); a channel on Slack arrives
+as an id token, and on Rocket.Chat by name, looked up with `rooms.info`'s
+`roomName` (`RestClient::room_by_name`, and `FakeRest` answers it). Rules
+that don't read refuse everyone, the owner too, as `PolicyUnavailable`,
+since the same row holds the hop cap, and `allow <name> everyone` clears
+them.
+
+### A ban leaves `me`, and still warns about a leaked secret
+
+**Issue.** A ban blocks a member's commands other than `me`, but a
+secret-bearing command sent in a channel is refused with advice to revoke
+the secret, which a banned member needs as much as anyone.
+
+**Solution.** `Commands::run` refuses a banned member's command before it
+runs, except `me` and a secret-bearing command sent where others can read
+it. `admin ban @member [reason]` bans the member the identity belongs to,
+creating it if needed, so every identity they link is covered; the reason
+is at most 500 characters and shown to them by `me`, never logged. Admins,
+matched by identity as T26 does, can't be banned. The router's view loads
+bans for every member it knows (the sender's, the attributed requester's
+and its key's) and fails closed if the store can't say.
+
+### The proxy's path allowlist stays deferred
+
+**Issue.** T26 left an allowlist of Anthropic API paths for the credential
+proxy open.
+
+**Solution.** Nothing assigns it to T27: it is still in the plan's
+Deferred work, waiting for a live capture of the paths the CLI uses, so
+this task leaves it.

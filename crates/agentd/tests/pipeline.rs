@@ -970,6 +970,243 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     stack.stop().await;
 }
 
+#[tokio::test]
+async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
+    let stack = start().await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    let today = OffsetDateTime::now_utc().replace_time(time::Time::MIDNIGHT);
+
+    stack.next_turn(Turn::reply("Done."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "m1", None, &[BOT]))
+        .await;
+    let billed = store.member_usage_since(bob, today).await.unwrap();
+    assert_eq!(
+        (billed.turns, billed.input_tokens, billed.output_tokens),
+        (1, 10, 1),
+        "fake-claude's usage for one reply"
+    );
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(
+        store
+            .member_usage_since(stack.alice, today)
+            .await
+            .unwrap()
+            .turns,
+        0,
+        "the owner pays nothing for bob's turn"
+    );
+    let spend = store
+        .thread_spend(&thread("GENERAL", "m1"), OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
+    assert_eq!(
+        store
+            .agent_turns_on(stack.agent, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        1
+    );
+
+    stack.next_turn(Turn::crash());
+    stack
+        .handle(stack.event("carol", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    assert!(
+        store
+            .member_for_identity(&key("carol"))
+            .await
+            .unwrap()
+            .is_none(),
+        "an unlinked member without the community key runs nothing and isn't billed"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn past_the_daily_cap_the_thread_is_told_once_and_the_owner_still_runs() {
+    let stack = start().await;
+    let store = stack.store();
+    store
+        .put_agent_limits(stack.agent, Some(1), None)
+        .await
+        .unwrap();
+    stack.next_turn(Turn::reply("Once."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "d1", None, &[BOT]))
+        .await;
+    assert_eq!(posts(&stack.calls_since(0))[0].1, "Once.");
+
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event(
+            "bob",
+            "GENERAL",
+            ConvKind::Channel,
+            "d2",
+            Some("d1"),
+            &[BOT],
+        ))
+        .await;
+    stack
+        .handle(stack.event(
+            "bob",
+            "GENERAL",
+            ConvKind::Channel,
+            "d3",
+            Some("d1"),
+            &[BOT],
+        ))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "one notice per thread and day: {sent:?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("d1")));
+    assert_eq!(
+        sent[0].1,
+        "helper has reached its owner's daily limit (1). Try again after midnight UTC."
+    );
+
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "e1", None, &[BOT]))
+        .await;
+    assert_eq!(
+        posts(&stack.calls_since(before)).len(),
+        1,
+        "another thread is told too"
+    );
+
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Still mine."));
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "d4",
+            Some("d1"),
+            &[BOT],
+        ))
+        .await;
+    assert_eq!(posts(&stack.calls_since(before))[0].1, "Still mine.");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn bans_and_deny_rules_refuse_a_requester() {
+    let stack = start().await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "b1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, "helper can't take requests from you.");
+    store.unban_member(bob).await.unwrap();
+
+    let mut rules = agentd::policy::Rules::default();
+    rules.deny(agentd::policy::Rule::Member {
+        key: key("bob"),
+        member: Some(bob),
+        label: "@bob".into(),
+    });
+    let (allow, deny) = rules.to_json().unwrap();
+    store
+        .put_agent_rules(stack.agent, &allow, &deny)
+        .await
+        .unwrap();
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "b2", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].1,
+        "helper's owner hasn't allowed you to use it here."
+    );
+
+    store
+        .put_agent_rules(stack.agent, "[oops", "[]")
+        .await
+        .unwrap();
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "b3", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(
+        sent[0].1, "helper can't check who may use it right now. Try again later.",
+        "rules that don't read refuse, the owner too"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_thread_turn_cap_stops_a_thread_but_not_a_dm() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.limits.thread_turns_per_hour = Some(1),
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("First."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "t1", None, &[BOT]))
+        .await;
+    let before = stack.mock.calls().len();
+    for id in ["t2", "t3"] {
+        stack
+            .handle(stack.event(
+                "alice",
+                "GENERAL",
+                ConvKind::Channel,
+                id,
+                Some("t1"),
+                &[BOT],
+            ))
+            .await;
+    }
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].1,
+        "helper won't answer here for now: agents have reached this thread's hourly turn \
+         limit (1). Try again next hour."
+    );
+
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("In the DM."));
+    for id in ["dm1", "dm2"] {
+        stack
+            .handle(stack.event("alice", "DM-ALICE", ConvKind::Dm, id, None, &[]))
+            .await;
+    }
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(
+        sent.iter()
+            .map(|(_, text, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["In the DM.", "In the DM."],
+        "a one-to-one DM isn't capped"
+    );
+    stack.stop().await;
+}
+
 /// Waits up to 30 seconds for `done`.
 async fn wait_until(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);

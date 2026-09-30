@@ -16,7 +16,7 @@ use futures::FutureExt as _;
 use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
-use store::{Agent, NewMessageRef, Store, StoreError};
+use store::{Agent, NewMessageRef, Store, StoreError, TurnUsage};
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -24,9 +24,10 @@ use tokio::task::JoinSet;
 use super::Turns;
 use super::billing::{CredentialFailure, FAILURE_DM_INTERVAL};
 use super::message;
-use super::view::StoreView;
+use super::view::{StoreView, ViewContext};
 use crate::commands::Replies;
 use crate::ctl::{MAX_POST_BYTES, Outbox, SurfaceLookup};
+use crate::policy::Limits;
 
 /// The emoji an agent's bot reacts with to the message a turn answers,
 /// while the turn runs, unless `[runner] working_emoji` says otherwise.
@@ -91,6 +92,8 @@ pub struct PipelineSettings {
     /// How many messages may wait or be answered at once for the agents of
     /// one owner.
     pub max_pending_per_owner: usize,
+    /// The community's caps on threads and hops, from `[limits]`.
+    pub limits: Limits,
 }
 
 /// Takes every surface's messages that aren't commands, decides which
@@ -651,7 +654,7 @@ impl Pipeline {
     /// ignore it, routes the platform's copy again and acts on the copy.
     async fn candidate(&self, job: &Job, agent: AgentId) {
         let (event, caps) = (job.event.as_ref(), job.caps);
-        let Some(decision) = self.decide(event, agent).await else {
+        let Some(decision) = self.decide(event, agent, caps).await else {
             return;
         };
         if let Decision::Ignore(reason) = decision {
@@ -665,7 +668,7 @@ impl Pipeline {
             self.act(event, agent, caps, decision).await;
             return;
         }
-        let Some(confirmed) = self.decide(&copy, agent).await else {
+        let Some(confirmed) = self.decide(&copy, agent, caps).await else {
             return;
         };
         if confirmed != decision {
@@ -677,9 +680,17 @@ impl Pipeline {
 
     /// The router's decision on `event` for `agent`. `None` when the store
     /// can't be read.
-    async fn decide(&self, event: &InboundEvent, agent: AgentId) -> Option<Decision> {
+    async fn decide(&self, event: &InboundEvent, agent: AgentId, caps: Caps) -> Option<Decision> {
         let store = &self.inner.store;
-        let view = match StoreView::load(store, event, agent, &self.inner.settings.managers).await {
+        let settings = &self.inner.settings;
+        let thread = thread_of(event, caps);
+        let context = ViewContext {
+            managers: &settings.managers,
+            thread: &thread,
+            limits: &settings.limits,
+            now: OffsetDateTime::now_utc(),
+        };
+        let view = match StoreView::load(store, event, agent, context).await {
             Ok(view) => view,
             Err(err) => {
                 tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't load what routing needs");
@@ -788,6 +799,9 @@ impl Pipeline {
     }
 
     /// Posts one line in `event`'s thread saying why `agent` won't answer.
+    /// A limit that counts turns or tokens over a day or an hour says so
+    /// once per thread in that window, so a capped agent doesn't answer
+    /// every message with the same line.
     async fn refuse(
         &self,
         event: &InboundEvent,
@@ -801,21 +815,62 @@ impl Pipeline {
         if !surface.can_post(&event.conv).await? {
             return Ok(());
         }
-        let name = self.agent_name(agent).await?;
-        let text = match reason {
-            RefuseReason::Paused => format!("{name} is paused by its owner."),
-            RefuseReason::Banned => format!("{name} can't take requests from you."),
-            RefuseReason::Denied => format!("{name}'s owner hasn't allowed you to use it here."),
-            RefuseReason::HopCap { max } => format!(
-                "{name} won't answer: this chain of agents has reached its limit of {max} hops."
-            ),
-            RefuseReason::PolicyUnavailable => {
-                format!("{name} can't check who may use it right now. Try again later.")
-            }
+        let text = refusal_text(&self.agent_name(agent).await?, reason);
+        let target = reply_target(event, caps);
+        let Some((kind, window)) = limit_window(reason, OffsetDateTime::now_utc()) else {
+            say(surface.as_ref(), &target, &text).await?;
+            tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
+            return Ok(());
         };
-        say(surface.as_ref(), &reply_target(event, caps), &text).await?;
+        let store = &self.inner.store;
+        let thread = thread_of(event, caps);
+        match store.claim_limit_notice(agent, &thread, kind, window).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(%agent, message = %event.message.id, %reason, "refused a message; the thread was told already");
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "couldn't claim a limit notice; posting it anyway");
+            }
+        }
+        if let Err(err) = say(surface.as_ref(), &target, &text).await {
+            if let Err(err) = store
+                .release_limit_notice(agent, &thread, kind, window)
+                .await
+            {
+                tracing::warn!(%agent, error = %err, "couldn't release a limit notice's claim");
+            }
+            return Err(err.into());
+        }
         tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
         Ok(())
+    }
+
+    /// Bills `turn`, whose outcome is `outcome`, to its requester, and
+    /// counts it for `agent` in `thread`. A requester the store has no
+    /// member for yet gets one. A failure is logged: the turn has run.
+    async fn meter(&self, agent: AgentId, turn: &Run, thread: &ThreadKey, outcome: &TurnOutcome) {
+        let store = &self.inner.store;
+        let now = OffsetDateTime::now_utc();
+        let key = &turn.requester.key;
+        let member = match turn.requester.member {
+            Some(member) => member,
+            None => match store.ensure_member(key, key.user.as_str(), now).await {
+                Ok(member) => member,
+                Err(err) => {
+                    tracing::warn!(%agent, requester = %key, error = %err, "couldn't find the member to bill a turn to");
+                    return;
+                }
+            },
+        };
+        let usage = turn_usage(outcome);
+        if let Err(err) = store
+            .record_turn_usage(member, agent, thread, usage, now)
+            .await
+        {
+            tracing::warn!(%agent, %member, error = %err, "couldn't meter a turn");
+        }
     }
 
     async fn agent_name(&self, agent: AgentId) -> Result<String, StoreError> {
@@ -859,6 +914,8 @@ impl Pipeline {
         };
         let delivered = match ran {
             Ok((session, turn_id, report)) => {
+                self.meter(agent, &turn, &thread_of(event, caps), &report.outcome)
+                    .await;
                 let failure = CredentialFailure::of(&report.outcome);
                 let delivery = Delivery {
                     store: &self.inner.store,
@@ -1127,6 +1184,74 @@ fn relink_text(name: &str) -> String {
         "{name} runs on the Claude account of whoever asks it, and yours stopped working: \
          Anthropic refused to renew the link. Send `login` to me here to link it again."
     )
+}
+
+/// The line a refusal of `reason` posts, for an agent named `name`.
+fn refusal_text(name: &str, reason: RefuseReason) -> String {
+    match reason {
+        RefuseReason::Paused => format!("{name} is paused by its owner."),
+        RefuseReason::Banned => format!("{name} can't take requests from you."),
+        RefuseReason::Denied => format!("{name}'s owner hasn't allowed you to use it here."),
+        RefuseReason::HopCap { max } => format!(
+            "{name} won't answer: this chain of agents has reached its limit of {max} hops."
+        ),
+        RefuseReason::DailyCap { max: 0 } => {
+            format!("{name} takes requests from its owner only.")
+        }
+        RefuseReason::DailyCap { max } => format!(
+            "{name} has reached its owner's daily limit ({max}). Try again after midnight UTC."
+        ),
+        RefuseReason::ThreadTurns { max } => format!(
+            "{name} won't answer here for now: agents have reached this thread's hourly turn \
+             limit ({max}). Try again next hour."
+        ),
+        RefuseReason::ThreadTokens { max } => format!(
+            "{name} won't answer here for now: agents have used this thread's daily token \
+             budget ({max}). Try again after midnight UTC, or in a new thread."
+        ),
+        RefuseReason::PolicyUnavailable => {
+            format!("{name} can't check who may use it right now. Try again later.")
+        }
+    }
+}
+
+/// For a refusal a limit over a day or an hour gives, the kind of notice
+/// and the start of the window it counts in, which `now` falls in.
+fn limit_window(
+    reason: RefuseReason,
+    now: OffsetDateTime,
+) -> Option<(&'static str, OffsetDateTime)> {
+    let (kind, seconds) = match reason {
+        RefuseReason::DailyCap { .. } => ("daily_cap", 86_400),
+        RefuseReason::ThreadTurns { .. } => ("thread_turns", 3_600),
+        RefuseReason::ThreadTokens { .. } => ("thread_tokens", 86_400),
+        RefuseReason::Paused
+        | RefuseReason::Banned
+        | RefuseReason::Denied
+        | RefuseReason::HopCap { .. }
+        | RefuseReason::PolicyUnavailable => return None,
+    };
+    let now = now.unix_timestamp();
+    let start = OffsetDateTime::from_unix_timestamp(now - now.rem_euclid(seconds)).ok()?;
+    Some((kind, start))
+}
+
+/// What the meter bills for a turn that ended as `outcome`: the input the
+/// model read fresh (uncached input and cache writes), the output and the
+/// cost. Cache reads, which every call of a turn repeats, aren't billed. A
+/// turn that crashed or timed out has no usage.
+fn turn_usage(outcome: &TurnOutcome) -> TurnUsage {
+    let TurnOutcome::Finished(result) = outcome else {
+        return TurnUsage::default();
+    };
+    let usage = result.usage.unwrap_or_default();
+    TurnUsage {
+        input_tokens: usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens),
+        output_tokens: usage.output_tokens,
+        cost_usd: result.cost_usd.unwrap_or(0.0),
+    }
 }
 
 /// A turn the router decided to run.

@@ -46,7 +46,15 @@
 //!    policy also holds the hop cap.
 //! 9. **Hop cap**: [`RefuseReason::HopCap`], also when the hop counter
 //!    would overflow.
-//! 10. **Credential.** The owner runs on their own credential, or gets
+//! 10. **Daily cap**, for anyone but the owner: [`RefuseReason::DailyCap`]
+//!     once the agent has taken [`AgentPolicy::turns_per_day`] turns today.
+//! 11. **Thread caps**, outside one-to-one DMs, for everyone, the owner
+//!     included: [`RefuseReason::ThreadTurns`] once agents took the hour's
+//!     turns in the thread, then [`RefuseReason::ThreadTokens`] once their
+//!     turns used the day's token budget. If the view can't say:
+//!     [`RefuseReason::PolicyUnavailable`]. A one-to-one DM has one agent
+//!     in it, so no agents can answer each other there.
+//! 12. **Credential.** The owner runs on their own credential, or gets
 //!     [`Decision::LinkPrompt`] if they have none; the community key is
 //!     never used for the owner. Anyone else runs on their own credential
 //!     if linked, else on the community key if one is configured, else gets
@@ -59,8 +67,8 @@
 //! is configured. Every refusal comes before the credential, so a link
 //! prompt or a community-key turn is never offered to a requester who would
 //! be refused anyway. Refusals follow the plan's order: the agent, then the
-//! person, then the rules, then the chain. None of them spends anything, so
-//! their order only decides which notice is shown.
+//! person, then the rules, then the chain, then the limits. None of them
+//! spends anything, so their order only decides which notice is shown.
 //!
 //! [`RouterView`] documents which lookups [`route`] makes for an event, in
 //! order, so a store-backed view knows what to load first.
@@ -87,7 +95,7 @@ pub use decision::{Decision, IgnoreReason, RefuseReason};
 pub use model::ModelPolicy;
 pub use view::{
     AgentPolicy, AgentState, Attribution, DEFAULT_MAX_HOPS, LinkState, ManagedBot, PolicyTarget,
-    RouterView,
+    RouterView, ThreadBudget,
 };
 
 /// Decides whether `agent` answers `event`, and how. See the
@@ -163,6 +171,17 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
             max: policy.max_hops,
         });
     };
+    if !is_owner && let Some(max) = policy.turns_per_day.filter(|_| policy.daily_cap_reached()) {
+        return Decision::Refuse(RefuseReason::DailyCap { max });
+    }
+    if !event.is_dm() {
+        let Some(budget) = view.thread_budget() else {
+            return Decision::Refuse(RefuseReason::PolicyUnavailable);
+        };
+        if let Some(reason) = budget.exceeded() {
+            return Decision::Refuse(reason);
+        }
+    }
 
     let credential = match credential(view, &requester, is_owner) {
         Ok(credential) => credential,

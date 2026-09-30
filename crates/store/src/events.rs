@@ -16,6 +16,11 @@ pub struct Swept {
     pub pending_logins: u64,
     /// Processed events older than [`PROCESSED_EVENT_RETENTION`].
     pub processed_events: u64,
+    /// `thread_usage` rows of days over more than
+    /// [`THREAD_USAGE_RETENTION`](crate::THREAD_USAGE_RETENTION) ago.
+    pub thread_usage: u64,
+    /// `limit_notices` rows of windows as old.
+    pub limit_notices: u64,
 }
 
 impl Store {
@@ -49,8 +54,10 @@ impl Store {
     }
 
     /// Deletes what has expired at `now`: pending logins whose expiry is not
-    /// after `now`, and processed events seen more than
-    /// [`PROCESSED_EVENT_RETENTION`] before it.
+    /// after `now`, processed events seen more than
+    /// [`PROCESSED_EVENT_RETENTION`] before it, and per-thread usage and
+    /// limit notices older than
+    /// [`THREAD_USAGE_RETENTION`](crate::THREAD_USAGE_RETENTION).
     ///
     /// # Errors
     ///
@@ -67,9 +74,12 @@ impl Store {
             .execute(&self.pool)
             .await?
             .rows_affected();
+        let (thread_usage, limit_notices) = self.sweep_thread_usage(now).await?;
         Ok(Swept {
             pending_logins,
             processed_events,
+            thread_usage,
+            limit_notices,
         })
     }
 }
@@ -146,7 +156,7 @@ mod tests {
             swept,
             Swept {
                 pending_logins: 2,
-                processed_events: 0
+                ..Swept::default()
             }
         );
         assert!(store.take_pending_login("old").await.unwrap().is_none());

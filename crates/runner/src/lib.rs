@@ -19,9 +19,11 @@
 //!    [`TurnResult`], a [`Crashed`](TurnOutcome::Crashed) process, or a
 //!    [`TimedOut`](TurnOutcome::TimedOut) turn whose process was killed.
 //!    A result's [`cost_usd`](TurnResult::cost_usd) is the turn's own,
-//!    although the CLI reports a running total for its process, except on
-//!    the first turn of a process started with `--resume`, whose running
-//!    total the CLI starts from the session's saved total.
+//!    although the CLI reports a running total for its process. A process
+//!    started with `--resume` starts that total from the session's total
+//!    as the CLI saved it in the transcript, which [`SessionManager`]
+//!    reads before it starts one and passes on with
+//!    [`ClaudeProcess::count_cost_from`].
 //! 3. [`ClaudeProcess::stop`] closes stdin and waits for the process.
 //!
 //! A kill doesn't always end a process: it can fail, and under Docker
@@ -75,6 +77,7 @@ mod persona;
 mod process;
 mod sessions;
 mod stream;
+mod transcript;
 
 pub use config::{
     ConfigError, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP,

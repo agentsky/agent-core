@@ -1,5 +1,5 @@
-//! The community admin commands: `admin api-key set` and `admin api-key
-//! clear`.
+//! The community admin commands: `admin api-key set`, `admin api-key
+//! clear`, `admin ban` and `admin unban`.
 //!
 //! Only the community admins `[community] admins` lists may run them; anyone
 //! else is told so, and a key they sent is dropped unstored. A key sent
@@ -7,8 +7,13 @@
 //! first, for admins and everyone else alike. The key is a `SecretString`
 //! from the parser on, is stored sealed, and is never logged or repeated in
 //! a reply.
+//!
+//! A ban is of a member, so it covers every identity they linked: agents
+//! refuse their requests, their own and the hops they started, and the
+//! only command they may run is `me`. An admin can't be banned, so a ban
+//! can't lock the community out of `admin unban`.
 
-use commands::ApiKeyCommand;
+use commands::{ApiKeyCommand, UserRef};
 use core_types::MemberKey;
 use secrecy::ExposeSecret as _;
 
@@ -17,7 +22,18 @@ use crate::community::{MAX_API_KEY_BYTES, is_plausible_api_key};
 
 /// The reply to an admin command from someone who isn't an admin.
 pub(super) const NOT_AN_ADMIN: &str =
-    "Only community admins can change the community API key. Ask one of them.";
+    "Only community admins can run `admin` commands. Ask one of them.";
+
+/// The longest reason a ban may give, in characters.
+pub(super) const MAX_BAN_REASON_CHARS: usize = 500;
+
+/// How a reply names the member `user` names.
+fn user_label(user: &UserRef) -> String {
+    let name = match user {
+        UserRef::Name(name) | UserRef::Id(name) => name,
+    };
+    format!("`@{}`", name.replace('`', ""))
+}
 
 impl Commands {
     /// Runs `admin api-key set` or `admin api-key clear` for `member`.
@@ -79,5 +95,90 @@ impl Commands {
         Ok(format!(
             "Community API key: {state}{changed}. You are a community admin."
         ))
+    }
+}
+
+impl Commands {
+    /// Runs `admin ban <user> [reason]` for `admin`.
+    pub(super) async fn ban(
+        &self,
+        admin: &MemberKey,
+        user: &UserRef,
+        reason: Option<String>,
+    ) -> Result<String, Failure> {
+        if !self.is_admin(admin) {
+            tracing::info!(member = %admin, "refused an admin command from someone who isn't an admin");
+            return Ok(NOT_AN_ADMIN.to_owned());
+        }
+        let label = user_label(user);
+        let Some(id) = self.resolve_user(admin, user).await? else {
+            return Ok(format!("I don't know {label}."));
+        };
+        let target = MemberKey {
+            user: id,
+            ..admin.clone()
+        };
+        if self.is_admin(&target) {
+            return Ok(format!(
+                "{label} is a community admin, and admins can't be banned. Take them off \
+                 `[community] admins` first."
+            ));
+        }
+        if reason
+            .as_deref()
+            .is_some_and(|reason| reason.chars().count() > MAX_BAN_REASON_CHARS)
+        {
+            return Ok(format!(
+                "A reason is at most {MAX_BAN_REASON_CHARS} characters. I didn't ban {label}."
+            ));
+        }
+        let store = &self.inner.store;
+        let member = store
+            .ensure_member(&target, target.user.as_str(), now())
+            .await?;
+        if store
+            .ban_member(member, admin, reason.as_deref(), now())
+            .await?
+        {
+            tracing::info!(%admin, %member, "banned a member");
+            Ok(format!(
+                "Banned {label}. Agents refuse their requests, and `me` is the only command \
+                 they can run. Undo it with `admin unban`."
+            ))
+        } else {
+            Ok(format!("{label} is banned already."))
+        }
+    }
+
+    /// Runs `admin unban <user>` for `admin`.
+    pub(super) async fn unban(&self, admin: &MemberKey, user: &UserRef) -> Result<String, Failure> {
+        if !self.is_admin(admin) {
+            tracing::info!(member = %admin, "refused an admin command from someone who isn't an admin");
+            return Ok(NOT_AN_ADMIN.to_owned());
+        }
+        let label = user_label(user);
+        let Some(id) = self.resolve_user(admin, user).await? else {
+            return Ok(format!("I don't know {label}."));
+        };
+        let target = MemberKey {
+            user: id,
+            ..admin.clone()
+        };
+        let store = &self.inner.store;
+        let unbanned = match self.member(&target).await? {
+            Some(member) => {
+                let unbanned = store.unban_member(member).await?;
+                if unbanned {
+                    tracing::info!(%admin, %member, "unbanned a member");
+                }
+                unbanned
+            }
+            None => false,
+        };
+        Ok(if unbanned {
+            format!("Unbanned {label}.")
+        } else {
+            format!("{label} isn't banned.")
+        })
     }
 }

@@ -60,8 +60,12 @@
 //!
 //! A result's `usage` is the turn's own, and its `total_cost_usd` is the
 //! process's running total, as the real CLI reports them: each reply adds
-//! [`REPLY_COST_USD`], an error result nothing, and a new process, resumed
-//! or not, counts from 0.
+//! [`REPLY_COST_USD`] and an error result nothing. A process started with
+//! `--session-id` counts from 0, and one started with `--resume` from the
+//! transcript's last `{"type":"cost-state","totalCostUSD":…}` line, or 0
+//! without one. Like the real CLI, the fake appends that line with its
+//! running total when stdin ends and the session has a transcript, and a
+//! crash writes none.
 //!
 //! With the OAuth token, the first successful turn of each process also
 //! prints a `rate_limit_event` line right after its first `assistant` line,

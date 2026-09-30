@@ -220,6 +220,9 @@ async fn run(args: Args) -> Result<ExitCode, String> {
         rate_limit_reported: Cell::new(false),
         total_cost_usd: Cell::new(0.0),
     };
+    if resuming {
+        session.total_cost_usd.set(session.restored_cost()?);
+    }
 
     let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
     let mut failed = false;
@@ -237,6 +240,7 @@ async fn run(args: Args) -> Result<ExitCode, String> {
             failed = session.turn(input["message"]["content"].clone()).await?;
         }
     }
+    session.save_cost()?;
     Ok(if failed {
         ExitCode::FAILURE
     } else {
@@ -313,6 +317,43 @@ impl Session {
         self.emit_reply(message)?;
         self.emit_result(&turn.reply, false, None, "end_turn", started)?;
         Ok(false)
+    }
+
+    /// The total the last `cost-state` line of the transcript holds, as
+    /// the real CLI restores it on `--resume`, or 0 without one.
+    fn restored_cost(&self) -> Result<f64, String> {
+        let file =
+            File::open(&self.transcript).map_err(|err| format!("reading the transcript: {err}"))?;
+        let mut total = 0.0;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|err| format!("reading the transcript: {err}"))?;
+            if let Ok(entry) = serde_json::from_str::<Value>(&line)
+                && entry["type"] == "cost-state"
+                && let Some(saved) = entry["totalCostUSD"].as_f64()
+            {
+                total = saved;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Appends the process's running total to the transcript as a
+    /// `cost-state` line, as the real CLI does when it exits, if the
+    /// session has a transcript. A crash or a kill writes none.
+    fn save_cost(&self) -> Result<(), String> {
+        if !self.transcript.exists() {
+            return Ok(());
+        }
+        let line = json!({
+            "type": "cost-state",
+            "totalCostUSD": self.total_cost_usd.get(),
+            "modelUsage": {},
+        });
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.transcript)
+            .map_err(|err| format!("writing the transcript: {err}"))?;
+        writeln!(file, "{line}").map_err(|err| format!("writing the transcript: {err}"))
     }
 
     fn user_turns(&self) -> Result<usize, String> {

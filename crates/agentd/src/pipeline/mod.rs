@@ -33,6 +33,7 @@ use sandbox::{DockerSandbox, Sandbox};
 use crate::app::App;
 use crate::commands::SessionControl;
 use crate::config::Config;
+use crate::policy::Limits;
 
 pub use billing::{
     COMMUNITY_KEY_REFUSED_TEXT, COMMUNITY_USAGE_LIMIT_TEXT, FAILURE_DM_INTERVAL,
@@ -146,9 +147,9 @@ impl Turns {
 }
 
 impl PipelineSettings {
-    /// The settings `app` gives: its data directory, its manager bots, and
-    /// `[runner]`'s working emoji and models, with the default queue
-    /// bounds.
+    /// The settings `app` gives: its data directory, its manager bots,
+    /// `[runner]`'s working emoji and models, and `[limits]`' caps, with the
+    /// default queue bounds.
     pub fn from_app(app: &App) -> Self {
         let managers = app
             .rocketchat()
@@ -165,6 +166,7 @@ impl PipelineSettings {
             queue_per_thread: DEFAULT_QUEUE_PER_THREAD,
             max_pending: DEFAULT_MAX_PENDING,
             max_pending_per_owner: DEFAULT_MAX_PENDING_PER_OWNER,
+            limits: Limits::from_config(&app.config().limits),
         }
     }
 }

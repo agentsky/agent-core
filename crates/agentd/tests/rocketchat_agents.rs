@@ -771,7 +771,10 @@ async fn commands_reach_the_intake_through_whichever_connection_hears_them() {
     let mut dm = [FakeRest::MANAGER_ID.to_owned(), chat.alice.clone()];
     dm.sort();
     let dm = dm.concat();
-    let linked = "Claude account: linked. Plan: unknown.";
+    let linked = concat!(
+        "Claude account: linked. Plan: unknown.",
+        "\nUsage billed to you today: 0 turns, 0 tokens. This month: 0 turns, 0 tokens (days start at midnight UTC)."
+    );
     let command = |room: &str, text: &str| {
         let id = chat.fake.seed_message(room, &chat.alice, text, None);
         let mut message = realtime_message(&id, room, (&chat.alice, "alice"), text);
@@ -927,5 +930,79 @@ async fn session_commands_work_as_agent_in_a_room_only_the_agents_bot_is_in() {
     for room in ["GENERAL", "AGENTS", "SECRET"] {
         assert!(chat.posted(room).await.is_empty(), "{room}");
     }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name() {
+    let chat = Chat::start().await;
+    let admin = format!(
+        "[community]\nadmins = [\"rocketchat:{TEAM}:{}\"]\n",
+        chat.bob
+    );
+    let running = Running::start_with(&chat, chat.config_with("sqlite::memory:", &admin)).await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+    let helper = running.agent(&chat.alice, "helper").await.unwrap().id;
+    let store = running.app.store();
+
+    assert_eq!(
+        chat.command("alice", "allow helper #general").await,
+        "Only you and `#general` may use `helper`."
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper @bob").await,
+        "Only you and `#general` may use `helper`, except `@bob`."
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper #nowhere").await,
+        "I don't know `#nowhere`. Name a channel agentd can see."
+    );
+    assert_eq!(
+        chat.command("alice", "allow helper @nobody").await,
+        "I don't know `@nobody`."
+    );
+    let policy = agentd::policy::agent_policy(
+        &store.agent_settings(helper).await.unwrap(),
+        &agentd::policy::Limits::default(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        policy.allow,
+        [router::PolicyTarget::Room(ConvRef {
+            surface: SurfaceKind::RocketChat,
+            team: TEAM.into(),
+            conversation: "GENERAL".into(),
+        })]
+    );
+    assert_eq!(
+        policy.deny,
+        [router::PolicyTarget::Member {
+            key: key(&chat.bob),
+            member: store.member_for_identity(&key(&chat.bob)).await.unwrap(),
+        }]
+    );
+
+    assert_eq!(
+        chat.command("bob", "admin ban @alice too many agents")
+            .await,
+        "Banned `@alice`. Agents refuse their requests, and `me` is the only command they \
+         can run. Undo it with `admin unban`."
+    );
+    assert!(
+        chat.command("alice", "limits helper turns=3")
+            .await
+            .starts_with("A community admin banned you")
+    );
+    assert_eq!(
+        chat.command("bob", "admin unban @alice").await,
+        "Unbanned `@alice`."
+    );
+    assert!(
+        chat.command("alice", "limits helper turns=3")
+            .await
+            .starts_with("`helper` takes at most 3 requests a day")
+    );
     running.stop().await;
 }

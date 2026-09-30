@@ -196,9 +196,11 @@ declares `/agent`, agent apps declare no commands, and `/agent me` shows the
 manager app's name so members can notice a hijack.
 
 Loop protection is mandatory because bots hear each other: a per-thread cap on
-agent turns, a per-thread token budget, agents ignore bot messages that do not
-mention them, and only mentions from agentd-managed agents are honored (see
-[Agent-to-agent attribution](#agent-to-agent-attribution)).
+agent turns per hour, a per-thread token budget per day, both counting every
+agent in the thread, a cap on the hops of a chain, agents ignore bot messages
+that do not mention them, and only mentions from agentd-managed agents are
+honored (see [Agent-to-agent attribution](#agent-to-agent-attribution)). A
+one-to-one DM holds one agent, so its caps don't apply there.
 
 ### Rocket.Chat
 
@@ -379,7 +381,8 @@ mentioned in someone's DM with a different bot never answers there. The
 owner's turns run only on the owner's credential: an owner without a linked
 account gets the link prompt, never the community key. Nor does anyone whose
 link broke: they are asked to link again, and nothing runs until they do. Refusals (a paused
-agent, a banned requester, the agent's deny rules, the hop cap) apply only to
+agent, a banned requester, the agent's deny rules, the hop cap, the agent's
+daily cap and the per-thread caps) apply only to
 messages that pass the gate above, so an unaddressed message never draws a
 notice, and they come before the credential, so nobody is offered a link
 prompt or a community-key turn they would then be refused. If the router
@@ -631,7 +634,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
 | `/agent skill add <name> [source]`, `/agent skill confirm <name> <skill>`, `/agent skill rm <name> <skill>` | Owner | Manage skills; confirm the hosts a skill asks for |
 | `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where |
-| `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits |
+| `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits; `off` removes one |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
 | `/agent sessions <name>`, `/agent reset <name> [here]` | Owner | Inspect or reset sessions |
 | `/agent list [@user]` | Anyone | Agent directory |
@@ -654,6 +657,9 @@ erDiagram
     SESSION ||--o{ MESSAGE_REF : shows
     AGENT ||--o{ VOLUME : uses
     MEMBER ||--o{ USAGE : accrues
+    MEMBER ||--o| BAN : "may have"
+    AGENT ||--o| AGENT_POLICY : "limited by"
+    AGENT ||--o{ THREAD_USAGE : counts
     MEMBER ||--o{ SLACK_CONFIG_TOKEN : registers
     AGENT ||--o{ AGENT_SKILL : has
     PENDING_LOGIN }o--|| MEMBER : for
@@ -735,6 +741,27 @@ erDiagram
     USAGE {
         date day
         int turns
+        int input_tokens
+        int output_tokens
+        real cost_usd
+    }
+    AGENT_POLICY {
+        int turns_per_day
+        int max_hops
+        text allow_json
+        text deny_json
+    }
+    THREAD_USAGE {
+        text thread
+        date day
+        int hour
+        int agent_turns
+        int tokens
+    }
+    BAN {
+        text banned_by
+        text reason
+        timestamp created_at
     }
     PENDING_LOGIN {
         text state
@@ -775,7 +802,7 @@ for Rocket.Chat bindings.
 | Model exfiltrates the real token | The real token never enters the sandbox. |
 | A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, name each host (no wildcards), apply to that agent only, and pass the same checks as configured rules. The `Skill` tool also loads `$CLAUDE_CONFIG_DIR/commands/*.md`, which the session may write, so an agent can plant commands for its own session; it can already write `CLAUDE.md` and `settings.json` there, so that grants nothing new. Under `--setting-sources user`, the working directory's `.claude/skills` and `CLAUDE.md` are not loaded. |
 | A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
-| Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
+| Agents loop on each other | Hop cap per chain, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |

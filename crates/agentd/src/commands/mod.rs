@@ -39,6 +39,7 @@
 mod admin;
 mod agents;
 pub mod intake;
+mod limits;
 pub mod relink;
 pub mod reply;
 pub mod rocketchat;
@@ -61,10 +62,11 @@ use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
 use core_types::{ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
-use store::{Store, StoreError};
+use store::{Store, StoreError, UsageTotals};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::policy::Limits;
 use crate::skills::Skills;
 use crate::slack::agents::SlackAgents;
 use crate::slack::manager::SlackManager;
@@ -208,6 +210,10 @@ impl FollowUp {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
+/// The reply to a banned member's commands, `me` aside.
+const BANNED: &str = "A community admin banned you, so agents won't take your requests and \
+                      `me` is the only command you can run.";
+
 /// Runs `/agent` commands and sends their replies. Agents are created on
 /// Rocket.Chat through [`RocketChatAgents`], and on Slack, as apps, through
 /// [`SlackAgents`] ([`with_slack_agents`](Self::with_slack_agents)).
@@ -218,6 +224,7 @@ pub struct Commands {
     inner: Arc<Inner>,
     admins: Arc<[MemberKey]>,
     slack_agents: Option<SlackAgents>,
+    limits: Limits,
 }
 
 #[derive(Debug)]
@@ -242,6 +249,8 @@ enum Failure {
     Surface(#[from] core_types::SurfaceError),
     #[error(transparent)]
     Skill(#[from] crate::skills::SkillError),
+    #[error("an agent's rules didn't serialize")]
+    Rules(#[from] serde_json::Error),
 }
 
 fn now() -> OffsetDateTime {
@@ -273,6 +282,7 @@ impl Commands {
             }),
             admins: Arc::new([]),
             slack_agents: None,
+            limits: Limits::default(),
         }
     }
 
@@ -290,6 +300,14 @@ impl Commands {
     #[must_use]
     pub fn with_admins(mut self, admins: impl IntoIterator<Item = MemberKey>) -> Self {
         self.admins = admins.into_iter().collect();
+        self
+    }
+
+    /// The same commands, with the community's caps from `[limits]`, which
+    /// `limits` replies with. Without it, the defaults.
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -396,6 +414,17 @@ impl Commands {
         files: &[InFile],
     ) -> (String, FollowUp) {
         let name = command.name();
+        match self.banned(member, &command, origin).await {
+            Ok(false) => {}
+            Ok(true) => {
+                tracing::info!(%member, command = name, "refused a banned member's command");
+                return (BANNED.to_owned(), FollowUp::default());
+            }
+            Err(err) => {
+                tracing::warn!(%member, command = name, error = %err, "couldn't read whether a member is banned");
+                return (FAILED.to_owned(), FollowUp::default());
+            }
+        }
         let result = match command {
             Command::Reset { name, here } => self.reset(member, name.as_str(), here, origin).await,
             command => self
@@ -407,6 +436,24 @@ impl Commands {
             tracing::warn!(%member, command = name, error = %err, "a command failed");
             (FAILED.to_owned(), FollowUp::default())
         })
+    }
+
+    /// Whether `command` from `key` is refused because a community admin
+    /// banned them. `me` never is, nor a secret-bearing command sent where
+    /// others can read it, whose refusal tells them to revoke the secret.
+    async fn banned(
+        &self,
+        key: &MemberKey,
+        command: &Command,
+        origin: &Origin,
+    ) -> Result<bool, Failure> {
+        if matches!(command, Command::Me) || (command.is_secret_bearing() && !origin.is_private()) {
+            return Ok(false);
+        }
+        match self.member(key).await? {
+            Some(member) => Ok(self.inner.store.is_banned(member).await?),
+            None => Ok(false),
+        }
     }
 
     /// The reply to `command`, for a command that is done once it has one.
@@ -450,6 +497,26 @@ impl Commands {
                 Command::Sessions { name } => self.sessions(member, name.as_str(), origin).await,
                 Command::Admin(AdminCommand::ApiKey(command)) => {
                     self.api_key(member, command).await
+                }
+                Command::Admin(AdminCommand::Ban { user, reason }) => {
+                    self.ban(member, &user, reason).await
+                }
+                Command::Admin(AdminCommand::Unban { user }) => self.unban(member, &user).await,
+                Command::Limits {
+                    name,
+                    turns_per_day,
+                    hops,
+                } => {
+                    self.limits(member, name.as_str(), turns_per_day, hops)
+                        .await
+                }
+                Command::Allow { name, target } => {
+                    self.allow_or_deny(member, name.as_str(), &target, true)
+                        .await
+                }
+                Command::Deny { name, target } => {
+                    self.allow_or_deny(member, name.as_str(), &target, false)
+                        .await
                 }
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
@@ -544,7 +611,8 @@ impl Commands {
     }
 
     async fn me(&self, key: &MemberKey, origin: &Origin) -> Result<String, Failure> {
-        let status = match self.member(key).await? {
+        let member = self.member(key).await?;
+        let status = match member {
             Some(member) => self.inner.auth.status(member).await?,
             None => LinkStatus::default(),
         };
@@ -561,6 +629,20 @@ impl Commands {
                 None => "Claude account: linked. Plan: unknown.".to_owned(),
             },
         };
+        reply.push('\n');
+        reply.push_str(&self.usage(member).await?);
+        if let Some(member) = member
+            && let Some(ban) = self.inner.store.ban(member).await?
+        {
+            reply.push_str("\nA community admin banned you: agents won't take your requests, and `me` is the only command you can run.");
+            if let Some(reason) = ban.reason.filter(|reason| !reason.trim().is_empty()) {
+                let reason: String = reason
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                reply.push_str(&format!(" Reason: {}", reason.trim()));
+            }
+        }
         if self.is_admin(key) {
             reply.push('\n');
             reply.push_str(&self.community_key_status().await?);
@@ -581,6 +663,37 @@ impl Commands {
             ));
         }
         Ok(reply)
+    }
+
+    /// `member`'s usage line for `me`: the turns and tokens billed to them
+    /// today and this month, UTC.
+    async fn usage(&self, member: Option<MemberId>) -> Result<String, Failure> {
+        let (today, month) = match member {
+            Some(member) => {
+                let now = now();
+                let today = now.replace_time(time::Time::MIDNIGHT);
+                let month = today.replace_day(1).unwrap_or(today);
+                let store = &self.inner.store;
+                (
+                    store.member_usage_since(member, today).await?,
+                    store.member_usage_since(member, month).await?,
+                )
+            }
+            None => Default::default(),
+        };
+        let describe = |usage: UsageTotals| {
+            format!(
+                "{} {}, {} tokens",
+                usage.turns,
+                if usage.turns == 1 { "turn" } else { "turns" },
+                usage.tokens()
+            )
+        };
+        Ok(format!(
+            "Usage billed to you today: {}. This month: {} (days start at midnight UTC).",
+            describe(today),
+            describe(month)
+        ))
     }
 
     /// The reply to a secret-bearing `command` sent where others can read

@@ -22,6 +22,7 @@ use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
+use crate::transcript::restored_cost;
 use crate::{
     ClaudeProcess, LaunchSpec, PoolConfig, ProcessConfig, Result, RunnerError, SessionStart,
     TurnOutcome, persona_dir, skills_dir,
@@ -155,6 +156,8 @@ struct Warm<H: TurnHooks> {
 /// A running container, and the process in it, if any.
 struct Held<H: TurnHooks> {
     container: Container,
+    /// The session's directory on its volume, as agentd sees it.
+    session_dir: PathBuf,
     mounts: Mounts,
     tracked: Arc<Tracked<H>>,
     process: Option<Running<H>>,
@@ -760,6 +763,10 @@ impl<H: TurnHooks> Inner<H> {
         } else {
             SessionStart::New
         };
+        let restored = match start {
+            SessionStart::Resume => Some(restored_cost(&held.session_dir, session.id).await),
+            SessionStart::New => None,
+        };
         let (env, handle) = match self.process_starting(session, ip, kind).await {
             Ok(started) => started,
             Err(error) => {
@@ -789,7 +796,10 @@ impl<H: TurnHooks> Inner<H> {
             Err(RunnerError::TurnTask)
         });
         match started {
-            Ok(process) => {
+            Ok(mut process) => {
+                if let Some(restored) = restored {
+                    process.count_cost_from(restored);
+                }
                 held.process = Some(Running {
                     process,
                     handle,
@@ -819,6 +829,7 @@ impl<H: TurnHooks> Inner<H> {
         let scope_permit = self.acquire(&scope_cap, Some(&volume_key)).await;
         let global_permit = self.acquire(&self.global_cap, None).await;
         let volume = self.sandbox.ensure_volume(&volume_key).await?;
+        let session_dir = volume.session_dir(session.id);
         let mut spec = SessionSpec::new(
             session.id,
             volume,
@@ -850,6 +861,7 @@ impl<H: TurnHooks> Inner<H> {
         tracing::info!(session = %session.id, container = %container.id(), "started a session container");
         Ok(Held {
             container,
+            session_dir,
             mounts,
             tracked,
             process: None,

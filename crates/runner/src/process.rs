@@ -137,7 +137,7 @@ pub struct ClaudeProcess {
     stdout: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
     state: State,
     line: Vec<u8>,
-    process_total_cost_usd: f64,
+    process_total_cost_usd: Option<f64>,
 }
 
 impl std::fmt::Debug for ClaudeProcess {
@@ -210,8 +210,17 @@ impl ClaudeProcess {
             child: io.child,
             state: State::Idle,
             line: Vec::new(),
-            process_total_cost_usd: 0.0,
+            process_total_cost_usd: Some(0.0),
         })
+    }
+
+    /// Counts the process's cost from `restored`, the total the CLI
+    /// restores for a `--resume`d session, so the first result's
+    /// [`cost_usd`](crate::TurnResult::cost_usd) is the turn's own too.
+    /// `None` when that total isn't known: the first result then has no
+    /// `cost_usd`, and later ones do. Call it before the first turn.
+    pub fn count_cost_from(&mut self, restored: Option<f64>) {
+        self.process_total_cost_usd = restored;
     }
 
     /// The session the process runs.
@@ -278,9 +287,11 @@ impl ClaudeProcess {
     ///
     /// The result's [`cost_usd`](crate::TurnResult::cost_usd) is the turn's
     /// own: the CLI reports a running total for the process, and the
-    /// process keeps the previous total to take it off. On the first turn
-    /// of a process started with [`SessionStart::Resume`] it also holds
-    /// what the CLI restored (see
+    /// process keeps the previous total to take it off. A process started
+    /// with [`SessionStart::Resume`] starts that total from what the CLI
+    /// restored only once told it with
+    /// [`count_cost_from`](Self::count_cost_from); until then its first
+    /// result's cost holds the restored total too (see
     /// [`process_total_cost_usd`](crate::TurnResult::process_total_cost_usd)).
     ///
     /// Neither the message nor any line of output is logged. One log line

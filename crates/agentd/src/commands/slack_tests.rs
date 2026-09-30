@@ -1603,7 +1603,10 @@ async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
         ),
     }];
     inbound
-        .send(SlackInbound::Message(Box::new(event), InFlight::untracked()))
+        .send(SlackInbound::Message(
+            Box::new(event),
+            InFlight::untracked(),
+        ))
         .await
         .unwrap();
     drop(inbound);

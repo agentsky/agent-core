@@ -16,6 +16,7 @@ use crate::commands::{Commands, ManagerBot, Replies};
 use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
 use crate::ctl::{Ctl, CtlSettings, SurfaceLookup};
 use crate::pipeline::StoreSurfaces;
+use crate::policy::Limits;
 use crate::skills::{Git, Skills};
 use crate::slack::agents::{AgentAppSettings, SlackAgents};
 use crate::slack::bots::SlackBots;
@@ -146,7 +147,8 @@ impl App {
             slack.clone(),
             skills.clone(),
         )
-        .with_admins(config.community.admins.iter().cloned());
+        .with_admins(config.community.admins.iter().cloned())
+        .with_limits(Limits::from_config(&config.limits));
         if let Some(slack_agents) = &slack_agents {
             commands = commands.with_slack_agents(slack_agents.clone());
         }
