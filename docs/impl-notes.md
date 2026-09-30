@@ -6532,7 +6532,11 @@ the CLI writes for a tool turn (queue operations, attachments, the
 (0.0112), which the CLI then restores; no rule had to be relaxed for it.
 The transcript is printed, and kept in
 `testkit/fixtures/transcript/tool-turn.jsonl` (four long attachment lines
-left out) for a unit test that needs no Docker. Then the hand-built
+left out) for a unit test that needs no Docker. The CLI runs as the
+session directory's owner, as agentd runs the sandbox when it isn't root,
+so the runner opens the files with the modes the CLI gave them; run as the
+image's user, it wrote a transcript the non-root CI runner could not
+open. Then the hand-built
 shapes (no cost line, one, two, a file of exactly 5,242,880 bytes) must
 read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
 `leaf3`, a duplicated key, a ledger-prefixed line) must be unknown. On the

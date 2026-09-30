@@ -1046,6 +1046,16 @@ mod tests {
         .collect()
     }
 
+    /// The user the container runs the CLI as: the session directory's
+    /// owner, as agentd's Docker sandbox runs it when agentd isn't root, so
+    /// the runner can read what the CLI writes; `None` for the image's own
+    /// user, whom a root runner opens the directory to.
+    fn container_user(dir: &Path) -> Option<String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let owner = std::fs::metadata(dir).unwrap();
+        (owner.uid() != 0).then(|| format!("{}:{}", owner.uid(), owner.gid()))
+    }
+
     fn open_to_all(path: &Path) {
         let mode = if path.is_dir() { 0o777 } else { 0o666 };
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1063,10 +1073,14 @@ mod tests {
         for sub in ["home", "work"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        open_to_all(dir);
+        let user = container_user(dir);
+        if user.is_none() {
+            open_to_all(dir);
+        }
         let output = std::process::Command::new("timeout")
             .arg("180")
             .args(["docker", "run", "--rm", "--network", "host", "-i"])
+            .args(user.iter().flat_map(|user| ["--user", user.as_str()]))
             .arg("-v")
             .arg(format!("{}:/volume/s", dir.display()))
             .args(["-w", "/volume/s/work"])
