@@ -1,6 +1,7 @@
 //! A stand-in for the Claude Code CLI in tests. The `testkit::claude` module
 //! documents its flags, checks and output.
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, CommandFactory, Parser, error::ErrorKind};
 use serde_json::{Value, json};
-use testkit::claude::{CRASH_EXIT_CODE, DEFAULT_MODEL, SCRIPT_ENV, Turn};
+use testkit::claude::{API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, SCRIPT_ENV, Turn};
 use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
 use uuid::Uuid;
 
@@ -125,6 +126,7 @@ struct Session {
     base_url: String,
     credential: Credential,
     http: reqwest::Client,
+    rate_limit_reported: Cell<bool>,
 }
 
 struct ApiError {
@@ -212,6 +214,7 @@ async fn run(args: Args) -> Result<ExitCode, String> {
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|err| format!("building the HTTP client: {err}"))?,
+        rate_limit_reported: Cell::new(false),
     };
 
     let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
@@ -281,6 +284,9 @@ impl Session {
         for argv in &turn.commands {
             self.run_command(argv).await?;
         }
+        for line in &turn.extra_lines {
+            emit_raw(line)?;
+        }
         if turn.is_error {
             let kind = match turn.api_error_status {
                 Some(401 | 403) => "authentication_failed",
@@ -300,7 +306,7 @@ impl Session {
             "usage": usage(10, 1),
         });
         self.record(json!({"type": "assistant", "message": message}))?;
-        self.emit_message("assistant", message, json!({}))?;
+        self.emit_reply(message)?;
         self.emit_result(&turn.reply, false, None, "end_turn", started)?;
         Ok(false)
     }
@@ -348,6 +354,7 @@ impl Session {
             .post(url)
             .header("anthropic-version", "2023-06-01")
             .header("user-agent", format!("claude-cli/{VERSION} (fake-claude)"))
+            .header("x-app", "cli")
             .header("x-claude-code-session-id", self.id.to_string())
             .json(&json!({
                 "model": self.model,
@@ -356,10 +363,12 @@ impl Session {
                 "messages": [{"role": "user", "content": content}],
             }));
         let request = match &self.credential {
-            Credential::ApiKey(key) => request.header("x-api-key", key),
+            Credential::ApiKey(key) => request
+                .header("x-api-key", key)
+                .header("anthropic-beta", API_KEY_BETA),
             Credential::OAuth(token) => request
                 .bearer_auth(token)
-                .header("anthropic-beta", "oauth-2025-04-20"),
+                .header("anthropic-beta", OAUTH_BETA),
             Credential::Missing => {
                 return Err(ApiError {
                     status: None,
@@ -404,25 +413,21 @@ impl Session {
 
     async fn run_command(&self, argv: &[String]) -> Result<(), String> {
         let tool_id = format!("toolu_fake_{}", Uuid::new_v4().simple());
-        self.emit_message(
-            "assistant",
-            json!({
-                "id": format!("msg_fake_{}", Uuid::new_v4().simple()),
-                "type": "message",
-                "role": "assistant",
-                "model": self.model,
-                "content": [{
-                    "type": "tool_use",
-                    "id": tool_id,
-                    "name": "Bash",
-                    "input": {"command": argv.join(" "), "description": "Run a scripted command"},
-                }],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": usage(10, 1),
-            }),
-            json!({}),
-        )?;
+        self.emit_reply(json!({
+            "id": format!("msg_fake_{}", Uuid::new_v4().simple()),
+            "type": "message",
+            "role": "assistant",
+            "model": self.model,
+            "content": [{
+                "type": "tool_use",
+                "id": tool_id,
+                "name": "Bash",
+                "input": {"command": argv.join(" "), "description": "Run a scripted command"},
+            }],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": usage(10, 1),
+        }))?;
         let (stdout, stderr, code) = match argv.split_first() {
             None => (String::new(), "empty command".to_owned(), None),
             Some((program, rest)) => match tokio::process::Command::new(program)
@@ -496,6 +501,23 @@ impl Session {
         Ok(true)
     }
 
+    /// Prints an `assistant` line of a successful API answer, and after the
+    /// first one in the process a `rate_limit_event` if the real CLI would.
+    fn emit_reply(&self, message: Value) -> Result<(), String> {
+        self.emit_message("assistant", message, json!({}))?;
+        if matches!(self.credential, Credential::OAuth(_))
+            && !self.rate_limit_reported.replace(true)
+        {
+            emit(&json!({
+                "type": "rate_limit_event",
+                "rate_limit_info": {"status": "allowed", "isUsingOverage": false},
+                "uuid": Uuid::new_v4(),
+                "session_id": self.id,
+            }))?;
+        }
+        Ok(())
+    }
+
     fn emit_message(&self, kind: &str, message: Value, extra: Value) -> Result<(), String> {
         let mut line = json!({
             "type": kind,
@@ -553,6 +575,10 @@ fn now() -> String {
 }
 
 fn emit(line: &Value) -> Result<(), String> {
+    emit_raw(&line.to_string())
+}
+
+fn emit_raw(line: &str) -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{line}")
         .and_then(|()| stdout.flush())
