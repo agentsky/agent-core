@@ -32,7 +32,10 @@
 //! The handlers then apply the target rules in [`target`](self) (from the
 //! turn's [`Side`](core_types::Side)) and write to the turn's [`Outbox`],
 //! which [`end_turn`](Ctl::end_turn) hands to the turn pipeline.
-//! `agentctl lock` takes leases in `scope_locks`, one volume at a time.
+//! `agentctl lock` takes leases in `scope_locks`, one volume at a time. A
+//! lease lasts no longer than the turn that took it: beginning or ending a
+//! turn, and revoking or replacing the token, delete the session's leases,
+//! so the lock is free at once rather than when the lease runs out.
 
 mod api;
 mod outbox;
@@ -226,7 +229,8 @@ impl Ctl {
     /// Mints the token of a new `claude` process, for its `AGENTCTL_TOKEN`.
     ///
     /// No turn is running on it yet. A token already issued for the same
-    /// session is revoked: a session runs one process at a time.
+    /// session is revoked, with the session's leases: a session runs one
+    /// process at a time.
     ///
     /// # Errors
     ///
@@ -257,7 +261,7 @@ impl Ctl {
 
     /// Records `turn` on the token, so its requests are authorized for that
     /// turn, and gives the turn an empty outbox. A turn still recorded on the
-    /// token is replaced, and its outbox dropped.
+    /// token is replaced, and its outbox and leases dropped.
     ///
     /// # Errors
     ///
@@ -293,7 +297,8 @@ impl Ctl {
     /// `None` if no turn was running, or the token was revoked.
     ///
     /// Requests still in flight when it returns are refused, and what they
-    /// staged is deleted.
+    /// staged is deleted. The session's `shared/` leases are deleted with
+    /// the turn, so the lock is free at once.
     ///
     /// # Errors
     ///
@@ -304,8 +309,8 @@ impl Ctl {
         Ok(self.outboxes().remove(&hash).map(|entry| entry.outbox))
     }
 
-    /// Deletes the token and drops its turn's outbox. Revoking a token twice
-    /// is harmless.
+    /// Deletes the token and the session's `shared/` leases, and drops its
+    /// turn's outbox. Revoking a token twice is harmless.
     ///
     /// # Errors
     ///

@@ -1377,13 +1377,15 @@ Deliverables:
 
 - The `Sandbox` trait:
   - `ensure_volume(VolumeKey) -> VolumeRef`.
-  - `prepare_session_dirs(volume, session)`. It creates `sessions/<id>/work`,
-    `sessions/<id>/claude`, `sessions/<id>/home` and `sessions/<id>/tmp`, and
-    writes `sessions/<id>/claude/settings.json` with `cleanupPeriodDays`
-    (configurable, default 3650).
   - `start(SessionSpec) -> Container`, where `SessionSpec` carries the session
     id, volume, image, environment, the agent's persona and skills
-    directories, and labels.
+    directories, and labels. Before creating the container it creates
+    `sessions/<id>/work`, `sessions/<id>/claude`, `sessions/<id>/home` and
+    `sessions/<id>/tmp`, and writes `sessions/<id>/claude/settings.json`
+    with `cleanupPeriodDays` (configurable, default 3650). That step is
+    crate-private, since it is safe only while the session has no running
+    container
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
   - `Container::paths()`, which gives the paths as the CLI sees them: working
     directory, `CLAUDE_CONFIG_DIR`, `HOME`, `TMPDIR`, persona file. Docker and
     process sandboxes differ here, and the runner uses only these.
@@ -1611,7 +1613,9 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails.
+  is killed and the turn fails. If the kill fails, the container is stopped
+  instead, since nothing was signalled
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
 - Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
   new process with `--resume`.
 - Classification of `is_error` results: `usage_limit` (rate limit or credit
@@ -1675,7 +1679,9 @@ Deliverables:
     `process_stopping` and then stops both.
   - It follows `Sandbox::events()`: a container that died has its process
     marked gone and `process_stopping` called at once, so its IP can't be
-    reused with a live mapping.
+    reused with a live mapping. The stream ends only after an `Err` item,
+    which means deaths may have been missed: the pool subscribes again and
+    compares `list_managed()` with the containers it holds.
   - A per-scope container cap, default 4. Turns beyond it wait in a per-scope
     queue.
   - A global cap.
@@ -1811,7 +1817,12 @@ Deliverables:
   (T17), validated with its `validate`; `image` fills every `SessionSpec`.
   agentd builds a `DockerSandbox` with its data directory, calls
   `reap_orphans` at startup, and documents the section in
-  `config/agentd.example.toml`.
+  `config/agentd.example.toml`. bollard logs every request body at debug
+  level, `exec` environments with placeholders and agentctl tokens
+  included, so `telemetry::subscriber` caps the `bollard` target at `info`
+  whatever `server.log_filter` says. Any other subscriber setup, such as a
+  test harness that captures logs, must keep that cap
+  ([impl-notes](impl-notes.md#bollard-logs-request-bodies-at-debug-level)).
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15

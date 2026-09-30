@@ -120,14 +120,6 @@ impl Sandbox for ProcessSandbox {
         self.layout.ensure_volume(key).await
     }
 
-    async fn prepare_session_dirs(
-        &self,
-        volume: &VolumeRef,
-        session: SessionId,
-    ) -> Result<PathBuf> {
-        self.layout.prepare_session_dirs(volume, session).await
-    }
-
     async fn start(&self, spec: &SessionSpec) -> Result<Container> {
         check_spec(spec)?;
         let dir = self
@@ -229,7 +221,7 @@ impl Sandbox for ProcessSandbox {
         };
         for child in &record.children {
             if !child.reaped.load(Ordering::SeqCst) {
-                kill_group(child.pgid);
+                kill_group(child.pgid).await;
             }
         }
         let _ = self.inner.events.send(ContainerEvent::Died {
@@ -255,13 +247,11 @@ impl Sandbox for ProcessSandbox {
 
     fn events(&self) -> BoxStream<'static, Result<ContainerEvent>> {
         let receiver = self.inner.events.subscribe();
-        stream::unfold(receiver, |mut receiver| async move {
+        stream::unfold(Some(receiver), |receiver| async move {
+            let mut receiver = receiver?;
             match receiver.recv().await {
-                Ok(event) => Some((Ok(event), receiver)),
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    Some((Err(SandboxError::EventsMissed), receiver))
-                }
-                Err(broadcast::error::RecvError::Closed) => None,
+                Ok(event) => Some((Ok(event), Some(receiver))),
+                Err(_) => Some((Err(SandboxError::EventsMissed), None)),
             }
         })
         .boxed()
@@ -291,13 +281,31 @@ fn link_skills(link: &std::path::Path, skills: Option<&std::path::Path>) -> Resu
 
 /// Sends SIGKILL to process group `pgid` with the `kill` command, since
 /// the workspace forbids the `unsafe` a direct `kill(2)` would need.
-fn kill_group(pgid: u32) {
-    let _ = std::process::Command::new("kill")
+async fn kill_group(pgid: u32) {
+    let _ = kill_command(pgid).status().await;
+}
+
+/// [`kill_group`] for `Drop`, which can't wait: on a tokio runtime the
+/// command runs in a task, and elsewhere it blocks.
+fn kill_group_detached(pgid: u32) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(kill_group(pgid));
+        }
+        Err(_) => {
+            let _ = kill_command(pgid).into_std().status();
+        }
+    }
+}
+
+fn kill_command(pgid: u32) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("kill");
+    command
         .args(["-s", "KILL", "--", &format!("-{pgid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    command
 }
 
 /// A child's stdin whose shutdown closes the pipe, as shutting down a
@@ -362,7 +370,7 @@ impl ProcessChild {
 
     pub(crate) async fn kill(&mut self) -> Result<()> {
         if !self.state.reaped.load(Ordering::SeqCst) {
-            kill_group(self.state.pgid);
+            kill_group(self.state.pgid).await;
         }
         let _ = self.child.start_kill();
         Ok(())
@@ -374,7 +382,7 @@ impl Drop for ProcessChild {
         if !self.state.reaped.swap(true, Ordering::SeqCst)
             && matches!(self.child.try_wait(), Ok(None))
         {
-            kill_group(self.state.pgid);
+            kill_group_detached(self.state.pgid);
         }
     }
 }
@@ -478,12 +486,14 @@ mod tests {
             })
             .await
             .unwrap();
-        let session = SessionId::new_v4();
-        let session_dir = sandbox
-            .prepare_session_dirs(&volume, session)
-            .await
-            .unwrap();
-        assert_eq!(session_dir, volume.session_dir(session));
+        let spec = SessionSpec::new(
+            SessionId::new_v4(),
+            volume.clone(),
+            "unused",
+            dir.0.join("agents/a1"),
+        );
+        sandbox.start(&spec).await.unwrap();
+        let session_dir = volume.session_dir(spec.session);
         for sub in ["work", "claude", "home", "tmp"] {
             assert!(session_dir.join(sub).is_dir(), "{sub}");
         }
@@ -494,11 +504,8 @@ mod tests {
         assert_eq!(settings, serde_json::json!({"cleanupPeriodDays": 9}));
 
         let default = ProcessSandbox::new(memory_store().await, dir.0.clone()).unwrap();
-        let other = default
-            .prepare_session_dirs(&volume, session)
-            .await
-            .unwrap();
-        let settings = std::fs::read_to_string(other.join("claude/settings.json")).unwrap();
+        default.start(&spec).await.unwrap();
+        let settings = std::fs::read_to_string(session_dir.join("claude/settings.json")).unwrap();
         assert!(settings.contains("3650"), "{settings}");
     }
 
@@ -717,6 +724,19 @@ mod tests {
             Err(SandboxError::NotFound)
         ));
         sandbox.stop(container.id()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_end_only_after_events_missed() {
+        let dir = TempDir::new();
+        let sandbox = sandbox(&dir).await;
+        let events = sandbox.events();
+        drop(sandbox);
+        let items: Vec<_> = events.collect().await;
+        assert!(
+            matches!(items.as_slice(), [Err(SandboxError::EventsMissed)]),
+            "{items:?}"
+        );
     }
 
     #[tokio::test]

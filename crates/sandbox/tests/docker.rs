@@ -4,16 +4,21 @@
 //! They use `debian:stable-slim` and run as the test process's own uid
 //! (10001 when that is root), since they check mounts and isolation, not
 //! the CLI. Each test uses its own `instance` label and its own internal
-//! network, so tests running in parallel leave each other alone.
+//! network, so tests running in parallel leave each other alone. A
+//! fixture removes its containers, network and directory when dropped,
+//! also when the test fails.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use bollard::Docker;
 use bollard::models::NetworkCreateRequest;
-use bollard::query_parameters::{CreateImageOptionsBuilder, KillContainerOptionsBuilder};
+use bollard::query_parameters::{
+    CreateImageOptionsBuilder, KillContainerOptionsBuilder, ListContainersOptionsBuilder,
+    RemoveContainerOptionsBuilder,
+};
 use core_types::{AgentId, ConvRef, ScopeKey, SessionId, SurfaceKind, VolumeKey};
 use futures::StreamExt;
 use sandbox::{
@@ -31,7 +36,26 @@ struct Fixture {
     sandbox: DockerSandbox,
     config: SandboxConfig,
     network: String,
+    owns_network: bool,
     dir: PathBuf,
+}
+
+/// The network a fixture's sandboxes attach to.
+enum Network<'a> {
+    /// A new internal network, like the real `sandbox` network.
+    Internal,
+    /// A new network with a route out.
+    Open,
+    /// Another fixture's network.
+    Shared(&'a str),
+}
+
+async fn connect() -> Docker {
+    Docker::connect_with_defaults()
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap()
 }
 
 async fn pull_image(docker: &Docker) {
@@ -51,30 +75,25 @@ async fn pull_image(docker: &Docker) {
 }
 
 impl Fixture {
-    /// A sandbox on a new internal network, or on `network` if given.
-    async fn new_on(network: Option<&str>) -> Self {
-        let docker = Docker::connect_with_defaults()
-            .unwrap()
-            .negotiate_version()
-            .await
-            .unwrap();
+    async fn new_on(network: Network<'_>) -> Self {
+        let docker = connect().await;
         pull_image(&docker).await;
         let tag = uuid::Uuid::new_v4().simple().to_string();
-        let network = match network {
-            Some(name) => name.to_string(),
-            None => {
-                let name = format!("agentd-test-{tag}");
-                docker
-                    .create_network(NetworkCreateRequest {
-                        name: name.clone(),
-                        internal: Some(true),
-                        ..Default::default()
-                    })
-                    .await
-                    .unwrap();
-                name
-            }
+        let (network, internal) = match network {
+            Network::Shared(name) => (name.to_string(), None),
+            Network::Internal => (format!("agentd-test-{tag}"), Some(true)),
+            Network::Open => (format!("agentd-test-open-{tag}"), Some(false)),
         };
+        if internal.is_some() {
+            docker
+                .create_network(NetworkCreateRequest {
+                    name: network.clone(),
+                    internal,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
         let dir = std::env::temp_dir().join(format!("sandbox-docker-{tag}"));
         std::fs::create_dir(&dir).unwrap();
         let me = std::fs::metadata(&dir).unwrap();
@@ -101,12 +120,13 @@ impl Fixture {
             sandbox,
             config,
             network,
+            owns_network: internal.is_some(),
             dir,
         }
     }
 
     async fn new() -> Self {
-        Self::new_on(None).await
+        Self::new_on(Network::Internal).await
     }
 
     async fn volume(&self, agent: AgentId, scope: ScopeKey) -> VolumeRef {
@@ -148,13 +168,49 @@ impl Fixture {
     async fn run(&self, container: &Container, script: &str) -> (i32, String) {
         self.run_with(container, script, "").await
     }
+}
 
-    async fn cleanup(self) {
-        self.sandbox.reap_orphans().await.unwrap();
-        if self.network.starts_with("agentd-test-") {
-            let _ = self.docker.remove_network(&self.network).await;
-        }
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let instance = self.config.instance.clone();
+        let network = self.owns_network.then(|| self.network.clone());
+        let cleanup = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(remove_leftovers(&instance, network.as_deref()));
+        });
+        let _ = cleanup.join();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Force-removes every container of `instance`, then `network`. It runs on
+/// its own runtime, since a fixture may be dropped while its test's runtime
+/// unwinds.
+async fn remove_leftovers(instance: &str, network: Option<&str>) {
+    let docker = connect().await;
+    let filters = HashMap::from([(
+        "label".to_string(),
+        vec![format!("{}={instance}", sandbox::LABEL_INSTANCE)],
+    )]);
+    let options = ListContainersOptionsBuilder::default()
+        .all(true)
+        .filters(&filters)
+        .build();
+    for container in docker
+        .list_containers(Some(options))
+        .await
+        .unwrap_or_default()
+    {
+        if let Some(id) = container.id {
+            let options = RemoveContainerOptionsBuilder::default().force(true).build();
+            let _ = docker.remove_container(&id, Some(options)).await;
+        }
+    }
+    if let Some(network) = network {
+        let _ = docker.remove_network(network).await;
     }
 }
 
@@ -184,7 +240,6 @@ async fn docker_a_session_cannot_see_another_sessions_directory() {
     assert_ne!(code, 0);
     let (code, out) = fx.run(&b, "ls /volume/sessions").await;
     assert_eq!((code, out.trim()), (0, spec_b.session.to_string().as_str()));
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -205,7 +260,6 @@ async fn docker_shared_is_visible_across_sessions() {
     let other_agent = fx.volume(AgentId::new_v4(), channel()).await;
     let c = fx.start(&fx.spec(&other_agent)).await;
     assert_ne!(fx.run(&c, "test -e /volume/shared/greeting").await.0, 0);
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -242,7 +296,6 @@ async fn docker_skills_and_persona_are_read_only() {
         .await;
     assert_eq!(code, 0);
     assert!(out.contains("\"cleanupPeriodDays\": 3650"), "{out}");
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -272,7 +325,6 @@ async fn docker_shared_can_be_read_only_and_memory_is_absent_unless_requested() 
     assert_ne!(fx.run(&task, "echo x > /volume/shared/t").await.0, 0);
     assert_ne!(fx.run(&task, "test -e /volume/memory").await.0, 0);
     assert_eq!(task.paths().memory, None);
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -296,7 +348,6 @@ async fn docker_runs_as_a_non_root_user_on_a_read_only_root() {
     assert_eq!(code, 0);
     assert!(out.contains("CapEff:\t0000000000000000"), "{out}");
     assert!(out.contains("NoNewPrivs:\t1"), "{out}");
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -329,7 +380,6 @@ async fn docker_home_and_tmp_are_writable_and_scripts_run_there() {
         out.trim(),
         format!("{} {}", paths.home.display(), paths.tmp.display())
     );
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -337,12 +387,12 @@ async fn docker_home_and_tmp_are_writable_and_scripts_run_there() {
 async fn docker_the_internet_is_unreachable() {
     let by_name = "timeout 10 bash -c 'echo > /dev/tcp/example.com/443'";
     let by_address = "timeout 10 bash -c 'echo > /dev/tcp/1.1.1.1/443'";
-    let open = Fixture::new_on(Some("bridge")).await;
+    let open = Fixture::new_on(Network::Open).await;
     let volume = open.volume(AgentId::new_v4(), channel()).await;
     let container = open.start(&open.spec(&volume)).await;
     let (code, _) = open.run(&container, by_name).await;
     assert_eq!(code, 0, "the probe must work where there is a route out");
-    open.cleanup().await;
+    drop(open);
 
     let fx = Fixture::new().await;
     let volume = fx.volume(AgentId::new_v4(), channel()).await;
@@ -351,7 +401,6 @@ async fn docker_the_internet_is_unreachable() {
     assert_ne!(fx.run(&container, by_address).await.0, 0);
     let ip = fx.sandbox.ip(container.id()).await.unwrap();
     assert!(!ip.is_loopback() && !ip.is_unspecified(), "{ip}");
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -379,14 +428,13 @@ async fn docker_exec_pipes_stdio_and_kill_stops_the_process() {
         .unwrap()
         .unwrap();
     assert_eq!(status.code, Some(137));
-    fx.cleanup().await;
 }
 
 #[tokio::test]
 #[ignore = "needs docker"]
 async fn docker_reap_orphans_stops_only_this_instances_containers() {
     let fx = Fixture::new().await;
-    let other = Fixture::new_on(Some(&fx.network)).await;
+    let other = Fixture::new_on(Network::Shared(&fx.network)).await;
     let volume = fx.volume(AgentId::new_v4(), channel()).await;
     let a = fx.start(&fx.spec(&volume)).await;
     let b = fx.start(&fx.spec(&volume)).await;
@@ -412,8 +460,6 @@ async fn docker_reap_orphans_stops_only_this_instances_containers() {
     assert_eq!(still.len(), 1);
     assert_eq!(&still[0].id, kept.id());
     fx.sandbox.stop(a.id()).await.unwrap();
-    other.cleanup().await;
-    fx.cleanup().await;
 }
 
 #[tokio::test]
@@ -443,5 +489,4 @@ async fn docker_a_killed_container_produces_a_die_event() {
             session: Some(spec.session),
         }
     );
-    fx.cleanup().await;
 }
