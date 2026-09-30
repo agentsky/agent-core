@@ -294,8 +294,8 @@ pub struct TurnStats {
     /// carried, added up. The CLI prints a line per content block of a
     /// message, each with the message's usage so far, and the lines of
     /// subagents running at once come interleaved, so the lines with one
-    /// `message.id` count once, at their largest, among the latest
-    /// [`RECENT_MESSAGES`] ids. See [`TurnOutcome::usage`].
+    /// `message.id` count once, at their largest, among the latest 64
+    /// ids. See [`TurnOutcome::usage`].
     pub message_usage: Usage,
     /// The latest short message ids of `assistant` lines, the latest last,
     /// each with that message's usage so far, counted in `message_usage`
