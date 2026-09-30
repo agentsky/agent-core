@@ -147,10 +147,38 @@ async fn in_session(
     row.map(Row::into_ref).transpose()
 }
 
+/// Gives the session's inbound row for `new.msg` the post's attribution
+/// from `new`, inside a transaction. The partial unique index still refuses
+/// it if another session's row attributes the message.
+async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Result<MessageRef> {
+    let row: Row = sqlx::query_as(concat!(
+        "UPDATE message_refs SET agent_id = ?, turn_id = ?, requester_member = ?, \
+         requester_key = ?, hop = ? WHERE session_id = ? AND surface = ? AND team_id = ? \
+         AND conversation = ? AND platform_ref = ? RETURNING ",
+        columns!()
+    ))
+    .bind(new.agent.map(|agent| agent.to_string()))
+    .bind(new.turn.map(|turn| turn.to_string()))
+    .bind(new.requester.member.map(|member| member.to_string()))
+    .bind(new.requester.key.to_string())
+    .bind(i64::from(new.hop.0))
+    .bind(new.session.to_string())
+    .bind(new.msg.conv.surface.as_str())
+    .bind(new.msg.conv.team.as_str())
+    .bind(new.msg.conv.conversation.as_str())
+    .bind(new.msg.id.as_str())
+    .fetch_one(conn)
+    .await?;
+    row.into_ref()
+}
+
 impl Store {
     /// Records `new` in its session with the session's next short id, and
-    /// returns the row. A message the session already has keeps its row,
-    /// which is returned unchanged.
+    /// returns the row. A message the session already has keeps its row and
+    /// short id, returned unchanged, except that an inbound row (no agent)
+    /// takes `new`'s agent, turn, requester and hop when `new` names an
+    /// agent: the session was shown the message before it recorded posting
+    /// it, and the post's attribution must not be lost.
     ///
     /// It runs in one `BEGIN IMMEDIATE` transaction, so concurrent calls
     /// for one session never hand out one short id twice.
@@ -158,9 +186,8 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::Database`] if a query fails, including when `new`
-    /// names an agent and the message is already recorded as posted by an
-    /// agent in another session; [`StoreError::Corrupt`] if a row doesn't
-    /// parse.
+    /// names an agent and the message is already recorded as posted in
+    /// another session; [`StoreError::Corrupt`] if a row doesn't parse.
     pub async fn record_message_ref(
         &self,
         new: &NewMessageRef<'_>,
@@ -168,8 +195,12 @@ impl Store {
     ) -> Result<MessageRef> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(found) = in_session(&mut tx, new.session, new.msg).await? {
+            let row = match (found.agent, new.agent) {
+                (None, Some(_)) => attribute(&mut tx, new).await?,
+                _ => found,
+            };
             tx.commit().await?;
-            return Ok(found);
+            return Ok(row);
         }
         let row: Row = sqlx::query_as(concat!(
             "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
@@ -569,6 +600,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again.short_id, shown.short_id);
+    }
+
+    #[tokio::test]
+    async fn recording_a_shown_message_as_posted_attributes_its_row() {
+        let store = memory_store().await;
+        let (session, other) = (SessionId::new_v4(), SessionId::new_v4());
+        let agent = AgentId::new_v4();
+        let turn = TurnId::new_v4();
+        let payer = requester("U1", Some(MemberId::new_v4()));
+        let sender = requester("UBOT", None);
+        let root = MessageId::new("1.1");
+        let reply = msg("C1", "2.1");
+        let posted = |session| NewMessageRef {
+            session,
+            msg: &reply,
+            thread_root: Some(&root),
+            agent: Some(agent),
+            turn: Some(turn),
+            requester: &payer,
+            hop: Hop(3),
+        };
+        store
+            .record_message_ref(&inbound(session, &msg("C1", "1.1"), None, &sender), at(1))
+            .await
+            .unwrap();
+        let shown = store
+            .record_message_ref(&inbound(session, &reply, Some(&root), &sender), at(2))
+            .await
+            .unwrap();
+        assert_eq!(shown.short_id, 2);
+        assert_eq!(store.posted_message_ref(&reply).await.unwrap(), None);
+
+        let attributed = store
+            .record_message_ref(&posted(session), at(3))
+            .await
+            .unwrap();
+        assert_eq!(attributed.short_id, shown.short_id);
+        assert_eq!(attributed.posted_at, shown.posted_at);
+        assert_eq!(attributed.thread_root, Some(root.clone()));
+        assert_eq!(attributed.agent, Some(agent));
+        assert_eq!(attributed.turn, Some(turn));
+        assert_eq!(attributed.requester, payer);
+        assert_eq!(attributed.hop, Hop(3));
+        assert_eq!(
+            store.posted_message_ref(&reply).await.unwrap(),
+            Some(attributed.clone())
+        );
+
+        let again = store
+            .record_message_ref(&inbound(session, &reply, Some(&root), &sender), at(4))
+            .await
+            .unwrap();
+        assert_eq!(again, attributed);
+
+        store
+            .record_message_ref(&inbound(other, &reply, Some(&root), &sender), at(5))
+            .await
+            .unwrap();
+        let clash = store.record_message_ref(&posted(other), at(6)).await;
+        assert!(matches!(clash, Err(StoreError::Database(_))), "{clash:?}");
+        assert_eq!(
+            store
+                .session_message_ref(other, &reply)
+                .await
+                .unwrap()
+                .unwrap()
+                .agent,
+            None
+        );
+        assert_eq!(
+            store.posted_message_ref(&reply).await.unwrap(),
+            Some(attributed)
+        );
     }
 
     #[tokio::test]

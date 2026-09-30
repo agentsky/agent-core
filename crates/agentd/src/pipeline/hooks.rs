@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use core_types::{CredentialKind, SessionId};
+use core_types::{CredentialKind, ScopeKey, SessionId, Side};
 use cred_proxy::{EGRESS_ENV, PlaceholderId, Registry};
 use runner::{HookError, ProcessEnv, Session, TurnHooks, TurnRequest};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -15,6 +15,11 @@ pub const AGENTCTL_TOKEN_VAR: &str = "AGENTCTL_TOKEN";
 /// The variable agentctl reads the API's address from.
 pub const AGENTCTL_URL_VAR: &str = "AGENTCTL_URL";
 
+/// Why [`Hooks`] refuses a turn on the owner's side outside the agent's
+/// private session.
+const OWNER_SIDE_OFF_PRIVATE: &str =
+    "a turn on the owner's side runs only in the agent's private session";
+
 /// Mints each `claude` process's placeholder and agentctl token, points
 /// and clears them around each turn, and revokes them when the process
 /// stops.
@@ -25,14 +30,16 @@ pub const AGENTCTL_URL_VAR: &str = "AGENTCTL_URL";
 ///   agentctl token with [`Ctl::issue_process_token`]. The process's
 ///   environment gets the token, the agentctl API's address, and
 ///   [`EGRESS_ENV`], which sends its HTTPS through the egress proxy.
-/// - [`turn_starting`](TurnHooks::turn_starting) points the placeholder at
-///   the turn's credential with [`Registry::point`], then records the turn
+/// - [`turn_starting`](TurnHooks::turn_starting) refuses a turn on the
+///   owner's side ([`Side::Owner`]) unless the session is the agent's
+///   private one ([`ScopeKey::Private`]), then points the placeholder at
+///   the turn's credential with [`Registry::point`] and records the turn
 ///   on the token with [`Ctl::begin_turn`].
-/// - [`turn_finished`](TurnHooks::turn_finished) clears the turn with
-///   [`Ctl::end_turn`], which hands back the turn's outbox, and unpoints the
-///   placeholder with [`Registry::unpoint`], whatever `end_turn` did. A
-///   placeholder already revoked, as when the container died mid-turn, has
-///   nothing left to clear.
+/// - [`turn_finished`](TurnHooks::turn_finished) unpoints the placeholder
+///   with [`Registry::unpoint`] first, so it is cleared whatever happens
+///   next, then clears the turn with [`Ctl::end_turn`], which hands back
+///   the turn's outbox. A placeholder already revoked, as when the
+///   container died mid-turn, has nothing left to clear.
 /// - [`process_stopping`](TurnHooks::process_stopping) revokes the
 ///   placeholder, which closes the session's egress tunnels once it was
 ///   the session's last, and the token. Both name this process only, so a
@@ -149,6 +156,9 @@ impl TurnHooks for Hooks {
         process: &ProcessHandle,
         turn: &TurnRequest,
     ) -> Result<(), HookError> {
+        if turn.side == Side::Owner && session.scope != ScopeKey::Private {
+            return Err(OWNER_SIDE_OFF_PRIVATE.into());
+        }
         self.registry.point(process.placeholder, turn.credential)?;
         self.ctl
             .begin_turn(
@@ -173,11 +183,10 @@ impl TurnHooks for Hooks {
         process: &ProcessHandle,
         turn: &TurnRequest,
     ) -> Result<Option<Outbox>, HookError> {
-        let ended = self.ctl.end_turn(&process.token).await;
         if !self.registry.unpoint(process.placeholder) {
             tracing::debug!(session = %session.id, turn = %turn.turn, "the turn's placeholder was already revoked");
         }
-        Ok(ended?)
+        Ok(self.ctl.end_turn(&process.token).await?)
     }
 
     async fn process_stopping(

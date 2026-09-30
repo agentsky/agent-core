@@ -99,8 +99,16 @@ impl Routers {
             commands.clone(),
         );
         let tokens: Arc<dyn TokenSource> = app.auth().clone();
+        let upstream = &app.config().proxy.upstream;
+        if upstream != cred_proxy::DEFAULT_UPSTREAM {
+            tracing::warn!(
+                %upstream,
+                default = cred_proxy::DEFAULT_UPSTREAM,
+                "the credential proxy forwards real credentials to proxy.upstream, not the default"
+            );
+        }
         let proxy = CredProxy::new(
-            &app.config().proxy.upstream,
+            upstream,
             app.registry().clone(),
             tokens,
             Arc::new(NoCommunityKey),
@@ -528,6 +536,48 @@ fn panicked(err: JoinError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::config::tests::{MINIMAL, env};
+    use crate::telemetry::tests::Captured;
+    use crate::telemetry::{LogFormat, subscriber};
+
+    async fn routers_logs(upstream: Option<&str>) -> String {
+        let text = match upstream {
+            Some(upstream) => format!("{MINIMAL}\n[proxy]\nupstream = \"{upstream}\"\n"),
+            None => MINIMAL.to_owned(),
+        };
+        let config = Config::parse(&text, env()).unwrap();
+        let store = store::Store::open_in_memory(config.sealer().unwrap())
+            .await
+            .unwrap();
+        let app = App::new(config, store, None).unwrap();
+        let captured = Captured::default();
+        let logs = subscriber(
+            LogFormat::Json,
+            tracing_subscriber::EnvFilter::new("warn"),
+            captured.clone(),
+        );
+        let _guard = tracing::subscriber::set_default(logs);
+        Routers::new(&app).unwrap();
+        captured.text()
+    }
+
+    #[tokio::test]
+    async fn another_upstream_than_the_default_is_logged_as_a_warning() {
+        let upstream = "https://llm-gateway.example.com";
+        let out = routers_logs(Some(upstream)).await;
+        let lines: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1, "{out}");
+        assert_eq!(lines[0]["level"], "WARN");
+        assert_eq!(lines[0]["fields"]["upstream"], upstream);
+        for quiet in [None, Some(cred_proxy::DEFAULT_UPSTREAM)] {
+            let out = routers_logs(quiet).await;
+            assert!(out.is_empty(), "{quiet:?}: {out}");
+        }
+    }
 
     #[test]
     fn a_task_that_stops_early_is_an_error() {

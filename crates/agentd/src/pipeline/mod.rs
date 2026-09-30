@@ -220,15 +220,17 @@ impl CommunityKey for NoCommunityKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::tests::{MINIMAL, env};
+    use crate::config::tests::{MINIMAL, env, sandboxed};
 
     #[test]
     fn settings_come_from_the_sandbox_and_runner_sections() {
         let plain = Config::parse(MINIMAL, env()).unwrap();
         assert_eq!(TurnSettings::from_config(&plain), None);
 
-        let text =
-            format!("{MINIMAL}\n[sandbox]\nimage = \"img:1\"\n[runner]\nturn_timeout_secs = 5\n");
+        let text = format!(
+            "{}\n[sandbox]\nimage = \"img:1\"\n[runner]\nturn_timeout_secs = 5\n",
+            sandboxed()
+        );
         let config = Config::parse(&text, env()).unwrap();
         let settings = TurnSettings::from_config(&config).unwrap();
         assert_eq!(settings.image, "img:1");

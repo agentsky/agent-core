@@ -1,7 +1,14 @@
-//! A Docker test with the real `claude`: it needs a Docker daemon and the
-//! sandbox image built from `images/sandbox/Dockerfile`, so it is ignored
-//! by default. CI builds the image, then runs it with
-//! `cargo test --workspace -- --ignored docker_`.
+//! Docker tests: they need a Docker daemon, so they are ignored by default.
+//! CI runs them with `cargo test --workspace -- --ignored docker_`.
+//!
+//! `docker_startup_reaps_only_this_instances_sandboxes` plants containers
+//! from `debian:stable-slim`, which it pulls if it is missing, and checks that
+//! [`connect_docker`](agentd::pipeline::connect_docker) stops only the one
+//! labeled as this instance's sandbox. It removes what it planted when it
+//! ends, also when it fails.
+//!
+//! `docker_real_claude_starts` runs the real `claude`, from the sandbox
+//! image built from `images/sandbox/Dockerfile`, which CI builds first.
 //!
 //! The image is `agent-core/sandbox:dev`, or `AGENT_CORE_SANDBOX_IMAGE`.
 //! Sessions run in it through agentd's hooks and the sandbox crate's
@@ -12,7 +19,9 @@
 //! the network and the data directory are removed when the test ends, also
 //! when it fails.
 
-use std::collections::BTreeMap;
+mod common;
+
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -21,17 +30,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agentd::ctl::{Ctl, CtlSettings, NoSurfaces};
-use agentd::pipeline::Hooks;
+use agentd::pipeline::{Hooks, connect_docker};
+use agentd::{App, Config};
 use async_trait::async_trait;
 use auth::{AuthError, TokenSource};
 use bollard::Docker;
-use bollard::models::NetworkCreateRequest;
-use bollard::query_parameters::{ListContainersOptionsBuilder, RemoveContainerOptionsBuilder};
+use bollard::models::{ContainerCreateBody, NetworkCreateRequest};
+use bollard::query_parameters::{
+    CreateImageOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+};
 use core_types::{
     AgentId, ConvRef, CredentialRef, Hop, MemberId, MemberKey, MessageId, Requester, ScopeKey,
-    Side, SurfaceKind, ThreadKey, TurnId, TurnKind, VolumeKey,
+    SessionId, Side, SurfaceKind, ThreadKey, TurnId, TurnKind, VolumeKey,
 };
 use cred_proxy::{CredProxy, FixedKey, Observation, ProxyObserver, Registry};
+use futures::StreamExt as _;
 use runner::{
     PoolConfig, ProcessConfig, SessionConfig, SessionManager, SessionStart, TurnOutcome,
     TurnRequest,
@@ -44,6 +57,7 @@ use testkit::fake_anthropic;
 use tokio::net::TcpListener;
 
 const DEFAULT_IMAGE: &str = "agent-core/sandbox:dev";
+const PLANTED_IMAGE: &str = "debian:stable-slim";
 const COMMUNITY_KEY: &str = "sk-ant-community-test-key";
 
 /// What the test leaves on the Docker host and on disk, removed on drop.
@@ -73,6 +87,51 @@ impl Drop for Leftovers {
         });
         let _ = cleanup.join();
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Containers a test planted, removed on drop.
+#[derive(Default)]
+struct Planted(Vec<String>);
+
+impl Drop for Planted {
+    fn drop(&mut self) {
+        let ids = std::mem::take(&mut self.0);
+        let cleanup = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let docker = connect().await;
+                    for id in ids {
+                        let options = RemoveContainerOptionsBuilder::default().force(true).build();
+                        let _ = docker.remove_container(&id, Some(options)).await;
+                    }
+                });
+        });
+        let _ = cleanup.join();
+    }
+}
+
+impl Planted {
+    /// Starts a container from [`PLANTED_IMAGE`] with `labels`.
+    async fn plant(&mut self, docker: &Docker, labels: HashMap<String, String>) -> String {
+        let created = docker
+            .create_container(
+                None,
+                ContainerCreateBody {
+                    image: Some(PLANTED_IMAGE.into()),
+                    cmd: Some(vec!["sleep".into(), "600".into()]),
+                    labels: Some(labels),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        self.0.push(created.id.clone());
+        docker.start_container(&created.id, None).await.unwrap();
+        created.id
     }
 }
 
@@ -157,6 +216,66 @@ fn process_total(outcome: &TurnOutcome) -> f64 {
         TurnOutcome::Finished(result) => result.process_total_cost_usd.unwrap(),
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn docker_startup_reaps_only_this_instances_sandboxes() {
+    let docker = connect().await;
+    if docker.inspect_image(PLANTED_IMAGE).await.is_err() {
+        let (from_image, tag) = PLANTED_IMAGE.split_once(':').unwrap();
+        let options = CreateImageOptionsBuilder::default()
+            .from_image(from_image)
+            .tag(tag)
+            .build();
+        let mut progress = docker.create_image(Some(options), None, None);
+        while let Some(item) = progress.next().await {
+            item.unwrap();
+        }
+    }
+    let instance = format!("test-{}", uuid::Uuid::new_v4().simple());
+    let mut planted = Planted::default();
+    let left = planted
+        .plant(
+            &docker,
+            HashMap::from([
+                (sandbox::LABEL_INSTANCE.to_owned(), instance.clone()),
+                (
+                    sandbox::LABEL_SESSION.to_owned(),
+                    SessionId::new_v4().to_string(),
+                ),
+            ]),
+        )
+        .await;
+    let stranger = planted.plant(&docker, HashMap::new()).await;
+    assert_eq!(containers(&docker, &instance).await, vec![left.clone()]);
+
+    let dir = common::TempDir::new();
+    let text = format!(
+        "{}\n[sandbox]\nimage = \"{PLANTED_IMAGE}\"\ninstance = \"{instance}\"\nstop_timeout_secs = 1\n",
+        common::CONFIG
+            .replace(
+                "proxy_listen = \"127.0.0.2:0\"",
+                "proxy_listen = \"127.0.0.2:8080\""
+            )
+            .replace(
+                "ctl_listen = \"127.0.0.2:0\"",
+                "ctl_listen = \"127.0.0.2:8081\""
+            )
+            .replace("/nonexistent/agentd", &dir.path().display().to_string()),
+    );
+    let config = Config::parse(&text, common::env()).unwrap();
+    let store = Store::open_in_memory(config.sealer().unwrap())
+        .await
+        .unwrap();
+    let app = App::new(config, store, None).unwrap();
+    assert!(connect_docker(&app).await.unwrap().is_some());
+
+    assert!(containers(&docker, &instance).await.is_empty());
+    assert!(docker.inspect_container(&left, None).await.is_err());
+    let kept = docker.inspect_container(&stranger, None).await.unwrap();
+    assert_eq!(kept.state.and_then(|state| state.running), Some(true));
+    drop(planted);
 }
 
 #[tokio::test]
