@@ -6586,12 +6586,16 @@ that crashed or timed out, and for a finished one each count the larger
 of the result's and the sum, so a forged low result can't undercut what
 was streamed first. The meter bills it.
 
-A `usage` with any count past `MAX_TURN_TOKENS` (100 million, far above a
-turn's use, as `MAX_TURN_COST_USD` is above its cost) is taken for forged
-and ignored, and a turn's sum stops at it. Ignoring only that line, not
-the turn's tokens, matters: an agent that could make its turn's tokens
-unknown by printing one huge line would take them out of the thread's
-budget, while a line past the cap now only adds nothing.
+No count of a turn is more than `MAX_TURN_TOKENS` (100 million, far above
+what a turn writes, as `MAX_TURN_COST_USD` is above its cost): a count
+past it in a `usage`, or in what a turn's lines add up to, counts as the
+cap. Each count is held on its own. A first version dropped a whole
+`usage` with any count past the cap, cache reads included, which a long
+turn over a million-token context passes honestly: the result's figures
+were lost for the streamed ones, which are lower, and an agent could
+print such a result to be undercounted. Held at the cap, a forged count
+can only raise the turn's figure, never take a real one out of the
+thread's budget.
 
 The agent runs as the CLI's user, so it can write to the CLI's stdout as
 well as its transcript, and print whatever lines it likes. Token counts

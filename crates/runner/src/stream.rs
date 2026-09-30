@@ -30,10 +30,12 @@ pub const MAX_TURN_COST_USD: f64 = 1_000.0;
 
 /// The most tokens of each kind one turn's [`usage`](TurnOutcome::usage)
 /// counts. The agent can print lines the runner reads usage from (see
-/// [`TurnOutcome::usage`]), so a line reporting more of any kind is taken
-/// for forged and its usage ignored, and what a turn's lines add up to
-/// stops here. Far above what a turn uses: a million-token context read
-/// fresh on each of a hundred calls.
+/// [`TurnOutcome::usage`]), so a count past it, in a line or in what a
+/// turn's lines add up to, counts as this. Each count is held on its own,
+/// so a count past it (cache reads of a long turn, say) never costs a
+/// line its other counts, and a forged one only raises the turn's figure.
+/// Far above what a turn writes: a million-token context read fresh on
+/// each of a hundred calls.
 pub const MAX_TURN_TOKENS: u64 = 100_000_000;
 
 /// The largest running total taken as the CLI's. Far above any session's,
@@ -94,8 +96,8 @@ impl TurnOutcome {
     /// The agent runs as the CLI's user and can write to its stdout, so
     /// these are the CLI's figures only as far as the agent leaves them
     /// alone: a record, and a budget against agents that loop by mistake,
-    /// not a bound on one that means to overspend. A figure past
-    /// [`MAX_TURN_TOKENS`] is ignored, and no count is more than it.
+    /// not a bound on one that means to overspend. No count is more than
+    /// [`MAX_TURN_TOKENS`].
     pub fn usage(&self) -> Usage {
         let streamed = self.stats().message_usage;
         match self {
@@ -239,27 +241,23 @@ impl Usage {
         }
     }
 
-    /// The counts in `value`, a `usage` object, or `None` if it isn't one
-    /// or any count is past [`MAX_TURN_TOKENS`].
+    /// The counts in `value`, a `usage` object, each at most
+    /// [`MAX_TURN_TOKENS`], or `None` if it isn't one.
     fn read(value: Option<&Value>) -> Option<Self> {
         let usage = value.filter(|usage| usage.is_object())?;
-        let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let read = Self {
+        let count = |key| {
+            usage
+                .get(key)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(MAX_TURN_TOKENS)
+        };
+        Some(Self {
             input_tokens: count("input_tokens"),
             output_tokens: count("output_tokens"),
             cache_creation_input_tokens: count("cache_creation_input_tokens"),
             cache_read_input_tokens: count("cache_read_input_tokens"),
-        };
-        let counts = [
-            read.input_tokens,
-            read.output_tokens,
-            read.cache_creation_input_tokens,
-            read.cache_read_input_tokens,
-        ];
-        counts
-            .iter()
-            .all(|count| *count <= MAX_TURN_TOKENS)
-            .then_some(read)
+        })
     }
 }
 
@@ -1069,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn a_count_past_the_turn_cap_is_ignored_and_a_turn_counts_at_most_the_cap() {
+    fn a_count_past_the_turn_cap_counts_as_the_cap_and_so_does_a_turn() {
         let line = |id: &str, output: u64| {
             format!(
                 r#"{{"type":"assistant","message":{{"id":"{id}","content":[],"usage":{{"input_tokens":1,"output_tokens":{output}}}}}}}"#
@@ -1077,29 +1075,46 @@ mod tests {
         };
         let mut stats = TurnStats::default();
         note_line(line("m1", 7).as_bytes(), &mut stats);
-        note_line(line("m1", MAX_TURN_TOKENS + 1).as_bytes(), &mut stats);
-        note_line(line("m2", u64::MAX).as_bytes(), &mut stats);
+        note_line(line("m1", u64::MAX).as_bytes(), &mut stats);
         assert_eq!(
             (
                 stats.message_usage.input_tokens,
                 stats.message_usage.output_tokens
             ),
-            (1, 7),
-            "a line past the cap is taken for forged"
+            (1, MAX_TURN_TOKENS)
         );
-        let huge = br#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":100000001}}"#;
-        let finished = TurnOutcome::Finished(
-            note_line(huge, &mut stats.clone())
-                .unwrap()
-                .into_result(stats.clone(), &mut Some(0.0)),
+        note_line(line("m2", u64::MAX).as_bytes(), &mut stats);
+        note_line(line("m3", 5).as_bytes(), &mut stats);
+        assert_eq!(
+            (
+                stats.message_usage.input_tokens,
+                stats.message_usage.output_tokens
+            ),
+            (3, MAX_TURN_TOKENS),
+            "a turn's lines add up to at most the cap"
         );
-        assert_eq!(finished.usage(), stats.message_usage);
+    }
 
-        for id in ["m3", "m4", "m5"] {
-            note_line(line(id, MAX_TURN_TOKENS / 2).as_bytes(), &mut stats);
-        }
-        assert_eq!(stats.message_usage.output_tokens, MAX_TURN_TOKENS);
-        assert_eq!(stats.message_usage.input_tokens, 4);
+    #[test]
+    fn a_long_turns_cache_reads_never_cost_it_its_result() {
+        let mut stats = TurnStats::default();
+        let streamed = br#"{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        note_line(streamed, &mut stats);
+        let result = br#"{"type":"result","subtype":"success","usage":{"input_tokens":10,"output_tokens":500,"cache_creation_input_tokens":40,"cache_read_input_tokens":150000000}}"#;
+        let finished = TurnOutcome::Finished(
+            note_line(result, &mut stats.clone())
+                .unwrap()
+                .into_result(stats, &mut Some(0.0)),
+        );
+        assert_eq!(
+            finished.usage(),
+            Usage {
+                input_tokens: 10,
+                output_tokens: 500,
+                cache_creation_input_tokens: 40,
+                cache_read_input_tokens: MAX_TURN_TOKENS,
+            }
+        );
     }
 
     #[test]
