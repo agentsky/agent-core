@@ -271,28 +271,42 @@ the consent it was granted under.
 
 The router cannot tell from message text whether a task needs private
 resources, so the agent asks during its turn, the same way qm-core's agents
-issue ask-agent requests mid-turn[^qm-askagent]. The flow:
+issue ask-agent requests mid-turn[^qm-askagent]. The request is asynchronous,
+like qm-core's. Consent can take hours, and a channel turn that waited would
+hold its container, block the thread's session queue, keep its turn token alive
+and outlast Claude Code's Bash tool timeout (2 minutes by default, with a
+10-minute ceiling unless raised)[^cc-envvars]. The flow:
 
 ```mermaid
 flowchart TD
     T["Channel turn running"] --> R["Agent runs agentctl private 'task text'"]
-    R --> O{"Turn requester<br/>is the owner?"}
+    R --> ID["agentctl returns a consent id at once.<br/>The turn tells the thread<br/>it asked the owner, then ends"]
+    ID --> O{"Turn requester<br/>is the owner?"}
     O -- yes --> RUN["Fresh session in the<br/>owner's private sandbox"]
     O -- no --> CN["Consent card to owner<br/>shows the exact task text"]
     CN -- approved --> RUN
-    CN -- declined --> DN["agentctl returns: declined"]
-    RUN --> RES["Reply and attached files<br/>posted to the thread"]
+    CN -- "declined or expired" --> DN["agentd posts the<br/>outcome to the thread"]
+    RUN --> RES["agentd posts the reply and<br/>attached files to the thread<br/>as a new agent message"]
 ```
 
-- Each private task gets a fresh session with id `UUIDv5(agent, consent id)` on
-  the owner's private volume. It never joins the owner's DM session, so a
-  non-owner's task cannot read the owner's DM transcript and does not add to it.
+- The same asynchronous path serves the owner as requester, with no consent
+  card. A long private task would otherwise hold the channel turn the same way.
+- `CONSENT` records the reply target: surface, conversation, thread root, the
+  originating session, the requester and the hop count. Unanswered consent cards
+  expire after a configurable time, 24 hours by default.
+- Each private task gets a fresh session with a random v4 id on the owner's
+  private volume. It never joins the owner's DM session, so a non-owner's task
+  cannot read the owner's DM transcript and does not add to it.
 - What crosses into the private turn is only the task text shown on the consent
   card and files the channel turn attached explicitly. The channel thread's
   transcript does not cross.
 - What comes back is only the private turn's final reply and files it attached.
-  agentctl returns them to the waiting channel turn and posts them to the
-  thread.
+  agentd posts them to the thread as a new agent message whose `MESSAGE_REF` is
+  attributed to the original requester and hop count, so a follow-up mention
+  of that message inherits correctly.
+- Inside a private task, `agentctl` offers only `attach`. `ask-agent` and
+  `private` are refused, so private context cannot flow to other agents and no
+  hops can chain on the owner's credential.
 
 ### Routing
 
@@ -300,7 +314,9 @@ flowchart TD
 flowchart TD
     E["InboundEvent"] --> B{"From a bot user?"}
     B -->|"yes, unmanaged"| X["Ignore"]
-    B -->|"yes, managed agent"| H["Inherit requester and<br/>hop count from the<br/>posting turn"]
+    B -->|"yes, managed agent"| M{"Mentions this agent?"}
+    M -- no --> X
+    M -- yes --> H["Inherit requester and<br/>hop count from the<br/>posting turn"]
     B -- no --> G{"Mentioned, reply to agent,<br/>or DM?"}
     G -- no --> X
     G -- yes --> O{"Requester is owner?"}
@@ -314,7 +330,9 @@ flowchart TD
 ```
 
 Response gating is deterministic: an explicit mention, a reply to the agent's
-own message, or a DM. qm-core runs a model call to decide whether to chime in on
+own message, or a DM. Messages from managed agents only count when they mention
+this agent explicitly. Replying in a thread is not enough, or two agents in one
+thread would answer each other indefinitely. qm-core runs a model call to decide whether to chime in on
 unaddressed thread messages. With subscription credentials that would cost a
 CLI run per message, so agent-core does not do it.
 
@@ -335,9 +353,11 @@ CLI run per message, so agent-core does not do it.
   `(agent, surface, team, conversation, thread root)`. Its id is a random UUIDv4
   minted on create and again on `/agent reset`, because `--session-id` needs an
   id that has not been used.
-- Directories on the volume: each session gets `sessions/<session id>/` as its
-  working directory and `CLAUDE_CONFIG_DIR`, and only that directory is mounted
-  read-write in its container. `shared/` is mounted into every session of the
+- Directories on the volume: each session gets `sessions/<session id>/work` as
+  its working directory and `sessions/<session id>/claude` as its
+  `CLAUDE_CONFIG_DIR`, and only `sessions/<session id>/` is mounted read-write in
+  its container. Keeping them apart keeps the agent's transcripts and
+  `settings.json` out of its own Glob, Grep and `git` scope. `shared/` is mounted into every session of the
   scope and guarded by a scope-level lock that `agentctl` takes for writes.
   Skills are mounted read-only.
 - The surface and team are part of every lookup key, so the same agent on two
@@ -370,7 +390,10 @@ API key, sent by the CLI as `x-api-key` from `ANTHROPIC_API_KEY`). The process
 environment is fixed at start, and plans differ in model access and rate limits.
 The runner therefore restarts the process, resuming from the transcript, when
 the next turn's credential kind or model differs from the running one. The model
-is chosen per turn from what the requester's plan allows. Switching the model
+is chosen per turn from what the requester's plan allows. The plan is read from
+the account profile (the `user:profile` scope) at link time and on every token
+refresh and stored in `CLAUDE_LINK`. Like the OAuth parameters, that profile is
+Claude Code's, not a published contract. Switching the model
 over the stream-json control channel instead of restarting is a later
 optimization.
 
@@ -380,7 +403,7 @@ sandbox[^cc-bypass].
 
 ### Persistence
 
-- Each session's `CLAUDE_CONFIG_DIR` is its own `sessions/<session id>/`
+- Each session's `CLAUDE_CONFIG_DIR` is its own `sessions/<session id>/claude`
   directory, and `CLAUDE_CODE_PROJECT_DIR_NAME` is set to the session id, so the
   transcript directory is named explicitly instead of being derived from the
   working directory (Claude Code 2.1.234 or later)[^cc-sessions].
@@ -423,7 +446,7 @@ CLAUDE_CODE_OAUTH_TOKEN=<placeholder>
 ANTHROPIC_BASE_URL=http://cred-proxy.internal:8080
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 DISABLE_AUTOUPDATER=1
-CLAUDE_CONFIG_DIR=/volume/sessions/<session id>
+CLAUDE_CONFIG_DIR=/volume/sessions/<session id>/claude
 CLAUDE_CODE_PROJECT_DIR_NAME=<session id>
 ```
 
@@ -477,8 +500,8 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl post --to <target> <text>` | Post somewhere else the agent is allowed to post |
 | `agentctl react <emoji> [message id]` | Add a reaction |
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
-| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester |
-| `agentctl private <task>` | Run a task on the owner's private resources. Needs the owner's consent unless the owner is this turn's requester. Returns the result |
+| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
+| `agentctl private <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless the owner is this turn's requester. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
 One bundled skill documents `agentctl`. Its token is scoped to one agent, scope,
 session, turn and requester, is bound to the session's container, and expires
@@ -563,6 +586,7 @@ erDiagram
         bytes access_token_enc
         bytes refresh_token_enc
         timestamp expires_at
+        text plan
     }
     AGENT {
         uuid id
@@ -602,8 +626,15 @@ erDiagram
     CONSENT {
         uuid id
         uuid requester_id
+        int hop
         text task_text
         text state
+        text reply_surface
+        text reply_conversation
+        text reply_thread_root
+        uuid origin_session_id
+        uuid private_session_id
+        timestamp expires_at
     }
     VOLUME {
         text scope_key
@@ -635,7 +666,8 @@ for Rocket.Chat bindings.
 | One session reads another session's placeholder or `agentctl` token | One container per session, so sessions share neither a PID namespace nor process environments. Tokens are bound to their container. |
 | One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. |
 | Agent-to-agent hops billed to the wrong person | A hop inherits the requester of the turn that posted the mention. Mentions from unmanaged bots are ignored. |
-| Private task leaks the owner's DM context to a non-owner | Each private task runs in a fresh session. Only the consented task text and explicit attachments cross in, only the reply and attachments cross out. |
+| Private task leaks the owner's DM context to a non-owner | Each private task runs in a fresh session. Only the consented task text and explicit attachments cross in, only the reply and attachments cross out. Private tasks cannot call `ask-agent` or `private`. |
+| A pending consent holds resources | `agentctl private` returns at once. The channel turn ends, and the result is posted later as a new message. Unanswered cards expire. |
 | Private files left behind for later channel turns | Private resources only run in the owner's private sandbox. Channel sandboxes never mount them. |
 | Concurrent threads corrupt a shared checkout | One working directory per session, a lock for the scope's shared paths. |
 | Model exfiltrates the real token | The real token never enters the sandbox. |
@@ -774,6 +806,7 @@ Direct calls would also need our own agent loop.
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/).
 [^slack-botmention]: [slackapi/java-slack-sdk#1279](https://github.com/slackapi/java-slack-sdk/issues/1279) shows `app_mention` with the `bot_message` subtype for a message posted by a workflow, not for one app's bot user mentioning another's. To be verified on a real workspace.
 [^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
+[^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.
 [^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.
 [^slack-approval]: [Manage app approval for your workspace](https://slack.com/help/articles/222386767-Manage-app-approval-for-your-workspace).
 [^slack-free]: [Feature limitations on the free version of Slack](https://slack.com/help/articles/27204752526611-Feature-limitations-on-the-free-version-of-Slack).
