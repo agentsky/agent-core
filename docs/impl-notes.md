@@ -1100,8 +1100,10 @@ without `errorType`. Meteor's DDP rate limiter, which guards `login`, instead
 surfaces through the login route as HTTP 401 with `error: "too-many-requests"`
 and no header.
 
-**Solution.** The wait is the header minus the local clock, floored at zero,
-and one second when the header is missing or unreadable. A 429, or either
+**Solution.** The wait is the header minus the response's `Date` (at first
+the local clock; see
+[Clock skew defeated the 429 retry](#clock-skew-defeated-the-429-retry)),
+floored at zero, and one second when the header is missing or unreadable. A 429, or either
 code in any status, is retried once when the wait is at most
 `with_max_retry_wait` (60 s by default, the server's default window);
 otherwise, or on a second limit, the call fails with
@@ -1149,3 +1151,47 @@ can't leak into the error.
   servers. To turn a `Cursor` (a message id) into a `latest` time for the
   top level, the client also has `chat.getMessage`, which the plan didn't
   list.
+
+### Clock skew defeated the 429 retry
+
+**Issue.** `x-ratelimit-reset` is the server's `Date.now()` plus the time to
+reset, so subtracting the local clock folds in any skew between the two
+hosts. With the local clock more than a minute behind the server's, the wait
+exceeded `with_max_retry_wait` and a call that would have succeeded a
+second later failed with `RateLimited`; with it ahead, the client retried at
+once and hit the limit again.
+
+**Solution.** The wait is the reset minus the response's own `Date` header,
+which the server (Node's `http` sets it on every response) or a proxy in
+front of it writes from a clock that is at worst next to the server's. It is
+parsed as RFC 7231's IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) with the
+`time` crate; the obsolete RFC 850 and asctime forms, which no current server
+sends, count as unreadable. A missing or unreadable `Date` falls back to the
+local clock, and the bounded maximum still applies. `Date` has whole seconds,
+so the wait can come out up to a second longer than the server's, never
+shorter; a reset near the end of a full 60-second window can therefore exceed
+the default maximum by that second and fail with `RateLimited` instead of
+waiting. `FakeRest::rate_limit_at` sends a 429 from a skewed server clock,
+with a `Date` in whole seconds and a reset measured from it.
+
+### Uploads are capped and read once
+
+**Issue.** `upload` read the whole file into memory with no limit, and read
+it again for the retry after a 429. The file comes from an agent's session,
+so its size is whatever the agent wrote, and a path to a device such as
+`/dev/zero` would read until memory ran out.
+
+**Solution.** `RestClient::with_max_upload_size` sets a limit, 100 MiB by
+default, which is Rocket.Chat's default `FileUpload_MaxFileSize`
+(`apps/meteor/server/settings/file-upload.ts`); a server with a lower limit
+still refuses with its own error. Before reading, the file's metadata must
+show a regular file within the limit, else the call fails with
+`SurfaceError::Api` naming the size and the limit, and nothing is sent. The
+read itself stops after limit + 1 bytes, so a file that grows after the check
+can't take more memory than that and is refused too. The bytes are read once
+into `Bytes`, and each attempt's multipart part is a cheap clone of them.
+Streaming the file instead would need reqwest's `stream` feature and
+`tokio-util`, would reopen and reread the file for the retry (which could
+then send different content), and would send a malformed body if the file
+changed size after its length was declared; with the cap, reading into memory
+is bounded and simpler.

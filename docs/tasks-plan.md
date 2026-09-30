@@ -1000,10 +1000,15 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
   - `rooms.media/{rid}` (multipart) then `rooms.mediaConfirm/{rid}/{fileId}`
     with `tmid`. `rooms.upload/{rid}` was removed in Rocket.Chat 8.0
     ([impl-notes](impl-notes.md#roomsupload-is-gone-in-rocketchat-80)).
+    Files over a configurable size (100 MiB by default, Rocket.Chat's
+    default `FileUpload_MaxFileSize`) are refused before they are read
+    ([impl-notes](impl-notes.md#uploads-are-capped-and-read-once)).
   - `channels.history`, `groups.history`, `im.history` and
     `chat.getThreadMessages` for `history`.
-- Handles the rate limiter: honor `x-ratelimit-reset` on 429, and retry at most
-  once.
+- Handles the rate limiter: honor `x-ratelimit-reset` on 429, measured
+  against the response's `Date` header rather than the local clock
+  ([impl-notes](impl-notes.md#clock-skew-defeated-the-429-retry)), and retry
+  at most once.
 - `testkit::rocketchat::FakeRest`: wiremock routes for the above.
 
 Acceptance: a wiremock test per method, including error mapping to

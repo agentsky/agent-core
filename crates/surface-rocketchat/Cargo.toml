@@ -11,6 +11,7 @@ publish = false
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 core-types.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["rustls", "multipart"] }
