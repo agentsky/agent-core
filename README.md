@@ -45,6 +45,12 @@ service links such as `AGENTD_PORT` are skipped, and any other variable
 starting with `AGENTD_` is ignored with a warning. Each listener binds
 agentd's own address on its network, never `0.0.0.0`, and the proxy and ctl
 listeners must be inside `internal.sandbox_subnet`.
+`[proxy] allow` is the sandboxes' egress allowlist: the hosts they may open
+HTTPS tunnels to through the proxy listener. It is empty by default, and
+`api.anthropic.com`, IP addresses, and hosts that resolve to loopback,
+link-local (cloud metadata), agentd's or private addresses are refused
+whatever it says. `max_tunnels` and `max_session_tunnels` cap the open
+tunnels in all and per sandbox.
 `GET /healthz` on the public listener answers 200 while the database does.
 It also serves Slack's request URLs, `/slack/b/<binding>/events`,
 `…/interactivity` and `…/commands`; the manager app's binding is `manager`,
@@ -64,6 +70,21 @@ breaks get a direct message saying so, retried with a growing wait for about
 three days if it can't be delivered. The manager posts every reply, so give its role
 `api-bypass-rate-limit`, or Rocket.Chat's REST rate limiter will delay
 replies when many members use commands at once.
+A linked member creates an agent with `create <name> [persona]`: the manager
+creates a bot user named `<name>` (or `<owner>.<name>` when that is taken),
+which logs in once to create its own personal access token, so the `bot` role
+needs `create-personal-access-tokens`, and the manager `create-user`. agentd
+listens as every agent's bot from then on, and again after a restart. Owners
+add a bot to a room with Rocket.Chat's own invite; `!agent create` in a room
+the manager is in adds it there, which needs `add-user-to-joined-room`.
+`persona <name> <text>` (or a `persona.md` attached to that command in the
+manager's direct message, up to 64 KB), `pause`, `resume` and `delete` work
+for the owner only, and `list [@member]` shows the agents. A member may have
+`agents.max_per_owner` agents (default 10); deleted ones don't count. `delete`
+deactivates the bot user, which needs `edit-other-user-active-status`; a
+deactivation that fails is retried for about three days. A bot sets
+`rocketchat.avatar_url` as its own avatar, if configured. Until agents take
+turns, each agent reacts with :eyes: to messages that mention it.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish; a second signal drops them at
 once. Logs go to standard error,

@@ -199,9 +199,11 @@ mention them, and only mentions from agentd-managed agents are honored (see
 
 The community admin installs agentd once and gives its manager account a custom
 role. After that `/agent create` is self-service: agentd calls `users.create`
-with the `bot` role, obtains a token for the new user, sets its name and avatar,
-and joins the rooms the owner allows. Bot users bypass the REST rate limiter by
-default[^rc-perms].
+with the `bot` role and the agent's name as display name, obtains a token for
+the new user, and the bot sets its own avatar. The owner invites the bot into
+rooms with Rocket.Chat's own invite, or the manager adds it to a room it is in
+where the owner ran `!agent create`. `/agent delete` deactivates the bot user.
+Bot users bypass the REST rate limiter by default[^rc-perms].
 
 The custom role needs `create-user`, plus `edit-other-user-active-status` if
 agentd passes `active` on create, and the permission for creating the bot's

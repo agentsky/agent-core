@@ -76,6 +76,31 @@ data_dir = "/var/lib/agentd"
 # The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
 attach_max_bytes = 52428800
 
+[proxy]
+# The hosts sandboxes may open HTTPS tunnels to, through the egress proxy on
+# proxy_listen (HTTPS_PROXY=http://cred-proxy.internal:8080). An exact host,
+# or *. and a suffix for every name below it (not the suffix itself), with
+# port 443 unless the rule names another: ["github.com",
+# "*.githubusercontent.com", "git.example.com:8443"]. IP addresses and
+# api.anthropic.com aren't rules. The proxy tunnels bytes without looking at
+# them, offers no plain HTTP, and always refuses api.anthropic.com. A host
+# is refused if any address it resolves to is private (10.0.0.0/8,
+# 172.16.0.0/12, 192.168.0.0/16, fc00::/7), loopback, link-local or a cloud
+# metadata address (169.254.169.254 included), agentd's own or the sandbox
+# network's, or reserved. Empty by default: no egress at all.
+allow = []
+
+# Open tunnels across all sandboxes, and per sandbox. A CONNECT past either
+# cap is refused. Tunnels close after 5 idle minutes, after an hour in any
+# case, and when their session's container stops.
+max_tunnels = 256
+max_session_tunnels = 32
+
+[agents]
+# How many agents one member may have (deleted ones don't count). `create`
+# refuses more. Default 10.
+max_per_owner = 10
+
 [claude_oauth]
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every
@@ -109,3 +134,7 @@ team = "chat.example.com"
 # The manager account's user _id (Administration > Users, or `me` in the
 # REST API with its token).
 manager_user_id = "aBcD1234eFgH5678"
+
+# An image URL every new agent's bot sets as its avatar. Optional: without
+# it, bots keep Rocket.Chat's default avatar.
+# avatar_url = "https://chat.example.com/assets/agent.png"
