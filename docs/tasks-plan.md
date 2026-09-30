@@ -1503,8 +1503,12 @@ Deliverables:
     credential of the other kind. Callers hold the placeholder's non-secret
     `PlaceholderId` for this and for revoking
     ([impl-notes](impl-notes.md#t18-credential-proxy)).
-  - `unpoint(placeholder_id)`, called at turn end, however the turn ended.
-    Until the next `point`, requests carrying the placeholder are refused.
+  - `unpoint(placeholder_id) -> bool`, called at turn end, however the turn
+    ended. Until the next `point`, requests carrying the placeholder are
+    refused. It returns whether the placeholder was live, like `revoke`: a
+    placeholder already revoked, as when its container died mid-turn and
+    `process_stopping` ran before `turn_finished`, is a normal case, not an
+    error.
   - `revoke(placeholder_id)` and `revoke_session(session)`.
   - An address belongs to one session: minting for an address revokes other
     sessions' placeholders bound to it.
@@ -1682,7 +1686,11 @@ Deliverables:
     the turn's credential and records the turn on the agentctl token.
   - `turn_finished(session, turn)`, which clears the turn from the token and
     unpoints the placeholder. It is called on every exit from the turn:
-    success, error, timeout, interrupt and cancellation.
+    success, error, timeout, interrupt and cancellation. It completes before
+    the session's queue slot is released, cancellation included, for example
+    by running the turn body in a task the caller's drop doesn't cancel.
+    Otherwise a late `turn_finished` for turn N could run after turn N+1's
+    `turn_starting` and clear N+1's pointer.
   - `process_stopping(session)`, which revokes the placeholder and the token. It
     is called before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.

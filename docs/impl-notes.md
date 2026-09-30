@@ -2559,6 +2559,12 @@ when it ended; since `turn_finished` runs once the turn's result is in, such
 a request is the model's own last call or a leftover process's, and the
 window is one token lookup long.
 
+`unpoint` returns whether the placeholder was live, like `revoke`, rather
+than an error for a revoked one. A container that dies mid-turn has its
+placeholder revoked by `process_stopping` before the turn's `turn_finished`
+runs, so a revoked placeholder is a normal case at turn end, with nothing
+left to clear.
+
 What remains: a background process left from turn N can still spend turn
 N+1's credential while N+1 runs, whoever its requester is. Only killing the
 processes a turn leaves behind when it ends removes that; the plan's
