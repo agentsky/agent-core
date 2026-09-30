@@ -101,7 +101,9 @@ fn thread_columns(thread: &ThreadKey) -> [&str; 4] {
 impl Store {
     /// Bills one turn of `agent` in `thread` to `member` at `at`: adds a
     /// turn and `usage` to the member's day, and a turn and its tokens to
-    /// the thread's hour for the agent, in one transaction.
+    /// the thread's hour for the agent, in one transaction. A turn
+    /// `for_owner`, requested by the agent's owner, isn't one its daily cap
+    /// counts ([`capped_turns_on`](Self::capped_turns_on)).
     ///
     /// A cost that isn't a finite number of at least 0 counts as 0, and a
     /// turn's tokens are capped far above what any turn uses.
@@ -116,6 +118,7 @@ impl Store {
         agent: AgentId,
         thread: &ThreadKey,
         usage: TurnUsage,
+        for_owner: bool,
         at: OffsetDateTime,
     ) -> Result<()> {
         let cost = if usage.cost_usd.is_finite() && usage.cost_usd > 0.0 {
@@ -143,9 +146,11 @@ impl Store {
         .await?;
         sqlx::query(
             "INSERT INTO thread_usage (surface, team_id, conversation, thread_root, day, hour, \
-             agent_id, agent_turns, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?) \
+             agent_id, agent_turns, others_turns, tokens) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) \
              ON CONFLICT (surface, team_id, conversation, thread_root, day, hour, agent_id) \
-             DO UPDATE SET agent_turns = agent_turns + 1, tokens = tokens + excluded.tokens",
+             DO UPDATE SET agent_turns = agent_turns + 1, \
+             others_turns = others_turns + excluded.others_turns, \
+             tokens = tokens + excluded.tokens",
         )
         .bind(surface)
         .bind(team)
@@ -154,6 +159,7 @@ impl Store {
         .bind(day_of(at))
         .bind(hour_of(at))
         .bind(agent.to_string())
+        .bind(i64::from(!for_owner))
         .bind(input.saturating_add(output))
         .execute(&mut *tx)
         .await?;
@@ -190,16 +196,16 @@ impl Store {
         })
     }
 
-    /// The turns `agent` took on the day `at` falls on, in every thread and
-    /// for every requester.
+    /// The turns `agent` took on the day `at` falls on, in every thread,
+    /// for anyone but its owner: the turns its daily cap counts.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if the query
     /// fails.
-    pub async fn agent_turns_on(&self, agent: AgentId, at: OffsetDateTime) -> Result<u32> {
+    pub async fn capped_turns_on(&self, agent: AgentId, at: OffsetDateTime) -> Result<u32> {
         let turns: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(agent_turns), 0) FROM thread_usage \
+            "SELECT COALESCE(SUM(others_turns), 0) FROM thread_usage \
              WHERE agent_id = ? AND day = ?",
         )
         .bind(agent.to_string())
@@ -370,19 +376,26 @@ mod tests {
         let t = thread(Some("1.0"));
         let day1 = 10 * DAY + 5;
         store
-            .record_turn_usage(alice, helper, &t, usage(100, 10, 0.5), at(day1))
+            .record_turn_usage(alice, helper, &t, usage(100, 10, 0.5), false, at(day1))
             .await
             .unwrap();
         store
-            .record_turn_usage(alice, helper, &t, usage(200, 20, 0.25), at(day1 + HOUR))
+            .record_turn_usage(
+                alice,
+                helper,
+                &t,
+                usage(200, 20, 0.25),
+                false,
+                at(day1 + HOUR),
+            )
             .await
             .unwrap();
         store
-            .record_turn_usage(alice, helper, &t, usage(1, 2, 1.0), at(day1 + DAY))
+            .record_turn_usage(alice, helper, &t, usage(1, 2, 1.0), false, at(day1 + DAY))
             .await
             .unwrap();
         store
-            .record_turn_usage(bob, helper, &t, usage(7, 7, 7.0), at(day1))
+            .record_turn_usage(bob, helper, &t, usage(7, 7, 7.0), false, at(day1))
             .await
             .unwrap();
 
@@ -413,7 +426,14 @@ mod tests {
         let t = thread(None);
         for cost in [f64::NAN, f64::INFINITY, -1.0] {
             store
-                .record_turn_usage(alice, helper, &t, usage(u64::MAX, u64::MAX, cost), at(5))
+                .record_turn_usage(
+                    alice,
+                    helper,
+                    &t,
+                    usage(u64::MAX, u64::MAX, cost),
+                    false,
+                    at(5),
+                )
                 .await
                 .unwrap();
         }
@@ -437,29 +457,41 @@ mod tests {
         );
         let (one, other) = (thread(Some("1.0")), thread(Some("2.0")));
         let noon = 20 * DAY + 12 * HOUR;
-        for (agent, thread, seconds) in [
-            (a, &one, noon),
-            (a, &one, noon + 60),
-            (b, &one, noon + 120),
-            (a, &other, noon),
-            (a, &one, noon - HOUR),
-            (a, &one, noon - DAY),
+        for (agent, thread, for_owner, seconds) in [
+            (a, &one, false, noon),
+            (a, &one, false, noon + 60),
+            (b, &one, false, noon + 120),
+            (a, &other, false, noon),
+            (a, &one, false, noon - HOUR),
+            (a, &one, true, noon + 180),
+            (a, &one, false, noon - DAY),
         ] {
             store
-                .record_turn_usage(alice, agent, thread, usage(10, 1, 0.0), at(seconds))
+                .record_turn_usage(
+                    alice,
+                    agent,
+                    thread,
+                    usage(10, 1, 0.0),
+                    for_owner,
+                    at(seconds),
+                )
                 .await
                 .unwrap();
         }
-        assert_eq!(store.agent_turns_on(a, at(noon)).await.unwrap(), 4);
-        assert_eq!(store.agent_turns_on(b, at(noon)).await.unwrap(), 1);
-        assert_eq!(store.agent_turns_on(a, at(noon - DAY)).await.unwrap(), 1);
+        assert_eq!(
+            store.capped_turns_on(a, at(noon)).await.unwrap(),
+            4,
+            "the owner's own turn isn't counted"
+        );
+        assert_eq!(store.capped_turns_on(b, at(noon)).await.unwrap(), 1);
+        assert_eq!(store.capped_turns_on(a, at(noon - DAY)).await.unwrap(), 1);
         assert_eq!(
             store.thread_spend(&one, at(noon + 600)).await.unwrap(),
             ThreadSpend {
-                turns_this_hour: 3,
-                tokens_today: 44
+                turns_this_hour: 4,
+                tokens_today: 55
             },
-            "both agents' turns this hour, and the whole day's tokens"
+            "both agents' turns this hour, the owner's too, and the whole day's tokens"
         );
         assert_eq!(
             store.thread_spend(&other, at(noon)).await.unwrap(),
@@ -534,7 +566,7 @@ mod tests {
         let now = 100 * DAY;
         for day in [96, 97, 98, 100] {
             store
-                .record_turn_usage(alice, helper, &t, usage(1, 1, 0.0), at(day * DAY))
+                .record_turn_usage(alice, helper, &t, usage(1, 1, 0.0), false, at(day * DAY))
                 .await
                 .unwrap();
             store
@@ -544,7 +576,10 @@ mod tests {
         }
         let swept = store.sweep_expired(at(now)).await.unwrap();
         assert_eq!((swept.thread_usage, swept.limit_notices), (2, 2));
-        assert_eq!(store.agent_turns_on(helper, at(98 * DAY)).await.unwrap(), 1);
+        assert_eq!(
+            store.capped_turns_on(helper, at(98 * DAY)).await.unwrap(),
+            1
+        );
         assert_eq!(
             store.member_usage_since(alice, at(0)).await.unwrap().turns,
             4,

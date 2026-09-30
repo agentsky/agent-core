@@ -6556,7 +6556,7 @@ and nothing else counts an agent's turns.
 
 **Solution.** `thread_usage` rows are keyed by thread, day, hour (UTC) and
 agent. The thread's turns this hour and tokens today, and the agent's
-turns today, are sums over it (an index on `(agent_id, day)` serves the
+turns for others today (`others_turns`), are sums over it (an index on `(agent_id, day)` serves the
 latter). Rows older than two days are swept with the other expired rows.
 `usage` keeps a member's days for good, for `me`'s month.
 
@@ -6580,8 +6580,11 @@ seen before). A failure to meter is logged; the turn has run.
 **Issue.** The plan doesn't say whether `turns=N/day` limits the owner.
 
 **Solution.** It limits requests from anyone but the owner, as allow and
-deny do, and counts every turn of the agent, the owner's and hops
-included. `turns=0` leaves the agent to its owner. `limits` takes `off`
+deny do, and counts only those: a first version counted the owner's own
+turns too, so an owner who used their agent used up what they had allowed
+others. `thread_usage.others_turns` counts the turns whose requester isn't
+the owner, hops included, and `Store::capped_turns_on` sums it for the
+router. `turns=0` leaves the agent to its owner. `limits` takes `off`
 for either setting, which the parser now reads as `Setting::Off`; without
 it an owner couldn't remove a cap once set.
 

@@ -2495,6 +2495,7 @@ async fn me_shows_what_was_billed_today_and_this_month() {
                     output_tokens: 1,
                     cost_usd: 0.5,
                 },
+                false,
                 at,
             )
             .await

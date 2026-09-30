@@ -16,9 +16,10 @@
 -- limits and no rules.
 --
 -- thread_usage counts agents' turns and tokens per thread, agent and hour,
--- for the per-thread caps and each agent's daily cap. A thread is named as
--- in message_refs: thread_root is '' for a conversation without threads.
--- Rows older than a couple of days are swept.
+-- for the per-thread caps, and others_turns, the turns requested by anyone
+-- but the agent's owner, for its daily cap. A thread is named as in
+-- message_refs: thread_root is '' for a conversation without threads. Rows
+-- older than a couple of days are swept.
 --
 -- limit_notices records that an agent told a thread it reached a limit, once
 -- per window (the day or the hour the limit counts), so a capped agent
@@ -54,6 +55,7 @@ CREATE TABLE thread_usage (
     hour INTEGER NOT NULL CHECK (hour BETWEEN 0 AND 23),
     agent_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
     agent_turns INTEGER NOT NULL,
+    others_turns INTEGER NOT NULL,
     tokens INTEGER NOT NULL,
     PRIMARY KEY (surface, team_id, conversation, thread_root, day, hour, agent_id)
 ) STRICT;

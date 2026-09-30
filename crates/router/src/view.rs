@@ -230,8 +230,8 @@ pub struct AgentPolicy {
     /// The most turns the agent takes a day (UTC) for anyone but its owner,
     /// or `None` for no cap. 0 leaves it to its owner alone.
     pub turns_per_day: Option<u32>,
-    /// The turns the agent has taken today (UTC), for anyone, its owner
-    /// included.
+    /// The turns the agent has taken today (UTC) for anyone but its owner:
+    /// the ones [`turns_per_day`](Self::turns_per_day) caps.
     pub turns_today: u32,
 }
 

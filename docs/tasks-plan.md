@@ -2340,8 +2340,8 @@ Deliverables:
   - `agent_policies` (`agent_id`, `turns_per_day`, `max_hops`, `allow_json`,
     `deny_json`).
   - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
-    `day`, `hour`, `agent_id`, `agent_turns`, `tokens`), for the per-thread
-    caps and each agent's daily cap
+    `day`, `hour`, `agent_id`, `agent_turns`, `others_turns`, `tokens`),
+    for the per-thread caps and each agent's daily cap
     ([impl-notes](impl-notes.md#one-table-counts-threads-and-agents)).
   - `bans` (`member_id`, `banned_by`, `reason`, `created_at`).
   - `limit_notices`, so a capped agent tells a thread once per window
@@ -2364,8 +2364,8 @@ Deliverables:
   `/agent me` shows today's and this month's turns and tokens (UTC).
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
-  Either setting may be `off`. The cap limits requests from anyone but the
-  owner and counts every turn of the agent
+  Either setting may be `off`. The cap limits and counts requests from
+  anyone but the owner
   ([impl-notes](impl-notes.md#the-owner-is-never-capped-by-their-own-agents-limit)).
   `AgentPolicy::max_hops` is the effective cap, the global one lowered by the
   agent's, and allow and deny follow `AgentPolicy::permits` (T22). This task

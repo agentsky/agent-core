@@ -762,6 +762,7 @@ erDiagram
         date day
         int hour
         int agent_turns
+        int others_turns
         int tokens
     }
     BAN {

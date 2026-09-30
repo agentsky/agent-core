@@ -1008,7 +1008,7 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
     assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
     assert_eq!(
         store
-            .agent_turns_on(stack.agent, OffsetDateTime::now_utc())
+            .capped_turns_on(stack.agent, OffsetDateTime::now_utc())
             .await
             .unwrap(),
         1
@@ -1088,7 +1088,8 @@ async fn past_the_daily_cap_the_thread_is_told_once_and_the_owner_still_runs() {
     assert_eq!(sent[0].0, in_thread("GENERAL", Some("d1")));
     assert_eq!(
         sent[0].1,
-        "helper has reached its owner's daily limit (1). Try again after midnight UTC."
+        "helper has reached the daily limit its owner set on requests from others (1). Try \
+         again after midnight UTC."
     );
 
     let before = stack.mock.calls().len();
@@ -1114,6 +1115,29 @@ async fn past_the_daily_cap_the_thread_is_told_once_and_the_owner_still_runs() {
         ))
         .await;
     assert_eq!(posts(&stack.calls_since(before))[0].1, "Still mine.");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_owners_own_turns_leave_the_daily_cap_to_others() {
+    let stack = start().await;
+    let store = stack.store();
+    store
+        .update_agent_settings(stack.agent, |settings| settings.turns_per_day = Some(1))
+        .await
+        .unwrap();
+    stack.next_turn(Turn::reply("Mine."));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "o1", None, &[BOT]))
+        .await;
+    stack.next_turn(Turn::reply("Bob's."));
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "o2", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "Bob's.");
     stack.stop().await;
 }
 

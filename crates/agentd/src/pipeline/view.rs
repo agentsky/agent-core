@@ -307,7 +307,7 @@ impl RouterView for StoreView {
 async fn policy(store: &Store, agent: AgentId, context: ViewContext<'_>) -> Option<AgentPolicy> {
     let loaded = async {
         let settings = store.agent_settings(agent).await?;
-        let turns = store.agent_turns_on(agent, context.now).await?;
+        let turns = store.capped_turns_on(agent, context.now).await?;
         Ok::<_, StoreError>((settings, turns))
     };
     match loaded.await {

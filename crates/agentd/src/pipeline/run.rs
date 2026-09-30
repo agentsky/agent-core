@@ -848,9 +848,17 @@ impl Pipeline {
     }
 
     /// Bills `turn`, whose outcome is `outcome`, to its requester, and
-    /// counts it for `agent` in `thread`. A requester the store has no
-    /// member for yet gets one. A failure is logged: the turn has run.
-    async fn meter(&self, agent: AgentId, turn: &Run, thread: &ThreadKey, outcome: &TurnOutcome) {
+    /// counts it for `agent` in `thread`, toward the agent's daily cap
+    /// unless it is `for_owner`. A requester the store has no member for
+    /// yet gets one. A failure is logged: the turn has run.
+    async fn meter(
+        &self,
+        agent: AgentId,
+        turn: &Run,
+        thread: &ThreadKey,
+        for_owner: bool,
+        outcome: &TurnOutcome,
+    ) {
         let store = &self.inner.store;
         let now = OffsetDateTime::now_utc();
         let key = &turn.requester.key;
@@ -866,7 +874,7 @@ impl Pipeline {
         };
         let usage = turn_usage(outcome);
         if let Err(err) = store
-            .record_turn_usage(member, agent, thread, usage, now)
+            .record_turn_usage(member, agent, thread, usage, for_owner, now)
             .await
         {
             tracing::warn!(%agent, %member, error = %err, "couldn't meter a turn");
@@ -904,18 +912,26 @@ impl Pipeline {
         let (working, ran) = match self.prepare(agent, event, turn.credential).await {
             Ok(None) => return Ok(()),
             Ok(Some(prepared)) => {
+                let owner = prepared.owner;
                 let working = self.show_working(&surface, event, &target).await;
                 let ran = self
                     .turn(event, agent, caps, &turn, surface.as_ref(), prepared)
                     .await;
-                (Some(working), ran)
+                (Some(working), ran.map(|ran| (owner, ran)))
             }
             Err(err) => (None, Err(err)),
         };
         let delivered = match ran {
-            Ok((session, turn_id, report)) => {
-                self.meter(agent, &turn, &thread_of(event, caps), &report.outcome)
-                    .await;
+            Ok((owner, (session, turn_id, report))) => {
+                let for_owner = turn.requester.member == Some(owner);
+                self.meter(
+                    agent,
+                    &turn,
+                    &thread_of(event, caps),
+                    for_owner,
+                    &report.outcome,
+                )
+                .await;
                 let failure = CredentialFailure::of(&report.outcome);
                 let delivery = Delivery {
                     store: &self.inner.store,
@@ -1199,7 +1215,8 @@ fn refusal_text(name: &str, reason: RefuseReason) -> String {
             format!("{name} takes requests from its owner only.")
         }
         RefuseReason::DailyCap { max } => format!(
-            "{name} has reached its owner's daily limit ({max}). Try again after midnight UTC."
+            "{name} has reached the daily limit its owner set on requests from others \
+             ({max}). Try again after midnight UTC."
         ),
         RefuseReason::ThreadTurns { max } => format!(
             "{name} won't answer here for now: agents have reached this thread's hourly turn \
