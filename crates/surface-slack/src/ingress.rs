@@ -55,10 +55,10 @@
 //! Anyone can send requests that are refused before verification (steps 2
 //! to 4) or challenges, so at most one refusal per binding per
 //! [`WARNING_INTERVAL`] is logged as a warning and one challenge as info;
-//! the rest are logged at debug level. A request refused at step 6 is
-//! logged the same way, since an agent's owner can sign as many as they
-//! like; each binding's refusals are counted apart, so one app's flood
-//! hides no other's.
+//! the rest are logged at debug level. A request refused at step 5 or 6,
+//! and Slack's `app_rate_limited` notice, are logged the same way, since
+//! an agent's owner can sign as many as they like; each binding's are
+//! counted apart, so one app's flood hides no other's.
 //!
 //! The queue holds each request's body as it arrived, at most
 //! [`MAX_BODY_BYTES`], so what waits is bounded in bytes, not only in
@@ -271,6 +271,7 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
             taken: Mutex::default(),
         }),
         refusals: Arc::new(Throttle::new(WARNING_INTERVAL)),
+        rate_limits: Arc::new(Throttle::new(WARNING_INTERVAL)),
         challenges: Arc::new(Throttle::new(WARNING_INTERVAL)),
     };
     let router = Router::new()
@@ -287,12 +288,13 @@ struct Ingress {
     queue: mpsc::UnboundedSender<Queued>,
     places: Arc<Places>,
     refusals: Arc<Throttle<BindingRef>>,
+    rate_limits: Arc<Throttle<BindingRef>>,
     challenges: Arc<Throttle>,
 }
 
 impl Ingress {
-    /// Logs a request refused before verification, or for having too many
-    /// in flight or coming too fast.
+    /// Logs a request refused before verification, for a body that doesn't
+    /// parse, or for having too many in flight or coming too fast.
     fn refused(
         &self,
         binding: BindingRef,
@@ -311,6 +313,21 @@ impl Ingress {
                 "refused a Slack request"
             ),
             None => tracing::debug!(%binding, kind, status, %reason, "refused a Slack request"),
+        }
+    }
+
+    /// Logs Slack's notice that it is rate limiting `binding`'s events.
+    fn rate_limited(&self, binding: BindingRef, minute_rate_limited: Option<i64>) {
+        match self.rate_limits.record(binding, Instant::now()) {
+            Some(quiet) => tracing::warn!(
+                %binding,
+                minute_rate_limited,
+                notices_since_last_warning = quiet,
+                "Slack is rate limiting this app's events"
+            ),
+            None => {
+                tracing::debug!(%binding, minute_rate_limited, "Slack is rate limiting this app's events")
+            }
         }
     }
 
@@ -620,7 +637,7 @@ async fn handle(
         Ok(Checked::RateLimited {
             minute_rate_limited,
         }) => {
-            tracing::warn!(%binding, minute_rate_limited, "Slack is rate limiting this app's events");
+            ingress.rate_limited(binding, minute_rate_limited);
             return StatusCode::OK.into_response();
         }
         Ok(Checked::Ignore(envelope_type)) => {
@@ -628,7 +645,7 @@ async fn handle(
             return StatusCode::OK.into_response();
         }
         Err(reason) => {
-            tracing::warn!(%binding, kind = kind.as_str(), reason, "refused a verified Slack request");
+            ingress.refused(binding, kind, StatusCode::BAD_REQUEST, &reason);
             return StatusCode::BAD_REQUEST.into_response();
         }
     }
