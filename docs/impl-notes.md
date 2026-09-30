@@ -2463,3 +2463,131 @@ the policy also holds the hop cap. Every other lookup already withholds a
 turn when it has no answer. The trait's rustdoc lists every lookup `route`
 may make for an event, in order, so T23 knows what to load, and T23's and
 T27's plan text say what they fill.
+
+## T20: runner process driver
+
+### The placeholder is not an environment entry
+
+**Issue.** The plan passes the placeholder in `LaunchSpec.env`, next to
+`AGENTCTL_TOKEN` and the proxy variables, and also says the runner sets
+exactly one of `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`. With the
+placeholder as a map entry under a name the caller picks, the runner can't
+guarantee that, and nothing would stop a caller from passing a real key,
+or `ANTHROPIC_AUTH_TOKEN` (which the CLI also sends as a bearer token), or
+its own `ANTHROPIC_BASE_URL` that bypasses the proxy.
+
+**Solution.** `LaunchSpec` has `credential: CredentialKind` and
+`placeholder: SecretString`, and the runner puts the placeholder in the one
+variable the kind uses. `LaunchSpec.env` is refused if it sets any variable
+the runner sets (`HOME`, `TMPDIR`, the design's credential proxy block) or
+any `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` variable. The placeholder must be
+non-empty printable ASCII. `LaunchSpec`'s `Debug` shows the environment's
+names only. `ClaudeProcess::start` also takes a `ProcessConfig` (the
+`claude` binary, `ANTHROPIC_BASE_URL`, the turn timeout), which the plan's
+three-argument signature had no place for. The plan's T20 bullet says so.
+
+### When a session has started
+
+**Issue.** The plan uses `--session-id` for a session that "has never
+started" and `--resume` otherwise, and T04 found that the transcript
+appears with the first user message. The caller can't look for the
+transcript itself: `Container::paths()` are the paths the CLI sees, which
+under Docker aren't agentd's. And a turn can end without anyone knowing
+whether the CLI read the message: a crash before it read stdin leaves no
+transcript, a crash after it leaves one. Guessing wrong either way fails the
+next start: `--session-id` on an existing transcript exits 1 without a
+result, and `--resume` without one prints an `error_during_execution`
+result and exits.
+
+**Solution.** `TurnStats::init_seen` records whether the CLI printed its
+`system`/`init` line for the turn, which it does once it has read the
+message. The plan's T21 now marks a session started after a turn with
+`init_seen`, whatever the outcome. The two refusals are tested: a
+`--session-id` start on a started session gives `Crashed` with exit code 1
+and `init_seen` false, and a `--resume` of a session that never started gives
+a `Finished` error result with subtype `error_during_execution`.
+
+### A failed write can follow the CLI's answer
+
+**Issue.** For a `--resume` without a transcript the CLI prints its result
+and exits without reading stdin. Writing the turn's line then races the
+exit: when the write lost, with `EPIPE`, the driver reported a crash and
+dropped the result line waiting in the pipe.
+
+**Solution.** A failed write is logged and the driver still reads stdout to
+its end, so a result printed before the process went is returned. The next
+turn on that process then finds the pipe closed and crashes.
+
+### Codes and tool names can carry text
+
+**Issue.** The first version logged the `type` of a skipped line, and kept
+line codes (`subtype`, `terminal_reason`, the assistant line's `error`) and
+tool names that matched `[A-Za-z0-9_.:-]`. The captured-log test put a fake
+API key (`sk-ant-api03-…`) in a line's `type` and it reached the log: key
+formats fit that pattern. Tool names are written by the model, so a
+prompt-injected model could choose one.
+
+**Solution.** A skipped line is logged with its length only. Codes are kept
+only in the form the CLI's codes take, at most 64 bytes of lowercase ASCII
+letters, digits and `_`, and dropped otherwise. A tool name is kept only if
+it is one of the six tools the process was given, and as `<other>`
+otherwise. The test covers a secret in each of these places, in the
+reply, in the user message and in tool output, and checks the placeholder
+and `AGENTCTL_TOKEN` too.
+
+### Lines are parsed as values, then read field by field
+
+**Issue.** A malformed line may be logged with its parse error only, but
+serde's typed errors quote the value that failed (`invalid type: string
+"…"`), so deserializing a line straight into structs would log whatever a
+mistyped field held.
+
+**Solution.** Each line is parsed into a `serde_json::Value`, whose errors
+are syntax errors that name a position, not content, and fields are read
+with `as_str`, `as_u64` and so on, so a field of the wrong type is absent
+rather than an error. A result line without `is_error` counts as an error
+unless its subtype is `success`. Lines are read with a 16 MiB cap
+(`MAX_LINE_BYTES`): a longer line is skipped, and logged with its length, so
+a huge tool result can't grow the buffer without bound. Result lines hold
+only the final reply and stay far below it.
+
+### Classifying errors by the assistant line's code
+
+**Issue.** The plan classifies `is_error` results by `api_error_status` and
+the text. The captures show the CLI's synthetic `assistant` line for an API
+error carries an `error` code too (`authentication_failed` next to the 401,
+`server_error` for an unreachable proxy), and `api_error_status` is null
+when there was no HTTP answer.
+
+**Solution.** `ErrorKind::classify` takes the status first (429 is
+`UsageLimit`, 401 and 403 `Auth`), then the code (`rate_limit` and
+`billing_error` are `UsageLimit`, `authentication_failed` is `Auth`), then
+phrases in the text ("usage limit", "rate limit", "hit your limit",
+"credit balance", "out of credits", "insufficient credit", "quota"). The
+code is kept in `TurnStats::api_error`. The phrase list is a guess at the
+CLI's messages; only the 401 path was seen live (T04's capture).
+
+### A cancelled turn leaves the stream mid-turn
+
+**Issue.** `send_turn` reads the turn's lines as it goes. If the caller
+drops its future (a cancelled request, a `select!`), the process is left in
+the middle of a turn, and the next turn would read the old turn's lines,
+result included, as its own.
+
+**Solution.** The process records that a turn is in progress, and a
+`send_turn` that finds one still in progress kills the process and returns
+`RunnerError::NotRunning`, as after a crash, so the caller resumes on a new
+process. A timeout ends the turn the same way, with the process killed and
+reaped (up to five more seconds) before `TimedOut` is returned. The timeout
+counts from the call, so it includes writing the message.
+
+### serde_json doesn't round floats exactly
+
+**Issue.** The fixture's `total_cost_usd` of `0.00014000000000000001`
+parsed to a value one unit in the last place away from the Rust literal:
+serde_json's default float parser is fast, not correctly rounded, unless
+its `float_roundtrip` feature is on.
+
+**Solution.** Left as is. T27 sums the cost per member and day, and an
+error of one unit in the last place per turn stays far below a cent. The
+test compares with a tolerance.

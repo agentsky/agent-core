@@ -1588,8 +1588,10 @@ Design: [Lifecycle](design.md#lifecycle),
 
 Deliverables:
 
-- `ClaudeProcess::start(sandbox, container, LaunchSpec) -> ClaudeProcess`. It
-  builds argv from the design's launch flags:
+- `ClaudeProcess::start(sandbox, container, &ProcessConfig, LaunchSpec) ->
+  ClaudeProcess`. `ProcessConfig` holds the `claude` binary, the proxy's
+  `ANTHROPIC_BASE_URL` and the turn timeout. It builds argv from the design's
+  launch flags:
   - `--session-id <id>` when the session has never started, `--resume <id>`
     otherwise.
   - `--tools "Bash,Read,Edit,Write,Glob,Grep"`, `--strict-mcp-config`,
@@ -1599,7 +1601,12 @@ Deliverables:
   - The environment from the design's credential proxy block, plus
     `HOME` and `TMPDIR` from `Container::paths()`. The placeholder, the
     process's `AGENTCTL_TOKEN` and the egress proxy variables come from the
-    caller in `LaunchSpec.env`. The runner doesn't know how they are made.
+    caller: the placeholder in `LaunchSpec.placeholder`, with
+    `LaunchSpec.credential` choosing its variable, and the rest in
+    `LaunchSpec.env`, which may not set the runner's own variables or any
+    `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` one
+    ([impl-notes](impl-notes.md#the-placeholder-is-not-an-environment-entry)).
+    The runner doesn't know how they are made.
 - `send_turn(user_message) -> TurnOutcome`. It writes one stream-json user line
   and reads lines until `type == "result"`. The outcome carries:
   - `is_error`, `result` text, `terminal_reason`, `api_error_status`.
@@ -1612,8 +1619,11 @@ Deliverables:
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
   is killed and the turn fails.
-- Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
-  new process with `--resume`.
+- Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
+  `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
+  starts a new process with `--resume`. `TurnStats::init_seen` says whether
+  the CLI read the turn's message, which is when its transcript starts
+  ([impl-notes](impl-notes.md#when-a-session-has-started)).
 - Classification of `is_error` results: `usage_limit` (rate limit or credit
   exhausted, when `api_error_status` is 429 or the text says so), `auth` (401
   or 403), `other`. T26 turns these into member-facing messages.
@@ -1666,6 +1676,9 @@ Deliverables:
     sandbox reports the container died.
 - `SessionManager`:
   - `lookup_or_create(agent, thread_key) -> Session`. A new session id is a v4.
+  - A session is marked `started` after a turn whose `TurnStats::init_seen`
+    is true, whatever its outcome, not when its process starts
+    ([impl-notes](impl-notes.md#when-a-session-has-started)).
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
   - `run_turn(session, TurnRequest) -> TurnOutcome`, serialized per session
