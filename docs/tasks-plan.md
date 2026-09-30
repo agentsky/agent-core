@@ -863,6 +863,14 @@ Deliverables:
 - `Command::is_secret_bearing()` is true for `Login { code: Some }`,
   `SlackToken` and `Admin(ApiKey { set })`, so callers can enforce
   private-channel rules and redact logs.
+- `ParseError::is_secret_bearing()` says the same of text that fails to
+  parse, including misspelt commands (`api-key set <key>` without `admin`,
+  `slack_token …`) and any word holding a known token prefix (`sk-ant-`,
+  `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`)
+  ([impl-notes](impl-notes.md#misspelt-secret-bearing-commands-arent-commands-at-all)).
+- A `skill add` source is an `https://` Git URL with an optional `#ref`, in a
+  narrow character set; anything else, including a word starting with `-`, is
+  a parse error ([impl-notes](impl-notes.md#a-skill-source-reaches-git-clone)).
 - `Command::help()` gives short usage text per command. An unknown command
   returns the help text as the error message.
 
@@ -1803,8 +1811,10 @@ Deliverables:
 - Skill storage per agent: `<data>/skills/<agent>/<name>/`, mounted read-only
   into every session of that agent. The bundled skill is always present.
 - `/agent skill add <name> <source>`, where `source` is one of:
-  - a Git URL with an optional `#ref`, cloned by agentd on the egress network,
-    shallow, with no submodules;
+  - an `https://` Git URL with an optional `#ref`, in the form T08's parser
+    accepts, cloned by agentd on the egress network, shallow, with no
+    submodules, passing the URL after `--` and the ref only inside an
+    `--opt=value` word, so neither can be read as an option;
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
