@@ -373,6 +373,12 @@ dependencies = [
 [[package]]
 name = "commands"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "core-types",
+ "secrecy",
+ "thiserror",
+]
 
 [[package]]
 name = "const-oid"
@@ -1261,6 +1267,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mime"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1546,6 +1568,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "render"
 version = "0.1.0"
 dependencies = [
+ "core-types",
  "pulldown-cmark",
 ]
 
@@ -1558,6 +1581,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -1566,6 +1590,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -2158,6 +2183,20 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "surface-rocketchat"
 version = "0.1.0"
+dependencies = [
+ "core-types",
+ "rand",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "testkit",
+ "time",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
 
 [[package]]
 name = "surface-slack"
@@ -2208,6 +2247,18 @@ dependencies = [
 [[package]]
 name = "testkit"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "core-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "uuid",
+ "wiremock",
+]
 
 [[package]]
 name = "thiserror"

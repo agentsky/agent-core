@@ -36,6 +36,10 @@ unused-allowed-license = "allow"
 
 [licenses.private]
 # The workspace crates carry only `license-file` and are never published.
+# This skips every `publish = false` crate, not only ours, so
+# scripts/ci/check-path-deps.sh (run by the same CI job) fails when a path
+# package other than the root package or a crate in crates/ is in the
+# graph.
 ignore = true
 
 [bans]

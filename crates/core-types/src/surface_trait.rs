@@ -109,9 +109,10 @@ pub struct InFile {
 pub struct Msg {
     /// The message's id in its conversation.
     pub id: MessageId,
-    /// Who sent it.
+    /// Who sent it. For a bot, its user id when known, or else its bot id,
+    /// as for [`InboundEvent::sender`](crate::InboundEvent::sender).
     pub sender: MemberKey,
-    /// Whether the sender is a bot user.
+    /// Whether the sender is a bot.
     pub sender_is_bot: bool,
     /// The message text.
     pub text: String,
