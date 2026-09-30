@@ -1377,13 +1377,15 @@ Deliverables:
 
 - The `Sandbox` trait:
   - `ensure_volume(VolumeKey) -> VolumeRef`.
-  - `prepare_session_dirs(volume, session)`. It creates `sessions/<id>/work`,
-    `sessions/<id>/claude`, `sessions/<id>/home` and `sessions/<id>/tmp`, and
-    writes `sessions/<id>/claude/settings.json` with `cleanupPeriodDays`
-    (configurable, default 3650).
   - `start(SessionSpec) -> Container`, where `SessionSpec` carries the session
     id, volume, image, environment, the agent's persona and skills
-    directories, and labels.
+    directories, and labels. Before creating the container it creates
+    `sessions/<id>/work`, `sessions/<id>/claude`, `sessions/<id>/home` and
+    `sessions/<id>/tmp`, and writes `sessions/<id>/claude/settings.json`
+    with `cleanupPeriodDays` (configurable, default 3650). That step is
+    crate-private, since it is safe only while the session has no running
+    container
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
   - `Container::paths()`, which gives the paths as the CLI sees them: working
     directory, `CLAUDE_CONFIG_DIR`, `HOME`, `TMPDIR`, persona file. Docker and
     process sandboxes differ here, and the runner uses only these.
@@ -1627,7 +1629,9 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails.
+  is killed and the turn fails. If the kill fails, the container is stopped
+  instead, since nothing was signalled
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
 - Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
   new process with `--resume`.
 - Classification of `is_error` results: `usage_limit` (rate limit or credit
@@ -1693,7 +1697,9 @@ Deliverables:
     `process_stopping` and then stops both.
   - It follows `Sandbox::events()`: a container that died has its process
     marked gone and `process_stopping` called at once, so its IP can't be
-    reused with a live mapping.
+    reused with a live mapping. The stream ends only after an `Err` item,
+    which means deaths may have been missed: the pool subscribes again and
+    compares `list_managed()` with the containers it holds.
   - A per-scope container cap, default 4. Turns beyond it wait in a per-scope
     queue.
   - A global cap.
@@ -1829,7 +1835,12 @@ Deliverables:
   (T17), validated with its `validate`; `image` fills every `SessionSpec`.
   agentd builds a `DockerSandbox` with its data directory, calls
   `reap_orphans` at startup, and documents the section in
-  `config/agentd.example.toml`.
+  `config/agentd.example.toml`. bollard logs every request body at debug
+  level, `exec` environments with placeholders and agentctl tokens
+  included, so `telemetry::subscriber` caps the `bollard` target at `info`
+  whatever `server.log_filter` says. Any other subscriber setup, such as a
+  test harness that captures logs, must keep that cap
+  ([impl-notes](impl-notes.md#bollard-logs-request-bodies-at-debug-level)).
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, and `turn_finished` calls
   `Registry::unpoint`. It sets the egress proxy variables from
@@ -1865,7 +1876,9 @@ Deliverables:
      3. Render and split with `Surface::render`. The trait takes no
         `MentionDirectory`, so each surface resolves `@Name` from its own
         member list; on Slack that is T29's per-team member cache, which
-        includes the agents' bot users
+        includes the agents' bot users. agentd passes each team's managed
+        agents' bot user ids to `TeamDirectory::set_managed_bots`, so an
+        agent keeps a name a human shares
         ([impl-notes](impl-notes.md#t29-slack-web-api)).
      4. Post as the agent's bot identity in the thread.
      5. Record `message_refs` for every chunk with the turn's requester and
@@ -2093,16 +2106,21 @@ Deliverables:
   1 MiB.
 - `url_verification`: echo the challenge for a known binding, without checking
   the signature. Slack sends it during `apps.manifest.create`, before agentd
-  has the new app's signing secret. The echo has no side effects. Every other
-  request type must verify.
+  has the new app's signing secret. The echo has no side effects. The one
+  other exception is Slack's `ssl_check`: a form whose `ssl_check` is `1`,
+  posted unsigned to the command URL, gets an empty 200 on the same terms.
+  Every other request type must verify.
   This PR adds that detail to the design's Slack transport bullet.
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
-  200 at once, or 503 when the queue is full, so Slack retries; they never
-  wait for the queue. Slash commands and interactivity return an empty 200 and
-  reply later through `response_url`.
+  200 at once, or 503 when the queue is full (Slack retries events, not
+  commands or interactions); they never wait for the queue. The secret lookup
+  and the body read share a 2-second timeout. Slash commands and
+  interactivity return an empty 200 and reply later through `response_url`.
 - Deduplication per binding: `store.mark_event_processed("slack:<binding>",
-  event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
-  a message that reached the same app twice. Slash commands and
+  event_id)` drops retried events, and messages are keyed by `(binding,
+  channel, ts)` instead, which drops a retry and a message that reached the
+  same app twice. Messages are normalized first, so a dropped one costs no
+  store write. Slash commands and
   interactivity, which have no event id, are deduplicated by signature, which
   drops a replay inside the 5-minute window. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
@@ -2176,9 +2194,11 @@ Deliverables:
   of 3,000 chars, and `supports_edit`, `supports_buttons`, `supports_threads`
   and `per_binding_delivery` all true.
 - A member cache per team, filled from `users.list` and refreshed on a
-  TTL, mapping display and real names to user ids. `SlackSurface::render`
-  reads it; bot users are listed too, so agents' names resolve without the
-  bindings. `users.info` can't look a user up by name.
+  TTL, mapping display and real names (and bot users' usernames) to user
+  ids. `SlackSurface::render` reads it; bot users are listed too, so agents'
+  names resolve without the bindings, and the managed agents' bot users
+  given to `TeamDirectory::set_managed_bots` win names they share with
+  others. `users.info` can't look a user up by name.
 - `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
   `user_id` for bot events that lack a `user` field, cached per bot id. A bot
   id that maps to no user keeps the `bot_id` as `sender.user` and no
@@ -2293,9 +2313,11 @@ Deliverables:
   to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
 - agentd's receiver of T28's `SlackInbound` builds a T29 `SlackSurface` per
-  active binding, with one `TeamDirectory` per team, awaits
-  `refresh_members` when a binding starts, and passes each message through
-  `fill_bot_sender` before routing it.
+  active binding, with one `TeamDirectory` per team. Whenever a team's
+  active agent bindings change, it passes their `bot_user_id`s to
+  `TeamDirectory::set_managed_bots`, so agents win names humans share. It
+  awaits `refresh_members` when a binding starts, and passes each message
+  through `fill_bot_sender` before routing it.
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 

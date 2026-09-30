@@ -62,9 +62,14 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// per minute.
 const DEFAULT_MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
 
-/// The page size for `users.list`, `conversations.history` and
+/// The default page size for `conversations.history` and
 /// `conversations.replies`. Slack recommends at most 200.
 const PAGE_SIZE: usize = 200;
+
+/// The largest page size asked for, and the one `users.list` uses: its
+/// Tier 2 quota of 20 calls a minute makes page count what a large
+/// workspace's refresh costs.
+const MAX_PAGE_SIZE: usize = 999;
 
 /// The most pages one paginated read follows, as a guard against a cursor
 /// that never ends.
@@ -853,7 +858,7 @@ impl WebApi {
     ///
     /// See [`map_error`].
     pub async fn users_page(&self, cursor: Option<&str>) -> Result<UsersPage> {
-        let mut form = vec![("limit", PAGE_SIZE.to_string())];
+        let mut form = vec![("limit", MAX_PAGE_SIZE.to_string())];
         if let Some(cursor) = cursor {
             form.push(("cursor", cursor.to_owned()));
         }
@@ -1102,7 +1107,7 @@ fn page_form(
     let limit = if page.limit == 0 {
         PAGE_SIZE
     } else {
-        page.limit.min(999)
+        page.limit.min(MAX_PAGE_SIZE)
     };
     form.push(("limit", limit.to_string()));
     if let Some(latest) = page.latest {

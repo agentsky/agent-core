@@ -125,7 +125,9 @@ async fn render_refreshes_a_stale_member_cache_in_the_background() {
     let (server, surface) = setup().await;
     Mock::given(method("POST"))
         .and(path("/api/users.list"))
-        .respond_with(ok(json!({"members": [{"id": USER, "name": "ada"}]})))
+        .respond_with(ok(
+            json!({"members": [{"id": USER, "name": "ada", "profile": {"display_name": "Ada"}}]}),
+        ))
         .expect(1)
         .mount(&server)
         .await;
@@ -157,7 +159,9 @@ async fn members_refresh_after_the_ttl_and_survive_a_failed_refresh() {
     let surface = SlackSurface::new(client.bot(SecretString::from(TOKEN)), directory);
     Mock::given(method("POST"))
         .and(path("/api/users.list"))
-        .respond_with(ok(json!({"members": [{"id": USER, "name": "ada"}]})))
+        .respond_with(ok(
+            json!({"members": [{"id": USER, "name": "ada", "profile": {"display_name": "Ada"}}]}),
+        ))
         .up_to_n_times(2)
         .mount(&server)
         .await;
@@ -182,7 +186,7 @@ async fn concurrent_member_refreshes_share_one_users_list() {
     Mock::given(method("POST"))
         .and(path("/api/users.list"))
         .respond_with(
-            ok(json!({"members": [{"id": USER, "name": "ada"}]}))
+            ok(json!({"members": [{"id": USER, "name": "ada", "profile": {"display_name": "Ada"}}]}))
                 .set_delay(Duration::from_millis(200)),
         )
         .expect(1)
@@ -208,6 +212,177 @@ async fn a_first_member_refresh_that_fails_is_an_error() {
         SurfaceError::Forbidden("missing_scope (needs users:read)".into())
     );
     assert!(surface.directory().members().is_empty());
+    assert_eq!(surface.refresh_members().await.unwrap_err(), err);
+    assert_eq!(requests(&server).await.len(), 1, "the retry waits");
+}
+
+#[tokio::test]
+async fn renders_after_a_failed_first_member_refresh_wait_to_retry() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "users.list",
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "fatal_error"})),
+    )
+    .await;
+    for _ in 0..8 {
+        assert_eq!(surface.render("@ada"), ["@ada"]);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(requests(&server).await.len(), 1);
+}
+
+fn members_with_bot() -> ResponseTemplate {
+    ok(json!({
+        "members": [
+            {"id": USER, "name": "ada", "profile": {"display_name": "Ada"}},
+            {"id": BOT_USER, "name": "helper", "is_bot": true, "profile": {"real_name": "helper"}},
+        ],
+    }))
+}
+
+async fn users_list_calls(server: &MockServer) -> usize {
+    requests(server)
+        .await
+        .iter()
+        .filter(|request| request.url.path() == "/api/users.list")
+        .count()
+}
+
+#[tokio::test]
+async fn a_managed_bot_the_member_list_lacks_makes_it_stale() {
+    let (server, surface) = setup().await;
+    mount(&server, "users.list", members_with_bot()).await;
+    surface.refresh_members().await.unwrap();
+    assert_eq!(users_list_calls(&server).await, 1);
+
+    surface
+        .directory()
+        .set_managed_bots([UserId::from(BOT_USER)]);
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        users_list_calls(&server).await,
+        1,
+        "a known bot keeps the list"
+    );
+
+    surface
+        .directory()
+        .set_managed_bots([UserId::from(BOT_USER), UserId::from("U0NEWBOT1")]);
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        users_list_calls(&server).await,
+        2,
+        "a new bot reads it again"
+    );
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        users_list_calls(&server).await,
+        2,
+        "once, even if still absent"
+    );
+
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT2")]);
+    assert_eq!(surface.render("@ada"), [format!("<@{USER}>")]);
+    for _ in 0..100 {
+        if users_list_calls(&server).await == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(users_list_calls(&server).await, 3, "render refreshes too");
+}
+
+#[tokio::test]
+async fn a_new_managed_bot_waits_out_a_failed_refresh() {
+    let (server, surface) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .respond_with(members_with_bot())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        "users.list",
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "fatal_error"})),
+    )
+    .await;
+    surface.refresh_members().await.unwrap();
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT1")]);
+    let stale = surface.refresh_members().await.unwrap();
+    assert_eq!(stale.lookup("ada"), Some(&UserId::from(USER)));
+    assert_eq!(users_list_calls(&server).await, 2);
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT2")]);
+    surface.refresh_members().await.unwrap();
+    assert_eq!(users_list_calls(&server).await, 2, "the retry wait holds");
+}
+
+#[tokio::test]
+async fn a_managed_bot_set_during_a_refresh_leaves_the_result_stale() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "users.list",
+        members_with_bot().set_delay(Duration::from_millis(200)),
+    )
+    .await;
+    let refreshing = tokio::spawn({
+        let surface = surface.clone();
+        async move { surface.refresh_members().await.map(drop) }
+    });
+    for _ in 0..100 {
+        if users_list_calls(&server).await == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    surface
+        .directory()
+        .set_managed_bots([UserId::from("U0NEWBOT1")]);
+    refreshing.await.unwrap().unwrap();
+    surface.refresh_members().await.unwrap();
+    assert_eq!(users_list_calls(&server).await, 2);
+}
+
+#[tokio::test]
+async fn managed_agents_keep_names_humans_share() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "users.list",
+        ok(json!({
+            "members": [
+                {"id": USER, "name": "helper", "profile": {"display_name": "Ada", "real_name": "Ada Lovelace"}},
+                {"id": "U0HUMAN02", "name": "grace", "profile": {"display_name": "Scout", "real_name": "Grace Hopper"}},
+                {"id": BOT_USER, "name": "helper", "is_bot": true, "profile": {"real_name": "helper"}},
+                {"id": "U0SCOUT01", "name": "scout", "is_bot": true, "profile": {"real_name": "scout"}},
+            ],
+        })),
+    )
+    .await;
+    surface.refresh_members().await.unwrap();
+    assert_eq!(
+        surface.render("@helper and @scout"),
+        [format!("<@{BOT_USER}> and @scout")]
+    );
+    surface
+        .directory()
+        .set_managed_bots([UserId::from(BOT_USER), UserId::from("U0SCOUT01")]);
+    assert_eq!(
+        surface.render("@helper and @scout, cc @Ada"),
+        [format!("<@{BOT_USER}> and <@U0SCOUT01>, cc <@{USER}>")]
+    );
+    let debug = format!("{surface:?}");
+    assert!(debug.contains(TEAM), "{debug}");
+    assert!(!debug.contains(USER) && !debug.contains("Ada"), "{debug}");
+    assert!(!debug.contains(TOKEN), "{debug}");
 }
 
 #[tokio::test]
@@ -498,8 +673,98 @@ async fn channel_history_pages_back_until_the_limit() {
     assert_eq!(ids, ["5.0", "7.0"]);
     let sent = requests(&server).await;
     assert_eq!(sent.len(), 2, "stopped once the limit was reached");
-    assert_eq!(form(&sent[0])["limit"], "2");
-    assert_eq!(form(&sent[1])["limit"], "1");
+    assert_eq!(form(&sent[0])["limit"], "200");
+    assert_eq!(form(&sent[1])["limit"], "200");
+}
+
+struct PagedHistory(Vec<Value>);
+
+impl wiremock::Respond for PagedHistory {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let form = form(request);
+        let limit: usize = form["limit"].parse().unwrap();
+        let start: usize = form
+            .get("cursor")
+            .map_or(0, |cursor| cursor.parse().unwrap());
+        let end = (start + limit).min(self.0.len());
+        let next = if end < self.0.len() {
+            end.to_string()
+        } else {
+            String::new()
+        };
+        ok(json!({
+            "messages": self.0[start..end],
+            "has_more": end < self.0.len(),
+            "response_metadata": {"next_cursor": next},
+        }))
+    }
+}
+
+#[tokio::test]
+async fn channel_history_asks_for_full_pages_however_many_messages_are_skipped() {
+    let (server, surface) = setup().await;
+    let mut newest_first: Vec<Value> = (0..30)
+        .map(|i| {
+            message(
+                &format!("{}.0", 100 - i),
+                json!({"subtype": "channel_join", "user": USER}),
+            )
+        })
+        .collect();
+    newest_first.push(message("50.0", json!({"user": USER})));
+    newest_first.push(message("40.0", json!({"user": USER})));
+    newest_first.push(message("30.0", json!({"user": USER})));
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.history"))
+        .respond_with(PagedHistory(newest_first))
+        .mount(&server)
+        .await;
+    let key = ThreadKey {
+        conv: conv(),
+        root: None,
+    };
+    let msgs = surface.history(&key, None, 2).await.unwrap();
+    let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["40.0", "50.0"]);
+    assert_eq!(requests(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn thread_history_skips_a_root_repeated_on_a_later_page() {
+    let (server, surface) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.replies"))
+        .and(body_string_contains("cursor=p2"))
+        .respond_with(ok(json!({
+            "messages": [
+                message("10.0", json!({"user": USER})),
+                message("10.2", json!({"user": USER})),
+                message("10.1", json!({"user": USER})),
+            ],
+            "response_metadata": {"next_cursor": ""},
+        })))
+        .mount(&server)
+        .await;
+    mount(
+        &server,
+        "conversations.replies",
+        ok(json!({
+            "messages": [
+                message("10.0", json!({"user": USER})),
+                message("10.1", json!({"user": USER})),
+            ],
+            "has_more": true,
+            "response_metadata": {"next_cursor": "p2"},
+        })),
+    )
+    .await;
+    let key = ThreadKey {
+        conv: conv(),
+        root: Some("10.0".into()),
+    };
+    let msgs = surface.history(&key, None, 10).await.unwrap();
+    let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["10.0", "10.1", "10.2"]);
 }
 
 fn bot_event() -> InboundEvent {

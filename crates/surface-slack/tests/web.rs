@@ -378,7 +378,7 @@ async fn users_info_and_every_page_of_users_list() {
     let sent = requests(&server).await;
     assert_eq!(form(&sent[0])["user"], "U0HUMAN01");
     let first = form(&sent[1]);
-    assert_eq!(first["limit"], "200");
+    assert_eq!(first["limit"], "999");
     assert!(!first.contains_key("cursor"));
     assert_eq!(form(&sent[2])["cursor"], "page2");
 }

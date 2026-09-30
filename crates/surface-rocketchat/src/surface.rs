@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,55 @@ const THREAD_PAGE: usize = 100;
 /// The most `chat.getThreadMessages` pages one `history` call reads.
 const MAX_THREAD_PAGES: usize = 50;
 
-/// The most users [`BotRoles`] remembers before it drops expired entries.
+/// The most users [`BotRoles`] remembers.
 const MAX_CACHED_USERS: usize = 10_000;
+
+/// The most rooms a [`RocketChatSurface`] remembers `rooms.info` for.
+const MAX_CACHED_ROOMS: usize = 10_000;
+
+/// A map whose entries expire after `ttl` and which holds at most `cap` of
+/// them: making room drops the expired entries, then the oldest.
+struct Cache<K, V> {
+    ttl: Duration,
+    cap: usize,
+    entries: HashMap<K, (V, Instant)>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
+    fn new(ttl: Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            cap,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.entries
+            .get(key)
+            .filter(|(_, at)| at.elapsed() < self.ttl)
+            .map(|(value, _)| value.clone())
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.cap {
+            let ttl = self.ttl;
+            self.entries.retain(|_, (_, at)| at.elapsed() < ttl);
+            while self.entries.len() >= self.cap {
+                let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, (value, Instant::now()));
+    }
+}
 
 /// Records which events were already handled, so that each message is
 /// delivered once although every bot connection in a room receives it.
@@ -82,7 +130,8 @@ pub trait Dedup: Send + Sync {
 /// another user's roles only to a caller with `view-full-other-user-info`,
 /// so agentd builds one `BotRoles` from the manager's client and shares it
 /// between every surface: whichever connection records a message first,
-/// the sender is classified the same way.
+/// the sender is classified the same way. It remembers at most 10,000
+/// users.
 ///
 /// Cloning is cheap and shares the cache.
 #[derive(Clone)]
@@ -93,7 +142,7 @@ pub struct BotRoles {
 struct BotRolesInner {
     rest: RestClient,
     ttl: Duration,
-    cache: Mutex<HashMap<UserId, (bool, Instant)>>,
+    cache: Mutex<Cache<UserId, bool>>,
 }
 
 impl fmt::Debug for BotRoles {
@@ -121,12 +170,12 @@ impl BotRoles {
             inner: Arc::new(BotRolesInner {
                 rest,
                 ttl,
-                cache: Mutex::new(HashMap::new()),
+                cache: Mutex::new(Cache::new(ttl, MAX_CACHED_USERS)),
             }),
         }
     }
 
-    fn cache(&self) -> MutexGuard<'_, HashMap<UserId, (bool, Instant)>> {
+    fn cache(&self) -> MutexGuard<'_, Cache<UserId, bool>> {
         self.inner
             .cache
             .lock()
@@ -134,20 +183,26 @@ impl BotRoles {
     }
 
     /// Whether `user` has the `bot` role.
+    ///
+    /// Every Rocket.Chat user has at least one role, so `users.info`
+    /// answering with none means the caller may not see them. That fails
+    /// with [`SurfaceError::Forbidden`] naming the missing
+    /// `view-full-other-user-info` permission, instead of classifying every
+    /// bot as a person.
     pub async fn is_bot(&self, user: &UserId) -> Result<bool> {
-        let ttl = self.inner.ttl;
-        if let Some((is_bot, at)) = self.cache().get(user)
-            && at.elapsed() < ttl
-        {
-            return Ok(*is_bot);
+        if let Some(is_bot) = self.cache().get(user) {
+            return Ok(is_bot);
         }
         let info = self.inner.rest.user_info(user).await?;
-        let is_bot = info.roles.iter().any(|role| role == "bot");
-        let mut cache = self.cache();
-        if cache.len() >= MAX_CACHED_USERS {
-            cache.retain(|_, (_, at)| at.elapsed() < ttl);
+        if info.roles.is_empty() {
+            return Err(SurfaceError::Forbidden(format!(
+                "users.info showed no roles for {user}; the roles of {} need the \
+                 view-full-other-user-info permission",
+                self.inner.rest.user_id()
+            )));
         }
-        cache.insert(user.clone(), (is_bot, Instant::now()));
+        let is_bot = info.roles.iter().any(|role| role == "bot");
+        self.cache().insert(user.clone(), is_bot);
         Ok(is_bot)
     }
 }
@@ -209,7 +264,7 @@ pub struct RocketChatSurface {
     limit: Limit,
     dedup: Arc<dyn Dedup>,
     bots: BotRoles,
-    rooms: Mutex<HashMap<ConversationId, RoomInfo>>,
+    rooms: Mutex<Cache<ConversationId, RoomInfo>>,
 }
 
 impl fmt::Debug for RocketChatSurface {
@@ -238,7 +293,7 @@ impl RocketChatSurface {
             limit: config.message_limit,
             dedup,
             bots,
-            rooms: Mutex::new(HashMap::new()),
+            rooms: Mutex::new(Cache::new(Duration::MAX, MAX_CACHED_ROOMS)),
         })
     }
 
@@ -257,31 +312,48 @@ impl RocketChatSurface {
         }
     }
 
-    fn cached_rooms(&self) -> MutexGuard<'_, HashMap<ConversationId, RoomInfo>> {
+    fn cached_rooms(&self) -> MutexGuard<'_, Cache<ConversationId, RoomInfo>> {
         self.rooms.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// `rooms.info`, remembered for the surface's lifetime: a room's type
-    /// and whether a DM has more than two members don't change.
+    /// `rooms.info`, remembered for the surface's lifetime, for at most
+    /// 10,000 rooms: a room's type and whether a DM has more than two
+    /// members don't change.
     async fn room_info(&self, room: &ConversationId) -> Result<RoomInfo> {
         if let Some(info) = self.cached_rooms().get(room) {
-            return Ok(info.clone());
+            return Ok(info);
         }
         let info = self.rest.room_info(room).await?;
         self.cached_rooms().insert(room.clone(), info.clone());
         Ok(info)
     }
 
-    async fn sender_is_bot(&self, message: &Message) -> Result<bool> {
+    /// Whether the sender is a bot. When its roles can't be read, the
+    /// sender counts as a person: [`BotRoles`] is shared by every surface,
+    /// so skipping the message would lose it on all of them, and the router
+    /// looks every sender up as a managed agent whatever this says.
+    async fn sender_is_bot(&self, message: &Message) -> bool {
         if message.bot {
-            return Ok(true);
+            return true;
         }
-        self.bots.is_bot(&message.sender.id).await
+        match self.bots.is_bot(&message.sender.id).await {
+            Ok(is_bot) => is_bot,
+            Err(err) => {
+                tracing::warn!(
+                    room = %message.room,
+                    message = %message.id,
+                    error = %err,
+                    "could not read the sender's roles, treating the sender as a person"
+                );
+                false
+            }
+        }
     }
 
     /// Normalizes one message and delivers it if it is the first copy.
-    /// Only a closed receiver is an error; anything else skips the message
-    /// without recording it, so another connection can still deliver it.
+    /// Only a closed receiver is an error. A room that can't be read or a
+    /// failure to record skips the message without recording it, so another
+    /// connection can still deliver it.
     async fn deliver(
         &self,
         binding: &Binding,
@@ -306,13 +378,7 @@ impl RocketChatSurface {
                 return Ok(());
             }
         };
-        let sender_is_bot = match self.sender_is_bot(&message).await {
-            Ok(is_bot) => is_bot,
-            Err(err) => {
-                tracing::warn!(%room, message = %message.id, error = %err, "could not read the sender's roles, skipping message");
-                return Ok(());
-            }
-        };
+        let sender_is_bot = self.sender_is_bot(&message).await;
         match self
             .dedup
             .mark_event_processed(DEDUP_SOURCE, message.id.as_str())
@@ -369,13 +435,7 @@ impl RocketChatSurface {
     }
 
     async fn to_msg(&self, message: Message) -> Msg {
-        let sender_is_bot = match self.sender_is_bot(&message).await {
-            Ok(is_bot) => is_bot,
-            Err(err) => {
-                tracing::debug!(message = %message.id, error = %err, "could not read the sender's roles");
-                false
-            }
-        };
+        let sender_is_bot = self.sender_is_bot(&message).await;
         let file_url = |file: &FileRef| self.rest.file_url(file);
         Msg {
             files: message
@@ -573,6 +633,27 @@ mod tests {
             surface.room(&conv),
             Err(SurfaceError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn the_cache_forgets_expired_entries_and_holds_at_most_its_cap() {
+        let mut cache = Cache::new(Duration::from_secs(60), 2);
+        cache.insert("a", 1);
+        std::thread::sleep(Duration::from_millis(2));
+        cache.insert("b", 2);
+        cache.insert("b", 3);
+        cache.insert("c", 4);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), Some(3));
+        assert_eq!(cache.get(&"c"), Some(4));
+
+        let mut expiring = Cache::new(Duration::ZERO, 2);
+        expiring.insert("a", 1);
+        assert_eq!(expiring.get(&"a"), None);
+        expiring.insert("b", 2);
+        expiring.insert("c", 3);
+        assert_eq!(expiring.entries.len(), 1);
     }
 
     #[test]
