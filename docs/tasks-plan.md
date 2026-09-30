@@ -713,12 +713,16 @@ Deliverables:
     `~strike~`.
   - Inline and fenced code are preserved, and their contents are never
     rewritten.
-  - Links to `<url|label>`, and bare URLs are left alone.
+  - Links to `<url|label>`. Bare `http(s)` URLs get explicit `<url>`
+    bounds, as in qm-core, so Slack doesn't pull neighboring marks into them
+    (see [impl-notes](impl-notes.md#bare-urls-get-explicit-bounds)).
   - Lists to `•` and `1.` lines, with two spaces of indent per nesting level.
   - Blockquotes to `>`.
   - Tables to aligned plain text inside a fenced code block.
   - Images to links.
-- Escapes `&`, `<` and `>` outside code, as Slack requires.
+- Escapes `&`, `<` and `>` everywhere, including inside code, as Slack
+  requires (see
+  [impl-notes](impl-notes.md#escaping-applies-inside-code-too)).
 - `@Name` (outside code) becomes `<@U…>` when `directory` resolves it and is
   left as text when it doesn't.
 - Neutralizes mass mentions. `@here`, `@channel` and `@everyone`, and literal
