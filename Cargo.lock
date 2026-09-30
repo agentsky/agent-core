@@ -636,7 +636,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "wiremock",
 ]
@@ -1907,6 +1906,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sqlx",
  "store",
  "testkit",
  "thiserror",
@@ -1914,7 +1914,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2679,6 +2678,8 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]

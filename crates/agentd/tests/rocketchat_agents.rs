@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use agentd::server::{Routers, Server};
 use agentd::{App, Config};
-use core_types::{MemberId, MemberKey, SurfaceKind};
+use core_types::{ConvKind, ConvRef, MemberId, MemberKey, ScopeKey, SurfaceKind, ThreadKey};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentState, BindingState, NewClaudeLink};
@@ -747,5 +747,99 @@ async fn create_in_a_channel_invites_the_bot_there() {
     );
     let bot = chat.fake.user("helper").unwrap();
     assert!(chat.fake.members("GENERAL").contains(&bot.id));
+    running.stop().await;
+}
+
+/// Seeds a session of `agent` in `room`'s thread `root` (the room's own
+/// session without one) on `scope`, with a finished turn.
+async fn seed_session(
+    running: &Running,
+    agent: core_types::AgentId,
+    room: &str,
+    root: Option<&str>,
+    scope: Option<ScopeKey>,
+) -> core_types::SessionId {
+    let conv = ConvRef {
+        surface: SurfaceKind::RocketChat,
+        team: TEAM.into(),
+        conversation: room.into(),
+    };
+    let scope =
+        scope.unwrap_or_else(|| ScopeKey::for_conversation(ConvKind::Channel, conv.clone()));
+    let thread = ThreadKey {
+        conv,
+        root: root.map(Into::into),
+    };
+    let store = running.app.store();
+    let session = store
+        .session_for_thread(agent, &thread, &scope, OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .session;
+    store
+        .record_session_turn(session.id, true, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    session.id
+}
+
+#[tokio::test]
+async fn session_commands_work_as_agent_in_a_room_only_the_agents_bot_is_in() {
+    let chat = Chat::start().await;
+    chat.fake.add_room("AGENTS", "c", "agents");
+    chat.fake.add_member("AGENTS", &chat.alice);
+    chat.fake.remove_member("AGENTS", FakeRest::MANAGER_ID);
+    chat.fake.add_room("SECRET", "p", "secret");
+    chat.fake.remove_member("SECRET", FakeRest::MANAGER_ID);
+    chat.fake.add_room("STAFF", "p", "staff");
+    let running = Running::start(&chat, "sqlite::memory:").await;
+    running.link(&chat.alice).await;
+    let helper = chat.create(&running, "alice", "helper").await;
+    chat.join(&helper, "AGENTS").await;
+    let agent = running.agent(&chat.alice, "helper").await.unwrap().id;
+    let general = seed_session(&running, agent, "GENERAL", Some("R1"), None).await;
+    let agents = seed_session(&running, agent, "AGENTS", Some("R2"), None).await;
+    let dm = seed_session(&running, agent, "HELPER-DM", None, Some(ScopeKey::Private)).await;
+    let secret = seed_session(&running, agent, "SECRET", Some("R3"), None).await;
+    let staff = seed_session(&running, agent, "STAFF", Some("R4"), None).await;
+    let mut manager_dm = [FakeRest::MANAGER_ID.to_owned(), chat.alice.clone()];
+    manager_dm.sort();
+    let manager_dm = manager_dm.concat();
+
+    chat.say("alice", "AGENTS", "!agent sessions helper", json!({}));
+    let listed = chat.wait_for_posts(&manager_dm, 1).await.remove(0);
+    let uri = chat.fake.uri();
+    for link in [
+        format!("{uri}/channel/general/thread/R1"),
+        format!("{uri}/channel/agents/thread/R2"),
+        format!("{uri}/direct/HELPER-DM"),
+    ] {
+        assert!(listed.contains(&link), "{link} in {listed}");
+    }
+    assert_eq!(
+        listed.lines().filter(|line| line.contains(&uri)).count(),
+        3,
+        "no private group has a link, the manager in it or not: {listed}"
+    );
+    assert!(!listed.contains("staff"), "{listed}");
+    assert!(listed.contains("`!agent reset helper here`"), "{listed}");
+
+    chat.say("alice", "AGENTS", "!agent reset helper here", json!({}));
+    let reply = chat.wait_for_posts(&manager_dm, 2).await.remove(1);
+    assert_eq!(
+        reply,
+        "Resetting `helper`'s session here: the next message in it starts a new conversation. \
+         If it is running a turn, it resets once that turn ends. If it can't be reset, I'll \
+         tell you in a direct message."
+    );
+    let store = running.app.store();
+    let reset_at = async |id| store.session(id).await.unwrap().unwrap().reset_at;
+    assert!(reset_at(agents).await.is_some());
+    for id in [general, dm, secret, staff] {
+        assert!(reset_at(id).await.is_none());
+    }
+    for room in ["GENERAL", "AGENTS", "SECRET"] {
+        assert!(chat.posted(room).await.is_empty(), "{room}");
+    }
     running.stop().await;
 }

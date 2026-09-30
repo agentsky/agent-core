@@ -38,6 +38,7 @@ use std::time::Duration;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 
 mod agents;
 mod claude_links;
@@ -66,7 +67,7 @@ pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
-pub use sessions::{Session, SessionKind, ThreadSession};
+pub use sessions::{RESETS_AT_ONCE, Session, SessionKind, ThreadSession};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
@@ -124,6 +125,7 @@ pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 pub struct Store {
     pool: SqlitePool,
     sealer: Arc<Sealer>,
+    resets: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for Store {
@@ -185,6 +187,7 @@ impl Store {
         Ok(Self {
             pool,
             sealer: Arc::new(sealer),
+            resets: Arc::new(Semaphore::new(RESETS_AT_ONCE)),
         })
     }
 

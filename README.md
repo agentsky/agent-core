@@ -117,6 +117,11 @@ turn ran on hits its usage limit or is refused, the thread is told whose it
 was, and the member who asked gets a direct message from the manager bot,
 at most once an hour for each kind of failure. Without `[sandbox]`, each agent reacts
 with :eyes: to messages that mention it.
+The owner lists an agent's sessions with `sessions <name>` (where each is,
+its last turn, and whether its container is warm), and starts them over
+with `reset <name>`, or only the ones of one conversation with
+`!agent reset <name> here` sent there; a reset stops the session's warm
+container once its running turn ends.
 Community admins are the member identities `[community] admins` lists, as
 `<surface>:<team>:<user>`. An admin sets the community API key with
 `admin api-key set <key>` in the manager bot's direct message (or with

@@ -42,7 +42,7 @@ fn persona_problem(persona: &str) -> Option<String> {
     }
 }
 
-fn no_such_agent(name: &str) -> String {
+pub(super) fn no_such_agent(name: &str) -> String {
     format!("You have no agent named `{name}`. Only an agent's owner can change it.")
 }
 
@@ -56,7 +56,11 @@ impl Commands {
     }
 
     /// `member`'s agent named `name`, if they have one.
-    async fn own_agent(&self, member: &MemberKey, name: &str) -> Result<Option<Agent>, Failure> {
+    pub(super) async fn own_agent(
+        &self,
+        member: &MemberKey,
+        name: &str,
+    ) -> Result<Option<Agent>, Failure> {
         let Some(owner) = self.member(member).await? else {
             return Ok(None);
         };
