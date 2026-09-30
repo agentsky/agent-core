@@ -9,9 +9,10 @@
 #
 # Documentation is any Markdown file and any file named LICENSE, except
 # under crates/, where Markdown files are runtime assets (personas,
-# skills) that tests read. Both commits must be present locally. The README is also the crate's rustdoc
-# (src/lib.rs includes it), so CI still runs the doctests and rustdoc for
-# a docs-only change; see the `docs` job in .github/workflows/ci.yml.
+# skills) that tests read. Both commits must be present locally. The
+# README is also the crate's rustdoc (src/lib.rs includes it), so CI
+# still runs the doctests and rustdoc for a docs-only change; see the
+# `docs` job in .github/workflows/ci.yml.
 set -eu
 
 base=${1:?base commit}

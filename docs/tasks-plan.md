@@ -51,9 +51,13 @@ These close questions the design leaves open, so that parallel tasks agree.
   resolver = "3"
   ```
 
-  `default-members` makes plain `cargo test`, `cargo clippy` and
-  `cargo coverage` at the root cover every crate, so the existing CI commands
-  keep working without `--workspace`.
+  `default-members` makes plain `cargo test` and `cargo clippy` at the root
+  cover every crate, so the existing CI commands keep working without
+  `--workspace`. `cargo llvm-cov` ignores `default-members`, so the `coverage`
+  alias passes `--workspace` itself
+  ([impl-notes](impl-notes.md#cargo-llvm-cov-ignores-default-members)).
+- CI runs cargo with `--locked`, so a stale `Cargo.lock` fails instead of
+  being re-resolved on the runner.
 - Crates live in `crates/<name>/`, with the package name equal to the directory
   name. All crates set `publish = false`.
 - Shared metadata (`edition`, `rust-version`, `license-file`) and every
@@ -240,6 +244,11 @@ description, and must pass T02's policy.
 
 ### Testing
 
+- The workspace forbids `unsafe`, and in edition 2024 `std::env::set_var` is
+  unsafe. Code that reads the environment (configuration overrides, the
+  runner's launch environment) takes it as an injected map or iterator, so
+  tests pass their own instead of mutating the process. Process groups for
+  reaping use the safe `CommandExt::process_group`, not `pre_exec`.
 - Tests never touch the network or a real Docker daemon by default. HTTP peers
   are `wiremock` servers or fakes from `testkit`.
 - `testkit` ships a `fake-claude` binary. It accepts the design's launch flags,
@@ -507,18 +516,25 @@ Deliverables:
 - `deny.toml` with these sections:
   - `[bans]` denies `openssl`, `openssl-sys` and `native-tls`, and warns on
     duplicate versions.
-  - `[licenses]` allows the permissive licenses the lockfile actually needs
-    (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unicode-3.0, Zlib, and
-    CDLA-Permissive-2.0 if `webpki-roots` is pulled in), and `OpenSSL` as a
-    per-crate exception for `aws-lc-sys`. GPL, LGPL and AGPL
-    are denied. A weak-copyleft license such as MPL-2.0 is allowed only as a
-    per-crate exception with a reason. `[licenses.private] ignore = true`,
-    because the workspace crates carry only `license-file`.
-  - `[advisories]` denies vulnerabilities and warns on unmaintained crates.
+  - `[licenses]` allows the permissive licenses that
+    `[workspace.dependencies]` actually needs: MIT, Apache-2.0,
+    BSD-3-Clause, ISC, Unicode-3.0, Zlib, and CDLA-Permissive-2.0 (for
+    `webpki-root-certs`). `aws-lc-sys` no longer needs an `OpenSSL`
+    exception; see
+    [impl-notes](impl-notes.md#aws-lc-sys-no-longer-needs-an-openssl-exception).
+    GPL, LGPL and AGPL are denied. A weak-copyleft license such as MPL-2.0 is
+    allowed only as a per-crate exception with a reason.
+    `[licenses.private] ignore = true`, because the workspace crates carry
+    only `license-file`.
+  - `[advisories]` denies vulnerabilities and warns on unmaintained crates
+    (the latter through `-W unmaintained` on the command line; see
+    [impl-notes](impl-notes.md#cargo-deny-020-has-no-warning-level-for-unmaintained-crates)).
   - `[sources]` allows crates.io only.
 - A `deny` job in `.github/workflows/ci.yml`, using
-  `EmbarkStudios/cargo-deny-action` pinned to a major version. It runs when
-  code changed and is added to `ci-passed`'s `needs`.
+  `EmbarkStudios/cargo-deny-action` pinned to a major version, run with
+  `--workspace` (see
+  [impl-notes](impl-notes.md#cargo-deny-checks-only-the-root-package-by-default)).
+  It runs when code changed and is added to `ci-passed`'s `needs`.
 - A README line naming the policy.
 
 Acceptance: the job passes on `main`'s lockfile. A throwaway local commit that

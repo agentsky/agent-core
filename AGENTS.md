@@ -17,11 +17,15 @@ sections it links to, and the plan's "Decisions" and "Definition of done"
 before starting.
 
 - The root package keeps `README.md` as its rustdoc. Every other crate lives
-  in `crates/<name>/`, and the workspace's `default-members` makes plain
-  `cargo test`, `cargo clippy` and `cargo coverage` cover all of them.
+  in `crates/<name>/`. The workspace's `default-members` makes plain
+  `cargo test` and `cargo clippy` cover all of them, and the `cargo coverage`
+  alias passes `--workspace` because `cargo llvm-cov` ignores
+  `default-members`.
 - Third-party dependency versions live only in the root `Cargo.toml` under
-  `[workspace.dependencies]`. Crates use `workspace = true` and add features
-  there.
+  `[workspace.dependencies]`. Crates use `workspace = true` and add extra
+  features in their own `Cargo.toml`.
+- `Cargo.lock` is committed and CI builds with `--locked`. Commit lockfile
+  changes with the change that causes them.
 - `testkit` is only ever a dev-dependency.
 - `core-types` does no I/O.
 - Surface crates (`surface-slack`, `surface-rocketchat`) never depend on each

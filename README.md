@@ -15,7 +15,7 @@ cargo test --all-features
 cargo coverage
 ```
 
-The repository is a Cargo workspace: the crates live in `crates/`, and plain
+It needs Rust 1.98.1 or newer (`rust-version` in `Cargo.toml`). The repository is a Cargo workspace: the crates live in `crates/`, and plain
 `cargo` commands at the root cover all of them. The work is planned in
 [`docs/tasks-plan.md`](docs/tasks-plan.md), which implements
 [`docs/design.md`](docs/design.md). Unexpected issues met along the way and
@@ -33,6 +33,13 @@ on pushes to `main` and on pull requests, plus a `cargo check` on the minimum
 supported Rust version declared in `Cargo.toml`. The formatting, lint, test
 and doc checks run on both x86_64 and aarch64 Linux. Dependabot keeps actions
 and crates up to date.
+
+The `deny` job enforces the dependency policy in `deny.toml` with
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny): no OpenSSL or
+`native-tls`, only the permissive licenses listed there, no crate with a
+known vulnerability (unmaintained crates only warn), and crates.io as the only
+source. Run it locally with `cargo install cargo-deny --locked` and
+`cargo deny --workspace --locked check -W unmaintained`.
 
 A change that touches only documentation (Markdown files and `LICENSE`, as
 decided by `scripts/ci/docs-only.sh`) skips the build and test jobs and runs
