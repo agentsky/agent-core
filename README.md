@@ -49,7 +49,8 @@ listeners must be inside `internal.sandbox_subnet`.
 HTTPS tunnels to through the proxy listener. It is empty by default, and
 `api.anthropic.com`, IP addresses, and hosts that resolve to loopback,
 link-local (cloud metadata), agentd's or private addresses are refused
-whatever it says; `[proxy] allow_private` opens chosen private subnets.
+whatever it says. `max_tunnels` and `max_session_tunnels` cap the open
+tunnels in all and per sandbox.
 `GET /healthz` on the public listener answers 200 while the database does.
 It also serves Slack's request URLs, `/slack/b/<binding>/events`,
 `…/interactivity` and `…/commands`; the manager app's binding is `manager`,

@@ -1,5 +1,6 @@
 //! [`EgressProxy`]: `CONNECT` tunnels from sandboxes to allowlisted hosts.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -19,12 +20,10 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::time::Instant;
 
-use crate::allowlist::{
-    ANTHROPIC_API_HOST, EgressPolicy, HostRule, Unreachable, normalize_host, parse_port,
-};
+use crate::allowlist::{ANTHROPIC_API_HOST, EgressPolicy, HostRule, normalize_host, parse_port};
 use crate::proxy::CONNECT_TIMEOUT;
 use crate::registry::Registry;
 
@@ -50,13 +49,50 @@ pub const EGRESS_ENV: [(&str, &str); 6] = [
     ("no_proxy", NO_PROXY),
 ];
 
-/// How long resolving a host may take.
-pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The egress proxy's caps and timeouts, given to
+/// [`EgressProxy::with_limits`]. [`Default`] gives the value each field
+/// names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressLimits {
+    /// Open tunnels across all sessions, counting `CONNECT`s still being
+    /// checked: 256. Past it, a `CONNECT` is refused with 503 before its
+    /// host is looked up.
+    pub max_tunnels: usize,
+    /// The same for one session: 32. Past it, the session's `CONNECT`s
+    /// are refused with 429.
+    pub max_session_tunnels: usize,
+    /// Host lookups running at once: 32. A lookup holds its place until the
+    /// resolver returns, even after [`resolve_timeout`](Self::resolve_timeout)
+    /// has refused its `CONNECT`, since the system resolver blocks a thread
+    /// and can't be cancelled. A `CONNECT` that finds no place within
+    /// `resolve_timeout` is refused with 503.
+    pub max_lookups: usize,
+    /// How long looking a host up may take, waiting for a place included:
+    /// 5 seconds.
+    pub resolve_timeout: Duration,
+    /// How long the [`EgressExtension`] may take to answer: 2 seconds.
+    /// Past it, the `CONNECT` is refused with 503.
+    pub extension_timeout: Duration,
+    /// How long a tunnel may go without a byte in either direction before
+    /// the proxy closes it: 5 minutes.
+    pub idle_timeout: Duration,
+    /// How long a tunnel may stay open, busy or not: 1 hour.
+    pub tunnel_lifetime: Duration,
+}
 
-/// How long a tunnel may go without a byte in either direction before the
-/// proxy closes it, unless [`EgressProxy::with_idle_timeout`] says
-/// otherwise.
-pub const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+impl Default for EgressLimits {
+    fn default() -> Self {
+        Self {
+            max_tunnels: 256,
+            max_session_tunnels: 32,
+            max_lookups: 32,
+            resolve_timeout: Duration::from_secs(5),
+            extension_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(300),
+            tunnel_lifetime: Duration::from_secs(3600),
+        }
+    }
+}
 
 /// Extra hosts for one session's sandbox, on top of the configured
 /// allowlist: the extension point for hosts an agent's skills declare
@@ -67,7 +103,8 @@ pub const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 #[async_trait]
 pub trait EgressExtension: Send + Sync {
     /// The extra rules for `session`'s agent. On failure it returns none,
-    /// so a lookup that fails denies rather than allows.
+    /// so a lookup that fails denies rather than allows. The proxy waits
+    /// [`EgressLimits::extension_timeout`] for it.
     async fn rules(&self, session: SessionId) -> Vec<HostRule>;
 }
 
@@ -121,28 +158,39 @@ impl Network for SystemNetwork {
 /// 2. Takes the target from the request line only, never from `Host`: an
 ///    authority-form `host:port` over HTTP/1, with no user info. IP
 ///    addresses are refused, so every tunnel goes to a named host.
-/// 3. Refuses [`ANTHROPIC_API_HOST`], then any host and port no rule
-///    allows: the [`EgressPolicy`]'s, then the [`EgressExtension`]'s for
-///    the session.
-/// 4. Resolves the host and refuses it if any address it resolves to is
-///    unreachable under the policy, so a name rebound to the metadata
-///    address or a private network is refused.
-/// 5. Connects to the addresses it checked, never to the name, so a second
+/// 3. Refuses [`ANTHROPIC_API_HOST`], then takes a tunnel place, refusing
+///    the `CONNECT` if the session or the proxy has
+///    [`max_session_tunnels`](EgressLimits::max_session_tunnels) or
+///    [`max_tunnels`](EgressLimits::max_tunnels) already.
+/// 4. Refuses any host and port no rule allows: the [`EgressPolicy`]'s,
+///    then the [`EgressExtension`]'s for the session.
+/// 5. Resolves the host, at most
+///    [`max_lookups`](EgressLimits::max_lookups) at a time, and refuses it
+///    if any address it resolves to is unreachable under the policy, so a
+///    name rebound to the metadata address or a private network is
+///    refused.
+/// 6. Connects to the addresses it checked, never to the name, so a second
 ///    resolution can't change where the tunnel goes, answers 200, and
 ///    copies bytes both ways without looking at them (no TLS
-///    interception). A tunnel closes when either side does, after
-///    [`TUNNEL_IDLE_TIMEOUT`] without traffic, or when the proxy is
-///    dropped.
+///    interception).
 ///
-/// A refusal is a 403 (502 if the host can't be resolved or reached) with
-/// a one-line plain-text reason of fixed text, and is logged with the
-/// session. Log lines name the host only once it is known to be a valid
-/// host name, and never the request line.
+/// A tunnel keeps its place until it closes: when either side does, after
+/// [`idle_timeout`](EgressLimits::idle_timeout) without traffic, after
+/// [`tunnel_lifetime`](EgressLimits::tunnel_lifetime), when its session
+/// has no live placeholder left (as after [`Registry::revoke_session`]),
+/// or when the proxy is dropped.
+///
+/// A refusal is a 403 (429 or 503 when a cap is reached, 502 if the host
+/// can't be resolved or reached) with a one-line plain-text reason of fixed
+/// text, and is logged with the session. Log lines name the host only once
+/// it is known to be a valid host name, and never the request line.
 pub struct EgressProxy {
     policy: EgressPolicy,
     network: Arc<dyn Network>,
     extension: Option<Arc<dyn EgressExtension>>,
-    idle_timeout: Duration,
+    limits: EgressLimits,
+    slots: Arc<Mutex<Slots>>,
+    lookups: Arc<Semaphore>,
     closing: watch::Sender<()>,
 }
 
@@ -151,19 +199,23 @@ impl fmt::Debug for EgressProxy {
         f.debug_struct("EgressProxy")
             .field("policy", &self.policy)
             .field("extension", &self.extension.is_some())
-            .field("idle_timeout", &self.idle_timeout)
+            .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
 }
 
 impl EgressProxy {
-    /// An egress proxy enforcing `policy` over the [`SystemNetwork`].
+    /// An egress proxy enforcing `policy` over the [`SystemNetwork`], with
+    /// the default [`EgressLimits`].
     pub fn new(policy: EgressPolicy) -> Self {
+        let limits = EgressLimits::default();
         Self {
             policy,
             network: Arc::new(SystemNetwork),
             extension: None,
-            idle_timeout: TUNNEL_IDLE_TIMEOUT,
+            limits,
+            slots: Arc::default(),
+            lookups: Arc::new(Semaphore::new(limits.max_lookups)),
             closing: watch::Sender::new(()),
         }
     }
@@ -180,11 +232,21 @@ impl EgressProxy {
         self
     }
 
-    /// Closes tunnels after `timeout` without traffic instead of
-    /// [`TUNNEL_IDLE_TIMEOUT`].
-    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
+    /// Uses `limits` instead of the defaults.
+    pub fn with_limits(mut self, limits: EgressLimits) -> Self {
+        self.lookups = Arc::new(Semaphore::new(limits.max_lookups));
+        self.limits = limits;
         self
+    }
+
+    /// The policy it enforces.
+    pub fn policy(&self) -> &EgressPolicy {
+        &self.policy
+    }
+
+    /// Its caps and timeouts.
+    pub fn limits(&self) -> EgressLimits {
+        self.limits
     }
 
     /// Answers a `CONNECT` from `peer`.
@@ -194,11 +256,11 @@ impl EgressProxy {
         peer: IpAddr,
         request: Request,
     ) -> Response {
-        let Some(session) = registry.session_at(peer) else {
+        let Some((session, revoked)) = registry.watch_source(peer) else {
             tracing::warn!(%peer, reason = Why::UnknownSource.reason(), "the egress proxy refused a CONNECT");
             return Why::UnknownSource.into_response();
         };
-        match self.open(session, request).await {
+        match self.open(session, revoked, request).await {
             Ok(response) => response,
             Err(Refused {
                 why,
@@ -219,7 +281,12 @@ impl EgressProxy {
         }
     }
 
-    async fn open(&self, session: SessionId, mut request: Request) -> Result<Response, Refused> {
+    async fn open(
+        &self,
+        session: SessionId,
+        revoked: watch::Receiver<()>,
+        mut request: Request,
+    ) -> Result<Response, Refused> {
         if !matches!(request.version(), Version::HTTP_10 | Version::HTTP_11) {
             return Err(Refused::new(Why::Version, None));
         }
@@ -228,17 +295,9 @@ impl EgressProxy {
         if target.host == ANTHROPIC_API_HOST {
             return Err(refuse(Why::Anthropic));
         }
+        let slot = self.take_slot(session).map_err(refuse)?;
         self.allowed(session, &target).await.map_err(refuse)?;
-        let resolved = tokio::time::timeout(
-            RESOLVE_TIMEOUT,
-            self.network.resolve(&target.host, target.port),
-        )
-        .await;
-        let mut addresses = match resolved {
-            Ok(Ok(addresses)) if !addresses.is_empty() => addresses,
-            _ => return Err(refuse(Why::Resolve)),
-        };
-        addresses.dedup();
+        let addresses = self.resolve(&target).await.map_err(refuse)?;
         if let Some((address, why)) = addresses
             .iter()
             .find_map(|&ip| self.policy.unreachable(ip).map(|why| (ip, why)))
@@ -252,6 +311,9 @@ impl EgressProxy {
             .dial(&addresses, target.port)
             .await
             .ok_or_else(|| refuse(Why::Connect))?;
+        if revoked.has_changed().is_err() {
+            return Err(refuse(Why::UnknownSource));
+        }
         tracing::debug!(
             %session,
             host = target.host.as_str(),
@@ -263,12 +325,34 @@ impl EgressProxy {
         tokio::spawn(tunnel(
             upgrade,
             upstream,
-            self.closing.subscribe(),
-            self.idle_timeout,
-            session,
+            Closers {
+                proxy: self.closing.subscribe(),
+                session: revoked,
+            },
+            self.limits,
+            slot,
             target,
         ));
         Ok(StatusCode::OK.into_response())
+    }
+
+    /// A tunnel place for `session`, held until the `CONNECT` is refused
+    /// or its tunnel closes.
+    fn take_slot(&self, session: SessionId) -> Result<Slot, Why> {
+        let mut slots = lock(&self.slots);
+        let open = slots.sessions.get(&session).copied().unwrap_or(0);
+        if open >= self.limits.max_session_tunnels {
+            return Err(Why::SessionFull);
+        }
+        if slots.total >= self.limits.max_tunnels {
+            return Err(Why::ProxyFull);
+        }
+        slots.sessions.insert(session, open + 1);
+        slots.total += 1;
+        Ok(Slot {
+            slots: Arc::clone(&self.slots),
+            session,
+        })
     }
 
     /// Whether a rule allows `target`: `Err(Port)` when a rule names the
@@ -280,7 +364,11 @@ impl EgressProxy {
             return Ok(());
         }
         let extra = match &self.extension {
-            Some(extension) => extension.rules(session).await,
+            Some(extension) => {
+                tokio::time::timeout(self.limits.extension_timeout, extension.rules(session))
+                    .await
+                    .map_err(|_| Why::Extension)?
+            }
             None => Vec::new(),
         };
         let rules = || self.policy.rules().iter().chain(&extra);
@@ -290,6 +378,31 @@ impl EgressProxy {
             Err(Why::Port)
         } else {
             Err(Why::NotAllowed)
+        }
+    }
+
+    /// The addresses `target`'s host resolves to, once a lookup place is
+    /// free. The lookup runs in a task of its own that keeps the place
+    /// until the resolver returns, so lookups the timeout gave up on still
+    /// count.
+    async fn resolve(&self, target: &Target) -> Result<Vec<IpAddr>, Why> {
+        let deadline = Instant::now() + self.limits.resolve_timeout;
+        let permit = tokio::time::timeout_at(deadline, Arc::clone(&self.lookups).acquire_owned())
+            .await
+            .map_err(|_| Why::Busy)?
+            .map_err(|_| Why::Busy)?;
+        let network = Arc::clone(&self.network);
+        let (host, port) = (target.host.clone(), target.port);
+        let lookup = tokio::spawn(async move {
+            let _permit = permit;
+            network.resolve(&host, port).await
+        });
+        match tokio::time::timeout_at(deadline, lookup).await {
+            Ok(Ok(Ok(mut addresses))) if !addresses.is_empty() => {
+                addresses.dedup();
+                Ok(addresses)
+            }
+            _ => Err(Why::Resolve),
         }
     }
 
@@ -378,9 +491,13 @@ enum Why {
     Target,
     IpLiteral,
     Anthropic,
+    SessionFull,
+    ProxyFull,
+    Extension,
     NotAllowed,
     Port,
-    Address(Unreachable),
+    Busy,
+    Address(&'static str),
     Resolve,
     Connect,
 }
@@ -394,9 +511,13 @@ impl Why {
             Self::Target => "invalid target",
             Self::IpLiteral => "IP address target",
             Self::Anthropic => "api.anthropic.com",
+            Self::SessionFull => "session tunnel cap reached",
+            Self::ProxyFull => "tunnel cap reached",
+            Self::Extension => "allowlist extension timed out",
             Self::NotAllowed => "host not allowed",
             Self::Port => "port not allowed",
-            Self::Address(why) => why.describe(),
+            Self::Busy => "lookup cap reached",
+            Self::Address(why) => why,
             Self::Resolve => "resolution failed",
             Self::Connect => "connection failed",
         }
@@ -417,8 +538,24 @@ impl Why {
                 forbidden,
                 "api.anthropic.com is always denied; the CLI reaches it through ANTHROPIC_BASE_URL.",
             ),
+            Self::SessionFull => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "This sandbox has too many open tunnels.",
+            ),
+            Self::ProxyFull => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The egress proxy has too many open tunnels.",
+            ),
+            Self::Extension => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The session's allowlist could not be loaded.",
+            ),
             Self::NotAllowed => (forbidden, "The host is not in the egress allowlist."),
             Self::Port => (forbidden, "The port is not allowed for this host."),
+            Self::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The egress proxy is busy looking up hosts.",
+            ),
             Self::Address(_) => (
                 forbidden,
                 "The host resolves to an address sandboxes may not reach.",
@@ -444,43 +581,85 @@ impl IntoResponse for Why {
     }
 }
 
-/// Copies bytes between the upgraded client connection and `upstream`
-/// until either closes, neither sends for `idle`, or `closing` ends.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The tunnel places taken, in all and per session.
+#[derive(Default)]
+struct Slots {
+    total: usize,
+    sessions: HashMap<SessionId, usize>,
+}
+
+/// One tunnel place, given back when dropped.
+struct Slot {
+    slots: Arc<Mutex<Slots>>,
+    session: SessionId,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut slots = lock(&self.slots);
+        slots.total -= 1;
+        if let Some(open) = slots.sessions.get_mut(&self.session) {
+            *open -= 1;
+            if *open == 0 {
+                slots.sessions.remove(&self.session);
+            }
+        }
+    }
+}
+
+/// What closes a tunnel from outside: receivers whose senders are dropped
+/// when the proxy is, and when the session has no live placeholder left.
+struct Closers {
+    proxy: watch::Receiver<()>,
+    session: watch::Receiver<()>,
+}
+
+/// Runs a tunnel until it closes, within `limits`, holding `slot`.
 async fn tunnel(
     upgrade: OnUpgrade,
-    mut upstream: TcpStream,
-    mut closing: watch::Receiver<()>,
-    idle: Duration,
-    session: SessionId,
+    upstream: TcpStream,
+    mut closers: Closers,
+    limits: EgressLimits,
+    slot: Slot,
     target: Target,
 ) {
-    let client = match upgrade.await {
-        Ok(client) => client,
-        Err(err) => {
-            tracing::debug!(%session, error = %err, "a CONNECT was never upgraded");
-            return;
-        }
+    let outcome = tokio::select! {
+        outcome = relay(upgrade, upstream, limits.idle_timeout) => outcome,
+        () = tokio::time::sleep(limits.tunnel_lifetime) => "lifetime reached",
+        _ = closers.proxy.changed() => "proxy stopped",
+        _ = closers.session.changed() => "session revoked",
+    };
+    tracing::debug!(
+        session = %slot.session,
+        host = target.host.as_str(),
+        port = target.port,
+        outcome,
+        "an egress tunnel ended"
+    );
+}
+
+/// Copies bytes between the upgraded client connection and `upstream`
+/// until either closes or neither sends for `idle`.
+async fn relay(upgrade: OnUpgrade, mut upstream: TcpStream, idle: Duration) -> &'static str {
+    let Ok(client) = upgrade.await else {
+        return "never upgraded";
     };
     let activity = Activity::default();
     let mut client = Watched {
         inner: TokioIo::new(client),
         activity: activity.clone(),
     };
-    let outcome = tokio::select! {
+    tokio::select! {
         copied = tokio::io::copy_bidirectional(&mut client, &mut upstream) => match copied {
             Ok(_) => "closed",
             Err(_) => "failed",
         },
         () = activity.idle(idle) => "idle",
-        _ = closing.changed() => "proxy stopped",
-    };
-    tracing::debug!(
-        %session,
-        host = target.host.as_str(),
-        port = target.port,
-        outcome,
-        "an egress tunnel ended"
-    );
+    }
 }
 
 /// When a tunnel last moved a byte.
@@ -495,13 +674,13 @@ impl Default for Activity {
 
 impl Activity {
     fn touch(&self) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        *lock(&self.0) = Instant::now();
     }
 
     /// Completes once nothing has moved for `idle`.
     async fn idle(&self, idle: Duration) {
         loop {
-            let deadline = *self.0.lock().unwrap_or_else(PoisonError::into_inner) + idle;
+            let deadline = *lock(&self.0) + idle;
             if Instant::now() >= deadline {
                 return;
             }
@@ -628,9 +807,13 @@ mod tests {
             Why::Target,
             Why::IpLiteral,
             Why::Anthropic,
+            Why::SessionFull,
+            Why::ProxyFull,
+            Why::Extension,
             Why::NotAllowed,
             Why::Port,
-            Why::Address(Unreachable::Own),
+            Why::Busy,
+            Why::Address("private address"),
             Why::Resolve,
             Why::Connect,
         ];
@@ -638,10 +821,11 @@ mod tests {
             assert!(!why.reason().is_empty());
             let (status, line) = why.answer();
             assert!(line.ends_with('.') && !line.contains('\n'), "{line}");
-            let expected = if matches!(why, Why::Resolve | Why::Connect) {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::FORBIDDEN
+            let expected = match why {
+                Why::Resolve | Why::Connect => StatusCode::BAD_GATEWAY,
+                Why::SessionFull => StatusCode::TOO_MANY_REQUESTS,
+                Why::ProxyFull | Why::Extension | Why::Busy => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::FORBIDDEN,
             };
             assert_eq!(status, expected, "{why:?}");
             let response = why.into_response();
@@ -651,10 +835,7 @@ mod tests {
                 "text/plain; charset=utf-8"
             );
         }
-        assert_eq!(
-            Why::Address(Unreachable::Private).reason(),
-            "private address"
-        );
+        assert_eq!(Why::Address("private address").reason(), "private address");
     }
 
     #[tokio::test(start_paused = true)]

@@ -140,12 +140,7 @@ async fn docker_a_sandbox_clones_from_an_allowed_host_only() {
     let subnet = ipam.subnet.unwrap().parse().unwrap();
 
     let registry = Registry::new();
-    let policy = EgressPolicy::new(
-        vec!["github.com".parse().unwrap()],
-        Vec::new(),
-        vec![subnet],
-    )
-    .unwrap();
+    let policy = EgressPolicy::new(vec!["github.com".parse().unwrap()], vec![subnet]);
     let router = CredProxy::new(
         "http://127.0.0.1:9",
         registry.clone(),

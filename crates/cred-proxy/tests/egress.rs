@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use auth::{AuthError, TokenSource};
 use core_types::{CredentialKind, CredentialRef, MemberId, SessionId};
 use cred_proxy::{
-    CredProxy, EGRESS_ENV, EgressExtension, EgressPolicy, EgressProxy, FixedKey, HostRule, Network,
-    Registry,
+    CredProxy, EGRESS_ENV, EgressExtension, EgressLimits, EgressPolicy, EgressProxy, FixedKey,
+    HostRule, Network, Registry,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 use testkit::fake_anthropic;
@@ -26,6 +26,7 @@ use tracing_subscriber::fmt::MakeWriter;
 const LOCAL: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const LOCAL_2: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 const STRANGER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+const LOCAL_3: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 6));
 const PUBLIC: IpAddr = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3));
 const PUBLIC_2: IpAddr = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 4));
 const WAIT: Duration = Duration::from_secs(10);
@@ -66,6 +67,9 @@ impl FakeNetwork {
 impl Network for FakeNetwork {
     async fn resolve(&self, host: &str, _port: u16) -> io::Result<Vec<IpAddr>> {
         lock(&self.resolved).push(host.to_owned());
+        if host == HANGS {
+            std::future::pending::<()>().await;
+        }
         lock(&self.answers)
             .get(host)
             .cloned()
@@ -81,6 +85,9 @@ impl Network for FakeNetwork {
         }
     }
 }
+
+/// A host whose lookup never returns, as when the resolver hangs.
+const HANGS: &str = "hangs.example.org";
 
 /// Extra rules for one session only.
 struct ForSession(SessionId, Vec<HostRule>);
@@ -110,12 +117,14 @@ fn rules(texts: &[&str]) -> Vec<HostRule> {
 }
 
 fn policy(allow: &[&str]) -> EgressPolicy {
-    EgressPolicy::new(
-        rules(allow),
-        vec!["10.20.0.0/16".parse().unwrap()],
-        vec!["172.30.0.0/24".parse().unwrap()],
-    )
-    .unwrap()
+    EgressPolicy::new(rules(allow), vec!["172.30.0.0/24".parse().unwrap()])
+}
+
+/// The default limits, changed by `change`.
+fn limits(change: impl FnOnce(&mut EgressLimits)) -> EgressLimits {
+    let mut limits = EgressLimits::default();
+    change(&mut limits);
+    limits
 }
 
 /// A running proxy with egress, on a free local port.
@@ -373,7 +382,7 @@ async fn refuses_a_host_not_on_the_allowlist() {
 
 #[tokio::test]
 async fn always_denies_api_anthropic_com() {
-    let policy = policy(&["api.anthropic.com", "*.anthropic.com"]);
+    let policy = policy(&["*.anthropic.com"]);
     let proxy = Proxy::start_with("http://127.0.0.1:9", policy, |egress| egress).await;
     proxy.sandbox(LOCAL);
     proxy.network.answer("api.anthropic.com", &[PUBLIC]);
@@ -404,8 +413,14 @@ async fn refuses_a_rebind_to_the_metadata_address() {
         vec!["::1"],
         vec!["10.1.2.3"],
         vec!["192.168.1.10"],
+        vec!["10.20.9.9"],
         vec!["172.30.0.2"],
         vec!["100.100.100.200"],
+        vec!["192.0.0.192"],
+        vec!["168.63.129.16"],
+        vec!["fd20:ce::254"],
+        vec!["fd00:c1::a9fe:a9fe"],
+        vec!["fd12:3456::9"],
         vec!["64:ff9b::a9fe:a9fe"],
     ] {
         let addresses: Vec<IpAddr> = answer.iter().map(|a| a.parse().unwrap()).collect();
@@ -422,15 +437,32 @@ async fn refuses_a_rebind_to_the_metadata_address() {
     }
     assert!(proxy.network.dialed().is_empty());
     assert_eq!(*lock(&accepted), 0);
+}
 
-    let allowed_private: IpAddr = "10.20.1.1".parse().unwrap();
-    proxy.network.answer("git.example.com", &[allowed_private]);
+#[tokio::test]
+async fn extension_rules_never_reach_private_addresses() {
+    let (echo, accepted) = echo_server().await;
+    let skilled = SessionId::new_v4();
+    let extension = Arc::new(ForSession(skilled, rules(&["evil-skill.example.net:22"])));
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress.with_extension(extension)
+    })
+    .await;
     proxy
-        .network
-        .route(SocketAddr::new(allowed_private, 443), echo);
-    let (mut stream, head) = proxy.connect("git.example.com:443").await;
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    echoes(&mut stream, b"allowed private subnet").await;
+        .registry
+        .mint(skilled, LOCAL, CredentialKind::Subscription)
+        .unwrap();
+    let private: IpAddr = "10.20.9.9".parse().unwrap();
+    proxy.network.answer("evil-skill.example.net", &[private]);
+    proxy.network.route(SocketAddr::new(private, 22), echo);
+    let (status, body) = proxy.refused(LOCAL, "evil-skill.example.net:22").await;
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    assert_eq!(
+        body,
+        "The host resolves to an address sandboxes may not reach.\n"
+    );
+    assert!(proxy.network.dialed().is_empty());
+    assert_eq!(*lock(&accepted), 0);
 }
 
 #[tokio::test]
@@ -543,7 +575,7 @@ async fn extension_rules_apply_to_their_session_only() {
     let skilled = SessionId::new_v4();
     let extension = Arc::new(ForSession(
         skilled,
-        rules(&["skill.example.net", "api.anthropic.com"]),
+        rules(&["skill.example.net", "*.anthropic.com"]),
     ));
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
         egress.with_extension(extension)
@@ -598,7 +630,7 @@ async fn unresolvable_and_unreachable_hosts_are_bad_gateways() {
 async fn tunnels_close_when_idle() {
     let (echo, _) = echo_server().await;
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
-        egress.with_idle_timeout(Duration::from_millis(300))
+        egress.with_limits(limits(|l| l.idle_timeout = Duration::from_millis(300)))
     })
     .await;
     proxy.sandbox(LOCAL);
@@ -625,6 +657,142 @@ async fn tunnels_close_when_the_proxy_is_dropped() {
     echoes(&mut stream, b"open").await;
     drop(proxy);
     closes(&mut stream).await;
+}
+
+/// Opens a tunnel from `ip` to `git.example.com`, which the fake routes to
+/// `echo`, and checks that it works.
+async fn open_tunnel(proxy: &Proxy, ip: IpAddr, echo: SocketAddr) -> TcpStream {
+    proxy.network.answer("git.example.com", &[PUBLIC]);
+    proxy.network.route(SocketAddr::new(PUBLIC, 443), echo);
+    let (mut stream, head) = proxy.connect_from(ip, "git.example.com:443").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    echoes(&mut stream, b"open").await;
+    stream
+}
+
+#[tokio::test]
+async fn caps_open_tunnels_per_session_and_in_all() {
+    let (echo, _) = echo_server().await;
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress.with_limits(limits(|l| {
+            l.max_session_tunnels = 2;
+            l.max_tunnels = 3;
+        }))
+    })
+    .await;
+    proxy.sandbox(LOCAL);
+    proxy.sandbox(LOCAL_2);
+    proxy.sandbox(LOCAL_3);
+    for _ in 0..5 {
+        let (status, _) = proxy.refused(LOCAL, "other.example:443").await;
+        assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    }
+    let first = open_tunnel(&proxy, LOCAL, echo).await;
+    let _second = open_tunnel(&proxy, LOCAL, echo).await;
+    let (status, body) = proxy.refused(LOCAL, "git.example.com:443").await;
+    assert_eq!(status, "HTTP/1.1 429 Too Many Requests");
+    assert_eq!(body, "This sandbox has too many open tunnels.\n");
+    let _third = open_tunnel(&proxy, LOCAL_2, echo).await;
+    let (status, body) = proxy.refused(LOCAL_3, "git.example.com:443").await;
+    assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(body, "The egress proxy has too many open tunnels.\n");
+    assert_eq!(proxy.network.resolved().len(), 3);
+
+    drop(first);
+    let reopened = tokio::time::timeout(WAIT, async {
+        loop {
+            let (stream, head) = proxy.connect_from(LOCAL, "git.example.com:443").await;
+            if head.starts_with("HTTP/1.1 200") {
+                return stream;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let mut reopened = reopened.expect("the closed tunnel's place was never given back");
+    echoes(&mut reopened, b"reopened").await;
+}
+
+#[tokio::test]
+async fn tunnels_close_at_their_lifetime_even_when_busy() {
+    let (echo, _) = echo_server().await;
+    let lifetime = Duration::from_millis(400);
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress.with_limits(limits(|l| l.tunnel_lifetime = lifetime))
+    })
+    .await;
+    proxy.sandbox(LOCAL);
+    let opened = tokio::time::Instant::now();
+    let mut stream = open_tunnel(&proxy, LOCAL, echo).await;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        echoes(&mut stream, b"busy").await;
+    }
+    closes(&mut stream).await;
+    assert!(opened.elapsed() >= lifetime, "{:?}", opened.elapsed());
+}
+
+#[tokio::test]
+async fn revoking_a_session_closes_its_tunnels() {
+    let (echo, _) = echo_server().await;
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| egress).await;
+    let revoked = proxy.sandbox(LOCAL);
+    proxy.sandbox(LOCAL_2);
+    let mut gone = open_tunnel(&proxy, LOCAL, echo).await;
+    let mut kept = open_tunnel(&proxy, LOCAL_2, echo).await;
+    assert_eq!(proxy.registry.revoke_session(revoked), 1);
+    closes(&mut gone).await;
+    echoes(&mut kept, b"other session").await;
+
+    proxy.sandbox(LOCAL_2);
+    closes(&mut kept).await;
+}
+
+#[tokio::test]
+async fn lookups_are_capped_even_after_they_time_out() {
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress.with_limits(limits(|l| {
+            l.max_lookups = 1;
+            l.resolve_timeout = Duration::from_millis(200);
+        }))
+    })
+    .await;
+    proxy.sandbox(LOCAL);
+    proxy.network.answer("git.example.com", &[PUBLIC]);
+    let (status, body) = proxy.refused(LOCAL, &format!("{HANGS}:443")).await;
+    assert_eq!(status, "HTTP/1.1 502 Bad Gateway");
+    assert_eq!(body, "The host could not be resolved.\n");
+    let (status, body) = proxy.refused(LOCAL, "git.example.com:443").await;
+    assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(body, "The egress proxy is busy looking up hosts.\n");
+    assert_eq!(proxy.network.resolved(), [HANGS]);
+}
+
+/// An extension that never answers.
+struct Stuck;
+
+#[async_trait]
+impl EgressExtension for Stuck {
+    async fn rules(&self, _session: SessionId) -> Vec<HostRule> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn an_extension_that_does_not_answer_is_refused() {
+    let (echo, _) = echo_server().await;
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
+        egress
+            .with_extension(Arc::new(Stuck))
+            .with_limits(limits(|l| l.extension_timeout = Duration::from_millis(200)))
+    })
+    .await;
+    proxy.sandbox(LOCAL);
+    let (status, body) = proxy.refused(LOCAL, "skill.example.net:443").await;
+    assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+    assert_eq!(body, "The session's allowlist could not be loaded.\n");
+    assert!(proxy.network.resolved().is_empty());
+    open_tunnel(&proxy, LOCAL, echo).await;
 }
 
 #[tokio::test]

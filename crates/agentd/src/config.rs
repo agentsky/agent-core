@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use auth::OAuthConfig;
 use core_types::Cidr;
-use cred_proxy::{EgressPolicy, HostRule};
+use cred_proxy::{EgressLimits, EgressPolicy, EgressProxy, HostRule};
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
@@ -227,21 +227,33 @@ impl Default for LimitsConfig {
 
 /// `[proxy]`. Every key has a default, so the section is optional; without
 /// it sandboxes reach no host at all.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
 pub struct ProxyConfig {
     /// `allow`: the hosts sandboxes may open HTTPS tunnels to, as
     /// [`HostRule`]s such as `github.com`, `*.githubusercontent.com` or
     /// `git.example.com:8443`. Port 443 unless a rule names another.
-    /// `api.anthropic.com` is denied whatever this says.
+    /// `api.anthropic.com` is refused as a rule, and denied whatever a
+    /// wildcard says.
     pub allow: Vec<HostRule>,
-    /// `allow_private`: private subnets (inside `10.0.0.0/8`,
-    /// `172.16.0.0/12`, `192.168.0.0/16` or `fc00::/7`) that allowed hosts
-    /// may resolve to. Private addresses are refused otherwise. None may
-    /// overlap `internal.sandbox_subnet` or hold one of agentd's listener
-    /// addresses.
-    pub allow_private: Vec<Cidr>,
+    /// `max_tunnels`: open egress tunnels across all sandboxes, default
+    /// 256 ([`EgressLimits::max_tunnels`]).
+    pub max_tunnels: usize,
+    /// `max_session_tunnels`: open egress tunnels per sandbox, default 32
+    /// ([`EgressLimits::max_session_tunnels`]). At most `max_tunnels`.
+    pub max_session_tunnels: usize,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        let limits = EgressLimits::default();
+        Self {
+            allow: Vec::new(),
+            max_tunnels: limits.max_tunnels,
+            max_session_tunnels: limits.max_session_tunnels,
+        }
+    }
 }
 
 /// Secrets, read from the environment only.
@@ -369,15 +381,24 @@ impl Config {
         })
     }
 
-    /// Builds the egress proxy's policy from `[proxy]`, keeping agentd's
-    /// listener addresses and the sandbox network out of reach.
+    /// Builds the egress proxy from `[proxy]`: its rules and tunnel caps,
+    /// with agentd's listener addresses and the sandbox network out of
+    /// reach.
     ///
     /// # Errors
     ///
     /// Never for a loaded `Config`, whose `[proxy]` section was checked the
     /// same way.
-    pub fn egress_policy(&self) -> Result<EgressPolicy, ConfigError> {
-        egress_policy(&self.proxy, &self.server, &self.internal)
+    pub fn egress_proxy(&self) -> Result<EgressProxy, ConfigError> {
+        let limits = EgressLimits {
+            max_tunnels: self.proxy.max_tunnels,
+            max_session_tunnels: self.proxy.max_session_tunnels,
+            ..EgressLimits::default()
+        };
+        Ok(
+            EgressProxy::new(egress_policy(&self.proxy, &self.server, &self.internal)?)
+                .with_limits(limits),
+        )
     }
 
     /// Builds the store's [`Sealer`] from the master key.
@@ -407,8 +428,7 @@ fn egress_policy(
         let prefix = if ip.is_ipv4() { 32 } else { 128 };
         own.push(Cidr::new(ip, prefix).map_err(|err| invalid(key, err.to_string()))?);
     }
-    EgressPolicy::new(proxy.allow.clone(), proxy.allow_private.clone(), own)
-        .map_err(|err| invalid(format!("proxy.allow_private.{}", err.index), err.reason))
+    Ok(EgressPolicy::new(proxy.allow.clone(), own))
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -538,6 +558,18 @@ impl File {
         }
         if self.limits.attach_max_bytes == 0 {
             return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
+        }
+        if self.proxy.max_tunnels == 0 {
+            return Err(invalid("proxy.max_tunnels", "must be at least 1"));
+        }
+        if self.proxy.max_session_tunnels == 0 {
+            return Err(invalid("proxy.max_session_tunnels", "must be at least 1"));
+        }
+        if self.proxy.max_session_tunnels > self.proxy.max_tunnels {
+            return Err(invalid(
+                "proxy.max_session_tunnels",
+                "must be at most proxy.max_tunnels",
+            ));
         }
         egress_policy(&self.proxy, &self.server, &self.internal)?;
         self.claude_oauth
@@ -805,8 +837,10 @@ data_dir = "/nonexistent/agentd"
         assert!(config.secrets.rc_manager_token.is_none());
         assert!(config.secrets.slack_manager.is_empty());
         assert!(config.unknown_env.is_empty());
-        assert!(config.proxy.allow.is_empty() && config.proxy.allow_private.is_empty());
-        assert!(config.egress_policy().unwrap().rules().is_empty());
+        assert!(config.proxy.allow.is_empty());
+        let egress = config.egress_proxy().unwrap();
+        assert!(egress.policy().rules().is_empty());
+        assert_eq!(egress.limits(), cred_proxy::EgressLimits::default());
         config.sealer().unwrap();
     }
 
@@ -827,16 +861,22 @@ data_dir = "/nonexistent/agentd"
 "#;
 
     #[test]
-    fn proxy_rules_and_private_subnets_load() {
+    fn proxy_rules_and_tunnel_caps_load() {
         let text = format!(
             "{DOCKER_ADDRESSES}allow = [\"GitHub.com\", \"*.example.com:8443\"]\n\
-             allow_private = [\"10.20.0.0/16\", \"172.31.0.3/32\"]\n"
+             max_tunnels = 100\nmax_session_tunnels = 100\n"
         );
         let config = with(&text, env()).unwrap();
         let rules: Vec<String> = config.proxy.allow.iter().map(ToString::to_string).collect();
         assert_eq!(rules, ["github.com", "*.example.com:8443"]);
-        assert_eq!(config.proxy.allow_private.len(), 2);
-        assert_eq!(config.egress_policy().unwrap().rules().len(), 2);
+        let egress = config.egress_proxy().unwrap();
+        assert_eq!(egress.policy().rules().len(), 2);
+        let limits = egress.limits();
+        assert_eq!((limits.max_tunnels, limits.max_session_tunnels), (100, 100));
+        assert_eq!(
+            limits.tunnel_lifetime,
+            cred_proxy::EgressLimits::default().tunnel_lifetime
+        );
     }
 
     #[test]
@@ -849,20 +889,27 @@ data_dir = "/nonexistent/agentd"
             ),
             ("allow = [\"*.com\"]", "proxy.allow.0", "two or more labels"),
             (
-                "allow_private = [\"169.254.0.0/16\"]",
-                "proxy.allow_private.0",
-                "must be inside",
+                "allow = [\"github.com\", \"API.anthropic.com\"]",
+                "proxy.allow.1",
+                "always denied",
             ),
             (
-                "allow_private = [\"10.0.0.0/8\", \"172.30.0.0/16\"]",
-                "proxy.allow_private.1",
-                "must not overlap",
+                "allow_private = [\"10.0.0.0/8\"]",
+                "proxy.allow_private",
+                "unknown field",
+            ),
+            ("max_tunnels = 0", "proxy.max_tunnels", "at least 1"),
+            (
+                "max_session_tunnels = 0",
+                "proxy.max_session_tunnels",
+                "at least 1",
             ),
             (
-                "allow_private = [\"172.31.0.0/24\"]",
-                "proxy.allow_private.0",
-                "must not overlap",
+                "max_tunnels = 8\nmax_session_tunnels = 9",
+                "proxy.max_session_tunnels",
+                "at most proxy.max_tunnels",
             ),
+            ("max_tunnels = -1", "proxy.max_tunnels", "invalid value"),
             ("deny = []", "proxy.deny", "unknown field"),
         ] {
             let err = file_err(&format!("{DOCKER_ADDRESSES}{proxy}\n"));

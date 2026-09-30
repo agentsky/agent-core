@@ -3850,12 +3850,17 @@ first. Resolution has a 5-second timeout and all connection attempts share
 the 10-second `CONNECT_TIMEOUT`, so a long answer of silent addresses can't
 hold a request.
 
-Never reachable, whatever resolves there: agentd's own listener addresses
-and the sandbox subnet (agentd passes them from its configuration),
-loopback, link-local (`169.254.0.0/16`, the metadata address among them),
-`fd00:ec2::254`, `0.0.0.0/8`, `100.64.0.0/10` (Alibaba's metadata address
-`100.100.100.200` is in it), `192.0.0.0/24` (Oracle's `192.0.0.192`),
-documentation, benchmarking, multicast, reserved and broadcast ranges. For
+Never reachable, whatever resolves there and whichever rule allowed the
+host: agentd's own listener addresses and the sandbox subnet (agentd passes
+them from its configuration), the private ranges (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), loopback, link-local
+(`169.254.0.0/16`, the metadata address among them), the other clouds'
+metadata and platform addresses (AWS's `fd00:ec2::254`, GCP's
+`fd20:ce::254`, Oracle's `fd00:c1::a9fe:a9fe` and Azure's WireServer
+`168.63.129.16`, the last in public address space), `0.0.0.0/8`,
+`100.64.0.0/10` (Alibaba's metadata address `100.100.100.200` is in it),
+`192.0.0.0/24` (Oracle's `192.0.0.192`), documentation, benchmarking,
+multicast, reserved and broadcast ranges. For
 IPv6 only global unicast (`2000::/3`) is reachable, minus `2001::/23`
 (Teredo among it), `2002::/16` (6to4), `2001:db8::/32` and `3fff::/20`:
 that also refuses IPv4-compatible, NAT64 (`64:ff9b::/96`) and other forms
@@ -3863,33 +3868,14 @@ that embed an IPv4 address, which would otherwise carry a private or
 metadata address past the IPv4 checks. IPv4-mapped addresses are checked as
 the IPv4 address they hold.
 
-### Private networks can be allowed, narrowly
-
-**Issue.** The plan denies private ranges whatever the allowlist says,
-which leaves no way to reach a Git server on an office network. The
-review brief asked for RFC 1918 to be denied "unless explicitly allowed".
-
-**Solution.** `[proxy] allow_private` lists subnets that allowed hosts may
-resolve to. Each must lie inside `10.0.0.0/8`, `172.16.0.0/12`,
-`192.168.0.0/16` or `fc00::/7`, must not hold `fd00:ec2::254`, and must not
-overlap the sandbox subnet or hold one of agentd's listener addresses;
-configuration validation refuses anything else, naming the entry. It opens
-addresses only for hosts a rule already allows, and never loopback,
-link-local or the other ranges above. The egress network's subnet isn't in
-agentd's configuration, so it can't be refused as a whole: a subnet that
-holds agentd's own egress address is refused, but a narrower one covering
-Rocket.Chat, MongoDB or the Docker host's gateway is the operator's to
-avoid, as the example configuration says. The plan's T19 bullet says so.
-
 ### `Cidr` moved to core-types
 
-**Issue.** The egress policy needs subnets for agentd's own networks and
-`allow_private`, and agentd's `net::Cidr` was the only implementation.
-cred-proxy can't depend on agentd.
+**Issue.** The egress policy needs subnets for agentd's own networks, and
+agentd's `net::Cidr` was the only implementation. cred-proxy can't depend
+on agentd.
 
 **Solution.** `Cidr` moved unchanged, with its tests, to
-`core_types::net`, which does no I/O, and gained `network`, `prefix`,
-`covers` and `overlaps`. agentd imports it from there.
+`core_types::net`, which does no I/O. agentd imports it from there.
 
 ### The CLI honors `NO_PROXY`, and needs it
 
@@ -3913,13 +3899,45 @@ native build in the sandbox image.
 tracking it, so a tunnel isn't part of agentd's graceful shutdown or its
 drain timeout, and nothing else would end one that stays open.
 
-**Solution.** A tunnel ends when either side closes, after
-`TUNNEL_IDLE_TIMEOUT` (5 minutes) with no byte in either direction, or
-when the `EgressProxy` is dropped, which happens once the listener and its
-connections are gone. Tunnel tasks hold only a `watch` receiver, not the
-proxy. Revoking a session's placeholder doesn't cut its tunnels, as it
-doesn't cut a forwarded request in T18: the container is going away, and a
-new one at the same address can't take over a TCP connection.
+**Solution.** A tunnel ends when either side closes, after 5 minutes with
+no byte in either direction, after an hour in any case, when its session
+has no live placeholder left, or when the `EgressProxy` is dropped, which
+happens once the listener and its connections are gone. Tunnel tasks hold
+only `watch` receivers, not the proxy.
+
+The session's receiver comes from the `Registry`, which drops the sender
+once the session's last placeholder is revoked, however that happens:
+`revoke`, `revoke_session`, or a mint for another session at the same
+address. T23's `process_stopping` already calls `revoke_session`, so a
+stopping container's tunnels close with no other call; an explicit
+`EgressProxy::close_session` would have needed T23 to keep a handle on a
+proxy that `CredProxy` owns. The receiver is taken with the session lookup,
+under the registry's lock, and checked again before the 200, so a session
+revoked while its `CONNECT` was being checked gets no tunnel.
+
+### Tunnels and lookups are capped
+
+**Issue.** Nothing bounded what one sandbox could hold: a review probe kept
+300 tunnels open from one session. Host lookups were worse. The system
+resolver (`getaddrinfo`, through `tokio::net::lookup_host`) blocks a thread
+of tokio's blocking pool, and the 5-second timeout only dropped the future:
+the lookup kept its thread, so a resolver that hangs let a sandbox fill the
+pool with lookups nobody waited for.
+
+**Solution.** `EgressLimits`, given to `EgressProxy::with_limits`:
+
+- A tunnel place is taken per `CONNECT` before the extension is asked or
+  the host looked up, and given back when the `CONNECT` is refused or its
+  tunnel closes: 32 per session (429 past it) and 256 in all (503).
+  agentd's `[proxy] max_session_tunnels` and `max_tunnels` set them.
+- Lookups run under a semaphore of 32 places, each in a task of its own
+  that holds its place until the resolver returns, even after the timeout
+  refused the `CONNECT`. Waiting for a place counts toward the 5-second
+  timeout, and a `CONNECT` that gets none is refused with 503. The
+  workspace has no asynchronous resolver, and the semaphore needs none.
+- The `EgressExtension` gets 2 seconds; past that the `CONNECT` is refused
+  with 503, since a lookup that can't answer denies.
+- A tunnel lives an hour at most, busy or not.
 
 ### What the allowlist doesn't stop
 
@@ -3932,8 +3950,7 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Killing leftover processes" entry covers that). Tunnels aren't capped per
-session.
+"Killing leftover processes" entry covers that).
 
 ### Testing without the network
 
@@ -3954,6 +3971,7 @@ which the host holds on the bridge, maps `cred-proxy.internal` to it with
 `extra_hosts`, and runs `alpine/git:2.54.0` with `EGRESS_ENV`: cloning
 `github.com/octocat/Hello-World` works, a GitLab clone gets
 `403 from proxy after CONNECT`, and a clone without the proxy fails. It
-needs a route to github.com, which the CI runner has. Here, outbound TLS is
-intercepted by the environment's proxy, so it passed only with that proxy's
-CA mounted into the container for the run.
+needs a route to github.com, which the CI runner has, and it passes in CI's
+Docker tests job. Where outbound TLS is intercepted, as in the environment
+it was written in, it passes only with the intercepting proxy's CA mounted
+into the container.

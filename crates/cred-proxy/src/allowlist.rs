@@ -32,6 +32,9 @@ const MAX_LABEL_LEN: usize = 63;
 /// and one trailing dot. IP addresses are not hosts: the egress proxy never
 /// connects to an address the client names. Every host, a wildcard's
 /// suffix included, has at least two labels, so `*.com` is refused.
+/// [`ANTHROPIC_API_HOST`] is refused too, on any port, since the egress
+/// proxy always denies it; a wildcard above it, such as `*.anthropic.com`,
+/// is accepted and still never reaches it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
 pub struct HostRule {
@@ -84,6 +87,12 @@ impl FromStr for HostRule {
             "expected a host name of two or more labels, such as github.com or \
              *.example.com, with an optional :port; IP addresses are not allowed",
         ))?;
+        if !wildcard && host == ANTHROPIC_API_HOST {
+            return Err(HostRuleError(
+                "api.anthropic.com is always denied; sandboxes reach it through the \
+                 credential proxy",
+            ));
+        }
         Ok(Self {
             host,
             wildcard,
@@ -151,96 +160,44 @@ pub fn normalize_host(name: &str) -> Option<String> {
     (labels.len() >= 2 && labels.iter().all(label_ok) && last_ok).then(|| name.to_ascii_lowercase())
 }
 
-/// The error returned by [`EgressPolicy::new`] for an `allow_private`
-/// entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("entry {index}: {reason}")]
-pub struct PolicyError {
-    /// The entry's position in `allow_private`.
-    pub index: usize,
-    /// What is wrong with it.
-    pub reason: &'static str,
-}
-
 /// What a sandbox may reach through the egress proxy.
 ///
 /// A host must match a [`HostRule`], either the configured ones or the
 /// ones an [`EgressExtension`](crate::EgressExtension) adds for the
 /// session's agent, and every address it resolves to must be reachable.
 /// [`ANTHROPIC_API_HOST`] is always denied. These addresses are never
-/// reachable:
+/// reachable, whichever rule allowed the host:
 ///
 /// - agentd's own networks, as given to [`new`](Self::new): its addresses
 ///   and the sandbox network;
-/// - loopback, link-local (`169.254.0.0/16`, which holds the cloud
-///   metadata address `169.254.169.254`, and `fe80::/10`), `fd00:ec2::254`,
-///   `0.0.0.0/8`, shared address space (`100.64.0.0/10`),
+/// - private addresses: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+///   and `fc00::/7`;
+/// - cloud metadata and platform addresses: link-local `169.254.0.0/16`
+///   (`169.254.169.254` among them) and `fe80::/10`, AWS's
+///   `fd00:ec2::254`, GCP's `fd20:ce::254`, Oracle's
+///   `fd00:c1::a9fe:a9fe`, Azure's WireServer `168.63.129.16`, Alibaba's
+///   `100.100.100.200` (in `100.64.0.0/10`) and Oracle's `192.0.0.192`
+///   (in `192.0.0.0/24`);
+/// - loopback, `0.0.0.0/8`, shared address space (`100.64.0.0/10`),
 ///   `192.0.0.0/24`, documentation and benchmarking ranges, multicast,
 ///   reserved and broadcast addresses;
 /// - IPv6 outside global unicast (`2000::/3`), and the parts of it that
 ///   embed or relay IPv4 or aren't routed: `2001::/23` (Teredo among them),
 ///   `2002::/16` (6to4), `2001:db8::/32` and `3fff::/20`.
-///
-/// Private addresses (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
-/// `fc00::/7`) are denied unless an `allow_private` subnet holds them.
 #[derive(Debug, Clone)]
 pub struct EgressPolicy {
     rules: Vec<HostRule>,
-    allow_private: Vec<Cidr>,
     own: Vec<Cidr>,
 }
 
-/// Why an address is unreachable, for the log line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Unreachable {
-    Own,
-    Special(&'static str),
-    Private,
-}
-
-impl Unreachable {
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            Self::Own => "agentd's own network",
-            Self::Special(kind) => kind,
-            Self::Private => "private address",
-        }
-    }
-}
+/// The reason logged for an address in one of agentd's own networks.
+pub(crate) const OWN_NETWORK: &str = "agentd's own network";
 
 impl EgressPolicy {
-    /// A policy allowing `rules`, and the private addresses in
-    /// `allow_private`, and never reaching `own`: agentd's addresses and
-    /// the sandbox network.
-    ///
-    /// # Errors
-    ///
-    /// [`PolicyError`] if an `allow_private` subnet isn't inside a private
-    /// range, holds `fd00:ec2::254`, or overlaps one of `own`.
-    pub fn new(
-        rules: Vec<HostRule>,
-        allow_private: Vec<Cidr>,
-        own: Vec<Cidr>,
-    ) -> Result<Self, PolicyError> {
-        for (index, subnet) in allow_private.iter().enumerate() {
-            let fail = |reason| Err(PolicyError { index, reason });
-            if !is_private_subnet(subnet) {
-                return fail(
-                    "must be inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 or fc00::/7",
-                );
-            }
-            if subnet.contains(IpAddr::V6(AWS_METADATA_V6)) {
-                return fail("must not hold the cloud metadata address fd00:ec2::254");
-            }
-            if own.iter().any(|net| net.overlaps(subnet)) {
-                return fail("must not overlap agentd's addresses or the sandbox network");
-            }
-        }
-        Ok(Self {
-            rules,
-            allow_private,
-            own,
-        })
+    /// A policy allowing `rules`, and never reaching `own`: agentd's
+    /// addresses and the sandbox network.
+    pub fn new(rules: Vec<HostRule>, own: Vec<Cidr>) -> Self {
+        Self { rules, own }
     }
 
     /// The configured rules.
@@ -248,35 +205,30 @@ impl EgressPolicy {
         &self.rules
     }
 
-    /// Why `ip` is unreachable, or `None` if it is reachable.
-    pub(crate) fn unreachable(&self, ip: IpAddr) -> Option<Unreachable> {
+    /// Why `ip` is unreachable, for the log line, or `None` if it is
+    /// reachable.
+    pub(crate) fn unreachable(&self, ip: IpAddr) -> Option<&'static str> {
         let ip = ip.to_canonical();
         if self.own.iter().any(|net| net.contains(ip)) {
-            return Some(Unreachable::Own);
+            return Some(OWN_NETWORK);
         }
-        match classify(ip) {
-            Class::Public => None,
-            Class::Special(kind) => Some(Unreachable::Special(kind)),
-            Class::Private if self.allow_private.iter().any(|net| net.contains(ip)) => None,
-            Class::Private => Some(Unreachable::Private),
+        match ip {
+            IpAddr::V4(v4) => SPECIAL_V4
+                .iter()
+                .find(|(network, prefix, _)| within_v4(v4, *network, *prefix))
+                .map(|(_, _, kind)| *kind),
+            IpAddr::V6(v6) => unreachable_v6(v6),
         }
     }
 }
 
-/// AWS's IPv6 instance metadata address.
-const AWS_METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
-
-enum Class {
-    Public,
-    Private,
-    Special(&'static str),
-}
-
-/// IPv4 ranges that are never reachable, with what they are.
-const SPECIAL_V4: [([u8; 4], u8, &str); 12] = [
+/// IPv4 ranges that are never reachable, with what they are. The first
+/// match names the address.
+const SPECIAL_V4: [([u8; 4], u8, &str); 16] = [
     ([0, 0, 0, 0], 8, "\"this network\" address"),
     ([127, 0, 0, 0], 8, "loopback address"),
     ([169, 254, 0, 0], 16, "link-local or cloud metadata address"),
+    ([168, 63, 129, 16], 32, "cloud metadata address"),
     ([100, 64, 0, 0], 10, "shared address space"),
     ([192, 0, 0, 0], 24, "IETF protocol address"),
     ([192, 0, 2, 0], 24, "documentation address"),
@@ -286,6 +238,17 @@ const SPECIAL_V4: [([u8; 4], u8, &str); 12] = [
     ([192, 88, 99, 0], 24, "6to4 relay address"),
     ([224, 0, 0, 0], 4, "multicast address"),
     ([240, 0, 0, 0], 4, "reserved or broadcast address"),
+    ([10, 0, 0, 0], 8, PRIVATE),
+    ([172, 16, 0, 0], 12, PRIVATE),
+    ([192, 168, 0, 0], 16, PRIVATE),
+];
+
+/// Cloud metadata addresses inside the IPv6 private range: AWS's, GCP's
+/// and Oracle's.
+const METADATA_V6: [Ipv6Addr; 3] = [
+    Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+    Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254),
+    Ipv6Addr::new(0xfd00, 0xc1, 0, 0, 0, 0, 0xa9fe, 0xa9fe),
 ];
 
 /// IPv6 ranges inside `2000::/3` that are never reachable.
@@ -296,27 +259,7 @@ const SPECIAL_V6: [(u128, u8, &str); 4] = [
     (0x3fff << 112, 20, "documentation address"),
 ];
 
-/// The IPv4 private ranges, which `allow_private` may open.
-const PRIVATE_V4: [([u8; 4], u8); 3] = [
-    ([10, 0, 0, 0], 8),
-    ([172, 16, 0, 0], 12),
-    ([192, 168, 0, 0], 16),
-];
-
-/// The IPv6 private range (unique local addresses).
-const PRIVATE_V6: (u128, u8) = (0xfc00 << 112, 7);
-
-/// Whether all of `subnet` is inside one private range.
-fn is_private_subnet(subnet: &Cidr) -> bool {
-    match subnet.network() {
-        IpAddr::V4(v4) => PRIVATE_V4.iter().any(|(network, prefix)| {
-            subnet.prefix() >= *prefix && within_v4(v4, *network, *prefix)
-        }),
-        IpAddr::V6(v6) => {
-            subnet.prefix() >= PRIVATE_V6.1 && within_v6(v6, PRIVATE_V6.0, PRIVATE_V6.1)
-        }
-    }
-}
+const PRIVATE: &str = "private address";
 
 fn within_v4(ip: Ipv4Addr, network: [u8; 4], prefix: u8) -> bool {
     let mask = u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0);
@@ -328,39 +271,18 @@ fn within_v6(ip: Ipv6Addr, network: u128, prefix: u8) -> bool {
     u128::from(ip) & mask == network & mask
 }
 
-fn classify(ip: IpAddr) -> Class {
-    match ip {
-        IpAddr::V4(v4) => {
-            if let Some((_, _, kind)) = SPECIAL_V4
-                .iter()
-                .find(|(network, prefix, _)| within_v4(v4, *network, *prefix))
-            {
-                Class::Special(kind)
-            } else if PRIVATE_V4
-                .iter()
-                .any(|(network, prefix)| within_v4(v4, *network, *prefix))
-            {
-                Class::Private
-            } else {
-                Class::Public
-            }
-        }
-        IpAddr::V6(v6) => {
-            if v6 == AWS_METADATA_V6 {
-                Class::Special("cloud metadata address")
-            } else if within_v6(v6, PRIVATE_V6.0, PRIVATE_V6.1) {
-                Class::Private
-            } else if !within_v6(v6, 0x2000 << 112, 3) {
-                Class::Special("IPv6 address outside global unicast")
-            } else if let Some((_, _, kind)) = SPECIAL_V6
-                .iter()
-                .find(|(network, prefix, _)| within_v6(v6, *network, *prefix))
-            {
-                Class::Special(kind)
-            } else {
-                Class::Public
-            }
-        }
+fn unreachable_v6(v6: Ipv6Addr) -> Option<&'static str> {
+    if METADATA_V6.contains(&v6) {
+        Some("cloud metadata address")
+    } else if within_v6(v6, 0xfc00 << 112, 7) {
+        Some(PRIVATE)
+    } else if !within_v6(v6, 0x2000 << 112, 3) {
+        Some("IPv6 address outside global unicast")
+    } else {
+        SPECIAL_V6
+            .iter()
+            .find(|(network, prefix, _)| within_v6(v6, *network, *prefix))
+            .map(|(_, _, kind)| *kind)
     }
 }
 
@@ -464,23 +386,38 @@ mod tests {
         assert_eq!(normalize_host("a.0d"), None);
     }
 
-    fn open_policy() -> EgressPolicy {
+    fn policy() -> EgressPolicy {
         EgressPolicy::new(
             vec![rule("example.com")],
-            vec![cidr("10.20.0.0/16"), cidr("fd12:3456::/32")],
             vec![cidr("172.30.0.0/24"), cidr("172.31.0.2/32")],
         )
-        .unwrap()
+    }
+
+    fn reason(text: &str) -> Option<&'static str> {
+        policy().unreachable(ip(text))
+    }
+
+    #[test]
+    fn the_anthropic_api_host_is_not_a_rule() {
+        for text in [
+            "api.anthropic.com",
+            "API.Anthropic.COM.",
+            "api.anthropic.com:443",
+            "api.anthropic.com:8443",
+        ] {
+            let err = text.parse::<HostRule>().unwrap_err().to_string();
+            assert!(err.contains("always denied"), "{text}: {err}");
+        }
+        assert!(rule("*.anthropic.com").names("console.anthropic.com"));
+        assert!(rule("*.api.anthropic.com").names("x.api.anthropic.com"));
     }
 
     #[test]
     fn link_local_metadata_loopback_and_special_addresses_are_never_reached() {
-        let policy = open_policy();
         for text in [
             "169.254.169.254",
             "169.254.0.1",
             "::ffff:169.254.169.254",
-            "fd00:ec2::254",
             "127.0.0.1",
             "127.255.255.254",
             "::1",
@@ -512,67 +449,68 @@ mod tests {
             "2001:db8::1",
             "3fff::1",
         ] {
+            let why = reason(text);
             assert!(
-                matches!(policy.unreachable(ip(text)), Some(Unreachable::Special(_))),
-                "{text} is reachable"
+                why.is_some_and(|why| why != PRIVATE && why != OWN_NETWORK),
+                "{text}: {why:?}"
             );
         }
     }
 
     #[test]
-    fn private_ranges_are_denied_unless_allowed() {
-        let policy = open_policy();
+    fn every_cloud_metadata_address_is_never_reached() {
+        for text in [
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "fd00:c1::a9fe:a9fe",
+            "168.63.129.16",
+            "::ffff:168.63.129.16",
+        ] {
+            assert_eq!(reason(text), Some("cloud metadata address"), "{text}");
+        }
+        assert_eq!(
+            reason("169.254.169.254"),
+            Some("link-local or cloud metadata address")
+        );
+        assert_eq!(reason("100.100.100.200"), Some("shared address space"));
+        assert_eq!(reason("192.0.0.192"), Some("IETF protocol address"));
+        for text in ["168.63.129.15", "168.63.129.17"] {
+            assert_eq!(reason(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn private_ranges_are_always_denied() {
         for text in [
             "10.0.0.1",
-            "10.21.0.1",
+            "10.20.9.9",
             "172.16.0.1",
             "172.31.255.255",
             "192.168.1.1",
             "fc00::1",
             "fd00::1",
-            "fd12:3457::1",
+            "fd12:3456::9",
             "::ffff:10.0.0.1",
         ] {
-            assert_eq!(
-                policy.unreachable(ip(text)),
-                Some(Unreachable::Private),
-                "{text}"
-            );
-        }
-        for text in [
-            "10.20.0.1",
-            "10.20.255.255",
-            "::ffff:10.20.3.4",
-            "fd12:3456::9",
-        ] {
-            assert_eq!(policy.unreachable(ip(text)), None, "{text}");
+            assert_eq!(reason(text), Some(PRIVATE), "{text}");
         }
     }
 
     #[test]
     fn agentd_and_the_sandbox_network_are_never_reached() {
-        let policy = open_policy();
         for text in [
             "172.30.0.2",
             "172.30.0.200",
             "::ffff:172.30.0.9",
             "172.31.0.2",
         ] {
-            assert_eq!(
-                policy.unreachable(ip(text)),
-                Some(Unreachable::Own),
-                "{text}"
-            );
+            assert_eq!(reason(text), Some(OWN_NETWORK), "{text}");
         }
-        assert_eq!(
-            policy.unreachable(ip("172.31.0.3")),
-            Some(Unreachable::Private)
-        );
+        assert_eq!(reason("172.31.0.3"), Some(PRIVATE));
     }
 
     #[test]
     fn public_addresses_are_reachable() {
-        let policy = open_policy();
         for text in [
             "140.82.112.3",
             "1.1.1.1",
@@ -586,45 +524,8 @@ mod tests {
             "2001:200::1",
             "::ffff:1.1.1.1",
         ] {
-            assert_eq!(policy.unreachable(ip(text)), None, "{text}");
+            assert_eq!(reason(text), None, "{text}");
         }
-        assert_eq!(Unreachable::Own.describe(), "agentd's own network");
-        assert_eq!(Unreachable::Private.describe(), "private address");
-    }
-
-    #[test]
-    fn allow_private_must_be_private_and_clear_of_agentd() {
-        let own = vec![cidr("172.30.0.0/24"), cidr("172.31.0.2/32")];
-        let check = |subnet: &str| {
-            EgressPolicy::new(
-                Vec::new(),
-                vec![cidr("10.0.0.0/24"), cidr(subnet)],
-                own.clone(),
-            )
-            .map(|_| ())
-        };
-        for (subnet, reason) in [
-            ("0.0.0.0/0", "must be inside"),
-            ("8.0.0.0/7", "must be inside"),
-            ("169.254.0.0/16", "must be inside"),
-            ("127.0.0.0/8", "must be inside"),
-            ("100.64.0.0/10", "must be inside"),
-            ("fe80::/10", "must be inside"),
-            ("::/0", "must be inside"),
-            ("fd00::/8", "fd00:ec2::254"),
-            ("fd00:ec2::254/128", "fd00:ec2::254"),
-            ("172.16.0.0/12", "must not overlap"),
-            ("172.30.0.128/25", "must not overlap"),
-            ("172.31.0.0/24", "must not overlap"),
-        ] {
-            let err = check(subnet).unwrap_err();
-            assert_eq!(err.index, 1, "{subnet}");
-            assert!(err.reason.contains(reason), "{subnet}: {err}");
-        }
-        for subnet in ["10.0.0.0/8", "192.168.5.0/24", "172.20.0.0/16", "fd12::/16"] {
-            assert!(check(subnet).is_ok(), "{subnet}");
-        }
-        let policy = open_policy();
-        assert_eq!(policy.rules(), [rule("example.com")]);
+        assert_eq!(policy().rules(), [rule("example.com")]);
     }
 }

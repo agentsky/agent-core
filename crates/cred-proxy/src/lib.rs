@@ -19,8 +19,9 @@
 //! - [`EgressProxy`] answers `CONNECT` on the same listener
 //!   ([`CredProxy::with_egress`]): tunnels to the hosts an [`EgressPolicy`]
 //!   allows, never to `api.anthropic.com`, and never to an address the
-//!   policy keeps out, checked after resolution. [`EGRESS_ENV`] is the
-//!   environment that points a sandbox's HTTPS at it.
+//!   policy keeps out, checked after resolution, within [`EgressLimits`].
+//!   [`EGRESS_ENV`] is the environment that points a sandbox's HTTPS at
+//!   it.
 //! - [`CommunityKey`] supplies the community API key, and
 //!   [`ProxyObserver`] sees each forwarded request's status and usage
 //!   headers.
@@ -48,12 +49,11 @@ mod proxy;
 mod registry;
 
 pub use allowlist::{
-    ANTHROPIC_API_HOST, DEFAULT_PORT, EgressPolicy, HostRule, HostRuleError, PolicyError,
-    normalize_host,
+    ANTHROPIC_API_HOST, DEFAULT_PORT, EgressPolicy, HostRule, HostRuleError, normalize_host,
 };
 pub use egress::{
-    EGRESS_ENV, EgressExtension, EgressProxy, NO_PROXY, Network, PROXY_URL, RESOLVE_TIMEOUT,
-    SystemNetwork, TUNNEL_IDLE_TIMEOUT,
+    EGRESS_ENV, EgressExtension, EgressLimits, EgressProxy, NO_PROXY, Network, PROXY_URL,
+    SystemNetwork,
 };
 pub use hooks::{CommunityKey, CommunityKeyError, FixedKey, Observation, ProxyObserver};
 pub use proxy::{CONNECT_TIMEOUT, CredProxy, DEFAULT_UPSTREAM, ProxyError};

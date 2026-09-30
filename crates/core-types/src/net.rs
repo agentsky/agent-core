@@ -86,32 +86,6 @@ impl Cidr {
         };
         mask(ip, self.prefix) == self.network
     }
-
-    /// The network address.
-    pub fn network(&self) -> IpAddr {
-        self.network
-    }
-
-    /// The prefix length.
-    pub fn prefix(&self) -> u8 {
-        self.prefix
-    }
-
-    /// Whether every address of `other` is in this subnet.
-    pub fn covers(&self, other: &Cidr) -> bool {
-        let other_prefix = match (self.network, other.network) {
-            (IpAddr::V6(_), IpAddr::V4(_)) => other.prefix + 96,
-            (IpAddr::V4(_), IpAddr::V6(_)) => return false,
-            _ => other.prefix,
-        };
-        self.prefix <= other_prefix && self.contains(other.network)
-    }
-
-    /// Whether this subnet and `other` share any address. Two subnets are
-    /// either disjoint or one covers the other.
-    pub fn overlaps(&self, other: &Cidr) -> bool {
-        self.covers(other) || other.covers(self)
-    }
 }
 
 fn mask(ip: IpAddr, prefix: u8) -> IpAddr {
@@ -263,25 +237,5 @@ mod tests {
         let unrelated = cidr("fd00::/8");
         assert!(!unrelated.contains(ip("172.30.0.9")));
         assert!(!unrelated.contains(ip("::ffff:172.30.0.9")));
-    }
-
-    #[test]
-    fn covers_and_overlaps_compare_whole_subnets() {
-        let wide = cidr("10.0.0.0/8");
-        let narrow = cidr("10.1.0.0/16");
-        assert!(wide.covers(&narrow));
-        assert!(!narrow.covers(&wide));
-        assert!(wide.overlaps(&narrow) && narrow.overlaps(&wide));
-        assert!(wide.covers(&wide));
-        assert!(!wide.overlaps(&cidr("11.0.0.0/8")));
-        assert!(!wide.covers(&cidr("fd00::/8")));
-        assert!(!cidr("fd00::/8").covers(&wide));
-        let mapped_range = cidr("::/0");
-        assert!(mapped_range.covers(&wide));
-        assert!(!cidr("::ffff:0:0/97").covers(&cidr("0.0.0.0/0")));
-        assert!(cidr("::ffff:0:0/96").covers(&cidr("172.30.0.0/24")));
-        assert!(cidr("10.1.2.3/32").overlaps(&wide));
-        assert_eq!(narrow.network(), ip("10.1.0.0"));
-        assert_eq!(narrow.prefix(), 16);
     }
 }
