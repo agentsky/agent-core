@@ -5339,17 +5339,17 @@ binding's agent the one candidate). Until then, and in an agentd without
 `[sandbox]`, they are dropped with a debug line.
 
 The Slack queue handles the manager's commands too, one request at a time,
-so `Inbound` only `try_send`s an agent's message into a queue of
-`MESSAGES_CAPACITY` (256) and drops it with a warning when that is full,
-as the ingress answers 503 when its own queue is. A worker of its own,
-among the routers' workers, takes them in order: it looks the receiving
-binding up, fills in a bot sender with the binding's
-`SlackSurface::fill_bot_sender` (`bots.info`, which may wait out a rate
-limit), and hands the message to the pipeline. A message to a binding that
-isn't active (still waiting for its install, or deleted) is dropped. One
-worker keeps each thread's messages in the order they came, which the
-pipeline's lanes rely on; the command intake likewise runs apart from the
-queue.
+so `Inbound` hands an agent's message to `Messages` without waiting. A
+worker of its own, among the routers' workers, runs a lane for each binding
+that has messages waiting: the lane looks the binding up, fills in a bot
+sender with the binding's `SlackSurface::fill_bot_sender` (`bots.info`),
+and hands the message to the pipeline, one message at a time in the order
+they came, which keeps each thread's messages in order for the pipeline's
+lanes. A message to a binding that isn't active (still waiting for its
+install, or deleted) is dropped. The command intake likewise runs apart
+from the queue. How many messages may wait is the ingress's business (see
+"One agent's traffic denies no other agent service" below), so `Messages`
+has no bound or drop of its own.
 
 ### One workspace for agent apps too
 
@@ -5460,7 +5460,10 @@ the owner sent there is in the owner's DM with the agent.
 `conversations.info` answers with to be the event's channel exactly, and
 refuses it otherwise (`SurfaceError::NotFound`, dropped without a word),
 so a channel id spelled another way can't give V's message a second
-deduplication key.
+deduplication key. An Enterprise Grid migration, if Slack then answered
+for a channel with an id other than the one its events carry, would make
+the check drop that channel's messages without a word until the two agree;
+this fails closed, and hasn't been seen against real Slack.
 
 The confirmation window, `CONFIRM_WINDOW` (15 minutes), refuses without a
 lookup a message whose `ts` is older than that when its event arrived.
@@ -5503,29 +5506,36 @@ up at no cost:
   `SurfaceError::RateLimited` without being sent, and a 429 is not
   retried. Before, a lane waited out the quota, and a 429 up to three
   times a minute, while its message held one of the pipeline's
-  `max_pending` places. Now it gets the "try again" line at once. That
-  line is still posted at `chat.postMessage`'s pace, so a lane may wait
-  for that, but no longer for the lookups.
-- A message also takes one of its agent's `max_pending_per_agent` places
-  (`DEFAULT_MAX_PENDING_PER_AGENT`, 16) besides one of the 64 shared
+  `max_pending` places. Now it gets the "try again" line at once, posted
+  apart from the lane (below).
+- A message also takes one of its agent's owner's `max_pending_per_owner`
+  places (`DEFAULT_MAX_PENDING_PER_OWNER`, 16) besides one of the 64 shared
   `max_pending`. Before, about 50 forged addressed events a minute to one
   agent, spread over its threads, kept all 64 taken while they waited in
   the owner token's Tier 3 queue, and every other agent answered only with
-  the busy line. Now one agent's messages hold at most 16, and a message
-  past its agent's places gets the busy line like one past the others.
-- Busy lines are capped per agent: at most `MAX_BUSY_LINES` (8) of one
-  agent's are posted at once, so one agent's forged traffic can't use up
-  the others'.
-- `SlackSurface::fill_bot_sender`, which `slack::Messages`' one worker runs
-  for every agent's messages in turn, looks the bot up without waiting
-  too. Events with a made-up `bot_id` and no `user` each miss the cache
-  and call `bots.info` (Tier 3) on the owner's token; past the quota the
-  worker used to wait, holding up every agent's messages, and past
-  `MESSAGES_CAPACITY` (256) waiting they were dropped. Now the event goes
-  on as it came, from a bot known only by its bot id, which the router
-  ignores as an unmanaged bot. Moving the lookup into each agent's lane
-  would have worked too, but needed the pipeline to know about Slack's bot
-  ids.
+  the busy line. A first fix gave each agent 16 places, but an owner with
+  four agents still held all 64. Now one owner's agents together hold at
+  most 16, and a message past its owner's places gets the busy line like
+  one past the others.
+- Notices, the busy line and the "try again" line, are posted in a task of
+  their own, which holds none of the message's places, at most
+  `MAX_NOTICES` (8) at once for one owner's agents; one more is dropped.
+  The "try again" line used to be posted in the lane, through the waiting
+  `chat.postMessage` client (a message a second per channel), so once the
+  owner had used up the history quota, every forged event held its place
+  for as long as that post waited. The post itself still waits for the
+  quota; making it fail fast would need a way for the pipeline to post
+  without waiting on every surface, and with the task holding no place
+  and eight at most per owner, waiting costs no other agent anything.
+- `SlackSurface::fill_bot_sender` looks the bot up without waiting too.
+  Events with a made-up `bot_id` and no `user` each miss the cache and
+  call `bots.info` (Tier 3) on the owner's token; past the quota the event
+  goes on as it came, from a bot known only by its bot id, which the router
+  ignores as an unmanaged bot. Within the quota each call is real and may
+  take a while; it runs in its binding's lane in `slack::Messages`, so it
+  holds up only that binding's messages. It used to run in one worker for
+  every agent's messages: 50 forged events with a 300 ms `bots.info`
+  delayed another agent's real message by 15 seconds.
 
 Costs and limits:
 
@@ -5533,9 +5543,12 @@ Costs and limits:
   that isn't ignored, the owner's included, and one `conversations.info`
   per channel per `CONV_KIND_TTL` (an hour), cached in the workspace's
   `TeamDirectory` for every binding. All three are Tier 3 (about 50 a
-  minute per app). Past that, the thread gets the "try again" line at
-  once, so an agent that really is asked more than about 50 times a
-  minute tells some of them to ask again. Agent apps need
+  minute per app), and so is the thread's `conversations.replies` that
+  `message::build` reads for a turn in a thread, from the same bucket. So
+  an agent answers about 50 top-level messages a minute, but only about 25
+  in threads, which cost two reads each. Past that, the thread gets the
+  "try again" line at once, so an agent that really is asked more than
+  that tells some of them to ask again. Agent apps need
   `channels:read`, `groups:read`, `im:read` and `mpim:read` for
   `conversations.info`, so the manifest asks for them beyond the plan's
   list. Slack lowered the history limits in 2025 for commercially
@@ -5558,8 +5571,9 @@ Costs and limits:
   text as Slack has it.
 - A lookup failure can't tell a real message from a forged one, so an
   owner who exhausts the app's rate limit can make the agent post the
-  "try again" line in threads it can post in, at `chat.postMessage`'s pace,
-  within the agent's own places. No turn runs and no one is billed.
+  "try again" line in threads it can post in, at `chat.postMessage`'s pace
+  and at most eight at once for the owner's agents. No turn runs and no one
+  is billed.
 - The owner holds the bot token, which reads every conversation the bot
   is in, other members' DMs with the agent included. Confirming doesn't
   hide those from the owner; what it guarantees is that no forged event
@@ -5567,15 +5581,82 @@ Costs and limits:
   volume or bills them.
 - The manager app isn't involved: its secret is the operators', and it
   starts no turns.
+- Deduplication records a message's `<channel>:<ts>` at the ingress,
+  before it is confirmed. A forged event carrying member V's real channel
+  and `ts` that arrives before Slack's own delivery of V's message takes
+  its place, and Slack's is dropped as a duplicate; the forged one is then
+  confirmed and runs as V asked, with V's text, or is dropped if it routes
+  differently from Slack's copy, and V's message goes unanswered.
+  Deduplication is per binding, so this reaches only the owner's own
+  agent, never another agent's delivery of the same message.
+- `TeamDirectory` remembers which bot ids have no bot user apart from
+  those that have one, each set bounded at 10,000. Made-up bot ids are
+  remembered as having none, so they only churn that set, never pushing
+  out a real bot's user, which would cost other agents' `bots.info` calls.
 
 The busy line, which a message past the queue bounds gets without being
-confirmed, is now posted in a task of its own, among the pipeline's tasks
-so a shutdown drains it, rather than in the one worker that hands agents'
-messages to the pipeline, so a slow post holds up no other agent's
-messages; the messages still reach their lanes in the order they came.
-`Pipeline::handle` still waits for it. A message past the bounds while
-its agent has `MAX_BUSY_LINES` being posted gets none, which also caps
-what forged events can make the agent say this way.
+confirmed, is posted in a task of its own, among the pipeline's tasks so a
+shutdown drains it, and so is the "try again" line; the messages still
+reach their lanes in the order they came. `Pipeline::handle` still waits
+for both: a message's `done` is shared with the notices it starts. A
+message past the bounds while its owner's agents have `MAX_NOTICES` being
+posted gets none, which also caps what forged events can make the agents
+say this way.
+
+### One agent's traffic denies no other agent service
+
+**Issue.** Confirming stops forged events from billing, resuming or
+prompting anyone, but an owner can still sign as many events as they like
+for each of their agents (up to 10), and a review found shared places
+they could take from every other agent. Probed end to end: 3,000
+concurrent signed events to one agent got 1,829 answers of 503, and
+another agent's real message got 503 too and was never answered. The
+ingress had one queue of 1,024 for every binding, the manager's included,
+drained by one worker writing a deduplication row per event, and behind
+it `slack::Messages` had one queue of 256, dropping silently after Slack
+had its 200, and one worker; see also the `bots.info` and pipeline notes
+above.
+
+**Solution.** Each bound is on the unit an attacker controls:
+
+- The ingress counts each binding's requests in flight, from the ack
+  until they are handed on, in one place (`ingress::Places`). An agent's
+  app may have `MAX_IN_FLIGHT_PER_AGENT` (32), agents' apps together
+  `QUEUE_CAPACITY` (1,024), and the manager app `QUEUE_CAPACITY` of its
+  own. The place is taken before the request is queued, so before its
+  deduplication write, and a request past its binding's gets 503, which
+  Slack retries, so nothing is dropped after Slack was told it arrived.
+  The queue behind is unbounded, since the places bound it. A message
+  keeps its place (`InFlight`, in `SlackInbound::Message`) through
+  `slack::Messages` until its lane hands it to the pipeline; any other
+  request gives it back once the queue has handed it on. The queue still
+  handles requests one at a time, so the manager's may wait behind up to
+  1,024 of agents', each one store write.
+- `slack::Messages` runs a lane for each binding, so what holds one up
+  (`bots.info`, the store) holds up that binding's messages only, which
+  its places bound.
+- The pipeline's shares are per owner, and notices hold no place (above).
+- `core_types::MAX_MENTIONS` (100): each surface keeps an event's first 100
+  different mentions. The router's view looks each one up in the store,
+  and a signed body of up to a megabyte held 60,000 of them, 11 seconds of
+  lookups in one lane. Slack's 40,000-character limit allows about 3,000
+  mention tokens, so a real message mentioning the bot after 100 others
+  isn't addressed to it; Rocket.Chat's are capped the same way.
+- The attribution wait (`ATTRIBUTION_WAIT`, 2 seconds) for a message
+  claiming to be from another agent's bot and mentioning this one is taken
+  on the event as it arrived, before confirming, so a forged event holds
+  its place for up to 2 seconds for free. Its place is one of its owner's,
+  so that stalls only their own agents.
+
+Several owners flooding together could still take what other agents need:
+four owners the pipeline's 64 places, 32 agents' apps the ingress's 1,024.
+End-to-end tests hold each bound with a gate or a held Slack call, not a
+sleep: an agent's flood past its 32 places is refused while another
+agent's message is answered; another agent is answered while a
+`bots.info` of the first is held; one owner's three agents together leave
+another owner's agent its place; and a message whose "try again" line is
+held leaves its place to the next. Each of these failed before the
+change.
 
 ### Bots don't join channels by posting
 

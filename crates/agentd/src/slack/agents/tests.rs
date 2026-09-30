@@ -13,7 +13,7 @@ use core_types::{
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
-use surface_slack::{SlackClient, SlackInbound};
+use surface_slack::{InFlight, SlackClient, SlackInbound};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use wiremock::matchers::{header, method, path};
@@ -264,10 +264,16 @@ async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
         [AppDeletion::Deleted]
     );
 
-    logs.snapshot().assert_has("installed an agent's Slack app");
-    let everything = global_logs().snapshot();
+    let logged = logs.snapshot();
+    logged
+        .assert_has("created an agent's Slack app")
+        .assert_has("installed an agent's Slack app")
+        .assert_has("deleted a deleted agent's Slack app")
+        .assert_has("\"target\":\"sqlx::query\"")
+        .assert_has("\"target\":\"hyper_util::client::legacy::pool\"")
+        .assert_has("\"level\":\"TRACE\"");
     for secret in SECRETS {
-        everything.assert_lacks(secret);
+        logged.assert_lacks(secret);
     }
 }
 
@@ -434,7 +440,10 @@ async fn an_agents_message_reaches_the_pipeline_with_its_bot_sender_looked_up() 
     )
     .with_agents(messages.clone());
     inbound
-        .send(SlackInbound::Message(Box::new(bot_message(binding, TEAM))))
+        .send(SlackInbound::Message(
+            Box::new(bot_message(binding, TEAM)),
+            InFlight::untracked(),
+        ))
         .await
         .unwrap();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -452,7 +461,10 @@ async fn an_agents_message_reaches_the_pipeline_with_its_bot_sender_looked_up() 
             ..event
         };
         inbound
-            .send(SlackInbound::Message(Box::new(event)))
+            .send(SlackInbound::Message(
+                Box::new(event),
+                InFlight::untracked(),
+            ))
             .await
             .unwrap();
     }

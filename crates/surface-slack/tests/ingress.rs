@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use core_types::{BindingId, ConvKind, SendError, Sender, Sink, UserId};
 use futures::StreamExt as _;
 use secrecy::{ExposeSecret as _, SecretString};
-use surface_slack::ingress::PRE_ACK_TIMEOUT;
+use surface_slack::ingress::{MAX_IN_FLIGHT_PER_AGENT, PRE_ACK_TIMEOUT};
 use surface_slack::{BindingRef, BoxError, Dedup, SigningSecrets, SlackApp, SlackInbound, ingress};
 use testkit::slack::{self as fixtures, BOT_USER, CHALLENGE, TEAM};
 use tokio::sync::{Notify, mpsc};
@@ -191,14 +191,14 @@ impl Harness {
             .await;
         assert_eq!(status, StatusCode::OK);
         match self.next().await {
-            SlackInbound::Message(event) => assert_eq!(event.event_id, event_id),
+            SlackInbound::Message(event, _) => assert_eq!(event.event_id, event_id),
             other => panic!("expected the marker, got {other:?}"),
         }
     }
 
     async fn message(&mut self) -> core_types::InboundEvent {
         match self.next().await {
-            SlackInbound::Message(event) => *event,
+            SlackInbound::Message(event, _) => *event,
             other => panic!("expected a message, got {other:?}"),
         }
     }
@@ -1023,7 +1023,7 @@ async fn the_ack_never_waits_for_the_queue() {
     let (tx, mut out) = mpsc::unbounded_channel();
     let worker =
         tokio::spawn(queue.run(Arc::new(MemoryDedup::default()), Sender::new(Collect(tx))));
-    let SlackInbound::Message(event) = out.recv().await.unwrap() else {
+    let SlackInbound::Message(event, _) = out.recv().await.unwrap() else {
         panic!("expected the first message");
     };
     assert_eq!(event.event_id, "Ev0MENTION1");
@@ -1033,7 +1033,7 @@ async fn the_ack_never_waits_for_the_queue() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let SlackInbound::Message(event) = out.recv().await.unwrap() else {
+    let SlackInbound::Message(event, _) = out.recv().await.unwrap() else {
         panic!("expected the retried message");
     };
     assert_eq!(event.event_id, "Ev0SECOND");
@@ -1065,4 +1065,72 @@ async fn the_queue_stops_when_its_receiver_is_gone() {
         ))
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A DM to an agent's app, the `n`th of its kind: its own event id and
+/// `ts`.
+fn nth_dm(n: usize) -> String {
+    fixtures::with_event_id(fixtures::MESSAGE_IM, &format!("Ev0HELD{n}"))
+        .replace("1727697900.000500", &format!("1727698000.{n:06}"))
+}
+
+#[tokio::test]
+async fn each_binding_has_its_own_places_in_flight() {
+    let mut harness = Harness::start();
+    for n in 0..MAX_IN_FLIGHT_PER_AGENT {
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, &nth_dm(n)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "message {n}");
+    }
+    let past = nth_dm(MAX_IN_FLIGHT_PER_AGENT);
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &past))
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    for n in 0..MAX_IN_FLIGHT_PER_AGENT {
+        let (status, _) = harness
+            .send(signed_events(other_agent(), OTHER_SECRET, &nth_dm(n)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "the other agent's message {n}");
+    }
+    let (status, _) = harness
+        .send(signed(
+            &path(BindingRef::Manager, "commands"),
+            MANAGER_SECRET,
+            fixtures::SLASH_COMMAND,
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the agents' apps took all of theirs, and none of the manager's"
+    );
+
+    let mut held = Vec::new();
+    for _ in 0..2 * MAX_IN_FLIGHT_PER_AGENT {
+        let SlackInbound::Message(event, place) = harness.next().await else {
+            panic!("expected the agents' messages first");
+        };
+        held.push((event, place));
+    }
+    assert!(matches!(harness.next().await, SlackInbound::Command(_)));
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &past))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a message handed on keeps its place until it is dropped"
+    );
+    held.truncate(MAX_IN_FLIGHT_PER_AGENT - 1);
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &past))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        harness.message().await.event_id,
+        format!("Ev0HELD{MAX_IN_FLIGHT_PER_AGENT}"),
+        "the refused message wasn't recorded as handled"
+    );
 }

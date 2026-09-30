@@ -28,7 +28,8 @@ pub const MAX_MEMBER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How long after a failed refresh the next attempt waits.
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 
-/// The most bot ids remembered before the cache starts over.
+/// The most bot ids remembered with a user, and apart from them the most
+/// remembered without one, before that cache starts over.
 const MAX_BOTS: usize = 10_000;
 
 /// How long a conversation's kind is remembered. A group DM can be
@@ -46,8 +47,44 @@ pub struct TeamDirectory {
     ttl: Duration,
     members: RwLock<Members>,
     refreshing: tokio::sync::Mutex<()>,
-    bots: Mutex<HashMap<String, Option<UserId>>>,
+    bots: Mutex<Bots>,
     conv_kinds: Mutex<HashMap<ConversationId, (ConvKind, Instant)>>,
+}
+
+/// Bot ids by what `bots.info` answered: those with a bot user, and apart
+/// from them those without one. Anyone who can sign an agent's events can
+/// make bot ids up, and each is remembered as having no user, so they fill
+/// only that set, never pushing out the bots that have one.
+#[derive(Default)]
+struct Bots {
+    users: HashMap<String, UserId>,
+    userless: HashSet<String>,
+}
+
+impl Bots {
+    fn get(&self, bot_id: &str) -> Option<Option<UserId>> {
+        if let Some(user) = self.users.get(bot_id) {
+            return Some(Some(user.clone()));
+        }
+        self.userless.contains(bot_id).then_some(None)
+    }
+
+    fn insert(&mut self, bot_id: &str, user: Option<UserId>) {
+        match user {
+            Some(user) => {
+                if self.users.len() >= MAX_BOTS {
+                    self.users.clear();
+                }
+                self.users.insert(bot_id.to_owned(), user);
+            }
+            None => {
+                if self.userless.len() >= MAX_BOTS {
+                    self.userless.clear();
+                }
+                self.userless.insert(bot_id.to_owned());
+            }
+        }
+    }
 }
 
 /// The member list, and when `users.list` may be read again.
@@ -81,7 +118,7 @@ impl TeamDirectory {
             ttl: DEFAULT_MEMBER_TTL,
             members: RwLock::new(Members::default()),
             refreshing: tokio::sync::Mutex::new(()),
-            bots: Mutex::new(HashMap::new()),
+            bots: Mutex::default(),
             conv_kinds: Mutex::new(HashMap::new()),
         }
     }
@@ -217,25 +254,22 @@ impl TeamDirectory {
     /// The bot user of the bot `bot_id`, from `bots.info` through `api`,
     /// cached per bot id. `None` for a bot with no user, such as a legacy
     /// integration, or one Slack doesn't know (`bot_not_found`); that answer
-    /// is cached too.
+    /// is cached too, apart from the bots that have a user, so bot ids made
+    /// up in forged events never push those out.
     ///
     /// # Errors
     ///
     /// Any other `bots.info` error. Nothing is cached then.
     pub async fn bot_user(&self, api: &WebApi, bot_id: &str) -> Result<Option<UserId>> {
         if let Some(known) = self.lock_bots().get(bot_id) {
-            return Ok(known.clone());
+            return Ok(known);
         }
         let user = match api.bot_info(bot_id).await {
             Ok(bot) => bot.user_id.filter(|user| is_user_id(user.as_str())),
             Err(SurfaceError::NotFound(_)) => None,
             Err(err) => return Err(err),
         };
-        let mut bots = self.lock_bots();
-        if bots.len() >= MAX_BOTS {
-            bots.clear();
-        }
-        bots.insert(bot_id.to_owned(), user.clone());
+        self.lock_bots().insert(bot_id, user.clone());
         Ok(user)
     }
 
@@ -285,7 +319,7 @@ impl TeamDirectory {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn lock_bots(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<UserId>>> {
+    fn lock_bots(&self) -> std::sync::MutexGuard<'_, Bots> {
         self.bots.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -293,12 +327,17 @@ impl TeamDirectory {
 impl fmt::Debug for TeamDirectory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let directory = self.members();
+        let (users, userless) = {
+            let bots = self.lock_bots();
+            (bots.users.len(), bots.userless.len())
+        };
         f.debug_struct("TeamDirectory")
             .field("team", &self.team)
             .field("ttl", &self.ttl)
             .field("names", &directory.len())
             .field("managed_bots", &directory.managed.len())
-            .field("bots", &self.lock_bots().len())
+            .field("bots", &users)
+            .field("userless_bots", &userless)
             .field("conv_kinds", &self.lock_conv_kinds().len())
             .finish_non_exhaustive()
     }
@@ -572,5 +611,18 @@ mod tests {
         assert_eq!(directory.len(), 1);
         assert!(!directory.is_empty());
         assert!(MemberDirectory::default().is_empty());
+    }
+
+    #[test]
+    fn made_up_bot_ids_never_push_out_the_bots_with_a_user() {
+        let mut bots = Bots::default();
+        bots.insert("B0REAL", Some("U0REAL".into()));
+        for n in 0..=MAX_BOTS {
+            bots.insert(&format!("B{n}"), None);
+        }
+        assert_eq!(bots.get("B0REAL"), Some(Some(UserId::from("U0REAL"))));
+        assert_eq!(bots.get(&format!("B{MAX_BOTS}")), Some(None));
+        assert_eq!(bots.get("B0"), None, "the userless cache started over");
+        assert_eq!(bots.get("B0UNSEEN"), None);
     }
 }

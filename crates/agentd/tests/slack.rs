@@ -337,7 +337,7 @@ async fn only_kept_messages_reach_processed_events_and_only_by_channel_and_ts() 
         200
     );
     match next(&mut out).await {
-        SlackInbound::Message(message) => assert_eq!(message.event_id, "Ev0IM000001"),
+        SlackInbound::Message(message, _) => assert_eq!(message.event_id, "Ev0IM000001"),
         other => panic!("expected the DM, got {other:?}"),
     }
     assert!(

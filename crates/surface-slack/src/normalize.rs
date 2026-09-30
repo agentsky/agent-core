@@ -8,8 +8,12 @@
 //! - Only plain messages and the `file_share` and `thread_broadcast`
 //!   subtypes are kept. Edits, deletions, joins, `bot_message` posts from
 //!   classic integrations and the other subtypes are dropped.
+//! - Mentions are the first [`MAX_MENTIONS`] users a message mentions
+//!   ([`mentions`]), since the router looks each one up and a forged event
+//!   can carry a megabyte of them.
 //! - In a channel (`channel_type` other than `im` and `mpim`), a message is
-//!   kept only if it mentions the binding's bot user or replies in a thread.
+//!   kept only if it mentions the binding's bot user among those, or replies
+//!   in a thread.
 //!   Whether the thread's root is the agent's own message is the router's
 //!   question; it needs the thread root, which is in `reply_to`.
 //! - `thread_ts` becomes both `thread_root` and `reply_to`, unless it equals
@@ -36,8 +40,8 @@
 use std::collections::HashSet;
 
 use core_types::{
-    BindingId, ConvKind, ConvRef, ConversationId, InFile, InboundEvent, MemberKey, MsgRef,
-    SurfaceKind, TeamId, UserId,
+    BindingId, ConvKind, ConvRef, ConversationId, InFile, InboundEvent, MAX_MENTIONS, MemberKey,
+    MsgRef, SurfaceKind, TeamId, UserId,
 };
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -273,9 +277,9 @@ pub fn unescape(text: &str) -> String {
     out
 }
 
-/// Every user mentioned in `text` and `blocks`, once each, in order of first
-/// appearance: `<@U…>` tokens in `text`, then `rich_text` `user` elements
-/// and tokens in `mrkdwn` text objects.
+/// The first [`MAX_MENTIONS`] users mentioned in `text` and `blocks`, once
+/// each, in order of first appearance: `<@U…>` tokens in `text`, then
+/// `rich_text` `user` elements and tokens in `mrkdwn` text objects.
 pub fn mentions(text: &str, blocks: Option<&Value>) -> Vec<UserId> {
     let mut found = Vec::new();
     scan_tokens(text, &mut found);
@@ -284,6 +288,7 @@ pub fn mentions(text: &str, blocks: Option<&Value>) -> Vec<UserId> {
     }
     let mut seen = HashSet::with_capacity(found.len());
     found.retain(|user| seen.insert(user.clone()));
+    found.truncate(MAX_MENTIONS);
     found
 }
 
@@ -427,12 +432,13 @@ mod tests {
     }
 
     #[test]
-    fn many_mentions_are_deduplicated_in_linear_time() {
+    fn many_mentions_are_deduplicated_in_linear_time_and_capped() {
         let text: String = (0..40_000).map(|n| format!("<@U{n}><@U{n}>")).collect();
         let found = mentions(&text, None);
-        assert_eq!(found.len(), 40_000);
+        assert_eq!(found.len(), MAX_MENTIONS);
         assert_eq!(found[0].as_str(), "U0");
-        assert_eq!(found[39_999].as_str(), "U39999");
+        assert_eq!(found[1].as_str(), "U1");
+        assert_eq!(found[MAX_MENTIONS - 1].as_str(), "U99");
     }
 
     #[test]

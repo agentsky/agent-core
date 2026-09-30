@@ -1750,3 +1750,106 @@ async fn forged_messages_from_an_unlinked_owner_send_no_link_prompts() {
     assert!(turned.posts(AGENT_TOKEN).await.is_empty());
     turned.stop().await;
 }
+
+/// A channel message mentioning helper, signed by its owner as if the bot
+/// known only by the made-up bot id `B0MADEUP<n>` had sent it, so its
+/// sender is looked up with `bots.info`.
+fn made_up_bot_message(n: u32) -> String {
+    let ts = recent_ts(5, n);
+    let text = format!("<@{AGENT_BOT}> hi");
+    let mut envelope: Value = serde_json::from_str(&channel_message(
+        fixtures::USER,
+        &ts,
+        &format!("Ev0MADEUP{n:04}"),
+        &text,
+    ))
+    .unwrap();
+    let event = envelope["event"].as_object_mut().unwrap();
+    event.remove("user");
+    event.insert("bot_id".to_owned(), json!(format!("B0MADEUP{n:04}")));
+    envelope.to_string()
+}
+
+impl Turned {
+    /// Makes `bots.info` with helper's token hold every lookup past the
+    /// client's timeout.
+    async fn hold_helpers_bot_lookups(&self) {
+        Mock::given(method("POST"))
+            .and(path("/api/bots.info"))
+            .and(header(
+                "authorization",
+                format!("Bearer {AGENT_TOKEN}").as_str(),
+            ))
+            .respond_with(
+                ok(json!({"bot": {"id": "B0MADEUP", "name": "made-up"}}))
+                    .set_delay(Duration::from_secs(600)),
+            )
+            .with_priority(1)
+            .mount(&self.slack)
+            .await;
+    }
+
+    /// Asks scout a question Slack confirms, and asserts that scout
+    /// answers within 20 seconds, less than the Slack client's 30-second
+    /// timeout of a held lookup.
+    async fn scout_answers(&self) {
+        let ts = recent_ts(4, 999_999);
+        let text = format!("<@{}> are you there?", SCOUT.bot);
+        self.slack_has(&ts, json!({"ts": ts, "user": fixtures::USER, "text": text}))
+            .await;
+        let question = channel_message(fixtures::USER, &ts, "Ev0SCOUT01", &text);
+        assert_eq!(self.post(1, SCOUT.secret, question).await, 200);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.posts(SCOUT.token).await.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "scout wasn't answered while helper's bot lookup was held"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(self.posts(SCOUT.token).await[0]["thread_ts"], ts.as_str());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_bot_lookup_for_one_agent_holds_up_no_other_agent() {
+    let turned = Turned::start(&[HELPER, SCOUT]).await;
+    turned.hold_helpers_bot_lookups().await;
+    for n in 1..=3 {
+        assert_eq!(
+            turned.post(0, SIGNING_SECRET, made_up_bot_message(n)).await,
+            200
+        );
+    }
+    turned.scout_answers().await;
+    assert_eq!(
+        turned.requests("bots.info", AGENT_TOKEN).await.len(),
+        1,
+        "helper's lane is still held on its first lookup, and its others wait behind it"
+    );
+    assert!(turned.posts(AGENT_TOKEN).await.is_empty());
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_agents_flood_is_refused_past_its_places_and_other_agents_are_not() {
+    let turned = Turned::start(&[HELPER, SCOUT]).await;
+    turned.hold_helpers_bot_lookups().await;
+    let places = u32::try_from(surface_slack::ingress::MAX_IN_FLIGHT_PER_AGENT).unwrap();
+    for n in 1..=places {
+        assert_eq!(
+            turned.post(0, SIGNING_SECRET, made_up_bot_message(n)).await,
+            200,
+            "helper's message {n} of {places} is taken"
+        );
+    }
+    assert_eq!(
+        turned
+            .post(0, SIGNING_SECRET, made_up_bot_message(places + 1))
+            .await,
+        503,
+        "helper has every place it may hold"
+    );
+    turned.scout_answers().await;
+    turned.stop().await;
+}

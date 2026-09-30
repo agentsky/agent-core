@@ -41,10 +41,19 @@
 //!    again. The handler never waits for the queue. Slash commands and
 //!    interactivity reply later through their `response_url`.
 //!
+//! 5. 503 if the binding has too many requests in flight: acknowledged, and
+//!    not yet handed on (see [`InFlight`]). Each agent's app may have
+//!    [`MAX_IN_FLIGHT_PER_AGENT`] at once, and agents' apps together the
+//!    `capacity` given to [`ingress`]; the manager app has a `capacity` of
+//!    its own, so no agent's traffic can take its places, and one agent's
+//!    can't take another's. Slack retries events, and the forger of a
+//!    flood is its app's owner, whose own app is the one refused.
+//!
 //! Anyone can send requests that are refused before verification (steps 2
 //! to 4) or challenges, so at most one refusal per [`WARNING_INTERVAL`] is
 //! logged as a warning and one challenge as info; the rest are logged at
-//! debug level.
+//! debug level. A request refused at step 5 is logged the same way, since
+//! an agent's owner can sign as many as they like.
 //!
 //! [`Queue::run`] then deduplicates each request through [`Dedup`],
 //! normalizes it, and hands it on as a [`SlackInbound`]:
@@ -60,6 +69,7 @@
 //!   `slack:<binding>:request`. Slack doesn't retry them, so a second copy is
 //!   a replay inside the five-minute window.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -78,7 +88,6 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use crate::inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
@@ -101,6 +110,9 @@ pub const PRE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// answered challenge as info, at most. The others are logged at debug
 /// level, and the next warning or info says how many there were.
 pub const WARNING_INTERVAL: Duration = Duration::from_secs(60);
+/// How many requests to one agent's app may be in flight at once. Beyond
+/// that, the app's requests get 503 until some are handed on.
+pub const MAX_IN_FLIGHT_PER_AGENT: usize = 32;
 /// The header in which Slack numbers a retried delivery.
 pub const RETRY_NUM_HEADER: &str = "x-slack-retry-num";
 /// The header in which Slack says why it retried.
@@ -201,15 +213,21 @@ pub trait Dedup: Send + Sync {
 }
 
 /// Builds the ingress: the router serving the request URLs, and the
-/// [`Queue`] behind it, which holds at most `capacity` requests.
+/// [`Queue`] behind it. At most `capacity` requests to the manager app, and
+/// `capacity` to agents' apps, [`MAX_IN_FLIGHT_PER_AGENT`] of them to each,
+/// are in flight at once.
 ///
 /// The queue closes when the router and every clone of it are dropped, and
 /// [`Queue::run`] returns once it has handled what was queued.
 pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Queue) {
-    let (sender, receiver) = mpsc::channel(capacity.max(1));
+    let (sender, receiver) = mpsc::unbounded_channel();
     let state = Ingress {
         secrets,
         queue: sender,
+        places: Arc::new(Places {
+            capacity,
+            taken: Mutex::default(),
+        }),
         refusals: Arc::new(Throttle::new(WARNING_INTERVAL)),
         challenges: Arc::new(Throttle::new(WARNING_INTERVAL)),
     };
@@ -224,13 +242,15 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
 #[derive(Clone)]
 struct Ingress {
     secrets: Arc<dyn SigningSecrets>,
-    queue: mpsc::Sender<Queued>,
+    queue: mpsc::UnboundedSender<Queued>,
+    places: Arc<Places>,
     refusals: Arc<Throttle>,
     challenges: Arc<Throttle>,
 }
 
 impl Ingress {
-    /// Logs a request refused before verification.
+    /// Logs a request refused before verification, or for having too many
+    /// in flight.
     fn refused(
         &self,
         binding: BindingRef,
@@ -261,6 +281,91 @@ impl Ingress {
                 "answered Slack's url_verification challenge"
             ),
             None => tracing::debug!(%binding, "answered Slack's url_verification challenge"),
+        }
+    }
+}
+
+/// A request's place among those in flight for its binding: taken when the
+/// ingress acknowledges the request, and given back when this is dropped.
+///
+/// [`Queue::run`] drops it once it has handed the request on, except for a
+/// message, whose place goes on in [`SlackInbound::Message`], so a message
+/// to an agent's app holds it until whoever takes the message drops it.
+pub struct InFlight(Option<(BindingRef, Arc<Places>)>);
+
+impl InFlight {
+    /// A place counted nowhere, for a message that didn't come through the
+    /// ingress.
+    pub fn untracked() -> Self {
+        Self(None)
+    }
+}
+
+impl fmt::Debug for InFlight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Some((binding, _)) => f.debug_tuple("InFlight").field(binding).finish(),
+            None => f.write_str("InFlight(untracked)"),
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if let Some((binding, places)) = self.0.take() {
+            places.give_back(binding);
+        }
+    }
+}
+
+/// The places in flight: `capacity` for the manager app, and `capacity`
+/// for agents' apps, [`MAX_IN_FLIGHT_PER_AGENT`] for each.
+#[derive(Debug)]
+struct Places {
+    capacity: usize,
+    taken: Mutex<Taken>,
+}
+
+#[derive(Debug, Default)]
+struct Taken {
+    manager: usize,
+    agents: usize,
+    by_agent: HashMap<BindingId, usize>,
+}
+
+impl Places {
+    /// A place for a request to `binding`, or `None` when it has none left.
+    fn take(self: &Arc<Self>, binding: BindingRef) -> Option<InFlight> {
+        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        match binding {
+            BindingRef::Manager if taken.manager >= self.capacity => return None,
+            BindingRef::Manager => taken.manager += 1,
+            BindingRef::Agent(_) if taken.agents >= self.capacity => return None,
+            BindingRef::Agent(id) => {
+                let held = taken.by_agent.entry(id).or_default();
+                if *held >= MAX_IN_FLIGHT_PER_AGENT {
+                    return None;
+                }
+                *held += 1;
+                taken.agents += 1;
+            }
+        }
+        Some(InFlight(Some((binding, Arc::clone(self)))))
+    }
+
+    fn give_back(&self, binding: BindingRef) {
+        let mut taken = self.taken.lock().unwrap_or_else(PoisonError::into_inner);
+        match binding {
+            BindingRef::Manager => taken.manager -= 1,
+            BindingRef::Agent(id) => {
+                taken.agents -= 1;
+                if let Some(held) = taken.by_agent.get_mut(&id) {
+                    *held -= 1;
+                    if *held == 0 {
+                        taken.by_agent.remove(&id);
+                    }
+                }
+            }
         }
     }
 }
@@ -436,23 +541,27 @@ async fn handle(
             return StatusCode::BAD_REQUEST.into_response();
         }
     };
+    let Some(place) = ingress.places.take(binding) else {
+        ingress.refused(
+            binding,
+            kind,
+            StatusCode::SERVICE_UNAVAILABLE,
+            &"too many of the binding's requests in flight",
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let queued = Queued {
         binding,
         bot_user: app.bot_user,
         received_at,
         request,
+        place,
     };
-    match ingress.queue.try_send(queued) {
-        Ok(()) => StatusCode::OK.into_response(),
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!(%binding, kind = kind.as_str(), "the Slack queue is full; refused a request");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
-        Err(TrySendError::Closed(_)) => {
-            tracing::warn!(%binding, kind = kind.as_str(), "the Slack queue is closed");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+    if ingress.queue.send(queued).is_err() {
+        tracing::warn!(%binding, kind = kind.as_str(), "the Slack queue is closed");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    StatusCode::OK.into_response()
 }
 
 /// Echoes a `url_verification` challenge, or refuses a malformed one.
@@ -621,6 +730,7 @@ struct Queued {
     bot_user: Option<UserId>,
     received_at: OffsetDateTime,
     request: Request,
+    place: InFlight,
 }
 
 /// Parses a verified body. The error names what was wrong, never what was
@@ -668,7 +778,7 @@ fn parse(kind: Kind, body: &[u8], signature: String) -> Result<Parsed, &'static 
 /// The receiving end of the ingress: requests that were acknowledged and
 /// still have to be deduplicated, normalized and handed on.
 pub struct Queue {
-    receiver: mpsc::Receiver<Queued>,
+    receiver: mpsc::UnboundedReceiver<Queued>,
 }
 
 impl fmt::Debug for Queue {
@@ -705,10 +815,19 @@ async fn process(queued: Queued, dedup: &dyn Dedup) -> Option<SlackInbound> {
         bot_user,
         received_at,
         request,
+        place,
     } = queued;
     match request {
         Request::Event(callback) => {
-            process_event(binding, bot_user.as_ref(), received_at, callback, dedup).await
+            process_event(
+                binding,
+                bot_user.as_ref(),
+                received_at,
+                callback,
+                dedup,
+                place,
+            )
+            .await
         }
         Request::Command { form, signature } => {
             if !first_time(
@@ -797,6 +916,7 @@ async fn process_event(
     received_at: OffsetDateTime,
     callback: EventCallback,
     dedup: &dyn Dedup,
+    place: InFlight,
 ) -> Option<SlackInbound> {
     let EventCallback {
         team_id,
@@ -847,7 +967,7 @@ async fn process_event(
         tracing::debug!(%binding, event_id, "dropped a Slack message this app already received");
         return None;
     }
-    Some(SlackInbound::Message(Box::new(message)))
+    Some(SlackInbound::Message(Box::new(message), place))
 }
 
 async fn first_time(dedup: &dyn Dedup, source: &str, key: &str, binding: BindingRef) -> bool {
