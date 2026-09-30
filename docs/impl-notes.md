@@ -866,7 +866,9 @@ and T13 has to tell the admin to revoke it.
 **Solution.** `ParseError::is_secret_bearing` is true when the text starts
 with `login` or `slack-token` and has arguments, or with `admin api-key` and
 has anything but a bare `set` or `clear` after it. Callers apply the same
-channel rule to both.
+channel rule to both. Review widened the rule to misspelt commands and known
+token prefixes; see
+[Misspelt secret-bearing commands](#misspelt-secret-bearing-commands-arent-commands-at-all).
 
 ### Secrets are `SecretString`, not `String`
 
@@ -938,3 +940,50 @@ needed. `limits` takes one or both settings in either order, each at most
 once; a missing one is `None`, meaning unchanged. `turns=N` is accepted
 without `/day`. Numbers are plain digits (`turns` is `u32`, `hops` is `u8`,
 the width of `core_types::Hop`).
+
+### A skill source reaches `git clone`
+
+**Issue.** `skill add <name> <source>` took any word as the source, and every
+argument may start with `-` (see the lone `--` entry above), so
+`skill add helper --upload-pack=<command>` parsed. T25 passes the source to
+`git clone`, where such a word is an option that runs a command, and other
+forms are just as unwelcome there: `ext::` and `file://` transports, local
+paths, SSH URLs, and a ref such as `#--upload-pack=…` that `git` would read
+as an option. A URL with `user:token@` would also put a credential in the
+agent's configuration.
+
+**Solution.** The source is checked by a value parser and must be an
+`https://` URL: the host is letters, digits, `.` and `-`, with an optional
+numeric port and no user info; the path is letters, digits and `-._~/%+`;
+and an optional `#ref` starts with a letter or digit, continues with letters,
+digits and `._/-`, and has no `..`, no `//` and no trailing `/` or `.`.
+Any other form, or a source over 2048 bytes, is refused with one fixed
+message that says what a source is and that leaving it out adds an attached
+`SKILL.md` or `.zip`. The Slack link token is unwrapped before the check. Query strings
+and non-ASCII paths are refused; percent-encoding covers the rare path that
+needs them. T25's plan now also has agentd pass the URL after `--` and the
+ref only inside an `--opt=value` word, as a second line of defense.
+
+### Misspelt secret-bearing commands aren't commands at all
+
+**Issue.** The rule in "Secret-bearing text that fails to parse" only looked
+at text whose command words parsed as `login`, `slack-token` or
+`admin api-key`. `api-key set sk-…` without `admin`, `slack_token …`,
+`slacktoken …` and `admin apikey set …` came back as `UnknownCommand` or
+`Invalid` with `is_secret_bearing()` false, so T13 wouldn't tell the member
+that the secret they just posted in a channel is public.
+
+**Solution.** `parse` computes the flag once for every error, from the words
+alone. It is true when a word naming a secret (`login`, `api-key` or
+`slack-token`, compared ignoring case, `-`, `_` and surrounding punctuation,
+so `apikey`, `API_KEY`, `slack_token`, `SlackToken:` and `log-in` match) is
+followed by anything but a bare `set` or `clear`, wherever it stands, or when
+any word contains a known token prefix: `sk-ant-` (Anthropic API keys and
+OAuth tokens), `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` and `xapp-` (Slack). This
+replaces the earlier rule, which it covers. It errs towards caution, since a
+missed warning leaves a live secret in a channel while a false one costs the
+member a new login: `how do I login here` counts, and so does a help request
+naming a token. The flag is computed only for errors; a command that parses
+is judged by `Command::is_secret_bearing` alone, so a persona mentioning
+`sk-ant-` is still just a persona. Error messages still never repeat the
+text.

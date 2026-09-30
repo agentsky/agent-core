@@ -29,8 +29,9 @@
 //!   and quotes included, with only the surrounding white space trimmed.
 //! - A member is `@name`, a channel `#name`. Slack delivers mentions it
 //!   recognizes as `<@U123|name>` and `<#C123|name>` tokens; both forms are
-//!   accepted, see [`UserRef`], [`RoomRef`] and [`Target`]. A Slack link
-//!   token `<url|label>` as a skill source becomes its URL.
+//!   accepted, see [`UserRef`], [`RoomRef`] and [`Target`]. A skill source
+//!   is an `https://` Git URL with an optional `#ref`; a Slack link token
+//!   `<url|label>` becomes its URL.
 //! - `help`, `help <command>` and empty text ask for help, and an unknown
 //!   command gets the full help text. Both come back as a [`ParseError`],
 //!   whose message the caller replies with.
@@ -182,8 +183,11 @@ pub enum SkillCommand {
     Add {
         /// The agent.
         name: AgentName,
-        /// A Git URL, optionally ending in `#ref`. `None` means the skill is
-        /// a `SKILL.md` or `.zip` attached to the message.
+        /// An `https://` Git URL, optionally ending in `#ref`. The parser
+        /// refuses any other form, so `git clone` can't read the source or
+        /// its ref as an option, and a URL carrying credentials is refused
+        /// too. `None` means the skill is a `SKILL.md` or `.zip` attached to
+        /// the message.
         source: Option<String>,
     },
     /// `skill rm <name> <skill>`.
@@ -344,11 +348,11 @@ pub enum ParseErrorKind {
 }
 
 impl ParseError {
-    pub(crate) fn new(kind: ParseErrorKind, message: String, secret_bearing: bool) -> Self {
+    pub(crate) fn new(kind: ParseErrorKind, message: String) -> Self {
         Self {
             kind,
             message,
-            secret_bearing,
+            secret_bearing: false,
         }
     }
 
@@ -357,12 +361,20 @@ impl ParseError {
         self.kind
     }
 
-    /// Whether the text was a secret-bearing command (`login`,
-    /// `slack-token` or `admin api-key set`) with arguments, even though it
-    /// didn't parse.
+    /// Whether the text that didn't parse looks like it holds a secret.
+    ///
+    /// That is the case when a word naming a secret (`login`, `api-key` or
+    /// `slack-token`, also misspelt as `apikey`, `api_key`, `slack_token`
+    /// or `slacktoken`) is followed by a value, anywhere in the text: a
+    /// secret-bearing command with extra or missing words, or with a
+    /// misspelt or missing command word such as `api-key set <key>` without
+    /// `admin`. It is also the case when any word holds a known token prefix
+    /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`), and for
+    /// unknown commands and help requests too.
     ///
     /// The secret may still be in the text, so callers apply the same
-    /// channel rules as for [`Command::is_secret_bearing`].
+    /// channel rules as for [`Command::is_secret_bearing`]. The heuristic
+    /// errs towards caution: `how do I login here` counts.
     pub fn is_secret_bearing(&self) -> bool {
         self.secret_bearing
     }
@@ -398,9 +410,9 @@ mod tests {
 
     #[test]
     fn parse_error_accessors() {
-        let err = ParseError::new(ParseErrorKind::Invalid, "Nope.".into(), true);
+        let err = ParseError::new(ParseErrorKind::Invalid, "Nope.".into());
         assert_eq!(err.kind(), ParseErrorKind::Invalid);
-        assert!(err.is_secret_bearing());
+        assert!(!err.is_secret_bearing());
         assert_eq!(err.to_string(), "Nope.");
     }
 }
