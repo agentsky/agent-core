@@ -99,8 +99,9 @@ impl SlackSurface {
     }
 
     /// Sets the binding's bot user, which [`Surface::confirm`] needs to
-    /// tell whether a channel message mentions the bot, as the ingress
-    /// does. Without one, only thread replies and DMs are confirmed.
+    /// tell, as the ingress does, whether a message outside a one-to-one DM
+    /// mentions the bot or replies in a thread under the bot's root.
+    /// Without one, only thread replies and DMs are confirmed.
     pub fn with_bot_user(mut self, bot_user: Option<UserId>) -> Self {
         self.bot_user = bot_user;
         self
@@ -427,8 +428,9 @@ impl Surface for SlackSurface {
     ///    thread the event names, and normalized with
     ///    [`normalize::read_back`], the ingress's rules, with this binding's
     ///    bot user: subtypes, sender, mentions from `text` and `blocks`,
-    ///    thread, files and whether a channel message is addressed. A bot
-    ///    known only by its bot id is named by its user, as
+    ///    thread, files and whether the message addresses the bot: outside
+    ///    a one-to-one DM, a mention of the bot or a thread reply under its
+    ///    root. A bot known only by its bot id is named by its user, as
     ///    [`fill_bot_sender`](Self::fill_bot_sender) names it.
     ///
     /// None of the lookups [waits](WebApi::without_waiting) for the bot

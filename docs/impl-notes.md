@@ -5941,6 +5941,39 @@ without a word.
   No flow replaces an agent's app today: a binding gets its bot user once,
   at install.
 
+### Own posts and quiet bots aren't kept either
+
+**Issue.** A ninth review found that `normalize` still kept, and charged
+to the owner's bucket, two kinds of message the router always ignores,
+in every kind of conversation: the agent's own posts (`OwnMessage`, and
+the pipeline drops the sending agent from the candidates as well), and
+bots' messages that don't mention the agent (`UnmanagedBot`, or
+`NotMentionedByAgent` for another agent). Nothing else reads them at
+ingress: `message_refs` rows for the agent's posts are written from
+`chat.postMessage`'s answer, a read-back confirms only inbound messages
+the router didn't ignore, and the manager app acts only on people's DMs.
+
+**Solution.**
+
+- `normalize` drops, as `Skip::NotAddressed`, a message whose sender is
+  the binding's bot user, and a bot's message (`bot_id` or `bot_profile`)
+  that doesn't mention the bot user, in DMs too. A bot's message is kept
+  when the bot user isn't known. `read_back` inherits both.
+- `parent_user_id` is read by a visitor that keeps a string only if
+  `is_user_id` accepts it and skips anything else without copying it, so
+  every other value still counts as missing.
+- The owner-rate test gives up after 10 seconds of wall clock rather than
+  2,000 rounds.
+- New agentd tests run a turn for a member's reply under the agent's own
+  root, with `parent_user_id` the agent's bot, and neither look up nor
+  answer a reply under a member's root.
+
+**Open.** Keeping a reply with no `parent_user_id` assumes Slack sends it
+on every reply under a root with a user, and leaves it out only under
+roots with none, such as incoming webhooks', Workflow Builder's and
+`bot_message` posts. That hasn't been checked against live Slack; it
+belongs in T32's live pass.
+
 ### Bots don't join channels by posting
 
 Slack refuses a post to a conversation the bot isn't in (T23b), and the

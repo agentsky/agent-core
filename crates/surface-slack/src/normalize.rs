@@ -22,6 +22,10 @@
 //!   own message stays the router's question, answered from `reply_to` and
 //!   the messages agentd recorded; `parent_user_id` only drops replies
 //!   under a root that can't be.
+//! - In every kind of conversation, the bot's own posts are dropped, and so
+//!   is another bot's message that doesn't mention the bot user, when the
+//!   bot user is known: the router ignores an agent's own posts, and
+//!   answers a bot only when it is another agent that mentions this one.
 //! - `thread_ts` becomes both `thread_root` and `reply_to`, unless it equals
 //!   the message's own `ts`, which makes the message the root itself.
 //! - A bot sender (`bot_id` or `bot_profile`) with a `user` field has that
@@ -76,13 +80,14 @@
 //! 160 KB of text, 55 KB of files and 7 KB of mentions.
 
 use std::collections::HashSet;
+use std::fmt;
 
 use core_types::{
     BindingId, ConvKind, ConvRef, ConversationId, InFile, InboundEvent, MAX_MENTIONS, MemberKey,
     MsgRef, SurfaceKind, TeamId, UserId,
 };
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use time::OffsetDateTime;
 
@@ -117,7 +122,7 @@ pub struct Context<'a> {
     pub binding: BindingId,
     /// The binding's bot user, if known. Without it, messages outside
     /// one-to-one DMs are kept only when they reply in a thread, whoever
-    /// posted its root.
+    /// posted its root, and bots' messages are kept whatever they mention.
     pub bot_user: Option<&'a UserId>,
     /// The envelope's `team_id`.
     pub team: &'a TeamId,
@@ -140,9 +145,11 @@ pub enum Skip {
     /// The event names neither a `user` nor a `bot_id`.
     #[error("the message has no sender")]
     NoSender,
-    /// A message outside a one-to-one DM that neither mentions the bot nor
-    /// replies in a thread whose root the bot may have posted.
-    #[error("a message outside a DM that neither mentions the bot nor replies under its root")]
+    /// A message the router would ignore: the bot's own post, another
+    /// bot's that doesn't mention the bot, or one outside a one-to-one DM
+    /// that neither mentions the bot nor replies in a thread whose root the
+    /// bot may have posted.
+    #[error("a message that doesn't address the bot")]
     NotAddressed,
     /// A bot's message that was edited.
     #[error("a bot's message was edited")]
@@ -161,10 +168,69 @@ struct MessageEvent {
     text: Option<String>,
     ts: Option<String>,
     thread_ts: Option<String>,
-    parent_user_id: Option<Value>,
+    #[serde(rename = "parent_user_id", deserialize_with = "user_id_or_nothing")]
+    parent_user: Option<UserId>,
     blocks: Option<Value>,
     files: Option<Vec<SlackFile>>,
     edited: Option<IgnoredAny>,
+}
+
+/// A string [`is_user_id`] accepts, or `None` for any other value, read
+/// without keeping what it skips.
+fn user_id_or_nothing<'de, D: Deserializer<'de>>(value: D) -> Result<Option<UserId>, D::Error> {
+    value.deserialize_any(UserIdOrNothing)
+}
+
+struct UserIdOrNothing;
+
+impl<'de> Visitor<'de> for UserIdOrNothing {
+    type Value = Option<UserId>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+        Ok(is_user_id(text).then(|| UserId::from(text)))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, value: D) -> Result<Self::Value, D::Error> {
+        value.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Self::Value, A::Error> {
+        while items.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Self::Value, A::Error> {
+        while entries.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -257,17 +323,16 @@ fn normalized(
     text.truncate(truncated(&text, MAX_TEXT_BYTES).len());
     let mentions = mentions(&text, event.blocks.as_ref());
     let thread_root = event.thread_ts.filter(|root| *root != ts);
+    let mentioned = context.bot_user.is_some_and(|bot| mentions.contains(bot));
+    let own = context.bot_user.is_some_and(|bot| *bot == sender);
+    let unaddressed_bot = is_bot && context.bot_user.is_some() && !mentioned;
     let root_by_someone_else = event
-        .parent_user_id
-        .as_ref()
-        .and_then(Value::as_str)
-        .filter(|parent| is_user_id(parent))
+        .parent_user
         .zip(context.bot_user)
-        .is_some_and(|(parent, bot)| parent != bot.as_str());
-    if conv_kind != ConvKind::Dm
-        && (thread_root.is_none() || root_by_someone_else)
-        && !context.bot_user.is_some_and(|bot| mentions.contains(bot))
-    {
+        .is_some_and(|(parent, bot)| parent != *bot);
+    let unaddressed_here =
+        conv_kind != ConvKind::Dm && (thread_root.is_none() || root_by_someone_else) && !mentioned;
+    if own || unaddressed_bot || unaddressed_here {
         return Err(Skip::NotAddressed);
     }
     let conv = ConvRef {
@@ -801,6 +866,70 @@ mod tests {
             normalize(channel_message(json!({"bot_profile": {"id": "B1"}}))).unwrap();
         assert!(profile_only.sender_is_bot);
         assert_eq!(profile_only.sender_bot_user, Some(UserId::from("U1")));
+    }
+
+    #[test]
+    fn own_posts_and_bots_not_mentioning_the_bot_are_dropped_in_every_kind() {
+        for (channel_type, kind) in [
+            ("im", ConvKind::Dm),
+            ("mpim", ConvKind::GroupDm),
+            ("channel", ConvKind::Channel),
+        ] {
+            let with = |extra: Value| {
+                let mut event = channel_message(json!({
+                    "channel_type": channel_type,
+                    "thread_ts": "1727697500.000050",
+                    "parent_user_id": BOT,
+                }));
+                for (key, value) in extra.as_object().unwrap() {
+                    event[key] = value.clone();
+                }
+                event
+            };
+            let own = with(json!({"user": BOT, "bot_id": "B0SELF", "text": "hi <@U0BOT>"}));
+            assert_eq!(
+                normalize(own.clone()),
+                Err(Skip::NotAddressed),
+                "{channel_type}"
+            );
+            assert_eq!(read(kind, own), Err(Skip::NotAddressed), "{channel_type}");
+            let own_unflagged = with(json!({"user": BOT, "text": "hi"}));
+            assert_eq!(
+                normalize(own_unflagged),
+                Err(Skip::NotAddressed),
+                "{channel_type}"
+            );
+            let mut quiet_bots = vec![
+                with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER", "text": "hi"})),
+                with(json!({"user": "U0OTHERBOT", "bot_profile": {"id": "B0OTHER"}, "text": "hi"})),
+                with(json!({"bot_id": "B0OTHER", "text": "hi <@U0HUMAN>"})),
+            ];
+            quiet_bots[2].as_object_mut().unwrap().remove("user");
+            for quiet in quiet_bots {
+                assert_eq!(normalize(quiet.clone()), Err(Skip::NotAddressed), "{quiet}");
+                assert_eq!(read(kind, quiet), Err(Skip::NotAddressed), "{channel_type}");
+            }
+            let calling = with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER"}));
+            assert!(normalize(calling.clone()).is_ok(), "{channel_type}");
+            assert!(read(kind, calling).is_ok(), "{channel_type}");
+            let person = with(json!({"text": "hi"}));
+            assert!(normalize(person).is_ok(), "{channel_type}");
+        }
+        let team = TeamId::from("T0TEAM");
+        let unknown_bot_user = Context {
+            binding: BindingId::new_v4(),
+            bot_user: None,
+            team: &team,
+            event_id: "Ev1",
+            received_at: datetime!(2026-09-30 12:00 UTC),
+        };
+        let quiet = channel_message(json!({
+            "channel_type": "im",
+            "user": "U0OTHERBOT",
+            "bot_id": "B0OTHER",
+            "text": "hi",
+        }));
+        assert!(message(&unknown_bot_user, &quiet).is_ok());
     }
 
     #[test]

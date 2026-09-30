@@ -1527,6 +1527,7 @@ async fn a_sender_not_shaped_like_slacks_is_acked_and_dropped_with_nothing_writt
         let event = body["event"].as_object_mut().unwrap();
         event.remove("user");
         event.insert("bot_id".into(), longer.clone().into());
+        event.insert("text".into(), format!("<@{BOT_USER}> done").into());
     });
     let (status, _) = harness
         .send(signed_events(agent(), AGENT_SECRET, &bot))
@@ -1770,6 +1771,57 @@ async fn one_owners_agents_in_busy_threads_miss_no_mention() {
 }
 
 #[tokio::test]
+async fn the_agents_own_posts_and_bots_not_mentioning_it_are_dropped_without_a_row() {
+    let mut harness = Harness::start();
+    let own = |event_id: &str, fixture: &str, extra: serde_json::Value| {
+        edited(fixture, |body| {
+            body["event_id"] = event_id.into();
+            let event = body["event"].as_object_mut().unwrap();
+            event.insert("user".into(), BOT_USER.into());
+            event.insert("bot_id".into(), "B0AGENT01".into());
+            event.insert("text".into(), format!("<@{BOT_USER}> done").into());
+            for (key, value) in extra.as_object().unwrap() {
+                event.insert(key.clone(), value.clone());
+            }
+        })
+    };
+    let other_bot = |event_id: &str, fixture: &str| {
+        edited(fixture, |body| {
+            body["event_id"] = event_id.into();
+            let event = body["event"].as_object_mut().unwrap();
+            event.insert("user".into(), "U0BOT0002".into());
+            event.insert("bot_id".into(), "B0OTHER01".into());
+            event.insert("text".into(), "deploy finished".into());
+            event.remove("blocks");
+        })
+    };
+    let dropped = [
+        own(
+            "Ev0OWNTHREAD",
+            fixtures::MESSAGE_THREAD_REPLY,
+            serde_json::json!({}),
+        ),
+        own("Ev0OWNDM", fixtures::MESSAGE_IM, serde_json::json!({})),
+        own(
+            "Ev0OWNROOT",
+            fixtures::MESSAGE_MENTION,
+            serde_json::json!({"thread_ts": "1727697600.000100"}),
+        ),
+        other_bot("Ev0BOTTHREAD", fixtures::MESSAGE_THREAD_REPLY),
+        other_bot("Ev0BOTDM", fixtures::MESSAGE_IM),
+        other_bot("Ev0BOTMPIM", fixtures::MESSAGE_MPIM),
+    ];
+    for body in &dropped {
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, body))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+}
+
+#[tokio::test]
 async fn a_thread_reply_under_the_agents_own_root_is_kept() {
     let mut harness = Harness::start();
     let root = fresh("1727697650.000150");
@@ -1823,7 +1875,10 @@ async fn messages_one_owner_keeps_past_their_rate_are_acked_and_dropped_without_
     let started = Instant::now();
     let (mut sent, mut kept, mut rounds) = (0, 0, 0);
     while kept == sent {
-        assert!(rounds < 2_000, "{sent} messages were all kept");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "all {sent} messages were kept"
+        );
         for (binding, secret) in adas {
             let (status, _) = harness
                 .send(signed_events(binding, secret, &nth_dm(rounds)))

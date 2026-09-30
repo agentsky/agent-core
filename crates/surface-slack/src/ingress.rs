@@ -277,8 +277,9 @@ pub struct SlackApp {
     /// `apps.manifest.create` hasn't returned it yet: the binding then
     /// answers only `url_verification`.
     pub signing_secret: Option<SecretString>,
-    /// The app's bot user, once known. Channel messages are kept when they
-    /// mention it.
+    /// The app's bot user, once known. A message outside a one-to-one DM
+    /// is kept when it mentions the bot user or replies in a thread under
+    /// the bot user's root (see [`normalize`]).
     pub bot_user: Option<UserId>,
 }
 

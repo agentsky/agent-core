@@ -18,14 +18,16 @@ use agentd::server::{Routers, Server};
 use agentd::{App, Config};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use core_types::{BindingId, MemberId, MemberKey, SurfaceKind, TeamId, UserId};
+use core_types::{
+    BindingId, Hop, MemberId, MemberKey, Requester, SessionId, SurfaceKind, TeamId, UserId,
+};
 use runner::{PoolConfig, ProcessConfig};
 use sandbox::ProcessSandbox;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{
-    AgentCreation, BindingState, NewAgent, NewClaudeLink, NewSlackApp, NewSlackConfigToken, Store,
-    Visibility,
+    AgentCreation, BindingState, NewAgent, NewClaudeLink, NewMessageRef, NewSlackApp,
+    NewSlackConfigToken, Store, Visibility,
 };
 use testkit::slack as fixtures;
 use testkit::{Turn, agentctl_path, fake_anthropic, fake_claude_path};
@@ -1477,6 +1479,128 @@ async fn a_forged_thread_pointing_at_an_agents_reply_bills_no_one() {
     );
     assert_eq!(turned.fake.message_requests().await.len(), 1);
     turned.no_turn_for_bob().await;
+    turned.stop().await;
+}
+
+impl Turned {
+    /// Records helper's post at `ts`, at the top of the channel, as a turn
+    /// ada asked for would.
+    async fn helper_posted_root(&self, ts: &str) {
+        let helper = self
+            .store
+            .agent_for_binding(self.bindings[0])
+            .await
+            .unwrap()
+            .unwrap();
+        self.store
+            .record_message_ref(
+                &NewMessageRef {
+                    session: SessionId::new_v4(),
+                    msg: &reply_ref(ts),
+                    thread_root: None,
+                    agent: Some(helper.id),
+                    turn: None,
+                    requester: &Requester {
+                        member: Some(self.ada),
+                        key: ada(),
+                    },
+                    hop: Hop(0),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_members_reply_under_the_agents_own_root_runs_a_turn() {
+    let turned = Turned::start(&[HELPER]).await;
+    let root = recent_ts(20, 100);
+    let reply = recent_ts(5, 200);
+    turned.helper_posted_root(&root).await;
+    turned
+        .slack_has(
+            &reply,
+            json!({
+                "ts": reply,
+                "user": fixtures::OTHER_USER,
+                "text": "and the tests?",
+                "thread_ts": root,
+                "parent_user_id": AGENT_BOT,
+            }),
+        )
+        .await;
+    let event = message_event(
+        fixtures::OTHER_USER,
+        &reply,
+        "Ev0OWNROOT",
+        "and the tests?",
+        json!({"thread_ts": root, "parent_user_id": AGENT_BOT}),
+    );
+    assert_eq!(turned.post(0, SIGNING_SECRET, event).await, 200);
+
+    let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    assert_eq!(posts[0]["thread_ts"], root.as_str());
+    let posted = turned.posted(HELPER.posted_ts).await;
+    assert_eq!(posted.requester.member, Some(turned.bob));
+    let confirmations = turned.confirmations(AGENT_TOKEN).await;
+    assert_eq!(confirmations.len(), 1);
+    assert_eq!(confirmations[0].url.path(), "/api/conversations.replies");
+    let form: HashMap<String, String> =
+        serde_urlencoded::from_bytes(&confirmations[0].body).unwrap();
+    assert_eq!(form["ts"], root, "read back in the agent's thread");
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_under_a_members_root_is_neither_looked_up_nor_answered() {
+    let turned = Turned::start(&[HELPER]).await;
+    let root = recent_ts(20, 100);
+    let reply = recent_ts(10, 200);
+    let event = message_event(
+        fixtures::OTHER_USER,
+        &reply,
+        "Ev0THEIRROOT",
+        "lunch?",
+        json!({"thread_ts": root, "parent_user_id": fixtures::USER}),
+    );
+    turned
+        .slack_has(
+            &reply,
+            json!({
+                "ts": reply,
+                "user": fixtures::OTHER_USER,
+                "text": "lunch?",
+                "thread_ts": root,
+                "parent_user_id": fixtures::USER,
+            }),
+        )
+        .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, event).await, 200);
+
+    let asked = recent_ts(5, 300);
+    let text = format!("<@{AGENT_BOT}> what's new?");
+    turned
+        .slack_has(
+            &asked,
+            json!({"ts": asked, "user": fixtures::OTHER_USER, "text": text}),
+        )
+        .await;
+    let mention = channel_message(fixtures::OTHER_USER, &asked, "Ev0AFTER", &text);
+    assert_eq!(turned.post(0, SIGNING_SECRET, mention).await, 200);
+    let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert_eq!(posts[0]["thread_ts"], asked.as_str());
+    assert!(
+        turned
+            .requests("conversations.replies", AGENT_TOKEN)
+            .await
+            .is_empty(),
+        "the reply under a member's root is never looked up"
+    );
+    assert_eq!(turned.confirmations(AGENT_TOKEN).await.len(), 1);
+    assert_eq!(turned.fake.message_requests().await.len(), 1);
     turned.stop().await;
 }
 
