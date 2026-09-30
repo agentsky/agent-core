@@ -1315,3 +1315,105 @@ can't leak into the error.
   servers. To turn a `Cursor` (a message id) into a `latest` time for the
   top level, the client also has `chat.getMessage`, which the plan didn't
   list.
+
+## T28: Slack ingress
+
+### The manager binding needs a `BindingId`
+
+**Issue.** `InboundEvent::binding` is a `BindingId`, a UUID, but the plan
+gives the manager app the fixed path segment `manager`, and the manager has no
+row in `agent_bindings` (its secret comes from configuration).
+
+**Solution.** `surface_slack::BindingRef` is `Manager` or `Agent(BindingId)`,
+parsed from the path: `manager`, or a binding id in canonical lowercase form;
+anything else is 404 without a lookup. Manager events carry
+`BindingRef::MANAGER_ID`, the nil UUID, which agentd never mints for an agent
+(the parser refuses it as an agent path too). Deduplication sources use the
+path form, so the manager's are `slack:manager…`.
+
+### Signing secret and bot user come from one lookup
+
+**Issue.** The plan's `SigningSecrets` trait returns a secret, but
+normalization also needs the binding's bot user id to keep channel messages
+that mention it, and T31 needs a binding in state `creating` to answer
+`url_verification` before any secret exists.
+
+**Solution.** `SigningSecrets::lookup(BindingRef)` returns
+`Option<SlackApp { signing_secret: Option<SecretString>, bot_user:
+Option<UserId> }>`. `None` is 404. A known binding without a secret answers
+only the challenge, and everything else gets 401. Without a bot user, channel
+messages pass only as thread replies; the manager has none until T30 reads it
+with `auth.test`, which doesn't matter while it subscribes only to
+`message.im`. agentd's `ConfigSigningSecrets` knows only the manager; T31
+adds the store-backed agent bindings in front of it.
+
+### Where the ack ends and processing begins
+
+**Issue.** The plan says handlers enqueue and return 200 at once, and
+deduplicate through the store. A store write before the ack could wait up to
+SQLite's 5-second `busy_timeout` and miss Slack's 3 seconds, and the plan
+doesn't say what a full queue does.
+
+**Solution.** The handler does only what needs no I/O beyond the secret
+lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
+bounded queue. A full or closed queue answers 503, so Slack retries; the
+handler never waits for it. `Queue::run` then deduplicates through the
+`Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
+and sends `SlackInbound` items, one at a time and in order, to a
+`core_types::Sender`. A failed dedup write drops the request rather than risk
+a duplicate turn. Until T29 and T30 consume it, agentd's sink (`Unrouted`)
+logs each item's binding and kind and drops it. agentd runs the queue as a
+`server::Worker` next to the listeners: `Routers` gained a `workers` field,
+and the queue ends once the public listener's router is dropped, so every
+acknowledged request is handled within the drain timeout. An acknowledged
+request is lost if agentd dies before handling it; Slack won't retry it.
+
+### Replays inside the five-minute window
+
+**Issue.** Signature verification with a five-minute window still lets a
+captured request be replayed within those minutes. Events are covered by
+`event_id` deduplication, but slash commands and interactivity have no id.
+
+**Solution.** Commands and interactions are deduplicated by their signature,
+lowercased (the verifier accepts either hex case, so an uppercased copy would
+otherwise pass), under `slack:<binding>:request`. Slack doesn't retry them, so
+a second copy is never legitimate. Timestamps are also refused when more than
+five minutes in the future, not only in the past.
+
+### Current Slack apps post without a subtype
+
+**Issue.** The plan ignores every subtype but `file_share` and
+`thread_broadcast`, and describes bot events without a `user` field. In the
+payloads of Slack's SDK test suites (`slackapi/bolt-python`
+`tests/scenario_tests/test_message_bot.py`), a current app's bot post has no
+subtype, with `bot_id`, `bot_profile` and its bot user in `user`; the
+`bot_message` subtype, without `user`, is for classic integrations and
+`response_url` posts.
+
+**Solution.** Kept as the plan says: agent posts arrive with no subtype and a
+`user`, and `bot_message` is ignored. The "no `user`" rule still applies to a
+bot event that passes the subtype filter (a fixture covers one). T32 should
+record which shape another agent's post has.
+
+### Mentions typed inside a rich-text block
+
+**Issue.** "Mentions come from `<@U…>` tokens in the text and in `blocks`"
+could be read as scanning every string in the blocks. In a `rich_text` block,
+a member who types `<@U123>` literally gets a `text` element holding it,
+while a real mention is a `user` element (and the message `text` escapes the
+literal as `&lt;@U123&gt;`).
+
+**Solution.** Mentions are the tokens in `text`, the `user` elements of
+`rich_text` blocks, and the tokens in `mrkdwn` text objects (section and
+context blocks, which bots post). `plain_text` and rich-text `text` elements
+are not scanned. Each user appears once, in order of first appearance.
+
+### A misspelled manager secret went unnoticed
+
+**Issue.** T10 accepts any `AGENTD_SLACK_MANAGER_<NAME>`, so a misspelled
+`…_SIGNING_SECRET` would silently leave the manager binding unknown.
+
+**Solution.** When any `AGENTD_SLACK_MANAGER_*` variable is set,
+`AGENTD_SLACK_MANAGER_SIGNING_SECRET` must be too; the error asks whether one
+is misspelled. The manager is known exactly when the secret is set, and
+agentd logs at startup which it is.

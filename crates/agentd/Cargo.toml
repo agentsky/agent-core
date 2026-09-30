@@ -12,8 +12,10 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
+core-types.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 secrecy.workspace = true
@@ -21,6 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 store.workspace = true
+surface-slack.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -30,4 +33,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-core-types.workspace = true
+testkit.workspace = true

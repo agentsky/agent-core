@@ -43,6 +43,9 @@ running them as a separate step. Configuration errors name the key or
 variable at fault, and any other variable starting with `AGENTD_` is refused.
 Each listener binds agentd's own address on its network, never `0.0.0.0`.
 `GET /healthz` on the public listener answers 200 while the database does.
+It also serves Slack's request URLs, `/slack/b/<binding>/events`,
+`…/interactivity` and `…/commands`; the manager app's binding is `manager`,
+and its requests are verified with `AGENTD_SLACK_MANAGER_SIGNING_SECRET`.
 On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.

@@ -1928,23 +1928,29 @@ Deliverables:
 
   The app id doesn't exist until `apps.manifest.create` returns, but the
   manifest must already carry its URLs, so agentd mints the binding id first
-  (T31). The manager app uses the fixed binding `manager`. The path selects
-  the signing secret: the binding's for agent apps, the one from configuration
-  for the manager. Unknown bindings get 404.
+  (T31). The manager app uses the fixed binding `manager`, whose events carry
+  the nil UUID as their `BindingId` (`BindingRef::MANAGER_ID`). The path
+  selects the signing secret: the binding's for agent apps, the one from
+  configuration for the manager. Unknown bindings get 404.
+  ([impl-notes](impl-notes.md#t28-slack-ingress))
 - Signature verification: `v0=HMAC-SHA256(secret, "v0:{ts}:{body}")` over the
   raw body, compared in constant time, rejecting timestamps more than 5 minutes
-  old.
+  from now in either direction, missing or repeated headers, and bodies over
+  1 MiB.
 - `url_verification`: echo the challenge for a known binding, without checking
   the signature. Slack sends it during `apps.manifest.create`, before agentd
   has the new app's signing secret. The echo has no side effects. Every other
   request type must verify.
   This PR adds that detail to the design's Slack transport bullet.
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
-  200 at once. Slash commands and interactivity return an empty 200 and reply
-  later through `response_url`.
+  200 at once, or 503 when the queue is full, so Slack retries; they never
+  wait for the queue. Slash commands and interactivity return an empty 200 and
+  reply later through `response_url`.
 - Deduplication per binding: `store.mark_event_processed("slack:<binding>",
   event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
-  a message that reached the same app twice. `X-Slack-Retry-Num` is logged.
+  a message that reached the same app twice. Slash commands and
+  interactivity, which have no event id, are deduplicated by signature, which
+  drops a replay inside the 5-minute window. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
   - Agent apps take every message from `message.channels`,
     `message.groups`, `message.im` and `message.mpim`, and don't subscribe to

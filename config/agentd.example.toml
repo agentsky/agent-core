@@ -14,15 +14,21 @@
 #                              secret unreadable.
 #   AGENTD_RC_MANAGER_TOKEN    The Rocket.Chat manager's personal access token.
 #   AGENTD_SLACK_MANAGER_<NAME>
-#                              The Slack manager app's secrets, such as
-#                              AGENTD_SLACK_MANAGER_SIGNING_SECRET.
+#                              The Slack manager app's secrets.
+#                              AGENTD_SLACK_MANAGER_SIGNING_SECRET verifies
+#                              requests to /slack/b/manager/events,
+#                              /interactivity and /commands; without it those
+#                              URLs answer 404. Every other
+#                              AGENTD_SLACK_MANAGER_* variable requires it.
 #
 # Listeners bind agentd's own address on the network they serve, never
 # 0.0.0.0 or [::]: the public listener on the `egress` network, the proxy and
 # ctl listeners on the `sandbox` network. A port of 0 picks a free port.
 
 [server]
-# The public listener: /healthz, and later Slack and OAuth callbacks. agentd
+# The public listener: /healthz, the Slack request URLs
+# (/slack/b/<binding>/events, /interactivity and /commands), and later OAuth
+# callbacks. agentd
 # terminates no TLS; put a TLS terminator in front of it.
 listen = "172.31.0.2:8443"
 

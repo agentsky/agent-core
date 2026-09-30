@@ -5,7 +5,7 @@
 //!
 //! | Listener | Key | Serves |
 //! | --- | --- | --- |
-//! | public | `server.listen` | `/healthz`, and later Slack and OAuth routes |
+//! | public | `server.listen` | `/healthz`, the Slack request URLs, and later OAuth callbacks |
 //! | proxy | `internal.proxy_listen` | the credential proxy (placeholder) |
 //! | ctl | `internal.ctl_listen` | the agentctl API (placeholder) |
 //!
@@ -13,9 +13,14 @@
 //! `internal.sandbox_subnet`. Every request carries the peer address as
 //! [`ConnectInfo<SocketAddr>`](axum::extract::ConnectInfo); the internal
 //! listeners identify sandboxes by it.
+//!
+//! [`Worker`]s run next to the listeners, such as the queue behind the
+//! Slack routes, and are drained with them on shutdown.
 
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -25,6 +30,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::serve::Listener;
+use core_types::Sender;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -37,12 +43,13 @@ use tower::Service as _;
 
 use crate::app::App;
 use crate::net::RefuseSubnet;
+use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
 /// How long `/healthz` waits for the store before reporting it unavailable.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The routes each listener serves.
+/// The routes each listener serves, and the workers behind them.
 #[derive(Debug)]
 pub struct Routers {
     /// The public listener's routes.
@@ -51,18 +58,61 @@ pub struct Routers {
     pub proxy: Router,
     /// The ctl listener's routes.
     pub ctl: Router,
+    /// Tasks that run as long as the listeners, such as the queue the Slack
+    /// routes fill.
+    pub workers: Vec<Worker>,
 }
 
 impl Routers {
-    /// The routes agentd serves: `/healthz` on the public listener. The
-    /// internal listeners answer everything with 404 until the credential
-    /// proxy and the agentctl API are added.
+    /// The routes agentd serves: `/healthz` and the Slack request URLs on
+    /// the public listener, with the Slack queue as a worker. The internal
+    /// listeners answer everything with 404 until the credential proxy and
+    /// the agentctl API are added.
     pub fn new(app: &App) -> Self {
+        let (slack_routes, slack_queue) = slack::routes(app);
         Self {
-            public: public_router(app.clone()),
+            public: public_router(app.clone()).merge(slack_routes),
             proxy: Router::new(),
             ctl: Router::new(),
+            workers: vec![Worker::new(
+                "Slack queue",
+                slack::run_queue(
+                    slack_queue,
+                    app.store().clone(),
+                    Sender::new(slack::Unrouted),
+                ),
+            )],
         }
+    }
+}
+
+/// A task [`Server::run`] runs next to the listeners.
+///
+/// It must keep running while agentd serves: one that ends before shutdown
+/// stops agentd with an error. On shutdown it gets the same drain timeout as
+/// in-flight requests. A worker that consumes what a router produces should
+/// end once that router is dropped, which happens after its listener has
+/// stopped and its connections have finished.
+pub struct Worker {
+    name: &'static str,
+    task: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Worker {
+    /// A worker named `name` in logs and errors, running `task`.
+    pub fn new(name: &'static str, task: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            name,
+            task: Box::pin(task),
+        }
+    }
+}
+
+impl fmt::Debug for Worker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Worker")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
@@ -154,12 +204,13 @@ impl Server {
     ///    to finish. Whatever is still running then is dropped.
     /// 3. The store is closed.
     ///
-    /// The sweeper runs alongside, every [`SWEEP_INTERVAL`].
+    /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
+    /// routers' [`Worker`]s.
     ///
     /// # Errors
     ///
-    /// If a listener or the sweeper stops before `shutdown` does. The others
-    /// are still shut down gracefully first.
+    /// If a listener, a worker or the sweeper stops before `shutdown` does.
+    /// The others are still shut down gracefully first.
     pub async fn run<F>(self, shutdown: F) -> anyhow::Result<()>
     where
         F: Future<Output = ()> + Send,
@@ -194,6 +245,12 @@ impl Server {
             routers.ctl,
             stopping.clone(),
         ));
+        for worker in routers.workers {
+            tasks.spawn(async move {
+                worker.task.await;
+                worker.name
+            });
+        }
         let store = app.store().clone();
         tasks.spawn(async move {
             sweeper::run(store, SWEEP_INTERVAL, stopping).await;

@@ -8,6 +8,8 @@
 //! - [`config`]: the TOML file plus secret environment variables.
 //! - [`app`]: [`App`], the shared state.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
+//! - [`slack`]: the Slack request URLs' signing secrets, deduplication and
+//!   queue.
 //! - [`sweeper`]: deleting expired rows every minute.
 //! - [`telemetry`]: log output and field redaction.
 //! - [`net`]: subnets and the public listener's guard.
@@ -19,6 +21,7 @@ pub mod cli;
 pub mod config;
 pub mod net;
 pub mod server;
+pub mod slack;
 pub mod sweeper;
 pub mod telemetry;
 

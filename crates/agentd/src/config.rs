@@ -37,6 +37,14 @@ pub const RC_MANAGER_TOKEN_VAR: &str = "AGENTD_RC_MANAGER_TOKEN";
 /// `AGENTD_SLACK_MANAGER_SIGNING_SECRET`. They are collected into
 /// [`Secrets::slack_manager`] by lowercased suffix.
 pub const SLACK_MANAGER_PREFIX: &str = "AGENTD_SLACK_MANAGER_";
+/// The Slack manager app's signing secret, which verifies requests to
+/// `/slack/b/manager/…`. The manager binding is known only when it is set,
+/// and every other [`AGENTD_SLACK_MANAGER_*`](SLACK_MANAGER_PREFIX)
+/// variable requires it.
+pub const SLACK_MANAGER_SIGNING_SECRET_VAR: &str = "AGENTD_SLACK_MANAGER_SIGNING_SECRET";
+/// The key of [`SLACK_MANAGER_SIGNING_SECRET_VAR`] in
+/// [`Secrets::slack_manager`].
+const SLACK_MANAGER_SIGNING_SECRET: &str = "signing_secret";
 /// Every variable with this prefix must be one agentd reads, so a misspelled
 /// secret fails at startup instead of going unnoticed.
 const ENV_PREFIX: &str = "AGENTD_";
@@ -135,6 +143,14 @@ pub struct Secrets {
     /// by its lowercased suffix: `AGENTD_SLACK_MANAGER_SIGNING_SECRET` is
     /// `signing_secret`.
     pub slack_manager: BTreeMap<String, SecretString>,
+}
+
+impl Secrets {
+    /// [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
+    /// if set.
+    pub fn slack_manager_signing_secret(&self) -> Option<&SecretString> {
+        self.slack_manager.get(SLACK_MANAGER_SIGNING_SECRET)
+    }
 }
 
 /// Why the configuration couldn't be loaded.
@@ -401,6 +417,15 @@ impl Secrets {
             )
         })?;
         Sealer::from_base64(&master_key).map_err(|err| invalid(MASTER_KEY_VAR, err.to_string()))?;
+        if !slack_manager.is_empty() && !slack_manager.contains_key(SLACK_MANAGER_SIGNING_SECRET) {
+            return Err(invalid(
+                SLACK_MANAGER_SIGNING_SECRET_VAR,
+                format!(
+                    "is not set, but other {SLACK_MANAGER_PREFIX}* variables are; the manager \
+                     app's requests can't be verified without it (is one of them misspelled?)"
+                ),
+            ));
+        }
         Ok(Self {
             master_key,
             rc_manager_token,
@@ -540,6 +565,38 @@ url = "sqlite::memory:"
         let debug = format!("{config:?}");
         for secret in ["rc-token", "sig-value", "cli-value"] {
             assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    #[test]
+    fn the_slack_manager_signing_secret_is_read_by_name() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert!(config.secrets.slack_manager_signing_secret().is_none());
+        let mut env = env();
+        env.push((
+            SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
+            "sig-value".to_owned(),
+        ));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_signing_secret()
+                .map(ExposeSecret::expose_secret),
+            Some("sig-value")
+        );
+    }
+
+    #[test]
+    fn other_slack_manager_secrets_need_the_signing_secret() {
+        for name in [
+            "AGENTD_SLACK_MANAGER_BOT_TOKEN",
+            "AGENTD_SLACK_MANAGER_SIGNNG_SECRET",
+        ] {
+            let err = env_err(&[(name, "value")]);
+            assert_eq!(err.key(), Some(SLACK_MANAGER_SIGNING_SECRET_VAR), "{err}");
+            assert!(err.to_string().contains("misspelled"), "{err}");
+            assert!(!err.to_string().contains("value"), "{err}");
         }
     }
 
