@@ -4913,10 +4913,11 @@ from every later turn.
 
 **Solution.** The builder reads up to 50 messages of the thread before the
 event and shows every one the session has no row for: a person's message,
-said before or during an earlier turn, or the agent's own post from
-outside the session, marked as such. The session's own replies and what it
-was shown have rows and are left out. Each message shown is recorded in the
-session, which gives it its short id and keeps it out of the next turn;
+said before or during an earlier turn, or the agent's own post from outside
+the session, marked as such when it is attributed to a turn (see the next
+note for the bot's posts that aren't). The session's own replies and what
+it was shown have rows and are left out. Each message shown is recorded in
+the session, which gives it its short id and keeps it out of the next turn;
 the builder returns the short ids it recorded, and the pipeline deletes
 those rows (`Store::forget_message_refs`, inbound rows only) when
 `run_turn` fails, which covers every failure before the CLI read the
@@ -4930,8 +4931,10 @@ the requester when it isn't the sender (a hop). Message text is kept to one
 line in the context block, so a message can't forge its structure; the
 event's own text keeps its line breaks, since a request often holds code,
 but every line after the first is indented, so none of it starts where a
-`[#N] name:` entry or a block would. A thread the event starts has no
-history to read.
+`[#N] name:` entry or a block would. A carriage return, a vertical tab, a
+form feed, NEL and U+2028 and U+2029 break a line there as `\n` does, since
+the model may read any of them as one; each becomes `\n`. A thread the
+event starts has no history to read.
 
 ### Notices have no message ref
 
@@ -4944,10 +4947,21 @@ never ran.
 a failure before the turn reached the model (a second `SessionReset`
 included), the busy line, the notice that part of a reply was lost, and
 the one a shutdown posts. Nothing reads one: no turn is billed for it, and
-a reply in its thread replies to the thread's root, not to the notice. The
-next turn shows one as the agent's post from outside the session. A turn's
-own failure message (a usage limit, a login that expired, a crash, a
+a reply in its thread replies to the thread's root, not to the notice. A
+turn's own failure message (a usage limit, a login that expired, a crash, a
 timeout) comes from a turn that ran, and is recorded as its reply.
+
+The files a turn uploads have no row either: `Surface::upload` returns no
+message, and Slack's `files.completeUploadExternal` doesn't say which
+message shares the files, so the trait wasn't changed for Rocket.Chat
+alone. An attributed upload would also be a second message of one turn
+that another agent's thread could answer. The next turn then shows a
+notice or an upload of the agent's bot as `you`, and only an attributed
+post as `you, outside this session`, since an unattributed one may be the
+session's own. The attribution of an agent's post is waited for only when
+the router reads it (see "An agent's post can arrive before its
+attribution"), so an upload, which mentions no one, holds up no other
+agent's lane.
 
 ### `SurfaceLookup` is asynchronous, and the pipeline posts through it
 
@@ -4978,25 +4992,37 @@ at once mid-turn, and the late reply was posted with the store already
 closed.
 
 **Solution.** The sink looks the candidates up and queues the message for
-each in a lane per agent and thread, whose task answers its messages one
-at a time in arrival order, so the turn message is built only once the
-turn before it has delivered. A lane holds at most 8 waiting messages, and
-the pipeline at most 64 waiting or running; a message past either gets one
-line in its thread saying the agent is busy, posted from the sink, which
-also slows the connection down. The lanes' tasks run in a `JoinSet` of the
+each in a lane per agent and thread, whose task answers its messages one at
+a time in arrival order, so the turn message is built only once the turn
+before it has delivered. A lane holds at most 8 waiting messages, and the
+pipeline at most 64 waiting or running; a person's message past either gets
+one line in its thread saying the agent is busy, posted from the sink,
+which also slows the connection down. A bot's message gets none, whether
+the surface flags the bot or agentd knows it as an agent's or the manager
+bot: the router ignores most of them anyway, and two bots could otherwise
+answer each other's busy lines. The lanes' tasks run in a `JoinSet` of the
 pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
-panicking message doesn't stop its lane. On shutdown `Server::run` stops
-the public listener and the chat connections, closes the pipeline, and
-gives the turns taken the drain timeout while the proxy and ctl listeners,
-which a running turn's CLI and agentctl need, still serve; only then do
-those stop, and the pipeline is dropped before the store is closed. Turns
-still running at the timeout are aborted, their working emoji taken off
-and their threads told to ask again, within five seconds. That is the
-simplest option that tells people: the turns and their queue stay in
+panicking message doesn't stop its lane. The set is behind a
+`std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
+a Rocket.Chat connection's is on every reconnect, can't leave a lane
+created without its task. Queueing checks that the pipeline is open under
+that lock and never starts a task once it is closed. `drain` polls the set
+under the lock without holding it across a wait, so a drain cut off by its
+timeout leaves the tasks for `cut_short`, which takes the set and shuts it
+down. On shutdown `Server::run` stops the public listener and the chat
+connections, closes the pipeline, and gives the turns taken the drain
+timeout while the proxy and ctl listeners, which a running turn's CLI and
+agentctl need, still serve; only then do those stop, and the pipeline is
+dropped before the store is closed. Turns still running or delivering their
+reply at the timeout are aborted, their working emoji taken off and their
+threads told to ask again, within five seconds: the guard that holds a
+turn's working emoji is kept until its reply, or its failure notice, has
+gone out, so a reply stuck on a slow post isn't lost without a word. That
+is the simplest option that tells people: the turns and their queue stay in
 memory rather than the store, so a crash, unlike a shutdown, still loses
 them silently, and messages still waiting in a lane at the timeout are
-dropped without a word, since no decision was made about them. The
-working emoji is held by a guard, so a panicking turn takes it off too.
+dropped without a word, since no decision was made about them. The working
+emoji is held by a guard, so a panicking turn takes it off too.
 
 ### An agent's post can arrive before its attribution
 
@@ -5005,9 +5031,12 @@ working emoji is held by a guard, so a panicking turn takes it off too.
 another agent's connection first. The router then saw a managed bot's
 message with no attribution and ignored it, dropping the hop.
 
-**Solution.** When the sender is an agent's bot and the message has no
-attribution yet, the view reads it again, with pauses doubling from 25 ms,
-for up to two seconds before routing. Only that candidate's lane waits.
+**Solution.** When the sender is another agent's bot, the message mentions
+the candidate, and it has no attribution yet, the view reads it again,
+with pauses doubling from 25 ms, for up to two seconds before routing. Only
+that candidate's lane waits. The router reads the attribution in that case
+only, so any other post of an agent's bot, such as an upload, which never
+gets one, is routed at once.
 
 ### Delivery goes on past a failed part
 
@@ -5016,17 +5045,18 @@ reactions, the outbox's reactions and the queued agentctl posts were lost,
 and so were the chunks after a failed one. The reply had no size cap,
 while `agentctl post` caps its text at `MAX_POST_BYTES`.
 
-**Solution.** Each chunk, the upload, each reaction and each queued post
-is tried whatever happened to the others; a chunk refused with a rate
-limit is posted once more after the wait the platform asks for, up to five
-seconds. If any part was lost, the thread gets one line saying so. The
-reply is cut at `MAX_POST_BYTES` on a character boundary, with a note that
-it was cut. Failures before the turn reached the model (writing the
-persona, reading the plan's model, building the turn message, starting the
-process) post the short failure notice too, once the bot is known to be
-able to post; a link prompt waits for the same check. The usage-limit and
-login texts name "the Claude account this request runs on" rather than
-"your", since a turn may run on the community key.
+**Solution.** Each chunk, the upload, each reaction and each queued post is
+tried whatever happened to the others; a chunk refused with a rate limit is
+posted once more after the wait the platform asks for, up to five seconds.
+If any part was lost, the thread gets one line saying so. The reply is cut
+at `MAX_POST_BYTES` on a character boundary, with a note that it was cut; a
+backtick or tilde code fence the cut leaves open is closed first, so the
+note isn't rendered as code. Failures before the turn reached the model
+(writing the persona, reading the plan's model, building the turn message,
+starting the process) post the short failure notice too, once the bot is
+known to be able to post; a link prompt waits for the same check. The
+usage-limit and login texts name "the Claude account this request runs on"
+rather than "your", since a turn may run on the community key.
 
 ### A turn whose start hook failed stops the process
 
