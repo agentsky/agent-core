@@ -80,7 +80,7 @@ one move:
 | `render` | lib | Markdown to Slack mrkdwn and Rocket.Chat, splitting, directives. |
 | `commands` | lib | `/agent` grammar and its parsed `Command` type. Handlers live in agentd. |
 | `router` | lib | **Added.** The design has "Router and turn policy" in the architecture diagram but no crate for it. It holds pure routing, gating and credential-selection logic. |
-| `runner` | lib | stream-json driver, per-session queue, warm pool, reaping. |
+| `runner` | lib | stream-json driver, per-session queue, warm pool, reaping. It never calls agentd: placeholder minting and turn tokens reach it through a `TurnHooks` trait that agentd implements (T23). |
 | `sandbox` | lib | `Sandbox` trait, Docker implementation (bollard), process implementation for tests and development. |
 | `cred-proxy` | lib | Header-swap reverse proxy and egress allowlist proxy. Served by agentd. |
 | `surface-rocketchat` | lib | REST and DDP clients, `Surface` implementation. |
@@ -126,8 +126,10 @@ description, and must pass T02's policy.
 
 - One TOML file (`agentd --config /etc/agentd/agentd.toml`) plus environment
   overrides for secrets only. Secrets never go in the file:
-  `AGENTD_MASTER_KEY` (base64, 32 bytes), `AGENTD_RC_MANAGER_TOKEN`,
-  `AGENTD_SLACK_MANAGER_*`, `AGENTD_COMMUNITY_API_KEY`.
+  `AGENTD_MASTER_KEY` (base64, 32 bytes), `AGENTD_RC_MANAGER_TOKEN` and
+  `AGENTD_SLACK_MANAGER_*`. The community API key is not configuration. An
+  admin sets it with `/agent admin api-key set` (T26), and it is stored sealed.
+  There is one source, so there is no precedence question.
 - `agentd gen-key` prints a new master key.
 - The file's sections, each added by the task that first needs it: `[server]`,
   `[internal]`, `[store]`, `[claude_oauth]`, `[sandbox]`, `[proxy]`,
@@ -156,23 +158,49 @@ description, and must pass T02's policy.
 - Two Docker networks:
   - `egress` is a normal bridge.
   - `sandbox` is `internal: true`, so it has no route out.
-- agentd runs in a container on both networks. On `sandbox` it has the aliases
+- agentd runs in a container on both networks, with a static address on each
+  (Compose `ipv4_address` on fixed subnets). On `sandbox` it has the aliases
   `cred-proxy.internal` and `agentctl.internal`.
+- Rocket.Chat and MongoDB are on `egress` only.
 - Sandbox containers attach to `sandbox` only. Everything they reach, they reach
   through agentd.
 - agentd listeners:
 
-  | Listener | Default | Reachable from | Serves |
+  | Listener | Binds | Reachable from | Serves |
   | --- | --- | --- | --- |
-  | public | `0.0.0.0:8443` | the internet, behind the operator's TLS terminator | Slack events, interactivity, slash commands, OAuth callbacks, `/healthz` |
-  | proxy | `:8080` on the sandbox network | sandboxes | `ANTHROPIC_BASE_URL` target, plus `HTTPS_PROXY` CONNECT with an allowlist |
-  | ctl | `:8081` on the sandbox network | sandboxes | agentctl API |
+  | public | agentd's `egress` address, port 8443 | the internet, behind the operator's TLS terminator | Slack events, interactivity, slash commands, OAuth callbacks, `/healthz` |
+  | proxy | agentd's `sandbox` address, port 8080 | sandboxes | `ANTHROPIC_BASE_URL` target, plus `HTTPS_PROXY` CONNECT with an allowlist |
+  | ctl | agentd's `sandbox` address, port 8081 | sandboxes | agentctl API |
 
+- Each listener binds its own address, never `0.0.0.0`, so a sandbox can't
+  reach the public routes. As a second guard, the public listener also refuses
+  connections from the sandbox subnet. T16 has a Docker test that a sandbox
+  reaches only ports 8080 and 8081.
 - A container's network identity is its IP on the `sandbox` network, read from
   `docker inspect` after start. The proxy and the ctl API map the source IP of
-  each connection to a session, and reject any IP they don't know.
+  each connection to a session, and reject any IP they don't know. Docker can
+  give a dead container's IP to a new one, so mappings are revoked before a
+  container is stopped and again when Docker reports it died (T21), and turn
+  tokens are purged at startup (T15).
 - agentd terminates no TLS itself. The operator puts a TLS terminator in front
   of the public listener; the README documents a Caddy example.
+
+### Volumes and scopes
+
+- A volume is keyed by `VolumeKey { agent, scope }`, matching the design's one
+  volume per `(agent, scope)`. Two agents in one channel never share a volume
+  or its `shared/` directory.
+- The owner's DMs with their agent and the agent's private tasks use one
+  volume, `VolumeKey { agent, scope: Private }`. Its `shared/` directory holds
+  what the owner granted: repositories and memory. Sessions stay separate
+  (each mounts only its own `sessions/<id>/`), so a private task can't read the
+  owner's DM transcript, as the design requires.
+- A non-owner's DM with an agent is a `Dm` scope with its own volume, and runs
+  on the public side.
+- Channel and group DM scopes each get their own volume per agent.
+- Writes to `shared/` go through `agentctl lock -- <command>` (T15), which
+  holds the scope's lock while the command runs. That is the design's
+  "scope-level lock that `agentctl` takes for writes".
 
 ### Claude Code CLI
 
@@ -209,11 +237,20 @@ description, and must pass T02's policy.
   `ANTHROPIC_BASE_URL` with its credential header. That lets runner,
   cred-proxy and pipeline tests run end to end without Docker or an Anthropic
   account.
+- Other crates find the binary with `testkit::fake_claude_path()`. Cargo only
+  sets `CARGO_BIN_EXE_<name>` for a package's own integration tests. The helper
+  runs `$CARGO build -p testkit --bin fake-claude --message-format=json` once
+  per test process and reads the executable path from the artifact message.
+  That respects whatever target directory is in effect, including
+  `cargo llvm-cov`'s.
 - Tests that need Docker are named `docker_*` and marked
   `#[ignore = "needs docker"]`. CI runs them with
-  `cargo test -- --ignored docker_` in a separate job (added in T17).
-- The coverage gate (85% of lines, workspace-wide) stays as is. Thin adapters
-  that only Docker or live tests exercise must stay thin.
+  `cargo test --workspace -- --ignored docker_` in a separate job (added in
+  T17), so Docker tests in any crate run.
+- The coverage gate (85% of lines, workspace-wide) stays as is. Docker tests
+  don't run under coverage, so code that only they exercise must stay thin.
+  Build requests to Docker, such as container configuration, as pure functions
+  with unit tests, and keep the code that sends them small.
 - Live checks against real Slack and Rocket.Chat are manual. The PR records
   what was run and what was seen. Never put real tokens in fixtures; redact
   captured payloads.
@@ -259,7 +296,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T12](#t12) | Rocket.Chat realtime and `Surface` | `rocketchat-realtime` | T04, T11 | M1 |
 | [T13](#t13) | Command dispatch and account commands | `account-commands` | T08, T09, T10, T12 | M1 |
 | [T14](#t14) | Agent lifecycle on Rocket.Chat | `agent-lifecycle-rocketchat` | T13 | M1 |
-| [T15](#t15) | `agentctl` and the ctl API | `agentctl` | T05, T10 | M2 |
+| [T15](#t15) | `agentctl` and the ctl API | `agentctl` | T04, T05, T10 | M2 |
 | [T16](#t16) | Sandbox image and Compose dev stack | `sandbox-image` | T15 | M2 |
 | [T17](#t17) | `sandbox` crate | `sandbox-crate` | T04, T05 | M2 |
 | [T18](#t18) | Credential proxy: header swap | `cred-proxy-swap` | T04, T09 | M2 |
@@ -267,7 +304,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T20](#t20) | `runner`: stream-json process driver | `runner-process` | T04, T17 | M2 |
 | [T21](#t21) | `runner`: sessions, queue, warm pool | `runner-sessions` | T20 | M2 |
 | [T22](#t22) | `router`: gating and credential policy | `router-policy` | T03, T04 | M2 |
-| [T23](#t23) | Turn pipeline end to end | `turn-pipeline` | T07, T14, T15, T18, T21, T22 | M2 |
+| [T23](#t23) | Turn pipeline end to end | `turn-pipeline` | T07, T14, T15, T16, T18, T19, T21, T22 | M2 |
 | [T24](#t24) | Session commands | `session-commands` | T23 | M2 |
 | [T25](#t25) | Skills and the `agentctl` skill | `skills` | T23 | M2 |
 | [T26](#t26) | Requester-pays routing | `requester-pays` | T23 | M3 |
@@ -294,8 +331,9 @@ Progress:
 - [ ] T35 · [ ] T36
 
 The design's milestone 3 (requester-pays) moves ahead of milestone 4 (Slack)
-as the design orders it. Slack work (T28 to T30) doesn't depend on M2 or M3 and
-can start as soon as T10 lands.
+as the design orders it. The Slack surface (T28, T29) needs only T05, T07 and
+T10, and the manager app (T30) adds T13, so that work can run alongside phases
+2 and 3. Only T31 waits for the pipeline.
 
 ## Dependency graph
 
@@ -303,14 +341,14 @@ can start as soon as T10 lands.
 graph TD
     T01 --> T02
     T01 --> T03
-    T01 --> T06
     T03 --> T04
     T03 --> T05
-    T03 --> T08
-    T03 --> T11
+    T01 --> T06
     T06 --> T07
+    T03 --> T08
     T05 --> T09
     T05 --> T10
+    T03 --> T11
     T04 --> T12
     T11 --> T12
     T08 --> T13
@@ -318,6 +356,7 @@ graph TD
     T10 --> T13
     T12 --> T13
     T13 --> T14
+    T04 --> T15
     T05 --> T15
     T10 --> T15
     T15 --> T16
@@ -326,22 +365,27 @@ graph TD
     T04 --> T18
     T09 --> T18
     T18 --> T19
+    T04 --> T20
     T17 --> T20
     T20 --> T21
     T03 --> T22
+    T04 --> T22
     T07 --> T23
     T14 --> T23
     T15 --> T23
+    T16 --> T23
     T18 --> T23
+    T19 --> T23
     T21 --> T23
     T22 --> T23
     T23 --> T24
     T23 --> T25
     T23 --> T26
     T26 --> T27
+    T05 --> T28
     T10 --> T28
-    T28 --> T29
     T07 --> T29
+    T28 --> T29
     T13 --> T30
     T29 --> T30
     T30 --> T31
@@ -395,12 +439,17 @@ Deliverables:
   states the crate rules: `testkit` is only a dev-dependency, `core-types` does
   no I/O, and surface crates never depend on each other.
 - `README.md`'s Development section mentions the workspace and the plan.
+- `scripts/ci/docs-only.sh` treats every path under `crates/` as code, even
+  `.md` files. Personas and skills there (T14, T25) are runtime assets that
+  tests read, so a change to one must not skip the build and test jobs.
 
 Acceptance:
 
 - Every existing CI job passes unchanged, and the coverage job covers every
   crate (check the per-crate list in the coverage summary).
 - `cargo tree -e normal -i openssl-sys` reports nothing.
+- `sh scripts/ci/docs-only.sh` exits 1 for a diff touching only
+  `crates/x/assets/a.md`, and 0 for one touching only `docs/a.md`.
 
 Out of scope: any real code in the crates.
 
@@ -413,9 +462,12 @@ Deliverables:
 - `deny.toml` with these sections:
   - `[bans]` denies `openssl`, `openssl-sys` and `native-tls`, and warns on
     duplicate versions.
-  - `[licenses]` allows the licenses the lockfile actually needs (MIT,
-    Apache-2.0, BSD, ISC, Unicode, Zlib, MPL-2.0 for `webpki-roots` if pulled
-    in) and denies copyleft.
+  - `[licenses]` allows the permissive licenses the lockfile actually needs
+    (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unicode-3.0, Zlib, and
+    CDLA-Permissive-2.0 if `webpki-roots` is pulled in). GPL, LGPL and AGPL
+    are denied. A weak-copyleft license such as MPL-2.0 is allowed only as a
+    per-crate exception with a reason. `[licenses.private] ignore = true`,
+    because the workspace crates carry only `license-file`.
   - `[advisories]` denies vulnerabilities and warns on unmaintained crates.
   - `[sources]` allows crates.io only.
 - A `deny` job in `.github/workflows/ci.yml`, using
@@ -451,8 +503,9 @@ Deliverables in `crates/core-types/src/`:
   - `ScopeKind` (`Dm`, `Channel`, `GroupDm`, `Private`).
   - `ScopeKey`, which renders to a stable string such as
     `dm:<surface>:<team>:<conv>`, `ch:<surface>:<team>:<conv>` or
-    `private:<agent>`. It is used for volume names, and its parse and display
-    round-trip.
+    `private`. Its parse and display round-trip.
+  - `VolumeKey { agent, scope }`, rendered as `<agent>/<scope>`, which names
+    volumes (see [Volumes and scopes](#volumes-and-scopes)).
 - `event.rs`: `InboundEvent` with:
   - `event_id` for deduplication, `binding`, `sender: MemberKey`.
   - `sender_is_bot: bool` and `sender_bot_user: Option<UserId>`.
@@ -467,14 +520,16 @@ Deliverables in `crates/core-types/src/`:
   - `TurnKind` (`Normal`, `PrivateTask(ConsentId)`).
 - `surface_trait.rs`: the design's `Surface` trait verbatim, with
   `#[async_trait]`, plus the `Binding`, `OutFile`, `InFile`, `Msg` and `Caps`
-  types. `Caps` has `max_message_chars`, `supports_edit`, `supports_buttons`
-  and `supports_threads`. Errors are `SurfaceError` with `thiserror`, including
+  types. `Caps` has `message_limit` (T07's `Limit`), `supports_edit`,
+  `supports_buttons`, `supports_threads` and `per_binding_delivery`. The last
+  is true where every agent's app receives its own copy of an event (Slack),
+  and false where agentd deduplicates one copy per message (Rocket.Chat). Errors are `SurfaceError` with `thiserror`, including
   a `RateLimited { retry_after }` variant.
 - `ctl.rs`: agentctl request and response types (serde) for `attach`, `post`,
-  `react`, `history`, `ask-agent` and `private`, with the error type. The
-  binary and the server share these.
+  `react`, `history`, `lock`, `ask-agent`, and `private` (task text plus file
+  paths), with the error type. The binary and the server share these.
 
-Acceptance: unit tests for `ScopeKey` round-trips, serde round-trips of every
+Acceptance: unit tests for `ScopeKey` and `VolumeKey` round-trips, serde round-trips of every
 wire type, and ID parsing. The crate has no dependency outside `serde`,
 `serde_json`, `uuid`, `time`, `thiserror` and `async-trait`.
 
@@ -512,14 +567,17 @@ Deliverables:
     `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<id>.jsonl`.
   - Can run `agentctl` commands listed in the script, to exercise the ctl API
     later.
+- `fake_claude_path()`, as described in [Testing](#testing), so other crates
+  can spawn the binary.
 - `fake_anthropic()`: a `wiremock` server that answers `/v1/messages` and
   `HEAD /api/hello`, and records the headers it received.
 - A `fixtures/` directory with the `stream-json` sample lines listed in
   [Claude Code CLI](#claude-code-cli). Capture them from a real CLI with an
   unreachable base URL, as in this plan's research, and redact the paths.
 
-Acceptance: tests that run `fake-claude` as a child process (found with
-`env!("CARGO_BIN_EXE_fake-claude")`) cover each of its checks. `MockSurface`
+Acceptance: tests that run `fake-claude` as a child process cover each of its
+checks. At least one test finds it through `fake_claude_path()`, so the helper
+is covered under `cargo coverage` as well. `MockSurface`
 has tests for its log and inject path.
 
 Out of scope: fake Rocket.Chat and Slack servers. Those are added with their
@@ -549,7 +607,8 @@ Deliverables:
     unique key on `(surface, team_id, user_id)`.
   - `claude_links` (`member_id` primary key, `access_token_enc`,
     `refresh_token_enc`, `expires_at`, `plan`, `rate_limit_tier`,
-    `updated_at`).
+    `broken_at`, `updated_at`). `broken_at` is set when a refresh fails and
+    cleared by the next successful login.
   - `pending_logins` (`state` primary key, `member_id`, `verifier_enc`,
     `expires_at`).
   - `processed_events` (`source`, `event_id`, `seen_at`) with a primary key on
@@ -574,8 +633,11 @@ Acceptance:
   test with `tokio::join!` on a file-backed database.
 - The migration applies to an empty database and is idempotent.
 
-Out of scope: agent, binding, session, message, consent and usage tables
-(added by T14, T21, T23, T27, T30 and T33).
+Out of scope: every other table. Each task that needs one adds its own
+migration: agents and bindings (T14), turn tokens and scope locks (T15),
+volumes (T17), sessions (T21), message refs (T23), community settings (T26),
+usage, policies, bans and thread usage (T27), Slack configuration tokens
+(T30), consents (T33).
 
 ### T06
 
@@ -624,11 +686,14 @@ Reference: qm-core `src/slack/safe-cut.ts`.
 
 Deliverables:
 
-- `render::split(text: &str, max_chars: usize) -> Vec<String>`. It:
+- `render::split(text: &str, limit: Limit) -> Vec<String>`, where
+  `Limit { max: usize, unit: LengthUnit }` and `LengthUnit` is `Chars` or
+  `Utf16`. Rocket.Chat checks `Message_MaxAllowedSize` against JavaScript
+  string length, so its limit counts UTF-16 code units, and an emoji counts
+  as two. It:
   - Prefers paragraph breaks, then line breaks, then spaces.
   - Never cuts inside a Slack `<…>` token, a Markdown link, a mention or a
-    multi-byte character. Cut on `char` boundaries; limits count `char`s, the
-    unit Slack and Rocket.Chat use.
+    multi-byte character. Cuts fall on `char` boundaries.
   - Closes an open code fence at the end of a chunk and reopens it, with the
     same info string, at the start of the next.
 - `render::directives::extract(text) -> (String, Vec<Directive>)` for
@@ -637,15 +702,16 @@ Deliverables:
 - `render::rocketchat::to_markdown(md, directory)`: pass-through, neutralizing
   `@all` and `@here` outside code, with the same `@Name` resolution as Slack.
 - Per-surface limits as constants: Slack 3,000 characters per `text` chunk
-  (under the 4,000 hard limit, leaving room for rendering growth) and
-  Rocket.Chat 5,000 (the server default `Message_MaxAllowedSize`).
-  `Caps.max_message_chars` carries them, and the Rocket.Chat value is
-  overridable from configuration.
+  (under the 4,000 hard limit, leaving room for rendering growth), and
+  Rocket.Chat 5,000 UTF-16 units (the server default `Message_MaxAllowedSize`).
+  `Caps` carries them as a `Limit`, and the Rocket.Chat value is overridable
+  from configuration.
 
 Acceptance: property-style tests (a hand-written generator is enough; no new
 dependency). Rejoining the chunks with fences removed gives back the original
-text, and no chunk exceeds the limit. Fixed cases cover a URL at the limit, an
-emoji at the limit, and a 10,000-character code block.
+text, and no chunk exceeds the limit in its unit. Fixed cases cover a URL at
+the limit, an emoji at the limit in both units, and a 10,000-character code
+block.
 
 ### T08
 
@@ -677,8 +743,9 @@ Deliverables:
     by T33.
 - Agent names validated as `[a-z0-9-]{2,32}`.
 - `limits` parses `turns=N/day hops=N` in any order.
-- `Command::is_secret_bearing()` is true for `Login { code: Some }` and
-  `SlackToken`, so callers can enforce private-channel rules and redact logs.
+- `Command::is_secret_bearing()` is true for `Login { code: Some }`,
+  `SlackToken` and `Admin(ApiKey { set })`, so callers can enforce
+  private-channel rules and redact logs.
 - `Command::help()` gives short usage text per command. An unknown command
   returns the help text as the error message.
 
@@ -756,8 +823,12 @@ Deliverables:
   and `agentd gen-key`.
 - Config loading: TOML plus secret environment variables, as in
   [Configuration](#configuration). Validation errors name the key.
-- `tracing` setup: human output on a TTY, JSON otherwise. A redaction layer
-  refuses to log any field named like `token`, `secret`, `key` or `code`.
+- `tracing` setup: human output on a TTY, JSON otherwise. Secrets are
+  `secrecy` types and never reach a field. As a backstop, a redaction layer
+  replaces the value of any field whose whole name is in a fixed list
+  (`token`, `access_token`, `refresh_token`, `bot_token`, `secret`,
+  `client_secret`, `signing_secret`, `api_key`, `code`, `verifier`,
+  `password`), so fields such as `scope_key` are still logged.
 - An axum public listener with `GET /healthz`, which checks the store. The
   internal listeners are placeholders that later tasks fill.
 - Graceful shutdown on SIGTERM: stop accepting, then drain for a configurable
@@ -786,9 +857,14 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
   - `users.create` with `roles: ["bot"]`, and `verified`, `joinDefaultChannels:
     false` and `requirePasswordChange: false`, with a random password that is
     never stored.
-  - `users.createToken`, or `users.generatePersonalAccessToken` when logged in
-    as the bot. Pick the one that works with the custom role on the target
-    server version and record which in the PR.
+  - A token for the new bot, in one of two ways. Pick the one that works with
+    the custom role on the target server version and record which in the PR:
+    - `users.createToken`. Recent servers refuse it unless the server runs
+      with `CREATE_TOKENS_FOR_USERS=true`.
+    - Log in once as the bot with its random password, then call
+      `users.generatePersonalAccessToken`. The `bot` role needs
+      `create-personal-access-tokens`, and the password is discarded
+      afterwards.
   - `users.setAvatar`, `users.update` (name), `users.setActiveStatus`.
   - `channels.invite` and `groups.invite`, `rooms.info`,
     `im.create`.
@@ -824,12 +900,17 @@ Deliverables:
   - Answer server `ping` with `pong`.
   - Subscribe to `stream-room-messages` per joined room. Per the design's open
     question, don't rely on `__my_messages__`.
+  - Subscribe to `stream-notify-user` `<uid>/subscriptions-changed`, and
+    subscribe to a room as soon as the bot is added to it. Owners invite bots
+    through the normal Rocket.Chat UI (T14), and the bot must hear the room
+    without a restart.
   - Reconnect with jittered exponential backoff and resubscribe.
   - One connection per bot user (managed agents and the manager).
 - Normalization into `InboundEvent`:
   - `mentions[]._id` goes to `mentions`.
   - `t` system messages are ignored.
-  - `tmid` becomes `thread_root`.
+  - `tmid` becomes `thread_root`, and also `reply_to`, since the router
+    decides whether the thread root is the agent's own message.
   - Room type `d` sets `is_dm`.
   - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`.
   - Edits (`editedAt`) are ignored.
@@ -838,8 +919,9 @@ Deliverables:
 - Deduplication through `store.mark_event_processed("rocketchat", _id)`, since
   several bots in one room each receive every message.
 - `RocketChatSurface`, implementing `Surface` over T11 and this client, with
-  `Caps { max_message_chars: 5000, supports_edit: true, supports_buttons:
-  false, supports_threads: true }`. Buttons stay false because interactive
+  `Caps { message_limit: 5000 UTF-16 units, supports_edit: true,
+  supports_buttons: false, supports_threads: true, per_binding_delivery:
+  false }`. Buttons stay false because interactive
   buttons need Apps-Engine. Consent uses text commands, see T33.
 - `testkit::rocketchat::FakeDdp`: a small WebSocket server scripting DDP
   frames.
@@ -847,8 +929,9 @@ Deliverables:
 Acceptance:
 
 - Tests against `FakeDdp` for login, subscription, a mention event producing
-  the right `InboundEvent`, and a dropped connection reconnecting and
-  resubscribing.
+  the right `InboundEvent`, a dropped connection reconnecting and
+  resubscribing, and a `subscriptions-changed` notice leading to a new room
+  subscription.
 - A test that two bots in one room produce one processed event, and that the
   router receives it once per mentioned agent. Routing to the mentioned agents
   happens in T23; here, assert the event carries every mention.
@@ -873,15 +956,19 @@ Deliverables:
   - A channel message starting with `!agent` is parsed after the prefix.
 - Handlers:
   - `login`: start the login and send the link privately.
-  - `login <code>`: complete the login. From `RocketChatChannel`, refuse,
-    invalidate the member's pending logins, and tell them privately to start
-    again.
+  - `login <code>`: complete the login.
+  - Any secret-bearing command from `RocketChatChannel` (`login <code>`,
+    `admin api-key set`) is refused, and the member is told privately that the
+    secret is now public. For `login <code>`, the member's pending logins are
+    invalidated and they are told to start again. For the API key, the admin is
+    told to revoke that key at Anthropic.
   - `logout`: delete the link (and, later, the Slack configuration token; T30
     adds that).
   - `me`: link status and plan. The usage line is added in T27, the manager app
     name in T30.
-- Relink notice: when `TokenSource` reports `RelinkRequired`, DM the member
-  once per failure. Deduplicate it through the store.
+- Relink notice: when `TokenSource` reports `RelinkRequired`, DM the member.
+  Send it only when `claude_links.broken_at` goes from empty to set, so there is
+  one notice per failure.
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
@@ -901,9 +988,12 @@ Deliverables:
 - A migration `…_agents.sql`:
   - `agents` (`id`, `owner_id`, `name` unique per owner, `persona`,
     `visibility`, `state` of `active`, `paused` or `deleted`, `created_at`).
-  - `agent_bindings` (`id`, `agent_id`, `surface`, `team_id`, `bot_user_id`,
-    `bot_token_enc`, plus the Slack columns from the design, nullable), unique
-    on `(surface, team_id, bot_user_id)`.
+  - `agent_bindings` (`id`, `agent_id`, `surface`, `team_id`, `bot_user_id`
+    nullable, `bot_token_enc` nullable, `state` of `creating`,
+    `pending_install`, `active` or `disabled`, `state_changed_at`, plus the
+    Slack columns from the design, nullable). Unique on `(surface, team_id,
+    bot_user_id)` where `bot_user_id` is set. Slack bindings exist before their
+    bot user does (T31).
 - Store methods for agents and bindings.
 - Handlers:
   - `create <name> [persona]` requires a linked member.
@@ -914,7 +1004,9 @@ Deliverables:
     3. Store the binding.
     4. Start its realtime connection.
     5. Reply with how to invite it.
-  - `persona <name> <text>`: owner only.
+  - `persona <name> <text>`: owner only. A `persona.md` file attached to a
+    DM with the manager bot, with `persona <name>` as its text, replaces the
+    persona the same way. Size is capped at 64 KB.
   - `list [@user]`: an agent directory.
   - `pause`, `resume` and `delete`, owner only. Delete deactivates the bot user
     and stops its connection; state becomes `deleted`.
@@ -937,8 +1029,8 @@ that mentions arrive per bot.
 
 ### T15
 
-**`agentctl` and the ctl API.** Branch `claude/agentctl`. Depends on T05 and
-T10.
+**`agentctl` and the ctl API.** Branch `claude/agentctl`. Depends on T04, T05
+and T10.
 
 Design: [Tools and skills](design.md#tools-and-skills).
 
@@ -947,26 +1039,43 @@ Deliverables:
 - `agentctl`, a static binary:
   - Subcommands `attach <path>`, `post --to <target> <text>`,
     `react <emoji> [message id]`, `history [--before id]`,
-    `ask-agent <agent> <task>` and `private <task>`.
+    `lock -- <command>…`, `ask-agent <agent> <task>` and
+    `private [--file <path>]… <task>`.
+  - `lock` acquires the scope's `shared/` lock through the API, runs the
+    command, and releases the lock when it exits. The lock is a lease in a
+    `scope_locks` table (`volume_key`, `holder_session`, `expires_at`),
+    renewed while the command runs, so a crashed holder frees it. This is the
+    lock the design says `agentctl` takes for writes; the PR adds the command
+    to the design's table.
   - Reads `AGENTCTL_URL` (default `http://agentctl.internal:8081`) and
     `AGENTCTL_TOKEN` from the environment.
   - Prints results as plain text for the model, and exits non-zero with a
     one-line reason on refusal.
   - `attach` streams the file to the API, capped at a configurable size
     (default 50 MB).
-- A CI step that builds `agentctl` for `x86_64-unknown-linux-musl` and checks
-  with `file` that the result is statically linked. It has no TLS and no C
-  dependencies, so the target needs no extra system packages.
+- A CI job, on x86_64 only, that adds the `x86_64-unknown-linux-musl` target,
+  builds `agentctl` for it, and checks that `readelf -l` shows no `INTERP`
+  segment (musl builds are static-pie, which `file` does not call
+  "statically linked"). agentctl has no TLS and no C dependencies, so the
+  target needs no extra system packages. The job is added to `ci-passed`.
 - The ctl API server in agentd, `crates/agentd/src/ctl/`, on the ctl listener:
   - Bearer token auth. Tokens are 32 random bytes stored as a SHA-256 hash in a
     new `turn_tokens` table (`hash`, `session_id`, `turn_id`, `agent_id`,
     `scope_key`, `requester`, `hop`, `kind`, `container_ip`, `expires_at`).
-    That table's migration belongs to this task.
+    That table's migration belongs to this task. agentd deletes every row at
+    startup: containers from before a restart are reaped (T17), and Docker can
+    give their IPs to new containers.
   - The connection's source IP must match `container_ip`.
   - `issue_turn_token(...)` and `revoke_turn_token(...)` for the runner.
   - Handlers write to a per-turn outbox (attachments staged on disk under the
     agentd data directory, reactions and posts queued) that the turn pipeline
     (T23) drains.
+  - Target rules, checked when the request arrives:
+    - On the public side (any turn a non-owner requested), `post` may target
+      only the current conversation, and `react` only messages in it.
+    - On the owner side, `post` may target any conversation the agent is bound
+      in and the owner is a member of.
+    - Anything else is refused with a reason the model can read.
   - `history` calls `Surface::history`.
   - `ask-agent` and `private` return "not available yet" until T33 and T34.
   - Refusal rule already in place: inside a `TurnKind::PrivateTask` token,
@@ -974,7 +1083,9 @@ Deliverables:
 
 Acceptance:
 
-- Tests for token hashing, expiry, IP binding and refusal inside private tasks.
+- Tests for token hashing, expiry, IP binding, the startup purge, refusal
+  inside private tasks, each target rule, and a `lock` lease that a second
+  session waits for and that expires when its holder dies.
 - `agentctl` against the server for each subcommand, through the `fake-claude`
   script path from T04.
 
@@ -1001,8 +1112,9 @@ Deliverables:
 - `images/agentd/Dockerfile`: a multi-stage build of agentd on a distroless or
   Debian slim base, run as non-root.
 - `deploy/compose/compose.yaml` for development:
-  - Rocket.Chat 7.x and MongoDB.
-  - agentd, on both networks, with the aliases from
+  - Rocket.Chat 7.x and MongoDB, on `egress` only.
+  - agentd, on both networks with static addresses, binding each listener to
+    its own address, with the aliases from
     [Network and deployment shape](#network-and-deployment-shape).
   - The `sandbox` network (`internal: true`) and the `egress` network.
   - A volume root on the host.
@@ -1023,70 +1135,89 @@ Acceptance:
 - `docker run --rm <image> claude --version` prints the pinned version.
 - `docker run --rm <image> id -u` prints 10001.
 - `docker run --rm <image> which node` fails.
+- A Docker test, with the Compose networks, that a container on `sandbox`
+  reaches agentd's ports 8080 and 8081, and not port 8443, Rocket.Chat,
+  MongoDB or the internet.
 
 ### T17
 
 **`sandbox` crate.** Branch `claude/sandbox-crate`. Depends on T04 and T05.
 
 Design: [Sessions and sandboxes](design.md#sessions-and-sandboxes),
-[Persistence](design.md#persistence).
+[Persistence](design.md#persistence). This plan:
+[Volumes and scopes](#volumes-and-scopes).
 
 Deliverables:
 
 - The `Sandbox` trait:
-  - `ensure_volume(scope) -> VolumeRef`.
-  - `prepare_session_dirs(volume, session)`, which creates
-    `sessions/<id>/work` and `sessions/<id>/claude`, and writes
-    `sessions/<id>/claude/settings.json` with `cleanupPeriodDays` (configurable,
-    default 3650).
+  - `ensure_volume(VolumeKey) -> VolumeRef`.
+  - `prepare_session_dirs(volume, session)`. It creates `sessions/<id>/work`,
+    `sessions/<id>/claude`, `sessions/<id>/home` and `sessions/<id>/tmp`, and
+    writes `sessions/<id>/claude/settings.json` with `cleanupPeriodDays`
+    (configurable, default 3650).
   - `start(SessionSpec) -> Container`, where `SessionSpec` carries the session
     id, volume, image, environment, the agent's persona and skills
     directories, and labels.
   - `Container::paths()`, which gives the paths as the CLI sees them: working
-    directory, `CLAUDE_CONFIG_DIR`, persona file. Docker and process sandboxes
-    differ here, and the runner uses only these.
+    directory, `CLAUDE_CONFIG_DIR`, `HOME`, `TMPDIR`, persona file. Docker and
+    process sandboxes differ here, and the runner uses only these.
   - `exec(container, argv, env) -> ChildIo` with piped stdin and stdout.
   - `ip(container)`.
   - `stop(container)`.
   - `list_managed()`.
-- A migration `…_volumes.sql` for the `volumes` table (`scope_key`, `path`,
-  `created_at`).
-- `DockerSandbox` (bollard):
-  - Creates the container with the pinned image, as user 10001.
+  - `events() -> Stream<ContainerEvent>`, which reports containers that died,
+    so the runner can revoke their mappings at once (T21).
+- A migration `…_volumes.sql` for the `volumes` table (`agent_id`,
+  `scope_key`, `path`, `created_at`), keyed by `(agent_id, scope_key)`.
+- `DockerSandbox` (bollard). `container_config(&SessionSpec) -> bollard
+  config` is a pure function with unit tests, and the rest is a thin sender:
+  - The pinned image, as user 10001.
   - `sessions/<id>/` mounted read-write at `/volume/sessions/<id>`, `shared/`
     at `/volume/shared`, skills read-only at
     `/volume/sessions/<id>/claude/skills`, and the agent's persona directory
     read-only at `/agent`.
+  - `HOME` and `TMPDIR` point into the session's `home/` and `tmp/`
+    directories, which are writable and allow execution.
+  - A tmpfs `/tmp` mounted with `exec`, because Docker's tmpfs default is
+    `noexec`.
   - Network `sandbox` only, `no-new-privileges`, all capabilities dropped,
     memory, CPU and PID limits from configuration, and a read-only root
-    filesystem with a tmpfs `/tmp`.
-  - Labels `agentd.session=<id>` and `agentd.scope=<key>`.
+    filesystem.
+  - Labels `agentd.session=<id>`, `agentd.agent=<id>` and
+    `agentd.scope=<key>`.
   - `exec` attaches stdin and stdout with bollard's exec API.
   - `list_managed` finds containers by label.
+  - `events` follows Docker's event stream, filtered to `die` events for
+    managed containers.
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
-  given environment and working directory, and `ip` returns `127.0.0.1`.
-- A `shared/` lock: `lock_shared(scope) -> guard`, backed by `std::fs::File::lock`
-  on `shared/.lock`. Only agentctl-mediated writes take it; document that.
-- `reap_orphans()` at startup: stop every container labeled `agentd.session`
-  that no live session owns. Placeholder mappings and turn tokens are dropped
-  when agentd restarts, so orphaned containers can't be used.
-- A CI job `docker-tests` that runs `cargo test -p sandbox -- --ignored docker_`
-  on ubuntu-24.04 with the sandbox image built in the same job (reusing T16's
-  Dockerfile), added to `ci-passed`.
+  given environment and working directory, and `ip` returns `127.0.0.1`. It
+  isolates nothing, and says so in its rustdoc.
+- `reap_orphans()` at startup: stop every container labeled `agentd.session`.
+  Placeholder mappings and turn tokens don't survive a restart, so no
+  container from before one can be used.
+- A CI job `docker-tests`, added to `ci-passed`. It runs
+  `cargo test --workspace -- --ignored docker_` on ubuntu-24.04, when code
+  changed. The tests here use `debian:stable-slim` with a non-root user, since
+  they check mounts and isolation, not the CLI. The sandbox image is T16's,
+  and the test that launches the real `claude` belongs to T23.
 
 Acceptance:
 
 - Unit tests with `ProcessSandbox` for the directory layout and the contents of
   `settings.json`.
-- Docker tests for mounts:
+- Unit tests of `container_config`: mounts, read-only flags, user,
+  environment, network, limits, capabilities, labels.
+- Two agents in one channel get two volumes.
+- Docker tests:
   - A session can't see another session's directory.
   - `shared/` is visible.
-  - Skills are read-only.
+  - Skills and the persona are read-only.
   - It runs as a non-root user.
-  - The only reachable host is on the sandbox network: `curl
-    https://example.com` fails.
-- Docker test: orphan reaping.
+  - `HOME` and `/tmp` are writable, and a script in `/tmp` runs.
+  - The internet is unreachable: `curl https://example.com` fails.
+  - Orphan reaping.
+  - A killed container produces a `die` event.
 
 ### T18
 
@@ -1165,11 +1296,15 @@ Deliverables:
   - Denial is checked after DNS resolution, so a DNS rebind can't reach them.
 - A denied `CONNECT` returns 403 with a one-line reason, and is logged with the
   session.
+- Absolute-form requests (`GET http://host/…`, what `HTTP_PROXY` produces for
+  plain HTTP) get 403. They must never fall through to the Anthropic reverse
+  proxy. Plain HTTP egress is not offered.
 
 Acceptance:
 
 - Tests for an allowed tunnel, a denied host, denial of `api.anthropic.com`,
-  a rebind to `169.254.169.254` denied, and a non-443 port denied.
+  a rebind to `169.254.169.254` denied, a non-443 port denied, and an
+  absolute-form request refused without reaching the upstream.
 - A Docker test (ignored by default) that a sandbox can `git clone` from an
   allowed host and not from another.
 
@@ -1191,8 +1326,10 @@ Deliverables:
     `--setting-sources user`, `--permission-mode bypassPermissions` and
     `--append-system-prompt-file <persona path>`.
   - `--model <m>` when the router chose one.
-  - The environment from the design's credential proxy block, with the
-    placeholder, plus `AGENTCTL_TOKEN` and the proxy variables from T19.
+  - The environment from the design's credential proxy block, plus
+    `HOME` and `TMPDIR` from `Container::paths()`. The placeholder,
+    `AGENTCTL_TOKEN` and the egress proxy variables come from the caller in
+    `LaunchSpec.env`. The runner doesn't know how they are made.
 - `send_turn(user_message) -> TurnOutcome`. It writes one stream-json user line
   and reads lines until `type == "result"`. The outcome carries:
   - `is_error`, `result` text, `terminal_reason`, `api_error_status`.
@@ -1227,36 +1364,49 @@ Acceptance:
 ### T21
 
 **`runner`: sessions, queue, warm pool.** Branch `claude/runner-sessions`.
-Depends on T20.
+Depends on T20. It must not depend on T15 or T18: it reaches them through
+`TurnHooks`, which agentd implements in T23.
 
 Design: [Keys](design.md#keys), [Lifecycle](design.md#lifecycle).
 
 Deliverables:
 
 - A migration `…_sessions.sql`: `sessions` (`id`, `agent_id`, `surface`,
-  `team_id`, `conversation`, `thread_root`, `scope_key`, `kind` of `normal` or
-  `private`, `started` bool, `last_turn_at`, `reset_at`), unique on `(agent_id,
-  surface, team_id, conversation, thread_root)` for `kind = normal`.
+  `team_id`, `conversation`, `thread_root` not null, `scope_key`, `kind` of
+  `normal` or `private`, `started` bool, `last_turn_at`, `reset_at`).
+  - DMs store `thread_root = ''`, because SQLite treats NULLs as distinct in
+    unique indexes.
+  - A partial unique index on `(agent_id, surface, team_id, conversation,
+    thread_root) WHERE kind = 'normal' AND reset_at IS NULL`, so a reset row
+    doesn't collide with its replacement.
+- The `TurnHooks` trait, the runner's only way out:
+  - `process_starting(session, container_ip, kind) -> ProcessEnv`, which
+    returns the placeholder and proxy variables for `LaunchSpec.env`.
+  - `turn_starting(session, &TurnRequest) -> TurnEnv`, which points the
+    placeholder at the turn's credential and returns the turn token.
+  - `turn_finished(session, turn)`, which revokes the turn token.
+  - `process_stopping(session)`, which revokes the placeholder. It is called
+    before the container is stopped, and again, idempotently, when the
+    sandbox reports the container died.
 - `SessionManager`:
-  - `lookup_or_create(agent, thread_key) -> Session`. DMs use `thread_root =
-    NULL`. A new session id is a v4.
+  - `lookup_or_create(agent, thread_key) -> Session`. A new session id is a v4.
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
   - `run_turn(session, TurnRequest) -> TurnOutcome`, serialized per session
     with a keyed queue. Turns queue in arrival order; steering is deferred.
 - Warm pool: one container and one `ClaudeProcess` per active session.
-  - An idle reaper, configurable, default 15 minutes, stops both and revokes
-    the placeholder.
+  - An idle reaper, configurable, default 15 minutes, calls
+    `process_stopping` and then stops both.
+  - It follows `Sandbox::events()`: a container that died has its process
+    marked gone and `process_stopping` called at once, so its IP can't be
+    reused with a live mapping.
   - A per-scope container cap, default 4. Turns beyond it wait in a per-scope
     queue.
   - A global cap.
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
-- Placeholder handling: mint at process start. At each turn start, `point` the
-  placeholder at the turn's `CredentialRef`, issue the turn token, and revoke
-  it at turn end.
 - Private sessions: `create_private(agent, consent) -> Session` on the
-  `private:<agent>` scope volume, always a fresh id. T33 uses it.
+  agent's `Private` volume, always a fresh id. T33 uses it.
 
 Acceptance:
 
@@ -1269,8 +1419,12 @@ Acceptance:
   - A credential-kind change restarts the process.
   - A model change restarts the process.
   - Reset starts with a new id.
-  - The placeholder points at the right credential in each turn, checked
-    through the fake Anthropic's recorded headers.
+  - A recording `TurnHooks` double sees the calls in order for each turn:
+    `process_starting` once per process, `turn_starting` and `turn_finished`
+    per turn, and `process_stopping` before every stop and after a killed
+    container.
+  - Two DM lookups create one session, and a reset session's replacement
+    inserts without a conflict.
 
 ### T22
 
@@ -1293,12 +1447,14 @@ Deliverables:
   - `is_reply_to_agent(msg, agent)`.
   - `policy(agent)`, which returns allow and deny (T27 fills it; the default
     allows).
+  - `is_banned(member)` (T27 fills it; the default is false).
 - `Decision` is one of:
   - `Ignore(reason)`.
   - `LinkPrompt`.
   - `Run { requester, hop, credential: CredentialRef, scope: ScopeKind,
     side: Owner | Public }`.
-  - `Refuse(reason)`, used for paused agents, deny rules and the hop cap.
+  - `Refuse(reason)`, used for paused agents, bans, deny rules and the hop
+    cap.
 - The flowchart from the design, each branch a named test:
   - Unmanaged bot, ignored.
   - Managed bot that doesn't mention the agent, ignored.
@@ -1321,7 +1477,7 @@ No I/O in the crate.
 ### T23
 
 **Turn pipeline end to end.** Branch `claude/turn-pipeline`. Depends on T07,
-T14, T15, T18, T21 and T22.
+T14, T15, T16, T18, T19, T21 and T22.
 
 Design: [Architecture](design.md#architecture),
 [Rendering and delivery](design.md#rendering-and-delivery),
@@ -1333,22 +1489,34 @@ Deliverables:
 - A migration `…_message_refs.sql`: `message_refs` (`session_id`,
   `short_id` per session, `surface`, `platform_ref`, `agent_id` nullable,
   `turn_id` nullable, `requester_member`, `requester_key`, `hop`,
-  `posted_at`), unique on `platform_ref`. Rows exist for every message agentd
-  posts, and for inbound messages shown to the model, so short ids resolve.
+  `posted_at`), unique on `(surface, team_id, conversation, platform_ref)`,
+  since a Slack `ts` is unique only within a channel. Rows exist for every
+  message agentd posts, and for inbound messages shown to the model, so short
+  ids resolve.
+- agentd's `TurnHooks` implementation (T21's trait): it mints and points
+  placeholders with T18's `Registry`, sets the egress proxy variables from
+  T19, and issues and revokes turn tokens with T15.
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
-  2. For each managed agent mentioned, or the agent whose DM it is, call
-     `router::route` with a store-backed `RouterView`.
+  2. For each candidate agent, call `router::route` with a store-backed
+     `RouterView`. The candidates are every managed agent mentioned, the
+     agent whose DM it is, and the agent that posted the thread root
+     (`reply_to`, looked up in `message_refs`). When the surface has
+     `per_binding_delivery`, only the receiving binding's agent is a
+     candidate, since each other agent gets its own copy.
   3. On `Run`, look up the session, build the turn message, and call
      `SessionManager::run_turn`.
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
-     3. Render and split for the surface.
+     3. Render and split for the surface. `MentionDirectory` is synchronous,
+        so the pipeline first builds a snapshot of the names the reply
+        mentions from agent bindings and the surface's member cache.
      4. Post as the agent's bot identity in the thread.
      5. Record `message_refs` for every chunk with the turn's requester and
         hop.
-     6. Apply reactions.
+     6. Apply reactions, and send the `agentctl post` messages the turn queued
+        (T15 already checked their targets).
   5. On `LinkPrompt`, reply in the thread with a private-link instruction
      (manager bot DM or ephemeral where the surface allows).
 - Turn message builder:
@@ -1376,6 +1544,15 @@ Acceptance:
   - A second mention in the thread resumes the same session.
   - A DM uses the DM session.
   - The same agent in two channels uses two volumes.
+  - A human reply in a thread whose root the agent posted, without a mention,
+    starts a turn.
+  - A queued `agentctl post` to the current conversation is delivered.
+- A Docker test (`docker_real_claude_starts`) with T16's image and T17's
+  container configuration: the real `claude` starts on a read-only root,
+  resumes a session through the proxy, and writes its transcript where
+  [Claude Code CLI](#claude-code-cli) says. It uses a test network that is
+  not internal, and `host-gateway` to reach the proxy and `fake_anthropic()`
+  in the test process, so it needs no account.
 
 Live check (manual, recorded in the PR): with the Compose stack from T16 and a
 real linked account, mention an agent in a channel on Rocket.Chat, run a turn
@@ -1445,16 +1622,19 @@ Deliverables:
   - Otherwise the member gets a link prompt.
   - The owner's credential is used only for owner-requested turns.
 - `/agent admin api-key set <key>` and `/agent admin api-key clear` for
-  community admins, stored sealed. Admins are listed in configuration, by
+  community admins. A migration `…_community_settings.sql` adds a
+  single-row `community_settings` table with `api_key_enc`. This is the only
+  source of the key. The command is secret-bearing: refused in channels
+  (T13's rule) and never logged. Admins are listed in configuration, by
   `MemberKey`.
 - The model is picked per requester plan through T22's `ModelPolicy`. A plan
   change after a token refresh takes effect on the next turn, and restarts the
   process when the model differs (T21's rule).
 - Usage-limit and auth errors from T20 are shown to the requester, never the
   owner, and name whose account hit the limit.
-- Public-side enforcement: a non-owner's turn runs on the channel scope volume,
-  never the owner's DM or private volume. Add a test that fails if a
-  non-owner decision ever resolves to a non-channel scope.
+- Public-side enforcement: a non-owner's turn runs on the conversation's own
+  channel, group DM or DM volume, never the agent's `Private` volume. Add a
+  test that fails if a non-owner decision ever resolves to `Private`.
 
 Acceptance: pipeline tests with two linked members and one unlinked member in
 one thread, each turn's credential checked through the fake Anthropic's
@@ -1472,11 +1652,14 @@ protection), [Security](design.md#security) (agents loop).
 
 Deliverables:
 
-- A migration `…_usage.sql` with two tables:
+- A migration `…_usage.sql` with four tables:
   - `usage` (`member_id`, `day`, `turns`, `input_tokens`, `output_tokens`,
     `cost_usd`), keyed `(member_id, day)`.
   - `agent_policies` (`agent_id`, `turns_per_day`, `max_hops`, `allow_json`,
     `deny_json`).
+  - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
+    `day`, `agent_turns`, `tokens`), for the per-thread caps.
+  - `bans` (`member_id`, `banned_by`, `reason`, `created_at`).
 - The meter accrues per requester from each `TurnOutcome`'s usage.
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
@@ -1488,17 +1671,25 @@ Deliverables:
   - Agent turns per thread per hour.
   - A token budget per thread per day.
   - A global hop cap. Per-agent `hops` can only lower it.
+- `/agent admin ban @user [reason]` and `/agent admin unban @user`, for
+  community admins. The router refuses a banned member's turns through
+  `RouterView::is_banned`, and a ban also blocks their commands other than
+  `me`.
 
-Acceptance: router tests for each limit and rule, command tests, and a pipeline
-test where two agents that mention each other stop at the hop cap.
+Acceptance: router tests for each limit, rule and ban, command tests, and a
+pipeline test where two agents that mention each other stop at the hop cap.
 
 ## Phase 4: Slack (design milestone 4)
 
-T28 to T30 need only T05, T10 and T13, so they can run alongside phases 2 and 3.
+T28 and T29 need only T05, T07 and T10, and T30 adds T13, so they can run
+alongside phases 2 and 3.
 
 ### T28
 
 **Slack ingress.** Branch `claude/slack-ingress`. Depends on T05 and T10.
+Secrets are looked up through a `SigningSecrets` trait. This task implements
+it for the manager binding from configuration. T31 adds the store-backed
+agent bindings.
 
 Design: [Slack](design.md#slack) (transport, acknowledge first, forged
 requests).
@@ -1530,11 +1721,21 @@ Deliverables:
 - Deduplication by `event_id` through `store.mark_event_processed("slack",
   event_id)`. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
-  - `app_mention` and `message.im`.
-  - `message` subtypes other than none and `thread_broadcast` are ignored.
-  - `thread_ts` becomes `thread_root`.
-  - `bot_id` or `bot_profile` sets `sender_is_bot`, with the bot's user id
-    resolved through `bots.info`, cached.
+  - `app_mention`, `message.im` and `message.mpim`, plus `message.channels`
+    and `message.groups` for replies in threads. A channel message without a
+    mention that isn't a thread reply is dropped here. Agent apps subscribe to
+    the channel message events because otherwise Slack never delivers a reply
+    to the agent's own message that doesn't mention it. The design's gating
+    counts such replies.
+  - A message that both mentions the app and is a thread reply arrives twice,
+    as `app_mention` and as `message.channels`. The two are deduplicated per
+    binding by `(channel, ts)`.
+  - `message` subtypes other than none, `file_share` and `thread_broadcast`
+    are ignored.
+  - `thread_ts` becomes `thread_root` and `reply_to`.
+  - `bot_id` or `bot_profile` sets `sender_is_bot`. `sender_bot_user` comes
+    from the event's `user` field when present. T29 adds the `bots.info`
+    lookup for events without one.
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
@@ -1565,17 +1766,22 @@ Deliverables:
   - `conversations.replies` and `conversations.history`, `conversations.info`
     and `conversations.join` (public channels only; the design requires
     membership for `app_mention`).
-  - `users.info`, `bots.info`, `auth.test`.
+  - `users.info`, `users.list` (paginated), `bots.info`, `auth.test`.
   - The file upload flow: `files.getUploadURLExternal`, then upload, then
     `files.completeUploadExternal` with `channel_id` and `thread_ts`.
 - Rate limits: on 429, honor `Retry-After`. Each method is tagged with its tier
   for a simple per-token limiter.
 - `response_url` helper for private command replies (`response_type:
   ephemeral`).
-- `SlackSurface`, implementing `Surface`, with `Caps { max_message_chars: 3000,
-  supports_edit: true, supports_buttons: true, supports_threads: true }`.
-- A `MentionDirectory` backed by `users.info` and a TTL cache per team, used by
-  `render::slack`.
+- `SlackSurface`, implementing `Surface`, with `Caps { message_limit: 3000 chars,
+  supports_edit: true, supports_buttons: true, supports_threads: true,
+  per_binding_delivery: true }`.
+- A member cache per team, filled from `users.list` and refreshed on a
+  TTL, mapping display and real names to user ids. The pipeline's
+  `MentionDirectory` snapshot (T23) reads it together with agent bindings.
+  `users.info` can't look a user up by name.
+- `bots.info` fills `sender_bot_user` for bot events that lack a `user`
+  field, cached per bot id.
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `post` renders and splits through `render`. Slack returns
@@ -1597,11 +1803,16 @@ Deliverables:
   - Interactivity, events and command request URLs under
     `/slack/b/manager/…`, with the public URL substituted.
   - Scopes: `commands`, `chat:write`, `im:write`, `im:history`,
-    `users:read`, `app_mentions:read`.
+    `users:read`, `files:read`, `app_mentions:read`.
+  - Bot events: `message.im` (commands and file uploads in the manager DM)
+    and `user_change` (to notice members who leave).
   - `README.md` steps to install it once per workspace and put its
     credentials in configuration.
 - Slack arm of `reply_private` (T13), using `response_url` for slash commands
   and a manager DM otherwise.
+- Manager DMs on Slack work as on Rocket.Chat: the whole text is parsed as a
+  command. Files attached there feed `persona` (T14's upload rule) and
+  `skill add` (T25), downloaded with the manager's bot token.
 - `/agent slack-token <token> <refresh>`, for linked members on Slack.
   - Validate the token with `auth.test` on the tooling API, or by calling
     `tooling.tokens.rotate` at once, which also proves the refresh token works.
@@ -1609,14 +1820,16 @@ Deliverables:
     (`member_id`, `team_id`, `token_enc`, `refresh_token_enc`, `expires_at`).
   - A rotation loop rotates each token when it has less than 2 hours left, and
     DMs the member on failure.
-- `/agent logout` also deletes the member's configuration tokens (per the
-  design's threat table).
+- `/agent logout` also deletes the member's configuration tokens, and so does
+  a `user_change` event whose user is `deleted` (the design's threat table:
+  "deleted on `/agent logout` or when the member leaves").
 - `/agent me` shows the manager app's name and app id on Slack, from
   `auth.test` at startup, so members notice a takeover.
 
 Acceptance: tests for the token command (success, invalid token, secret never
-logged), rotation (a wiremock sequence of two rotations), logout deleting
-tokens, and `me` output. The manifest template passes a YAML parse test and a
+logged), rotation (a wiremock sequence of two rotations), logout and a
+deleted-user event each deleting tokens, a command sent as a manager DM, and
+`me` output. The manifest template passes a YAML parse test and a
 snapshot test.
 
 Live check (manual): install the manager app on the Slack development
@@ -1636,11 +1849,12 @@ Deliverables:
 - A generated agent manifest:
   - The bot user display name is the agent name.
   - No slash commands.
-  - Bot events `app_mention`, `message.im`.
+  - Bot events `app_mention`, `message.im`, `message.mpim`,
+    `message.channels` and `message.groups` (T28 explains the last two).
   - Scopes: `app_mentions:read`, `chat:write`, `chat:write.public` (off by
     default, a configuration switch), `channels:history`, `groups:history`,
-    `im:history`, `im:write`, `reactions:write`, `files:write`,
-    `users:read`, `channels:join`.
+    `im:history`, `mpim:history`, `im:write`, `reactions:write`,
+    `files:read`, `files:write`, `users:read`, `channels:join`.
   - Events and interactivity URLs under `/slack/b/{binding}/…`.
   - `redirect_urls` set to `{public_url}/slack/oauth/callback`.
 - On `/agent create <name>` on Slack:
@@ -1659,8 +1873,12 @@ Deliverables:
   3. Store `bot_token_enc` and `bot_user_id`, and mark the binding active.
   4. Tell the member.
 
-  When Slack reports the install is waiting for admin approval, tell the member
-  that, and leave the binding pending.
+  When the workspace requires app approval, the member's click becomes a
+  request and Slack never calls the callback. So the install DM says an admin
+  may need to approve it. If a binding is still `pending_install` after a
+  configurable time (default 1 hour), agentd DMs the member once more.
+- The store-backed `SigningSecrets` implementation (T28's trait) for agent
+  bindings.
 - `/agent delete` on Slack calls `apps.manifest.delete` (this removes the app
   and its bot user) and deletes the binding. `pause` stops handling its events
   without touching Slack.
@@ -1668,8 +1886,9 @@ Deliverables:
   invited to a channel to hear mentions; the reply to create says so.
 
 Acceptance: wiremock tests for the full create, install and callback
-sequence (including a challenge answered while the binding is `creating`); approval pending; delete; a callback with a forged or replayed state
-refused; and a pipeline test where a Slack `app_mention` produces a reply
+sequence (including a challenge answered while the binding is `creating`),
+the pending-install reminder, delete, a callback with a forged or replayed
+state refused, and a pipeline test where a Slack `app_mention` produces a reply
 posted with the agent's bot token.
 
 Live check (manual): on the Slack development workspace, create two agents,
@@ -1719,8 +1938,10 @@ Deliverables:
   `decided_by` and `decided_at`.
 - `agentctl private <task>` handler:
   1. Create a `consents` row with the turn's requester, hop, reply target and
-     origin session. Copy explicitly attached files into the consent's staging
-     area.
+     origin session. Copy the files named with `--file` (paths in the
+     calling session's directory) into the consent's staging area. These are
+     the design's "files the channel turn attached explicitly". The PR adds
+     `--file` to the design's `agentctl` table.
   2. Return the consent id at once.
   3. If the requester is the owner, set the state to `approved` and enqueue the
      task. Otherwise send the consent card to the owner.
