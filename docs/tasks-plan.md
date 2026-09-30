@@ -7,10 +7,10 @@ can pick up one at a time. Each task is one PR, with its dependencies, the
 files it owns, what it delivers, and how a reviewer knows it is done. Tasks
 without a dependency path between them can run in parallel.
 
-The design is the source of truth for behavior. This plan fixes the
-engineering choices the design leaves open ([Decisions](#decisions-this-plan-fixes))
-and orders the work. If a task has to deviate from the design, the same PR
-updates `docs/design.md` and says why in its description.
+The design is the source of truth for behavior. This plan fixes the engineering
+choices the design leaves open ([Decisions](#decisions-this-plan-fixes)) and
+orders the work. If a task has to deviate from the design, the same PR updates
+`docs/design.md` and says why in its description.
 
 ## How to use this plan
 
@@ -90,12 +90,12 @@ one move:
 | `agentctl` | bin | In-sandbox CLI. Static musl build. |
 | `testkit` | lib | **Added.** Test-only: `MockSurface`, the `fake-claude` binary, fake Rocket.Chat and Anthropic servers, fixtures. Only ever a dev-dependency. |
 
-Encryption lives in `store` instead of `auth`. Every encrypted column
-(Claude tokens, PKCE verifiers, Slack client and signing secrets, bot tokens,
-Slack configuration tokens) goes through the store, so doing it there means no
-caller can forget. The store API takes and returns `secrecy::SecretString`, and
-seals values with ChaCha20-Poly1305 using the row's table, column and primary key
-as associated data, so a ciphertext copied into another row fails to decrypt.
+Encryption lives in `store` instead of `auth`. Every encrypted column (Claude
+tokens, PKCE verifiers, Slack client and signing secrets, bot tokens, Slack
+configuration tokens) goes through the store, so doing it there means no caller
+can forget. The store API takes and returns `secrecy::SecretString`, and seals
+values with ChaCha20-Poly1305 using the row's table, column and primary key as
+associated data, so a ciphertext copied into another row fails to decrypt.
 
 ### Libraries
 
@@ -218,11 +218,13 @@ description, and must pass T02's policy.
   a build argument (2.1.285 when this plan was written). It uses the native
   installer, not npm, so the image has no Node.js.
 - The stream-json output shapes the runner relies on, observed on 2.1.285:
-  - `{"type":"system","subtype":"init","session_id":…,"model":…,"tools":[…]}`
-    at start.
+  - `{"type":"system","subtype":"init",…}` at start, with `session_id`,
+    `model` and `tools`.
   - `{"type":"assistant","message":{…}}` and `{"type":"user",…}` during the
     turn.
-  - A final `{"type":"result","subtype":…,"is_error":bool,"result":"…","session_id":…,"total_cost_usd":…,"usage":{…},"terminal_reason":…,"api_error_status":…}`.
+  - A final `{"type":"result",…}` line with `subtype`, `is_error`, `result`,
+    `session_id`, `total_cost_usd`, `usage`, `terminal_reason` and
+    `api_error_status`.
     `is_error` decides failure, not `subtype`. An unreachable upstream produced
     `subtype: "success"` with `is_error: true` and
     `terminal_reason: "api_error"`.
@@ -268,7 +270,8 @@ description, and must pass T02's policy.
 
 Every PR, in addition to its task's acceptance criteria:
 
-- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+- `cargo fmt --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test --all-features`, `cargo test --doc --all-features`, and
   `RUSTDOCFLAGS=-D\ warnings cargo doc --no-deps --all-features` pass locally.
 - `cargo coverage` passes (85% of lines).
@@ -299,7 +302,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T04](#t04) | `testkit`: mock surface and fake claude | `testkit` | T03 | foundation |
 | [T05](#t05) | `store` foundation and encryption | `store-foundation` | T03 | foundation |
 | [T06](#t06) | `render`: Slack mrkdwn | `render-slack-mrkdwn` | T01 | foundation |
-| [T07](#t07) | `render`: splitting, directives, Rocket.Chat | `render-split-directives` | T06 | foundation |
+| [T07](#t07) | `render`: splitting, directives, Rocket.Chat | `render-split-directives` | T03, T06 | foundation |
 | [T08](#t08) | `commands`: `/agent` parser | `commands-parser` | T03 | foundation |
 | [T09](#t09) | `auth`: PKCE, exchange, refresh, plan | `auth-pkce` | T05 | M1 |
 | [T10](#t10) | `agentd` skeleton | `agentd-skeleton` | T05 | M1 |
@@ -308,7 +311,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T13](#t13) | Command dispatch and account commands | `account-commands` | T08, T09, T10, T12 | M1 |
 | [T14](#t14) | Agent lifecycle on Rocket.Chat | `agent-lifecycle-rocketchat` | T13 | M1 |
 | [T15](#t15) | `agentctl` and the ctl API | `agentctl` | T04, T05, T10 | M2 |
-| [T16](#t16) | Sandbox image and Compose dev stack | `sandbox-image` | T15 | M2 |
+| [T16](#t16) | Sandbox image and Compose dev stack | `sandbox-image` | T11, T15 | M2 |
 | [T17](#t17) | `sandbox` crate | `sandbox-crate` | T04, T05 | M2 |
 | [T18](#t18) | Credential proxy: header swap | `cred-proxy-swap` | T04, T09 | M2 |
 | [T19](#t19) | Credential proxy: egress allowlist | `egress-allowlist` | T18 | M2 |
@@ -326,20 +329,48 @@ Every PR, in addition to its task's acceptance criteria:
 | [T31](#t31) | Slack agent apps from manifests | `slack-agent-apps` | T30, T23 | M4 |
 | [T32](#t32) | Verify Slack bot-to-bot delivery | `slack-bot-mention-check` | T31 | M5 gate |
 | [T33](#t33) | Consent cards and private tasks | `private-tasks` | T26, T31 | M5 |
-| [T34](#t34) | Agent-to-agent hand-off | `agent-to-agent` | T32, T33 | M5 |
+| [T34](#t34) | Agent-to-agent hand-off | `agent-to-agent` | T27, T32, T33 | M5 |
 | [T35](#t35) | Cloud hand-off (design first) | `cloud-handoff-design` | T34 | M6 |
 | [T36](#t36) | Slack Connect (design first) | `slack-connect-design` | T34 | M7 |
 
 Progress:
 
-- [ ] T01 · [ ] T02 · [ ] T03 · [ ] T04 · [ ] T05 · [ ] T06 · [ ] T07 · [ ] T08
-- [ ] T09 · [ ] T10 · [ ] T11 · [ ] T12 · [ ] T13 · [ ] T14
-- [ ] T15 · [ ] T16 · [ ] T17 · [ ] T18 · [ ] T19 · [ ] T20 · [ ] T21 · [ ] T22
-  · [ ] T23 · [ ] T24 · [ ] T25
-- [ ] T26 · [ ] T27
-- [ ] T28 · [ ] T29 · [ ] T30 · [ ] T31
-- [ ] T32 · [ ] T33 · [ ] T34
-- [ ] T35 · [ ] T36
+- [ ] T01 Workspace skeleton
+- [ ] T02 Dependency policy in CI
+- [ ] T03 `core-types`
+- [ ] T04 `testkit`: mock surface and fake claude
+- [ ] T05 `store` foundation and encryption
+- [ ] T06 `render`: Slack mrkdwn
+- [ ] T07 `render`: splitting, directives, Rocket.Chat
+- [ ] T08 `commands`: `/agent` parser
+- [ ] T09 `auth`: PKCE, exchange, refresh, plan
+- [ ] T10 `agentd` skeleton
+- [ ] T11 Rocket.Chat REST client
+- [ ] T12 Rocket.Chat realtime and `Surface`
+- [ ] T13 Command dispatch and account commands
+- [ ] T14 Agent lifecycle on Rocket.Chat
+- [ ] T15 `agentctl` and the ctl API
+- [ ] T16 Sandbox image and Compose dev stack
+- [ ] T17 `sandbox` crate
+- [ ] T18 Credential proxy: header swap
+- [ ] T19 Credential proxy: egress allowlist
+- [ ] T20 `runner`: stream-json process driver
+- [ ] T21 `runner`: sessions, queue, warm pool
+- [ ] T22 `router`: gating and credential policy
+- [ ] T23 Turn pipeline end to end
+- [ ] T24 Session commands
+- [ ] T25 Skills and the `agentctl` skill
+- [ ] T26 Requester-pays routing
+- [ ] T27 Usage meter, limits, allow and deny
+- [ ] T28 Slack ingress
+- [ ] T29 Slack Web API and `Surface`
+- [ ] T30 Slack manager app and configuration token
+- [ ] T31 Slack agent apps from manifests
+- [ ] T32 Verify Slack bot-to-bot delivery
+- [ ] T33 Consent cards and private tasks
+- [ ] T34 Agent-to-agent hand-off
+- [ ] T35 Cloud hand-off (design first)
+- [ ] T36 Slack Connect (design first)
 
 The design's milestone 3 (requester-pays) moves ahead of milestone 4 (Slack)
 as the design orders it. The Slack surface (T28, T29) needs only T05, T07 and
@@ -355,6 +386,7 @@ graph TD
     T03 --> T04
     T03 --> T05
     T01 --> T06
+    T03 --> T07
     T06 --> T07
     T03 --> T08
     T05 --> T09
@@ -370,6 +402,7 @@ graph TD
     T04 --> T15
     T05 --> T15
     T10 --> T15
+    T11 --> T16
     T15 --> T16
     T04 --> T17
     T05 --> T17
@@ -404,6 +437,7 @@ graph TD
     T31 --> T32
     T26 --> T33
     T31 --> T33
+    T27 --> T34
     T32 --> T34
     T33 --> T34
     T34 --> T35
@@ -506,7 +540,8 @@ Deliverables in `crates/core-types/src/`:
 - `surface.rs`:
   - `SurfaceKind` (`Slack`, `RocketChat`).
   - String newtypes `TeamId`, `UserId`, `ConversationId`, `MessageId`.
-  - `MemberKey { surface, team, user }` and `ConvRef { surface, team, conversation }`.
+  - `MemberKey { surface, team, user }` and
+    `ConvRef { surface, team, conversation }`.
   - `ThreadKey { conv, root: Option<MessageId> }`, where `None` means a DM's
     continuous session.
   - `ReplyTarget { conv, thread_root }`, `MsgRef`, `Cursor`.
@@ -529,20 +564,24 @@ Deliverables in `crates/core-types/src/`:
   - `Requester { member: Option<MemberId>, key: MemberKey }`.
   - `Hop(u8)`.
   - `TurnKind` (`Normal`, `PrivateTask(ConsentId)`).
+  - `Side` (`Owner`, `Public`), shared by the router's decision (T22) and the
+    agentctl target rules (T15).
 - `surface_trait.rs`: the design's `Surface` trait verbatim, with
   `#[async_trait]`, plus the `Binding`, `OutFile`, `InFile`, `Msg` and `Caps`
-  types. `Caps` has `message_limit` (T07's `Limit`), `supports_edit`,
-  `supports_buttons`, `supports_threads` and `per_binding_delivery`. The last
-  is true where every agent's app receives its own copy of an event (Slack),
-  and false where agentd deduplicates one copy per message (Rocket.Chat). Errors are `SurfaceError` with `thiserror`, including
-  a `RateLimited { retry_after }` variant.
+  types. `Caps` has `message_limit`, `supports_edit`, `supports_buttons`,
+  `supports_threads` and `per_binding_delivery`. The last is true where every
+  agent's app receives its own copy of an event (Slack), and false where
+  agentd deduplicates one copy per message (Rocket.Chat). `message_limit` is
+  a `Limit { max: usize, unit: LengthUnit }`, with `LengthUnit` `Chars` or
+  `Utf16`; T07's splitter takes it. Errors are `SurfaceError` with
+  `thiserror`, including a `RateLimited { retry_after }` variant.
 - `ctl.rs`: agentctl request and response types (serde) for `attach`, `post`,
   `react`, `history`, `lock`, `ask-agent`, and `private` (task text plus file
   paths), with the error type. The binary and the server share these.
 
-Acceptance: unit tests for `ScopeKey` and `VolumeKey` round-trips, serde round-trips of every
-wire type, and ID parsing. The crate has no dependency outside `serde`,
-`serde_json`, `uuid`, `time`, `thiserror` and `async-trait`.
+Acceptance: unit tests for `ScopeKey` and `VolumeKey` round-trips, serde
+round-trips of every wire type, and ID parsing. The crate has no dependency
+outside `serde`, `serde_json`, `uuid`, `time`, `thiserror` and `async-trait`.
 
 Out of scope: any logic beyond construction, parsing and formatting.
 
@@ -666,8 +705,8 @@ Behavioral reference: qm-core `src/slack/mrkdwn.ts`.
 
 Deliverables:
 
-- `render::slack::to_mrkdwn(md: &str, directory: &dyn MentionDirectory) -> String`,
-  built on `pulldown-cmark` events. It converts:
+- `render::slack::to_mrkdwn(md: &str, directory: &dyn MentionDirectory)
+  -> String`, built on `pulldown-cmark` events. It converts:
   - Headings to bold lines.
   - `**bold**` to `*bold*`, `*em*` and `_em_` to `_em_`, and `~~strike~~` to
     `~strike~`.
@@ -696,18 +735,17 @@ Out of scope: splitting (T07).
 ### T07
 
 **`render`: splitting, directives, Rocket.Chat.** Branch
-`render-split-directives`. Depends on T06.
+`render-split-directives`. Depends on T03 and T06.
 
 Design: [Rendering and delivery](design.md#rendering-and-delivery).
 Reference: qm-core `src/slack/safe-cut.ts`.
 
 Deliverables:
 
-- `render::split(text: &str, limit: Limit) -> Vec<String>`, where
-  `Limit { max: usize, unit: LengthUnit }` and `LengthUnit` is `Chars` or
-  `Utf16`. Rocket.Chat checks `Message_MaxAllowedSize` against JavaScript
-  string length, so its limit counts UTF-16 code units, and an emoji counts
-  as two. It:
+- `render::split(text: &str, limit: Limit) -> Vec<String>`, with `Limit` from
+  `core-types` (T03). Rocket.Chat checks `Message_MaxAllowedSize` against
+  JavaScript string length, so its limit counts UTF-16 code units, and an emoji
+  counts as two. It:
   - Prefers paragraph breaks, then line breaks, then spaces.
   - Never cuts inside a Slack `<…>` token, a Markdown link, a mention or a
     multi-byte character. Cuts fall on `char` boundaries.
@@ -851,7 +889,8 @@ Deliverables:
 - Graceful shutdown on SIGTERM: stop accepting, then drain for a configurable
   timeout.
 - An `App` struct holding the shared state (config, store, later the surfaces,
-  runner and proxy) that later tasks extend. Keep it in `crates/agentd/src/app.rs`.
+  runner and proxy) that later tasks extend. Keep it in
+  `crates/agentd/src/app.rs`.
 - A background sweeper task that calls `store.sweep_expired` every minute.
 - `config/agentd.example.toml`.
 
@@ -932,14 +971,18 @@ Deliverables:
   - The `bot` field, or a sender with the `bot` role, sets `sender_is_bot`.
   - Edits (`editedAt`) are ignored.
   - `event_id` is the message `_id`.
-  - A bot's own messages are dropped.
+  - A bot's own messages are not dropped here. Every connection in a room
+    receives every message and the first to record it wins, so a per-connection
+    drop could discard the only copy another agent would have seen. The
+    pipeline never makes the sending agent a candidate (T23), and the router
+    ignores managed-bot messages that don't mention the agent (T22).
 - Deduplication through `store.mark_event_processed("rocketchat", _id)`, since
   several bots in one room each receive every message.
 - `RocketChatSurface`, implementing `Surface` over T11 and this client, with
-  `Caps { message_limit: 5000 UTF-16 units, supports_edit: true,
-  supports_buttons: false, supports_threads: true, per_binding_delivery:
-  false }`. Buttons stay false because interactive
-  buttons need Apps-Engine. Consent uses text commands, see T33.
+  a `message_limit` of 5,000 UTF-16 units, `supports_edit` and
+  `supports_threads` true, and `supports_buttons` and `per_binding_delivery`
+  false. Buttons stay false because interactive buttons need Apps-Engine.
+  Consent uses text commands, see T33.
 - `testkit::rocketchat::FakeDdp`: a small WebSocket server scripting DDP
   frames.
 
@@ -949,9 +992,11 @@ Acceptance:
   the right `InboundEvent`, a dropped connection reconnecting and
   resubscribing, and a `subscriptions-changed` notice leading to a new room
   subscription.
-- A test that two bots in one room produce one processed event, and that the
-  router receives it once per mentioned agent. Routing to the mentioned agents
-  happens in T23; here, assert the event carries every mention.
+- A test that two bots in one room produce one processed event, and that
+  agent A's post mentioning agent B survives deduplication whichever
+  connection records it first. The router receives it once per mentioned
+  agent. Routing to the mentioned agents happens in T23; here, assert the
+  event carries every mention.
 
 ### T13
 
@@ -1095,8 +1140,9 @@ Deliverables:
   - Handlers write to a per-turn outbox (attachments staged on disk under the
     agentd data directory, reactions and posts queued) that the turn pipeline
     (T23) drains.
-  - Target rules, checked when the request arrives, from the turn's `side`
-    (T22's `Decision.side`, stored at `begin_turn`):
+  - Target rules, checked when the request arrives, from the turn's `Side`
+    (the `core-types` type T22's router decides with, stored at
+    `begin_turn`):
     - `Public` (every channel turn, the owner's included, since channel text
       is untrusted): `post` may target only the current conversation, and
       `react` only messages in it.
@@ -1111,18 +1157,19 @@ Deliverables:
 
 Acceptance:
 
-- Tests for token hashing, IP binding, refusal between turns, the startup
-  purge, refusal inside private tasks, each target rule, and a `lock` lease that a second
-  session waits for and that expires when its holder dies.
+- Tests for token hashing, IP binding, refusal between turns, the startup purge,
+  refusal inside private tasks, each target rule, and a `lock` lease that a
+  second session waits for and that expires when its holder dies.
 - `agentctl` against the server for each subcommand, through the `fake-claude`
   script path from T04.
 
 ### T16
 
 **Sandbox image and Compose dev stack.** Branch `sandbox-image`.
-Depends on T15.
+Depends on T11 and T15.
 
-Design: [Why the CLI runs inside the sandbox](design.md#why-the-cli-runs-inside-the-sandbox),
+Design:
+[Why the CLI runs inside the sandbox](design.md#why-the-cli-runs-inside-the-sandbox),
 [Lifecycle](design.md#lifecycle) (non-root),
 [Credential proxy](design.md#credential-proxy) (environment).
 
@@ -1347,8 +1394,9 @@ Acceptance:
 **`runner`: stream-json process driver.** Branch `runner-process`.
 Depends on T04 and T17.
 
-Design: [Lifecycle](design.md#lifecycle), [Tools and skills](design.md#tools-and-skills)
-(launch flags), [Claude Code CLI](#claude-code-cli) in this plan.
+Design: [Lifecycle](design.md#lifecycle),
+[Tools and skills](design.md#tools-and-skills) (launch flags),
+[Claude Code CLI](#claude-code-cli) in this plan.
 
 Deliverables:
 
@@ -1425,8 +1473,8 @@ Deliverables:
   - `turn_starting(session, &TurnRequest)`, which points the placeholder at
     the turn's credential and records the turn on the agentctl token.
   - `turn_finished(session, turn)`, which clears the turn from the token.
-  - `process_stopping(session)`, which revokes the placeholder and the token. It is called
-    before the container is stopped, and again, idempotently, when the
+  - `process_stopping(session)`, which revokes the placeholder and the token. It
+    is called before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.
 - `SessionManager`:
   - `lookup_or_create(agent, thread_key) -> Session`. A new session id is a v4.
@@ -1501,6 +1549,10 @@ Deliverables:
   - Unmanaged bot, ignored.
   - Managed bot that doesn't mention the agent, ignored.
   - Managed bot that mentions the agent inherits requester and hop plus one.
+  - Managed bot that mentions the agent but has no `message_ref`,
+    `Ignore("unattributed managed bot")`. T34's pipeline retries the lookup
+    before calling `route`, so the router stays pure.
+  - An agent's own message, ignored, even if it mentions itself.
   - Human, not addressed, ignored.
   - Owner in a DM, owner credential on the owner side, `ScopeKind::Private`
     (so the agent's `Private` volume).
@@ -1566,9 +1618,15 @@ Deliverables:
 - Turn message builder:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
+  - Messages agentd posted for this agent in this thread outside this session,
+    found in `message_refs` by agent and a different `session_id`. That covers
+    a private task's result and its declined or expired outcomes (T33), which
+    never enter the channel session's transcript. This PR fixes the design's
+    Persistence bullet on the per-turn message to say so.
   - Who is present, with short ids from `message_refs`.
   - Surface hints.
   - The system prompt (persona) is never changed per turn.
+- Candidates never include the agent that posted the message.
 - A typing or "working" indicator where the surface supports it. On
   Rocket.Chat, react with a configurable emoji at turn start and remove it at
   the end.
@@ -1724,8 +1782,9 @@ Deliverables:
   `RouterView::is_banned`, and a ban also blocks their commands other than
   `me`.
 
-Acceptance: router tests for each limit, rule and ban, command tests, and a
-pipeline test where two agents that mention each other stop at the hop cap.
+Acceptance: router tests for each limit, rule and ban, including the hop cap,
+and command tests. The pipeline test of two agents mentioning each other
+until the cap belongs to T34, which hardens that path.
 
 ## Phase 4: Slack (design milestone 4)
 
@@ -1779,7 +1838,12 @@ Deliverables:
   - A channel message that neither mentions the app's bot user nor is a
     thread reply is dropped here.
   - This PR updates the design's identities table ("How the bot hears it")
-    to match.
+    to match, and adds a row to its security table for the cost: each agent
+    app needs the `*:history` scopes and receives every message in every
+    channel it is in. N agents in a channel means N copies of its traffic,
+    each member's app can read the channel's history, and workspaces that
+    require app approval are more likely to block the install. That is the
+    price of the design's "reply to the agent's own message" gating on Slack.
   - `message` subtypes other than none, `file_share` and `thread_broadcast`
     are ignored.
   - `thread_ts` becomes `thread_root` and `reply_to`.
@@ -1823,9 +1887,9 @@ Deliverables:
   for a simple per-token limiter.
 - `response_url` helper for private command replies (`response_type:
   ephemeral`).
-- `SlackSurface`, implementing `Surface`, with `Caps { message_limit: 3000 chars,
-  supports_edit: true, supports_buttons: true, supports_threads: true,
-  per_binding_delivery: true }`.
+- `SlackSurface`, implementing `Surface`. Its `Caps` have a `message_limit`
+  of 3,000 chars, and `supports_edit`, `supports_buttons`, `supports_threads`
+  and `per_binding_delivery` all true.
 - A member cache per team, filled from `users.list` and refreshed on a
   TTL, mapping display and real names to user ids. The pipeline's
   `MentionDirectory` snapshot (T23) reads it together with agent bindings.
@@ -1930,14 +1994,18 @@ Deliverables:
 - The store-backed `SigningSecrets` implementation (T28's trait) for agent
   bindings.
 - `/agent delete` on Slack calls `apps.manifest.delete` (this removes the app
-  and its bot user) and deletes the binding. `pause` stops handling its events
+  and its bot user) and deletes the binding. That needs the owner's
+  configuration token, which `/agent logout` deletes (T30). Without one,
+  agentd disables the binding, stops handling its events, and tells the owner
+  to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 
 Acceptance: wiremock tests for the full create, install and callback
 sequence (including a challenge answered while the binding is `creating`),
-the pending-install reminder, delete, a callback with a forged or replayed
+the pending-install reminder, delete with and without a configuration token,
+a callback with a forged or replayed
 state refused, and a pipeline test where a Slack channel message mentioning
 the agent produces a reply posted with the agent's bot token.
 
@@ -2045,8 +2113,8 @@ Acceptance, as tests named after the design's rules:
 
 ### T34
 
-**Agent-to-agent hand-off.** Branch `agent-to-agent`. Depends on T32
-and T33.
+**Agent-to-agent hand-off.** Branch `agent-to-agent`. Depends on T27,
+T32 and T33.
 
 Design: [Agent-to-agent attribution](design.md#agent-to-agent-attribution),
 [Routing](design.md#routing).
@@ -2077,7 +2145,8 @@ Acceptance:
 
 - Pipeline tests: A mentions B and B's turn runs on the original requester's
   credential with hop 1; B mentions A and the turn runs with hop 2; the chain
-  stops at the cap.
+  stops at T27's cap, and a per-agent `hops` limit lowers it.
+- The thread token budget from T27 stops a chain.
 - A race test where the inbound event precedes the ref write.
 - `ask-agent` inherits attribution.
 - An unmanaged bot's mention is ignored.
