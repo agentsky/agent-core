@@ -1271,16 +1271,20 @@ Deliverables:
     `CLAUDE_CODE_VERSION` build argument, with no Node.js.
   - `agentctl` copied from a multi-stage Rust build.
   - A non-root user `agent` with uid 10001, and `WORKDIR /volume`.
+  - `/bin/sh`, which `DockerSandbox::exec` runs every command through.
   - Entrypoint `tini --`. The container idles (`sleep infinity`), and the
     runner execs `claude` into it.
 - `images/agentd/Dockerfile`: a multi-stage build of agentd on a distroless or
-  Debian slim base, run as non-root.
+  Debian slim base, run as uid 10001, the sandbox user, so the volume
+  directories agentd creates are writable in sandboxes
+  ([impl-notes](impl-notes.md#agent-writable-directories-are-given-to-the-sandbox-user)).
 - `deploy/compose/compose.yaml` for development:
   - Rocket.Chat 7.x and MongoDB, on `egress` only.
   - agentd, on both networks with static addresses, binding each listener to
     its own address, with the aliases from
     [Network and deployment shape](#network-and-deployment-shape).
-  - The `sandbox` network (`internal: true`) and the `egress` network.
+  - The `sandbox` network (`internal: true`, with `name: sandbox` so Docker
+    doesn't prefix the project name) and the `egress` network.
   - A volume root on the host.
   - Access to the Docker socket for agentd, documented as a development-only
     shortcut with a note that production should use a socket proxy.
@@ -1334,6 +1338,8 @@ Deliverables:
     so the runner can revoke their mappings at once (T21).
 - A migration `…_volumes.sql` for the `volumes` table (`agent_id`,
   `scope_key`, `path`, `created_at`), keyed by `(agent_id, scope_key)`.
+  `path` is relative to the data directory and unique
+  ([impl-notes](impl-notes.md#the-volumes-row-records-a-relative-path)).
 - Volumes are host directories under `volumes/` in the agentd data
   directory, at `volumes/<agent id>/<scope dir>`. `<scope dir>` is the
   lowercase hex SHA-256 of the scope key's string form: 64 characters from
@@ -1367,23 +1373,36 @@ Deliverables:
   - Network `sandbox` only, `no-new-privileges`, all capabilities dropped,
     memory, CPU and PID limits from configuration, and a read-only root
     filesystem.
-  - Labels `agentd.session=<id>`, `agentd.agent=<id>` and
-    `agentd.scope=<key>`.
-  - `exec` attaches stdin and stdout with bollard's exec API.
-  - `list_managed` finds containers by label.
+  - Labels `agentd.session=<id>`, `agentd.agent=<id>`,
+    `agentd.scope=<key>` and `agentd.instance=<[sandbox] instance>`.
+  - `exec` attaches stdin and stdout with bollard's exec API, through a
+    `/bin/sh` wrapper that reports the pid so the process can be killed
+    ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
+  - `list_managed` finds containers by the `agentd.session` label and this
+    agentd's `agentd.instance` label
+    ([impl-notes](impl-notes.md#several-agentd-or-test-runs-on-one-docker-host)).
   - `events` follows Docker's event stream, filtered to `die` events for
     managed containers.
+  - Mount sources are rewritten to `[sandbox] host_data_dir` when agentd
+    sees its data directory at another path than the Docker daemon
+    ([impl-notes](impl-notes.md#agentds-paths-arent-the-docker-daemons)).
+  - Agent-writable directories are given to the sandbox user, and nothing
+    on the host follows a symlink inside them
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
   given environment and working directory, and `ip` returns `127.0.0.1`. It
   isolates nothing, and says so in its rustdoc.
-- `reap_orphans()` at startup: stop every container labeled `agentd.session`.
+- `reap_orphans()` at startup: stop every container labeled `agentd.session`
+  with this agentd's `agentd.instance`.
   Placeholder mappings and agentctl tokens don't survive a restart, so no
   container from before one can be used.
 - A CI job `docker-tests`, added to `ci-passed`. It runs
   `cargo test --workspace -- --ignored docker_` on ubuntu-24.04, when code
   changed. The tests here use `debian:stable-slim` with a non-root user, since
-  they check mounts and isolation, not the CLI. The sandbox image is T16's,
+  they check mounts and isolation, not the CLI. They run as the test
+  process's own non-root uid, since a non-root test can't give directories
+  to uid 10001. The sandbox image is T16's,
   and the test that launches the real `claude` belongs to T23.
 
 Acceptance:
@@ -1704,6 +1723,11 @@ Deliverables:
     the thread lookups below.
   - Rows exist for every message agentd posts, and for inbound messages shown
     to the model, so short ids resolve.
+- agentd's `[sandbox]` configuration section is `sandbox::SandboxConfig`
+  (T17), validated with its `validate`; `image` fills every `SessionSpec`.
+  agentd builds a `DockerSandbox` with its data directory, calls
+  `reap_orphans` at startup, and documents the section in
+  `config/agentd.example.toml`.
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15.

@@ -66,6 +66,13 @@ newly published advisory fails a run of its own. Run it locally with
 `cargo deny --workspace --locked check -W unmaintained` and
 `sh scripts/ci/check-path-deps.sh`.
 
+The `docker-tests` job runs the tests that need a Docker daemon: they are
+named `docker_*` and marked ignored, so the other jobs skip them. Run them
+locally, with Docker running, as
+`cargo test --workspace -- --ignored docker_`. They pull
+`debian:stable-slim` and create and remove their own networks and
+containers.
+
 A change that touches only documentation (Markdown files and `LICENSE`, as
 decided by `scripts/ci/docs-only.sh`) skips the build and test jobs and runs
 only the doctests and rustdoc, since this README is also the crate docs. To

@@ -1324,3 +1324,157 @@ can't leak into the error.
   servers. To turn a `Cursor` (a message id) into a `latest` time for the
   top level, the client also has `chat.getMessage`, which the plan didn't
   list.
+
+## T17: sandbox
+
+### Docker can't signal an exec'd process
+
+**Issue.** T20 kills a turn's process on timeout, but Docker's API has no
+way to signal a process started with `exec`: `kill` reaches only a
+container's PID 1, and the pid `inspect_exec` reports is in the host's PID
+namespace, which agentd, itself in a container, can't see. Killing the
+container would force the runner to start a new one for every timeout.
+
+**Solution.** `DockerSandbox::exec` runs argv as
+`/bin/sh -c 'echo $$; exec "$@"' sh <argv…>`. The shell prints its pid,
+then `exec` replaces it with the command under the same pid, and `"$@"`
+passes argv through without shell interpretation. The sandbox strips that
+first line from stdout, and `ChildHandle::kill` runs
+`sh -c 'kill -s KILL "$1"'` in the container as the same user. The image
+needs `/bin/sh` (Debian has it). Only the process is killed; processes it
+started are reparented to the container's init and end when the container
+stops. `ProcessSandbox` kills the child's whole process group instead,
+through the `kill` command, since a direct `kill(2)` would need `unsafe`.
+
+### Agent-writable directories are given to the sandbox user
+
+**Issue.** The sandbox runs as uid 10001, but agentd creates the volume
+directories. Created by root, or by another non-root user, they aren't
+writable in the container.
+
+**Solution.** `shared/`, `memory/`, each session's `work/`, `claude/`,
+`home/` and `tmp/`, and `settings.json` are given to the configured
+`uid:gid` with `lchown` when their owner differs. That works when agentd
+runs as root or as the sandbox user itself, and fails with an error naming
+the cause otherwise. T16's agentd image should therefore run as uid 10001
+(the plan's T16 says so). `volumes/` is `0700` and stays agentd's, and so
+does each `sessions/<id>/`: the agent can write inside `work/` and the
+others but can't rename or replace them.
+
+The Docker tests can't use 10001: on the CI runner the test process is not
+root, so it can't give directories away. They run the sandbox as the test
+process's own uid, which is still not root, and 10001 when the tests run
+as root.
+
+### The agent controls what is inside its session directory
+
+**Issue.** agentd writes `claude/settings.json` on the host before every
+start, and Docker mounts the skills directory at `claude/skills`. Both are
+inside the session's read-write mount, so a previous run of the agent could
+have replaced `claude` with a symlink to a host path, and agentd (possibly
+root) would write through it.
+
+**Solution.** Nothing on the host follows a symlink inside an
+agent-writable tree. Before each start, each of `work/`, `claude/`,
+`home/` and `tmp/` that isn't a real directory (checked with
+`symlink_metadata`) is removed and created again, as is `claude/skills`
+when there are skills to mount there. `settings.json` is written to a new
+file (`create_new`, so `O_EXCL`, which doesn't follow a symlink) and renamed
+over the old one, which replaces a symlink instead of following it; a
+directory in its place is removed. It is rewritten on every start, so an
+agent can't lower `cleanupPeriodDays` and lose its transcripts. Ownership
+changes use `lchown`. The runner never runs two containers of one session,
+so nothing in the container can race these steps.
+
+### Several agentd, or test runs, on one Docker host
+
+**Issue.** The plan's `reap_orphans` stops every container labeled
+`agentd.session`, and `list_managed` and `events` filter on the same label.
+Two agentd on one host, or a Docker test running next to another, would
+stop each other's sandboxes.
+
+**Solution.** Every container also gets `agentd.instance=<name>`, from
+`[sandbox] instance` (default `agentd`), and listing, reaping and events
+select on both labels. Each Docker test uses its own instance name and its
+own internal network. The plan's T17 bullet says so.
+
+### agentd's paths aren't the Docker daemon's
+
+**Issue.** Bind mount sources are paths on the Docker host. agentd runs in
+a container (plan: Network and deployment shape), where its data directory
+may be mounted somewhere else than on the host.
+
+**Solution.** `[sandbox] host_data_dir` names the data directory as the
+daemon sees it. Every mount source under agentd's data directory (the
+volume, the persona and skills directories) is rewritten to that prefix,
+and one outside it is refused while the key is set. Unset, paths are used
+as they are, which fits a data directory mounted at the same path. Docker
+refuses a bind mount whose source doesn't exist, so a wrong setting fails
+at start instead of mounting an empty directory.
+
+### What the sandbox refuses in a `SessionSpec`
+
+**Issue.** The plan leaves open what a spec may carry.
+
+**Solution.** `container_config` and `ProcessSandbox::start` refuse a spec
+that sets `HOME` or `TMPDIR` (the sandbox sets them), an environment name
+that is empty or holds `=`, NUL anywhere, a label under `agentd.`, a
+persona or skills path that isn't absolute or holds `..`, and `memory`
+on any volume but the agent's `Private` one, which is the only one with a
+`memory/` directory. The container environment is visible to anyone who
+can inspect the container, so its rustdoc says it holds no secrets; the
+placeholder, the agentctl token and the proxy variables go to `exec`.
+Errors from `exec` requests never carry Docker's message, since the request
+held that environment. `SessionSpec::new` gives the least access:
+`shared/` read-only and no `memory/`.
+
+### The volumes row records a relative path
+
+**Issue.** The plan's `volumes.path` doesn't say relative to what.
+
+**Solution.** It is `volumes/<agent id>/<digest>`, relative to the data
+directory, so moving the data directory doesn't make every row wrong. The
+path column is unique, and `Store::volume_by_path` answers which key a
+directory holds. Recording a key again keeps its `created_at`.
+
+### bollard's API version and Docker on the runner
+
+**Issue.** bollard 0.21 sends API version 1.53 by default. An older daemon
+refuses a client version it doesn't know.
+
+**Solution.** `DockerSandbox::connect` calls `negotiate_version`, which
+drops to the daemon's version. bollard's 2-minute request timeout covers
+only the response headers, so long `exec` and event streams aren't cut.
+
+### No curl in `debian:stable-slim`
+
+**Issue.** The plan's test runs `curl https://example.com`, which in
+`debian:stable-slim` fails only because curl isn't installed.
+
+**Solution.** The test opens a TCP connection with bash's `/dev/tcp`, by
+name (`example.com:443`) and by address (`1.1.1.1:443`), under `timeout`.
+As a control, the same probe must succeed from a container on Docker's
+default `bridge` network, so the test can't pass because the probe itself
+is broken.
+
+### A `ChildStdin` closes only when dropped
+
+**Issue.** Shutting down a Docker exec's stdin half-closes the connection,
+and the process sees end of input. A tokio `ChildStdin` ignores
+`shutdown`: the pipe closes only when it is dropped, so a runner that
+shut stdin down would hang `fake-claude` under `ProcessSandbox`.
+
+**Solution.** `ProcessSandbox` wraps the pipe so that `shutdown` drops it,
+and both sandboxes document that shutting stdin down closes the stream.
+
+### bollard's event stream starts when it is first polled
+
+**Issue.** `Docker::events` returns a stream that sends its request only
+when first polled. A container that died between `Sandbox::events` and the
+first poll would be missed, and the runner would keep a mapping for a dead
+container's IP.
+
+**Solution.** `DockerSandbox::events` passes `since` with the time of the
+call, and Docker replays the buffered events from then. An error on the
+stream ends it after one `EventsMissed` item, so the runner re-subscribes
+and compares `list_managed` with what it holds.

@@ -255,6 +255,29 @@ jobs:
       - name: Check
         run: cargo check --locked --all-targets --all-features
 
+  # Tests that need a Docker daemon: every test named `docker_*` in the
+  # workspace. They are marked `#[ignore = "needs docker"]`, so the other
+  # jobs skip them, and they run here with `--ignored`. The runner has a
+  # Docker daemon; the tests pull the images they use.
+  docker-tests:
+    name: Docker tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Show the Docker daemon
+        run: docker version
+
+      - name: Run Docker tests
+        run: cargo test --locked --workspace --all-features -- --ignored docker_
+
   # Dependency policy in deny.toml: banned crates, licenses, advisories and
   # sources. `--workspace` makes every workspace crate a root of the graph;
   # the root manifest is a package, so without it only that package's
@@ -300,7 +323,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny]
+    needs: [changes, rust, docs, coverage, msrv, deny, docker-tests]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results

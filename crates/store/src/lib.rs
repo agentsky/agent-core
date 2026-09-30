@@ -16,8 +16,9 @@
 //!
 //! Repository methods are grouped by table: [`members`](Store::ensure_member),
 //! [`claude_links`](Store::put_claude_link),
-//! [`pending_logins`](Store::put_pending_login) and
-//! [`processed_events`](Store::mark_event_processed).
+//! [`pending_logins`](Store::put_pending_login),
+//! [`processed_events`](Store::mark_event_processed) and
+//! [`volumes`](Store::put_volume).
 
 #![warn(missing_docs)]
 
@@ -34,11 +35,13 @@ mod events;
 mod members;
 mod pending_logins;
 mod seal;
+mod volumes;
 
 pub use claude_links::{ClaudeLink, NewClaudeLink};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use seal::{KeyError, SealError, Sealer};
+pub use volumes::Volume;
 
 use seal::Aad;
 
@@ -332,6 +335,7 @@ mod tests {
                 "pending_logins",
                 "processed_events",
                 "surface_identities",
+                "volumes",
             ]
         );
     }
