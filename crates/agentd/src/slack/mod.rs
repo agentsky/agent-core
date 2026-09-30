@@ -32,16 +32,18 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Instant;
 
 use axum::Router;
 use axum::routing::get;
-use core_types::{BindingId, InboundEvent, SendError, Sender, Sink, TeamId, UserId};
+use core_types::{BindingId, InboundEvent, SendError, Sender, Sink, TeamId, Throttle, UserId};
 use futures::FutureExt as _;
 use secrecy::SecretString;
 use store::Store;
+use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
-    BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
+    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
     SlackInbound, ingress,
 };
 use time::OffsetDateTime;
@@ -118,14 +120,15 @@ impl ConfigSigningSecrets {
 
 #[async_trait::async_trait]
 impl SigningSecrets for ConfigSigningSecrets {
-    async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
-        Ok(match binding {
-            BindingRef::Manager => self.manager.clone().map(|secret| SlackApp {
-                signing_secret: Some(secret),
-                bot_user: self.bot_user.clone(),
-            }),
-            BindingRef::Agent(_) => None,
-        })
+    async fn manager(&self) -> Result<Option<SlackApp>, BoxError> {
+        Ok(self.manager.clone().map(|secret| SlackApp {
+            signing_secret: Some(secret),
+            bot_user: self.bot_user.clone(),
+        }))
+    }
+
+    async fn agent(&self, _: BindingId) -> Result<Option<AgentApp>, BoxError> {
+        Ok(None)
     }
 }
 
@@ -151,14 +154,24 @@ impl StoreSigningSecrets {
 
 #[async_trait::async_trait]
 impl SigningSecrets for StoreSigningSecrets {
-    async fn lookup(&self, binding: BindingRef) -> Result<Option<SlackApp>, BoxError> {
-        let (BindingRef::Agent(id), Some((store, team))) = (binding, &self.agents) else {
-            return self.config.lookup(binding).await;
+    async fn manager(&self) -> Result<Option<SlackApp>, BoxError> {
+        self.config.manager().await
+    }
+
+    async fn agent(&self, binding: BindingId) -> Result<Option<AgentApp>, BoxError> {
+        let Some((store, team)) = &self.agents else {
+            return Ok(None);
         };
-        Ok(store.slack_app_keys(id, team).await?.map(|keys| SlackApp {
-            signing_secret: keys.signing_secret,
-            bot_user: keys.bot_user,
-        }))
+        Ok(store
+            .slack_app_keys(binding, team)
+            .await?
+            .map(|keys| AgentApp {
+                app: SlackApp {
+                    signing_secret: keys.signing_secret,
+                    bot_user: keys.bot_user,
+                },
+                owner: keys.owner,
+            }))
     }
 }
 
@@ -173,7 +186,10 @@ impl SigningSecrets for StoreSigningSecrets {
 /// only as many as the ingress lets it have in flight. Until then, and in
 /// an agentd that runs no turns, messages are dropped, as are messages to
 /// a binding that isn't active (still waiting for its install, or
-/// deleted).
+/// deleted), and those that reach their lane's turn after the pipeline
+/// closed. A failed bot lookup is logged as a warning at most once per
+/// binding per [`WARNING_INTERVAL`], since the owner can make up as many
+/// bot ids as they like.
 ///
 /// Cloning is cheap and shares the lanes and the connection.
 ///
@@ -189,6 +205,15 @@ type Waiting = (InboundEvent, InFlight);
 
 /// The messages waiting in each binding's lane, besides the one it handles.
 type Lanes = Arc<Mutex<HashMap<BindingId, VecDeque<Waiting>>>>;
+
+/// What every lane shares.
+#[derive(Clone)]
+struct Shared {
+    bots: SlackBots,
+    lanes: Lanes,
+    onward: Arc<OnceLock<Sender<InboundEvent>>>,
+    warnings: Arc<Throttle<BindingId>>,
+}
 
 impl Messages {
     /// Messages to the agents whose bots are `bots`, and the worker that
@@ -231,7 +256,12 @@ async fn run_lanes(
     mut waiting: mpsc::UnboundedReceiver<Waiting>,
     onward: Arc<OnceLock<Sender<InboundEvent>>>,
 ) {
-    let lanes = Lanes::default();
+    let shared = Shared {
+        bots,
+        lanes: Lanes::default(),
+        onward,
+        warnings: Arc::new(Throttle::new(WARNING_INTERVAL)),
+    };
     let mut running = JoinSet::new();
     loop {
         tokio::select! {
@@ -239,8 +269,8 @@ async fn run_lanes(
                 let Some(message) = received else {
                     break;
                 };
-                if let Some(first) = queue_in_lane(&lanes, message) {
-                    running.spawn(lane(bots.clone(), Arc::clone(&lanes), Arc::clone(&onward), first));
+                if let Some(first) = queue_in_lane(&shared.lanes, message) {
+                    running.spawn(lane(shared.clone(), first));
                 }
             }
             Some(_) = running.join_next(), if !running.is_empty() => {}
@@ -271,22 +301,17 @@ fn queue_in_lane(lanes: &Lanes, message: Waiting) -> Option<Waiting> {
 
 /// Hands one binding's messages on, one at a time in the order they came,
 /// until none waits.
-async fn lane(
-    bots: SlackBots,
-    lanes: Lanes,
-    onward: Arc<OnceLock<Sender<InboundEvent>>>,
-    mut message: Waiting,
-) {
+async fn lane(shared: Shared, mut message: Waiting) {
     let binding = message.0.binding;
     loop {
-        let handed = AssertUnwindSafe(hand_on(&bots, &onward, message))
+        let handed = AssertUnwindSafe(hand_on(&shared, message))
             .catch_unwind()
             .await;
         if handed.is_err() {
             tracing::error!(%binding, "handing an agent's message on panicked");
         }
         let next = {
-            let mut lanes = lock(&lanes);
+            let mut lanes = lock(&shared.lanes);
             match lanes.get_mut(&binding).and_then(VecDeque::pop_front) {
                 Some(next) => next,
                 None => {
@@ -300,18 +325,19 @@ async fn lane(
 }
 
 /// Looks `event`'s binding up, fills in its bot sender, and hands it to
-/// the turn pipeline, giving its place back after.
-async fn hand_on(
-    bots: &SlackBots,
-    onward: &OnceLock<Sender<InboundEvent>>,
-    (mut event, _place): Waiting,
-) {
+/// the turn pipeline, giving its place back after. Does none of it once
+/// the pipeline is closed.
+async fn hand_on(shared: &Shared, (mut event, _place): Waiting) {
     let binding = event.binding;
-    let Some(onward) = onward.get() else {
+    let Some(onward) = shared.onward.get() else {
         tracing::debug!(%binding, "agentd runs no turns; dropped a message to an agent");
         return;
     };
-    let surface = match bots.surface(binding).await {
+    if onward.is_closed() {
+        tracing::debug!(%binding, "the turn pipeline is closed; dropped a message to an agent");
+        return;
+    }
+    let surface = match shared.bots.surface(binding).await {
         Ok(Some(surface)) => surface,
         Ok(None) => {
             tracing::debug!(%binding, "a message to an agent's app that isn't active; dropped it");
@@ -323,15 +349,25 @@ async fn hand_on(
         }
     };
     if let Err(err) = surface.fill_bot_sender(&mut event).await {
-        tracing::warn!(%binding, error = %err, "couldn't look a bot sender up; its message goes on as it is");
+        match shared.warnings.record(binding, Instant::now()) {
+            Some(quiet) => tracing::warn!(
+                %binding,
+                error = %err,
+                failed_since_last_warning = quiet,
+                "couldn't look a bot sender up; its message goes on as it is"
+            ),
+            None => {
+                tracing::debug!(%binding, error = %err, "couldn't look a bot sender up; its message goes on as it is")
+            }
+        }
     }
     if onward.send(event).await.is_err() {
         tracing::warn!(%binding, "the turn pipeline is gone; dropped a message");
     }
 }
 
-/// Deduplication in the store's `processed_events`, which the sweeper
-/// empties after [`store::PROCESSED_EVENT_RETENTION`].
+/// Deduplication in the store's `processed_events`, each key kept for
+/// [`DEDUP_RETENTION`], after which the sweeper deletes it.
 #[derive(Debug, Clone)]
 pub struct StoreDedup(pub Store);
 
@@ -340,7 +376,7 @@ impl Dedup for StoreDedup {
     async fn first_time(&self, source: &str, key: &str) -> Result<bool, BoxError> {
         Ok(self
             .0
-            .mark_event_processed(source, key, OffsetDateTime::now_utc())
+            .mark_event_processed(source, key, OffsetDateTime::now_utc(), DEDUP_RETENTION)
             .await?)
     }
 }
@@ -475,17 +511,33 @@ mod tests {
     async fn only_the_manager_is_known_and_only_with_a_secret() {
         let secret = SecretString::from("manager-secret");
         let secrets = ConfigSigningSecrets::new(Some(&secret), Some(UserId::new("U0MANAGER")));
-        let manager = secrets.lookup(BindingRef::Manager).await.unwrap().unwrap();
+        let manager = secrets.manager().await.unwrap().unwrap();
         assert_eq!(
             manager.signing_secret.unwrap().expose_secret(),
             "manager-secret"
         );
         assert_eq!(manager.bot_user, Some(UserId::new("U0MANAGER")));
-        let agent = BindingRef::Agent(core_types::BindingId::new_v4());
-        assert!(secrets.lookup(agent).await.unwrap().is_none());
+        let agent = core_types::BindingId::new_v4();
+        assert!(secrets.agent(agent).await.unwrap().is_none());
 
         let none = ConfigSigningSecrets::new(None, None);
-        assert!(none.lookup(BindingRef::Manager).await.unwrap().is_none());
+        assert!(none.manager().await.unwrap().is_none());
         assert!(!format!("{secrets:?}").contains("manager-secret"));
+    }
+
+    #[tokio::test]
+    async fn slack_deduplication_forgets_a_key_after_an_hour() {
+        let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
+        let store = Store::open_in_memory(sealer).await.unwrap();
+        let dedup = StoreDedup(store.clone());
+        let (source, key) = ("slack:manager:message", "D0DM00001:1727697900.000500");
+        assert!(dedup.first_time(source, key).await.unwrap());
+        assert!(!dedup.first_time(source, key).await.unwrap());
+        let within = OffsetDateTime::now_utc() + time::Duration::minutes(50);
+        store.sweep_expired(within).await.unwrap();
+        assert!(!dedup.first_time(source, key).await.unwrap());
+        let past = OffsetDateTime::now_utc() + time::Duration::minutes(61);
+        store.sweep_expired(past).await.unwrap();
+        assert!(dedup.first_time(source, key).await.unwrap());
     }
 }

@@ -41,7 +41,12 @@ impl Dedup for StoreDedup {
     ) -> Result<bool, SurfaceError> {
         let first = self
             .store
-            .mark_event_processed(source, event_id, time::OffsetDateTime::now_utc())
+            .mark_event_processed(
+                source,
+                event_id,
+                time::OffsetDateTime::now_utc(),
+                store::PROCESSED_EVENT_RETENTION,
+            )
             .await
             .map_err(|err| SurfaceError::Api(err.to_string()))?;
         let _ = self
@@ -624,7 +629,12 @@ async fn two_bots_in_one_room_deliver_each_message_once() {
     h.no_more_events();
     let processed_again = h
         .store
-        .mark_event_processed(DEDUP_SOURCE, "m-both", time::OffsetDateTime::now_utc())
+        .mark_event_processed(
+            DEDUP_SOURCE,
+            "m-both",
+            time::OffsetDateTime::now_utc(),
+            store::PROCESSED_EVENT_RETENTION,
+        )
         .await
         .unwrap();
     assert!(!processed_again);
@@ -737,7 +747,12 @@ async fn a_message_in_an_unreadable_room_is_left_for_another_connection() {
     assert_eq!(h.next_decision().await.1, "m-real");
     let unclaimed = h
         .store
-        .mark_event_processed(DEDUP_SOURCE, "m-ghost", time::OffsetDateTime::now_utc())
+        .mark_event_processed(
+            DEDUP_SOURCE,
+            "m-ghost",
+            time::OffsetDateTime::now_utc(),
+            store::PROCESSED_EVENT_RETENTION,
+        )
         .await
         .unwrap();
     assert!(unclaimed);

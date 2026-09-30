@@ -7,11 +7,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use core_types::{BindingId, SurfaceKind, TeamId};
 use store::{BindingState, Store, StoreError};
-use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
+use surface_slack::{SlackClient, SlackSurface, TeamDirectory, WebApi};
 
 /// The surfaces agents' Slack bots act through, one per active binding,
 /// built from the store on first use and kept. Every binding shares the
-/// workspace's one [`TeamDirectory`], the manager app's.
+/// workspace's one [`TeamDirectory`], the manager app's, and reads its
+/// member list with the manager app's token
+/// ([`SlackSurface::with_members_api`]), never an agent's, which the
+/// agent's owner holds.
 ///
 /// - [`surface`](Self::surface) is the binding's surface, for looking bot
 ///   senders up with [`SlackSurface::fill_bot_sender`] and for replies. It
@@ -37,6 +40,7 @@ struct Inner {
     store: Store,
     client: SlackClient,
     directory: Arc<TeamDirectory>,
+    members_api: WebApi,
     built: Mutex<HashMap<BindingId, Arc<SlackSurface>>>,
 }
 
@@ -50,14 +54,16 @@ impl fmt::Debug for SlackBots {
 }
 
 impl SlackBots {
-    /// The bots of `store`'s Slack bindings in `directory`'s workspace,
-    /// acting through `client`.
-    pub fn new(store: Store, client: SlackClient, directory: Arc<TeamDirectory>) -> Self {
+    /// The bots of `store`'s Slack bindings in the workspace of `manager`,
+    /// the manager app's surface, acting through `client`. They share its
+    /// directory, and read the member list with its token.
+    pub fn new(store: Store, client: SlackClient, manager: &SlackSurface) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 client,
-                directory,
+                directory: Arc::clone(manager.directory()),
+                members_api: manager.api().clone(),
                 built: Mutex::new(HashMap::new()),
             }),
         }
@@ -108,7 +114,8 @@ impl SlackBots {
                         self.inner.client.bot(token),
                         Arc::clone(&self.inner.directory),
                     )
-                    .with_bot_user(row.bot_user.clone()),
+                    .with_bot_user(row.bot_user.clone())
+                    .with_members_api(self.inner.members_api.clone()),
                 );
                 Arc::clone(self.built().entry(binding).or_insert(surface))
             }

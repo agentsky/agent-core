@@ -134,11 +134,7 @@ async fn harness() -> Harness {
             app_name: None,
         },
     );
-    let bots = SlackBots::new(
-        store.clone(),
-        client,
-        Arc::clone(manager.surface().directory()),
-    );
+    let bots = SlackBots::new(store.clone(), client, manager.surface());
     let agents = SlackAgents::new(
         store.clone(),
         manager,
@@ -495,6 +491,52 @@ async fn an_agents_message_reaches_the_pipeline_with_its_bot_sender_looked_up() 
         .expect("the worker ends with its queue")
         .unwrap();
     assert!(rx.try_recv().is_err());
+}
+
+struct Closed;
+
+#[async_trait::async_trait]
+impl Sink<InboundEvent> for Closed {
+    async fn send(&self, _: InboundEvent) -> Result<(), SendError> {
+        Err(SendError)
+    }
+
+    fn is_closed(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_closed_pipeline_gets_no_lookups_for_the_messages_left() {
+    let h = harness().await;
+    mount(
+        &h.slack,
+        "bots.info",
+        AGENT_TOKEN,
+        ok(json!({"bot": {"id": "B0OTHERBOT", "user_id": "U0OTHERBOT"}})),
+    )
+    .await;
+    let binding = installed(&h).await;
+    let (messages, worker) = Messages::new(h.agents.bots().clone());
+    messages.connect(Sender::new(Closed));
+    let worker = tokio::spawn(worker);
+    for _ in 0..3 {
+        messages.hand(bot_message(binding, TEAM), InFlight::untracked());
+    }
+    drop(messages);
+    tokio::time::timeout(Duration::from_secs(5), worker)
+        .await
+        .expect("the worker ends with its queue")
+        .unwrap();
+    let lookups = h
+        .slack
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/bots.info")
+        .count();
+    assert_eq!(lookups, 0);
 }
 
 async fn installed(h: &Harness) -> BindingId {

@@ -5,12 +5,12 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_types::{
     AgentId, Caps, ConvKind, CredentialRef, Hop, InboundEvent, MemberId, MemberKey, MsgRef,
     ReplyTarget, Requester, ScopeKey, ScopeKind, SendError, Sender, Side, Sink, Surface,
-    SurfaceError, ThreadKey, TurnId, TurnKind,
+    SurfaceError, ThreadKey, Throttle, TurnId, TurnKind,
 };
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
@@ -69,6 +69,11 @@ pub const DEFAULT_MAX_PENDING_PER_OWNER: usize = 16;
 /// How many notices the agents of one owner may be posting at once: busy
 /// lines and asks to try again. One more while that many are is dropped.
 const MAX_NOTICES: usize = 8;
+
+/// How often a warning about one agent's flood (a message not taken, a
+/// notice not posted) is logged, at most; the next says how many went
+/// quiet.
+const FLOOD_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long the notices of turns cut short by a shutdown may take.
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -217,6 +222,19 @@ struct Inner {
     tasks: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
+    floods: Throttle<(AgentId, Flood)>,
+}
+
+/// What an agent's flood makes the pipeline refuse or drop, each warned
+/// about apart: a message not taken, a notice not posted or failed, and a
+/// message that confirming dropped or couldn't check, which is what a
+/// forged event reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Flood {
+    BotMessage,
+    Message,
+    Notice,
+    Unconfirmed,
 }
 
 /// One agent in one thread: its messages are answered in arrival order.
@@ -316,6 +334,16 @@ impl Drop for WorkingGuard {
     }
 }
 
+/// Takes the pipeline's finished tasks off `tasks`, logging any that
+/// panicked, as [`Pipeline::drain`] does.
+fn reap(tasks: &mut JoinSet<()>) {
+    while let Some(joined) = tasks.try_join_next() {
+        if let Err(err) = joined {
+            tracing::error!(error = %err, "a pipeline task failed");
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -344,6 +372,7 @@ impl Pipeline {
                 tasks: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
+                floods: Throttle::new(FLOOD_WARNING_INTERVAL),
             }),
         }
     }
@@ -474,14 +503,26 @@ impl Pipeline {
             if taken {
                 waiting.push(finished);
             } else if from_bot {
-                tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; dropping a bot's message");
+                if let Some(quiet) = self.flooded(agent, Flood::BotMessage) {
+                    tracing::warn!(%agent, message = %event.message.id, dropped_since_last_warning = quiet, "too many messages waiting; dropping a bot's message");
+                }
             } else {
-                tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; not taking this one");
+                if let Some(quiet) = self.flooded(agent, Flood::Message) {
+                    tracing::warn!(%agent, message = %event.message.id, refused_since_last_warning = quiet, "too many messages waiting; not taking this one");
+                }
                 self.notice(&event, agent, owner, caps, Notice::Busy, done);
                 waiting.push(finished);
             }
         }
         waiting
+    }
+
+    /// Whether a warning about `agent`'s `flood` is due: `Some` of how many
+    /// went quiet since the last, at most once per
+    /// [`FLOOD_WARNING_INTERVAL`] for each agent and kind, since whoever
+    /// signs an agent's events can make as many as they like.
+    fn flooded(&self, agent: AgentId, flood: Flood) -> Option<u64> {
+        self.inner.floods.record((agent, flood), Instant::now())
     }
 
     /// A place in the pipeline and one among `owner`'s agents', or `None`
@@ -515,7 +556,7 @@ impl Pipeline {
             lock(&self.inner.lanes).remove(&key);
             return true;
         }
-        while tasks.try_join_next().is_some() {}
+        reap(&mut tasks);
         tasks.spawn(self.clone().lane(key, first));
         true
     }
@@ -571,13 +612,16 @@ impl Pipeline {
         done: Done,
     ) {
         let Ok(permit) = self.share(owner).notices.try_acquire_owned() else {
-            tracing::warn!(%agent, message = %event.message.id, ?notice, "too many notices being posted; not posting another");
+            if let Some(quiet) = self.flooded(agent, Flood::Notice) {
+                tracing::warn!(%agent, message = %event.message.id, ?notice, not_posted_since_last_warning = quiet, "too many notices being posted; not posting another");
+            }
             return;
         };
         let mut tasks = lock(&self.inner.tasks);
         if self.is_closed() {
             return;
         }
+        reap(&mut tasks);
         let pipeline = self.clone();
         let event = Arc::clone(event);
         tasks.spawn(async move {
@@ -605,8 +649,10 @@ impl Pipeline {
             say(surface.as_ref(), &reply_target(event, caps), &text).await?;
             Ok::<_, PipelineError>(())
         };
-        if let Err(err) = told.await {
-            tracing::warn!(%agent, message = %event.message.id, ?notice, error = %err, "couldn't post a notice");
+        if let Err(err) = told.await
+            && let Some(quiet) = self.flooded(agent, Flood::Notice)
+        {
+            tracing::warn!(%agent, message = %event.message.id, ?notice, error = %err, failed_since_last_warning = quiet, "couldn't post a notice");
         }
     }
 
@@ -687,7 +733,9 @@ impl Pipeline {
             return;
         };
         if !copy_stands(&decision, &confirmed) {
-            tracing::warn!(%agent, message = %event.message.id, "the platform's copy of a message routes differently from its event; dropped it");
+            if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message routes differently from its event; dropped it");
+            }
             return;
         }
         self.act(&copy, agent, caps, confirmed).await;
@@ -734,11 +782,15 @@ impl Pipeline {
                 Some(copy)
             }
             Ok(_) => {
-                tracing::warn!(%agent, message = %event.message.id, "the platform doesn't have this message as it arrived; dropped it");
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform doesn't have this message as it arrived; dropped it");
+                }
                 None
             }
             Err(err @ (SurfaceError::RateLimited { .. } | SurfaceError::Transport(_))) => {
-                tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't confirm a message with the platform; asking to try again");
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, unconfirmed_since_last_warning = quiet, "couldn't confirm a message with the platform; asking to try again");
+                }
                 self.notice(
                     &job.event,
                     agent,
@@ -750,7 +802,9 @@ impl Pipeline {
                 None
             }
             Err(err) => {
-                tracing::warn!(%agent, message = %event.message.id, error = %err, "the platform refused to confirm a message; dropped it");
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, unconfirmed_since_last_warning = quiet, "the platform refused to confirm a message; dropped it");
+                }
                 None
             }
         }
@@ -1684,6 +1738,10 @@ impl Sink<InboundEvent> for PipelineSink {
     async fn send(&self, event: InboundEvent) -> Result<(), SendError> {
         self.pipeline.dispatch(event, self.caps).await;
         Ok(())
+    }
+
+    fn is_closed(&self) -> bool {
+        self.pipeline.is_closed()
     }
 }
 

@@ -11,6 +11,7 @@ use agentd::server::{Routers, Server, Worker, public_router};
 use agentd::{App, Config, slack};
 use core_types::{SendError, Sender, Sink};
 use serde_json::{Value, json};
+use surface_slack::ingress::DEDUP_RETENTION;
 use surface_slack::{BindingRef, SlackInbound};
 use testkit::slack as fixtures;
 use time::OffsetDateTime;
@@ -292,7 +293,12 @@ async fn retries_are_dropped_through_the_store() {
 
     assert!(
         !app.store()
-            .mark_event_processed("slack:manager", "Ev0USERCHG1", OffsetDateTime::now_utc())
+            .mark_event_processed(
+                "slack:manager",
+                "Ev0USERCHG1",
+                OffsetDateTime::now_utc(),
+                DEDUP_RETENTION,
+            )
             .await
             .unwrap(),
         "the event id is not in processed_events"
@@ -353,13 +359,21 @@ async fn only_kept_messages_reach_processed_events_and_only_by_channel_and_ts() 
         ("slack:manager:message", "C0CHAN001:1727697610.000200"),
     ] {
         assert!(
-            store.mark_event_processed(source, key, now).await.unwrap(),
+            store
+                .mark_event_processed(source, key, now, DEDUP_RETENTION)
+                .await
+                .unwrap(),
             "{source} {key} is in processed_events"
         );
     }
     assert!(
         !store
-            .mark_event_processed("slack:manager:message", "D0DM00001:1727697900.000500", now)
+            .mark_event_processed(
+                "slack:manager:message",
+                "D0DM00001:1727697900.000500",
+                now,
+                DEDUP_RETENTION,
+            )
             .await
             .unwrap(),
         "the DM is not in processed_events"

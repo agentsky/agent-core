@@ -26,8 +26,10 @@ const MAX_PAGES: usize = 1000;
 /// How long before its event arrived a message may have been posted and
 /// still be read back by [`Surface::confirm`]. Slack's last retry of a
 /// delivery comes about five minutes after the first; deduplication
-/// forgets an event after seven days, and a message older than the bot's
-/// membership never had one, so without it either could be replayed.
+/// forgets a message after [`DEDUP_RETENTION`](crate::ingress::DEDUP_RETENTION),
+/// and a message older than the bot's membership never had one, so without
+/// it either could be replayed. The ingress acknowledges and drops an
+/// agent's message this old before it records it.
 pub const CONFIRM_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// What [`SlackSurface::caps`] returns: a 3,000-character message limit
@@ -92,6 +94,7 @@ pub const CLIENT_URL: &str = "https://app.slack.com/client/";
 #[derive(Clone)]
 pub struct SlackSurface {
     api: WebApi,
+    members_api: WebApi,
     directory: Arc<TeamDirectory>,
     bot_user: Option<UserId>,
 }
@@ -102,15 +105,27 @@ impl SlackSurface {
     /// the bindings of a workspace.
     pub fn new(api: WebApi, directory: Arc<TeamDirectory>) -> Self {
         Self {
+            members_api: api.clone(),
             api,
             directory,
             bot_user: None,
         }
     }
 
+    /// Reads the workspace's member list, which every binding in it
+    /// shares, through `api` rather than the binding's own token. agentd
+    /// gives agents' surfaces the manager app's, which its operators hold:
+    /// an agent's owner holds the agent's token, and could revoke it or use
+    /// up its quota to keep the shared list stale for everyone.
+    pub fn with_members_api(mut self, api: WebApi) -> Self {
+        self.members_api = api;
+        self
+    }
+
     /// Sets the binding's bot user, which [`Surface::confirm`] needs to
-    /// tell whether a channel message mentions the bot, as the ingress
-    /// does. Without one, only thread replies and DMs are confirmed.
+    /// tell, as the ingress does, whether a message outside a one-to-one DM
+    /// mentions the bot or replies in a thread under the bot's root.
+    /// Without one, only thread replies and DMs are confirmed.
     pub fn with_bot_user(mut self, bot_user: Option<UserId>) -> Self {
         self.bot_user = bot_user;
         self
@@ -128,13 +143,14 @@ impl SlackSurface {
     }
 
     /// Reads the workspace's members again when the cache is older than its
-    /// TTL, and returns the snapshot [`render`](Surface::render) will use.
+    /// TTL, through the [members API](Self::with_members_api), and returns
+    /// the snapshot [`render`](Surface::render) will use.
     ///
     /// # Errors
     ///
     /// The `users.list` error, when there is no older list to fall back on.
     pub async fn refresh_members(&self) -> Result<Arc<MemberDirectory>> {
-        self.directory.refresh_members(&self.api).await
+        self.directory.refresh_members(&self.members_api).await
     }
 
     /// Starts a member refresh on the current Tokio runtime when the cache
@@ -436,8 +452,9 @@ impl Surface for SlackSurface {
     ///    thread the event names, and normalized with
     ///    [`normalize::read_back`], the ingress's rules, with this binding's
     ///    bot user: subtypes, sender, mentions from `text` and `blocks`,
-    ///    thread, files and whether a channel message is addressed. A bot
-    ///    known only by its bot id is named by its user, as
+    ///    thread, files and whether the message addresses the bot: outside
+    ///    a one-to-one DM, a mention of the bot or a thread reply under its
+    ///    root. A bot known only by its bot id is named by its user, as
     ///    [`fill_bot_sender`](Self::fill_bot_sender) names it.
     ///
     /// None of the lookups [waits](WebApi::without_waiting) for the bot
@@ -450,10 +467,8 @@ impl Surface for SlackSurface {
     /// would drop.
     async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
         let channel = self.channel(&event.conv)?;
-        let fresh = ts_time(event.message.id.as_str())
-            .is_some_and(|sent| sent >= event.received_at - CONFIRM_WINDOW);
-        if !fresh {
-            tracing::warn!(binding = %event.binding, message = %event.message.id, "a message older than the confirmation window; not reading it back");
+        if !within_window(event.message.id.as_str(), event.received_at) {
+            tracing::debug!(binding = %event.binding, message = %event.message.id, "a message older than the confirmation window; not reading it back");
             return Ok(None);
         }
         let api = self.api.without_waiting();
@@ -523,6 +538,12 @@ fn ts_parts(ts: &str) -> Option<(i64, u32)> {
     }
     let micros = format!("{fraction:0<6}").parse().ok()?;
     Some((seconds.parse().ok()?, micros))
+}
+
+/// Whether a message with this `ts` was posted at most [`CONFIRM_WINDOW`]
+/// before `received_at`, when its event arrived.
+pub(crate) fn within_window(ts: &str, received_at: OffsetDateTime) -> bool {
+    ts_time(ts).is_some_and(|sent| sent >= received_at - CONFIRM_WINDOW)
 }
 
 /// When a message with this `ts` was sent.

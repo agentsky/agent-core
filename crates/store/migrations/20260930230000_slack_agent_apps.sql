@@ -13,9 +13,18 @@
 -- owner one reminder, which `install_reminded_at` records. The claim, lease and
 -- attempt columns follow the relink notices' pattern: a claim counts an
 -- attempt and sets `install_reminder_next_at` to the lease's end.
+--
+-- A processed event is remembered for as long as its caller asks, until
+-- `expires_at`: Slack's deduplication keys for an hour, Rocket.Chat's
+-- messages for a week, as every row recorded before this did.
 
 ALTER TABLE agent_bindings ADD COLUMN app_scopes TEXT;
 ALTER TABLE agent_bindings ADD COLUMN app_redirect_url TEXT;
 ALTER TABLE agent_bindings ADD COLUMN install_reminded_at INTEGER;
 ALTER TABLE agent_bindings ADD COLUMN install_reminder_attempts INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE agent_bindings ADD COLUMN install_reminder_next_at INTEGER;
+
+ALTER TABLE processed_events ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;
+UPDATE processed_events SET expires_at = seen_at + 604800;
+DROP INDEX processed_events_seen_at;
+CREATE INDEX processed_events_expires_at ON processed_events (expires_at);

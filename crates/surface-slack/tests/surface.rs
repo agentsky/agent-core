@@ -11,12 +11,12 @@ use core_types::{
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::normalize::{self, Context};
+use surface_slack::normalize::{self, Context, MAX_ID_TAIL};
 use surface_slack::surface::CAPS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 use testkit::Held;
 use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const TOKEN: &str = "xoxb-surface-test";
@@ -143,6 +143,34 @@ async fn render_refreshes_a_stale_member_cache_in_the_background() {
         }
     }
     assert_eq!(rendered, [format!("<@{USER}>")]);
+}
+
+#[tokio::test]
+async fn the_member_list_is_read_with_the_members_api_token_only() {
+    let (server, agent) = setup().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let agent = agent.with_members_api(client.bot(SecretString::from("xoxb-manager")));
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .and(header("authorization", "Bearer xoxb-manager"))
+        .respond_with(ok(
+            json!({"members": [{"id": USER, "name": "ada", "profile": {"display_name": "Ada"}}]}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "token_revoked"})),
+        )
+        .mount(&server)
+        .await;
+    let members = agent.refresh_members().await.unwrap();
+    assert_eq!(members.lookup("ada"), Some(&UserId::from(USER)));
+    let seen = requests(&server).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].headers["authorization"], "Bearer xoxb-manager");
 }
 
 #[test]
@@ -1086,10 +1114,11 @@ async fn the_conversation_kind_comes_from_conversations_info_once_an_hour() {
     assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
 
     let (server, surface) = confirming_setup(json!({"is_mpim": true, "is_group": true})).await;
+    let mention = format!("<@{BOT_USER}> in a group DM");
     mount(
         &server,
         "conversations.history",
-        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "no mention"}]})),
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": mention}]})),
     )
     .await;
     assert_eq!(
@@ -1109,6 +1138,34 @@ async fn a_message_older_than_the_window_is_not_read_back() {
     event.message.id = "not a ts".into();
     assert_eq!(surface.confirm(&event).await, Ok(None));
     assert!(requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_thread_reply_is_confirmed_only_under_a_root_the_bot_may_have_posted() {
+    let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
+    let root = event.thread_root.clone().unwrap();
+    for (parent, confirmed) in [
+        (json!(BOT_USER), true),
+        (Value::Null, true),
+        (json!("not a user"), true),
+        (json!(USER), false),
+    ] {
+        let (server, surface) = confirming_setup(public_channel()).await;
+        mount(
+            &server,
+            "conversations.replies",
+            ok(json!({"messages": [{
+                "ts": event.message.id.as_str(),
+                "user": USER,
+                "text": event.text,
+                "thread_ts": root.as_str(),
+                "parent_user_id": parent,
+            }]})),
+        )
+        .await;
+        let copy = surface.confirm(&event).await.unwrap();
+        assert_eq!(copy.is_some(), confirmed, "{parent}");
+    }
 }
 
 #[tokio::test]
@@ -1237,4 +1294,29 @@ async fn a_channel_id_slack_spells_otherwise_is_refused() {
         Err(SurfaceError::NotFound(_))
     ));
     assert!(lookups(&server, "conversations.history").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_bot_id_not_shaped_like_slacks_is_never_looked_up() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0MADEUP", "user_id": "U0MADEUP"}})),
+    )
+    .await;
+    for bot_id in [
+        format!("B{}", "A".repeat(900_000)),
+        format!("B{}", "A".repeat(MAX_ID_TAIL + 1)),
+        "B".to_owned(),
+        "b0lower".to_owned(),
+        "U0HUMAN01".to_owned(),
+    ] {
+        let mut event = bot_event();
+        event.sender.user = bot_id.as_str().into();
+        let before = event.clone();
+        surface.fill_bot_sender(&mut event).await.unwrap();
+        assert_eq!(event, before);
+    }
+    assert!(lookups(&server, "bots.info").await.is_empty());
 }

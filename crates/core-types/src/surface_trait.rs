@@ -260,6 +260,12 @@ impl<T: Send + 'static> Sender<T> {
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         self.sink.send(item).await
     }
+
+    /// Whether the receiver is known to take no more items, so the sender
+    /// can skip the work of making one (see [`Sink::is_closed`]).
+    pub fn is_closed(&self) -> bool {
+        self.sink.is_closed()
+    }
 }
 
 impl<T: Send + 'static> Clone for Sender<T> {
@@ -300,6 +306,12 @@ impl<T: Send + 'static> fmt::Debug for Sender<T> {
 pub trait Sink<T: Send + 'static>: Send + Sync {
     /// Delivers one item. Fails once the receiver is gone.
     async fn send(&self, item: T) -> Result<(), SendError>;
+
+    /// Whether the receiver takes no more items. False unless the sink can
+    /// tell; [`send`](Self::send) still decides.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// The receiver behind a [`Sender`] is gone.

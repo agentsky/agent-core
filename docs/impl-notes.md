@@ -5355,6 +5355,448 @@ marks bob's link broken, and sees bob's channel message and DM make no
 upstream request and each get the relink prompt, while carol, unlinked,
 still runs on the community key.
 
+## T27: Usage meter, limits, allow and deny
+
+### The base branch lacked T24 to T26
+
+**Issue.** T27 builds on T26 (community admins, the `admin` command group,
+`failure_notices`), but `claude/slack-agent-apps` (T31), which T27 was to
+be stacked on, and `claude/skills` (T25, on T26, on T24) both fork from
+`claude/turn-pipeline-delivery`, so neither holds the other.
+
+**Solution.** The branch merges `claude/skills` first, in a commit of its
+own, resolving the conflicts: `Commands` keeps T25's `Inner`, which isn't
+`Clone`, and carries T31's `SlackAgents` beside the admins; the pipeline
+keeps T31's confirm-then-act split with T26's relink prompt; the Slack
+inbound passes both T25's files and T31's in-flight place. The T27 commit
+comes after it, so it reads on its own once the stack is chained again.
+
+### The runner reads the restored total from the transcript
+
+**Issue.** The plan offers two ways to take the total a `--resume`d
+process restores off its first turn's cost: read the transcript's last
+`cost-state` line, or keep a total in `sessions` when a process exits
+cleanly. The second can't see what the CLI will actually restore: a
+leftover process in the container can append its own `cost-state` line
+after a clean exit, and the CLI restores that one.
+
+**Solution.** The first. `SessionManager` reads the total before it
+starts a `--resume`d process, off the async runtime, and hands it to
+`ClaudeProcess::count_cost_from`; `TurnResult::cost_usd` is then the turn's
+own on every turn. The transcript is agent-writable, so the read opens
+`claude/projects/<id>/<id>.jsonl` below the session's directory one
+component at a time with `O_NOFOLLOW` (rustix `openat`, a runner
+dependency now), accepts only a regular file, opened `O_NONBLOCK` so a
+FIFO can't hang it.
+
+The runner must read the total the CLI restores, or none: a total it
+reads but the CLI doesn't restore is billed, the difference up to
+`MAX_TURN_COST_USD`, to the next requester per forced crash and resume.
+Two versions tried to mirror the pinned CLI's loader and missed. The
+first read a line with a derived serde struct, which accepts a JSON array
+as the struct's fields in order, so `["cost-state", 0]` read as 0. The
+second parsed lines as `JSON.parse` does and checked the CLI's zod schema
+(read from 2.1.285's bundled source), and a review with the real CLI
+against a stub API found two more paths: past 5,242,880 bytes (`gue` in
+the source) the loader indexes lines by their first bytes before parsing
+them, so `{"type":"artifact-autoreact-ledger","type":"cost-state",…}` is a
+ledger line to the CLI and a `cost-state` line to `JSON.parse`; and the CLI
+restores the `cost-state` line of the session its last message names,
+so an appended message and `cost-state` line of another session id
+restored that session's total.
+
+So the runner no longer mirrors the loader; it fails closed. It reads a
+total only when all of these hold, and otherwise the total is unknown:
+
+- the file is at most 5,242,880 bytes, and ends its last line (the CLI
+  ends every line it writes, and the size keeps the CLI off its index
+  pass and its compaction, both only past that size);
+- every line is blank or a JSON object with no key written twice at any
+  depth (the CLI never writes one twice);
+- every line with a `sessionId` carries the session's own id, and every
+  message (a `user`, `assistant`, `system`, `attachment` or `progress`
+  line, or any with a `uuid` or `parentUuid`) carries one, so the last
+  message names this session;
+- a `type` that is present is a string, and every `cost-state` line
+  starts with the bytes the CLI writes,
+  `{"type":"cost-state","sessionId":"<id>",`, holds only the keys the CLI
+  writes, and passes its schema with a margin: every amount at most half
+  the CLI's bound (so the two parsers' rounding can't fall on different
+  sides of it), model names printable ASCII, the token sums in bounds.
+
+The total is then the last `cost-state` line's, or 0 without one. The
+unknown side is always the runner's: an agent can make its first turn's
+cost unknown, never move it. The file is read whole, and no line has a
+length cap: the CLI's own lines (tool results) run long. A missing
+transcript (the CLI then refuses the `--resume`) or one it can't open this
+way is unknown too.
+
+This guarantees what the Docker test checks, not every path of a loader
+the runner can't see all of: `docker_the_pinned_cli_restores_whatever_total_the_runner_reads`
+(a runner unit test CI's Docker job runs) resumes the pinned CLI from the
+sandbox image on crafted transcripts, against a stub API that answers 400
+so the result's `total_cost_usd` is the restored total, and asserts that
+whenever the runner reads a total the CLI restored exactly it. First it
+has the CLI write a real session: one `-p` turn against a stub that
+streams a `Write` call and then a text reply, so the transcript holds what
+the CLI writes for a tool turn (queue operations, attachments, the
+`tool_use` and `tool_result` lines, `last-prompt`, `atis-latch` and its
+`cost-state` line), and the runner must read the total that turn reported
+(0.0112), which the CLI then restores; no rule had to be relaxed for it.
+The transcript is printed, and kept in
+`testkit/fixtures/transcript/tool-turn.jsonl` (four long attachment lines
+left out) for a unit test that needs no Docker. The CLI runs as the
+session directory's owner, as agentd runs the sandbox when it isn't root,
+so the runner opens the files with the modes the CLI gave them; run as the
+image's user, it wrote a transcript the non-root CI runner could not
+open. Then the hand-built
+shapes (no cost line, one, two, a file of exactly 5,242,880 bytes) must
+read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
+`leaf3`, a duplicated key, a ledger-prefixed line) must be unknown. On the
+code before this, the test read 0.25 where the CLI restored 5 for
+`ledger_big` and `attr_big`, and 5 where it restored 7 for `leaf2` and
+`leaf3`.
+
+All of that holds only if nothing changes the file between the runner's
+read and the CLI's, and a process the agent leaves running in the
+container can: when the agent kills its own CLI, the exit is confirmed
+and the container kept, so the next requester's `--resume` ran in a
+container where a background loop could wait for `resume <id>` to appear
+and append a `cost-state` line of 900 after the runner read 5, billing the
+next requester about $895. `SessionManager::ensure_process` now reads the
+restored total only when it started the container in the same call:
+nothing of the agent's runs in a fresh one before the CLI (its command is
+`sleep infinity` from the image, the exec wrapper is the image's `sh`, and
+the credential proxy and agentctl token are agentd's), and a session's
+earlier container is stopped before another starts. A `--resume` in a
+container an earlier process ran in (after a crash, a kill, or a
+credential kind or model change) counts its first turn's cost as unknown.
+A runner test resumes in such a container and gets no cost; before this
+it got the turn's cost. Stopping the container before every resume would
+keep that cost known at a container start's price, and would also end
+the agent's leftover processes (Deferred work's "Killing leftover
+processes at turn end").
+
+A turn's cost is unknown (`None`, and billed as 0) when its result or the
+process's previous one has no plausible total (so a result without one
+leaves the next turn unknown too, and the one after is known again), when
+the total falls, or when it rises by more than `MAX_TURN_COST_USD`
+($1,000). An unknown restored total makes only the first turn's cost
+unknown. Even so, the agent can write the transcript and the CLI's stdout
+(it runs as the same user), so `cost_usd` is a record, never something a
+limit is enforced with: no cap reads it.
+
+`fake-claude` now appends a `cost-state` line shaped as 2.1.285 writes
+it, starting with the same bytes, when its input ends, and none when it
+crashes, and restores the session's last one on `--resume`;
+a runner test checks the resumed turn's cost after a clean stop and after
+a crash, and the Docker test now checks the corrected cost against the real
+CLI in CI.
+
+### Cache reads aren't tokens the meter counts
+
+**Issue.** A result's `usage` has four counts. Every API call of a turn
+reads the whole conversation from the prompt cache, so cache reads grow
+with a thread's length, not its work: a token budget counting them would
+stop a long thread after a few turns.
+
+**Solution.** The meter's input tokens are uncached input plus cache
+writes, and its tokens are those plus output, for `usage`, `thread_usage`
+and `me`. `usage.cost_usd` keeps the CLI's own figure, which prices every
+kind.
+
+### A turn is billed at least what its messages used
+
+**Issue.** Only a result line carries a turn's usage, so a turn that
+crashed or timed out, one whose CLI the agent killed itself included,
+counted as a turn with no tokens, and a loop of such turns never reached
+the thread's token budget. A result line that reports less than the turn
+used would undercut it too.
+
+**Solution.** `TurnStats::message_usage` adds up the `message.usage` of
+the turn's `assistant` lines. The CLI prints one line per content block of
+an API message, each with that message's usage so far; in the captures
+their output counts are lower than the result's, and their input counts
+add up to it. Subagents print their messages as `assistant` lines too,
+with a `parent_tool_use_id` (2.1.285's source emits each subagent
+message's blocks as they stream), so the lines of Task subagents running
+at once come interleaved: `s1, s2, s1, s2`. A first version counted a
+message once only across consecutive lines, and so counted such a turn
+twice. `TurnStats` now keeps the latest 64 message ids with what each has
+counted, and a line of a known id adds only what it raises that by; an id
+pushed out by 64 others counts again, which only more than 64 messages
+streaming at once would reach. `TurnOutcome::usage` is that sum for a turn
+that crashed or timed out, and for a finished one each count the larger
+of the result's and the sum, so a forged low result can't undercut what
+was streamed first. The meter bills it.
+
+No count of a turn is more than `MAX_TURN_TOKENS` (100 million, far above
+what a turn writes, as `MAX_TURN_COST_USD` is above its cost): a count
+past it in a `usage`, or in what a turn's lines add up to, counts as the
+cap. Each count is held on its own. A first version dropped a whole
+`usage` with any count past the cap, cache reads included, which a long
+turn over a million-token context passes honestly: the result's figures
+were lost for the streamed ones, which are lower, and an agent could
+print such a result to be undercounted. Held at the cap, a forged count
+can only raise the turn's figure, never take a real one out of the
+thread's budget.
+
+The agent runs as the CLI's user, so it can write to the CLI's stdout as
+well as its transcript, and print whatever lines it likes. Token counts
+are therefore the CLI's only as long as the agent leaves them alone: they
+stop agents that loop by mistake, not one that means to overspend. The
+turn caps (per thread and hour, and per agent and day) and the hop cap
+count turns agentd starts itself, so they are the hard bounds on a loop.
+Metering at the credential proxy, which sees every API response, would
+make tokens and cost a bound too (the plan's Deferred work). The same
+stdout predates T27 with a worse problem, which this task leaves there
+too: a forged `result` line ends the turn early with the agent's text as
+the reply, and the CLI's real result for the turn is then read as the
+next turn's, so the next requester gets this turn's reply and pays its
+cost and tokens. Reading turns from a channel the agent can't write
+closes both.
+
+### One table counts threads and agents
+
+**Issue.** The plan's `thread_usage` has a day but no hour and no agent,
+while the caps are turns per thread per hour and turns per agent per day,
+and nothing else counts an agent's turns.
+
+**Solution.** `thread_usage` rows are keyed by thread, day, hour (UTC) and
+agent. The thread's turns this hour and tokens today, and the agent's
+turns for others today (`others_turns`), are sums over it (an index on
+`(agent_id, day)` serves the latter). Rows older than two days are swept
+with the other expired rows. `usage` keeps a member's days for good, for
+`me`'s month.
+
+### Counts are read before a turn and written after it
+
+**Issue.** The router is pure, so the limits compare counts the view
+loaded before the turn, and a turn's tokens are known only after it.
+
+**Solution.** The pipeline meters each turn right after the runner returns
+it, before delivering the reply, in one transaction (`usage` and
+`thread_usage`). Turns of one agent in one thread run one at a time, so
+their counts are exact; turns running at once elsewhere (other threads,
+or other agents in the same thread) can each pass a cap the others are
+about to reach, so a cap can be passed by the turns in flight when it is
+reached. The overshoot is bounded: one turn per agent in a thread at a
+time, at most the pipeline's 64 places (16 for one owner's agents) in
+all, and no more than the runner's container cap can run. A turn is billed
+to its requester's member, created from the identity if the store has
+none yet (a community-key turn of someone never seen before). A failure to
+meter is logged; the turn has run.
+
+### What the caps count, and what they don't promise
+
+**Issue.** Several edges of the caps follow from counting per UTC calendar
+day and hour, per thread, and per member, and the plan doesn't settle them.
+
+**Solution.** They are kept, and written down here:
+
+- Windows are calendar hours and days (UTC), not sliding ones, so a thread
+  can take up to twice `thread_turns_per_hour` across an hour's boundary,
+  and an agent twice its `turns=N/day` across midnight.
+- The thread caps count every turn in the thread, whoever asked, so any
+  member who may use an agent there can use up the thread's hour for
+  everyone, the owner included. A new thread starts afresh; a one-to-one
+  DM isn't capped.
+- A turn that ends with an error result (a credential at its usage limit,
+  an unreachable API) counts: it is a turn agentd started, and a loop of
+  failing turns has to stop as well. A turn that crashed or timed out
+  counts too, with what its messages used. Only a message the router
+  refuses, or a turn that never reached the CLI, counts nothing.
+- A limit's refusal can change between the event's routing and the
+  platform's copy's (T31's confirmation), as a turn ends or a window turns.
+  The pipeline used to drop such a message silently; it now acts on the
+  copy's decision when either is a limit's refusal (`limited`), since the
+  copy is the message as the platform has it, but only if both decisions
+  name the same requester identity (`Decision::requester`'s key): a limit
+  can change between the two routings, and so can the member an identity
+  belongs to, as one is made for it, but who asked can't, so a copy that
+  names someone else is dropped as any other difference is.
+
+### The owner is never capped by their own agent's limit
+
+**Issue.** The plan doesn't say whether `turns=N/day` limits the owner.
+
+**Solution.** It limits requests from anyone but the owner, as allow and
+deny do, and counts only those: a first version counted the owner's own
+turns too, so an owner who used their agent used up what they had allowed
+others. `thread_usage.others_turns` counts the turns whose requester isn't
+the owner, hops included, and `Store::capped_turns_on` sums it for the
+router. `turns=0` leaves the agent to its owner. `limits` takes `off`
+for either setting, which the parser now reads as `Setting::Off`; without
+it an owner couldn't remove a cap once set.
+
+### Thread caps count every agent and skip one-to-one DMs
+
+**Issue.** Loop protection needs caps across every agent in a thread, but
+an owner's long working session in their DM with their agent is no loop,
+and a one-to-one DM can't hold another agent.
+
+**Solution.** `RouterView::thread_budget` gives the thread's spend and the
+caps, and the router asks it only outside one-to-one DMs; `None` refuses
+as `PolicyUnavailable`. The caps apply to every requester, the owner
+included, since a chain the owner started loops as well as anyone's.
+Refusals come after the hop cap and the daily cap and before the
+credential. `[limits] thread_turns_per_hour` (default 30) and
+`thread_tokens_per_day` (default 2,000,000) turn off at 0, and
+`max_hops` (default 3) is the global hop cap.
+
+### A capped agent says so once per thread and window
+
+**Issue.** "Past the daily cap, reply once per thread per day" needs a
+record of the reply that other instances and a restart see, and the
+thread caps would otherwise answer every message with the same line.
+
+**Solution.** `limit_notices` holds one row per agent, thread, kind and
+window (the UTC day for the daily cap and the token budget, the hour for
+the turn cap), claimed with an insert before posting and released if the
+post fails, as `failure_notices` does. A pause, the hop cap and an
+unreadable policy still post each time, as before.
+
+### A refusal of the requester is told to them alone, once a day
+
+**Issue.** A banned member's message, or one an agent's rules deny, drew a
+public line in the thread, every time: a banned member mentioning k agents
+had k lines posted per message, and the thread learnt who was banned or
+denied.
+
+**Solution.** `Decision::Refuse` now carries the requester, as the link
+prompts do (for a hop, the requester the turn inherited), and
+`RefuseReason::is_personal` marks `Banned` and `Denied`. For those the
+pipeline sends the line to the requester from the manager bot, like a link
+prompt, and only if the agent's bot could have answered there. It claims a
+`failure_notices` row first, so the requester is told at most once per
+`REFUSAL_DM_INTERVAL` (a day): about a ban once for all agents
+(`refusal/banned`), and about each agent's rules once for that agent
+(`refusal/denied/<agent id>`); a DM that fails releases the claim. The
+kinds don't start with T26's `refused/`, which names a refused
+credential. Those rows are kept like the other failure notices, one per
+requester and kind, and T26's failure DMs now read the pipeline's clock
+too, so the table sees one clock.
+
+Only a requester who sent the message is told. On a hop the requester is
+inherited from the turn whose post named the agent, and they never
+addressed it: a first version sent them the DM anyway, so an attacker's
+agent naming k agents that deny everyone had the manager send its
+requester k messages about agents they never asked. A hop's refusal of
+its requester is logged and told to no one; the thread isn't told either,
+since that would say who is banned or denied, and would give a spamming
+agent a line per agent it names.
+
+### Allow and deny undo each other
+
+**Issue.** T22 fixed what the rules mean (deny wins; a non-empty allow
+list restricts), but no command removes a rule, so the owner had no way
+back from a mistake.
+
+**Solution.** `deny <target>` puts the target on the deny list and leaves
+the allow list alone. Taking the target off the allow list too, as a first
+version did, widened access: after `allow helper @bob`, `deny helper @bob`
+emptied the allow list and opened the agent to everyone else. A deny must
+never grant access, and deny wins anyway, so the allow entry stays.
+`allow` puts the target on the allow list, so the first `allow` limits the
+agent to its targets, and lifts a deny of it. A first version only lifted
+the deny of a denied target, so under an allow list that didn't hold it
+`allow helper @bob` still left bob out, and took a second `allow`; now a
+denied target is added to the allow list too when the list is not empty,
+and only lifted when it is, so lifting a deny never limits an agent open
+to everyone. A full allow list refuses the command whole, deny included.
+Replies leave a denied target out of the allowed ones, and an allow list
+whose every target is denied reads "Only you may use". `allow everyone`
+empties the allow list and takes `everyone` off the deny list; denies by
+name stay. An `allow` of a member or a channel while `everyone` is denied
+changes nothing anyone can see, so its reply says to send `allow <name>
+everyone` first. Each list holds at most 100 rules. Rules are JSON agentd
+owns (`policy::Rule`), with the identity or conversation and how the owner
+wrote it; replies name them in code spans, which neither surface turns
+into a mention. A member is resolved as `list` does (Slack sends an id,
+Rocket.Chat a username the manager looks up). A channel on Slack arrives
+as an id token, whose name after `|` the reply shows. On Rocket.Chat the
+manager looks it up with `rooms.info`, by `roomName`
+(`RestClient::room_by_name`, and `FakeRest` answers it), or by `roomId`
+for an id typed as a `<#…>` token, which is never taken as it is. The
+manager can read private groups a member may not be in, so only a public
+channel is found: a private group reads as unknown whether or not it
+exists, and can't be named in a new rule on Rocket.Chat yet. A room the
+lookup doesn't find is still matched against the agent's own room rules by
+the name the owner wrote (`#secret`), so a channel denied or allowed while
+public and made private since can be allowed or denied again; that tells
+the owner only what their own rules hold. Checking the asker's membership
+of the group would take a lookup of another user's rooms the manager
+doesn't make yet. Rules that don't read refuse everyone, the owner too, as
+`PolicyUnavailable`, since the same row holds the hop cap, and `allow
+<name> everyone` clears them.
+
+### An agent's settings change in one transaction
+
+**Issue.** `limits`, `allow` and `deny` read an agent's settings, changed
+them and wrote them back as separate queries, so two commands sent at once
+could each write over the other's change: of eight `allow`s sent together,
+one was kept.
+
+**Solution.** `Store::update_agent_settings` reads the row, applies the
+command's change, a plain function of the settings, and writes it in one
+`BEGIN IMMEDIATE` transaction, and replaces `put_agent_limits` and
+`put_agent_rules`. Resolving the target (a user or room lookup) happens
+before it, outside the transaction. `Rules::write` puts the lists in the
+settings; serializing a rule can't fail, and if it ever did the list
+would be empty text, which doesn't read and so refuses everyone.
+
+### A ban leaves what only takes away, and still warns about a leaked secret
+
+**Issue.** A ban blocks a member's commands, but a
+secret-bearing command sent in a channel is refused with advice to revoke
+the secret, which a banned member needs as much as anyone.
+
+**Solution.** `Commands::run` refuses a banned member's command before it
+runs, except the commands that only take something away from them (`me`,
+`logout`, and `pause` and `delete` of their own agents) and a
+secret-bearing command sent where others can read it. `admin ban @member
+[reason]` bans the member the identity belongs to, creating it if needed,
+so every identity they link is covered; an identity of theirs they never
+linked is another member to agentd, and isn't. The reason is at most 500
+characters and shown to them by `me`, never logged. Admins, matched by
+identity as T26 does, can't be banned, and neither `Commands::run` nor
+the router holds an admin back (the pipeline's view never counts an
+admin's identity as banned, as sender or as a hop's requester, and `me`
+doesn't say they are), so a ban row left on an admin's member (made
+before they were listed) can't lock the community out of `admin unban`
+or silence the admin's requests. Deleting a
+member deletes their ban (`ON DELETE CASCADE`). The router's view loads
+bans for every member it knows (the sender's, the attributed requester's
+and its key's) and fails closed if the store can't say.
+
+A banned owner's agents go on answering others. A ban limits what the
+member may ask for and change; each of their agents' turns runs on its own
+requester's credential, and the agent stays as its owner left it, since
+the owner can't change it while banned, only pause or delete it. An admin
+who wants such an agent silent asks the owner to pause it, or removes its
+bot on the platform.
+
+### The usage migration was edited in place
+
+**Issue.** `thread_usage.others_turns` was added to
+`20260930240000_usage.sql` after the branch's first push, by editing the
+migration rather than adding another, since T27 hadn't merged. sqlx keeps
+each applied migration's checksum and refuses to start on a database whose
+applied migration has since changed.
+
+**Solution.** Nothing migrates such a database: one that ran an earlier
+version of this branch's migration must be recreated (a development store
+only; no release shipped it).
+
+### The proxy's path allowlist stays deferred
+
+**Issue.** T26 left an allowlist of Anthropic API paths for the credential
+proxy open.
+
+**Solution.** Nothing assigns it to T27: it is still in the plan's
+Deferred work, waiting for a live capture of the paths the CLI uses, so
+this task leaves it.
+
 ## T28: Slack ingress
 
 ### The manager binding needs a `BindingId`
@@ -6112,6 +6554,15 @@ users on every lookup (`Store::active_bot_users`, which reads no token),
 which also picks up agents another instance installed; an install and a
 deletion do it too.
 
+Whichever binding's lookup or render starts it, `users.list` is read with
+the manager app's token (`SlackSurface::with_members_api`, which
+`SlackBots` gives every agent's surface), never the agent's. The read
+holds the directory's one refresh lock, and a failure sets the shared
+retry wait and, before the first list, the error every caller gets; an
+agent's owner holds its token and could revoke it or use up its Tier 2
+quota, and so keep the list stale, or missing, for every agent. The
+operators hold the manager's token.
+
 ### Owners can forge their agents' events
 
 **Issue.** An agent's app is created with its owner's configuration token,
@@ -6197,8 +6648,10 @@ The confirmation window, `CONFIRM_WINDOW` (15 minutes), refuses without a
 lookup a message whose `ts` is older than that when its event arrived.
 Slack retries a failed delivery three times, the last about five minutes
 after the first, so a real event is always well inside it. Deduplication
-keeps an event for seven days, and a message older than the bot's
+keeps a message for an hour, and a message older than the bot's
 membership never had one, so without the window either could be replayed.
+The ingress now applies the window too, before it records anything (see
+"What one owner can make agentd keep").
 
 A lookup that fails without saying anything about the message (a Slack
 5xx or an unreachable Slack, `SurfaceError::Transport`, or a rate limit,
@@ -6318,9 +6771,10 @@ Costs and limits:
   Deduplication is per binding, so this reaches only the owner's own
   agent, never another agent's delivery of the same message.
 - `TeamDirectory` remembers which bot ids have no bot user apart from
-  those that have one, each set bounded at 10,000. Made-up bot ids are
-  remembered as having none, so they only churn that set, never pushing
-  out a real bot's user, which would cost other agents' `bots.info` calls.
+  those that have one, each set bounded at 10,000 ids shaped like Slack's.
+  Made-up bot ids are remembered as having none, so they only churn that
+  set, never pushing out a real bot's user, which would cost other agents'
+  `bots.info` calls.
 
 The busy line, which a message past the queue bounds gets without being
 confirmed, is posted in a task of its own, among the pipeline's tasks so a
@@ -6370,6 +6824,55 @@ above.
   lookups in one lane. Slack's 40,000-character limit allows about 3,000
   mention tokens, so a real message mentioning the bot after 100 others
   isn't addressed to it; Rocket.Chat's are capped the same way.
+- Places bound concurrency, not rate: a review signed 100 events with a
+  900 KB `event_id` each in 1.6 seconds, which grew the shared SQLite file
+  by 184 MB, kept for the seven days deduplication remembers a key, and
+  each took about 16 ms of the one queue worker the manager's requests
+  wait behind. Now the ids a key is made of must be shaped like Slack's,
+  or the body gets 400 before the ack and writes nothing: `event_id` is
+  `Ev` and 1 to 32 uppercase letters or digits, `team_id` `T` or `E` and
+  1 to 20, a `message` event's `channel` `C`, `D` or `G` and 1 to 20, and
+  its `ts` and `thread_ts` 10 digits, a dot and 6 digits. Every fixture,
+  taken from Slack's SDK test suites, fits, and so do the ids in Slack's
+  documentation. Only a message's `channel` is checked: other events'
+  `channel` can be an object, and isn't a key. The manager app's requests
+  are checked the same way, which costs it nothing. A signed slash command
+  or interaction is keyed by its signature, whose shape verification
+  already fixes.
+- Each agent's app also has a token bucket (`ingress::Places`, beside its
+  count): `AGENT_BURST` (100) requests at once, refilled at
+  `AGENT_REQUESTS_PER_SECOND` (8), about Slack's own ceiling of 30,000
+  events an hour for one app. Past it, 503, before the deduplication
+  write; a request refused for its places takes no token. The bucket is in
+  memory, since a restart only gives each app one more burst; the manager
+  app has none. One owner's agents' apps together have a second bucket of
+  twice that (see "What one owner can make agentd keep").
+- One owner's agents' apps together have `MAX_IN_FLIGHT_PER_OWNER` (64)
+  places, twice one app's, rather than 32 for each of up to
+  `agents.max_per_owner` agents: with its default of 10, one owner held
+  320 of the 1,024, and with 32 agents all of them. `slack_app_keys`
+  returns the binding's owner with its secret, joined from `agents`, for
+  the ingress to count by.
+- The queue holds each request's body as it arrived (`Bytes`, at most a
+  megabyte), not the parsed event: a `serde_json::Map` of a megabyte of
+  `[0,0,…]` took 16 to 32 MB, about 5 to 10 GB for one owner's 320 places
+  then. The handler still verifies the raw body, and parses only what it
+  checks (the envelope's type and ids, and a message's ids, skipping the
+  rest), then `Queue::run` parses the body again. Slash commands and
+  interactions are queued the same way.
+- The warnings a flood causes are logged at most once a minute for each
+  binding or agent, the next one saying how many went quiet
+  (`core_types::Throttle`, which the ingress's refusals moved to, now kept
+  per binding too, so one app's flood hides no other's refusals): the
+  ingress's 400s and `app_rate_limited` notices, the pipeline's "too many
+  messages waiting" and "too many notices being posted", and the lanes'
+  "couldn't look a bot sender up". The next section adds the rest.
+- The pipeline reaps finished tasks when it spawns a notice, as it does
+  when it spawns a lane; a flood of notices on an otherwise quiet
+  pipeline kept every finished one until the next lane. A lane in
+  `slack::Messages` checks whether the pipeline has closed
+  (`Sink::is_closed`) before it looks the binding up or calls
+  `bots.info`.
 - The attribution wait (`ATTRIBUTION_WAIT`, 2 seconds) for a message
   claiming to be from another agent's bot and mentioning this one is taken
   on the event as it arrived, before confirming, so a forged event holds
@@ -6377,14 +6880,280 @@ above.
   so that stalls only their own agents.
 
 Several owners flooding together could still take what other agents need:
-four owners the pipeline's 64 places, 32 agents' apps the ingress's 1,024.
+four owners the pipeline's 64 places, 16 the ingress's 1,024. The queue
+worker is still one, so the manager's requests may wait behind up to 1,024
+of agents', each now one small store write.
 End-to-end tests hold each bound with a gate or a held Slack call, not a
 sleep: an agent's flood past its 32 places is refused while another
 agent's message is answered; another agent is answered while a
 `bots.info` of the first is held; one owner's three agents together leave
 another owner's agent its place; and a message whose "try again" line is
 held leaves its place to the next. Each of these failed before the
-change.
+change. So did the ingress tests that an id not shaped like Slack's
+(among them 900 KB ones) gets 400 with nothing recorded, and that an
+agent's burst past its bucket gets 503 while another agent's app and the
+manager's are answered.
+
+### What one owner can make agentd keep
+
+**Issue.** A sixth review found no way past the places, buckets or shapes,
+but found what one owner could still make agentd hold in memory, in its
+logs and on disk. A signed DM with no `user` and a 900 KB `bot_id` got 200:
+`fill_bot_sender` called `bots.info` with it on the agent's token, and a
+`bot_not_found` was cached in the workspace's shared set of bots without a
+user, 10,000 ids but no bound in bytes, about 10 GB. `files` had no bound:
+a 999 KB DM with 34,000 files became a 9.9 MB `InboundEvent`, and one
+owner's apps may have 64 in flight. A body that passed the handler's
+`IgnoredAny` check but not the queue's full parse (`"\ud800"`, `1e400`,
+deep nesting) logged an unthrottled warning, and so did the pipeline's
+warnings a forged message reaches when confirmed, Slack's retry header
+(which isn't signed) at info, and a failed notice. Agents' apps' other
+events, commands and interactions, which agentd drops, still wrote a
+deduplication row each, and every row was kept seven days, 8 a second for
+each of an owner's agents. The unsigned challenge probe parsed a
+`challenge` of any JSON, so a megabyte of `[0,0,…]` took 16 to 32 MB before
+verification.
+
+**Solution.** One place bounds what is kept, and the ingress refuses what
+it would refuse, before the ack:
+
+- `normalize` holds every shape check (`is_user_id`, `is_bot_id`,
+  `is_file_id`, `is_channel_id`, `is_team_id`, `is_event_id`, `is_ts`),
+  each at most 20 characters after its prefix (32 for an `event_id`), and
+  the ingress's pre-parse uses them. A message whose `channel`, `ts`,
+  `thread_ts`, `user` or `bot_id` isn't shaped like Slack's is
+  `Skip::Malformed`, whether it came as an event or was read back; the
+  ingress answers such an event with 400 before the ack. Mentions are
+  `U…`/`W…` ids of at most 21 characters, from `text` and `blocks` alike.
+- A kept message is cut to Slack's limits: `text` to its first 40,000
+  characters (`MAX_TEXT_CHARS`), files to the first 10 the bot can
+  download (`MAX_FILES`), each with an `F…` id, a URL of at most 4 KB, a
+  name cut to 255 characters and a MIME type of at most 255 bytes, and
+  mentions to 100 as before. So an `InboundEvent` is at most about 220 KB,
+  whatever the body held, and the 64 an owner's apps may have in flight
+  at most about 14 MB. Files in history read back are cut the same way.
+  An ignored subtype is carried, and logged, cut to 64 bytes.
+- `TeamDirectory::bot_user` answers `None` for an id not shaped like a
+  bot id, without calling `bots.info` or caching it, however it is
+  reached (`fill_bot_sender`, `confirm` and history), so its caches hold
+  only short ids.
+- The ingress acknowledges and drops, without a deduplication row or a
+  place, what an agent's app doesn't need: its events other than
+  messages, its slash commands, its interactions, and a message whose
+  `ts` is more than `CONFIRM_WINDOW` before it arrived, which `confirm`
+  refuses anyway (`surface::within_window`, shared by both). The manager
+  app's requests are handled as before.
+- Slack's deduplication keys are kept an hour (`DEDUP_RETENTION`), not
+  seven days: longer than Slack retries (about five minutes), than a
+  signature is accepted (five minutes) and than the confirmation window
+  (15 minutes), so a replay after it expires is refused by the window for
+  an agent and by the signature for the manager. `processed_events` gains
+  an `expires_at` column, set from the retention each caller passes to
+  `mark_event_processed`, which the sweeper deletes by; Rocket.Chat keeps
+  its week (`PROCESSED_EVENT_RETENTION`). The column, its backfill for
+  existing rows and its index replacing `seen_at`'s are in T31's own
+  migration.
+- One owner's agents' apps together have a token bucket too, `OWNER_BURST`
+  (200) then `OWNER_REQUESTS_PER_SECOND` (16), twice one app's like their
+  places. So one owner adds at most 16 rows a second, each a few dozen
+  bytes and kept an hour: about 60,000 rows, some 15 MB with the indexes,
+  where before one owner's ten agents could add 80 a second for a week.
+  A bucket that is full while its app or owner has nothing in flight is
+  forgotten, being the same as none. The owner is no longer optional for
+  an agent's seat: an agent's app whose lookup names no owner (the store
+  always names one) gets 503 rather than be counted apart.
+- Every log line the ingress writes for what a forger can repeat goes
+  through one per-binding throttle, keyed by kind: refusals, including
+  400s for a malformed signed body, which take no token since they write
+  nothing; `app_rate_limited`; answered challenges, now counted per
+  binding rather than all together; Slack's retry headers; and a queued
+  body that no longer parses, which only a signed, crafted body can be.
+  The pipeline's warnings for a message confirming dropped or couldn't
+  check (older than the window, not at Slack, routing differently,
+  refused, or Slack unreachable) share a new `Flood::Unconfirmed` kind, and
+  a notice that fails to post shares `Flood::Notice`; `confirm`'s own line
+  for a message older than the window is at debug level.
+- The challenge probe reads `type` and `challenge` as strings only
+  (`Cow<str>`), in two parses that skip everything else, so a non-string
+  challenge is refused as malformed without being built, and the
+  interactivity check reads the payload with `IgnoredAny` once it starts
+  with `{`, allocating no keys.
+- The pipeline reaps finished tasks through one helper that logs a task
+  that panicked, as `drain` does, where it used to drop the error.
+
+The ingress's burst test still runs on the clock, with bounds that allow
+for the refill while it runs; the buckets' own tests take the time as an
+argument, and one checks an owner's bucket at a fixed time.
+
+### Real traffic meets no refusal of its own
+
+**Issue.** Slack turns off an app's event subscriptions when its request
+URL keeps failing, so a 400 or 503 for a real delivery costs far more than
+a 200 that drops it: only forged bodies should meet a refusal the ingress
+adds. A seventh review found three that real traffic could meet:
+
+- The owner's bucket (`OWNER_BURST`, `OWNER_REQUESTS_PER_SECOND`) was
+  charged at admission, for every request. Each agent's app gets every
+  message in every channel it is in, so ten agents in busy channels at 1.6
+  messages a second each make 16 deliveries a second; past the burst of
+  200, a real mention got 503, and so did Slack's retries of it, and it
+  was lost. Yet the bucket exists to bound deduplication rows, and only a
+  kept message writes one. A new test, one owner's ten agents taking 40
+  unaddressed channel messages each and then a mention, got 503 at round
+  20 of 40 before the change.
+- The ingress refused with 400 a message whose `user` or `bot_id` wasn't
+  shaped like Slack's, the manager app's included. That bounded nothing,
+  since `normalize` drops such a message as `Skip::Malformed` before any
+  row, cache or lookup, and Slack says its ids "could grow longer in the
+  future", so a longer real id would have turned the app off. The ids that
+  make up a deduplication key had the same risk, at 20 characters after
+  the prefix (32 for an `event_id`).
+- A message to an agent's app older than the confirmation window was
+  dropped with a debug line. While agentd's clock runs more than 15
+  minutes fast, or Slack delivers a backlog late, every message is, and
+  nothing said so.
+
+**Solution.**
+
+- The owner's bucket is charged where the row is written: in
+  `process_event`, once `normalize` has kept a message and before its
+  deduplication write (`InFlight::keep`, which knows the place's owner).
+  A message past it is dropped after its 200, with no row, and a warning
+  once a minute per binding (`Note::OwnerRate`). Admission keeps only each
+  app's own bucket: Slack itself delivers at most 30,000 events an hour to
+  one app, about 8.3 a second, and that bucket allows a burst of 100 then
+  8 a second, so real traffic to one app meets it only in a burst of more
+  than 100 events within a few seconds, which Slack's retries then
+  deliver; moving it too would leave a forger's flood bound only by
+  places, each request costing an HMAC and a parse before the ack. One
+  owner's agents' apps together can now take `AGENT_REQUESTS_PER_SECOND`
+  for each agent at admission, all of it CPU, since unaddressed messages
+  write nothing and their places are given back as soon as the queue
+  reaches them.
+- The ingress no longer checks a message's sender, and `MessageIds` no
+  longer reads it; `normalize` drops one not shaped like Slack's after the
+  200. The shapes that make up a key, and `normalize`'s, allow up to 64
+  uppercase letters or digits after the prefix (`normalize::MAX_ID_TAIL`,
+  now for `event_id` too), and a `ts` of 10 to 20 digits, the first not a
+  zero, a dot and 6 digits, so a message still has one spelling: a key is
+  at most about a hundred bytes, and a mention at most 65. Rows are about
+  twice as large as the 20-character bound allowed, so one owner's hour of
+  rows is about 20 MB rather than 15.
+- A message dropped for its age goes through the ingress's throttle as
+  `Note::Stale`: a warning once a minute per binding, counting those
+  dropped since, that asks whether agentd's clock is right. `confirm`'s
+  own check stays at debug: an event reaches it only through the ingress,
+  which has applied the same check to the same `ts` and arrival time.
+- `text` is cut to 160,000 bytes (`MAX_TEXT_BYTES`) at a character
+  boundary rather than to 40,000 characters. Slack sends text escaped, `&`
+  as `&amp;`, so a character cap cut real messages of mostly `&` or `<` to
+  a fifth of their length, while the byte cap is the same bound on memory.
+  A mention past the cut is still read from `blocks`, where Slack's
+  clients put each one too.
+- `SigningSecrets` has a method for each kind of binding, `manager` and
+  `agent`, and an agent's app (`AgentApp`) always carries its owner, so
+  the seat of a request follows from the lookup and `Busy::Ownerless`,
+  which guarded a case the store never produced, is gone.
+- The test that a full bucket with nothing in flight is forgotten gives
+  each place back at a time it chooses, not when the place is dropped, so
+  it no longer reads the clock.
+
+T31's migration (`20260930230000_slack_agent_apps.sql`) was edited in
+place during review to add `processed_events.expires_at`. A database that
+already ran an earlier version of it must be recreated: sqlx refuses a
+migration whose checksum changed. `expires_at` keeps its `DEFAULT 0`,
+backfilled at once from `seen_at`: SQLite refuses to add a `NOT NULL`
+column without a default to a table that has rows, and rebuilding
+`processed_events` for it isn't worth it, since every writer goes through
+`mark_event_processed`, which always sets it.
+
+### Thread replies under someone else's root aren't kept
+
+**Issue.** An eighth review found that busy threads still drained the
+owner's bucket. `normalize` kept every channel thread reply, whether or
+not it could address the bot, so each of one owner's agents' apps kept,
+and charged, every reply in every thread of every channel it was in; the
+router then ignored nearly all of them, since it answers a person there
+only for a mention of the agent or a reply under one of the agent's own
+messages. A new test, one owner's ten agents taking a thread reply each
+in 40 rounds and then a mention, kept 210 replies before the change and
+dropped the mention after its 200. Group DMs were kept whole, though the
+router applies the channel rule to them too (only a one-to-one DM is
+addressed by being one), and a message `normalize` found malformed was
+logged at debug only, so a change in Slack's ids would drop messages
+without a word.
+
+**Solution.**
+
+- Outside a one-to-one DM, `normalize` drops a thread reply that doesn't
+  mention the bot when its `parent_user_id`, which Slack sends on every
+  thread reply, names a user other than the binding's bot user. A reply
+  is kept when either is missing, and a `parent_user_id` that isn't a
+  string shaped like a user id counts as missing rather than making the
+  message malformed, since it is only compared, never kept. The router
+  stays the judge of whether the root is the agent's own: `parent_user_id`
+  drops only replies under a root the bot can't have posted, which the
+  router would ignore, while hops need a mention and `reply_to` is still
+  the thread root. `read_back` runs the same rule on Slack's copy, whose
+  `conversations.replies` messages carry `parent_user_id` too.
+- Group DMs follow the same rule as channels, top-level messages included.
+- A kept message's owner's token is taken before deduplication, as before,
+  and the module docs now say why: finding a retry a duplicate is a store
+  write too.
+- `Skip::Malformed` goes through the ingress's throttle as
+  `Note::Malformed`: a warning once a minute per binding.
+- The owner-rate test no longer needs its 270 messages sent within about
+  4.3 seconds: it sends rounds until one of the owner's messages is
+  dropped, and bounds what was kept by the burst plus what the measured
+  time refilled.
+- An agent whose app is replaced by one with another bot user would keep
+  replies in the threads its old bot started only when they mention it.
+  No flow replaces an agent's app today: a binding gets its bot user once,
+  at install.
+
+### Own posts and quiet bots aren't kept either
+
+**Issue.** A ninth review found that `normalize` still kept, and charged
+to the owner's bucket, two kinds of message the router always ignores,
+in every kind of conversation: the agent's own posts (`OwnMessage`, and
+the pipeline drops the sending agent from the candidates as well), and
+bots' messages that don't mention the agent (`UnmanagedBot`, or
+`NotMentionedByAgent` for another agent). Nothing else reads them at
+ingress: `message_refs` rows for the agent's posts are written from
+`chat.postMessage`'s answer, a read-back confirms only inbound messages
+the router didn't ignore, and the manager app acts only on people's DMs.
+
+**Solution.**
+
+- `normalize` drops, as `Skip::NotAddressed`, a message whose sender is
+  the binding's bot user, and a bot's message (`bot_id` or `bot_profile`)
+  that doesn't mention the bot user, in DMs too. A bot's message is kept
+  when the bot user isn't known. `read_back` inherits both.
+- `parent_user_id` is read by a visitor that keeps a string only if
+  `is_user_id` accepts it and skips anything else without copying it, so
+  every other value still counts as missing.
+- The owner-rate test gives up after 10 seconds of wall clock rather than
+  2,000 rounds.
+- New agentd tests run a turn for a member's reply under the agent's own
+  root, with `parent_user_id` the agent's bot, and neither look up nor
+  answer a reply under a member's root.
+
+**Open.** Keeping a reply with no `parent_user_id` assumes Slack sends it
+on every reply under a root with a user, and leaves it out only under
+roots with none, such as incoming webhooks', Workflow Builder's and
+`bot_message` posts. That hasn't been checked against live Slack; it
+belongs in T32's live pass.
+
+Two more gaps are left open, since the router ignores what they let
+through or nothing makes them happen today:
+
+- An own post that carries a `bot_id` and no `user` isn't recognized as
+  the bot's own, since `normalize` compares the sender with the bot user,
+  and is kept if it mentions the bot user. The router ignores it anyway.
+- `normalize` matches only the current binding's bot user, while the
+  router's `agent_of_bot_user` knows the bot users of an agent's bindings
+  in any state. If an agent ever got a second Slack binding in the same
+  team, mentions of its old bot user would be dropped at ingress.
 
 ### Bots don't join channels by posting
 
@@ -6441,445 +7210,3 @@ would let a bot post in any public channel, is off unless
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
-
-## T27: Usage meter, limits, allow and deny
-
-### The base branch lacked T24 to T26
-
-**Issue.** T27 builds on T26 (community admins, the `admin` command group,
-`failure_notices`), but `claude/slack-agent-apps` (T31), which T27 was to
-be stacked on, and `claude/skills` (T25, on T26, on T24) both fork from
-`claude/turn-pipeline-delivery`, so neither holds the other.
-
-**Solution.** The branch merges `claude/skills` first, in a commit of its
-own, resolving the conflicts: `Commands` keeps T25's `Inner`, which isn't
-`Clone`, and carries T31's `SlackAgents` beside the admins; the pipeline
-keeps T31's confirm-then-act split with T26's relink prompt; the Slack
-inbound passes both T25's files and T31's in-flight place. The T27 commit
-comes after it, so it reads on its own once the stack is chained again.
-
-### The runner reads the restored total from the transcript
-
-**Issue.** The plan offers two ways to take the total a `--resume`d
-process restores off its first turn's cost: read the transcript's last
-`cost-state` line, or keep a total in `sessions` when a process exits
-cleanly. The second can't see what the CLI will actually restore: a
-leftover process in the container can append its own `cost-state` line
-after a clean exit, and the CLI restores that one.
-
-**Solution.** The first. `SessionManager` reads the total before it
-starts a `--resume`d process, off the async runtime, and hands it to
-`ClaudeProcess::count_cost_from`; `TurnResult::cost_usd` is then the turn's
-own on every turn. The transcript is agent-writable, so the read opens
-`claude/projects/<id>/<id>.jsonl` below the session's directory one
-component at a time with `O_NOFOLLOW` (rustix `openat`, a runner
-dependency now), accepts only a regular file, opened `O_NONBLOCK` so a
-FIFO can't hang it.
-
-The runner must read the total the CLI restores, or none: a total it
-reads but the CLI doesn't restore is billed, the difference up to
-`MAX_TURN_COST_USD`, to the next requester per forced crash and resume.
-Two versions tried to mirror the pinned CLI's loader and missed. The
-first read a line with a derived serde struct, which accepts a JSON array
-as the struct's fields in order, so `["cost-state", 0]` read as 0. The
-second parsed lines as `JSON.parse` does and checked the CLI's zod schema
-(read from 2.1.285's bundled source), and a review with the real CLI
-against a stub API found two more paths: past 5,242,880 bytes (`gue` in
-the source) the loader indexes lines by their first bytes before parsing
-them, so `{"type":"artifact-autoreact-ledger","type":"cost-state",…}` is a
-ledger line to the CLI and a `cost-state` line to `JSON.parse`; and the CLI
-restores the `cost-state` line of the session its last message names,
-so an appended message and `cost-state` line of another session id
-restored that session's total.
-
-So the runner no longer mirrors the loader; it fails closed. It reads a
-total only when all of these hold, and otherwise the total is unknown:
-
-- the file is at most 5,242,880 bytes, and ends its last line (the CLI
-  ends every line it writes, and the size keeps the CLI off its index
-  pass and its compaction, both only past that size);
-- every line is blank or a JSON object with no key written twice at any
-  depth (the CLI never writes one twice);
-- every line with a `sessionId` carries the session's own id, and every
-  message (a `user`, `assistant`, `system`, `attachment` or `progress`
-  line, or any with a `uuid` or `parentUuid`) carries one, so the last
-  message names this session;
-- a `type` that is present is a string, and every `cost-state` line
-  starts with the bytes the CLI writes,
-  `{"type":"cost-state","sessionId":"<id>",`, holds only the keys the CLI
-  writes, and passes its schema with a margin: every amount at most half
-  the CLI's bound (so the two parsers' rounding can't fall on different
-  sides of it), model names printable ASCII, the token sums in bounds.
-
-The total is then the last `cost-state` line's, or 0 without one. The
-unknown side is always the runner's: an agent can make its first turn's
-cost unknown, never move it. The file is read whole, and no line has a
-length cap: the CLI's own lines (tool results) run long. A missing
-transcript (the CLI then refuses the `--resume`) or one it can't open this
-way is unknown too.
-
-This guarantees what the Docker test checks, not every path of a loader
-the runner can't see all of: `docker_the_pinned_cli_restores_whatever_total_the_runner_reads`
-(a runner unit test CI's Docker job runs) resumes the pinned CLI from the
-sandbox image on crafted transcripts, against a stub API that answers 400
-so the result's `total_cost_usd` is the restored total, and asserts that
-whenever the runner reads a total the CLI restored exactly it. First it
-has the CLI write a real session: one `-p` turn against a stub that
-streams a `Write` call and then a text reply, so the transcript holds what
-the CLI writes for a tool turn (queue operations, attachments, the
-`tool_use` and `tool_result` lines, `last-prompt`, `atis-latch` and its
-`cost-state` line), and the runner must read the total that turn reported
-(0.0112), which the CLI then restores; no rule had to be relaxed for it.
-The transcript is printed, and kept in
-`testkit/fixtures/transcript/tool-turn.jsonl` (four long attachment lines
-left out) for a unit test that needs no Docker. The CLI runs as the
-session directory's owner, as agentd runs the sandbox when it isn't root,
-so the runner opens the files with the modes the CLI gave them; run as the
-image's user, it wrote a transcript the non-root CI runner could not
-open. Then the hand-built
-shapes (no cost line, one, two, a file of exactly 5,242,880 bytes) must
-read, and the review's attacks (`ledger_big`, `attr_big`, `leaf2`,
-`leaf3`, a duplicated key, a ledger-prefixed line) must be unknown. On the
-code before this, the test read 0.25 where the CLI restored 5 for
-`ledger_big` and `attr_big`, and 5 where it restored 7 for `leaf2` and
-`leaf3`.
-
-All of that holds only if nothing changes the file between the runner's
-read and the CLI's, and a process the agent leaves running in the
-container can: when the agent kills its own CLI, the exit is confirmed
-and the container kept, so the next requester's `--resume` ran in a
-container where a background loop could wait for `resume <id>` to appear
-and append a `cost-state` line of 900 after the runner read 5, billing the
-next requester about $895. `SessionManager::ensure_process` now reads the
-restored total only when it started the container in the same call:
-nothing of the agent's runs in a fresh one before the CLI (its command is
-`sleep infinity` from the image, the exec wrapper is the image's `sh`, and
-the credential proxy and agentctl token are agentd's), and a session's
-earlier container is stopped before another starts. A `--resume` in a
-container an earlier process ran in (after a crash, a kill, or a
-credential kind or model change) counts its first turn's cost as unknown.
-A runner test resumes in such a container and gets no cost; before this
-it got the turn's cost. Stopping the container before every resume would
-keep that cost known at a container start's price, and would also end
-the agent's leftover processes (Deferred work's "Killing leftover
-processes at turn end").
-
-A turn's cost is unknown (`None`, and billed as 0) when its result or the
-process's previous one has no plausible total (so a result without one
-leaves the next turn unknown too, and the one after is known again), when
-the total falls, or when it rises by more than `MAX_TURN_COST_USD`
-($1,000). An unknown restored total makes only the first turn's cost
-unknown. Even so, the agent can write the transcript and the CLI's stdout
-(it runs as the same user), so `cost_usd` is a record, never something a
-limit is enforced with: no cap reads it.
-
-`fake-claude` now appends a `cost-state` line shaped as 2.1.285 writes
-it, starting with the same bytes, when its input ends, and none when it
-crashes, and restores the session's last one on `--resume`;
-a runner test checks the resumed turn's cost after a clean stop and after
-a crash, and the Docker test now checks the corrected cost against the real
-CLI in CI.
-
-### Cache reads aren't tokens the meter counts
-
-**Issue.** A result's `usage` has four counts. Every API call of a turn
-reads the whole conversation from the prompt cache, so cache reads grow
-with a thread's length, not its work: a token budget counting them would
-stop a long thread after a few turns.
-
-**Solution.** The meter's input tokens are uncached input plus cache
-writes, and its tokens are those plus output, for `usage`, `thread_usage`
-and `me`. `usage.cost_usd` keeps the CLI's own figure, which prices every
-kind.
-
-### A turn is billed at least what its messages used
-
-**Issue.** Only a result line carries a turn's usage, so a turn that
-crashed or timed out, one whose CLI the agent killed itself included,
-counted as a turn with no tokens, and a loop of such turns never reached
-the thread's token budget. A result line that reports less than the turn
-used would undercut it too.
-
-**Solution.** `TurnStats::message_usage` adds up the `message.usage` of
-the turn's `assistant` lines. The CLI prints one line per content block of
-an API message, each with that message's usage so far; in the captures
-their output counts are lower than the result's, and their input counts
-add up to it. Subagents print their messages as `assistant` lines too,
-with a `parent_tool_use_id` (2.1.285's source emits each subagent
-message's blocks as they stream), so the lines of Task subagents running
-at once come interleaved: `s1, s2, s1, s2`. A first version counted a
-message once only across consecutive lines, and so counted such a turn
-twice. `TurnStats` now keeps the latest 64 message ids with what each has
-counted, and a line of a known id adds only what it raises that by; an id
-pushed out by 64 others counts again, which only more than 64 messages
-streaming at once would reach. `TurnOutcome::usage` is that sum for a turn
-that crashed or timed out, and for a finished one each count the larger
-of the result's and the sum, so a forged low result can't undercut what
-was streamed first. The meter bills it.
-
-No count of a turn is more than `MAX_TURN_TOKENS` (100 million, far above
-what a turn writes, as `MAX_TURN_COST_USD` is above its cost): a count
-past it in a `usage`, or in what a turn's lines add up to, counts as the
-cap. Each count is held on its own. A first version dropped a whole
-`usage` with any count past the cap, cache reads included, which a long
-turn over a million-token context passes honestly: the result's figures
-were lost for the streamed ones, which are lower, and an agent could
-print such a result to be undercounted. Held at the cap, a forged count
-can only raise the turn's figure, never take a real one out of the
-thread's budget.
-
-The agent runs as the CLI's user, so it can write to the CLI's stdout as
-well as its transcript, and print whatever lines it likes. Token counts
-are therefore the CLI's only as long as the agent leaves them alone: they
-stop agents that loop by mistake, not one that means to overspend. The
-turn caps (per thread and hour, and per agent and day) and the hop cap
-count turns agentd starts itself, so they are the hard bounds on a loop.
-Metering at the credential proxy, which sees every API response, would
-make tokens and cost a bound too (the plan's Deferred work). The same
-stdout predates T27 with a worse problem, which this task leaves there
-too: a forged `result` line ends the turn early with the agent's text as
-the reply, and the CLI's real result for the turn is then read as the
-next turn's, so the next requester gets this turn's reply and pays its
-cost and tokens. Reading turns from a channel the agent can't write
-closes both.
-
-### One table counts threads and agents
-
-**Issue.** The plan's `thread_usage` has a day but no hour and no agent,
-while the caps are turns per thread per hour and turns per agent per day,
-and nothing else counts an agent's turns.
-
-**Solution.** `thread_usage` rows are keyed by thread, day, hour (UTC) and
-agent. The thread's turns this hour and tokens today, and the agent's
-turns for others today (`others_turns`), are sums over it (an index on
-`(agent_id, day)` serves the latter). Rows older than two days are swept
-with the other expired rows. `usage` keeps a member's days for good, for
-`me`'s month.
-
-### Counts are read before a turn and written after it
-
-**Issue.** The router is pure, so the limits compare counts the view
-loaded before the turn, and a turn's tokens are known only after it.
-
-**Solution.** The pipeline meters each turn right after the runner returns
-it, before delivering the reply, in one transaction (`usage` and
-`thread_usage`). Turns of one agent in one thread run one at a time, so
-their counts are exact; turns running at once elsewhere (other threads,
-or other agents in the same thread) can each pass a cap the others are
-about to reach, so a cap can be passed by the turns in flight when it is
-reached. The overshoot is bounded: one turn per agent in a thread at a
-time, at most the pipeline's 64 places (16 for one owner's agents) in
-all, and no more than the runner's container cap can run. A turn is billed
-to its requester's member, created from the identity if the store has
-none yet (a community-key turn of someone never seen before). A failure to
-meter is logged; the turn has run.
-
-### What the caps count, and what they don't promise
-
-**Issue.** Several edges of the caps follow from counting per UTC calendar
-day and hour, per thread, and per member, and the plan doesn't settle them.
-
-**Solution.** They are kept, and written down here:
-
-- Windows are calendar hours and days (UTC), not sliding ones, so a thread
-  can take up to twice `thread_turns_per_hour` across an hour's boundary,
-  and an agent twice its `turns=N/day` across midnight.
-- The thread caps count every turn in the thread, whoever asked, so any
-  member who may use an agent there can use up the thread's hour for
-  everyone, the owner included. A new thread starts afresh; a one-to-one
-  DM isn't capped.
-- A turn that ends with an error result (a credential at its usage limit,
-  an unreachable API) counts: it is a turn agentd started, and a loop of
-  failing turns has to stop as well. A turn that crashed or timed out
-  counts too, with what its messages used. Only a message the router
-  refuses, or a turn that never reached the CLI, counts nothing.
-- A limit's refusal can change between the event's routing and the
-  platform's copy's (T31's confirmation), as a turn ends or a window turns.
-  The pipeline used to drop such a message silently; it now acts on the
-  copy's decision when either is a limit's refusal (`limited`), since the
-  copy is the message as the platform has it, but only if both decisions
-  name the same requester identity (`Decision::requester`'s key): a limit
-  can change between the two routings, and so can the member an identity
-  belongs to, as one is made for it, but who asked can't, so a copy that
-  names someone else is dropped as any other difference is.
-
-### The owner is never capped by their own agent's limit
-
-**Issue.** The plan doesn't say whether `turns=N/day` limits the owner.
-
-**Solution.** It limits requests from anyone but the owner, as allow and
-deny do, and counts only those: a first version counted the owner's own
-turns too, so an owner who used their agent used up what they had allowed
-others. `thread_usage.others_turns` counts the turns whose requester isn't
-the owner, hops included, and `Store::capped_turns_on` sums it for the
-router. `turns=0` leaves the agent to its owner. `limits` takes `off`
-for either setting, which the parser now reads as `Setting::Off`; without
-it an owner couldn't remove a cap once set.
-
-### Thread caps count every agent and skip one-to-one DMs
-
-**Issue.** Loop protection needs caps across every agent in a thread, but
-an owner's long working session in their DM with their agent is no loop,
-and a one-to-one DM can't hold another agent.
-
-**Solution.** `RouterView::thread_budget` gives the thread's spend and the
-caps, and the router asks it only outside one-to-one DMs; `None` refuses
-as `PolicyUnavailable`. The caps apply to every requester, the owner
-included, since a chain the owner started loops as well as anyone's.
-Refusals come after the hop cap and the daily cap and before the
-credential. `[limits] thread_turns_per_hour` (default 30) and
-`thread_tokens_per_day` (default 2,000,000) turn off at 0, and
-`max_hops` (default 3) is the global hop cap.
-
-### A capped agent says so once per thread and window
-
-**Issue.** "Past the daily cap, reply once per thread per day" needs a
-record of the reply that other instances and a restart see, and the
-thread caps would otherwise answer every message with the same line.
-
-**Solution.** `limit_notices` holds one row per agent, thread, kind and
-window (the UTC day for the daily cap and the token budget, the hour for
-the turn cap), claimed with an insert before posting and released if the
-post fails, as `failure_notices` does. A pause, the hop cap and an
-unreadable policy still post each time, as before.
-
-### A refusal of the requester is told to them alone, once a day
-
-**Issue.** A banned member's message, or one an agent's rules deny, drew a
-public line in the thread, every time: a banned member mentioning k agents
-had k lines posted per message, and the thread learnt who was banned or
-denied.
-
-**Solution.** `Decision::Refuse` now carries the requester, as the link
-prompts do (for a hop, the requester the turn inherited), and
-`RefuseReason::is_personal` marks `Banned` and `Denied`. For those the
-pipeline sends the line to the requester from the manager bot, like a link
-prompt, and only if the agent's bot could have answered there. It claims a
-`failure_notices` row first, so the requester is told at most once per
-`REFUSAL_DM_INTERVAL` (a day): about a ban once for all agents
-(`refusal/banned`), and about each agent's rules once for that agent
-(`refusal/denied/<agent id>`); a DM that fails releases the claim. The
-kinds don't start with T26's `refused/`, which names a refused
-credential. Those rows are kept like the other failure notices, one per
-requester and kind, and T26's failure DMs now read the pipeline's clock
-too, so the table sees one clock.
-
-Only a requester who sent the message is told. On a hop the requester is
-inherited from the turn whose post named the agent, and they never
-addressed it: a first version sent them the DM anyway, so an attacker's
-agent naming k agents that deny everyone had the manager send its
-requester k messages about agents they never asked. A hop's refusal of
-its requester is logged and told to no one; the thread isn't told either,
-since that would say who is banned or denied, and would give a spamming
-agent a line per agent it names.
-
-### Allow and deny undo each other
-
-**Issue.** T22 fixed what the rules mean (deny wins; a non-empty allow
-list restricts), but no command removes a rule, so the owner had no way
-back from a mistake.
-
-**Solution.** `deny <target>` puts the target on the deny list and leaves
-the allow list alone. Taking the target off the allow list too, as a first
-version did, widened access: after `allow helper @bob`, `deny helper @bob`
-emptied the allow list and opened the agent to everyone else. A deny must
-never grant access, and deny wins anyway, so the allow entry stays.
-`allow` puts the target on the allow list, so the first `allow` limits the
-agent to its targets, and lifts a deny of it. A first version only lifted
-the deny of a denied target, so under an allow list that didn't hold it
-`allow helper @bob` still left bob out, and took a second `allow`; now a
-denied target is added to the allow list too when the list is not empty,
-and only lifted when it is, so lifting a deny never limits an agent open
-to everyone. A full allow list refuses the command whole, deny included.
-Replies leave a denied target out of the allowed ones, and an allow list
-whose every target is denied reads "Only you may use". `allow everyone`
-empties the allow list and takes `everyone` off the deny list; denies by
-name stay. An `allow` of a member or a channel while `everyone` is denied
-changes nothing anyone can see, so its reply says to send `allow <name>
-everyone` first. Each list holds at most 100 rules. Rules are JSON agentd
-owns (`policy::Rule`), with the identity or conversation and how the owner
-wrote it; replies name them in code spans, which neither surface turns
-into a mention. A member is resolved as `list` does (Slack sends an id,
-Rocket.Chat a username the manager looks up). A channel on Slack arrives
-as an id token, whose name after `|` the reply shows. On Rocket.Chat the
-manager looks it up with `rooms.info`, by `roomName`
-(`RestClient::room_by_name`, and `FakeRest` answers it), or by `roomId`
-for an id typed as a `<#…>` token, which is never taken as it is. The
-manager can read private groups a member may not be in, so only a public
-channel is found: a private group reads as unknown whether or not it
-exists, and can't be named in a new rule on Rocket.Chat yet. A room the
-lookup doesn't find is still matched against the agent's own room rules by
-the name the owner wrote (`#secret`), so a channel denied or allowed while
-public and made private since can be allowed or denied again; that tells
-the owner only what their own rules hold. Checking the asker's membership
-of the group would take a lookup of another user's rooms the manager
-doesn't make yet. Rules that don't read refuse everyone, the owner too, as
-`PolicyUnavailable`, since the same row holds the hop cap, and `allow
-<name> everyone` clears them.
-
-### An agent's settings change in one transaction
-
-**Issue.** `limits`, `allow` and `deny` read an agent's settings, changed
-them and wrote them back as separate queries, so two commands sent at once
-could each write over the other's change: of eight `allow`s sent together,
-one was kept.
-
-**Solution.** `Store::update_agent_settings` reads the row, applies the
-command's change, a plain function of the settings, and writes it in one
-`BEGIN IMMEDIATE` transaction, and replaces `put_agent_limits` and
-`put_agent_rules`. Resolving the target (a user or room lookup) happens
-before it, outside the transaction. `Rules::write` puts the lists in the
-settings; serializing a rule can't fail, and if it ever did the list
-would be empty text, which doesn't read and so refuses everyone.
-
-### A ban leaves what only takes away, and still warns about a leaked secret
-
-**Issue.** A ban blocks a member's commands, but a
-secret-bearing command sent in a channel is refused with advice to revoke
-the secret, which a banned member needs as much as anyone.
-
-**Solution.** `Commands::run` refuses a banned member's command before it
-runs, except the commands that only take something away from them (`me`,
-`logout`, and `pause` and `delete` of their own agents) and a
-secret-bearing command sent where others can read it. `admin ban @member
-[reason]` bans the member the identity belongs to, creating it if needed,
-so every identity they link is covered; an identity of theirs they never
-linked is another member to agentd, and isn't. The reason is at most 500
-characters and shown to them by `me`, never logged. Admins, matched by
-identity as T26 does, can't be banned, and neither `Commands::run` nor
-the router holds an admin back (the pipeline's view never counts an
-admin's identity as banned, as sender or as a hop's requester, and `me`
-doesn't say they are), so a ban row left on an admin's member (made
-before they were listed) can't lock the community out of `admin unban`
-or silence the admin's requests. Deleting a
-member deletes their ban (`ON DELETE CASCADE`). The router's view loads
-bans for every member it knows (the sender's, the attributed requester's
-and its key's) and fails closed if the store can't say.
-
-A banned owner's agents go on answering others. A ban limits what the
-member may ask for and change; each of their agents' turns runs on its own
-requester's credential, and the agent stays as its owner left it, since
-the owner can't change it while banned, only pause or delete it. An admin
-who wants such an agent silent asks the owner to pause it, or removes its
-bot on the platform.
-
-### The usage migration was edited in place
-
-**Issue.** `thread_usage.others_turns` was added to
-`20260930240000_usage.sql` after the branch's first push, by editing the
-migration rather than adding another, since T27 hadn't merged. sqlx keeps
-each applied migration's checksum and refuses to start on a database whose
-applied migration has since changed.
-
-**Solution.** Nothing migrates such a database: one that ran an earlier
-version of this branch's migration must be recreated (a development store
-only; no release shipped it).
-
-### The proxy's path allowlist stays deferred
-
-**Issue.** T26 left an allowlist of Anthropic API paths for the credential
-proxy open.
-
-**Solution.** Nothing assigns it to T27: it is still in the plan's
-Deferred work, waiting for a live capture of the paths the CLI uses, so
-this task leaves it.

@@ -12,6 +12,8 @@
 //! - [`surface_trait`]: the [`Surface`] trait and the types it uses.
 //! - [`ctl`]: request and response types of the agentctl API.
 //! - [`net`]: [`Cidr`] subnets.
+//! - [`throttle`]: [`Throttle`], which lets a repeated log line through
+//!   once per interval.
 //!
 //! Every item is re-exported at the crate root, except
 //! [`surface_trait::Result`], which would shadow `std`'s.
@@ -25,6 +27,7 @@ pub mod net;
 pub mod scope;
 pub mod surface;
 pub mod surface_trait;
+pub mod throttle;
 pub mod turn;
 
 pub use ctl::*;
@@ -37,6 +40,7 @@ pub use surface_trait::{
     Binding, Caps, InFile, LengthUnit, Limit, Msg, OutFile, SendError, Sender, Sink, Surface,
     SurfaceError,
 };
+pub use throttle::Throttle;
 pub use turn::*;
 
 /// The error returned when a string form (an ID, a key, a surface name) fails
