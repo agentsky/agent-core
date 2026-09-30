@@ -58,7 +58,7 @@ fn help_for_one_command() {
     let admin = fail("help Admin ban").to_string();
     assert!(admin.contains("`admin api-key set <key>`"));
     assert!(admin.contains("`admin slack`"));
-    assert_eq!(fail("help skill").to_string().lines().count(), 2);
+    assert_eq!(fail("help skill").to_string().lines().count(), 3);
 }
 
 #[test]
