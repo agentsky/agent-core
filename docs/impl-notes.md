@@ -2969,6 +2969,29 @@ on it. Now a result after a failed write, or a resume refusal (where the
 write can win the race), reaps the process before `Finished` is returned,
 so `is_running()` is false and the next turn gets `NotRunning`.
 
+### A spawn on another thread can hold the pipe open
+
+**Issue.** The test for that, `a_result_after_a_failed_write_ends_the_process`,
+failed once in CI's Coverage job with the process still running: the write
+to a script that had closed its stdin succeeded. Locally it failed in 2 of
+100 runs of the test binary, 5 of 150 with four busy loops on the CPUs, 1 of
+150 under `cargo llvm-cov`, and never alone or with `--test-threads=1`. The
+tests run in parallel and each spawns processes through `ProcessSandbox`. A
+child starts with a copy of every descriptor open in the test process and
+holds it until its exec closes it (`O_CLOEXEC`). A child forked on another
+thread while this test's spawn had the stdin pipe open, and not scheduled
+until after the script had closed its end, was still a reader when the
+driver wrote. The same leak failed the test once with `ETXTBSY`: a child
+forked while `std::fs::write` had the script open for writing still held it
+when the script was exec'd. The driver was right; the test process broke
+the precondition.
+
+**Solution.** `ProcessSandbox::exec` holds a process-wide lock around the
+spawn. A spawn returns only once its child has exec'd, so with one spawn at
+a time no child is left holding another's pipes, or a file written before
+the spawn. After the change: 0 failures in 300 runs with the busy loops,
+and 0 in 150 under `cargo llvm-cov` with them.
+
 ### Codes and tool names can carry text
 
 **Issue.** The first version logged the `type` of a skipped line, and kept
