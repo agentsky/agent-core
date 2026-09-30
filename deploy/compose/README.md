@@ -61,6 +61,12 @@ grep -q '^AGENTD_MASTER_KEY=' .env ||
 grep -q '^RC_ADMIN_PASS=' .env ||
   echo "RC_ADMIN_PASS=$(openssl rand -hex 16)" >> .env
 
+# agentd's configuration: the example, whose addresses match compose.yaml,
+# without its [rocketchat] section, which names a placeholder server.
+[ -e agentd.toml ] ||
+  awk '/^\[/ { skip = ($0 == "[rocketchat]") } !skip' ../../config/agentd.example.toml > agentd.toml
+grep -q '^AGENT_CORE_CONFIG=' .env || echo "AGENT_CORE_CONFIG=./agentd.toml" >> .env
+
 # Let sandboxes reach agentd's 8080 and 8081, and nothing else on their
 # network. Again after every reboot of the host.
 sudo sh isolate-sandbox.sh
@@ -128,23 +134,20 @@ agentd makes, and give agentd that instead.
 
 ## 3. Configure agentd
 
-agentd reads [`config/agentd.example.toml`](../../config/agentd.example.toml)
-by default, whose addresses match `compose.yaml`. To change it, copy it here
-and point `AGENT_CORE_CONFIG` at the copy:
-
-```bash
-cp -n ../../config/agentd.example.toml agentd.toml
-grep -q '^AGENT_CORE_CONFIG=' .env || echo "AGENT_CORE_CONFIG=./agentd.toml" >> .env
-```
+agentd reads `agentd.toml` here, which step 1 copied from
+[`config/agentd.example.toml`](../../config/agentd.example.toml) without its
+`[rocketchat]` section.
 
 Keep the `[server]` and `[internal]` addresses unless you change
 `compose.yaml` and `isolate-sandbox.sh` to match. Put the manager's token
 from step 2 in `.env` as `AGENTD_RC_MANAGER_TOKEN=<token>`, replacing the
 line if there is one already.
 
-The manager's user id and Rocket.Chat's address (`http://rocketchat:3000` on
-the `egress` network) go in the `[rocketchat]` section once agentd reads
-one. For sandboxes, the `[sandbox]` section, once agentd reads it, takes:
+Then add the example's `[rocketchat]` section, with `base_url =
+"http://rocketchat:3000"` (Rocket.Chat on the `egress` network), a `team`
+name, and the manager's user id as `manager_user_id`. agentd refuses to
+start with the section and no `AGENTD_RC_MANAGER_TOKEN`. For sandboxes, the
+`[sandbox]` section, once agentd reads it, takes:
 
 ```toml
 [sandbox]

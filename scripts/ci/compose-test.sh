@@ -159,7 +159,8 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 AGENT_CORE_DATA=$tmp/data
-AGENT_CORE_CONFIG=$root/config/agentd.example.toml
+AGENT_CORE_CONFIG=$tmp/agentd.toml
+awk '/^\[/ { skip = ($0 == "[rocketchat]") } !skip' "$root/config/agentd.example.toml" >"$AGENT_CORE_CONFIG"
 AGENT_CORE_SANDBOX_NETWORK=$sandbox_net
 AGENT_CORE_EGRESS_NETWORK=$egress_net
 DOCKER_GID=$(stat -c %g /var/run/docker.sock)
