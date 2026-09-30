@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,12 +57,26 @@ fn push(log: &Log, event: Event) {
     log.lock().unwrap().push(event);
 }
 
+/// Faults the next hook call of each kind makes: an error or a panic.
+#[derive(Default)]
+struct Faults {
+    fail_turn_starting: AtomicBool,
+    fail_turn_finished: AtomicBool,
+    panic_turn_starting: AtomicBool,
+    panic_turn_finished: AtomicBool,
+}
+
+impl Faults {
+    fn take(flag: &AtomicBool) -> bool {
+        flag.swap(false, Ordering::SeqCst)
+    }
+}
+
 struct Hooks {
     log: Log,
     script: PathBuf,
     next: AtomicU32,
-    fail_turn_starting: Arc<AtomicBool>,
-    fail_turn_finished: Arc<AtomicBool>,
+    faults: Arc<Faults>,
 }
 
 #[async_trait::async_trait]
@@ -103,7 +118,10 @@ impl TurnHooks for Hooks {
             &self.log,
             Event::TurnStarting(session.id, *process, turn.turn),
         );
-        if self.fail_turn_starting.swap(false, Ordering::SeqCst) {
+        if Faults::take(&self.faults.panic_turn_starting) {
+            panic!("turn_starting panicked");
+        }
+        if Faults::take(&self.faults.fail_turn_starting) {
             return Err("turn_starting refused".into());
         }
         Ok(())
@@ -119,7 +137,10 @@ impl TurnHooks for Hooks {
             &self.log,
             Event::TurnFinished(session.id, *process, turn.turn),
         );
-        if self.fail_turn_finished.swap(false, Ordering::SeqCst) {
+        if Faults::take(&self.faults.panic_turn_finished) {
+            panic!("turn_finished panicked");
+        }
+        if Faults::take(&self.faults.fail_turn_finished) {
             return Err("turn_finished failed".into());
         }
         Ok(turn.turn)
@@ -132,14 +153,16 @@ impl TurnHooks for Hooks {
 }
 
 /// A [`ProcessSandbox`] that logs starts and stops, counts running
-/// containers, and can hide deaths from its event stream and then break
-/// the stream.
+/// containers, can fail stops, and can hide deaths from its event stream
+/// and then break the stream.
 struct TestSandbox {
     inner: ProcessSandbox,
     log: Log,
     running: Mutex<HashSet<ContainerId>>,
     most: AtomicU32,
     sessions: Mutex<BTreeMap<ContainerId, SessionId>>,
+    fail_stops: AtomicBool,
+    failed_stops: AtomicU32,
     hide_deaths: Arc<AtomicBool>,
     break_events: Arc<Notify>,
 }
@@ -184,6 +207,14 @@ impl Sandbox for TestSandbox {
     }
 
     async fn stop(&self, container: &ContainerId) -> sandbox::Result<()> {
+        if self.fail_stops.load(Ordering::SeqCst) {
+            self.failed_stops.fetch_add(1, Ordering::SeqCst);
+            return Err(SandboxError::Docker {
+                op: "stop container",
+                status: Some(500),
+                message: None,
+            });
+        }
         if let Some(session) = self.sessions.lock().unwrap().get(container) {
             push(&self.log, Event::ContainerStopped(*session));
         }
@@ -231,8 +262,7 @@ struct Harness {
     log: Log,
     manager: SessionManager<Hooks>,
     agent: AgentId,
-    fail_turn_starting: Arc<AtomicBool>,
-    fail_turn_finished: Arc<AtomicBool>,
+    faults: Arc<Faults>,
 }
 
 impl Harness {
@@ -267,6 +297,8 @@ impl Harness {
             running: Mutex::default(),
             most: AtomicU32::new(0),
             sessions: Mutex::default(),
+            fail_stops: AtomicBool::new(false),
+            failed_stops: AtomicU32::new(0),
             hide_deaths: Arc::default(),
             break_events: Arc::new(Notify::new()),
         });
@@ -277,14 +309,12 @@ impl Harness {
         };
         let mut pool = PoolConfig::default();
         change(&mut process, &mut pool);
-        let fail_turn_starting = Arc::new(AtomicBool::new(false));
-        let fail_turn_finished = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(Faults::default());
         let hooks = Hooks {
             log: Arc::clone(&log),
             script,
             next: AtomicU32::new(0),
-            fail_turn_starting: Arc::clone(&fail_turn_starting),
-            fail_turn_finished: Arc::clone(&fail_turn_finished),
+            faults: Arc::clone(&faults),
         };
         let manager = SessionManager::new(
             store.clone(),
@@ -306,8 +336,7 @@ impl Harness {
             log,
             manager,
             agent,
-            fail_turn_starting,
-            fail_turn_finished,
+            faults,
         }
     }
 
@@ -317,6 +346,13 @@ impl Harness {
 
     fn clear(&self) {
         self.log.lock().unwrap().clear();
+    }
+
+    fn process_starts(&self) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| matches!(event, Event::ProcessStarting(..)))
+            .count()
     }
 
     async fn thread_session(&self, root: &str) -> Session {
@@ -869,7 +905,7 @@ async fn a_timeout_stops_the_process_and_the_next_turn_resumes() {
 async fn a_failed_turn_starting_skips_the_turn_but_still_finishes_it() {
     let h = Harness::new(&[Turn::reply("one")]).await;
     let session = h.thread_session("1.1").await;
-    h.fail_turn_starting.store(true, Ordering::SeqCst);
+    h.faults.fail_turn_starting.store(true, Ordering::SeqCst);
     let refused = request("never sent");
     let err = h
         .manager
@@ -905,7 +941,7 @@ async fn a_failed_turn_starting_skips_the_turn_but_still_finishes_it() {
 async fn a_failed_turn_finished_stops_the_process() {
     let h = Harness::new(&[Turn::reply("one"), Turn::reply("two")]).await;
     let session = h.thread_session("1.1").await;
-    h.fail_turn_finished.store(true, Ordering::SeqCst);
+    h.faults.fail_turn_finished.store(true, Ordering::SeqCst);
     let report = h.run(session.id, request("1")).await;
     assert_eq!(reply(&report), "one");
     assert!(report.finished.is_err());
@@ -1039,4 +1075,166 @@ async fn a_turn_cut_off_before_its_outcome_was_recorded_resumes_first() {
     assert!(!report.reran, "the transcript exists: the --resume works");
     assert_eq!(report.process_start, Some(SessionStart::Resume));
     assert_eq!(h.transcript(&read), ["b", "c"]);
+}
+
+#[tokio::test]
+async fn a_panic_in_turn_starting_still_finishes_the_turn_and_stops_the_process() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    h.faults.panic_turn_starting.store(true, Ordering::SeqCst);
+    let panicked = request("never sent");
+    let err = h.manager.run_turn(id, panicked.clone()).await.unwrap_err();
+    assert!(matches!(err, RunnerError::TurnTask), "{err}");
+    assert_eq!(
+        h.events(),
+        [
+            Event::ContainerStarted(id),
+            Event::ProcessStarting(id, CredentialKind::Subscription, 1),
+            Event::TurnStarting(id, 1, panicked.turn),
+            Event::TurnFinished(id, 1, panicked.turn),
+            Event::ProcessStopping(id, 1),
+        ]
+    );
+    assert!(h.transcript(&session).is_empty());
+    let stored = h.store.session(id).await.unwrap().unwrap();
+    assert!(!stored.started && !stored.maybe_started);
+    let report = h.run(id, request("sent")).await;
+    assert_eq!(reply(&report), "one");
+    assert_eq!(
+        report.process_start,
+        Some(SessionStart::New),
+        "the process was not reused"
+    );
+}
+
+#[tokio::test]
+async fn a_panic_in_turn_finished_records_the_turn_and_stops_the_process() {
+    let h = Harness::new(&[Turn::reply("one"), Turn::reply("two")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    h.faults.panic_turn_finished.store(true, Ordering::SeqCst);
+    let first = request("1");
+    let err = h.manager.run_turn(id, first.clone()).await.unwrap_err();
+    assert!(matches!(err, RunnerError::TurnTask), "{err}");
+    assert_eq!(
+        h.events(),
+        [
+            Event::ContainerStarted(id),
+            Event::ProcessStarting(id, CredentialKind::Subscription, 1),
+            Event::TurnStarting(id, 1, first.turn),
+            Event::TurnFinished(id, 1, first.turn),
+            Event::ProcessStopping(id, 1),
+        ]
+    );
+    let stored = h.store.session(id).await.unwrap().unwrap();
+    assert!(stored.started && !stored.maybe_started, "{stored:?}");
+    let next = h.run(id, request("2")).await;
+    assert_eq!(reply(&next), "two");
+    assert_eq!(next.process_start, Some(SessionStart::Resume));
+    assert_eq!(h.transcript(&session), ["1", "2"]);
+}
+
+#[tokio::test]
+async fn a_panicked_turn_wakes_a_session_waiting_for_its_container() {
+    let h = Harness::with(
+        &[Turn::reply("slow").with_delay(Duration::from_millis(600))],
+        |_, pool| pool.global_container_cap = 1,
+    )
+    .await;
+    let first = h.thread_session("1.1").await;
+    let second = h.thread_session("2.2").await;
+    h.faults.panic_turn_finished.store(true, Ordering::SeqCst);
+    let waiting = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.manager.run_turn(second.id, request("b")).await
+    };
+    let (panicked, waited) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(h.manager.run_turn(first.id, request("a")), waiting)
+    })
+    .await
+    .expect("the waiting session was woken when the panicked turn let go");
+    assert!(matches!(panicked, Err(RunnerError::TurnTask)));
+    assert_eq!(reply(&waited.unwrap()), "slow");
+    assert_eq!(h.sandbox.most.load(Ordering::SeqCst), 1);
+    assert!(!h.manager.is_warm(first.id));
+    assert!(h.manager.is_warm(second.id));
+}
+
+#[tokio::test]
+async fn a_container_that_fails_to_stop_keeps_its_places_until_the_reaper_stops_it() {
+    let h = Harness::with(&[Turn::reply("one"), Turn::reply("two")], |_, pool| {
+        pool.global_container_cap = 1;
+        pool.idle_timeout_secs = 1;
+    })
+    .await;
+    let first = h.thread_session("1.1").await;
+    let second = h.thread_session("2.2").await;
+    h.sandbox.fail_stops.store(true, Ordering::SeqCst);
+    reply(&h.run(first.id, request("1")).await);
+    h.manager.stop(first.id).await;
+    assert!(h.events().contains(&Event::ProcessStopping(first.id, 1)));
+    assert!(
+        h.manager.is_warm(first.id),
+        "the session still holds the container"
+    );
+    assert_eq!(h.sandbox.running(), 1);
+    let err = h
+        .manager
+        .run_turn(first.id, request("2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunnerError::Sandbox(_)), "{err}");
+    assert_eq!(
+        h.process_starts(),
+        1,
+        "no second process resumes the transcript"
+    );
+    let waiting = h.manager.run_turn(second.id, request("b"));
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), &mut waiting)
+            .await
+            .is_err(),
+        "the global cap still counts the container"
+    );
+    assert_eq!(h.sandbox.most.load(Ordering::SeqCst), 1);
+    assert!(
+        h.sandbox.failed_stops.load(Ordering::SeqCst) >= 4,
+        "the reaper kept trying"
+    );
+    h.sandbox.fail_stops.store(false, Ordering::SeqCst);
+    let report = tokio::time::timeout(Duration::from_secs(20), waiting)
+        .await
+        .expect("the reaper stopped the container")
+        .unwrap();
+    assert_eq!(reply(&report), "one");
+    assert!(!h.manager.is_warm(first.id));
+    assert_eq!(h.sandbox.most.load(Ordering::SeqCst), 1);
+    assert_eq!(h.transcript(&first), ["1"]);
+}
+
+#[tokio::test]
+async fn a_refusal_shaped_result_from_a_new_process_is_not_a_refused_resume() {
+    let dir = TempDir::new();
+    let refusing = dir.0.join("refusing-claude");
+    std::fs::write(
+        &refusing,
+        "#!/bin/sh\nread -r line\necho '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&refusing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = refusing.to_str().unwrap().to_owned();
+    let h = Harness::with(&[], |process, _| process.claude_bin = bin).await;
+    let session = h.thread_session("1.1").await;
+    let report = h.run(session.id, request("hi")).await;
+    assert!(report.outcome.resume_refused(), "{report:?}");
+    assert_eq!(report.process_start, Some(SessionStart::New));
+    assert!(!report.reran, "a --session-id start refuses no --resume");
+    assert_eq!(h.process_starts(), 1);
+    let stored = h.store.session(session.id).await.unwrap().unwrap();
+    assert!(
+        !stored.started && stored.maybe_started,
+        "whether the CLI read the message is still unknown: {stored:?}"
+    );
 }

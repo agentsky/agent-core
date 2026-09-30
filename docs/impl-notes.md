@@ -3933,6 +3933,46 @@ process is stopped (with `process_stopping`), since the runner can't tell
 whether the placeholder is still pointed. A failed `process_stopping` is
 logged and the stop goes ahead.
 
+A panic is caught at the turn: one in `turn_starting` or the send still has
+`turn_finished` called, and after any panic, `turn_finished`'s included, the
+turn is recorded if it has an outcome and the process is stopped as after a
+failed `turn_finished`. Only then does the panic resume, failing the turn
+with `RunnerError::TurnTask`. Otherwise the next turn would reuse a process
+whose placeholder may still be pointed, and the store would keep
+`maybe_started` for a turn whose outcome was known. The slot's release
+wakes waiters for an idle container from a drop guard, so a panic doesn't
+leave a session waiting on the caps until the idle timeout.
+
+### A container that fails to stop
+
+**Issue.** When `Sandbox::stop` failed, the pool forgot the container and
+freed its places under the caps, though it may still have been running with
+its process in it. The next turn of the session then started another
+container and another process on the same transcript, past the caps, and
+nothing tried the stop again.
+
+**Solution.** A container whose stop fails stays its session's, marked
+dead, with its places under the caps. A turn that finds it, and `reset`,
+try the stop again and fail with `RunnerError::Sandbox` if it still fails,
+so no second process resumes the transcript. The reaper tries every dead
+container each round, and eviction under a full cap tries it first. A
+container's address is read when a process starts in it, after the
+container is held, so a container whose address can't be read goes the
+same way.
+
+### A refused `--resume` is known only on a resumed process
+
+**Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
+its shape: an `error_during_execution` error result before `system`/`init`.
+Acting on that shape for any process would mark a session unstarted, and
+run its turn again, after a `--session-id` start or a warm process's later
+turn ended that way for some other reason.
+
+**Solution.** The runner treats it as a refusal only on the turn that
+started the process with `SessionStart::Resume`. Any other turn with that
+outcome is recorded like any turn without `init_seen`, which leaves
+`maybe_started` as it was.
+
 ### What is durable
 
 **Issue.** Queued and in-flight state must survive a restart if anything

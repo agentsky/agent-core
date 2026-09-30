@@ -98,8 +98,9 @@ impl fmt::Debug for TurnRequest {
 /// 2. For each turn on it, [`turn_starting`](Self::turn_starting), then
 ///    [`turn_finished`](Self::turn_finished), which is called on every exit
 ///    from the turn once `turn_starting` was called: success, error,
-///    timeout, crash, a failed `turn_starting`, and a caller that stopped
-///    waiting. It returns before the session's next turn can start.
+///    timeout, crash, a failed or panicking `turn_starting`, and a caller
+///    that stopped waiting. It returns before the session's next turn can
+///    start.
 /// 3. [`process_stopping`](Self::process_stopping), before the process or
 ///    its container is stopped, or once it is found gone. It may be called
 ///    again for the same process, from the container's death, so it must be
@@ -158,7 +159,9 @@ pub trait TurnHooks: Send + Sync + 'static {
     ///
     /// Any failure. The runner can't tell what is still pointed, so it
     /// stops the process (calling
-    /// [`process_stopping`](Self::process_stopping)).
+    /// [`process_stopping`](Self::process_stopping)). It does the same when
+    /// this hook, `turn_starting` or the turn panicked, and the panic then
+    /// fails the turn with [`RunnerError::TurnTask`](crate::RunnerError::TurnTask).
     async fn turn_finished(
         &self,
         session: &Session,

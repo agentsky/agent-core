@@ -4,13 +4,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
-use std::net::IpAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use core_types::{AgentId, ConsentId, ScopeKey, SessionId, Side, ThreadKey, TurnKind, VolumeKey};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use sandbox::{Container, ContainerEvent, ContainerId, Sandbox, SessionSpec, SharedAccess};
 use store::{Session, SessionKind, Store};
 use time::OffsetDateTime;
@@ -152,7 +152,6 @@ struct Warm<H: TurnHooks> {
 /// A running container, and the process in it, if any.
 struct Held<H: TurnHooks> {
     container: Container,
-    ip: IpAddr,
     mounts: Mounts,
     tracked: Arc<Tracked<H>>,
     process: Option<Running<H>>,
@@ -177,7 +176,8 @@ struct Tracked<H: TurnHooks> {
 }
 
 struct TrackedState<H: TurnHooks> {
-    /// The sandbox reported the container dead.
+    /// The sandbox reported the container dead, or failed to stop it: its
+    /// session must stop it before using it again.
     dead: bool,
     /// When its last turn ended, or it started.
     last_used: Instant,
@@ -204,7 +204,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// arrival order, and one runs at a time. A turn runs in a task of its own
 /// once it reaches the front of the queue, so a caller that stops waiting
 /// doesn't cut it short: [`TurnHooks::turn_finished`] always runs, and
-/// returns before the next turn of the session starts.
+/// returns before the next turn of the session starts. A turn whose hooks or
+/// send panicked still has `turn_finished` called, unless it was the one that
+/// panicked, and then has its process stopped as after a failed
+/// `turn_finished`, before the panic goes on to fail the turn with
+/// [`RunnerError::TurnTask`].
 ///
 /// A turn reuses the session's warm process when its credential kind, its
 /// model and its mounts match, and otherwise stops it (and the container,
@@ -212,7 +216,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// process that crashed, timed out or refused its `--resume` is stopped
 /// after the turn; if it wasn't seen to exit, its container is stopped too
 /// before the next process starts, so two processes never write one
-/// transcript.
+/// transcript. A container the sandbox fails to stop stays the session's,
+/// marked dead: the session's turns fail until a later stop succeeds, rather
+/// than start another process on its transcript.
 ///
 /// # Started sessions
 ///
@@ -220,8 +226,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// whatever the turn's outcome: the CLI read the message, so the transcript
 /// exists. Until then processes start with `--session-id`. If the CLI
 /// refuses a `--resume` for want of a transcript
-/// ([`TurnOutcome::resume_refused`]), the session is marked unstarted and
-/// the turn runs again, once, with `--session-id` under the same id.
+/// ([`TurnOutcome::resume_refused`] on the first turn of a process the turn
+/// started with [`SessionStart::Resume`]), the session is marked unstarted
+/// and the turn runs again, once, with `--session-id` under the same id.
 ///
 /// Before a turn goes to an unstarted session's CLI, the store records
 /// that the session may have started; the turn's end clears it once the
@@ -237,7 +244,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// Containers idle for [`PoolConfig::idle_timeout_secs`] are reaped:
 /// [`TurnHooks::process_stopping`], then the process and the container
-/// stop. The manager follows [`Sandbox::events`]: a container that died has
+/// stop. A container the sandbox failed to stop keeps its places under the
+/// caps, and the reaper tries again each round.
+///
+/// The manager follows [`Sandbox::events`]: a container that died has
 /// `process_stopping` called for its process at once, so its address can't
 /// be reused while its placeholder and token live. When the stream ends
 /// (it always ends with an error), the manager subscribes again and
@@ -379,10 +389,12 @@ impl<H: TurnHooks> SessionManager<H> {
     ///
     /// # Errors
     ///
-    /// [`RunnerError::Store`].
+    /// - [`RunnerError::Sandbox`] if the warm container couldn't be
+    ///   stopped. The session isn't reset.
+    /// - [`RunnerError::Store`].
     pub async fn reset(&self, session: SessionId) -> Result<Option<Session>> {
         self.with_slot(session, |inner, mut warm| async move {
-            inner.release_container(&mut warm).await;
+            inner.release_container(&mut warm).await?;
             Ok(inner
                 .store
                 .reset_session(warm.session, OffsetDateTime::now_utc())
@@ -397,8 +409,7 @@ impl<H: TurnHooks> SessionManager<H> {
     pub async fn stop(&self, session: SessionId) {
         let stopped = self
             .with_slot(session, |inner, mut warm| async move {
-                inner.release_container(&mut warm).await;
-                Ok(())
+                inner.release_container(&mut warm).await
             })
             .await;
         if let Err(error) = stopped {
@@ -427,7 +438,8 @@ impl<H: TurnHooks> SessionManager<H> {
     /// - [`RunnerError::Hook`] if `process_starting` or `turn_starting`
     ///   failed; the turn wasn't sent.
     /// - [`RunnerError::Sandbox`], [`RunnerError::Store`] and the process's
-    ///   own errors if the container or the process couldn't be started.
+    ///   own errors if the container or the process couldn't be started, or
+    ///   the session's old container couldn't be stopped.
     /// - [`RunnerError::TurnTask`] if the turn's task panicked.
     pub async fn run_turn(
         &self,
@@ -442,7 +454,8 @@ impl<H: TurnHooks> SessionManager<H> {
 
     /// Waits for `session`'s slot, then runs `work` on it in a task of its
     /// own, which the caller's drop doesn't cancel. The slot is released
-    /// when `work` ends, and waiters for an idle container are woken.
+    /// when `work` ends, even by panicking, and then waiters for an idle
+    /// container are woken.
     async fn with_slot<T, F, Fut>(&self, session: SessionId, work: F) -> Result<T>
     where
         T: Send + 'static,
@@ -453,12 +466,22 @@ impl<H: TurnHooks> SessionManager<H> {
         let warm = slot.lock_owned().await;
         let inner = Arc::clone(&self.inner);
         let task = tokio::spawn(async move {
-            let result = work(Arc::clone(&inner), warm).await;
-            inner.idle.notify_waiters();
-            inner.prune();
-            result
+            let _released = SlotReleased(Arc::clone(&inner));
+            work(inner, warm).await
         });
         task.await.map_err(|_| RunnerError::TurnTask)?
+    }
+}
+
+/// Wakes waiters for an idle container and prunes when dropped: at the end
+/// of a slot's work, however it ends, once the work has dropped the slot's
+/// guard.
+struct SlotReleased<H: TurnHooks>(Arc<Inner<H>>);
+
+impl<H: TurnHooks> Drop for SlotReleased<H> {
+    fn drop(&mut self) {
+        self.0.idle.notify_waiters();
+        self.0.prune();
     }
 }
 
@@ -507,9 +530,10 @@ impl<H: TurnHooks> Inner<H> {
             }
             check_kind(&session, request)?;
             let process_start = self.ensure_process(warm, &session, request).await?;
-            let (outcome, finished) = self.exchange(warm, &session, request).await;
+            let resumed = process_start == Some(SessionStart::Resume);
+            let (outcome, finished) = self.exchange(warm, &session, request, resumed).await;
             let outcome = outcome?;
-            if outcome.resume_refused() && !reran {
+            if resumed && outcome.resume_refused() && !reran {
                 tracing::info!(session = %session.id, "the CLI refused to resume a session without a transcript; running the turn again with --session-id");
                 reran = true;
                 continue;
@@ -525,11 +549,20 @@ impl<H: TurnHooks> Inner<H> {
 
     /// Sends the turn to the warm process between `turn_starting` and
     /// `turn_finished`, records it, and stops what the outcome says to.
+    /// `resumed` says whether the turn started the process with
+    /// [`SessionStart::Resume`], so a [`TurnOutcome::resume_refused`] result
+    /// is the CLI refusing it.
+    ///
+    /// A panic in `turn_starting` or the send still has `turn_finished`
+    /// called. After any panic, `turn_finished`'s included, the turn is
+    /// recorded if it has an outcome and the process is stopped as after a
+    /// failed `turn_finished`; then the panic resumes.
     async fn exchange(
         &self,
         warm: &mut Warm<H>,
         session: &Session,
         request: &TurnRequest,
+        resumed: bool,
     ) -> (
         Result<TurnOutcome>,
         std::result::Result<H::Finished, HookError>,
@@ -541,23 +574,28 @@ impl<H: TurnHooks> Inner<H> {
             return (Err(RunnerError::NotRunning), Err("no process".into()));
         };
         let handle = Arc::clone(&running.handle);
-        let outcome = match self.hooks.turn_starting(session, &handle, request).await {
-            Err(source) => Err(RunnerError::Hook {
-                hook: "turn_starting",
-                source,
-            }),
-            Ok(()) => match self.store.mark_session_turn_pending(session.id).await {
-                Ok(true) => running.process.send_turn(&request.message).await,
-                Ok(false) => Err(RunnerError::SessionReset),
-                Err(error) => Err(error.into()),
-            },
-        };
-        let finished = self.hooks.turn_finished(session, &handle, request).await;
+        let mut panicked = None;
+        let sent = AssertUnwindSafe(self.send(session, &handle, &mut running.process, request))
+            .catch_unwind()
+            .await;
+        let outcome = sent.unwrap_or_else(|panic| {
+            panicked = Some(panic);
+            Err(RunnerError::TurnTask)
+        });
+        let finished = AssertUnwindSafe(self.hooks.turn_finished(session, &handle, request))
+            .catch_unwind()
+            .await;
+        let finished = finished.unwrap_or_else(|panic| {
+            panicked = panicked.take().or(Some(panic));
+            Err("the turn_finished hook panicked".into())
+        });
         if let Err(error) = &finished {
             tracing::warn!(session = %session.id, %error, "the turn_finished hook failed; stopping the process");
+        } else if panicked.is_some() {
+            tracing::warn!(session = %session.id, "the turn panicked; stopping the process");
         }
         if let Ok(outcome) = &outcome {
-            let recorded = if outcome.resume_refused() {
+            let recorded = if resumed && outcome.resume_refused() {
                 self.store.mark_session_unstarted(session.id).await
             } else {
                 self.store
@@ -581,23 +619,60 @@ impl<H: TurnHooks> Inner<H> {
             dead,
             running.process.is_running(),
             running.process.may_be_alive(),
-            finished.is_ok(),
+            finished.is_ok() && panicked.is_none(),
         );
         match action {
             AfterTurn::Keep => {}
             AfterTurn::StopProcess => {
                 if self.stop_process(held).await {
-                    self.release_container(warm).await;
+                    self.release_container(warm).await.ok();
                 }
             }
-            AfterTurn::StopContainer => self.release_container(warm).await,
+            AfterTurn::StopContainer => {
+                self.release_container(warm).await.ok();
+            }
+        }
+        if let Some(panic) = panicked {
+            std::panic::resume_unwind(panic);
         }
         (outcome, finished)
+    }
+
+    /// `turn_starting`, then the turn to `process` once the store records
+    /// that the session may have started.
+    async fn send(
+        &self,
+        session: &Session,
+        handle: &H::Process,
+        process: &mut ClaudeProcess,
+        request: &TurnRequest,
+    ) -> Result<TurnOutcome> {
+        self.hooks
+            .turn_starting(session, handle, request)
+            .await
+            .map_err(|source| RunnerError::Hook {
+                hook: "turn_starting",
+                source,
+            })?;
+        if !self.store.mark_session_turn_pending(session.id).await? {
+            return Err(RunnerError::SessionReset);
+        }
+        process.send_turn(&request.message).await
     }
 
     /// Makes sure the session has a container with the turn's mounts and a
     /// running process on the turn's credential kind and model. Returns how
     /// the process was started, if it was.
+    ///
+    /// The container's address is read after the container is tracked, so
+    /// a death the sandbox reports from then on is seen, and one before then
+    /// makes reading the address fail.
+    ///
+    /// # Errors
+    ///
+    /// Besides a failed start, [`RunnerError::Sandbox`] if a container
+    /// that had to go first couldn't be stopped: the session still holds
+    /// it, and no process starts beside one that may still run.
     async fn ensure_process(
         &self,
         warm: &mut Warm<H>,
@@ -609,7 +684,7 @@ impl<H: TurnHooks> Inner<H> {
         if let Some(held) = &warm.held {
             let dead = held.tracked.state().dead;
             if dead || held.mounts != mounts {
-                self.release_container(warm).await;
+                self.release_container(warm).await?;
             }
         }
         if let Some(held) = warm.held.as_mut() {
@@ -619,7 +694,7 @@ impl<H: TurnHooks> Inner<H> {
                     && running.process.model() == request.model.as_deref()
             });
             if !fits && self.stop_process(held).await {
-                self.release_container(warm).await;
+                self.release_container(warm).await?;
             }
         }
         let held = match warm.held.take() {
@@ -634,6 +709,13 @@ impl<H: TurnHooks> Inner<H> {
         if held.process.is_some() {
             return Ok(None);
         }
+        let ip = match self.sandbox.ip(held.container.id()).await {
+            Ok(ip) => ip,
+            Err(error) => {
+                self.release_container(warm).await.ok();
+                return Err(error.into());
+            }
+        };
         let start = if session.resumes() {
             SessionStart::Resume
         } else {
@@ -641,7 +723,7 @@ impl<H: TurnHooks> Inner<H> {
         };
         let (env, handle) = self
             .hooks
-            .process_starting(session, held.ip, kind)
+            .process_starting(session, ip, kind)
             .await
             .map_err(|source| RunnerError::Hook {
                 hook: "process_starting",
@@ -671,17 +753,14 @@ impl<H: TurnHooks> Inner<H> {
             Err(error) => {
                 held.tracked.state().process = None;
                 self.process_stopping(session, &handle).await;
-                self.release_container(warm).await;
+                self.release_container(warm).await.ok();
                 Err(error)
             }
         }
     }
 
-    /// Starts a container for `session` once both caps have room.
-    ///
-    /// The container is tracked before its address is read, so a death
-    /// the sandbox reports from then on is seen, and one before then makes
-    /// reading the address fail.
+    /// Starts a container for `session` once both caps have room, and
+    /// tracks it.
     async fn start_container(
         &self,
         session: &Session,
@@ -714,20 +793,9 @@ impl<H: TurnHooks> Inner<H> {
             }),
         });
         lock(&self.containers).insert(container.id().clone(), Arc::clone(&tracked));
-        let ip = match self.sandbox.ip(container.id()).await {
-            Ok(ip) => ip,
-            Err(error) => {
-                lock(&self.containers).remove(container.id());
-                if let Err(stop) = self.sandbox.stop(container.id()).await {
-                    tracing::warn!(session = %session.id, container = %container.id(), error = %stop, "stopping a container without an address failed");
-                }
-                return Err(error.into());
-            }
-        };
         tracing::info!(session = %session.id, container = %container.id(), "started a session container");
         Ok(Held {
             container,
-            ip,
             mounts,
             tracked,
             process: None,
@@ -798,7 +866,7 @@ impl<H: TurnHooks> Inner<H> {
 
     /// Stops `tracked`'s container if its session has no turn running,
     /// still holds it, and `due` still says so once the session's lock is
-    /// held. Returns whether it did.
+    /// held. Returns whether it stopped it.
     async fn stop_if_idle(
         &self,
         tracked: &Tracked<H>,
@@ -818,8 +886,7 @@ impl<H: TurnHooks> Inner<H> {
         {
             return false;
         }
-        self.release_container(&mut warm).await;
-        true
+        self.release_container(&mut warm).await.is_ok()
     }
 
     /// Stops every container idle for longer than the idle timeout, and
@@ -842,19 +909,30 @@ impl<H: TurnHooks> Inner<H> {
 
     /// Stops the held container: `process_stopping` and the process first,
     /// then the container. Its places under the caps are freed.
-    async fn release_container(&self, warm: &mut Warm<H>) {
-        let Some(mut held) = warm.held.take() else {
-            return;
+    ///
+    /// If the sandbox fails to stop it, the session keeps holding it,
+    /// marked dead, with its places under the caps: it may still be running,
+    /// so no other process may resume its transcript, and the reaper tries
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// [`RunnerError::Sandbox`] if the container couldn't be stopped.
+    async fn release_container(&self, warm: &mut Warm<H>) -> Result<()> {
+        let Some(held) = warm.held.as_mut() else {
+            return Ok(());
         };
-        lock(&self.containers).remove(held.container.id());
-        self.stop_process(&mut held).await;
+        self.stop_process(held).await;
         if let Err(error) = self.sandbox.stop(held.container.id()).await {
-            tracing::warn!(session = %warm.session, container = %held.container.id(), %error, "stopping a session container failed");
-        } else {
-            tracing::info!(session = %warm.session, container = %held.container.id(), "stopped a session container");
+            tracing::warn!(session = %warm.session, container = %held.container.id(), %error, "stopping a session container failed; keeping it to try again");
+            held.tracked.state().dead = true;
+            return Err(error.into());
         }
-        drop(held);
+        tracing::info!(session = %warm.session, container = %held.container.id(), "stopped a session container");
+        lock(&self.containers).remove(held.container.id());
+        warm.held = None;
         self.idle.notify_waiters();
+        Ok(())
     }
 
     /// Stops the held process, if any, after `process_stopping`. Returns

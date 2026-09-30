@@ -1780,8 +1780,9 @@ Deliverables:
   - A session is marked `started` after a turn whose `TurnStats::init_seen`
     is true, whatever its outcome, not when its process starts
     ([impl-notes](impl-notes.md#when-a-session-has-started)).
-  - A turn whose outcome is `TurnOutcome::resume_refused()` (a `--resume`
-    of a session with no transcript) resets the session to `--session-id`:
+  - A turn whose outcome is `TurnOutcome::resume_refused()` on a process
+    the turn started with `SessionStart::Resume` (a `--resume` of a session
+    with no transcript) resets the session to `--session-id`:
     the row is marked not started and the turn runs again, once, on a new
     process with `SessionStart::New` and the same id, since the CLI never
     read the message.
@@ -1985,7 +1986,11 @@ Deliverables:
      `per_binding_delivery`, only the receiving binding's agent is a
      candidate, since each other agent gets its own copy.
   3. On `Run`, look up the session, build the turn message, and call
-     `SessionManager::run_turn`.
+     `SessionManager::run_turn`. `run_turn` returns
+     `RunnerError::SessionReset` when a reset or a scope-change replacement
+     lands between `lookup_or_create` and the turn reaching the front of the
+     session's queue. The pipeline then calls `lookup_or_create` again and
+     retries the turn once on the session it returns.
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
@@ -2533,7 +2538,10 @@ Deliverables:
   4. Mounts follow [Volumes and scopes](#volumes-and-scopes): a task the owner
      requested gets `shared/` read-write and `memory/`. A task a non-owner
      requested gets `shared/` read-only and no `memory/`, and its consent card
-     says it can read the owner's shared files.
+     says it can read the owner's shared files. The runner picks the mounts
+     from `TurnRequest.side`, so the task's turn sets it to `Side::Owner`
+     exactly when the consent's requester is the owner, and to `Side::Public`
+     otherwise. It never copies the side of the channel turn that asked.
   5. The turn recorded on the agentctl token has `TurnKind::PrivateTask`, so
      agentctl allows only `attach` (T15's rule).
 - Delivery: the final reply and attached files are posted to the recorded
