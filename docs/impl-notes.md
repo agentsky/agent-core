@@ -168,3 +168,129 @@ concurrency group of their own: in `main`'s group, where
 pending would cancel that pending run, and its badges would not be
 published. GitHub runs schedules on the default branch only, so the trigger
 takes effect once this workflow is on `main`.
+
+## T03: core-types
+
+### The `Surface` trait's `Sender` has no runtime to come from
+
+**Issue.** The design's trait takes `tx: Sender<InboundEvent>`, which reads
+as a `tokio::sync::mpsc::Sender`. T03 limits core-types to `serde`,
+`serde_json`, `uuid`, `time`, `thiserror` and `async-trait`, so no runtime's
+channel is available. `std::sync::mpsc` blocks, which an async surface must
+not do.
+
+**Solution.** core-types defines `Sender<T>`, a cloneable handle over an
+`Arc<dyn Sink<T>>`, where `Sink` is an `#[async_trait]` trait with one
+method, `send(item) -> Result<(), SendError>`. The receiving side (agentd,
+testkit's `MockSurface`) wraps its tokio sender in a small local type that
+implements `Sink`. `SendError` converts to `SurfaceError::Closed`, so a
+surface's event loop can end with `tx.send(event).await?`.
+
+### `history` couldn't read a thread
+
+**Issue.** The design's `history(&self, conv: &ConvRef, …)` names only a
+conversation. Both of its callers read a thread: T23's turn message builder
+("thread messages since the agent's last reply") and `agentctl history`
+("more thread context"). Slack's `conversations.replies` and Rocket.Chat's
+`chat.getThreadMessages` both need the thread root, which a `ConvRef` doesn't
+carry.
+
+**Solution.** `history` takes `thread: &ThreadKey`. A `ThreadKey` without a
+root reads the conversation's top level, which is what a DM's continuous
+session needs. The design's trait is updated to match. The rustdoc fixes the
+order: at most `limit` messages, the newest ones older than `before`, oldest
+first.
+
+### `is_dm` couldn't tell a group DM from a channel
+
+**Issue.** T22's router returns a `ScopeKind`, which has `GroupDm`, but
+`InboundEvent` only had `is_dm: bool`. Nothing an event carried could produce
+`GroupDm`.
+
+**Solution.** `InboundEvent` has `conv_kind: ConvKind` (`Dm`, `GroupDm`,
+`Channel`) instead, with an `is_dm()` method. T12 (Rocket.Chat room type `d`)
+and T28 (Slack `channel_type`) are updated to set it.
+`ScopeKey::for_conversation(kind, conv)` builds the matching scope.
+
+### Key strings and separators inside platform ids
+
+**Issue.** `dm:<surface>:<team>:<conv>` is ambiguous if an id contains `:`.
+Slack's ids never do, but the Rocket.Chat "team" is whatever id agentd picks
+for a server, and a `host:port` is a natural choice. A `/` in an id would
+likewise break `VolumeKey`'s `<agent>/<scope>`.
+
+**Solution.** Inside key strings, `%`, `:` and `/` in ids are written as
+`%25`, `%3A` and `%2F`. Ids without them, which is every id Slack and
+Rocket.Chat produce today, appear unchanged. Parsing accepts only what
+`Display` writes (no lowercase or other escapes, and no raw `/`), and IDs
+parse only in lowercase hyphenated form, so a key string that parses always
+renders back to itself and one key never has two spellings in a database
+column. A scope key never contains `/`, which keeps `VolumeKey`'s single
+separator unambiguous; it is still not a safe file name (see
+[below](#scope-keys-are-not-file-or-docker-names)). `MemberKey` and `ConvRef` have the same `<surface>:<team>:<id>` string form,
+for columns such as T23's `requester_key`.
+
+### `post` returns one `MsgRef`
+
+**Issue.** T29's acceptance said `post` renders and splits through `render`,
+but `post` returns a single `MsgRef`, and T23 records a `message_refs` row
+for every chunk after calling `render` itself.
+
+**Solution.** `Surface::post` sends one already-rendered chunk, as its
+rustdoc says, and `Surface::render` does the converting and splitting. T29's
+acceptance is reworded to test `render` instead.
+
+### The scope lock had no lease id
+
+**Issue.** `LockResponse::Held` carried only an expiry, and renew and
+release named no lease: the server could match them only by session. Claude
+Code runs Bash tool calls in parallel, so one session can run two
+`agentctl lock -- …` at once. Both would get `Held`, and when the first
+command exited its `Release` would free the lock while the second command
+was still writing to `shared/`.
+
+**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
+on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
+`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
+`Release { lease }`, so a renew or release without a lease fails to
+deserialize. The lock is exclusive per lease, not per session: a second
+acquire, from any session, gets `Busy`, and a renew or release naming any
+lease but the current one answers `Released` and changes nothing. T15's
+`scope_locks` table takes `lease_id` as its primary key next to
+`holder_session`, and its acceptance tests the same-session case.
+
+### Scope keys are not file or Docker names
+
+**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
+segment" because it never contains `/`. It always contains `:`, and may
+contain `%` and any other character a platform id holds. A `:` splits a
+bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
+`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
+Docker volume after the key would break or be refused.
+
+**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
+is a key for columns, labels and logs, not a file or Docker object name. T17
+in the plan fixes how volumes are named and mounted: host directories at
+`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
+data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
+type `bind`), never `binds` strings or named Docker volumes. A digest was
+chosen over a reversible encoding of the key (hex or base32), which grows
+with the key and could pass the 255-byte file-name limit for a long
+Rocket.Chat team id; the `volumes` table records which key a directory holds.
+
+### A Slack bot message may name no user
+
+**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
+message may carry only a `bot_id` and no `user`, and the router's
+managed-bot lookup (T22) needs one key to look up. The plan did not say what
+`sender.user` holds then, or whether the router keys on `sender` or on
+`sender_bot_user`.
+
+**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
+surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
+so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
+`user`, or the `user_id` from `bots.info` (T29) when the event has only a
+`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
+has `sender_bot_user: None`; no binding has that id, so the router ignores
+it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
+section saying this, and T12, T22, T28 and T29 in the plan match it.
