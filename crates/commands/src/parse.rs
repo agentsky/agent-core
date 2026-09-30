@@ -466,28 +466,34 @@ fn parse_limit(s: &str) -> Result<Limit, Reason> {
     let s = s.to_ascii_lowercase();
     let (key, value) = s.split_once('=').ok_or(LIMIT_RULE)?;
     match key {
-        "turns" => setting(value.strip_suffix("/day").unwrap_or(value)).map(Limit::TurnsPerDay),
-        "hops" => setting(value).map(Limit::Hops),
+        "turns" => setting(
+            value.strip_suffix("/day").unwrap_or(value),
+            Reason("turns is at most 4294967295 a day."),
+        )
+        .map(Limit::TurnsPerDay),
+        "hops" => setting(value, Reason("hops is at most 255.")).map(Limit::Hops),
         _ => Err(LIMIT_RULE),
     }
 }
 
-/// `off`, or a number as [`number`] reads it.
-fn setting<T: std::str::FromStr>(s: &str) -> Result<Setting<T>, Reason> {
+/// `off`, or a number as [`number`] reads it, or `too_large` for a number
+/// past `T`'s largest.
+fn setting<T: std::str::FromStr>(s: &str, too_large: Reason) -> Result<Setting<T>, Reason> {
     if s == "off" {
         Ok(Setting::Off)
     } else {
-        number(s).map(Setting::To)
+        number(s, too_large).map(Setting::To)
     }
 }
 
 /// A number written as plain ASCII digits, which `u32::from_str` alone
-/// would stretch to allow a leading `+`.
-fn number<T: std::str::FromStr>(s: &str) -> Result<T, Reason> {
+/// would stretch to allow a leading `+`, or `too_large` for one past `T`'s
+/// largest.
+fn number<T: std::str::FromStr>(s: &str, too_large: Reason) -> Result<T, Reason> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return Err(LIMIT_RULE);
     }
-    s.parse().map_err(|_| Reason("That limit is too large."))
+    s.parse().map_err(|_| too_large)
 }
 
 fn limits(name: AgentName, settings: &[Limit]) -> Result<Command, Reason> {

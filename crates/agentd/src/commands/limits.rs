@@ -2,7 +2,7 @@
 //! agent, which the router applies to every turn (see [`crate::policy`]).
 
 use commands::{RoomRef, Setting, Target, UserRef};
-use core_types::{ConvRef, ConversationId, MemberKey};
+use core_types::{ConvRef, ConversationId, MemberKey, SurfaceKind};
 
 use super::agents::no_such_agent;
 use super::{Commands, Failure};
@@ -166,13 +166,10 @@ impl Commands {
                 }
             }
             Target::Room(room) => {
-                let written = match room {
-                    RoomRef::Name(name) | RoomRef::Id(name) => name,
-                };
-                let label = format!("#{written}");
+                let label = format!("#{}", room.shown());
                 match self.resolve_room(key, room).await? {
                     None => Err(format!(
-                        "I don't know `{}`. Name a channel agentd can see.",
+                        "I don't know `{}`. Name a public channel agentd can see.",
                         label.replace('`', "")
                     )),
                     Some(conversation) => Ok(Rule::Room {
@@ -189,19 +186,22 @@ impl Commands {
     }
 
     /// The conversation `room` names on `key`'s surface, or `None` if
-    /// nothing by that name is found. A Slack channel arrives as its id;
-    /// a Rocket.Chat one by name, which the manager looks up.
+    /// nothing is found. A Slack channel arrives as the id Slack wrote in.
+    /// On Rocket.Chat the manager looks the room up, by name or by an id
+    /// typed as a token, and only a public channel is found: the manager
+    /// reads private groups a member may not be in, so a group is "not
+    /// found" whether or not it exists.
     async fn resolve_room(
         &self,
         key: &MemberKey,
         room: &RoomRef,
     ) -> Result<Option<ConversationId>, Failure> {
-        match room {
-            RoomRef::Id(id) => Ok(Some(ConversationId::new(id.as_str()))),
-            RoomRef::Name(name) => match self.agents_for(key) {
-                Some(agents) => Ok(agents.room_named(name).await?),
-                None => Ok(None),
-            },
+        match (self.agents_for(key), room) {
+            (Some(agents), room) => Ok(agents.public_channel(room).await?),
+            (None, RoomRef::Id { id, .. }) if key.surface == SurfaceKind::Slack => {
+                Ok(Some(ConversationId::new(id.as_str())))
+            }
+            (None, _) => Ok(None),
         }
     }
 }

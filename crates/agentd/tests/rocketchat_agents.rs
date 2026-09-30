@@ -956,7 +956,27 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
     );
     assert_eq!(
         chat.command("alice", "deny helper #nowhere").await,
-        "I don't know `#nowhere`. Name a channel agentd can see."
+        "I don't know `#nowhere`. Name a public channel agentd can see."
+    );
+    chat.fake.add_room("HIDDEN", "p", "hidden");
+    chat.fake.add_member("HIDDEN", FakeRest::MANAGER_ID);
+    for text in ["allow helper #hidden", "allow helper <#HIDDEN>"] {
+        assert!(
+            chat.command("alice", text)
+                .await
+                .starts_with("I don't know `#"),
+            "a private group is never found, though the manager can read it: {text}"
+        );
+    }
+    assert_eq!(
+        chat.command("alice", "deny helper <#MADEUP>").await,
+        "I don't know `#MADEUP`. Name a public channel agentd can see.",
+        "an id typed on Rocket.Chat is looked up, not taken as it is"
+    );
+    assert_eq!(
+        chat.command("alice", "allow helper <#GENERAL>").await,
+        "Only you and `#general` may use `helper`, except `@bob`.",
+        "a public channel's id finds it, and is the same rule as its name"
     );
     assert_eq!(
         chat.command("alice", "allow helper @nobody").await,

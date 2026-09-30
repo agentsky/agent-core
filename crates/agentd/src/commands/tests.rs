@@ -2308,11 +2308,8 @@ async fn allow_and_deny_change_the_owners_rules() {
     h.dm("alice", "allow helper <#GENERAL>").await;
     assert_eq!(
         h.last_reply("alice"),
-        "Only you and `@CAROL`, `#GENERAL` may use `helper`."
-    );
-    assert_eq!(
-        policy().await.allow[1],
-        router::PolicyTarget::Room(conv("GENERAL"))
+        "I don't know `#GENERAL`. Name a public channel agentd can see.",
+        "on Rocket.Chat a channel token is looked up, never taken as it is"
     );
 
     h.dm("alice", "deny helper everyone").await;
@@ -2333,7 +2330,7 @@ async fn allow_and_deny_change_the_owners_rules() {
     h.dm("alice", "deny helper #random").await;
     assert_eq!(
         h.last_reply("alice"),
-        "I don't know `#random`. Name a channel agentd can see."
+        "I don't know `#random`. Name a public channel agentd can see."
     );
     h.dm("BOB", "deny helper everyone").await;
     assert_eq!(

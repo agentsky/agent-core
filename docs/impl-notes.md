@@ -6656,9 +6656,14 @@ everyone` first. Each list holds at most 100 rules. Rules are JSON agentd owns
 (`policy::Rule`), with the identity or conversation and how the owner
 wrote it; replies name them in code spans, which neither surface turns
 into a mention. A member is resolved as `list` does (Slack sends an id,
-Rocket.Chat a username the manager looks up); a channel on Slack arrives
-as an id token, and on Rocket.Chat by name, looked up with `rooms.info`'s
-`roomName` (`RestClient::room_by_name`, and `FakeRest` answers it). Rules
+Rocket.Chat a username the manager looks up). A channel on Slack arrives
+as an id token, whose name after `|` the reply shows. On Rocket.Chat the
+manager looks it up with `rooms.info`, by `roomName`
+(`RestClient::room_by_name`, and `FakeRest` answers it), or by `roomId`
+for an id typed as a `<#…>` token, which is never taken as it is. The
+manager can read private groups a member may not be in, so only a public
+channel is found: a private group reads as unknown whether or not it
+exists, and can't be named in a rule on Rocket.Chat yet. Rules
 that don't read refuse everyone, the owner too, as `PolicyUnavailable`,
 since the same row holds the hop cap, and `allow <name> everyone` clears
 them.

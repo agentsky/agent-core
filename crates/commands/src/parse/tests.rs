@@ -353,7 +353,10 @@ fn allow_and_deny() {
         ),
         (
             "<#C024BE7LR|general>",
-            Target::Room(crate::RoomRef::Id("C024BE7LR".into())),
+            Target::Room(crate::RoomRef::Id {
+                id: "C024BE7LR".into(),
+                name: Some("general".into()),
+            }),
         ),
         ("everyone", Target::Everyone),
     ];
@@ -458,7 +461,11 @@ fn limits_rejects_malformed_settings() {
     }
     invalid(
         "limits helper hops=256",
-        &format!("That limit is too large.\n{usage}"),
+        &format!("hops is at most 255.\n{usage}"),
+    );
+    invalid(
+        "limits helper turns=4294967296/day",
+        &format!("turns is at most 4294967295 a day.\n{usage}"),
     );
     invalid(
         "limits helper hops=1 hops=2",
