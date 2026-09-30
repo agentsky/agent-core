@@ -377,6 +377,83 @@ and then `--resume`. `fake-claude` follows what they showed:
 Absolute paths in the captures are rewritten to the sandbox layout
 (`/volume/sessions/<id>/work` and `…/claude`).
 
+### `rate_limit_event` comes once per process, and only with OAuth
+
+**Issue.** Review asked for `fake-claude` to print a `rate_limit_event`
+after every successful API call, so runner tests always meet a line they
+must skip. The capture in `tool-turns.jsonl` has one such line for three
+API calls, and the CLI's own schema describes the line as "emitted when rate
+limit info changes". Re-running Claude Code 2.1.285 against a local
+streaming server showed that with `CLAUDE_CODE_OAUTH_TOKEN` it prints one
+right after the first `assistant` line of each process, a `--resume`d
+process included, and with `ANTHROPIC_API_KEY` it prints none.
+
+**Solution.** `fake-claude` does the same: with the OAuth token, the first
+successful turn of each process prints `{"type":"rate_limit_event",
+"rate_limit_info":{"status":"allowed","isUsingOverage":false},…}` after its
+first `assistant` line. A test checks a tool turn and a reply against the
+capture's line sequence. For anything else a parser must skip, including
+lines that aren't JSON, a script turn lists raw `extra_lines`, printed after
+its commands and before its reply.
+
+### The real CLI's `anthropic-beta` header
+
+**Issue.** `fake-claude` sent `anthropic-beta: oauth-2025-04-20` with the
+OAuth token and nothing with an API key. The same capture showed Claude Code
+2.1.285 sending a comma list with either credential: ten betas with the
+OAuth token, starting `claude-code-20250219,oauth-2025-04-20,…`, and nine
+with an API key, without `oauth-2025-04-20` and
+`extended-cache-ttl-2025-04-11` but with
+`mid-conversation-tool-changes-2026-07-01`. It also sends `x-app: cli`.
+
+**Solution.** `fake-claude` sends the captured lists, exported as
+`testkit::claude::OAUTH_BETA` and `API_KEY_BETA` so T18 can check the proxy
+forwards them untouched, and `x-app: cli`. `fake_anthropic()` still records
+every header.
+
+### `MockSurface` lost an event when its loop ended mid-delivery
+
+**Issue.** The `events` loop took each event off its channel and then sent
+it. When the receiver was gone, or the loop was cancelled while the send
+waited for room, that event was dropped, although the docs promise that
+queued events stay for the next loop. The mock also ignored its own `Caps`
+and could not fail, so tests could not drive the core's handling of
+`Unsupported`, `RateLimited` or `Unauthorized`.
+
+**Solution.** Each binding's events are a queue under the mock's lock,
+with a `Notify` for new events. The loop sends a copy of the front event and
+removes it only once the sender has taken it, so neither a closed receiver
+nor a cancellation loses it. Calls check the `Caps` first (`edit` without
+`supports_edit`, a thread root without `supports_threads`), then a
+per-operation queue filled by `fail_next(op, error)`. Failed calls are not
+recorded, as a failed upload already wasn't.
+
+### A refused port the test keeps
+
+**Issue.** The unreachable-upstream test bound a port, dropped the
+listener and used the port. A server started by a parallel test could take
+the port in between, and the request would succeed or hang.
+
+**Solution.** The test binds a `tokio::net::TcpSocket` and never calls
+`listen`. The port stays taken for the whole test, so nothing else can get
+it, and a connection to a bound socket that isn't listening is refused at
+once.
+
+### `fake_claude_path()`'s nested build
+
+**Issue.** Review found the first call blocking the test thread for about
+20 seconds on a second dependency build, without `--locked`.
+
+**Solution.** The nested build passes `--locked`, and the rustdoc says the
+first call blocks and should come before any timeout. After a workspace
+`cargo test`, the nested build finds everything fresh and takes about
+0.2 seconds, and under `cargo coverage` the target directory holds a single
+build of each dependency. It builds again only when the caller's package selection
+resolved testkit's dependencies with other features, which a test process
+can't see. A `--profile` flag doesn't change feature resolution: it would
+only help under `cargo test --release`, which nothing here runs, so it isn't
+passed.
+
 ## T05: store
 
 ### The key reaches the store through `open`
@@ -727,10 +804,10 @@ a table or a list cut in two renders differently.
 delivery steps already list. `split` knows both renderers' output syntax:
 it never cuts inside a Slack `<…>` token, an HTML entity such as `&amp;`, a
 Markdown link or image, an `@mention`, a fence line, or a character, and
-keeps combining marks, joiners, skin-tone modifiers and flag pairs with the
-character before them. A property test renders generated Markdown with
-`to_mrkdwn` and checks that no cut lands inside a token or an entity. The
-crate docs state the order.
+keeps grapheme clusters together (see [Grapheme clusters need a mark
+table](#grapheme-clusters-need-a-mark-table)). A property test renders
+generated Markdown with `to_mrkdwn` and checks that no cut lands inside a
+token or an entity. The crate docs state the order.
 
 ### Chunks keep their whitespace, so they rejoin exactly
 
@@ -789,13 +866,102 @@ user id, which is what Slack's `<@U…>` needs. Rocket.Chat mentions are written
 
 **Solution.** The trait now returns "the handle the surface's mention syntax
 needs": a user id on Slack, a username on Rocket.Chat. The Rocket.Chat
-renderer only accepts a username made of letters, digits, `.`, `_` and `-`
-that isn't `all` or `here`, so a directory entry can't turn a mention into a
-broadcast. `@all` and `@here` get the same zero-width space as Slack's
-broadcasts. Code spans, code blocks, link destinations, autolinks and bare
-URLs are left alone, found with the same `pulldown-cmark` parse
-(`render::verbatim`), so `https://x.io/@all` keeps working. The bare URL
+renderer only accepts a username made of ASCII letters and digits, `.`, `_`
+and `-` (the server's name pattern) that isn't a broadcast name, so a
+directory entry can't turn a mention into a broadcast. Name resolution
+leaves code spans, code blocks, link destinations, autolinks and bare URLs
+alone, found with the same `pulldown-cmark` parse (`render::verbatim`).
+Broadcasts are neutralized everywhere, code and URLs included (see [Code
+doesn't protect a broadcast on
+Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
 scanner moved from `slack.rs` to `render::url` to be shared.
+
+### Code doesn't protect a broadcast on Rocket.Chat
+
+**Issue.** The renderer first neutralized `@all` and `@here` only outside
+code and link targets, with the Slack renderer's word rules (Unicode letters
+and digits, not after a letter). Rocket.Chat decides who a message notifies
+from its raw text, not from rendered Markdown. `MentionsParser.getUserMentions`
+(`app/mentions/lib/MentionsParser.ts`, the same in 7.10.0 and 8.0.0) removes
+`[label](dest)` links with `/\[[^\]]*\]\([^)]+\)/g`, then matches
+`(^|\s|>)@([0-9a-zA-Z-_.]+…)` with flags `gm`, and
+`MentionsServer.getUsersByMentions` (`app/mentions/server/Mentions.ts`)
+notifies the room when the name is `all` or `here`. The name class is
+ASCII-only and code isn't special. So `@all` in a fenced, indented or inline
+code span, `@allé` and `@here٣` (the name ends at the first non-ASCII
+character), a link title spanning lines, inline HTML (`<a>@all</a>`),
+`[x](y)@all` at a line start (the link removal leaves `@all` there), and a
+directory entry resolving to `allé` all broadcast.
+
+**Solution.** After rendering, `to_markdown` makes one last pass over the
+whole output, code and link targets included, with the server's grammar: it
+inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
+precedes the `@`. The server reads no name after the zero-width space. A
+URL or a code sample containing `/@all` or `@here` gets the zero-width space
+too; that is the price of the server not knowing about code. `@allison` and
+`@all.hands` stay untouched. The pass is the only place that inserts the
+space; name resolution just skips broadcasts so they are never offered to
+the directory. Usernames from the directory must match the server's ASCII
+class. The tests port the server's regex (`rocketchat::server`, checked
+against the JavaScript regex under Node on 30,000 generated strings while
+writing it) and assert that no output, and no chunk `split` makes from it,
+yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
+pattern; a server configured with a narrower name pattern could read `@all`
+out of `@all.hands`.
+
+### A cut can create or shorten a mention
+
+**Issue.** A mention was kept whole only when its `@` followed a
+non-alphanumeric character, and a cut could fall right before any `@`. The
+server's grammar accepts an `@` at the start of the message, so a harmless
+`x@name` could become a mention at the start of the next chunk, and a forced
+cut inside an oversized construct could shorten `@herectic` to `@here`.
+
+**Solution.** `split` keeps every `@` and the name after it together,
+whatever precedes the `@`, and never cuts right before an `@` that follows
+anything but whitespace or `>`. When a single construct is longer than the
+chunk and a cut has to fall inside it, the cut still avoids the inside of a
+name: it falls right after the `@` instead, so neither chunk holds a
+shortened name. Together with the final pass above, every `@` run in a chunk
+is a run of the rendered text, and those are already neutralized.
+
+### Grapheme clusters need a mark table
+
+**Issue.** The splitter's list of characters that attach to the one before
+them covered combining diacritics, variation selectors, emoji modifiers,
+the joiner and tags, but no script-specific marks. `"कि"` repeated and split
+at 1,001 characters gave chunks starting with the vowel sign U+093F; Thai
+vowels and tone marks, Hebrew and Arabic points, and Hangul vowel and
+trailing jamo were cut the same way. The workspace has no Unicode property
+crate.
+
+**Solution.** `split::graphemes` holds a table of 336 ranges: every
+character of general category `Mn`, `Mc` or `Me`, plus everything Unicode 17
+gives `Grapheme_Cluster_Break` `Extend`, `SpacingMark`, `V`, `T` or `ZWJ`,
+generated from the `unicode-segmentation` crate's tables and Python's
+`unicodedata`. A cut also never falls after an Indic virama
+(`Indic_Conjunct_Break=Linker`) before a letter, after a zero-width joiner,
+or after a Hangul leading jamo before another leading jamo or a syllable.
+Prepend characters and the full emoji ZWJ grammar are left out; the rules
+only ever remove cut positions, so an approximation errs toward longer
+clusters.
+
+### Reference links and long entity names
+
+**Issue.** Codex's review found two cuts the splitter allowed: inside a
+reference-style link, `aaaa[label][ref]` with `[ref]: /url` below, split at
+13, and inside an HTML entity with a name longer than ten characters, such
+as `&CounterClockwiseContourIntegral;`.
+
+**Solution.** When the text defines a label (a line starting `[label]:`
+after optional spaces and `>` markers), `[text][label]`, `[label][]` and
+`[label]` on one line are kept whole like inline links, with labels matched
+case-insensitively and with whitespace collapsed, as CommonMark does. Only
+labels without brackets and up to 999 characters count, which also keeps
+the matching linear. Brackets without a definition are ordinary text. An
+entity name may now have up to 31 characters, the length of the longest
+HTML5 name.
 
 ### Directive details qm-core decides and T07 doesn't
 
@@ -808,8 +974,9 @@ code included, whenever it removed something.
 
 **Solution.** `directives::extract` accepts several names separated by spaces
 or commas, strips colons, lowercases, keeps only valid short names
-(`[a-z0-9_+'-]+` with an optional `::skin-tone-2` to `-6`), drops duplicates
-and returns at most `MAX_REACTIONS` (5). Literal emoji characters are dropped:
+(`[a-z0-9_+'-]+` with an optional `::skin-tone-2` to `-6`, at most
+`MAX_NAME_LEN`, 64, characters in all), drops duplicates and returns at most
+`MAX_REACTIONS` (5). Literal emoji characters are dropped:
 the table would be a large data file for a case the agent's instructions can
 avoid. A directive with an `@` target is removed without effect, since
 reacting to the current message instead would be wrong and short message ids
@@ -866,7 +1033,9 @@ and T13 has to tell the admin to revoke it.
 **Solution.** `ParseError::is_secret_bearing` is true when the text starts
 with `login` or `slack-token` and has arguments, or with `admin api-key` and
 has anything but a bare `set` or `clear` after it. Callers apply the same
-channel rule to both.
+channel rule to both. Review widened the rule to misspelt commands and known
+token prefixes; see
+[Misspelt secret-bearing commands](#misspelt-secret-bearing-commands-arent-commands-at-all).
 
 ### Secrets are `SecretString`, not `String`
 
@@ -939,6 +1108,53 @@ once; a missing one is `None`, meaning unchanged. `turns=N` is accepted
 without `/day`. Numbers are plain digits (`turns` is `u32`, `hops` is `u8`,
 the width of `core_types::Hop`).
 
+### A skill source reaches `git clone`
+
+**Issue.** `skill add <name> <source>` took any word as the source, and every
+argument may start with `-` (see the lone `--` entry above), so
+`skill add helper --upload-pack=<command>` parsed. T25 passes the source to
+`git clone`, where such a word is an option that runs a command, and other
+forms are just as unwelcome there: `ext::` and `file://` transports, local
+paths, SSH URLs, and a ref such as `#--upload-pack=…` that `git` would read
+as an option. A URL with `user:token@` would also put a credential in the
+agent's configuration.
+
+**Solution.** The source is checked by a value parser and must be an
+`https://` URL: the host is letters, digits, `.` and `-`, with an optional
+numeric port and no user info; the path is letters, digits and `-._~/%+`;
+and an optional `#ref` starts with a letter or digit, continues with letters,
+digits and `._/-`, and has no `..`, no `//` and no trailing `/` or `.`.
+Any other form, or a source over 2048 bytes, is refused with one fixed
+message that says what a source is and that leaving it out adds an attached
+`SKILL.md` or `.zip`. The Slack link token is unwrapped before the check. Query strings
+and non-ASCII paths are refused; percent-encoding covers the rare path that
+needs them. T25's plan now also has agentd pass the URL after `--` and the
+ref only inside an `--opt=value` word, as a second line of defense.
+
+### Misspelt secret-bearing commands aren't commands at all
+
+**Issue.** The rule in "Secret-bearing text that fails to parse" only looked
+at text whose command words parsed as `login`, `slack-token` or
+`admin api-key`. `api-key set sk-…` without `admin`, `slack_token …`,
+`slacktoken …` and `admin apikey set …` came back as `UnknownCommand` or
+`Invalid` with `is_secret_bearing()` false, so T13 wouldn't tell the member
+that the secret they just posted in a channel is public.
+
+**Solution.** `parse` computes the flag once for every error, from the words
+alone. It is true when a word naming a secret (`login`, `api-key` or
+`slack-token`, compared ignoring case, `-`, `_` and surrounding punctuation,
+so `apikey`, `API_KEY`, `slack_token`, `SlackToken:` and `log-in` match) is
+followed by anything but a bare `set` or `clear`, wherever it stands, or when
+any word contains a known token prefix: `sk-ant-` (Anthropic API keys and
+OAuth tokens), `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` and `xapp-` (Slack). This
+replaces the earlier rule, which it covers. It errs towards caution, since a
+missed warning leaves a live secret in a channel while a false one costs the
+member a new login: `how do I login here` counts, and so does a help request
+naming a token. The flag is computed only for errors; a command that parses
+is judged by `Command::is_secret_bearing` alone, so a persona mentioning
+`sk-ant-` is still just a persona. Error messages still never repeat the
+text.
+
 ## T09: auth
 
 ### Claude Code 2.1.285's OAuth requests, read from the binary
@@ -1005,13 +1221,15 @@ the link broken. Taken literally, a network blip, a timeout or a 5xx from the
 token endpoint would force every member who happened to refresh then to log
 in again.
 
-**Solution.** Only a refusal marks the link broken: HTTP 400 (`invalid_grant`
-and the like), 401 or 403 from the token endpoint. Any other failure leaves
-the link as it is. If the current access token hasn't expired yet (a refresh
-starts 5 minutes early) it is returned; otherwise the error is. A broken link
-returns `RelinkRequired` at once, without calling the endpoint again, until
-the member logs in. `RelinkRequired { newly_broken }` carries what
-`mark_claude_link_broken` returned, so T13 sends one notice per failure.
+**Solution.** Only a response saying the refresh token is dead marks the
+link broken; which responses say so is in
+[A 4xx from the token endpoint is not always a dead token](#a-4xx-from-the-token-endpoint-is-not-always-a-dead-token).
+Any other failure leaves the link as it is. If the current access token
+hasn't expired yet (a refresh starts 5 minutes early) it is returned;
+otherwise the error is. A broken link returns `RelinkRequired` at once,
+without calling the endpoint again, until the member logs in. The member is
+told once per failure through the relink notices described in
+[A cancelled caller lost the refresh](#a-cancelled-caller-lost-the-refresh).
 
 ### `put_claude_link` would let a refresh undo a logout
 
@@ -1023,10 +1241,11 @@ result and link the member again.
 login, logout) holds that member's lock from the `KeyedLocks` the
 single-flight refresh uses, so a logout waits for a refresh in flight and then
 deletes its result. And a refresh stores through a new store method,
-`update_claude_link`, a plain `UPDATE` that returns false when there is no
-row, so even a delete that bypasses `auth` isn't undone; `auth` then revokes
-the orphaned refresh token and returns `NotLinked`. A login still upserts,
-since it is meant to create the link.
+`update_claude_tokens`, a plain `UPDATE` that returns false when there is no
+row (or, since the generation fix below, a newer login's row), so even a
+delete that bypasses `auth` isn't undone; `auth` then revokes the orphaned
+refresh token and returns `NotLinked`. A login still upserts, since it is
+meant to create the link.
 
 ### Error values could leak what they describe
 
@@ -1052,7 +1271,9 @@ logins, pastes someone else's code, or when the profile can't be read.
 
 - A member has at most one pending login: `start_login` drops the earlier
   ones, so only the newest link works, and the table can't be filled by
-  repeated `login` commands.
+  repeated `login` commands. See
+  [Two logins started at once both stayed pending](#two-logins-started-at-once-both-stayed-pending)
+  for why that is one store transaction.
 - `take_pending_login` deletes the row before the member check, so a code
   pasted by the wrong member is used up. The owner's code has leaked, so they
   have to start again, and the error (`UnknownLogin`) doesn't reveal that the
@@ -1064,6 +1285,159 @@ logins, pastes someone else's code, or when the profile can't be read.
   backticks, quotes and angle brackets around the text, accepts a pasted
   callback URL (including Slack's `<url|label>` form), and rejects input over
   4 KiB.
+
+### A cancelled caller lost the refresh
+
+**Issue.** `access_token` refreshed inside the caller's future. If the caller
+was dropped after the token endpoint answered but before the store was
+updated, the rotated refresh token was lost, and with it the member's link
+(Anthropic rotates refresh tokens, so the stored one may no longer work). A
+test with a 100 ms timeout around a 300 ms token endpoint showed it. The same
+drop could lose `newly_broken` after `mark_claude_link_broken` had set
+`broken_at`, so no relink notice would ever be sent. T18's proxy drops
+request futures whenever a client disconnects, so this would happen in
+normal use.
+
+**Solution.** A refresh runs in a task of its own, spawned by the first
+caller that needs it. The task takes the member's lock, refreshes, stores
+the tokens or marks the link broken, and publishes its result on a
+`tokio::sync::watch` channel; every caller, the first included, only waits
+on that channel, so dropping a caller cancels nothing. A guard removes the
+member's entry from the in-flight map however the task ends, and a caller
+whose task died without a result gets `AuthError::RefreshInterrupted`.
+
+The relink notice no longer depends on a caller either. `RelinkRequired`
+lost its `newly_broken` field; instead, when `mark_claude_link_broken`
+returns true, the task sends the member on an unbounded channel whose
+receiver agentd takes once with `Auth::take_relink_notices()` and turns into
+the DM (T13). Notices queue until received. Tests cancel the caller mid-refresh
+and check that the store ends up with the rotated tokens, and that the
+broken mark and the notice both arrive.
+
+### A failed refresh was retried by every waiter
+
+**Issue.** Refreshes were single-flight only when they succeeded: a waiter
+that got the lock after a failed refresh found the token still stale and
+refreshed again, so ten callers during a 503 sent ten requests one after
+another (about 2 s), and with a token endpoint that hangs up to the 30 s
+timeout, up to 300 s.
+
+**Solution.** Waiters share the refresh task's result, failure included, so
+one refresh sends one request whatever it returns. After a failure that
+doesn't break the link, the member's failure time is kept in memory (it is
+disposable: a restart only means one extra attempt), and for
+`REFRESH_BACKOFF` (30 s) a still-valid token is handed out without trying
+again. An expired token is always retried, one request at a time, since there
+is nothing to hand out instead. `AuthError` became `Clone` for this (its
+`reqwest::Error` and `StoreError` are behind `Arc`). A test sends ten
+concurrent calls during a delayed 503 and sees one request, and one more
+call right after still sends none.
+
+### A 4xx from the token endpoint is not always a dead token
+
+**Issue.** Any HTTP 400, 401 or 403 from the token endpoint broke the link,
+including a 403 HTML page such as a Cloudflare challenge, which says nothing
+about the refresh token.
+
+**Solution.** Claude Code 2.1.285's rule, read from the binary
+(`grep -aoE 'function Vce\([a-z]+\)\{.{0,400}'` and the functions next to
+it, `a5n`, `fLo`, `bBt`, `tl` and the caller `_5o`): it reads the OAuth
+error code as `error` when that is a string and `error.type` when it is an
+object, and treats a refresh token as dead (`known_dead_refresh_token`) only
+for HTTP 400 or 401 with `invalid_grant`. It treats an account as on hold
+for HTTP 400, 401 or 403 whose body is `{error: "invalid_grant" |
+"access_denied", error_description: "account_on_hold"}`. `invalid_client`,
+`invalid_scope` and `unauthorized_client` on a 400 are "expected" failures it
+logs without reporting. Everything else is a plain `refresh_failed` it tries
+again later.
+
+`auth` marks the link broken for HTTP 400 or 401 with `invalid_grant`,
+`invalid_client`, `invalid_scope` or `unauthorized_client`, and for an
+account on hold on 400, 401 or 403. Any other 4xx, with or without a body,
+is transient. Two deviations: Claude Code doesn't mark a token dead for the
+three "expected" codes, but none of them can pass on retry (a wrong client
+ID, or `scopes` widened after members linked), so `auth` asks the member to
+log in again rather than retrying forever; and the plan's wording ("HTTP
+400, 401 or 403") is narrowed to these codes. Tests cover each code, the
+account-on-hold body, and 4xx responses that must not break the link.
+
+### The plan was read while holding the member's lock
+
+**Issue.** After a refresh, the profile request (10 s timeout) ran while the
+member's lock was held, so a logout, a login, or the next refresh waited on
+it, and every caller of `access_token` waited for it too.
+
+**Solution.** The refresh task stores the tokens with
+`update_claude_tokens`, hands the token to its callers and releases the
+lock, then reads the profile and stores only the plan with
+`update_claude_plan`, an `UPDATE` of the plan columns for the link's
+generation. A failed read keeps the old plan. Tests show the caller and a
+logout both finish while the profile is still answering, and that the late
+plan write doesn't bring back a link deleted meanwhile.
+
+### A stale refresh could break a newer login
+
+**Issue.** A refresh that read the link, then waited on the token endpoint
+while the member logged in again (from another instance, or through the
+store directly), could mark the new login's link broken when its old
+refresh token was refused, so T13 would send a wrong relink notice. A
+successful one could overwrite the new login's tokens with the old grant's.
+
+**Solution.** A new migration adds `claude_links.generation` and a one-row
+`claude_link_generations` counter. `put_claude_link` takes the next value
+from the counter and stores it with the link in one `BEGIN IMMEDIATE`
+transaction and returns it. The counter never goes back, so a link deleted
+by a logout and stored again gets a new generation too (a per-row counter
+would restart). `update_claude_tokens`, `update_claude_plan` and
+`mark_claude_link_broken` take the generation the refresh read and change
+nothing unless it still matches. When one of them finds the link replaced,
+`auth` revokes any refresh token it no longer needs and hands out whatever
+the store now holds. Store and `auth` tests cover a mark after a new login
+(nothing changes) and a new login after a mark (the new link is not broken),
+and a refresh finishing after a new login.
+
+### Two logins started at once both stayed pending
+
+**Issue.** `start_login` deleted the member's pending logins and then
+inserted the new one in two statements, so two concurrent starts could
+interleave and leave both.
+
+**Solution.** `put_pending_login` itself deletes the member's other pending
+logins and inserts the new one in one `BEGIN IMMEDIATE` transaction, so
+there is no separate step to forget. A store test with six concurrent puts
+over ten rounds on a file database, and an `auth` test with six concurrent
+`start_login` calls, each leave exactly one.
+
+### An expired token could be handed out after a failed refresh
+
+**Issue.** After a failed refresh, whether the current token was still valid
+was checked against the time read before the request, which can take up to
+30 s, so a token that expired during the request was still handed out.
+
+**Solution.** The clock is read again after the attempt. A test lets a token
+with 2 s left wait 2.5 s for a 503 and gets the error, not the token.
+
+### `me` needs the link state without the tokens
+
+**Issue.** T13's `me` only needs whether the member is linked, the plan and
+whether the link is broken, and reading the link decrypted both tokens for
+that.
+
+**Solution.** `Auth::status(member) -> LinkStatus { linked, plan, broken }`
+over a new store method, `claude_link_status`, that selects only `plan`,
+`rate_limit_tier` and `broken_at`. A test reads the status of a link whose
+tokens no longer decrypt.
+
+### Store methods read the clock themselves
+
+**Issue.** `ensure_member`, `mark_event_processed` and `put_claude_link`
+(and the old `update_claude_link`) called `OffsetDateTime::now_utc()`
+inside, unlike `sweep_expired` and `mark_claude_link_broken`, which take the
+time. Their tests couldn't pin the stored timestamps.
+
+**Solution.** They take a `now: OffsetDateTime`, as do the new
+`update_claude_tokens`; callers pass the current time, and the store tests
+pass fixed times and check them.
 
 ### sqlx's sha2 0.10 next to auth's sha2 0.11
 
@@ -1353,8 +1727,10 @@ without `errorType`. Meteor's DDP rate limiter, which guards `login`, instead
 surfaces through the login route as HTTP 401 with `error: "too-many-requests"`
 and no header.
 
-**Solution.** The wait is the header minus the local clock, floored at zero,
-and one second when the header is missing or unreadable. A 429, or either
+**Solution.** The wait is the header minus the response's `Date` (at first
+the local clock; see
+[Clock skew defeated the 429 retry](#clock-skew-defeated-the-429-retry)),
+floored at zero, and one second when the header is missing or unreadable. A 429, or either
 code in any status, is retried once when the wait is at most
 `with_max_retry_wait` (60 s by default, the server's default window);
 otherwise, or on a second limit, the call fails with
@@ -1402,3 +1778,47 @@ can't leak into the error.
   servers. To turn a `Cursor` (a message id) into a `latest` time for the
   top level, the client also has `chat.getMessage`, which the plan didn't
   list.
+
+### Clock skew defeated the 429 retry
+
+**Issue.** `x-ratelimit-reset` is the server's `Date.now()` plus the time to
+reset, so subtracting the local clock folds in any skew between the two
+hosts. With the local clock more than a minute behind the server's, the wait
+exceeded `with_max_retry_wait` and a call that would have succeeded a
+second later failed with `RateLimited`; with it ahead, the client retried at
+once and hit the limit again.
+
+**Solution.** The wait is the reset minus the response's own `Date` header,
+which the server (Node's `http` sets it on every response) or a proxy in
+front of it writes from a clock that is at worst next to the server's. It is
+parsed as RFC 7231's IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) with the
+`time` crate; the obsolete RFC 850 and asctime forms, which no current server
+sends, count as unreadable. A missing or unreadable `Date` falls back to the
+local clock, and the bounded maximum still applies. `Date` has whole seconds,
+so the wait can come out up to a second longer than the server's, never
+shorter; a reset near the end of a full 60-second window can therefore exceed
+the default maximum by that second and fail with `RateLimited` instead of
+waiting. `FakeRest::rate_limit_at` sends a 429 from a skewed server clock,
+with a `Date` in whole seconds and a reset measured from it.
+
+### Uploads are capped and read once
+
+**Issue.** `upload` read the whole file into memory with no limit, and read
+it again for the retry after a 429. The file comes from an agent's session,
+so its size is whatever the agent wrote, and a path to a device such as
+`/dev/zero` would read until memory ran out.
+
+**Solution.** `RestClient::with_max_upload_size` sets a limit, 100 MiB by
+default, which is Rocket.Chat's default `FileUpload_MaxFileSize`
+(`apps/meteor/server/settings/file-upload.ts`); a server with a lower limit
+still refuses with its own error. Before reading, the file's metadata must
+show a regular file within the limit, else the call fails with
+`SurfaceError::Api` naming the size and the limit, and nothing is sent. The
+read itself stops after limit + 1 bytes, so a file that grows after the check
+can't take more memory than that and is refused too. The bytes are read once
+into `Bytes`, and each attempt's multipart part is a cheap clone of them.
+Streaming the file instead would need reqwest's `stream` feature and
+`tokio-util`, would reopen and reread the file for the retry (which could
+then send different content), and would send a malformed body if the file
+changed size after its length was declared; with the cap, reading into memory
+is bounded and simpler.

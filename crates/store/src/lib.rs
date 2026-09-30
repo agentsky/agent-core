@@ -35,7 +35,7 @@ mod members;
 mod pending_logins;
 mod seal;
 
-pub use claude_links::{ClaudeLink, NewClaudeLink};
+pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use seal::{KeyError, SealError, Sealer};
@@ -327,6 +327,7 @@ mod tests {
             table_names(&store).await,
             [
                 "_sqlx_migrations",
+                "claude_link_generations",
                 "claude_links",
                 "members",
                 "pending_logins",
@@ -343,7 +344,10 @@ mod tests {
         let store = Store::open(&dir.db_url(), Sealer::from_base64(&key).unwrap())
             .await
             .unwrap();
-        let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
+        let member = store
+            .ensure_member(&member_key("u1"), "Ada", at(1_000))
+            .await
+            .unwrap();
         MIGRATOR.run(&store.pool).await.unwrap();
         drop(store);
 
@@ -382,7 +386,7 @@ mod tests {
         let a = memory_store().await;
         let b = memory_store().await;
         let key = member_key("u1");
-        let member = a.ensure_member(&key, "Ada").await.unwrap();
+        let member = a.ensure_member(&key, "Ada", at(1_000)).await.unwrap();
         assert_eq!(b.member_for_identity(&key).await.unwrap(), None);
         let (x, y) = tokio::join!(a.member_for_identity(&key), a.member_for_identity(&key));
         assert_eq!(x.unwrap(), Some(member));
@@ -393,7 +397,10 @@ mod tests {
     async fn an_in_memory_url_opens_an_in_memory_database() {
         let store = Store::open("sqlite::memory:", sealer()).await.unwrap();
         assert_eq!(pragma(&store, "journal_mode").await, "memory");
-        let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
+        let member = store
+            .ensure_member(&member_key("u1"), "Ada", at(1_000))
+            .await
+            .unwrap();
         assert_eq!(
             store.member_for_identity(&member_key("u1")).await.unwrap(),
             Some(member)
@@ -442,9 +449,12 @@ mod tests {
     async fn a_wrong_key_fails_to_read_secrets() {
         let dir = TempDir::new();
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
-        let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
+        let member = store
+            .ensure_member(&member_key("u1"), "Ada", at(1_000))
+            .await
+            .unwrap();
         store
-            .put_claude_link(member, &claude_links::tests::new_link("a", "r"))
+            .put_claude_link(member, &claude_links::tests::new_link("a", "r"), at(1_000))
             .await
             .unwrap();
         store
@@ -482,14 +492,21 @@ mod tests {
     #[tokio::test]
     async fn errors_never_contain_secrets() {
         let store = memory_store().await;
-        let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
+        let member = store
+            .ensure_member(&member_key("u1"), "Ada", at(1_000))
+            .await
+            .unwrap();
+        let other = store
+            .ensure_member(&member_key("u2"), "Bob", at(1_000))
+            .await
+            .unwrap();
         let secret = SecretString::from("sk-ant-oat01-supersecret");
         store
             .put_pending_login("state", member, &secret, at(1_000))
             .await
             .unwrap();
         let err = store
-            .put_pending_login("state", member, &secret, at(1_000))
+            .put_pending_login("state", other, &secret, at(1_000))
             .await
             .unwrap_err();
         assert!(!format!("{err} {err:?}").contains(secret.expose_secret()));

@@ -1,6 +1,7 @@
 //! The HTTP calls: code exchange, refresh, profile and revocation, with the
 //! request shapes Claude Code 2.1.285 sends.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{Client, StatusCode, Url};
@@ -35,7 +36,7 @@ pub(crate) fn build_client() -> Result<Client, AuthError> {
         .build()
         .map_err(|source| AuthError::Http {
             endpoint: Endpoint::Client,
-            source: source.without_url(),
+            source: Arc::new(source.without_url()),
         })
 }
 
@@ -102,21 +103,88 @@ struct Revocation<'a> {
     client_id: &'a str,
 }
 
-/// The body of an OAuth error response (RFC 6749 section 5.2).
-#[derive(Deserialize)]
+/// OAuth `error` codes after which a refresh token can't work again, as
+/// Claude Code 2.1.285 reads them: `invalid_grant` is its dead refresh token,
+/// and the other three are its "expected" refresh failures, which no retry
+/// fixes.
+const DEAD_TOKEN_CODES: [&str; 4] = [
+    "invalid_grant",
+    "invalid_client",
+    "invalid_scope",
+    "unauthorized_client",
+];
+
+/// The `error_description` with which the token endpoint says the account is
+/// on hold.
+const ACCOUNT_ON_HOLD: &str = "account_on_hold";
+
+/// What an error body says, read the way Claude Code 2.1.285 reads it:
+/// `error` is the code when it is a string, and `error.type` when it is an
+/// object.
 struct OAuthErrorBody {
-    error: Option<String>,
+    code: Option<String>,
+    description: Option<String>,
+}
+
+impl OAuthErrorBody {
+    fn parse(body: &[u8]) -> Self {
+        let value = serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+        let code = match value.get("error") {
+            Some(serde_json::Value::String(code)) => Some(code.clone()),
+            Some(error) => error
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            None => None,
+        };
+        let description = value
+            .get("error_description")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Self { code, description }
+    }
 }
 
 /// The OAuth `error` code of a failed response, if it has one that is safe
 /// to put in an error message: short, and only lowercase letters and
 /// underscores, as RFC 6749's codes are. `error_description` is never kept.
 fn oauth_error_code(body: &[u8]) -> Option<String> {
-    let code = serde_json::from_slice::<OAuthErrorBody>(body).ok()?.error?;
+    let code = OAuthErrorBody::parse(body).code?;
     let safe = !code.is_empty()
         && code.len() <= MAX_ERROR_CODE
         && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
     safe.then_some(code)
+}
+
+/// Whether a failed refresh response says the refresh token will never work
+/// again: HTTP 400 or 401 with one of [`DEAD_TOKEN_CODES`], or HTTP 400, 401
+/// or 403 with an account-on-hold body (`error` `invalid_grant` or
+/// `access_denied`, `error_description` `account_on_hold`). Any other
+/// response, such as a 403 HTML page from a proxy, is not.
+fn token_is_dead(status: StatusCode, body: &[u8]) -> bool {
+    let body = OAuthErrorBody::parse(body);
+    let code = body.code.as_deref();
+    let on_hold = matches!(code, Some("invalid_grant" | "access_denied"))
+        && body.description.as_deref() == Some(ACCOUNT_ON_HOLD);
+    match status.as_u16() {
+        400 | 401 => on_hold || code.is_some_and(|code| DEAD_TOKEN_CODES.contains(&code)),
+        403 => on_hold,
+        _ => false,
+    }
+}
+
+/// A failed refresh.
+pub(crate) struct RefreshFailure {
+    pub(crate) error: AuthError,
+    /// Whether the token endpoint said the refresh token is dead
+    /// ([`token_is_dead`]), so the link has to be marked broken.
+    pub(crate) dead: bool,
+}
+
+impl From<AuthError> for RefreshFailure {
+    fn from(error: AuthError) -> Self {
+        Self { error, dead: false }
+    }
 }
 
 /// A response read in full: its status and body.
@@ -128,7 +196,7 @@ struct Response {
 async fn send(request: reqwest::RequestBuilder, endpoint: Endpoint) -> Result<Response, AuthError> {
     let http = |source: reqwest::Error| AuthError::Http {
         endpoint,
-        source: source.without_url(),
+        source: Arc::new(source.without_url()),
     };
     let response = request.send().await.map_err(http)?;
     let status = response.status();
@@ -200,7 +268,7 @@ pub(crate) async fn refresh(
     refresh_token: &SecretString,
     client_id: &str,
     scope: &str,
-) -> Result<Tokens, AuthError> {
+) -> Result<Tokens, RefreshFailure> {
     let body = RefreshGrant {
         grant_type: "refresh_token",
         refresh_token: refresh_token.expose_secret(),
@@ -213,9 +281,12 @@ pub(crate) async fn refresh(
         .timeout(TOKEN_TIMEOUT);
     let response = send(request, Endpoint::Token).await?;
     if !response.status.is_success() {
-        return Err(status_error(Endpoint::Token, &response));
+        return Err(RefreshFailure {
+            error: status_error(Endpoint::Token, &response),
+            dead: token_is_dead(response.status, &response.body),
+        });
     }
-    parse::<TokenResponse>(&response.body, Endpoint::Token)?.into_tokens(Endpoint::Token)
+    Ok(parse::<TokenResponse>(&response.body, Endpoint::Token)?.into_tokens(Endpoint::Token)?)
 }
 
 /// GETs the profile with the access token and reads the plan from it.
@@ -317,5 +388,59 @@ mod tests {
         }
         let long = format!(r#"{{"error":"{}"}}"#, "a".repeat(MAX_ERROR_CODE + 1));
         assert_eq!(oauth_error_code(long.as_bytes()), None);
+        assert_eq!(
+            oauth_error_code(br#"{"error":{"type":"invalid_grant","message":"x"}}"#),
+            Some("invalid_grant".to_owned())
+        );
+    }
+
+    fn dead(status: u16, body: &str) -> bool {
+        token_is_dead(StatusCode::from_u16(status).unwrap(), body.as_bytes())
+    }
+
+    #[test]
+    fn a_token_is_dead_only_on_a_terminal_oauth_error() {
+        for code in DEAD_TOKEN_CODES {
+            let body = format!(r#"{{"error":"{code}"}}"#);
+            assert!(dead(400, &body), "{code}");
+            assert!(dead(401, &body), "{code}");
+            assert!(!dead(403, &body), "{code}");
+            assert!(!dead(500, &body), "{code}");
+        }
+        assert!(dead(400, r#"{"error":{"type":"invalid_grant"}}"#));
+        for (status, body) in [
+            (400, r#"{"error":"invalid_request"}"#),
+            (400, r#"{"error":"server_error"}"#),
+            (401, r#"{"error":"access_denied"}"#),
+            (400, "{}"),
+            (400, ""),
+            (401, "<html>Unauthorized</html>"),
+            (403, "<html>Just a moment...</html>"),
+            (403, r#"{"error":"forbidden"}"#),
+            (429, r#"{"error":"invalid_grant"}"#),
+            (503, r#"{"error":"invalid_grant"}"#),
+        ] {
+            assert!(!dead(status, body), "{status} {body}");
+        }
+    }
+
+    #[test]
+    fn an_account_on_hold_is_a_dead_token() {
+        for status in [400, 401, 403] {
+            for code in ["invalid_grant", "access_denied"] {
+                let body = format!(
+                    r#"{{"error":"{code}","error_description":"account_on_hold","error_uri":"https://claude.ai/restricted"}}"#
+                );
+                assert!(dead(status, &body), "{status} {code}");
+            }
+        }
+        assert!(!dead(
+            403,
+            r#"{"error":"server_error","error_description":"account_on_hold"}"#
+        ));
+        assert!(!dead(
+            500,
+            r#"{"error":"access_denied","error_description":"account_on_hold"}"#
+        ));
     }
 }

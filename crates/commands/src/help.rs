@@ -76,7 +76,7 @@ pub(crate) const SPECS: &[Spec] = &[
     Spec::new(
         "skill add",
         "skill add <name> [source]",
-        "add a skill to an agent from a Git URL (optionally ending in #ref), \
+        "add a skill to an agent from an https:// Git URL (optionally ending in #ref), \
          or from a SKILL.md or .zip attached to a direct message with me",
     ),
     Spec::new(
