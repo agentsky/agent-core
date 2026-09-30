@@ -24,7 +24,7 @@ use sandbox::{
 use secrecy::SecretString;
 use store::{Sealer, Store};
 use testkit::{FakeAnthropic, Turn};
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use tracing_subscriber::fmt::MakeWriter;
 
 struct TempDir(PathBuf);
@@ -357,6 +357,20 @@ impl Harness {
 
     fn events(&self) -> Vec<Event> {
         self.log.lock().unwrap().clone()
+    }
+
+    /// A connection of its own to the store's database, holding its write
+    /// lock until it commits.
+    async fn lock_writes(&self) -> sqlx::SqliteConnection {
+        use sqlx::Connection;
+
+        let url = format!("sqlite://{}", self._dir.0.join("agentd.db").display());
+        let mut writer = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        writer
     }
 
     fn clear(&self) {
@@ -771,7 +785,7 @@ async fn reset_starts_with_a_new_id() {
     reply(&h.run(old.id, request("one")).await);
     let new = h
         .manager
-        .reset(old.id, permits())
+        .reset(old.id)
         .await
         .unwrap()
         .expect("a replacement");
@@ -802,38 +816,47 @@ async fn reset_starts_with_a_new_id() {
             .await,
         Err(RunnerError::UnknownSession)
     ));
-    assert_eq!(h.manager.reset(old.id, permits()).await.unwrap(), None);
-}
-
-fn permits() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(1))
+    assert_eq!(h.manager.reset(old.id).await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn a_reset_holds_its_session_until_a_permit_is_free() {
     let h = Harness::new(&[Turn::reply("old")]).await;
-    let old = h.thread_session("1.1").await;
-    reply(&h.run(old.id, request("one")).await);
-    let permits = Arc::new(Semaphore::new(0));
-    let waiting = tokio::time::timeout(
-        Duration::from_millis(100),
-        h.manager.reset(old.id, Arc::clone(&permits)),
-    )
+    let warm = h.thread_session("1.1").await;
+    reply(&h.run(warm.id, request("one")).await);
+    let mut cold = Vec::new();
+    for n in 0..store::RESETS_AT_ONCE {
+        cold.push(h.thread_session(&format!("2.{n}")).await.id);
+    }
+    let mut writer = h.lock_writes().await;
+    let mut resets = Vec::new();
+    for session in cold {
+        let mut reset = Box::pin(h.manager.reset(session));
+        assert!(futures::poll!(reset.as_mut()).is_pending());
+        resets.push(reset);
+    }
+    tokio::task::yield_now().await;
+    let mut reset = Box::pin(h.manager.reset(warm.id));
+    assert!(futures::poll!(reset.as_mut()).is_pending());
+    eventually("the container stops while every permit is taken", || {
+        h.events().contains(&Event::ContainerStopped(warm.id))
+    })
     .await;
-    assert!(waiting.is_err(), "the reset waits for a permit");
-    assert!(!h.events().contains(&Event::ContainerStopped(old.id)));
+    let mut turn = Box::pin(h.manager.run_turn(warm.id, request("two")));
+    assert!(
+        futures::poll!(turn.as_mut()).is_pending(),
+        "a turn sent while the reset waits for a permit waits behind it"
+    );
     assert_eq!(
-        h.store.session(old.id).await.unwrap().unwrap().reset_at,
+        h.store.session(warm.id).await.unwrap().unwrap().reset_at,
         None
     );
-    permits.add_permits(1);
-    assert_eq!(
-        h.manager.reset(old.id, permits).await.unwrap(),
-        None,
-        "a reset queued behind the first finds the session reset"
-    );
-    assert!(h.events().contains(&Event::ContainerStopped(old.id)));
-    assert!(!h.manager.is_warm(old.id));
+    sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    for cold in resets {
+        assert!(cold.await.unwrap().is_some());
+    }
+    assert!(reset.await.unwrap().is_some());
+    assert!(matches!(turn.await, Err(RunnerError::SessionReset)));
 }
 
 #[tokio::test]

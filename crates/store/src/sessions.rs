@@ -12,6 +12,11 @@ use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
 
 const TABLE: &str = "sessions";
 
+/// How many [`reset_session`](Store::reset_session) calls write at once, per
+/// [`Store`] and its clones. SQLite has one writer, so more would only
+/// hold more of the pool's connections waiting for it.
+pub const RESETS_AT_ONCE: usize = 2;
+
 /// The columns every query reads, in [`Row`]'s order.
 macro_rules! columns {
     () => {
@@ -382,6 +387,10 @@ impl Store {
     /// `None` for a private task's session, and for a session that is
     /// unknown or already reset.
     ///
+    /// It waits for one of [`RESETS_AT_ONCE`] permits before it takes a
+    /// connection, so a reset of thousands of sessions leaves the rest of
+    /// the pool to other work.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if a query fails, [`StoreError::Corrupt`] if
@@ -391,6 +400,7 @@ impl Store {
         id: SessionId,
         now: OffsetDateTime,
     ) -> Result<Option<Session>> {
+        let _permit = self.resets.acquire().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<Row> = sqlx::query_as(concat!(
             "SELECT ",
@@ -685,6 +695,45 @@ mod tests {
         );
         let again = store.reset_session(new.id, at(6)).await.unwrap().unwrap();
         assert_ne!(again.id, new.id);
+    }
+
+    #[tokio::test]
+    async fn at_most_a_few_resets_write_at_once() {
+        use sqlx::Connection;
+
+        let dir = TempDir::new();
+        let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
+        let agent = AgentId::new_v4();
+        let mut ids = Vec::new();
+        for n in 0..3 * RESETS_AT_ONCE {
+            let found = store
+                .session_for_thread(agent, &thread(&format!("{n}.1")), &channel(), at(1))
+                .await
+                .unwrap();
+            ids.push(found.session.id);
+        }
+        let mut writer = SqliteConnection::connect(&dir.db_url()).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        let resets: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                let store = store.clone();
+                tokio::spawn(async move { store.reset_session(id, at(2)).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        let in_use = usize::try_from(store.pool.size()).unwrap() - store.pool.num_idle();
+        assert_eq!(
+            in_use, RESETS_AT_ONCE,
+            "only the resets holding a permit wait for the writer with a connection"
+        );
+        sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+        for reset in resets {
+            assert!(reset.await.unwrap().unwrap().is_some());
+        }
     }
 
     #[tokio::test]

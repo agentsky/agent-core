@@ -5210,30 +5210,79 @@ returns `Pending` before joining the mutex's queue, so a plain poll left
 every idle session past about the 128th out of its queue until after the
 reply.
 
-Once a reset holds its session, it takes one of 8 permits
-(`RESETS_AT_ONCE` in `commands/sessions.rs`) before stopping the container
-and writing the row, and lets it go when it ends. Without a cap, a reset of
-thousands of sessions ran as many `BEGIN IMMEDIATE` transactions at once
-against the store's pool of 10 connections: with 2,000 an unrelated `ping`
-waited 3 seconds, and every other agent's turns waited behind them, or past
-the pool's 30-second acquire timeout. The permits are one
-semaphore in `Commands`, shared by every reset command, and
-`SessionManager::reset` takes it as an argument and acquires it inside the
-session's slot, so the reset is already queued while it waits for a
-permit, and it waits on no other session while it holds one. Without a
-runner, a store-only reset takes the same permits. A reset waiting for a
-permit holds its session, so a turn sent there after the command waits for
-it, as it would for the reset itself.
+The guarantee also relies on that first poll not stopping early.
+`join_all` drives more than 30 futures through `FuturesOrdered`, whose
+`FuturesUnordered` returns `Pending` once two futures have woken themselves
+while being polled (`yielded >= 2`, futures 0.3.34). `unconstrained`
+removes the cause that hit every big reset, the cooperative budget. A rare
+case remains: a reset is woken inside its own poll when its session's lock
+is handed over, its spawned task ends, or a store permit is let go on
+another worker between it registering its waker and returning `Pending`.
+Two of those in one poll leave the resets after them to join their queues
+on the next poll, after the reply. The first poll never yields: for 10,000
+sessions it took 71-75 ms with a runner (a slot lock and a spawned task
+each) and 18-19 ms without one, in a debug build on a loaded machine, two
+runs each, holding one worker thread that long.
 
-Waiting for them to end is
-the command's `FollowUp`: the intake releases the member's command order
-once the reply is sent and then runs the follow-up in the same task, so the
-owner's next command goes ahead. If a reset fails (a container that can't be
+A reset's store write takes one of 2 permits (`store::RESETS_AT_ONCE`):
+`Store::reset_session` waits for one before it takes a connection and lets
+it go when its transaction ends. Without a cap, a reset of thousands of
+sessions ran as many `BEGIN IMMEDIATE` transactions at once against the
+store's pool of 10 connections: with 2,000 an unrelated `ping` waited 3
+seconds, and every other agent's turns waited behind them, or past the
+pool's 30-second acquire timeout. The semaphore lives in `Store` and is
+shared by its clones, so it bounds every reset in the process, through the
+runner or, without one, in the store alone, and neither `SessionControl`
+nor `SessionManager` passes permits around. It covers only the write.
+Stopping a container never used the pool and is bounded by
+`global_container_cap`. An earlier version held the permit through the
+stop as well, about 10 seconds or 120 with a degraded Docker daemon, which
+held up every other reset, cold ones and other owners' too, each holding
+its session meanwhile, so turns queued there filled the pipeline's
+`max_pending` and `evict_idle` couldn't free their containers. `SessionManager::reset` stops the container and then
+writes, with the session held, so the reset is already queued while it
+waits for a permit, and it waits on no other session while it holds one. A
+turn sent to a session whose reset waits for a permit waits for it, as it
+would for the reset itself.
+
+SQLite has one writer, so more permits add no throughput and only park
+more of the pool's connections in the busy handler. A throwaway probe
+measured it: a file database in WAL mode, 2,000 sessions reset at once,
+and a `ping` and an unrelated one-row `UPDATE` every 5 ms meanwhile, three
+rounds of each cap in a debug build on 4 shared, loaded CPUs. The cap of 8
+before this change was applied in the probe around each write, the cap of
+2 is the store's own.
+
+| Cap | Reset of 2,000 | `ping` p99 | `ping` max | Unrelated write p99 | Unrelated write max |
+| --- | --- | --- | --- | --- | --- |
+| None | 3.8-5.1 s | 12 ms-1.4 s | 3.0-3.6 s | 0.06-2.1 s | 2.8-3.7 s |
+| 8 | 4.7-5.5 s | 1.0-5.5 ms | 4-34 ms | 0.63-1.04 s | 0.93-2.1 s |
+| 2 | 4.4-5.0 s | 1.6-3.7 ms | 8-32 ms | 0.43-0.53 s | 0.63-2.0 s |
+
+A reset takes as long with 2 as with 8. A `ping` reads, which WAL lets it
+do while a write is open, so it waits only for a connection, and both caps
+leave it some; 2 leaves 8 of the 10 free rather than 2. An unrelated write
+still waits about half a second at p99: SQLite's busy handler retries after
+sleeps of up to 100 ms and loses to resets that write back to back, which
+no cap on resets alone makes fair.
+
+Waiting for the resets to end is the command's `FollowUp`: the intake
+releases the member's command order once the reply is sent and then runs
+the follow-up in the same task, so the owner's next command goes ahead. If a reset fails (a container that can't be
 stopped isn't reset, T21), the owner is told in a direct message from the
 manager bot, with the command to send again. At shutdown the intake waits
 for follow-ups as for commands, within the drain; one still waiting when the
-drain ends is dropped with the intake's tasks, and its reset leaves the
-queue without resetting. The follow-up lives only in memory: if the instance
+drain ends is dropped with the intake's tasks. A reset still queued behind
+its session's turns then leaves the queue without resetting. One that holds
+its session goes on: `with_slot` runs the work in a task of its own, as for
+a turn, and dropping the caller drops only its `JoinHandle`. It keeps the
+runner's `Inner` alive until it ends, within one container stop, and it can
+reach the store after `Store::close`. That is harmless: `close` waits for a
+transaction in progress, and one begun after it fails at once, leaving the
+session unreset with its container stopped, as any failed reset does, and
+the process's exit ends the task anyway. Stopping the task with its caller
+would cancel a container stop part way or thread a cancellation into the
+write, for no gain. The follow-up lives only in memory: if the instance
 dies, the queued resets die with it and nothing is reset, which the owner
 sees in `sessions` and can send again.
 

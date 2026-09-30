@@ -397,31 +397,25 @@ impl<H: TurnHooks> SessionManager<H> {
             .await?)
     }
 
-    /// Resets `session`: once the turns queued before it have run and a
-    /// permit of `permits` is free, stops its warm process and container,
-    /// marks it reset and, for a normal session, makes its replacement with
-    /// a new id, which the next turn starts with `--session-id`. Returns the
-    /// replacement, or `None` for a private task's session and a session
-    /// that was unknown or already reset. Turns queued after the reset fail
-    /// with [`RunnerError::SessionReset`].
+    /// Resets `session`: once the turns queued before it have run, stops
+    /// its warm process and container, marks it reset and, for a normal
+    /// session, makes its replacement with a new id, which the next turn
+    /// starts with `--session-id`. Returns the replacement, or `None` for a
+    /// private task's session and a session that was unknown or already
+    /// reset. Turns queued after the reset fail with
+    /// [`RunnerError::SessionReset`].
     ///
-    /// The permit is taken once the session is held and let go when the
-    /// reset ends, so `permits` bounds how many resets stop containers and
-    /// write to the store at once, while each is already queued on its
-    /// session.
+    /// The store write waits for one of [`store::RESETS_AT_ONCE`] permits
+    /// with the session held, so the reset stays queued on its session and
+    /// waits on no other session while it holds one.
     ///
     /// # Errors
     ///
     /// - [`RunnerError::Sandbox`] if the warm container couldn't be
     ///   stopped. The session isn't reset.
     /// - [`RunnerError::Store`].
-    pub async fn reset(
-        &self,
-        session: SessionId,
-        permits: Arc<Semaphore>,
-    ) -> Result<Option<Session>> {
+    pub async fn reset(&self, session: SessionId) -> Result<Option<Session>> {
         self.with_slot(session, |inner, mut warm| async move {
-            let _permit = permits.acquire_owned().await;
             inner.release_container(&mut warm).await?;
             Ok(inner
                 .store
