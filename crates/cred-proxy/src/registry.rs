@@ -271,16 +271,16 @@ impl Registry {
     /// Clears the placeholder's pointer, for the turn that ended, however
     /// it ended. Until the next [`point`](Self::point), requests carrying it
     /// are refused. A request authorized before the call keeps its
-    /// credential.
-    ///
-    /// # Errors
-    ///
-    /// [`RegistryError::Unknown`] if the placeholder was revoked.
-    pub fn unpoint(&self, id: PlaceholderId) -> Result<(), RegistryError> {
-        let mut entries = self.lock();
-        let entry = entries.get_mut(&id).ok_or(RegistryError::Unknown)?;
-        entry.credential = None;
-        Ok(())
+    /// credential. Returns whether it was live; a placeholder already
+    /// revoked, as when its container died mid-turn, has nothing to clear.
+    pub fn unpoint(&self, id: PlaceholderId) -> bool {
+        match self.lock().get_mut(&id) {
+            Some(entry) => {
+                entry.credential = None;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Revokes the placeholder. Returns whether it was live.
@@ -456,12 +456,12 @@ mod tests {
         let placeholder = registry.mint(session, IP, CredentialKind::ApiKey).unwrap();
         let token = placeholder.expose_secret();
         let key = CredentialKind::ApiKey;
-        registry.unpoint(placeholder.id()).unwrap();
+        assert!(registry.unpoint(placeholder.id()));
         registry
             .point(placeholder.id(), CredentialRef::Community)
             .unwrap();
         assert!(registry.authorize(token, IP, key).is_ok());
-        registry.unpoint(placeholder.id()).unwrap();
+        assert!(registry.unpoint(placeholder.id()));
         assert_eq!(
             registry.authorize(token, IP, key),
             Err(Denial::NotPointed(session))
@@ -471,10 +471,7 @@ mod tests {
             .unwrap();
         assert!(registry.authorize(token, IP, key).is_ok());
         assert!(registry.revoke(placeholder.id()));
-        assert_eq!(
-            registry.unpoint(placeholder.id()),
-            Err(RegistryError::Unknown)
-        );
+        assert!(!registry.unpoint(placeholder.id()));
     }
 
     #[test]
