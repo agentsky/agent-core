@@ -112,7 +112,7 @@ pub struct PipelineSettings {
 ///    wait for one agent in one thread, and
 ///    [`max_pending`](PipelineSettings::max_pending) wait or run in all; a
 ///    person's message past either gets one line saying the agent is busy,
-///    posted in a task of its own, at most [`MAX_BUSY_LINES`] at once, and
+///    posted in a task of its own, at most eight at once, and
 ///    a bot's gets nothing, so two bots can't answer each other's busy
 ///    lines.
 /// 3. **Routing.** [`router::route`] for the candidate, with a view of the
