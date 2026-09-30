@@ -805,7 +805,10 @@ Direct calls would also need our own agent loop.
 - The exact Rocket.Chat custom role. The current reading is `create-user`,
   `edit-other-user-active-status` when passing `active`, and token creation.
   An issue from 2017 reported that `users.create` also needed edit-user
-  permissions[^rc-7351]. Needs a test on the target server version.
+  permissions[^rc-7351]. Needs a test on the target server version. Creating
+  a custom role needs an Enterprise license (`roles.create` requires the
+  `custom-roles` module on 7.13.9), so the Community Edition needs another
+  answer, such as the permissions on a built-in role.
 - Whether Slack delivers `app_mention` when one app's bot user mentions
   another's. Agent-to-agent turns on Slack depend on it.
 - One container per active session costs more than one per scope. Idle reaping

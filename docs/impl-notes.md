@@ -2463,3 +2463,101 @@ the policy also holds the hop cap. Every other lookup already withholds a
 turn when it has no answer. The trait's rustdoc lists every lookup `route`
 may make for an event, in order, so T23 knows what to load, and T23's and
 T27's plan text say what they fill.
+
+## T16: sandbox image and Compose
+
+### An internal network still reaches the host
+
+**Issue.** `internal: true` removes a network's route out, but Docker still
+gives the host the network's gateway address on the bridge. On Docker
+29.3.1, a container on an internal network connected to a listener that a
+host process had bound to `0.0.0.0`, through the gateway address. A sandbox
+could therefore reach anything listening on the host's wildcard address:
+sshd, a database, a development server. Published container ports were not
+reachable that way, and names outside the network didn't resolve.
+
+**Solution.** The `sandbox` network also sets the bridge driver option
+`com.docker.network.bridge.inhibit_ipv4: "true"`, so the host has no
+address on it; the same probe then fails, while agentd's address and its
+aliases on the network still answer. `scripts/ci/compose-test.sh` starts a
+listener on the host's wildcard address, shows it reachable through the
+`egress` gateway, and checks that a sandbox reaches it through neither
+gateway. Whatever creates the sandbox network outside this Compose file
+(a production deployment) needs the same option. The plan's network
+section says so.
+
+### Static addresses need an `ip_range`, and the range moves the gateway
+
+**Issue.** Compose starts containers in dependency order, and a container
+without a static address can take any free one. MongoDB started before
+agentd and took `172.31.0.2`, so agentd failed with "Address already in
+use". Limiting dynamic addresses with `ip_range` fixed that, but Docker
+then made the first address of the range, `172.31.0.128`, the gateway.
+
+**Solution.** Both networks set `ip_range` to the upper half of their
+subnet (`.128/25`) and name the gateway (`.1`) explicitly. agentd's static
+addresses stay in the lower half, so a container started earlier, or a
+sandbox started while agentd is recreated, can't take them. That leaves
+about 126 addresses for sandboxes on the default `/24`; a deployment that
+needs more running at once widens the subnet in both `compose.yaml` and
+`internal.sandbox_subnet`.
+
+### Custom roles need a Rocket.Chat Enterprise license
+
+**Issue.** The design gives the manager a custom role. On 7.13.9,
+`roles.create` is registered in `apps/meteor/ee/server/api/roles.ts` with
+`license: ['custom-roles']` and refuses without that license module, and
+`roles.update` refuses for any role that isn't protected (built in). The
+Community Edition, which the Compose stack runs, can only change which
+built-in roles hold a permission (`permissions.update`, which needs
+`access-permissions`).
+
+**Solution.** `deploy/compose/README.md` lists the permissions from T11's
+reading of the source, creates the custom role where a license allows it,
+and otherwise gives the manager `admin` for development. What least
+privilege looks like on the Community Edition is added to the design's
+open question on the manager's role, for T11's live check to settle.
+
+### The native installer and a read-only image
+
+**Issue.** `https://claude.ai/install.sh` downloads the latest build, which
+runs `claude install <version>`: the pinned build goes to
+`~/.local/share/claude/versions/<version>`, linked from
+`~/.local/bin/claude`. Sessions run with a `HOME` of their own on a
+read-only root, so nothing under the build's `HOME` is on their path.
+
+**Solution.** The image runs the installer with a scratch `HOME`, copies
+the resolved binary to `/usr/local/bin/claude`, and removes the scratch
+directory. The 2.1.285 binary says the auto-updater leaves a copy that
+isn't a link into `versions/` alone, and the image sets
+`DISABLE_AUTOUPDATER=1` as well. The build fails unless the installed
+binary prints `<CLAUDE_CODE_VERSION> (Claude Code)`. That `ARG` in
+`images/sandbox/Dockerfile` is the only place the version is written: the
+CI check reads it from there.
+
+### agentd's data directory is created by root
+
+**Issue.** agentd runs as uid 10001, and Docker creates a missing bind
+mount source on the host owned by root, so agentd couldn't write its
+database.
+
+**Solution.** A one-shot `data-init` service (busybox) gives the directory
+to `10001:10001` with mode 0700 before agentd starts, through
+`depends_on` with `service_completed_successfully`. Only the top directory
+is changed; agentd owns what it creates inside.
+
+### What the network test checks, and how
+
+**Issue.** Most "unreachable" checks pass trivially: a name on another
+network doesn't resolve from `sandbox`, and a stopped service refuses
+everyone.
+
+**Solution.** The test probes by address as well as by name, with bash's
+`/dev/tcp` under `timeout` as in T17's test, and runs every unreachable
+target once from the `egress` network first as a control. The stack uses
+the real images, so Rocket.Chat and MongoDB must be healthy (their Compose
+health checks) and agentd must answer `/healthz` before the probes run.
+The distroless agentd image has no shell or client for a health check, so
+the test polls `/healthz` with curl from a container on `egress`. The
+cloud metadata address `169.254.169.254` is checked as well, since the
+design blocks it.

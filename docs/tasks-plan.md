@@ -166,10 +166,17 @@ description, and must pass T02's policy.
 - Development and single-host deployment use Docker Compose (added in T16).
 - Two Docker networks:
   - `egress` is a normal bridge.
-  - `sandbox` is `internal: true`, so it has no route out.
+  - `sandbox` is `internal: true`, so it has no route out, and sets the
+    bridge option `com.docker.network.bridge.inhibit_ipv4`, so the host has
+    no address on it. Without that a sandbox reaches whatever listens on the
+    host's wildcard address
+    ([impl-notes](impl-notes.md#an-internal-network-still-reaches-the-host)).
 - agentd runs in a container on both networks, with a static address on each
-  (Compose `ipv4_address` on fixed subnets). On `sandbox` it has the aliases
-  `cred-proxy.internal` and `agentctl.internal`.
+  (Compose `ipv4_address` on fixed subnets). Other containers take addresses
+  from an `ip_range` that excludes agentd's
+  ([impl-notes](impl-notes.md#static-addresses-need-an-ip_range-and-the-range-moves-the-gateway)).
+  On `sandbox` it has the aliases `cred-proxy.internal` and
+  `agentctl.internal`.
 - Rocket.Chat and MongoDB are on `egress` only.
 - Sandbox containers attach to `sandbox` only. Everything they reach, they reach
   through agentd.
@@ -1363,7 +1370,7 @@ Acceptance:
 - `docker run --rm <image> which node` fails.
 - A Docker test, with the Compose networks, that a container on `sandbox`
   reaches agentd's ports 8080 and 8081, and not port 8443, Rocket.Chat,
-  MongoDB or the internet.
+  MongoDB, the host or the internet.
 
 ### T17
 

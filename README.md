@@ -55,6 +55,17 @@ requests `server.drain_timeout_secs` to finish; a second signal drops them at
 once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
 
+## Development stack
+
+[`deploy/compose`](deploy/compose/README.md) runs Rocket.Chat, MongoDB and
+agentd with Docker Compose, on the two networks the plan describes, and
+builds the sandbox image agentd starts sessions from. Its README walks
+through bringing it up, setting up the Rocket.Chat manager, configuring
+agentd, and the manual live checks. The images are built from
+[`images/sandbox`](images/sandbox/Dockerfile), which pins the Claude Code
+version with the `CLAUDE_CODE_VERSION` build argument, and
+[`images/agentd`](images/agentd/Dockerfile).
+
 ## CI
 
 GitHub Actions runs the same formatting, lint, test, doc, and coverage checks
@@ -84,8 +95,16 @@ locally, with Docker running, as
 `debian:stable-slim` and create and remove their own networks and
 containers.
 
-A change that touches only documentation (Markdown files and `LICENSE`, as
-decided by `scripts/ci/docs-only.sh`) skips the build and test jobs and runs
+The `images` job builds both images through the Compose file, without
+pushing them, and runs `scripts/ci/compose-test.sh`: the sandbox image
+prints the pinned `claude --version`, runs as uid 10001 and has no `node`,
+and a container on the Compose `sandbox` network reaches agentd's ports 8080
+and 8081 but not its public port, Rocket.Chat, MongoDB, the host or the
+internet. `deploy/compose/README.md` says how to run it locally.
+
+A change that touches only documentation (Markdown files and `LICENSE`
+outside `crates/` and `images/`, as decided by `scripts/ci/docs-only.sh`)
+skips the build and test jobs and runs
 only the doctests and rustdoc, since this README is also the crate docs. To
 protect `main`, require the `CI passed` check: it passes when every other job
 passed or was skipped.
