@@ -785,7 +785,9 @@ Deliverables:
   `[[react: <emoji>]]` (the only directive for now). Directives inside code are
   not parsed.
 - `render::rocketchat::to_markdown(md, directory)`: pass-through, neutralizing
-  `@all` and `@here` outside code, with the same `@Name` resolution as Slack.
+  `@all` and `@here` outside code, with the same `@Name` resolution as Slack
+  (the directory returns usernames there; see
+  [impl-notes](impl-notes.md#rocketchat-mentions-need-a-username-not-an-id)).
 - Per-surface limits as constants: Slack 3,000 characters per `text` chunk
   (under the 4,000 hard limit, leaving room for rendering growth), and
   Rocket.Chat 5,000 UTF-16 units (the server default `Message_MaxAllowedSize`).

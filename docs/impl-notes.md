@@ -297,3 +297,110 @@ line is still scanned. Names are passed to the directory as written;
 `MentionDirectory` implementations own case folding. The scanner lives in
 `render::mention` so T07's Rocket.Chat renderer can reuse it with its own
 broadcast names.
+
+## T07: splitting and directives
+
+### Split the rendered text, not the Markdown
+
+**Issue.** T07 didn't say whether `split` runs on the agent's Markdown or on
+a renderer's output. Rendering changes the length (`&` becomes `&amp;`, a link
+becomes `<url|label>`, a table grows padding), so chunks cut from Markdown
+can exceed the limit once rendered. And the renderers need whole constructs:
+a table or a list cut in two renders differently.
+
+**Solution.** The order is extract directives, render, then split, as T23's
+delivery steps already list. `split` knows both renderers' output syntax:
+it never cuts inside a Slack `<…>` token, an HTML entity such as `&amp;`, a
+Markdown link or image, an `@mention`, a fence line, or a character, and
+keeps combining marks, joiners, skin-tone modifiers and flag pairs with the
+character before them. A property test renders generated Markdown with
+`to_mrkdwn` and checks that no cut lands inside a token or an entity. The
+crate docs state the order.
+
+### Chunks keep their whitespace, so they rejoin exactly
+
+**Issue.** The acceptance property says that rejoining the chunks with the
+fences removed gives the original text. Trimming the whitespace at a cut
+would break that.
+
+**Solution.** Chunks are consecutive slices of the text, plus the fence lines
+the splitter adds. A cut falls after a blank line, a line break or a run of
+spaces, and that whitespace stays at the end of the earlier chunk, so the next
+chunk doesn't start with a blank line. The tests check the property on the
+splitter's internal pieces, and check separately that each piece renders as
+reopening line, slice and closing fence.
+
+### Where the splitter cuts
+
+**Issue.** qm-core's `safeCutIndex` backs off from the limit to avoid a `<…>`
+token or an unbalanced `` ` ``, `*` or `~`, but it doesn't look for paragraph,
+line or word breaks, and it counts ```` ``` ```` anywhere in the text as a
+fence.
+
+**Solution.** A break is used when it falls in the second half of the chunk:
+a blank line outside code, or the start or end of a code block, first, then a
+line break, then a space outside code. Spaces inside a code block don't
+count, since a cut there breaks a code line in two. Otherwise the latest break
+of any kind wins, and a word is cut only as a last resort. Code spans and
+pairs of `*`, `_` or `~` on a line are kept whole only if that still leaves
+at least a quarter of the chunk, like qm-core's 25% floor, because an `_` in
+an identifier can pair with one much further along the line. The hard rules
+above give way only when one construct is longer than a chunk. Fences are
+found line by line: three or more backticks or tildes after optional spaces
+and `>` markers, and a closing line needs the same number of `>`, so a
+blockquoted fence in Slack output (`> ```sh`) is closed and reopened with its
+prefix. A cut never lands just after an opening line or just before a closing
+line, which would leave an empty code block.
+
+### Limits smaller than a fence or a character
+
+**Issue.** A continuation chunk repeats the opening fence line and adds a
+closing one. With a tiny limit, or a very long info string, those lines alone
+leave no room for content, and a limit of 1 UTF-16 unit can't hold an emoji at
+all. qm-core stops repeating fences below a 32-character budget.
+
+**Solution.** A fence is repeated only when twice its opening line plus four
+units fits the limit, which guarantees that every chunk can hold at least one
+character between them. Otherwise the block is split like plain text. A chunk
+always holds at least one character, so a limit below one character's size is
+exceeded rather than looping; the rustdoc says so. Real limits (3,000 and
+5,000) never get near either case.
+
+### Rocket.Chat mentions need a username, not an id
+
+**Issue.** `MentionDirectory::resolve` was documented as returning a platform
+user id, which is what Slack's `<@U…>` needs. Rocket.Chat mentions are written
+`@username`; a user id there is not a mention.
+
+**Solution.** The trait now returns "the handle the surface's mention syntax
+needs": a user id on Slack, a username on Rocket.Chat. The Rocket.Chat
+renderer only accepts a username made of letters, digits, `.`, `_` and `-`
+that isn't `all` or `here`, so a directory entry can't turn a mention into a
+broadcast. `@all` and `@here` get the same zero-width space as Slack's
+broadcasts. Code spans, code blocks, link destinations, autolinks and bare
+URLs are left alone, found with the same `pulldown-cmark` parse
+(`render::verbatim`), so `https://x.io/@all` keeps working. The bare URL
+scanner moved from `slack.rs` to `render::url` to be shared.
+
+### Directive details qm-core decides and T07 doesn't
+
+**Issue.** T07 names only `[[react: <emoji>]]`. qm-core's `extractReactions`
+also accepts several names per directive, names with colons, literal emoji
+characters (through a generated table of about 1,800 entries), and a target
+message after `@`, caps a reply at five reactions, strips an unclosed
+`[[react:` running to the end of the text, and trims every line of the reply,
+code included, whenever it removed something.
+
+**Solution.** `directives::extract` accepts several names separated by spaces
+or commas, strips colons, lowercases, keeps only valid short names
+(`[a-z0-9_+'-]+` with an optional `::skin-tone-2` to `-6`), drops duplicates
+and returns at most `MAX_REACTIONS` (5). Literal emoji characters are dropped:
+the table would be a large data file for a case the agent's instructions can
+avoid. A directive with an `@` target is removed without effect, since
+reacting to the current message instead would be wrong and short message ids
+belong to T23's `message_refs`. An unclosed `[[react:` is removed only on the
+last line, so prose that mentions the syntax can't delete the rest of a
+reply. Whitespace is cleaned only next to removed directives: a line that
+held only directives goes, space before a directive at the end of a line
+goes, and at most one blank line is left where a line was removed. Code is
+found with the parse tree, and a directive overlapping it is left as text.
