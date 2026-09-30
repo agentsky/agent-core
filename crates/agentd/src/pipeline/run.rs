@@ -843,6 +843,8 @@ impl Pipeline {
     /// A refused login whose link is already marked broken gets no message
     /// here: the relink notice tells the member once. Nor does a failure of
     /// a kind the requester was told about within [`FAILURE_DM_INTERVAL`].
+    /// A message that fails to send releases its claim, so the next failure
+    /// of that kind tries again.
     async fn tell_requester(&self, agent: AgentId, turn: &Run, failure: CredentialFailure) {
         let store = &self.inner.store;
         if failure == CredentialFailure::Refused
@@ -857,24 +859,21 @@ impl Pipeline {
             }
         }
         let kind = failure.notice_kind(turn.credential);
-        match store
-            .claim_failure_notice(
-                &turn.requester.key,
-                kind,
-                OffsetDateTime::now_utc(),
-                FAILURE_DM_INTERVAL,
-            )
+        let now = OffsetDateTime::now_utc();
+        let claimed = match store
+            .claim_failure_notice(&turn.requester.key, kind, now, FAILURE_DM_INTERVAL)
             .await
         {
-            Ok(true) => {}
+            Ok(true) => true,
             Ok(false) => {
                 tracing::debug!(%agent, requester = %turn.requester.key, kind, "the requester was told about this failure recently");
                 return;
             }
             Err(err) => {
                 tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't check when the requester was last told; telling them anyway");
+                false
             }
-        }
+        };
         let name = self.agent_name(agent).await.unwrap_or_else(|err| {
             tracing::warn!(%agent, error = %err, "couldn't read the agent's name");
             "This agent".to_owned()
@@ -882,6 +881,13 @@ impl Pipeline {
         let text = failure.requester_text(turn.credential, &name);
         if let Err(err) = self.inner.replies.dm(&turn.requester.key, &text).await {
             tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't tell the requester why their turn failed");
+            if claimed
+                && let Err(err) = store
+                    .release_failure_notice(&turn.requester.key, kind, now)
+                    .await
+            {
+                tracing::warn!(%agent, requester = %turn.requester.key, error = %err, "couldn't release the claim on telling the requester");
+            }
         }
     }
 

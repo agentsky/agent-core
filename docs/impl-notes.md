@@ -5180,9 +5180,9 @@ credential it was: `usage_limit/member`, `refused/member`,
 a `failure_notices` table keyed by the requester's identity, since a
 community-key turn may have no member, and claimed with one conditional
 upsert before sending, so it holds across restarts and instances. A
-message that then fails to send isn't retried within the hour; the thread
-has the reply either way. If the claim itself fails, the requester is
-told anyway.
+message that then fails to send releases the claim, deleting the row only
+if it still holds the time claimed, so the next failure of that kind tries
+again. If the claim itself fails, the requester is told anyway.
 
 ### The pipeline also refuses a private scope for anyone but the owner
 

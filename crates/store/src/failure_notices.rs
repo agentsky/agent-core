@@ -15,8 +15,8 @@ impl Store {
     /// that kind or were last told at least `every` before `now`; false
     /// otherwise, and nothing changes. One caller at a time gets the claim.
     ///
-    /// Claim before sending. A message that then fails to send is not
-    /// retried until `every` has passed.
+    /// Claim before sending, and [release](Self::release_failure_notice)
+    /// the claim if the message then fails to send.
     ///
     /// # Errors
     ///
@@ -43,6 +43,29 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Gives up the claim on telling `requester` about a failure of `kind`
+    /// made at `sent_at`, so the next failure can claim it at once. A claim
+    /// made at any other time is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails.
+    pub async fn release_failure_notice(
+        &self,
+        requester: &MemberKey,
+        kind: &str,
+        sent_at: OffsetDateTime,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM failure_notices WHERE requester = ? AND kind = ? AND sent_at = ?")
+            .bind(requester.to_string())
+            .bind(kind)
+            .bind(to_unix(sent_at))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -83,5 +106,49 @@ mod tests {
             "an hour later it is claimed again"
         );
         assert!(!claim(&bob, "usage_limit/member", 13_601).await);
+    }
+
+    #[tokio::test]
+    async fn a_released_claim_can_be_claimed_again_at_once() {
+        let store = memory_store().await;
+        let bob = member_key("bob");
+        let kind = "usage_limit/member";
+        assert!(
+            store
+                .claim_failure_notice(&bob, kind, at(10_000), HOUR)
+                .await
+                .unwrap()
+        );
+        store
+            .release_failure_notice(&bob, kind, at(9_999))
+            .await
+            .unwrap();
+        store
+            .release_failure_notice(&bob, "refused/member", at(10_000))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .claim_failure_notice(&bob, kind, at(10_001), HOUR)
+                .await
+                .unwrap(),
+            "only the claim made at that time, for that kind, is released"
+        );
+        store
+            .release_failure_notice(&bob, kind, at(10_000))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .claim_failure_notice(&bob, kind, at(10_002), HOUR)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .claim_failure_notice(&bob, kind, at(10_003), HOUR)
+                .await
+                .unwrap()
+        );
     }
 }

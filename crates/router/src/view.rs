@@ -37,7 +37,7 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 /// 7. [`policy`] for `agent`.
 /// 8. [`link_state`] for the requester's member (the owner's, when the
 ///    requester is the owner), then, unless it is linked or broken,
-///    [`community_key_configured`].
+///    [`community_key_configured`], which is never read for the owner.
 ///
 /// # Missing answers
 ///
@@ -45,11 +45,16 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 /// and [`policy`] return `None` when the view doesn't have the answer, for
 /// example because the pipeline didn't preload it, and the router then
 /// refuses with [`RefuseReason::PolicyUnavailable`] instead of assuming the
-/// requester is allowed. A missing answer anywhere else can only withhold a
-/// turn: an unknown agent is ignored, an unknown mention or reply doesn't
-/// address the agent, and an unknown link or community key gives a link
-/// prompt. An unknown link state reads as [`LinkState::Unlinked`], which
-/// runs on the community key only when one is configured.
+/// requester is allowed. A missing answer elsewhere withholds a turn: an
+/// unknown agent is ignored, an unknown mention or reply doesn't address
+/// the agent, and an unknown community key gives a link prompt.
+///
+/// [`link_state`] is the exception: it has no "unknown", and a view without
+/// the answer reads as [`LinkState::Unlinked`], which runs a non-owner's
+/// turn on the community key when one is configured, even if their link
+/// broke. So a view must answer it for every member the router can ask
+/// about: the owner, the sender's member, and an attributed requester's
+/// member. agentd's `StoreView::load` preloads all of them.
 ///
 /// [`agent_owner`]: RouterView::agent_owner
 /// [`agent_state`]: RouterView::agent_state

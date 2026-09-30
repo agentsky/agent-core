@@ -30,7 +30,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentCreation, NewAgent, NewClaudeLink, Store, Visibility};
 use testkit::{
-    Call, FakeAnthropic, MockSurface, Turn, agentctl_path, fake_anthropic, fake_claude_path,
+    Call, FakeAnthropic, MockSurface, Op, Turn, agentctl_path, fake_anthropic, fake_claude_path,
 };
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
@@ -789,6 +789,29 @@ async fn a_usage_limit_or_refusal_names_whose_account_and_tells_only_the_request
     for (_, text) in stack.agents.posts() {
         assert!(!text.contains("alice") && !text.contains("owner"), "{text}");
     }
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_failure_message_that_fails_to_send_is_tried_again_on_the_next_failure() {
+    let stack = start(Duration::from_secs(86_400)).await;
+    stack.every_turn(Turn::api_error(429, "You've hit your usage limit."));
+    stack
+        .manager
+        .fail_next(Op::Post, SurfaceError::Transport("reset".into()));
+    let (text, _, _) = stack
+        .answer(stack.mention("bob", "GENERAL", "f1", None))
+        .await;
+    assert_eq!(text, USAGE_LIMIT_TEXT);
+    assert!(stack.dms_to("bob").is_empty());
+
+    let (text, _, _) = stack
+        .answer(stack.mention("bob", "GENERAL", "f2", Some("f1")))
+        .await;
+    assert_eq!(text, USAGE_LIMIT_TEXT);
+    let told = stack.dms_to("bob");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].contains("usage limit"), "{}", told[0]);
     stack.stop().await;
 }
 

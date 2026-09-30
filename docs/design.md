@@ -277,7 +277,7 @@ So a turn always runs on the credential of the person who caused it.
 | The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests runs without a consent card (see below) |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
 | A private task requested during a non-owner's turn | Owner's private sandbox | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
-| Unlinked member | Channel | Community API key if configured, otherwise a "link your account" reply | Public side only |
+| Unlinked member | Channel | Community API key if configured, otherwise a "link your account" DM from the manager bot | Public side only |
 | Agent to agent | Thread | The requester of the turn whose message mentioned the agent | Public side only, hop-capped |
 
 ### Agent-to-agent attribution
@@ -353,10 +353,10 @@ flowchart TD
     O -- yes --> OC["Owner credential,<br/>conversation's scope"]
     O -- no --> L{"Requester linked?"}
     L -- yes --> RQ["Requester credential,<br/>channel scope"]
-    L -- "broken" --> RL["Reply: link your account again"]
+    L -- "broken" --> RL["DM from the manager bot:<br/>link your account again"]
     L -- no --> K{"Community API key?"}
     K -- yes --> CK["Community key,<br/>channel scope"]
-    K -- no --> LK["Reply: link your account"]
+    K -- no --> LK["DM from the manager bot:<br/>link your account"]
 ```
 
 Response gating is deterministic: an explicit mention, a reply to the agent's
