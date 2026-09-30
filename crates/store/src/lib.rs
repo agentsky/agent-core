@@ -20,8 +20,9 @@
 //! [`pending_logins`](Store::put_pending_login),
 //! [`processed_events`](Store::mark_event_processed),
 //! [`ctl_tokens`](Store::put_ctl_token),
-//! [`scope_locks`](Store::acquire_scope_lock) and
-//! [`volumes`](Store::put_volume).
+//! [`scope_locks`](Store::acquire_scope_lock),
+//! [`volumes`](Store::put_volume) and
+//! [`slack_config_tokens`](Store::put_slack_config_token).
 
 #![warn(missing_docs)]
 
@@ -40,6 +41,7 @@ mod members;
 mod pending_logins;
 mod relink_notices;
 mod seal;
+mod slack_config_tokens;
 mod volumes;
 
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
@@ -48,6 +50,9 @@ pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
+pub use slack_config_tokens::{
+    NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
+};
 pub use volumes::Volume;
 
 use seal::Aad;
@@ -344,6 +349,7 @@ mod tests {
                 "pending_logins",
                 "processed_events",
                 "scope_locks",
+                "slack_config_tokens",
                 "surface_identities",
                 "volumes",
             ]

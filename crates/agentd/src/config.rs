@@ -26,7 +26,10 @@
 //!
 //! Every other `AGENTD_SLACK_MANAGER_*` secret requires
 //! [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
-//! so a misspelling of that name fails at startup too.
+//! so a misspelling of that name fails at startup too, and the signing
+//! secret requires
+//! [`AGENTD_SLACK_MANAGER_BOT_TOKEN`](SLACK_MANAGER_BOT_TOKEN_VAR): the
+//! manager app answers commands with it.
 //!
 //! The environment is passed in rather than read from the process, so tests
 //! supply their own (`std::env::set_var` is `unsafe` in edition 2024, and the
@@ -68,6 +71,12 @@ pub const SLACK_MANAGER_SIGNING_SECRET_VAR: &str = "AGENTD_SLACK_MANAGER_SIGNING
 /// The key of [`SLACK_MANAGER_SIGNING_SECRET_VAR`] in
 /// [`Secrets::slack_manager`].
 const SLACK_MANAGER_SIGNING_SECRET: &str = "signing_secret";
+/// The Slack manager app's bot token (`xoxb-…`), which answers commands and
+/// sends the manager's DMs. Required with
+/// [`SLACK_MANAGER_SIGNING_SECRET_VAR`], and the other way round.
+pub const SLACK_MANAGER_BOT_TOKEN_VAR: &str = "AGENTD_SLACK_MANAGER_BOT_TOKEN";
+/// The key of [`SLACK_MANAGER_BOT_TOKEN_VAR`] in [`Secrets::slack_manager`].
+const SLACK_MANAGER_BOT_TOKEN: &str = "bot_token";
 /// The prefix of every variable agentd reads. Unknown ones are sorted as the
 /// [module docs](self) describe.
 const ENV_PREFIX: &str = "AGENTD_";
@@ -83,6 +92,8 @@ pub const MAX_DRAIN_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_LOG_FILTER: &str = "info";
 /// The default for `limits.attach_max_bytes`: 50 MiB.
 pub const DEFAULT_ATTACH_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// The default for `slack.api_url`.
+pub const DEFAULT_SLACK_API_URL: &str = surface_slack::web::DEFAULT_BASE_URL;
 
 /// agentd's configuration, validated.
 #[derive(Debug)]
@@ -102,6 +113,10 @@ pub struct Config {
     /// `[rocketchat]`: the Rocket.Chat server and its manager bot, if agentd
     /// serves Rocket.Chat.
     pub rocketchat: Option<RocketChatConfig>,
+    /// `[slack]`: where the Slack Web API is. Every key has a default, so
+    /// the section is optional. agentd serves Slack when the manager app's
+    /// secrets are set.
+    pub slack: SlackConfig,
     /// Secrets from the environment.
     pub secrets: Secrets,
     /// Unknown `AGENTD_` variables that were ignored, by name, sorted.
@@ -121,6 +136,8 @@ struct File {
     #[serde(default)]
     claude_oauth: OAuthConfig,
     rocketchat: Option<RocketChatConfig>,
+    #[serde(default)]
+    slack: SlackConfig,
 }
 
 /// `[server]`.
@@ -204,6 +221,26 @@ pub struct RocketChatConfig {
     pub manager_user_id: String,
 }
 
+/// `[slack]`. Every key has a default, so the section is optional. The
+/// manager app's secrets come from
+/// [`AGENTD_SLACK_MANAGER_*`](SLACK_MANAGER_PREFIX).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct SlackConfig {
+    /// `api_url`: the Web API's base URL, [`DEFAULT_SLACK_API_URL`] unless
+    /// a test points it at a fake.
+    pub api_url: String,
+}
+
+impl Default for SlackConfig {
+    fn default() -> Self {
+        Self {
+            api_url: DEFAULT_SLACK_API_URL.to_owned(),
+        }
+    }
+}
+
 /// `[limits]`. Every key has a default, so the section is optional.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -240,6 +277,12 @@ impl Secrets {
     /// if set.
     pub fn slack_manager_signing_secret(&self) -> Option<&SecretString> {
         self.slack_manager.get(SLACK_MANAGER_SIGNING_SECRET)
+    }
+
+    /// [`AGENTD_SLACK_MANAGER_BOT_TOKEN`](SLACK_MANAGER_BOT_TOKEN_VAR), if
+    /// set. It is set exactly when the signing secret is.
+    pub fn slack_manager_bot_token(&self) -> Option<&SecretString> {
+        self.slack_manager.get(SLACK_MANAGER_BOT_TOKEN)
     }
 }
 
@@ -340,6 +383,7 @@ impl Config {
             limits: file.limits,
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
+            slack: file.slack,
             secrets,
             unknown_env,
         })
@@ -491,6 +535,12 @@ impl File {
         if let Some(rocketchat) = &self.rocketchat {
             rocketchat.validate()?;
         }
+        surface_slack::SlackClient::new(&self.slack.api_url).map_err(|_| {
+            invalid(
+                "slack.api_url",
+                "must be an http:// or https:// URL without user info, query or fragment",
+            )
+        })?;
         Ok(())
     }
 }
@@ -590,6 +640,15 @@ impl Secrets {
                 format!(
                     "is not set, but other {SLACK_MANAGER_PREFIX}* variables are; the manager \
                      app's requests can't be verified without it (is one of them misspelled?)"
+                ),
+            ));
+        }
+        if !slack_manager.is_empty() && !slack_manager.contains_key(SLACK_MANAGER_BOT_TOKEN) {
+            return Err(invalid(
+                SLACK_MANAGER_BOT_TOKEN_VAR,
+                format!(
+                    "is not set, but {SLACK_MANAGER_SIGNING_SECRET_VAR} is; the manager app \
+                     answers commands with its bot token (is it misspelled?)"
                 ),
             ));
         }
@@ -776,6 +835,10 @@ data_dir = "/nonexistent/agentd"
             "AGENTD_SLACK_MANAGER_CLIENT_SECRET".to_owned(),
             "cli-value".to_owned(),
         ));
+        env.push((
+            SLACK_MANAGER_BOT_TOKEN_VAR.to_owned(),
+            "bot-value".to_owned(),
+        ));
         let config = with(MINIMAL, env).unwrap();
         assert_eq!(
             config
@@ -795,12 +858,13 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(
             slack,
             [
+                ("bot_token", "bot-value"),
                 ("client_secret", "cli-value"),
                 ("signing_secret", "sig-value")
             ]
         );
         let debug = format!("{config:?}");
-        for secret in ["rc-token", "sig-value", "cli-value"] {
+        for secret in ["rc-token", "sig-value", "cli-value", "bot-value"] {
             assert!(!debug.contains(secret), "{debug}");
         }
     }
@@ -890,16 +954,26 @@ manager_user_id = "manager-id"
         assert_eq!(err.key(), Some("claude_oauth.bogus"), "{err}");
     }
 
-    #[test]
-    fn the_slack_manager_signing_secret_is_read_by_name() {
-        let config = with(MINIMAL, env()).unwrap();
-        assert!(config.secrets.slack_manager_signing_secret().is_none());
+    /// The environment with both Slack manager secrets.
+    fn with_slack_manager() -> Vec<(String, String)> {
         let mut env = env();
         env.push((
             SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
             "sig-value".to_owned(),
         ));
-        let config = with(MINIMAL, env).unwrap();
+        env.push((
+            SLACK_MANAGER_BOT_TOKEN_VAR.to_owned(),
+            "bot-value".to_owned(),
+        ));
+        env
+    }
+
+    #[test]
+    fn the_slack_manager_secrets_are_read_by_name() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert!(config.secrets.slack_manager_signing_secret().is_none());
+        assert!(config.secrets.slack_manager_bot_token().is_none());
+        let config = with(MINIMAL, with_slack_manager()).unwrap();
         assert_eq!(
             config
                 .secrets
@@ -907,6 +981,50 @@ manager_user_id = "manager-id"
                 .map(ExposeSecret::expose_secret),
             Some("sig-value")
         );
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_bot_token()
+                .map(ExposeSecret::expose_secret),
+            Some("bot-value")
+        );
+    }
+
+    #[test]
+    fn the_signing_secret_needs_the_bot_token() {
+        for name in [
+            SLACK_MANAGER_SIGNING_SECRET_VAR,
+            "AGENTD_SLACK_MANAGER_BOT_TOKN",
+        ] {
+            let mut extra = vec![(SLACK_MANAGER_SIGNING_SECRET_VAR, "sig-value")];
+            if name != SLACK_MANAGER_SIGNING_SECRET_VAR {
+                extra.push((name, "bot-value"));
+            }
+            let err = env_err(&extra);
+            assert_eq!(err.key(), Some(SLACK_MANAGER_BOT_TOKEN_VAR), "{err}");
+            assert!(err.to_string().contains("misspelled"), "{err}");
+            assert!(!err.to_string().contains("value"), "{err}");
+        }
+    }
+
+    #[test]
+    fn slack_api_url_defaults_and_is_checked() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert_eq!(config.slack.api_url, "https://slack.com/api/");
+        let text = format!("{MINIMAL}\n[slack]\napi_url = \"http://127.0.0.1:9/api/\"\n");
+        let config = with(&text, env()).unwrap();
+        assert_eq!(config.slack.api_url, "http://127.0.0.1:9/api/");
+        for bad in [
+            "ftp://slack.com/api/",
+            "https://slack.com/api/?x=1",
+            "not a url",
+        ] {
+            let text = format!("{MINIMAL}\n[slack]\napi_url = \"{bad}\"\n");
+            let err = with(&text, env()).unwrap_err();
+            assert_eq!(err.key(), Some("slack.api_url"), "{err}");
+        }
+        let err = file_err(&format!("{MINIMAL}\n[slack]\nbogus = 1\n"));
+        assert!(err.key().unwrap().starts_with("slack"), "{err}");
     }
 
     #[test]
@@ -1246,6 +1364,10 @@ manager_user_id = "manager-id"
         env.push((
             SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
             "inner space is kept".to_owned(),
+        ));
+        env.push((
+            SLACK_MANAGER_BOT_TOKEN_VAR.to_owned(),
+            "bot-value".to_owned(),
         ));
         let config = with(MINIMAL, env).unwrap();
         assert_eq!(

@@ -43,6 +43,7 @@ uuid.workspace = true
 [dev-dependencies]
 futures.workspace = true
 log.workspace = true
+serde_norway.workspace = true
 testkit.workspace = true
 tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true

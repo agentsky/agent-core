@@ -42,8 +42,10 @@ use tokio::task::{JoinError, JoinSet};
 use tower::Service as _;
 
 use crate::app::App;
+use crate::commands::intake::{CommandIntake, CommandSubmitter};
 use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
-use crate::commands::rocketchat::{self, CommandIntake};
+use crate::commands::rocketchat::{self, CommandFeed};
+use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
@@ -63,27 +65,39 @@ pub struct Routers {
     /// Tasks that run as long as the listeners, such as the queue the Slack
     /// routes fill.
     pub workers: Vec<Worker>,
+    /// The intake that runs every surface's commands. The Slack queue holds
+    /// a submitter into it.
+    pub intake: CommandIntake,
+    /// A submitter into [`intake`](Self::intake), for the Rocket.Chat
+    /// manager bot's connection. [`Server::run`] holds it until shutdown,
+    /// so the intake runs as long as the listeners.
+    pub commands: CommandSubmitter,
 }
 
 impl Routers {
     /// The routes agentd serves: `/healthz` and the Slack request URLs on
-    /// the public listener, with the Slack queue as a worker, and the
-    /// agentctl API on the ctl listener. The proxy listener answers
-    /// everything with 404 until the credential proxy is added.
+    /// the public listener, with the Slack queue as a worker handing
+    /// commands to the command intake, and the agentctl API on the ctl
+    /// listener. The proxy listener answers everything with 404 until the
+    /// credential proxy is added.
     pub fn new(app: &App) -> Self {
         let (slack_routes, slack_queue) = slack::routes(app);
+        let (intake, commands) = CommandIntake::new(app.commands().clone());
+        let inbound = slack::Inbound::new(
+            app.store().clone(),
+            app.slack().map(|slack| slack.identity().clone()),
+            commands.clone(),
+        );
         Self {
             public: public_router(app.clone()).merge(slack_routes),
             proxy: Router::new(),
             ctl: app.ctl().router(),
             workers: vec![Worker::new(
                 "Slack queue",
-                slack::run_queue(
-                    slack_queue,
-                    app.store().clone(),
-                    Sender::new(slack::Unrouted),
-                ),
+                slack::run_queue(slack_queue, app.store().clone(), Sender::new(inbound)),
             )],
+            intake,
+            commands,
         }
     }
 }
@@ -209,10 +223,11 @@ impl Server {
     /// 3. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
-    /// routers' [`Worker`]s, the relink notifier and, with `[rocketchat]`,
-    /// the manager bot's connection, which feeds the commands it hears to
-    /// the [`CommandIntake`]. The intake finishes the commands it received
-    /// once the connection stops.
+    /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
+    /// with the Slack manager app the configuration token rotator, and with
+    /// `[rocketchat]` the manager bot's connection, which feeds the
+    /// commands it hears to the intake like the Slack queue does. The
+    /// intake finishes the commands it received once both stop.
     ///
     /// # Errors
     ///
@@ -272,13 +287,27 @@ impl Server {
             notifier.run(wake, RELINK_SWEEP_INTERVAL, notifying).await;
             "relink notifier"
         });
-        if let Some(manager) = app.rocketchat() {
-            let (intake, feed) =
-                CommandIntake::new(app.commands().clone(), manager.binding.clone());
+        let intake = routers.intake;
+        tasks.spawn(async move {
+            intake.run().await;
+            "command intake"
+        });
+        let commands = routers.commands;
+        let holding = stopping.clone();
+        if let Some(slack) = app.slack() {
+            let rotator = ConfigTokenRotator::new(
+                app.store().clone(),
+                slack.client().clone(),
+                app.commands().replies().clone(),
+            );
+            let rotating = stopping.clone();
             tasks.spawn(async move {
-                intake.run().await;
-                "Rocket.Chat command intake"
+                rotator.run(ROTATION_INTERVAL, rotating).await;
+                "Slack configuration token rotator"
             });
+        }
+        if let Some(manager) = app.rocketchat() {
+            let feed = CommandFeed::new(commands.clone(), manager.binding.clone());
             let connection = rocketchat::listen(
                 manager.surface.clone(),
                 manager.binding.clone(),
@@ -292,6 +321,11 @@ impl Server {
                 "Rocket.Chat manager bot's connection"
             });
         }
+        tasks.spawn(async move {
+            stopped(holding).await;
+            drop(commands);
+            "command submitter"
+        });
         tracing::info!(
             public = %addrs.public,
             proxy = %addrs.proxy,

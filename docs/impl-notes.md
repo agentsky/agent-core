@@ -3810,3 +3810,175 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
 - `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
+
+## T30: Slack manager app and configuration token
+
+Slack's documentation site wasn't reachable, so the shapes below were read
+from Slack's SDKs: `tooling.tokens.rotate` from `slackapi/python-slack-sdk`
+(`slack_sdk/web/client.py`, which sends `refresh_token` as a form field) and
+`slackapi/java-slack-sdk` (`ToolingTokensRotateResponse`, `RequestFormBuilder`,
+`MethodsRateLimits`), and the manifest's keys from the Java SDK's
+`AppManifest`. None of it has run against real Slack yet.
+
+### One agentd serves one workspace
+
+**Issue.** The plan says to install the manager app "once per workspace",
+but its secrets are configuration: one signing secret, one bot token, and the
+fixed binding `manager`. Nothing in the plan said which workspace that is,
+and identities and replies need its team id.
+
+**Solution.** agentd serves the workspace the bot token belongs to. The
+signing secret now requires `AGENTD_SLACK_MANAGER_BOT_TOKEN` and the other
+way round, and `App::open` asks Slack who the token is before serving:
+`auth.test` gives the team, the bot user and the bot, and `bots.info` on the
+bot gives the app's id and name (T29's note said `auth.test` names no app).
+If Slack refuses or can't be reached, agentd doesn't start; the error names
+the variable, never the token. A new, optional `[slack]` section has one key,
+`api_url`, so tests can point agentd at a fake Web API. The ingress now keeps
+channel messages that mention the manager's bot user, which no longer
+matters to the manager app itself, since it subscribes only to `message.im`.
+
+### A configuration token is checked by rotating it
+
+**Issue.** The plan offers two checks, `auth.test` with the configuration
+token or `tooling.tokens.rotate` at once. Whether `auth.test` accepts a
+configuration token isn't in the SDKs, and it wouldn't show that the
+refresh token works.
+
+**Solution.** `/agent slack-token` rotates at once with the refresh token,
+which proves it works and returns a fresh pair valid for 12 hours, and stores
+that pair; the token the member typed is never used or stored. The call
+sends no `Authorization` header and the refresh token only in the form body.
+The answer's `team_id` and `user_id` must be the sender's own workspace and
+user, since agentd would otherwise create apps as someone else or in another
+workspace. A mismatch has already used up the refresh token, so the reply
+says to generate a new one. Only a linked member on Slack may register a
+token. `ConfigToken` and the store's token types keep both tokens as
+`SecretString`, and a captured-log test at `trace` finds neither, nor the
+`response_url`.
+
+`tooling.tokens.rotate` is Tier 1 in the Java SDK ("special" per its own
+comment). The limiter's new `Tier1` allows 5 calls a minute per bucket, and
+a rotation's bucket is keyed by its refresh token, which is single use, so
+the limiter never delays two different tokens.
+
+### Rotation is leased and versioned
+
+**Issue.** Refresh tokens are single use. Two instances rotating the same
+token would leave one with a refused refresh token, and a rotation finishing
+after the member registered a new token would overwrite it with the old
+grant's successor, as a stale Claude refresh could (T09).
+
+**Solution.** `slack_config_tokens` has the plan's columns plus `version`,
+`updated_at`, `lease_until`, `broken_at`, `notified_at` and
+`notice_attempts`. Every write of the tokens sets a new random `version`,
+and every call that acts on a row read earlier takes the version it read
+(`SlackConfigTokenRef`), so it changes nothing once the member registered
+again. A random value rather than a counter, because a counter per row
+starts over when the row is deleted and stored again. The rotator claims a
+due token with a conditional `UPDATE` that sets a 5-minute lease
+(`ROTATION_LEASE`), rotates, and stores the new pair, which ends the lease.
+A process that dies after Slack rotated but before the store was updated
+loses the new pair; the next rotation is refused, and the member is told to
+register a new token. The encrypted columns' associated data is the row's
+`member_id:team_id`.
+
+### Which failures a member hears about
+
+**Issue.** The plan says the rotation loop "DMs the member on failure". Most
+failures (a timeout, a 5xx, a rate limit) say nothing about the token, and a
+DM for each would come every few minutes.
+
+**Solution.** Only a refused refresh token breaks the token:
+`invalid_refresh_token`, which now maps to `SurfaceError::Unauthorized`, or
+any other code that does. The row is marked broken, and its member is owed
+one DM from the manager app, claimed with a 10-minute lease
+(`NOTICE_LEASE`) and tried at most 20 times, like the relink notice; a
+member no manager bot reaches waits unclaimed. Any other failure keeps the
+claim's lease, so the token is tried again when it ends, well within the
+2 hours it still has. `/agent me` shows whether the token is registered,
+renewed automatically, or refused.
+
+### One command intake for every surface
+
+**Issue.** T13's `CommandIntake` took commands only from Rocket.Chat events,
+through a `CommandFeed` that knew the Rocket.Chat manager's binding, and
+`Server::run` built it only with `[rocketchat]`. Slack's commands come from
+the Slack queue, which `Routers::new` builds before `run`.
+
+**Solution.** `commands::intake::CommandIntake` takes `(member, text,
+origin)` through a `CommandSubmitter`, keeping T13's ordering per member and
+its drain at shutdown. `CommandFeed::new(submitter, binding)` is the
+Rocket.Chat side. `Routers` carries the intake and one submitter; the Slack
+queue's `slack::Inbound` sink holds another. `Server::run` runs the intake
+always, hands the submitter to the Rocket.Chat connection, and drops its own
+copy when shutdown starts, so the intake finishes what it received once the
+queue and the connection stop. `slack::Unrouted` is gone: `Inbound` passes
+the manager's slash commands and DMs to the intake, deletes the token of a
+member a `user_change` says was deleted, and drops everything else until
+T31 routes agents' messages.
+
+### Slack replies and entities
+
+- `Origin::SlackDm { channel }` is new: a DM to the manager app is private
+  and answered in the same DM, and replies there name commands bare
+  (`login <code>`), as on Rocket.Chat.
+- A slash command's reply is the rendered Markdown, each chunk sent to its
+  `response_url` with T29's `respond_ephemeral`. Slack accepts five
+  responses per URL; command replies are one chunk.
+- Notices (relink, broken token) open the manager's DM with
+  `conversations.open` (new in `WebApi::open_dm`, Tier 3, needs `im:write`),
+  so relink notices now reach Slack-only members too.
+- `surface_slack::normalize::unescape` decodes `&amp;`, `&lt;` and `&gt;`
+  in one pass. It is applied to command text only (slash commands and
+  manager DMs), before `commands::parse`, as T08's note expected. Message
+  text for turns stays escaped: decoding it would make a literal `<@U…>`
+  a member typed look like a mention token to anything that reads mentions
+  from text later.
+- A `user_change` deletes the token for the event's workspace only (the
+  envelope's `team_id`, or the user's own when the envelope has none), since
+  the member may still be in another workspace; `/agent logout` deletes the
+  member's tokens in every workspace. Neither revokes the token at Slack:
+  the SDKs have no revoke method for configuration tokens, and whether
+  `auth.revoke` accepts one is unverified.
+
+### Files in the manager DM wait for their handlers
+
+**Issue.** The plan says files attached to a manager DM feed `persona`
+(T14's upload rule) and `skill add` (T25), downloaded with the manager's bot
+token. Neither handler is in this stack yet; both commands answer "isn't
+available yet".
+
+**Solution.** T30 adds the download, `WebApi::download_file(file,
+max_bytes)`: it sends the bot token only to an `https` URL on `slack.com` or
+a subdomain (or the API URL's own origin, for tests), follows no redirects
+(Slack redirects a request it refuses to its sign-in page), checks the
+declared size and the `Content-Length` before reading, and stops reading
+past the limit. Passing the DM's files to the handlers is left to T14 and
+T25, whose plan text now says so.
+
+### The manager's events URL before its secret is set
+
+**Issue.** Slack verifies the events request URL when the app is created
+from the manifest, but agentd knows the `manager` binding only once
+`AGENTD_SLACK_MANAGER_SIGNING_SECRET` is set (T28), which Slack shows only
+after creation, so the first challenge gets 404.
+
+**Solution.** The README's install steps say to retry the verification
+under "Event Subscriptions" once agentd runs with the secrets. Whether
+Slack's "From a manifest" flow creates the app anyway and leaves the URL
+unverified, as expected, is part of the live check.
+
+### The manifest template
+
+`deploy/slack/manager-manifest.yaml` uses `${PUBLIC_URL}` as its only
+placeholder, which is a valid YAML plain scalar (a `{{…}}` placeholder would
+start a flow mapping) and fills in with `envsubst '$PUBLIC_URL'`. Besides
+the plan's scopes and events it turns the app home's messages tab on and
+its read-only mode off, or members couldn't DM the app, and sets
+`should_escape: true` on `/agent`, which delivers mentions as `<@U…|name>`
+tokens that T08's parser reads. agentd's image build context leaves out
+`deploy/`, so agentd doesn't embed the template; the tests read it with
+`include_str!` and parse it with `serde_norway` (MIT OR Apache-2.0, a
+maintained fork of the deprecated `serde_yaml`; with `unsafe-libyaml-norway`,
+MIT, it is a dev-dependency of agentd only).

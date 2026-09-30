@@ -19,11 +19,12 @@ use tokio::sync::watch;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use super::intake::CommandIntake;
 use super::relink::{
     RELINK_BACKOFF_INITIAL, RELINK_BACKOFF_MAX, RELINK_LEASE, RELINK_MAX_ATTEMPTS, RelinkNotifier,
     relink_notice,
 };
-use super::rocketchat::{CommandIntake, command_in, listen};
+use super::rocketchat::{CommandFeed, command_in, listen};
 use super::*;
 use crate::telemetry::tests::Captured;
 use crate::telemetry::{LogFormat, subscriber};
@@ -98,7 +99,12 @@ async fn harness() -> Harness {
         mock.clone(),
         Arc::new(Dms),
     ));
-    let commands = Commands::new(store.clone(), Arc::clone(&auth), Replies::new(Some(bot)));
+    let commands = Commands::new(
+        store.clone(),
+        Arc::clone(&auth),
+        Replies::new(Some(bot)),
+        None,
+    );
     Harness {
         store,
         auth,
@@ -225,7 +231,8 @@ fn serve(
     h: &Harness,
     stopping: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), SurfaceError>> {
-    let (intake, feed) = CommandIntake::new(h.commands.clone(), h.manager.clone());
+    let (intake, submitter) = CommandIntake::new(h.commands.clone());
+    let feed = CommandFeed::new(submitter, h.manager.clone());
     let connection = listen(
         h.mock.clone(),
         h.manager.clone(),
@@ -657,7 +664,7 @@ async fn the_intake_ignores_non_commands_and_stops_when_the_connection_ends() {
 }
 
 #[tokio::test]
-async fn slack_and_unknown_workspaces_have_no_private_replies_yet() {
+async fn without_the_slack_manager_app_slack_and_unknown_workspaces_get_no_replies() {
     let h = harness().await;
     let replies = h.commands.replies();
     let slack = MemberKey {
@@ -674,11 +681,15 @@ async fn slack_and_unknown_workspaces_have_no_private_replies_yet() {
         .reply_private(&slack, &origin, "hi")
         .await
         .unwrap_err();
-    assert!(matches!(err, ReplyError::SlackUnavailable), "{err}");
+    assert!(
+        matches!(err, ReplyError::NoManagerBot(SurfaceKind::Slack)),
+        "{err}"
+    );
     assert!(matches!(
         replies.dm(&slack, "hi").await,
-        Err(ReplyError::SlackUnavailable)
+        Err(ReplyError::NoManagerBot(SurfaceKind::Slack))
     ));
+    assert!(!replies.can_dm(&slack));
     let elsewhere = MemberKey {
         team: "other.example.org".into(),
         ..key("alice")

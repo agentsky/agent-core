@@ -13,10 +13,12 @@ use crate::commands::rocketchat::{RocketChatDms, StoreDedup};
 use crate::commands::{Commands, ManagerBot, Replies};
 use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
 use crate::ctl::{Ctl, CtlSettings, NoSurfaces, SurfaceLookup};
+use crate::slack::manager::SlackManager;
 
 /// The shared state: the configuration, the store, the agentctl API,
-/// account linking, command dispatch and the Rocket.Chat manager bot, and
-/// later the agents' surfaces, the runner and the credential proxy.
+/// account linking, command dispatch and the manager bots of Rocket.Chat and
+/// Slack, and later the agents' surfaces, the runner and the credential
+/// proxy.
 ///
 /// Cloning is cheap: every clone shares the same state. Axum handlers take it
 /// as their state.
@@ -28,6 +30,7 @@ pub struct App {
     auth: Arc<Auth>,
     commands: Commands,
     rocketchat: Option<RocketChatManager>,
+    slack: Option<SlackManager>,
 }
 
 /// The Rocket.Chat manager bot: its surface and the binding it listens as.
@@ -45,18 +48,19 @@ pub struct RocketChatManager {
 }
 
 impl App {
-    /// An `App` over an already open `store`, with no surfaces for
-    /// `agentctl history` yet.
+    /// An `App` over an already open `store`, with the Slack manager app
+    /// `slack` if agentd serves Slack (see [`SlackManager::from_config`]),
+    /// and no surfaces for `agentctl history` yet.
     ///
     /// # Errors
     ///
     /// If the HTTP clients for Claude or Rocket.Chat can't be built.
-    pub fn new(config: Config, store: Store) -> anyhow::Result<Self> {
-        Self::with_surfaces(config, store, Arc::new(NoSurfaces))
+    pub fn new(config: Config, store: Store, slack: Option<SlackManager>) -> anyhow::Result<Self> {
+        Self::with_surfaces(config, store, slack, Arc::new(NoSurfaces))
     }
 
-    /// An `App` over an already open `store`, whose agentctl API finds
-    /// surfaces through `surfaces`.
+    /// An `App` over an already open `store`, with the Slack manager app
+    /// `slack`, whose agentctl API finds surfaces through `surfaces`.
     ///
     /// # Errors
     ///
@@ -64,6 +68,7 @@ impl App {
     pub fn with_surfaces(
         config: Config,
         store: Store,
+        slack: Option<SlackManager>,
         surfaces: Arc<dyn SurfaceLookup>,
     ) -> anyhow::Result<Self> {
         let ctl = Ctl::new(store.clone(), CtlSettings::from_config(&config), surfaces);
@@ -72,8 +77,11 @@ impl App {
                 .context("setting up Claude account linking")?,
         );
         let rocketchat = rocketchat_manager(&config, &store)?;
-        let replies = Replies::new(rocketchat.as_ref().map(|(_, bot)| Arc::clone(bot)));
-        let commands = Commands::new(store.clone(), Arc::clone(&auth), replies);
+        let mut replies = Replies::new(rocketchat.as_ref().map(|(_, bot)| Arc::clone(bot)));
+        if let Some(slack) = &slack {
+            replies = replies.with_slack(Arc::new(slack.manager_bot()), slack.client().clone());
+        }
+        let commands = Commands::new(store.clone(), Arc::clone(&auth), replies, slack.clone());
         Ok(Self {
             config: Arc::new(config),
             store,
@@ -81,20 +89,23 @@ impl App {
             auth,
             commands,
             rocketchat: rocketchat.map(|(manager, _)| manager),
+            slack,
         })
     }
 
     /// Opens the store at `store.url` with the master key, running pending
-    /// migrations, builds the `App`, and deletes every agentctl token,
-    /// scope lock and staged attachment left from before (see
-    /// [`Ctl::purge`]).
+    /// migrations, asks Slack who the manager app is if agentd serves Slack,
+    /// builds the `App`, and deletes every agentctl token, scope lock and
+    /// staged attachment left from before (see [`Ctl::purge`]).
     ///
     /// # Errors
     ///
-    /// If the store can't be opened or migrated, or the purge fails.
+    /// If the store can't be opened or migrated, Slack can't tell who the
+    /// manager app is, or the purge fails.
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let store = open_store(&config).await?;
-        let app = Self::new(config, store)?;
+        let slack = SlackManager::from_config(&config).await?;
+        let app = Self::new(config, store, slack)?;
         let purged = app
             .ctl
             .purge()
@@ -136,6 +147,11 @@ impl App {
     /// The Rocket.Chat manager bot, if agentd serves Rocket.Chat.
     pub fn rocketchat(&self) -> Option<&RocketChatManager> {
         self.rocketchat.as_ref()
+    }
+
+    /// The Slack manager app, if agentd serves Slack.
+    pub fn slack(&self) -> Option<&SlackManager> {
+        self.slack.as_ref()
     }
 }
 

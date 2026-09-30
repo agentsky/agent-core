@@ -19,6 +19,11 @@
 #                              /interactivity and /commands; without it those
 #                              URLs answer 404. Every other
 #                              AGENTD_SLACK_MANAGER_* variable requires it.
+#                              AGENTD_SLACK_MANAGER_BOT_TOKEN, the app's bot
+#                              token (xoxb-...), is required with it: the
+#                              manager answers commands with it, and agentd
+#                              asks Slack at startup which workspace it
+#                              belongs to.
 #
 # A variable whose name is a near miss of one of these (within two edits of
 # AGENTD_MASTER_KEY or AGENTD_RC_MANAGER_TOKEN, or starting within two edits of
@@ -109,3 +114,11 @@ team = "chat.example.com"
 # The manager account's user _id (Administration > Users, or `me` in the
 # REST API with its token).
 manager_user_id = "aBcD1234eFgH5678"
+
+# The Slack Web API. agentd serves Slack when the manager app's secrets
+# (AGENTD_SLACK_MANAGER_SIGNING_SECRET and AGENTD_SLACK_MANAGER_BOT_TOKEN) are
+# set; README.md says how to create the app from
+# deploy/slack/manager-manifest.yaml. The section is optional.
+[slack]
+# The Web API's base URL. Change it only to point tests at a fake.
+api_url = "https://slack.com/api/"

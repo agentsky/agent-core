@@ -5,9 +5,15 @@
 //! [`commands::parse`] and runs it. The reply always goes privately to the
 //! member through [`Replies::reply_private`], wherever the command came from.
 //!
+//! - [`intake`]: runs the commands every surface hears, one member's in
+//!   order.
 //! - [`rocketchat`]: which Rocket.Chat messages are commands. A DM to the
 //!   manager bot is a command as a whole; a message elsewhere is one when it
 //!   starts with `!agent`.
+//! - [`slack`]: which Slack requests are commands: `/agent`, and a DM to
+//!   the manager app as a whole.
+//! - [`slack_tokens`]: members' Slack app configuration tokens, which
+//!   `/agent slack-token` registers and a background loop renews.
 //! - [`relink`]: the notice a member gets, once, when their Claude link
 //!   breaks.
 //! - [`reply`]: private replies through each surface's manager bot.
@@ -23,10 +29,15 @@
 //! secret-bearing gets the same treatment. Commands are logged by name only,
 //! never with their text or arguments.
 
+pub mod intake;
 pub mod relink;
 pub mod reply;
 pub mod rocketchat;
+pub mod slack;
+pub mod slack_tokens;
 
+#[cfg(test)]
+mod slack_tests;
 #[cfg(test)]
 mod tests;
 
@@ -40,17 +51,24 @@ use secrecy::SecretString;
 use store::{Store, StoreError};
 use time::OffsetDateTime;
 
+use crate::slack::manager::SlackManager;
+
 pub use reply::{ManagerBot, OpenDm, Replies, ReplyError};
 
 /// Where a command came from. It decides where the reply goes and whether
 /// the command may carry a secret.
 pub enum Origin {
     /// A Slack slash command. Its text isn't posted to the channel, so it
-    /// is private. The reply goes to `response_url` (T30).
+    /// is private. The reply goes to `response_url`.
     SlackSlash {
         /// Where Slack takes the ephemeral reply. Anyone holding it can post
         /// there for a while, so it is kept secret.
         response_url: SecretString,
+    },
+    /// A direct message with the Slack manager app, in `channel`.
+    SlackDm {
+        /// The DM's channel.
+        channel: ConversationId,
     },
     /// A direct message with the Rocket.Chat manager bot, in `room`.
     RocketChatDm {
@@ -69,6 +87,9 @@ impl fmt::Debug for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SlackSlash { .. } => f.write_str("SlackSlash"),
+            Self::SlackDm { channel } => {
+                f.debug_struct("SlackDm").field("channel", channel).finish()
+            }
             Self::RocketChatDm { room } => {
                 f.debug_struct("RocketChatDm").field("room", room).finish()
             }
@@ -90,17 +111,20 @@ impl Origin {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SlackSlash { .. } => "slack_slash",
+            Self::SlackDm { .. } => "slack_dm",
             Self::RocketChatDm { .. } => "rocketchat_dm",
             Self::RocketChatChannel { .. } => "rocketchat_channel",
         }
     }
 
     /// How the member types `command` where their reply lands: after
-    /// `/agent` on Slack, bare in the manager bot's DM on Rocket.Chat.
+    /// `/agent` in a Slack slash command, bare in the manager bot's DM.
     fn command(&self, command: &str) -> String {
         match self {
             Self::SlackSlash { .. } => format!("`/agent {command}`"),
-            Self::RocketChatDm { .. } | Self::RocketChatChannel { .. } => format!("`{command}`"),
+            Self::SlackDm { .. } | Self::RocketChatDm { .. } | Self::RocketChatChannel { .. } => {
+                format!("`{command}`")
+            }
         }
     }
 
@@ -108,7 +132,7 @@ impl Origin {
     fn private_place(&self) -> &'static str {
         match self {
             Self::SlackSlash { .. } => "with the `/agent` command, which no one else sees",
-            Self::RocketChatDm { .. } | Self::RocketChatChannel { .. } => {
+            Self::SlackDm { .. } | Self::RocketChatDm { .. } | Self::RocketChatChannel { .. } => {
                 "here, in this direct message"
             }
         }
@@ -131,6 +155,7 @@ struct Inner {
     store: Store,
     auth: Arc<Auth>,
     replies: Replies,
+    slack: Option<SlackManager>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -147,13 +172,20 @@ fn now() -> OffsetDateTime {
 }
 
 impl Commands {
-    /// Commands over `store` and `auth`, replying through `replies`.
-    pub fn new(store: Store, auth: Arc<Auth>, replies: Replies) -> Self {
+    /// Commands over `store` and `auth`, replying through `replies`, with
+    /// the Slack manager app `slack` if agentd serves Slack.
+    pub fn new(
+        store: Store,
+        auth: Arc<Auth>,
+        replies: Replies,
+        slack: Option<SlackManager>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 auth,
                 replies,
+                slack,
             }),
         }
     }
@@ -213,6 +245,9 @@ impl Commands {
                 }
                 Command::Logout => self.logout(member, origin).await,
                 Command::Me => self.me(member, origin).await,
+                Command::SlackToken { refresh, .. } => {
+                    self.slack_token(member, &refresh, origin).await
+                }
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         };
@@ -281,21 +316,32 @@ impl Commands {
     }
 
     async fn logout(&self, key: &MemberKey, origin: &Origin) -> Result<String, Failure> {
-        let unlinked = match self.member(key).await? {
+        let (unlinked, tokens) = match self.member(key).await? {
             Some(member) => {
                 self.inner.store.invalidate_pending_logins(member).await?;
-                self.inner.auth.logout(member).await?
+                let tokens = self.inner.store.delete_slack_config_tokens(member).await?;
+                if tokens > 0 {
+                    tracing::info!(%member, tokens, "deleted Slack configuration tokens at logout");
+                }
+                (self.inner.auth.logout(member).await?, tokens)
             }
-            None => false,
+            None => (false, 0),
         };
-        Ok(if unlinked {
+        let mut reply = if unlinked {
             format!(
                 "Your Claude account is unlinked. Send {} to link one again.",
                 origin.command("login")
             )
         } else {
             "No Claude account is linked.".to_owned()
-        })
+        };
+        if tokens > 0 {
+            reply.push_str(
+                " I also deleted your Slack configuration token, so I can no longer create or \
+                 change apps as you.",
+            );
+        }
+        Ok(reply)
     }
 
     async fn me(&self, key: &MemberKey, origin: &Origin) -> Result<String, Failure> {
@@ -304,7 +350,7 @@ impl Commands {
             None => LinkStatus::default(),
         };
         let login = origin.command("login");
-        Ok(match status {
+        let mut reply = match status {
             LinkStatus { linked: false, .. } => {
                 format!("Claude account: not linked. Send {login} to link one.")
             }
@@ -315,7 +361,23 @@ impl Commands {
                 Some(plan) => format!("Claude account: linked. Plan: {}.", plan_name(&plan)),
                 None => "Claude account: linked. Plan: unknown.".to_owned(),
             },
-        })
+        };
+        if key.surface == SurfaceKind::Slack
+            && let Some(slack) = &self.inner.slack
+        {
+            reply.push('\n');
+            reply.push_str(&self.slack_token_status(key, origin).await?);
+            let manager = slack.identity();
+            let name = manager.app_name.as_deref().unwrap_or("(no name)");
+            reply.push_str(&format!(
+                "\nCommands here are answered by the Slack app `{}` (`{}`). If `/agent` ever \
+                 answers as another app, that app has taken the command over: don't send it \
+                 codes or tokens, and tell your workspace admins.",
+                name.replace('`', ""),
+                manager.app_id.replace('`', ""),
+            ));
+        }
+        Ok(reply)
     }
 
     /// The reply to a secret-bearing `command` sent where others can read
