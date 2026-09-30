@@ -1189,6 +1189,63 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
 }
 
 #[tokio::test]
+async fn one_agents_flood_leaves_the_other_agents_their_places() {
+    let stack = start_with(Setup {
+        pipeline: |settings| {
+            settings.max_pending = 4;
+            settings.max_pending_per_agent = 2;
+        },
+        ..Setup::default()
+    })
+    .await;
+    stack.other_agent("writer", "UWRITER").await;
+    stack.next_turn(Turn::reply("Done.").with_delay(Duration::from_millis(500)));
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    for id in ["f1", "f2", "f3", "f4", "f5"] {
+        sink.send(stack.event("bob", "GENERAL", ConvKind::Channel, id, None, &[BOT]))
+            .await
+            .unwrap();
+    }
+    sink.send(stack.event(
+        "bob",
+        "GENERAL",
+        ConvKind::Channel,
+        "w1",
+        None,
+        &["UWRITER"],
+    ))
+    .await
+    .unwrap();
+    wait_until(
+        "the flood's busy lines and the three turns are posted",
+        || {
+            let posts = stack.mock.posts();
+            posts.iter().filter(|(_, text)| text == "Done.").count() == 3
+                && posts
+                    .iter()
+                    .filter(|(_, text)| text.starts_with("helper is busy"))
+                    .count()
+                    == 3
+        },
+    )
+    .await;
+    let posts = stack.mock.posts();
+    assert!(
+        posts
+            .iter()
+            .any(|(to, text)| *to == in_thread("GENERAL", Some("w1")) && text == "Done."),
+        "writer answered: {posts:#?}"
+    );
+    assert!(
+        !posts
+            .iter()
+            .any(|(_, text)| text.starts_with("writer is busy")),
+        "{posts:#?}"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its_thread_told() {
     let stack = start_with(Setup {
         drain_timeout_secs: 1,

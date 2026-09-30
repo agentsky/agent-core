@@ -147,6 +147,20 @@ impl Limiter {
         }
     }
 
+    /// Counts one call in `bucket` under `tier` if it may be made now.
+    ///
+    /// # Errors
+    ///
+    /// When the tier's quota is used up or a 429 blocked the bucket,
+    /// returns how long until it frees up, without waiting.
+    pub(crate) fn try_now(&self, bucket: &Bucket, tier: Tier) -> Result<(), Duration> {
+        let now = Instant::now();
+        match self.try_acquire(bucket, tier, now) {
+            None => Ok(()),
+            Some(Wait::Quota(until) | Wait::Blocked(until)) => Err(until - now),
+        }
+    }
+
     /// Counts a call and returns `None` if `bucket` has quota left at `now`,
     /// or else says until when to wait.
     fn try_acquire(&self, bucket: &Bucket, tier: Tier, now: Instant) -> Option<Wait> {
@@ -301,6 +315,30 @@ mod tests {
         assert_eq!(Instant::now(), start);
         limiter.acquire(&key, Tier::Tier2, max).await.unwrap();
         assert_eq!(Instant::now(), start + WINDOW);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn try_now_never_waits() {
+        let limiter = Limiter::default();
+        let key = bucket("bots.info", None);
+        let start = Instant::now();
+        for _ in 0..Tier::Tier3.per_minute() {
+            limiter.try_now(&key, Tier::Tier3).unwrap();
+        }
+        assert_eq!(limiter.try_now(&key, Tier::Tier3), Err(WINDOW));
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(
+            limiter.try_now(&key, Tier::Tier3),
+            Err(start + WINDOW - Instant::now())
+        );
+        tokio::time::advance(Duration::from_secs(40)).await;
+        limiter.try_now(&key, Tier::Tier3).unwrap();
+        let other = bucket("users.info", None);
+        limiter.block(&other, Instant::now() + Duration::from_secs(5));
+        assert_eq!(
+            limiter.try_now(&other, Tier::Tier4),
+            Err(Duration::from_secs(5))
+        );
     }
 
     #[tokio::test(start_paused = true)]

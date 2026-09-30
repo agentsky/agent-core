@@ -169,11 +169,11 @@ sends an admin a request instead, and agentd reminds the member once if the
 app still isn't installed after `[slack] install_reminder_secs` (default an
 hour). Once it is installed, the manager app tells the member which bot
 user to invite to a channel (names are unique per owner only, so it names the
-bot by mention), and they mention it there. Before it acts on a message for
-anyone but the agent's owner, agentd reads the message back from Slack with
-the agent's bot token and routes Slack's copy, not the event, since the
-owner holds the app's signing secret and could otherwise forge messages
-from other members. `/agent delete` deletes the app with the member's
+bot by mention), and they mention it there. Before it acts on any message it
+doesn't ignore, agentd reads the message back from Slack with the agent's
+bot token and routes Slack's copy, not the event, since the owner holds the
+app's signing secret and could otherwise forge messages, their own included,
+in other members' conversations and threads. `/agent delete` deletes the app with the member's
 configuration token, or, without a working one, stops answering as it and
 says to delete the app at <https://api.slack.com/apps>. Apps ask for
 `chat:write.public` only with `[slack] public_posting = true`. On the free

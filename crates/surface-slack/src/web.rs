@@ -20,7 +20,8 @@
 //! [`SlackClient::with_max_retry_wait`]; otherwise it fails with
 //! [`SurfaceError::RateLimited`]. Each method is also tagged with its rate
 //! limit tier, and calls wait client-side before they would exceed it (see
-//! the `limit` module).
+//! the `limit` module). A client made with [`WebApi::without_waiting`]
+//! does neither: it fails with [`SurfaceError::RateLimited`] instead.
 
 use std::fmt;
 use std::sync::Arc;
@@ -386,6 +387,7 @@ impl SlackClient {
             client: self.clone(),
             key: TokenKey::of(&token),
             auth: Auth::Bearer(token),
+            waits: true,
         }
     }
 
@@ -407,6 +409,7 @@ impl SlackClient {
             client: self.clone(),
             key: TokenKey::of(refresh_token),
             auth: Auth::None,
+            waits: true,
         };
         let form = vec![("refresh_token", refresh_token.expose_secret().to_owned())];
         let rotated: RotateResponse = api
@@ -543,6 +546,7 @@ impl SlackClient {
                 client_id: client_id.to_owned(),
                 client_secret: client_secret.clone(),
             },
+            waits: true,
         };
         let form = vec![
             ("code", code.expose_secret().to_owned()),
@@ -583,6 +587,7 @@ impl SlackClient {
             client: self.clone(),
             key: TokenKey::of(config_token),
             auth: Auth::Bearer(config_token.clone()),
+            waits: true,
         }
     }
 
@@ -657,6 +662,7 @@ pub struct WebApi {
     client: SlackClient,
     auth: Auth,
     key: TokenKey,
+    waits: bool,
 }
 
 /// How a [`WebApi`] authenticates its calls.
@@ -679,6 +685,7 @@ impl fmt::Debug for WebApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebApi")
             .field("client", &self.client)
+            .field("waits", &self.waits)
             .field("token", &"[REDACTED]")
             .finish()
     }
@@ -1515,8 +1522,9 @@ impl WebApi {
     }
 
     /// Sends a call, waiting for the limiter first and retrying a rate
-    /// limit that clears soon enough. Returns the body of an `ok: true`
-    /// answer, or the failure of an `ok: false` one.
+    /// limit that clears soon enough, unless this client
+    /// [doesn't wait](Self::without_waiting). Returns the body of an
+    /// `ok: true` answer, or the failure of an `ok: false` one.
     async fn send(
         &self,
         method: Method,
@@ -1527,12 +1535,13 @@ impl WebApi {
         let mut retries = 0;
         loop {
             let max_wait = self.client.max_retry_wait;
-            if let Err(retry_after) = self
-                .client
-                .limiter
-                .acquire(&bucket, method.tier(), max_wait)
-                .await
-            {
+            let limiter = &self.client.limiter;
+            let acquired = if self.waits {
+                limiter.acquire(&bucket, method.tier(), max_wait).await
+            } else {
+                limiter.try_now(&bucket, method.tier())
+            };
+            if let Err(retry_after) = acquired {
                 return Err(SurfaceError::RateLimited { retry_after });
             }
             let response = self
@@ -1543,7 +1552,7 @@ impl WebApi {
             match reply(response).await? {
                 Reply::RateLimited(wait) => {
                     self.client.limiter.block(&bucket, Instant::now() + wait);
-                    if retries >= MAX_RETRIES || wait > self.client.max_retry_wait {
+                    if !self.waits || retries >= MAX_RETRIES || wait > self.client.max_retry_wait {
                         tracing::warn!(
                             method = method.name(),
                             retry_after_s = wait.as_secs(),
@@ -1594,6 +1603,18 @@ impl WebApi {
 }
 
 impl WebApi {
+    /// This client, but never waiting on the rate limit: a call over its
+    /// tier's quota, or in a bucket a 429 holds, fails at once with
+    /// [`SurfaceError::RateLimited`] without being sent, and a 429 isn't
+    /// retried. For lookups a flood of forged events could otherwise queue
+    /// behind the token's quota.
+    pub fn without_waiting(&self) -> Self {
+        Self {
+            waits: false,
+            ..self.clone()
+        }
+    }
+
     /// `request` with the bot token in `Authorization`, if this client has
     /// one.
     fn authorized(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {

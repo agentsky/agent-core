@@ -39,9 +39,10 @@ use crate::config::Config;
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
 pub use message::HISTORY_LIMIT;
 pub use run::{
-    DEFAULT_MAX_PENDING, DEFAULT_QUEUE_PER_THREAD, DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT,
-    FAILED_TEXT, LOGIN_EXPIRED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TIMED_OUT_TEXT,
-    TRUNCATED_NOTE, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
+    DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_AGENT, DEFAULT_QUEUE_PER_THREAD,
+    DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT, FAILED_TEXT, LOGIN_EXPIRED_TEXT, Pipeline,
+    PipelineSettings, RESTARTING_TEXT, TIMED_OUT_TEXT, TRUNCATED_NOTE, UNCONFIRMED_TEXT,
+    USAGE_LIMIT_TEXT,
 };
 pub use surfaces::StoreSurfaces;
 
@@ -160,6 +161,7 @@ impl PipelineSettings {
             models: runner.models.clone(),
             queue_per_thread: DEFAULT_QUEUE_PER_THREAD,
             max_pending: DEFAULT_MAX_PENDING,
+            max_pending_per_agent: DEFAULT_MAX_PENDING_PER_AGENT,
         }
     }
 }

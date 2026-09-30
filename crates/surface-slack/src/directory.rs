@@ -246,7 +246,9 @@ impl TeamDirectory {
     ///
     /// # Errors
     ///
-    /// The `conversations.info` error. Nothing is cached then.
+    /// The `conversations.info` error, or [`SurfaceError::NotFound`] when
+    /// the id Slack answers with isn't `channel` exactly, as for an id in
+    /// another case. Nothing is cached then.
     pub async fn conv_kind(&self, api: &WebApi, channel: &ConversationId) -> Result<ConvKind> {
         let now = Instant::now();
         if let Some((kind, until)) = self.lock_conv_kinds().get(channel)
@@ -255,6 +257,11 @@ impl TeamDirectory {
             return Ok(*kind);
         }
         let info = api.conversation_info(channel).await?;
+        if info.id != *channel {
+            return Err(SurfaceError::NotFound(
+                "the channel id isn't Slack's own spelling".into(),
+            ));
+        }
         let kind = if info.is_im {
             ConvKind::Dm
         } else if info.is_mpim {

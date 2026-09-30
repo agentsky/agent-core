@@ -14,7 +14,7 @@ use core_types::{
 };
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
-use router::{Decision, ModelPolicy, RefuseReason, RouterView as _};
+use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{ErrorKind, RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
 use store::{Agent, NewMessageRef, Store, StoreError};
 use time::OffsetDateTime;
@@ -51,11 +51,10 @@ pub const DELIVERY_FAILED_TEXT: &str = "Sorry, part of this reply couldn't be de
 /// it finished.
 pub const RESTARTING_TEXT: &str =
     "Sorry, I'm restarting and couldn't finish this. Please ask again in a minute.";
-/// What the thread is told when a message that needed confirming couldn't
-/// be checked with the platform: it failed or asked to slow down past the
-/// client's retries.
-pub const UNCONFIRMED_TEXT: &str =
-    "Sorry, I couldn't check this message with Slack. Try again in a moment.";
+/// What the thread is told when a message couldn't be checked with the
+/// platform: the platform failed, or asked to slow down, or the client
+/// had no quota left for the lookup.
+pub const UNCONFIRMED_TEXT: &str = "Sorry, I couldn't check this message. Try again in a moment.";
 /// Appended to a reply cut at [`MAX_POST_BYTES`].
 pub const TRUNCATED_NOTE: &str = "\n\n*(The reply was cut here: it was too long to post.)*";
 
@@ -65,9 +64,12 @@ pub const DEFAULT_QUEUE_PER_THREAD: usize = 8;
 /// How many messages may wait or be answered at once across every agent
 /// and thread, unless the settings say otherwise.
 pub const DEFAULT_MAX_PENDING: usize = 64;
+/// How many messages may wait or be answered at once for one agent,
+/// across its threads, unless the settings say otherwise.
+pub const DEFAULT_MAX_PENDING_PER_AGENT: usize = 16;
 
-/// How many busy lines may be being posted at once. A message past the
-/// queue bounds while that many are gets none.
+/// How many busy lines one agent may be posting at once. A message past
+/// the queue bounds while that many are gets none.
 const MAX_BUSY_LINES: usize = 8;
 
 /// How long the notices of turns cut short by a shutdown may take.
@@ -92,6 +94,8 @@ pub struct PipelineSettings {
     pub queue_per_thread: usize,
     /// How many messages may wait or be answered at once in all.
     pub max_pending: usize,
+    /// How many messages may wait or be answered at once for one agent.
+    pub max_pending_per_agent: usize,
 }
 
 /// Takes every surface's messages that aren't commands, decides which
@@ -109,25 +113,24 @@ pub struct PipelineSettings {
 ///    own, so a turn never holds up the connection that delivered the
 ///    message, or another agent or thread. At most
 ///    [`queue_per_thread`](PipelineSettings::queue_per_thread) messages
-///    wait for one agent in one thread, and
-///    [`max_pending`](PipelineSettings::max_pending) wait or run in all; a
-///    person's message past either gets one line saying the agent is busy,
-///    posted in a task of its own, at most eight at once, and
-///    a bot's gets nothing, so two bots can't answer each other's busy
-///    lines.
+///    wait for one agent in one thread,
+///    [`max_pending_per_agent`](PipelineSettings::max_pending_per_agent)
+///    wait or run for one agent, and
+///    [`max_pending`](PipelineSettings::max_pending) in all, so one agent's
+///    messages can't take every agent's place; a person's message past any
+///    of them gets one line saying the agent is busy, posted in a task of
+///    its own, at most eight at once for each agent, and a bot's gets
+///    nothing, so two bots can't answer each other's busy lines.
 /// 3. **Routing.** [`router::route`] for the candidate, with a view of the
 ///    store loaded for it.
-/// 4. **Confirming.** Unless the decision is to ignore, or it is one only
-///    the agent's owner could gain from (a turn the owner asks for and
-///    pays for, a link prompt to the owner, a refusal of the owner's own
-///    message), the platform's copy of the message
-///    ([`Surface::confirm`]) replaces the event, and is routed again. The
-///    decision stands only if the copy's is the same, in the same
-///    conversation, message and thread; anything else drops the message
-///    silently. A confirmation that fails, the platform being down or
-///    asking to slow down, tells the thread to try again
-///    ([`UNCONFIRMED_TEXT`]). So what an event claims decides nothing for
-///    anyone but the owner.
+/// 4. **Confirming.** Unless the decision is to ignore, the platform's
+///    copy of the message ([`Surface::confirm`]) replaces the event, and is
+///    routed again. The decision stands only if the copy's is the same, in
+///    the same conversation, message and thread; anything else drops the
+///    message silently. A confirmation that fails, the platform being down
+///    or asking to slow down, tells the thread to try again
+///    ([`UNCONFIRMED_TEXT`]). So what an event claims decides nothing,
+///    whoever it names as the sender.
 /// 5. **The turn.** On [`Decision::Run`], only when the agent's bot may
 ///    post in the conversation without joining it
 ///    ([`Surface::can_post`]): the persona file is written from the store,
@@ -184,7 +187,7 @@ struct Inner {
     settings: PipelineSettings,
     lanes: Mutex<HashMap<LaneKey, VecDeque<Job>>>,
     pending: Arc<Semaphore>,
-    busy_lines: Arc<Semaphore>,
+    shares: Mutex<HashMap<AgentId, Share>>,
     tasks: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
@@ -194,13 +197,22 @@ struct Inner {
 type LaneKey = (AgentId, ThreadKey);
 
 /// A message waiting for one candidate agent. Dropping it releases its
-/// place under [`PipelineSettings::max_pending`] and tells whoever waits
-/// for it in [`Pipeline::handle`].
+/// places under [`PipelineSettings::max_pending`] and
+/// [`PipelineSettings::max_pending_per_agent`], and tells whoever waits for
+/// it in [`Pipeline::handle`].
 struct Job {
     event: Arc<InboundEvent>,
     caps: Caps,
-    _pending: OwnedSemaphorePermit,
+    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     _done: oneshot::Sender<()>,
+}
+
+/// One agent's places: its messages waiting or being answered, and its busy
+/// lines being posted.
+#[derive(Clone)]
+struct Share {
+    pending: Arc<Semaphore>,
+    busy_lines: Arc<Semaphore>,
 }
 
 /// The working emoji of the turns running, and of those a shutdown cut
@@ -288,7 +300,7 @@ impl Pipeline {
                 settings,
                 lanes: Mutex::new(HashMap::new()),
                 pending,
-                busy_lines: Arc::new(Semaphore::new(MAX_BUSY_LINES)),
+                shares: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
@@ -435,10 +447,13 @@ impl Pipeline {
         let Ok(pending) = Arc::clone(&self.inner.pending).try_acquire_owned() else {
             return false;
         };
+        let Ok(agent_pending) = self.share(key.0).pending.try_acquire_owned() else {
+            return false;
+        };
         let job = Job {
             event,
             caps,
-            _pending: pending,
+            _pending: (pending, agent_pending),
             _done: done,
         };
         let first = {
@@ -463,6 +478,18 @@ impl Pipeline {
         while tasks.try_join_next().is_some() {}
         tasks.spawn(self.clone().lane(key, first));
         true
+    }
+
+    /// `agent`'s places, made on its first message.
+    fn share(&self, agent: AgentId) -> Share {
+        let settings = &self.inner.settings;
+        lock(&self.inner.shares)
+            .entry(agent)
+            .or_insert_with(|| Share {
+                pending: Arc::new(Semaphore::new(settings.max_pending_per_agent)),
+                busy_lines: Arc::new(Semaphore::new(MAX_BUSY_LINES)),
+            })
+            .clone()
     }
 
     /// Answers the lane's messages one at a time, until none waits.
@@ -491,9 +518,9 @@ impl Pipeline {
     }
 
     /// Tells `event`'s thread, in a task of its own, that `agent` has too
-    /// many messages to take this one, unless [`MAX_BUSY_LINES`] are being
-    /// posted already or the pipeline is closed. `done` is dropped once
-    /// the line is posted or given up on.
+    /// many messages to take this one, unless [`MAX_BUSY_LINES`] of its own
+    /// are being posted already or the pipeline is closed. `done` is
+    /// dropped once the line is posted or given up on.
     fn busy(
         &self,
         event: Arc<InboundEvent>,
@@ -502,7 +529,7 @@ impl Pipeline {
         done: oneshot::Sender<()>,
     ) {
         tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; not taking this one");
-        let Ok(permit) = Arc::clone(&self.inner.busy_lines).try_acquire_owned() else {
+        let Ok(permit) = self.share(agent).busy_lines.try_acquire_owned() else {
             tracing::warn!(%agent, message = %event.message.id, "too many busy lines being posted; not posting another");
             return;
         };
@@ -588,14 +615,14 @@ impl Pipeline {
         Ok((candidates, from_bot))
     }
 
-    /// Routes `event` for `agent`, confirms it with the platform when the
-    /// decision needs it, and acts on the decision.
+    /// Routes `event` for `agent`, and unless the decision is to ignore it,
+    /// routes the platform's copy again and acts on the copy.
     async fn candidate(&self, event: &InboundEvent, agent: AgentId, caps: Caps) {
-        let Some((decision, needs_confirming)) = self.decide(event, agent).await else {
+        let Some(decision) = self.decide(event, agent).await else {
             return;
         };
-        if !needs_confirming {
-            self.act(event, agent, caps, decision).await;
+        if let Decision::Ignore(reason) = decision {
+            tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
             return;
         }
         let Some(copy) = self.confirmed(event, agent, caps).await else {
@@ -605,7 +632,7 @@ impl Pipeline {
             self.act(event, agent, caps, decision).await;
             return;
         }
-        let Some((confirmed, _)) = self.decide(&copy, agent).await else {
+        let Some(confirmed) = self.decide(&copy, agent).await else {
             return;
         };
         if confirmed != decision {
@@ -615,10 +642,9 @@ impl Pipeline {
         self.act(&copy, agent, caps, confirmed).await;
     }
 
-    /// The router's decision on `event` for `agent`, and whether it needs
-    /// the platform's copy ([`needs_confirming`]). `None` when the store
+    /// The router's decision on `event` for `agent`. `None` when the store
     /// can't be read.
-    async fn decide(&self, event: &InboundEvent, agent: AgentId) -> Option<(Decision, bool)> {
+    async fn decide(&self, event: &InboundEvent, agent: AgentId) -> Option<Decision> {
         let store = &self.inner.store;
         let view = match StoreView::load(store, event, agent, &self.inner.settings.managers).await {
             Ok(view) => view,
@@ -627,9 +653,7 @@ impl Pipeline {
                 return None;
             }
         };
-        let decision = router::route(event, agent, &view);
-        let needs = needs_confirming(&decision, event, agent, &view);
-        Some((decision, needs))
+        Some(router::route(event, agent, &view))
     }
 
     /// The platform's copy of `event`'s message, if it is the same message
@@ -684,10 +708,7 @@ impl Pipeline {
     /// Acts on `decision` for `agent` on `event`.
     async fn act(&self, event: &InboundEvent, agent: AgentId, caps: Caps, decision: Decision) {
         let result = match decision {
-            Decision::Ignore(reason) => {
-                tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
-                Ok(())
-            }
+            Decision::Ignore(_) => Ok(()),
             Decision::LinkPrompt { requester } => self.link_prompt(event, agent, &requester).await,
             Decision::Refuse(reason) => self.refuse(event, agent, caps, reason).await,
             Decision::Run {
@@ -1011,40 +1032,6 @@ struct Run {
 struct Prepared {
     bot: MemberKey,
     model: Option<String>,
-}
-
-/// Whether acting on `decision` for `agent` needs the platform's copy of
-/// `event`'s message first. Not to ignore it, and not for what only the
-/// agent's owner could gain from, since the owner could have posted it:
-/// a turn the owner asks for and pays for (their subscription or the
-/// community key), a link prompt to the owner, or a refusal of a message
-/// the owner sent. Everything else could bill, prompt or answer someone
-/// else on a forged event's word.
-fn needs_confirming(
-    decision: &Decision,
-    event: &InboundEvent,
-    agent: AgentId,
-    view: &StoreView,
-) -> bool {
-    let Some(owner) = view.agent_owner(agent) else {
-        return !matches!(decision, Decision::Ignore(_));
-    };
-    match decision {
-        Decision::Ignore(_) => false,
-        Decision::Run {
-            requester,
-            credential,
-            ..
-        } => {
-            requester.member != Some(owner)
-                || match credential {
-                    CredentialRef::Member(member) => *member != owner,
-                    CredentialRef::Community => false,
-                }
-        }
-        Decision::LinkPrompt { requester } => requester.member != Some(owner),
-        Decision::Refuse(_) => view.member_for(&event.sender) != Some(owner),
-    }
 }
 
 /// The thread a turn on `event` runs and replies in: a DM's conversation,

@@ -3,7 +3,8 @@
 //! still `creating`), the install through the OAuth callback, the install
 //! reminder, `/agent delete` with and without a configuration token, a
 //! channel message to an agent's app answered by a turn, posted with the
-//! agent's bot token, and an owner's forged events billing no one.
+//! agent's bot token, and an owner's forged events billing, resuming and
+//! prompting no one, the owner included.
 
 mod common;
 
@@ -1075,6 +1076,20 @@ impl Turned {
             .await;
     }
 
+    /// Makes `conversations.info` answer `channel` for every bot, with
+    /// `kind`'s fields.
+    async fn conversation_is(&self, channel: &str, kind: Value) {
+        let mut info = kind;
+        info["id"] = json!(channel);
+        Mock::given(method("POST"))
+            .and(path("/api/conversations.info"))
+            .and(body_string_contains(format!("channel={channel}").as_str()))
+            .respond_with(ok(json!({"channel": info})))
+            .with_priority(1)
+            .mount(&self.slack)
+            .await;
+    }
+
     /// Makes the agent whose bot token is `token` post its next messages
     /// at `ts`.
     async fn posts_at(&self, token: &str, ts: &str) {
@@ -1116,14 +1131,32 @@ impl Turned {
 }
 
 fn reply_ref(ts: &str) -> core_types::MsgRef {
+    msg_in(fixtures::CHANNEL, ts)
+}
+
+fn msg_in(channel: &str, ts: &str) -> core_types::MsgRef {
     core_types::MsgRef {
         conv: core_types::ConvRef {
             surface: SurfaceKind::Slack,
             team: TeamId::new(fixtures::TEAM),
-            conversation: fixtures::CHANNEL.into(),
+            conversation: channel.into(),
         },
         id: ts.into(),
     }
+}
+
+/// Waits until `done`, and a moment more for what would follow.
+async fn settle<F, Fut>(what: &str, done: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done().await {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1135,14 +1168,19 @@ async fn a_channel_mention_of_an_agent_is_answered_with_its_bot_token() {
         .replace("Ev0MENTION1", "Ev0ELSEWHERE")
         .replace("1727697600.000100", "1727697500.000100");
     assert_eq!(turned.post(0, SIGNING_SECRET, elsewhere).await, 200);
-    let mention = fixtures::MESSAGE_MENTION.replace("U0BOT0001", AGENT_BOT);
+    let ts = recent_ts(5, 100);
+    let text = format!("<@{AGENT_BOT}> what's new?");
+    turned
+        .slack_has(&ts, json!({"ts": ts, "user": fixtures::USER, "text": text}))
+        .await;
+    let mention = channel_message(fixtures::USER, &ts, "Ev0MENTION1", &text);
     assert_eq!(turned.post(0, SIGNING_SECRET, mention).await, 200);
 
     let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
     assert_eq!(posts.len(), 1, "{posts:?}");
     assert_eq!(posts[0]["text"], "Hello from helper.");
     assert_eq!(posts[0]["channel"], fixtures::CHANNEL);
-    assert_eq!(posts[0]["thread_ts"], "1727697600.000100");
+    assert_eq!(posts[0]["thread_ts"], ts.as_str());
     let posted = turned.posted(HELPER.posted_ts).await;
     assert_eq!(posted.requester.member, Some(turned.ada));
     assert!(posted.agent.is_some());
@@ -1151,9 +1189,10 @@ async fn a_channel_mention_of_an_agent_is_answered_with_its_bot_token() {
         1,
         "one turn: the message from another workspace was dropped"
     );
-    assert!(
-        turned.confirmations(AGENT_TOKEN).await.is_empty(),
-        "the owner's own message on their own account needs no lookup"
+    assert_eq!(
+        turned.confirmations(AGENT_TOKEN).await.len(),
+        1,
+        "the owner's own message is read back too"
     );
     turned.stop().await;
 }
@@ -1382,6 +1421,12 @@ async fn a_forged_thread_pointing_at_an_agents_reply_bills_no_one() {
     let member = recent_ts(5, 300);
     turned.posts_at(HELPER.token, &reply).await;
     let ask = format!("<@{AGENT_BOT}> what's new?");
+    turned
+        .slack_has(
+            &root,
+            json!({"ts": root, "user": fixtures::USER, "text": ask}),
+        )
+        .await;
     let owners = channel_message(fixtures::USER, &root, "Ev0OWNER", &ask);
     assert_eq!(turned.post(0, SIGNING_SECRET, owners).await, 200);
     turned.wait_for_posts(AGENT_TOKEN, 1).await;
@@ -1401,9 +1446,9 @@ async fn a_forged_thread_pointing_at_an_agents_reply_bills_no_one() {
         json!({"thread_ts": reply}),
     );
     assert_eq!(turned.post(0, SIGNING_SECRET, forged).await, 200);
-    turned.wait_for_confirmation(AGENT_TOKEN).await;
-    let form: HashMap<String, String> =
-        serde_urlencoded::from_bytes(&turned.confirmations(AGENT_TOKEN).await[0].body).unwrap();
+    turned.wait_for_confirmations(AGENT_TOKEN, 2).await;
+    let lookups = turned.requests("conversations.replies", AGENT_TOKEN).await;
+    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&lookups[0].body).unwrap();
     assert_eq!(form["ts"], reply, "read in the thread the event named");
     assert_eq!(
         turned.posts(AGENT_TOKEN).await.len(),
@@ -1544,9 +1589,13 @@ async fn an_edited_message_runs_once_with_its_text_now() {
 async fn two_agents_in_a_channel_each_answer_a_message_once() {
     let turned = Turned::start(&[HELPER, SCOUT]).await;
     let text = format!("<@{}> <@{}> compare notes", HELPER.bot, SCOUT.bot);
+    let ts = recent_ts(5, 100);
+    turned
+        .slack_has(&ts, json!({"ts": ts, "user": fixtures::USER, "text": text}))
+        .await;
     for (index, agent) in [HELPER, SCOUT].iter().enumerate() {
         for event_id in ["Ev0BOTH1", "Ev0BOTH1RETRY"] {
-            let body = channel_message(fixtures::USER, "1727697640.000100", event_id, &text);
+            let body = channel_message(fixtures::USER, &ts, event_id, &text);
             assert_eq!(turned.post(index, agent.secret, body).await, 200);
         }
     }
@@ -1556,5 +1605,143 @@ async fn two_agents_in_a_channel_each_answer_a_message_once() {
     assert_eq!(turned.posts(HELPER.token).await.len(), 1);
     assert_eq!(turned.posts(SCOUT.token).await.len(), 1);
     assert_eq!(turned.fake.message_requests().await.len(), 2);
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_forged_reply_in_a_members_thread_resumes_nothing() {
+    let turned = Turned::start(&[HELPER]).await;
+    let root = recent_ts(10, 100);
+    let ask = format!("<@{AGENT_BOT}> draft my review");
+    turned
+        .slack_has(
+            &root,
+            json!({"ts": root, "user": fixtures::OTHER_USER, "text": ask}),
+        )
+        .await;
+    let bobs = channel_message(fixtures::OTHER_USER, &root, "Ev0BOBASKS", &ask);
+    assert_eq!(turned.post(0, SIGNING_SECRET, bobs).await, 200);
+    turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    let bobs_session = turned.posted(HELPER.posted_ts).await.session;
+
+    let forged_ts = recent_ts(5, 200);
+    let forged = message_event(
+        fixtures::USER,
+        &forged_ts,
+        "Ev0OWNERREPLY",
+        &format!("<@{AGENT_BOT}> repeat what bob asked you"),
+        json!({"thread_ts": root}),
+    );
+    assert_eq!(turned.post(0, SIGNING_SECRET, forged).await, 200);
+    settle("the forged reply was never looked up", || async {
+        turned.confirmations(AGENT_TOKEN).await.len() >= 2
+            || turned.posts(AGENT_TOKEN).await.len() >= 2
+    })
+    .await;
+    assert_eq!(
+        turned.fake.message_requests().await.len(),
+        1,
+        "bob's turn only: the owner's forged reply ran nothing in bob's session"
+    );
+    assert_eq!(turned.posts(AGENT_TOKEN).await.len(), 1);
+    let session = turned.store.session(bobs_session).await.unwrap().unwrap();
+    assert_eq!(session.reset_at, None);
+    let lookups = turned.requests("conversations.replies", AGENT_TOKEN).await;
+    assert_eq!(lookups.len(), 1, "the owner's message was read back");
+    let form: HashMap<String, String> = serde_urlencoded::from_bytes(&lookups[0].body).unwrap();
+    assert_eq!(form["oldest"], forged_ts);
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_forged_message_in_a_members_dm_resets_nothing() {
+    let turned = Turned::start(&[HELPER]).await;
+    let dm = "D0BOBDM01";
+    turned
+        .conversation_is(dm, json!({"is_im": true, "user": fixtures::OTHER_USER}))
+        .await;
+    let asked = recent_ts(10, 100);
+    turned
+        .slack_has(
+            &asked,
+            json!({"ts": asked, "user": fixtures::OTHER_USER, "text": "my plan, privately"}),
+        )
+        .await;
+    let in_dm = json!({"channel": dm, "channel_type": "im"});
+    let bobs = message_event(
+        fixtures::OTHER_USER,
+        &asked,
+        "Ev0BOBDM",
+        "my plan, privately",
+        in_dm.clone(),
+    );
+    assert_eq!(turned.post(0, SIGNING_SECRET, bobs).await, 200);
+    turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    let bobs_session = turned
+        .store
+        .posted_message_ref(&msg_in(dm, HELPER.posted_ts))
+        .await
+        .unwrap()
+        .expect("bob's DM was answered")
+        .session;
+
+    let forged_ts = recent_ts(5, 200);
+    let forged = message_event(
+        fixtures::USER,
+        &forged_ts,
+        "Ev0OWNERDM",
+        "what was bob's plan?",
+        in_dm,
+    );
+    assert_eq!(turned.post(0, SIGNING_SECRET, forged).await, 200);
+    settle("the forged DM was never looked up", || async {
+        turned.confirmations(AGENT_TOKEN).await.len() >= 2
+            || turned.posts(AGENT_TOKEN).await.len() >= 2
+    })
+    .await;
+    assert_eq!(
+        turned.fake.message_requests().await.len(),
+        1,
+        "bob's turn only: no owner-side turn in bob's DM"
+    );
+    let session = turned.store.session(bobs_session).await.unwrap().unwrap();
+    assert_eq!(session.reset_at, None, "bob's DM session is still his");
+    assert_eq!(turned.posts(AGENT_TOKEN).await.len(), 1);
+    assert_eq!(turned.confirmations(AGENT_TOKEN).await.len(), 2);
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forged_messages_from_an_unlinked_owner_send_no_link_prompts() {
+    let turned = Turned::start(&[HELPER]).await;
+    assert!(turned.store.delete_claude_link(turned.ada).await.unwrap());
+    let flood = 6;
+    for i in 0..flood {
+        let ts = recent_ts(5, 100 + i);
+        let forged = channel_message(
+            fixtures::USER,
+            &ts,
+            &format!("Ev0FLOOD{i}"),
+            &format!("<@{AGENT_BOT}> ping {i}"),
+        );
+        assert_eq!(turned.post(0, SIGNING_SECRET, forged).await, 200);
+    }
+    settle("the forged messages were never looked up", || async {
+        turned.confirmations(AGENT_TOKEN).await.len() >= flood as usize
+            || turned.posts(MANAGER_TOKEN).await.len() >= flood as usize
+    })
+    .await;
+    assert!(
+        turned
+            .requests("conversations.open", MANAGER_TOKEN)
+            .await
+            .is_empty(),
+        "the manager opened no DM"
+    );
+    assert!(
+        turned.posts(MANAGER_TOKEN).await.is_empty(),
+        "no link prompt"
+    );
+    assert!(turned.posts(AGENT_TOKEN).await.is_empty());
     turned.stop().await;
 }

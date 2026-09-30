@@ -876,6 +876,30 @@ async fn fill_bot_sender_leaves_humans_known_bots_and_other_teams_alone() {
     assert!(requests(&server).await.is_empty());
 }
 
+#[tokio::test]
+async fn a_bot_lookup_past_the_quota_fails_at_once_without_a_call() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0MADEUP", "user_id": "U0MADEUP"}})),
+    )
+    .await;
+    for n in 0..50 {
+        let mut event = bot_event();
+        event.sender.user = format!("B0MADEUP{n}").into();
+        surface.fill_bot_sender(&mut event).await.unwrap();
+    }
+    let mut event = bot_event();
+    let before = event.clone();
+    let started = std::time::Instant::now();
+    let err = surface.fill_bot_sender(&mut event).await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(matches!(err, SurfaceError::RateLimited { .. }), "{err:?}");
+    assert_eq!(event, before, "the message goes on from an unmanaged bot");
+    assert_eq!(lookups(&server, "bots.info").await.len(), 50);
+}
+
 /// `event`, as if it arrived a second after it was posted.
 fn arrived_now(mut event: InboundEvent) -> InboundEvent {
     let (seconds, _) = event.message.id.as_str().split_once('.').unwrap();
@@ -1175,6 +1199,45 @@ async fn a_message_that_cannot_be_read_back_is_an_error() {
     assert!(matches!(
         surface.confirm(&event).await,
         Err(SurfaceError::Transport(_))
+    ));
+    assert!(lookups(&server, "conversations.history").await.is_empty());
+}
+
+#[tokio::test]
+async fn confirming_never_waits_out_a_rate_limit() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ResponseTemplate::new(429).insert_header("retry-after", "30"),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    for _ in 0..2 {
+        assert!(matches!(
+            surface.confirm(&event).await,
+            Err(SurfaceError::RateLimited { .. })
+        ));
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        lookups(&server, "conversations.history").await.len(),
+        1,
+        "not retried, and the next lookup isn't sent while the 429 holds"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_id_slack_spells_otherwise_is_refused() {
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    let lower = CHANNEL.to_lowercase();
+    event.conv.conversation = lower.as_str().into();
+    event.message.conv.conversation = lower.as_str().into();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    assert!(matches!(
+        surface.confirm(&event).await,
+        Err(SurfaceError::NotFound(_))
     ));
     assert!(lookups(&server, "conversations.history").await.is_empty());
 }

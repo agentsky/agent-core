@@ -163,7 +163,9 @@ impl SigningSecrets for StoreSigningSecrets {
 /// [`new`](Self::new) returns, which looks each one's binding up, fills in
 /// its bot sender with [`SlackSurface::fill_bot_sender`], and hands it to the
 /// turn pipeline once [`connect`](Self::connect)ed, one at a time in the
-/// order they came. Until then, and in an agentd that runs no turns, they
+/// order they came. The bot lookup never waits for the token's quota: past
+/// it, the message goes on from a bot known only by its bot id, which the
+/// router ignores, so made-up bot ids can't stall every agent's messages. Until then, and in an agentd that runs no turns, they
 /// are dropped, as are messages to a binding that isn't active (still
 /// waiting for its install, or deleted).
 ///

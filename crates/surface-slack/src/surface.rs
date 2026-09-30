@@ -147,10 +147,15 @@ impl SlackSurface {
     /// Events from a human, from a bot whose user is already known, or from
     /// another workspace are left alone.
     ///
+    /// The lookup [never waits](WebApi::without_waiting) for the token's
+    /// `bots.info` quota, so events with made-up bot ids can't stall the
+    /// caller behind it.
+    ///
     /// # Errors
     ///
-    /// A `bots.info` failure other than `bot_not_found`. The event is left
-    /// unchanged.
+    /// A `bots.info` failure other than `bot_not_found`, including
+    /// [`SurfaceError::RateLimited`] when the quota is used up. The event is
+    /// left unchanged.
     pub async fn fill_bot_sender(&self, event: &mut InboundEvent) -> Result<()> {
         if !event.sender_is_bot
             || event.sender_bot_user.is_some()
@@ -160,7 +165,8 @@ impl SlackSurface {
             return Ok(());
         }
         let bot_id = event.sender.user.as_str().to_owned();
-        if let Some(user) = self.directory.bot_user(&self.api, &bot_id).await? {
+        let api = self.api.without_waiting();
+        if let Some(user) = self.directory.bot_user(&api, &bot_id).await? {
             event.sender.user = user.clone();
             event.sender_bot_user = Some(user);
         }
@@ -400,7 +406,8 @@ impl Surface for SlackSurface {
     ///    event arrived is refused without a lookup.
     /// 2. The conversation's kind comes from `conversations.info`, cached
     ///    per channel ([`TeamDirectory::conv_kind`]), never from the event's
-    ///    `channel_type`.
+    ///    `channel_type`; a channel id Slack gives back spelled otherwise
+    ///    is refused, so each message has one spelling to deduplicate by.
     /// 3. The message is read back whole with [`WebApi::message`], in the
     ///    thread the event names, and normalized with
     ///    [`normalize::read_back`], the ingress's rules, with this binding's
@@ -408,6 +415,11 @@ impl Surface for SlackSurface {
     ///    thread, files and whether a channel message is addressed. A bot
     ///    known only by its bot id is named by its user, as
     ///    [`fill_bot_sender`](Self::fill_bot_sender) names it.
+    ///
+    /// None of the lookups [waits](WebApi::without_waiting) for the bot
+    /// token's quota: past it, or while a 429 holds it, confirming fails
+    /// at once with [`SurfaceError::RateLimited`], so forged events can't
+    /// hold the caller's place behind the owner's token.
     ///
     /// The binding, event id and arrival time are the event's. `None` when
     /// Slack doesn't have the message, or has it in a form the ingress
@@ -420,9 +432,9 @@ impl Surface for SlackSurface {
             tracing::warn!(binding = %event.binding, message = %event.message.id, "a message older than the confirmation window; not reading it back");
             return Ok(None);
         }
-        let conv_kind = self.directory.conv_kind(&self.api, channel).await?;
-        let Some(raw) = self
-            .api
+        let api = self.api.without_waiting();
+        let conv_kind = self.directory.conv_kind(&api, channel).await?;
+        let Some(raw) = api
             .message(channel, event.thread_root.as_ref(), &event.message.id)
             .await?
         else {
