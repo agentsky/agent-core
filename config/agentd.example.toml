@@ -80,7 +80,7 @@ url = "sqlite:///var/lib/agentd/agentd.db"
 # posted; agentd empties ctl-outbox/ at startup. Agents' skills live under
 # skills/ (mounted read-only into their sandboxes), skills waiting for their
 # owner to confirm their hosts under skills-pending/, and skills being
-# fetched under skills-work/, which startup empties.
+# fetched under skills-work/, which startup clears of work left over.
 data_dir = "/var/lib/agentd"
 
 [limits]
@@ -108,7 +108,8 @@ upstream = "https://api.anthropic.com"
 # metadata address (169.254.169.254 included), agentd's own or the sandbox
 # network's, or reserved. Empty by default: no egress at all. An agent's
 # sandboxes may also reach the hosts its skills declare in `allowed-hosts`,
-# once its owner confirms them (`skill confirm`), under the same checks.
+# once its owner confirms them (`skill confirm`), under the same checks;
+# a skill names each host, with no wildcards.
 allow = []
 
 # Open tunnels across all sandboxes, and per sandbox. A CONNECT past either

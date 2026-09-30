@@ -2893,8 +2893,9 @@ everyone.
 target once from the `egress` network first as a control. The stack uses
 the real images, so Rocket.Chat and MongoDB must be healthy (their Compose
 health checks) and agentd must answer `/healthz` before the probes run.
-The distroless agentd image has no shell or client for a health check, so
-the test polls `/healthz` with curl from a container on `egress`. The
+The agentd image has no HTTP client for a health check (it was distroless
+here, with no shell either; T25 moved it to Debian slim for `git`), so the
+test polls `/healthz` with curl from a container on `egress`. The
 cloud metadata address `169.254.169.254` is checked as well, since the
 design blocks it.
 
@@ -5102,8 +5103,9 @@ with a `pending` row; the reply lists the hosts and asks for
 `skill confirm <name> <skill>` within an hour (`PENDING_TTL`). Confirming
 moves the files into the agent's skills and makes the row `active`, which is
 when its hosts count. A confirmation after the hour finds the skill dropped;
-startup drops expired ones and any pending files without a row. The parser
-gained `SkillCommand::Confirm`, and the design's command table lists it.
+the sweeper drops expired ones every minute, with their files, and startup
+too. The parser gained `SkillCommand::Confirm`, and the design's command
+table lists it.
 
 ### Skills are rows, their files are directories
 
@@ -5119,8 +5121,30 @@ one it would replace. `Store::skill_hosts_for_session` joins `sessions` and
 `agents` (deleted agents get none) and `SkillHosts` parses each host with
 `HostRule` again, so a row that no longer parses allows nothing. Files stay
 on disk, moved into place with a rename so a session sees a skill whole or
-not at all; `skill rm` deletes the row first, which takes the hosts away at
-once, then the directories.
+not at all. Replacing one moves the old directory aside first, so a session
+starting between the two renames sees neither; `renameat2` with
+`RENAME_EXCHANGE` would close that, but needs a fallback for file systems
+without it, and the window is two renames.
+
+The row and the files change in the order that never grants hosts to files
+the owner didn't confirm them for. `skill add` records the row first: an
+active row carries no hosts and replaces any row that did, and a pending
+row's hosts don't count. `skill confirm` moves the files into place, then
+makes the row active; a failed move leaves it pending, and the old skill is
+moved back. `skill rm` deletes the rows, then the directories. A failure
+between the two steps can leave directories no row records, so startup
+removes work directories, pending skills without a pending row and skills
+without an active row (the bundled one aside), but only those unchanged
+(by status change time, which a rename updates) for `STALE_AFTER`, the
+clone timeout and three minutes: in a blue-green deploy the old instance
+may still be cloning or moving one. The 32-skill cap is checked inside
+`put_skill`'s transaction.
+
+`skill rm` refuses new connections to the skill's hosts at once, but the
+egress proxy has no hook to close one agent's tunnels to one host, and
+revoking the agent's sessions would restart its conversations. Tunnels
+already open end on their own, within the 5-minute idle timeout or the
+1-hour lifetime, and the reply says so.
 
 ### A clone reaches agentd's own network unless the host is checked
 
@@ -5141,13 +5165,54 @@ sandbox subnet. `git` is then pinned to the checked addresses with
 URL), may use only `https` (`protocol.allow=never`,
 `protocol.https.allow=always`), and runs with an empty environment, no
 system or global configuration, no credential helper or prompt, no hooks or
-templates, `transfer.fsckObjects`, and `core.symlinks=false`. The clone is
+templates, no bundle URIs (`transfer.bundleURI=false`, `fetch.bundleURI=`)
+or file system monitor, `transfer.fsckObjects`, and `core.symlinks=false`.
+The empty environment also means an operator's `HTTPS_PROXY` never reaches
+a clone: it connects directly, from agentd's own network. The clone is
 `--depth=1 --single-branch --no-recurse-submodules --no-tags`, the ref only
 as `--branch=<ref>` and the URL after `--`. It runs in its own process group,
 killed whole after 2 minutes or once its directory passes 40 MB. Tests serve
 a local repository through `Git::serving_prefix_from_directory_for_tests`,
 which rewrites one `https://` prefix to a `file://` directory and skips the
-lookup; nothing in agentd's configuration reaches it.
+lookup; it and the `file://` configuration exist only in test builds.
+
+A clone runs inside the owner's command, and one member's commands run one
+at a time, so a clone that takes its full 2 minutes holds that owner's
+other commands for as long; other members aren't held up.
+
+### The URL git gets names the host as the pin does
+
+**Issue.** agentd checked and pinned the normalized host, but gave `git`
+the URL as the owner wrote it. curl matches `http.curloptResolve` entries
+by name, without dropping a trailing dot, so `https://evil.example./r`
+missed the pin for `evil.example`, and curl resolved the name again,
+reopening DNS rebinding into agentd's network.
+
+**Solution.** `git` gets a URL rebuilt from what was checked,
+`https://<normalized host>:<port><path>`, so its host and port are exactly
+the pin's; a test runs a stand-in `git` and compares the two, `GitHub.com.`
+included. The egress proxy has no such gap: it connects to the addresses it
+checked, never to a name.
+
+### Measuring a clone's directory can't stop one file
+
+**Issue.** The 40 MB cap was checked by measuring the directory every
+250 ms. A small pack of a highly compressible blob checks out hundreds of
+megabytes between two measurements, onto the volume that also holds the
+store; a test cloning an 8 MB blob of zeros under a 1 MB cap finished
+before any measurement saw it.
+
+**Solution.** No file `git` or its helpers write may pass 40 MB:
+`RLIMIT_FSIZE`. The workspace forbids `unsafe`, so `pre_exec` can't set it,
+and `prlimit` on the child's pid after `spawn` races `git` starting
+`git-remote-https`, which would not inherit it. `git` starts through
+`/bin/sh -c 'ulimit -f "$1" && shift && exec "$@"'`, which sets the limit
+before `exec`, so every process of the clone has it; `compose-test.sh`
+checks that the image runs `git` that way. A write past the limit kills
+the writer with `SIGXFSZ`, and `git` killed by it is `TooLarge`. When a
+helper such as `index-pack` is the one killed, `git` exits with an error
+and removes the clone, and the owner gets the generic "Git couldn't clone
+that" reply. The directory is still measured, for the total.
 
 ### The agentd image needs git
 
@@ -5156,8 +5221,8 @@ says, and the distroless image has no `git`. A Rust Git client would be a
 large dependency for one shallow clone.
 
 **Solution.** The runtime stage is `debian:trixie-slim` (the digest the
-sandbox image pins) with `git` and `ca-certificates`; it still runs as
-10001. Trixie's Git is 2.47, above the 2.37 `http.curloptResolve` needs.
+sandbox image pins) with `git` and `ca-certificates`, and Debian's `/bin/sh`
+for `ulimit -f`; it still runs as 10001. Trixie's Git is 2.47, above the 2.37 `http.curloptResolve` needs.
 `compose-test.sh` checks that `git` runs in the image. The image couldn't be
 built here (Debian's mirror is blocked); CI builds it.
 
@@ -5168,18 +5233,22 @@ built here (Debian's mirror is blocked); CI builds it.
 anywhere, and ends up mounted into sandboxes.
 
 **Solution.** `skills::package` checks every skill the same way, whatever
-it came from: at most 10 MB of files, 1,000 files and directories and 16
-levels; names without an empty, `.` or `..` part, `\`, control or invisible
-formatting characters; only regular files and directories (a symlink or a
-special file is refused, in a zip and in a clone); modes rewritten to
+it came from: at most 10 MB of files, 1,000 files and directories, 16
+levels and paths of 1,024 bytes (so a deep tree of long names is refused
+before the file system answers `ENAMETOOLONG`); names without an empty, `.`
+or `..` part, `\`, control or invisible formatting characters; only regular
+files and directories (a symlink or a special file in a zip is refused; a
+clone checks symlinks out as plain files holding their targets, and a
+symlink found in any tree is refused); modes rewritten to
 `0755` for directories and `0644`, or `0755` with an execute bit, for files.
 A `.zip` is read with the `zip` crate (MIT) with only
 `deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`
 and `typed-path`: stored or deflated entries, none encrypted, each counted
 as it inflates against its declared size, so a small archive can't unpack
 past the cap. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
-top or in the only top-level directory, at most 256 KB of UTF-8; its front
-matter, at most 16 KB between `---` lines, is read with `serde_norway`
+top or in the only top-level directory (anything else, a lone file at the
+top included, is "no SKILL.md"), at most 256 KB of UTF-8; its front
+matter, at most 16 KB between `---` lines (YAML's `...` doesn't close it), is read with `serde_norway`
 (now a normal dependency of agentd) into the three keys agentd needs, so
 other keys are skipped rather than built: a "billion laughs" document under
 a key agentd doesn't read parses at once, and one under `allowed-hosts` or
@@ -5187,7 +5256,12 @@ a key agentd doesn't read parses at once, and one under `allowed-hosts` or
 `[a-z0-9-]{1,64}` and can't be `agentctl`; the description has 1 to 1,024
 characters; `allowed-hosts` is a list or a comma-separated line of at most
 16 `HostRule`s, so `api.anthropic.com`, IP addresses and single labels are
-refused before the owner is asked. Error replies are fixed sentences that
+refused before the owner is asked. A skill may not declare a wildcard: a
+built-in list of public suffixes would always miss some (`*.github.io`,
+`*.herokuapp.com` and the rest of the Public Suffix List's private
+section), any agent's owner can add a skill, and naming each host costs a
+skill little within 16 entries. Hosts on a port other than 443 are named
+again in the reply that asks for confirmation. Error replies are fixed sentences that
 never repeat the content. An agent has at most 32 skills besides
 `agentctl`.
 
@@ -5218,3 +5292,26 @@ an attachment from either manager's DM (and nowhere else), and both
 `persona` and `skill add` use it, so `persona <name>` with a `persona.md`
 attached works on Slack too. `download_file` answers `TooLarge` past its
 limit.
+
+### Skills reach the model only with the Skill tool
+
+**Issue.** The launch flags gave `--tools "Bash,Read,Edit,Write,Glob,Grep"`.
+Claude Code 2.1.285 lists the skills it finds in
+`$CLAUDE_CONFIG_DIR/skills` to the model only when the `Skill` tool is
+among the enabled tools; a probe against a fake API showed a mounted skill
+never appeared in the request without it. Every skill, the bundled
+`agentctl` one included, was mounted and never seen.
+
+**Solution.** `runner`'s `TOOLS`, and the design's launch flags, add
+`Skill`. A runner test fails if `--tools` lacks it, and the fakes and
+tests that spell the flags out follow.
+
+### Commands always have skills
+
+**Issue.** `Commands` took its `Skills` through an optional
+`with_skills`, only so that tests could build one without it, which needed
+`Arc::make_mut` and a "not available" branch agentd never took.
+
+**Solution.** `Commands::new` takes the `Skills`. Tests that never run a
+skill command pass one over a data directory that doesn't exist, which
+nothing reads until a skill command runs.

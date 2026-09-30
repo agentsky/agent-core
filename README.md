@@ -119,8 +119,8 @@ own network, only over `https` and only from a host whose addresses are all
 public, and keeps skills in `skills/` under `store.data_dir`, mounted
 read-only into the agent's sandboxes. A skill whose `SKILL.md` lists
 `allowed-hosts` waits until the owner confirms them with
-`skill confirm <name> <skill>`; those hosts then extend `[proxy] allow` for
-that agent's sandboxes only.
+`skill confirm <name> <skill>`; those hosts, each named in full (no
+wildcards), then extend `[proxy] allow` for that agent's sandboxes only.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask

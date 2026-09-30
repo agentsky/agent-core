@@ -569,8 +569,11 @@ declare `allowed-hosts:` in its front matter; it is held back until the
 owner confirms those hosts with `/agent skill confirm`, and they then extend
 the egress allowlist for that agent's sandboxes only, never to
 `api.anthropic.com` or private and metadata addresses. Skills reach a
-conversation when its process next starts; removing one revokes its hosts
-at once.
+conversation when its process next starts; removing one refuses new
+connections to its hosts at once, and connections already open end within
+the egress proxy's idle and lifetime limits. Claude Code shows the model
+its skills only when the `Skill` tool is enabled, so the launch flags
+enable it.
 
 One bundled skill documents `agentctl`, and every agent has it. Its token is one per `claude`
 process, scoped to one agent, scope and session, and bound to the session's
@@ -586,7 +589,7 @@ Launch flags:
 
 ```text
 claude -p --input-format stream-json --output-format stream-json --verbose \
-  --tools "Bash,Read,Edit,Write,Glob,Grep" --strict-mcp-config \
+  --tools "Bash,Read,Edit,Write,Glob,Grep,Skill" --strict-mcp-config \
   --setting-sources user --permission-mode bypassPermissions \
   --append-system-prompt-file /agent/persona.md \
   --session-id <uuid> | --resume <uuid>
@@ -753,7 +756,8 @@ for Rocket.Chat bindings.
 | Private files left behind for later channel turns | Private resources only run in the owner's private sandbox. Channel sandboxes never mount them. |
 | Concurrent threads corrupt a shared checkout | One working directory per session, a lock for the scope's shared paths. |
 | Model exfiltrates the real token | The real token never enters the sandbox. |
-| A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, apply to that agent only, and pass the same checks as configured rules. |
+| A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, name each host (no wildcards), apply to that agent only, and pass the same checks as configured rules. |
+| A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
 | Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |

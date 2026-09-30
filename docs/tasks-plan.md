@@ -1717,7 +1717,7 @@ Deliverables:
   launch flags:
   - `--session-id <id>` when the session has never started, `--resume <id>`
     otherwise.
-  - `--tools "Bash,Read,Edit,Write,Glob,Grep"`, `--strict-mcp-config`,
+  - `--tools "Bash,Read,Edit,Write,Glob,Grep,Skill"`, `--strict-mcp-config`,
     `--setting-sources user`, `--permission-mode bypassPermissions` and
     `--append-system-prompt-file <persona path>`.
   - `--model <m>` when the router chose one.
@@ -2251,6 +2251,8 @@ Notes from implementing it
 - An upload is a `.md` (up to 256 KB) or a `.zip` (up to 10 MB, unpacked
   too); both surfaces' manager DMs pass their files to the handlers, so a
   `persona.md` attached on Slack works now too.
+- The launch flags enable the `Skill` tool: without it Claude Code never
+  tells the model about the mounted skills.
 
 ## Phase 3: requester-pays (design milestone 3)
 
@@ -2851,6 +2853,15 @@ Not scheduled. Each needs a decision before it becomes a task.
   clear of agentd's networks, the egress network's other services and the
   Docker gateway. It must never apply to `EgressExtension` rules, which
   any agent's owner can add through a skill (T25), nor to wildcards.
+- **Cloning skills in a throwaway container.** T25's `git` clone runs
+  inside agentd, whose container holds the Docker socket, so a `git` bug a
+  hostile server can reach would reach the socket too (design, Security).
+  Running each clone in a short-lived container on the egress network,
+  without the socket or agentd's data volume, writing into a volume agentd
+  then checks, would take that away.
+- **Skills of deleted agents.** T25 keeps a deleted agent's skill rows and
+  files, as the persona is kept. Deleting them with the agent, or at a
+  later purge, needs a decision on what `delete` keeps.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.
