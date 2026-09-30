@@ -11,6 +11,7 @@ use agentd::{App, Config, slack};
 use core_types::{SendError, Sender, Sink};
 use surface_slack::{BindingRef, SlackInbound};
 use testkit::slack as fixtures;
+use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -50,9 +51,12 @@ impl Running {
         let server = Server::bind(app.clone(), routers).await.unwrap();
         let public = server.addrs().public;
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(server.run(async {
-            let _ = stopped.await;
-        }));
+        let task = tokio::spawn(server.run(
+            async {
+                let _ = stopped.await;
+            },
+            std::future::pending(),
+        ));
         Self {
             app,
             public,
@@ -198,7 +202,7 @@ async fn retries_are_dropped_through_the_store() {
 
     assert!(
         !app.store()
-            .mark_event_processed("slack:manager", "Ev0USERCHG1")
+            .mark_event_processed("slack:manager", "Ev0USERCHG1", OffsetDateTime::now_utc())
             .await
             .unwrap(),
         "the event id is not in processed_events"
