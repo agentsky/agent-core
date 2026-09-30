@@ -506,41 +506,43 @@ async fn lock(
 ) -> Result<Json<LockResponse>, ApiError> {
     let request: LockRequest = json_body(body, "lock")?;
     let store = ctl.store();
-    let volume = &caller.token.volume;
-    let holder = caller.token.session;
+    let (token, turn) = (&caller.hash, caller.turn.id);
     let ttl = ctl.settings().lease_ttl;
     let now = OffsetDateTime::now_utc();
+    let held = |lease, expires_at: OffsetDateTime| LockResponse::Held {
+        lease,
+        expires_at,
+        seconds_left: u64::try_from(expires_at.unix_timestamp() - now.unix_timestamp())
+            .unwrap_or(0),
+    };
     let failed = |err: store::StoreError| internal("a scope lock query", &err);
     let response = match request {
         LockRequest::Acquire => match store
-            .acquire_scope_lock(volume, holder, now, ttl)
+            .acquire_scope_lock(token, turn, now, ttl)
             .await
             .map_err(failed)?
         {
-            Some(lease) => LockResponse::Held {
-                lease: lease.lease,
-                expires_at: lease.expires_at,
-            },
+            Some(lease) => held(lease.lease, lease.expires_at),
             None => LockResponse::Busy,
         },
         LockRequest::Renew { lease } => match store
-            .renew_scope_lock(volume, holder, lease, now, ttl)
+            .renew_scope_lock(token, turn, lease, now, ttl)
             .await
             .map_err(failed)?
         {
-            Some(expires_at) => LockResponse::Held { lease, expires_at },
+            Some(expires_at) => held(lease, expires_at),
             None => LockResponse::Released,
         },
         LockRequest::Release { lease } => {
             store
-                .release_scope_lock(volume, holder, lease)
+                .release_scope_lock(token, lease)
                 .await
                 .map_err(failed)?;
             LockResponse::Released
         }
     };
     tracing::debug!(
-        session = %holder,
+        session = %caller.token.session,
         op = ?request,
         state = ?response,
         "agentctl lock"

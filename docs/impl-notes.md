@@ -2135,11 +2135,34 @@ closed port.
 one-second lease can end almost at once.
 
 **Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`). agentctl
-relies on it only until one second before its expiry, since another command
-may take the lock at the expiry itself, and renews it when a third of that
-remaining time has passed, at least every 200 ms. A `ttl` below one second
-counts as one, and agentctl needs a lease of at least two seconds. Tests
-that renew use a 3-second lease.
+relies on it only until two seconds before its `seconds_left` (below) have
+passed: one for the rounding, and one because another command may take the
+lock at the expiry itself. It renews it when a third of that remaining time
+has passed, at least every 200 ms. A `ttl` below one second counts as one.
+agentctl needs a lease of at least three seconds: a new lease that leaves
+less than half a second before that point, enough to wait 200 ms and renew,
+is released at once, and `lock` fails with "the shared/ lock's lease is too
+short to hold". With a two-second lease the deadline came at the grant, and
+a first renewal lost the race about one run in five. Tests that renew use a
+3-second lease.
+
+### The lease is timed on agentctl's clock
+
+**Issue.** agentctl compared the lease's `expires_at`, from agentd's wall
+clock, with the sandbox's clock. Probes against the binary showed a server
+40 seconds behind made every lease look expired, so `lock` killed its
+command at once, and one 5 seconds ahead let the command run 5 seconds past
+the real expiry, under the next holder.
+
+**Solution.** `LockResponse::Held` also carries `seconds_left`, which agentd
+computes from the same clock and second it stored the lease with
+(`expires_at` minus now, in whole seconds; the lease really lasts between
+`seconds_left - 1` and `seconds_left`). agentctl times the lease on its
+monotonic clock from when it sent the request: its deadline is the send
+instant plus `seconds_left`, minus a second for rounding and a second of
+margin. agentd measured no earlier than the send, so a slow answer only
+makes the deadline earlier. `expires_at` stays in the response for logs and
+other readers.
 
 ### What agentctl does when it loses the lock
 
@@ -2151,16 +2174,35 @@ timeout, so a renewal agentd never answered let the command keep writing
 past the lease's expiry, and delayed `SIGTERM` by as long.
 
 **Solution.** The renewal runs in the same `select!` as the command's exit,
-the stop signals and a deadline one second before the lease's expiry, and
-its request timeout is capped at the time left until that deadline. A
-refused renewal, or no successful renewal by the deadline, means another
-command may soon hold the lock, so agentctl kills its command and exits 1
-with "lost the shared/ lock (…); stopped the command". On `SIGTERM`,
-`SIGINT` or `SIGHUP` it kills the command, releases the lease and exits
-with 128 plus the signal. The signal handlers are installed before the
-lease is acquired and kept until the release is sent, so a signal is never
-lost in between, and the release waits at most two seconds, after which the
-lease expires on its own. agentctl waits at most 100 seconds for the lock
+the stop signals and the lease's deadline, and its request timeout is capped
+at the time left until that deadline. A renewal agentd refused (the lease
+expired or was released, no turn, a revoked token), or no successful
+renewal by the deadline, means another command may soon hold the lock, so
+agentctl kills its command's process group with `SIGKILL` at once and exits
+1 with "lost the shared/ lock (…); stopped the command". A renewal that
+failed in transit, or that agentd answered with its internal error ("agentd
+failed; try again", say a busy SQLite database), is retried until the
+deadline: a probe that returned one 500 during a 30-second lease had killed
+the command with 19 seconds of the lease left. The signal handlers are
+installed before the lease is acquired and kept until the release is sent,
+so a signal is never lost in between, and the release waits at most two
+seconds, after which the lease expires on its own.
+
+On `SIGTERM`, `SIGINT` or `SIGHUP` while the command runs, agentctl passes
+the same signal on to the command's process group, which being its own
+group no longer gets a terminal's signals, waits up to two seconds for the
+command to exit (never past the lease's deadline), and then kills the group
+with `SIGKILL`. A `SIGKILL` at once had left `git` no chance to remove its
+`index.lock`. The command is left unreaped while agentctl waits
+(`waitid` with `WNOWAIT`), so the group's id can't be reused before the
+kill. agentctl then releases the lease and exits with 128 plus the signal.
+
+A signal while an acquire is in flight used to drop the request, and a
+lease agentd granted for it held the lock with nobody renewing it, for up
+to 30 seconds. agentctl now lets a request already sent finish, for up to
+two seconds, releases the lease if it was granted, and exits with 128 plus
+the signal without running the command. A signal between attempts exits at
+once. agentctl waits at most 100 seconds for the lock
 by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
 a command by default, so the model sees why it failed rather than a killed
 command.
@@ -2182,7 +2224,11 @@ while the command hasn't been reaped, so its id can't have been reused. A
 process that leaves the group (`setsid`, say) escapes, processes the
 command leaves running when it exits on its own are not stopped, and an
 agentctl killed with `SIGKILL` leaves its command running once the lease
-expires. Being in its own group, the command is not in the terminal's
+expires. So does a caller that kills agentctl alone: if Claude Code's Bash
+tool kills a command that runs past its timeout through the command's
+process group, agentctl's command is no longer in that group and survives
+it. Whether the CLI kills the group or the process, and with which signal,
+has to be checked against the real CLI; T23's live check does. Being in its own group, the command is not in the terminal's
 foreground group, so it can't read from a terminal; agentctl runs under the
 model's Bash tool, which gives it none. The lock is a guard for cooperating
 commands, as the design's "scope-level lock that `agentctl` takes for
@@ -2200,8 +2246,18 @@ transaction that records or clears a token's turn (`set_ctl_turn`), deletes
 the token (`delete_ctl_token`), or replaces it with a new token for the
 session (`put_ctl_token`). A lease lasts no longer than the turn that took
 it, and the lock is free as soon as `end_turn` or `revoke_process_token`
-returns. An acquire authorized just before the turn ended can still land
-after the delete; that lease can't be renewed, and expires on its own.
+returns.
+
+That alone didn't hold when `begin_turn` replaced a turn still recorded on
+the token: an acquire authorized under the first turn could land after the
+second turn's delete, and its lease was then renewed under the second turn.
+So acquire and renew name the token's digest and the turn they were
+authorized under, and each is one statement that takes the volume and
+session from the token's row only while it still records that turn
+(`INSERT … SELECT … FROM ctl_tokens WHERE hash = ? AND turn_id = ?`, and
+`… (volume_key, holder_session) IN (SELECT …)` for renew). A request
+authorized under a replaced or ended turn grants and renews nothing. Release
+names only the token, since giving a lease back is always safe.
 
 ### `lock` is refused inside private tasks
 
