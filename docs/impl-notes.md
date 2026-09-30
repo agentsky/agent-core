@@ -3950,9 +3950,10 @@ twice an hour, not every minute, until it is fixed or deleted.
 **Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
 failed under CPU load, always at "the pass retired the bot": 1 of 200
 runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
-server to count no connections, then read the binding once. A pass stops a connection by signalling its task, which
-closes the socket on its own while the pass goes on to `abandon_stale` and
-`retire_pending`, so the socket can close before `mark_retired` runs.
+server to count no connections, then read the binding once. A pass stops a
+connection by signalling its task, which closes the socket on its own while
+the pass goes on to `abandon_stale` and `retire_pending`, so the socket can
+close before `mark_retired` runs.
 Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
 The order can also flip: a delete that lands between a pass's `reconcile`
 and its `retire_pending` is retired by that pass and disconnected by the
@@ -3972,8 +3973,17 @@ and sent `users.create`", and a 300 ms response delay for "the abandonment
 lands before the response". Adding 150 ms before the username is recorded
 failed it 10 of 10 runs. Its `users.create` response is now held until the
 test has abandoned the creation, so the abandonment always lands while the
-request is in flight; it passes 10 of 10 with the 150 ms added. The tests install no tracing subscriber, so
-`RUST_LOG` doesn't change their timing.
+request is in flight; it passes 10 of 10 with the 150 ms added.
+
+The hold is `testkit::Held`, and the other tests that slept and assumed a
+delayed response was still on its way now use it too: the auth tests that
+act during a refresh, the command test that expects a second member's reply
+while the first member's login is out, and the Slack test that changes the
+managed bots during a member refresh. Each waits for its request to arrive,
+acts, then releases the response, and fails after 30 seconds rather than
+hanging when the request never comes. The logout test only waits for its
+refresh to arrive: logout queues behind that refresh on the member's lock,
+so holding the response would deadlock, and either order ends the same.
 
 ### Before turns, a bot reacts instead of replying
 

@@ -12,6 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use store::{NewClaudeLink, Sealer, Store};
+use testkit::{Held, Hold};
 use time::OffsetDateTime;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1094,7 +1095,10 @@ async fn a_refresh_in_flight_during_logout_does_not_relink() {
         let (auth, member) = (h.auth.clone(), h.member);
         tokio::spawn(async move { auth.access_token(member).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    eventually("the refresh is sent", || async {
+        !requests_to(&h.server, TOKEN_PATH).await.is_empty()
+    })
+    .await;
     assert!(h.auth.logout(h.member).await.unwrap());
     refresh.await.unwrap().unwrap();
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
@@ -1107,11 +1111,10 @@ async fn a_refresh_in_flight_during_logout_does_not_relink() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refresh_finishing_after_the_link_was_deleted_does_not_recreate_it() {
     let h = harness().await;
+    let (held, mut hold) = Held::new(token_response("access-2", Some("refresh-2")));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .mount(&h.server)
         .await;
     mount_profile(&h.server, "access-2", "claude_max").await;
@@ -1132,8 +1135,9 @@ async fn a_refresh_finishing_after_the_link_was_deleted_does_not_recreate_it() {
         let (auth, member) = (h.auth.clone(), h.member);
         tokio::spawn(async move { auth.access_token(member).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hold.arrived().await;
     assert!(h.store.delete_claude_link(h.member).await.unwrap());
+    hold.release();
     let err = refresh.await.unwrap().unwrap_err();
     assert!(matches!(err, AuthError::NotLinked), "{err:?}");
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
@@ -1141,6 +1145,16 @@ async fn a_refresh_finishing_after_the_link_was_deleted_does_not_recreate_it() {
         !requests_to(&h.server, REVOKE_PATH).await.is_empty()
     })
     .await;
+}
+
+async fn cancel_once_held(h: &Harness, mut hold: Hold) {
+    tokio::select! {
+        result = h.auth.access_token(h.member) => {
+            panic!("the call ended before it was cancelled: {result:?}")
+        }
+        () = hold.arrived() => {}
+    }
+    hold.release();
 }
 
 async fn stored_tokens(store: &Store, member: MemberId) -> (String, String) {
@@ -1154,20 +1168,17 @@ async fn stored_tokens(store: &Store, member: MemberId) -> (String, String) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_caller_does_not_lose_the_rotated_refresh_token() {
     let h = harness().await;
+    let (held, hold) = Held::new(token_response("access-2", Some("refresh-2")));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .expect(1)
         .mount(&h.server)
         .await;
     mount_profile(&h.server, "access-2", "claude_pro").await;
     link(&h.store, h.member, "access-1", "refresh-1", 60).await;
 
-    let cancelled =
-        tokio::time::timeout(Duration::from_millis(100), h.auth.access_token(h.member)).await;
-    assert!(cancelled.is_err());
+    cancel_once_held(&h, hold).await;
     eventually("the rotated tokens are stored", || async {
         stored_tokens(&h.store, h.member).await == ("access-2".to_owned(), "refresh-2".to_owned())
     })
@@ -1180,22 +1191,18 @@ async fn a_cancelled_caller_does_not_lose_the_rotated_refresh_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_caller_does_not_lose_the_broken_mark_or_the_notice() {
     let h = harness().await;
+    let (held, hold) =
+        Held::new(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            ResponseTemplate::new(400)
-                .set_body_json(json!({"error": "invalid_grant"}))
-                .set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .expect(1)
         .mount(&h.server)
         .await;
     link(&h.store, h.member, "access-1", "refresh-1", 60).await;
     let mut notices = h.auth.take_relink_notices().unwrap();
 
-    let cancelled =
-        tokio::time::timeout(Duration::from_millis(100), h.auth.access_token(h.member)).await;
-    assert!(cancelled.is_err());
+    cancel_once_held(&h, hold).await;
     let notice = tokio::time::timeout(Duration::from_secs(5), notices.recv())
         .await
         .unwrap();
@@ -1332,13 +1339,11 @@ async fn the_plan_is_read_after_the_members_lock_is_released() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_refresh_does_not_break_a_newer_login() {
     let h = harness().await;
+    let (held, mut hold) =
+        Held::new(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            ResponseTemplate::new(400)
-                .set_body_json(json!({"error": "invalid_grant"}))
-                .set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .expect(1)
         .mount(&h.server)
         .await;
@@ -1349,8 +1354,9 @@ async fn a_refused_refresh_does_not_break_a_newer_login() {
         let (auth, member) = (h.auth.clone(), h.member);
         tokio::spawn(async move { auth.access_token(member).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hold.arrived().await;
     link(&h.store, h.member, "access-new", "refresh-new", 3600).await;
+    hold.release();
     let token = refresh.await.unwrap().unwrap();
     assert_eq!(token.expose_secret(), "access-new");
     let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
@@ -1361,11 +1367,10 @@ async fn a_refused_refresh_does_not_break_a_newer_login() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refresh_finishing_after_a_new_login_does_not_overwrite_it() {
     let h = harness().await;
+    let (held, mut hold) = Held::new(token_response("access-2", Some("refresh-2")));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .expect(1)
         .mount(&h.server)
         .await;
@@ -1387,8 +1392,9 @@ async fn a_refresh_finishing_after_a_new_login_does_not_overwrite_it() {
         let (auth, member) = (h.auth.clone(), h.member);
         tokio::spawn(async move { auth.access_token(member).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    hold.arrived().await;
     let fresh = link(&h.store, h.member, "access-new", "refresh-new", 3600).await;
+    hold.release();
     let token = refresh.await.unwrap().unwrap();
     assert_eq!(token.expose_secret(), "access-new");
     assert_eq!(
