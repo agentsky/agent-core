@@ -32,9 +32,7 @@ Consequences:
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
-  use that license; see
-  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
+  per-crate exception.
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -239,6 +237,61 @@ for every chunk after calling `render` itself.
 **Solution.** `Surface::post` sends one already-rendered chunk, as its
 rustdoc says, and `Surface::render` does the converting and splitting. T29's
 acceptance is reworded to test `render` instead.
+
+### The scope lock had no lease id
+
+**Issue.** `LockResponse::Held` carried only an expiry, and renew and
+release named no lease: the server could match them only by session. Claude
+Code runs Bash tool calls in parallel, so one session can run two
+`agentctl lock -- …` at once. Both would get `Held`, and when the first
+command exited its `Release` would free the lock while the second command
+was still writing to `shared/`.
+
+**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
+on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
+`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
+`Release { lease }`, so a renew or release without a lease fails to
+deserialize. The lock is exclusive per lease, not per session: a second
+acquire, from any session, gets `Busy`, and a renew or release naming any
+lease but the current one answers `Released` and changes nothing. T15's
+`scope_locks` table takes `lease_id` as its primary key next to
+`holder_session`, and its acceptance tests the same-session case.
+
+### Scope keys are not file or Docker names
+
+**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
+segment" because it never contains `/`. It always contains `:`, and may
+contain `%` and any other character a platform id holds. A `:` splits a
+bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
+`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
+Docker volume after the key would break or be refused.
+
+**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
+is a key for columns, labels and logs, not a file or Docker object name. T17
+in the plan fixes how volumes are named and mounted: host directories at
+`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
+data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
+type `bind`), never `binds` strings or named Docker volumes. A digest was
+chosen over a reversible encoding of the key (hex or base32), which grows
+with the key and could pass the 255-byte file-name limit for a long
+Rocket.Chat team id; the `volumes` table records which key a directory holds.
+
+### A Slack bot message may name no user
+
+**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
+message may carry only a `bot_id` and no `user`, and the router's
+managed-bot lookup (T22) needs one key to look up. The plan did not say what
+`sender.user` holds then, or whether the router keys on `sender` or on
+`sender_bot_user`.
+
+**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
+surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
+so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
+`user`, or the `user_id` from `bots.info` (T29) when the event has only a
+`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
+has `sender_bot_user: None`; no binding has that id, so the router ignores
+it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
+section saying this, and T12, T22, T28 and T29 in the plan match it.
 
 ## T06: Slack mrkdwn
 
@@ -464,58 +517,3 @@ limit.
 closing inline code, and replacing the backtick with a look-alike would change
 the code's text. Agents rarely put backticks in inline code; a fenced block
 shows them correctly.
-
-### The scope lock had no lease id
-
-**Issue.** `LockResponse::Held` carried only an expiry, and renew and
-release named no lease: the server could match them only by session. Claude
-Code runs Bash tool calls in parallel, so one session can run two
-`agentctl lock -- …` at once. Both would get `Held`, and when the first
-command exited its `Release` would free the lock while the second command
-was still writing to `shared/`.
-
-**Solution.** A new `LeaseId` (a UUID newtype like the other ids) is minted
-on every acquire and returned in `LockResponse::Held { lease, expires_at }`.
-`LockRequest` is now an enum tagged by `op`, with `Renew { lease }` and
-`Release { lease }`, so a renew or release without a lease fails to
-deserialize. The lock is exclusive per lease, not per session: a second
-acquire, from any session, gets `Busy`, and a renew or release naming any
-lease but the current one answers `Released` and changes nothing. T15's
-`scope_locks` table takes `lease_id` as its primary key next to
-`holder_session`, and its acceptance tests the same-session case.
-
-### Scope keys are not file or Docker names
-
-**Issue.** `ScopeKey`'s rustdoc called its string "safe as one path
-segment" because it never contains `/`. It always contains `:`, and may
-contain `%` and any other character a platform id holds. A `:` splits a
-bollard `binds` entry (`src:dst:ro`), and Docker volume names allow only
-`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, so a sandbox that named a directory or a
-Docker volume after the key would break or be refused.
-
-**Solution.** The rustdoc of `ScopeKey` and `VolumeKey` now says the string
-is a key for columns, labels and logs, not a file or Docker object name. T17
-in the plan fixes how volumes are named and mounted: host directories at
-`volumes/<agent id>/<lowercase hex SHA-256 of the scope key>` in the agentd
-data directory, mounted through bollard's `Mounts` API (`HostConfig::mounts`,
-type `bind`), never `binds` strings or named Docker volumes. A digest was
-chosen over a reversible encoding of the key (hex or base32), which grows
-with the key and could pass the 255-byte file-name limit for a long
-Rocket.Chat team id; the `volumes` table records which key a directory holds.
-
-### A Slack bot message may name no user
-
-**Issue.** `InboundEvent::sender` is a required `MemberKey`, but a Slack bot
-message may carry only a `bot_id` and no `user`, and the router's
-managed-bot lookup (T22) needs one key to look up. The plan did not say what
-`sender.user` holds then, or whether the router keys on `sender` or on
-`sender_bot_user`.
-
-**Solution.** The router keys on `sender` when `sender_is_bot` is true, and a
-surface puts the bot's user id in both `sender.user` and `sender_bot_user`,
-so they never disagree: `u._id` on Rocket.Chat, and on Slack the event's
-`user`, or the `user_id` from `bots.info` (T29) when the event has only a
-`bot_id`. A bot with no known user id keeps its `bot_id` in `sender.user` and
-has `sender_bot_user: None`; no binding has that id, so the router ignores
-it as an unmanaged bot. `InboundEvent`'s rustdoc has a "Bot senders"
-section saying this, and T12, T22, T28 and T29 in the plan match it.
