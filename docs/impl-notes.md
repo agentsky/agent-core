@@ -5132,9 +5132,12 @@ conversation, and `Origin::conversation` gives it, or for `!agent` the room,
 on the sender's team. In the manager bot's DM there is no conversation to
 reset, so `here` is refused there with how to send it. A message there has
 no conversation, but a Slack slash command sent there names the DM like any
-other, so when `here` finds no session, the conversation is compared with
-the manager's DM with the owner (`Replies::dm_room`, a
-`conversations.open`) and the command refused the same way. A DM with the
+other, so when a slash command's `here` finds no session, its conversation
+is compared with the manager's DM with the owner (`Replies::dm_room`, a
+`conversations.open`) and the command refused the same way. Only a slash
+command is compared: on Rocket.Chat the manager bot's DM always arrives as
+`Origin::RocketChatDm`, and opening it (`users.info` and `im.create`) would
+only cost two calls for an answer known beforehand. A DM with the
 agent's bot is a room like any other (T13), so `!agent reset <name> here`
 there resets the owner's DM session, and in a room only the agent's bot is
 in the agent's connection hears it, as T14 made every connection feed the
@@ -5200,9 +5203,29 @@ could outlast a Slack `response_url`, which expires after 30 minutes.
 
 **Solution.** Every reset is issued at once (`join_all`) and polled once
 before the reply, so each is queued on its session before the owner reads
-"Resetting". There is no cap on how many run at once: the idle sessions'
-containers stop in parallel, and their rows' short write transactions wait
-their turn in the store's pool and busy timeout. Waiting for them to end is
+"Resetting". That poll runs under `tokio::task::unconstrained`: Tokio's
+cooperative budget allows 128 operations per task poll (tokio 1.53), each
+lock taken on an idle session spends one, and once it is spent a lock
+returns `Pending` before joining the mutex's queue, so a plain poll left
+every idle session past about the 128th out of its queue until after the
+reply.
+
+Once a reset holds its session, it takes one of 8 permits
+(`RESETS_AT_ONCE` in `commands/sessions.rs`) before stopping the container
+and writing the row, and lets it go when it ends. Without a cap, a reset of
+thousands of sessions ran as many `BEGIN IMMEDIATE` transactions at once
+against the store's pool of 10 connections: with 2,000 an unrelated `ping`
+waited 3 seconds, and every other agent's turns waited behind them, or past
+the pool's 30-second acquire timeout. The permits are one
+semaphore in `Commands`, shared by every reset command, and
+`SessionManager::reset` takes it as an argument and acquires it inside the
+session's slot, so the reset is already queued while it waits for a
+permit, and it waits on no other session while it holds one. Without a
+runner, a store-only reset takes the same permits. A reset waiting for a
+permit holds its session, so a turn sent there after the command waits for
+it, as it would for the reset itself.
+
+Waiting for them to end is
 the command's `FollowUp`: the intake releases the member's command order
 once the reply is sent and then runs the follow-up in the same task, so the
 owner's next command goes ahead. If a reset fails (a container that can't be
@@ -5213,3 +5236,11 @@ drain ends is dropped with the intake's tasks, and its reset leaves the
 queue without resetting. The follow-up lives only in memory: if the instance
 dies, the queued resets die with it and nothing is reset, which the owner
 sees in `sessions` and can send again.
+
+The follow-up isn't polled while the reply is being sent. A reset queued on
+a busy session whose turn ends in that window is handed the session's lock,
+but runs only once the reply is sent, so the session's next turn waits for
+the reply's round trip too. Driving the follow-up alongside the reply would
+need the failure DM held back until the reply is out, and the resets task
+aborted with the intake at shutdown, which isn't worth a delay of one
+reply.

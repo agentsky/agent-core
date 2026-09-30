@@ -17,13 +17,15 @@
 //!   it is refused in the direct message with the manager bot. Every reset
 //!   joins its session's queue at once, behind the turns queued before it
 //!   ([`SessionManager::reset`]), so a message sent after the command
-//!   starts the new conversation. It stops the warm process and container
-//!   first, and gives the conversation a new session id, which its next
-//!   turn starts with `--session-id`. The reply comes as soon as the
-//!   resets are queued, and waiting for them to end is a [`FollowUp`],
-//!   which holds up none of the owner's later commands. A session whose
-//!   container can't be stopped isn't reset, and the owner is told in a
-//!   direct message from the manager bot.
+//!   starts the new conversation. Once a reset holds its session it waits
+//!   for one of [`RESETS_AT_ONCE`] permits, shared by every reset, so a
+//!   big reset doesn't take the whole store pool. It stops the warm process
+//!   and container first, and gives the conversation a new session id,
+//!   which its next turn starts with `--session-id`. The reply comes as
+//!   soon as the resets are queued, and waiting for them to end is a
+//!   [`FollowUp`], which holds up none of the owner's later commands. A
+//!   session whose container can't be stopped isn't reset, and the owner
+//!   is told in a direct message from the manager bot.
 //!
 //! The runner reaches the commands through [`SessionControl`], which
 //! [`Turns`](crate::pipeline::Turns) hands over when it starts. Without a
@@ -46,6 +48,7 @@ use store::{Session, SessionKind};
 use surface_rocketchat::rest::RoomType;
 use time::OffsetDateTime;
 use time::macros::format_description;
+use tokio::sync::Semaphore;
 
 use super::agents::no_such_agent;
 use super::{Commands, Failure, FollowUp, Origin};
@@ -53,19 +56,27 @@ use super::{Commands, Failure, FollowUp, Origin};
 /// The most sessions `sessions` lists.
 pub const MAX_LISTED: usize = 20;
 
+/// How many resets stop containers and write to the store at once.
+pub(super) const RESETS_AT_ONCE: usize = 8;
+
 /// What the session commands need from the runner.
 #[async_trait]
 pub trait SessionControl: Send + Sync {
     /// Resets `session` once the turns queued before it have run, stopping
     /// its warm process and container first. Returns its replacement, or
     /// `None` for a private task's session and one already reset. The reset
-    /// joins the session's queue when the future is first polled.
+    /// joins the session's queue when the future is first polled, and once
+    /// it holds the session it does its work with a permit of `permits`.
     ///
     /// # Errors
     ///
     /// [`RunnerError::Sandbox`] if the warm container couldn't be stopped,
     /// and the session isn't reset; [`RunnerError::Store`].
-    async fn reset(&self, session: SessionId) -> Result<Option<Session>, RunnerError>;
+    async fn reset(
+        &self,
+        session: SessionId,
+        permits: Arc<Semaphore>,
+    ) -> Result<Option<Session>, RunnerError>;
 
     /// The sessions that have a warm container, or a turn running.
     fn warm_sessions(&self) -> Vec<SessionId>;
@@ -73,8 +84,12 @@ pub trait SessionControl: Send + Sync {
 
 #[async_trait]
 impl<H: TurnHooks> SessionControl for SessionManager<H> {
-    async fn reset(&self, session: SessionId) -> Result<Option<Session>, RunnerError> {
-        SessionManager::reset(self, session).await
+    async fn reset(
+        &self,
+        session: SessionId,
+        permits: Arc<Semaphore>,
+    ) -> Result<Option<Session>, RunnerError> {
+        SessionManager::reset(self, session, permits).await
     }
 
     fn warm_sessions(&self) -> Vec<SessionId> {
@@ -232,7 +247,7 @@ impl Commands {
             .collect();
         if ids.is_empty() {
             return done(match &conv {
-                Some(conv) if self.is_manager_dm(key, conv).await => {
+                Some(_) if self.is_manager_dm(key, origin).await => {
                     here_elsewhere(key.surface, name, origin)
                 }
                 Some(_) => format!("`{name}` has no session here to reset."),
@@ -241,7 +256,7 @@ impl Commands {
         }
         let count = ids.len();
         let mut resets = Box::pin(self.clone().reset_all(control, ids));
-        let queued = futures::poll!(resets.as_mut());
+        let queued = futures::poll!(tokio::task::unconstrained(resets.as_mut()));
         let place = if here { " here" } else { "" };
         let reply = if count == 1 {
             format!(
@@ -286,9 +301,14 @@ impl Commands {
         Ok((reply, follow_up))
     }
 
-    /// Whether `conv` is the manager bot's direct message with `key`, where
-    /// no agent answers. A Slack slash command sent there names it.
-    async fn is_manager_dm(&self, key: &MemberKey, conv: &ConvRef) -> bool {
+    /// Whether `origin` is a Slack slash command sent in the manager app's
+    /// direct message with `key`, where no agent answers. Elsewhere the
+    /// manager bot's DM is never a command's conversation: a message there
+    /// is [`Origin::SlackDm`] or [`Origin::RocketChatDm`].
+    async fn is_manager_dm(&self, key: &MemberKey, origin: &Origin) -> bool {
+        let Origin::SlackSlash { conv, .. } = origin else {
+            return false;
+        };
         if conv.surface != key.surface || conv.team != key.team {
             return false;
         }
@@ -302,7 +322,8 @@ impl Commands {
     }
 
     /// Resets the sessions `ids`, all at once, so each joins its session's
-    /// queue as soon as this is first polled.
+    /// queue as soon as this is first polled. Their work is bounded by the
+    /// shared permits, taken once each holds its session.
     async fn reset_all(
         self,
         control: Option<Arc<dyn SessionControl>>,
@@ -323,15 +344,18 @@ impl Commands {
     /// Resets `session` through the runner if there is one, or else in the
     /// store, and returns whether it worked.
     async fn reset_one(&self, control: Option<&dyn SessionControl>, session: SessionId) -> bool {
+        let permits = Arc::clone(&self.inner.resets);
         let reset = match control {
-            Some(control) => control.reset(session).await.map(drop),
-            None => self
-                .inner
-                .store
-                .reset_session(session, OffsetDateTime::now_utc())
-                .await
-                .map(drop)
-                .map_err(RunnerError::from),
+            Some(control) => control.reset(session, permits).await.map(drop),
+            None => {
+                let _permit = permits.acquire_owned().await;
+                self.inner
+                    .store
+                    .reset_session(session, OffsetDateTime::now_utc())
+                    .await
+                    .map(drop)
+                    .map_err(RunnerError::from)
+            }
         };
         if let Err(error) = &reset {
             tracing::warn!(%session, %error, "couldn't reset a session");

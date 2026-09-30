@@ -216,6 +216,7 @@ struct Inner {
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
     sessions: Mutex<Option<Weak<dyn SessionControl>>>,
+    resets: Arc<tokio::sync::Semaphore>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -253,6 +254,7 @@ impl Commands {
                 rocketchat,
                 slack,
                 sessions: Mutex::new(None),
+                resets: Arc::new(tokio::sync::Semaphore::new(sessions::RESETS_AT_ONCE)),
             }),
         }
     }

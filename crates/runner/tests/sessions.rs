@@ -24,7 +24,7 @@ use sandbox::{
 use secrecy::SecretString;
 use store::{Sealer, Store};
 use testkit::{FakeAnthropic, Turn};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing_subscriber::fmt::MakeWriter;
 
 struct TempDir(PathBuf);
@@ -771,7 +771,7 @@ async fn reset_starts_with_a_new_id() {
     reply(&h.run(old.id, request("one")).await);
     let new = h
         .manager
-        .reset(old.id)
+        .reset(old.id, permits())
         .await
         .unwrap()
         .expect("a replacement");
@@ -802,7 +802,38 @@ async fn reset_starts_with_a_new_id() {
             .await,
         Err(RunnerError::UnknownSession)
     ));
-    assert_eq!(h.manager.reset(old.id).await.unwrap(), None);
+    assert_eq!(h.manager.reset(old.id, permits()).await.unwrap(), None);
+}
+
+fn permits() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(1))
+}
+
+#[tokio::test]
+async fn a_reset_holds_its_session_until_a_permit_is_free() {
+    let h = Harness::new(&[Turn::reply("old")]).await;
+    let old = h.thread_session("1.1").await;
+    reply(&h.run(old.id, request("one")).await);
+    let permits = Arc::new(Semaphore::new(0));
+    let waiting = tokio::time::timeout(
+        Duration::from_millis(100),
+        h.manager.reset(old.id, Arc::clone(&permits)),
+    )
+    .await;
+    assert!(waiting.is_err(), "the reset waits for a permit");
+    assert!(!h.events().contains(&Event::ContainerStopped(old.id)));
+    assert_eq!(
+        h.store.session(old.id).await.unwrap().unwrap().reset_at,
+        None
+    );
+    permits.add_permits(1);
+    assert_eq!(
+        h.manager.reset(old.id, permits).await.unwrap(),
+        None,
+        "a reset queued behind the first finds the session reset"
+    );
+    assert!(h.events().contains(&Event::ContainerStopped(old.id)));
+    assert!(!h.manager.is_warm(old.id));
 }
 
 #[tokio::test]

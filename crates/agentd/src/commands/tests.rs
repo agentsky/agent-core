@@ -2,6 +2,7 @@
 //! endpoints.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -744,12 +745,12 @@ async fn a_relink_notice_is_sent_once_per_break_across_instances() {
 
 /// Opens no DM: every open fails, and each try is counted.
 #[derive(Default)]
-struct DeadDms(std::sync::atomic::AtomicUsize);
+struct DeadDms(AtomicUsize);
 
 #[async_trait]
 impl OpenDm for DeadDms {
     async fn open_dm(&self, _: &MemberKey) -> Result<ConversationId, SurfaceError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_add(1, Ordering::SeqCst);
         Err(SurfaceError::Transport("down".into()))
     }
 }
@@ -809,7 +810,7 @@ async fn an_unreachable_member_is_retried_with_growing_waits_then_given_up_once(
         dms.clone(),
     ));
     let notifier = RelinkNotifier::new(h.store.clone(), Replies::new(Some(bot)));
-    let tries = || dms.0.load(std::sync::atomic::Ordering::SeqCst);
+    let tries = || dms.0.load(Ordering::SeqCst);
     let mut now = OffsetDateTime::now_utc();
     let mut waits = Vec::new();
     for _ in 0..RELINK_MAX_ATTEMPTS {
@@ -1030,43 +1031,79 @@ async fn agent_commands_without_rocketchat_agents() {
     assert_eq!(h.last_reply("alice"), "Deleted `helper`.");
 }
 
-/// A runner for the session commands: warm sessions are listed, and
-/// resets go to the store once the gate lets them through, except for
-/// sessions whose sandbox won't stop.
+/// A runner for the session commands: warm sessions are listed, and a
+/// reset holds its session's lock, then takes a permit and goes to the store
+/// once the gate lets it through, except for sessions whose sandbox won't
+/// stop.
 struct FakeRunner {
     store: Store,
+    mock: Arc<MockSurface>,
     warm: std::sync::Mutex<std::collections::HashSet<core_types::SessionId>>,
     stuck: std::sync::Mutex<std::collections::HashSet<core_types::SessionId>>,
-    resets: std::sync::Mutex<Vec<core_types::SessionId>>,
+    slots: std::sync::Mutex<
+        std::collections::HashMap<core_types::SessionId, Arc<tokio::sync::Mutex<()>>>,
+    >,
+    resets: std::sync::Mutex<Vec<(core_types::SessionId, usize)>>,
+    working: AtomicUsize,
+    most_working: AtomicUsize,
     gate: tokio::sync::Semaphore,
 }
 
 impl FakeRunner {
-    fn new(store: &Store) -> Arc<Self> {
-        Self::with_gate(store, tokio::sync::Semaphore::MAX_PERMITS)
+    fn new(h: &Harness) -> Arc<Self> {
+        Self::with_gate(h, tokio::sync::Semaphore::MAX_PERMITS)
     }
 
     /// A runner whose resets each wait for a permit of its gate, which
     /// starts closed.
-    fn gated(store: &Store) -> Arc<Self> {
-        Self::with_gate(store, 0)
+    fn gated(h: &Harness) -> Arc<Self> {
+        Self::with_gate(h, 0)
     }
 
-    fn with_gate(store: &Store, permits: usize) -> Arc<Self> {
+    fn with_gate(h: &Harness, permits: usize) -> Arc<Self> {
         Arc::new(Self {
-            store: store.clone(),
+            store: h.store.clone(),
+            mock: Arc::clone(&h.mock),
             warm: std::sync::Mutex::default(),
             stuck: std::sync::Mutex::default(),
+            slots: std::sync::Mutex::default(),
             resets: std::sync::Mutex::default(),
+            working: AtomicUsize::new(0),
+            most_working: AtomicUsize::new(0),
             gate: tokio::sync::Semaphore::new(permits),
         })
     }
 
-    /// The sessions whose reset has been asked for, sorted.
+    /// The sessions whose reset holds their lock, sorted.
     fn resets(&self) -> Vec<core_types::SessionId> {
-        let mut resets = self.resets.lock().unwrap().clone();
+        let mut resets: Vec<_> = self
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, _)| *session)
+            .collect();
         resets.sort();
         resets
+    }
+
+    /// How many resets held their session's lock before the manager bot
+    /// posted anything.
+    fn held_before_any_post(&self) -> usize {
+        self.resets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, posts)| *posts == 0)
+            .count()
+    }
+
+    fn working(&self) -> usize {
+        self.working.load(Ordering::SeqCst)
+    }
+
+    fn most_working(&self) -> usize {
+        self.most_working.load(Ordering::SeqCst)
     }
 }
 
@@ -1075,14 +1112,28 @@ impl SessionControl for FakeRunner {
     async fn reset(
         &self,
         session: core_types::SessionId,
+        permits: Arc<tokio::sync::Semaphore>,
     ) -> Result<Option<store::Session>, runner::RunnerError> {
-        self.resets.lock().unwrap().push(session);
+        let slot = Arc::clone(self.slots.lock().unwrap().entry(session).or_default());
+        let _held = slot.lock_owned().await;
+        let posts = self.mock.posts().len();
+        self.resets.lock().unwrap().push((session, posts));
+        let _permit = permits.acquire_owned().await.unwrap();
+        let working = self.working.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most_working.fetch_max(working, Ordering::SeqCst);
         self.gate.acquire().await.unwrap().forget();
-        if self.stuck.lock().unwrap().contains(&session) {
-            return Err(sandbox::SandboxError::NotFound.into());
-        }
-        self.warm.lock().unwrap().remove(&session);
-        Ok(self.store.reset_session(session, at(10_000)).await?)
+        let reset: Result<_, runner::RunnerError> = if self.stuck.lock().unwrap().contains(&session)
+        {
+            Err(sandbox::SandboxError::NotFound.into())
+        } else {
+            self.warm.lock().unwrap().remove(&session);
+            self.store
+                .reset_session(session, at(10_000))
+                .await
+                .map_err(Into::into)
+        };
+        self.working.fetch_sub(1, Ordering::SeqCst);
+        reset
     }
 
     fn warm_sessions(&self) -> Vec<core_types::SessionId> {
@@ -1305,7 +1356,7 @@ fn sorted<const N: usize>(ids: [core_types::SessionId; N]) -> Vec<core_types::Se
 async fn sessions_lists_the_sessions_in_use_most_recent_first() {
     let h = harness().await;
     let s = h.sessions().await;
-    let runner = FakeRunner::new(&h.store);
+    let runner = FakeRunner::new(&h);
     runner
         .warm
         .lock()
@@ -1336,7 +1387,7 @@ async fn sessions_lists_the_sessions_in_use_most_recent_first() {
 async fn reset_without_here_resets_every_session_in_use_of_the_senders_agent() {
     let h = harness().await;
     let s = h.sessions().await;
-    let runner = FakeRunner::new(&h.store);
+    let runner = FakeRunner::new(&h);
     let control: Arc<dyn SessionControl> = runner.clone();
     h.commands.use_sessions(Arc::downgrade(&control));
 
@@ -1401,7 +1452,7 @@ async fn reset_without_here_resets_every_session_in_use_of_the_senders_agent() {
 async fn reset_here_resets_only_the_conversations_sessions() {
     let h = harness().await;
     let s = h.sessions().await;
-    let runner = FakeRunner::new(&h.store);
+    let runner = FakeRunner::new(&h);
     let control: Arc<dyn SessionControl> = runner.clone();
     h.commands.use_sessions(Arc::downgrade(&control));
 
@@ -1453,7 +1504,7 @@ async fn reset_here_resets_only_the_conversations_sessions() {
 async fn a_session_whose_sandbox_wont_stop_is_not_reset() {
     let h = harness().await;
     let s = h.sessions().await;
-    let runner = FakeRunner::new(&h.store);
+    let runner = FakeRunner::new(&h);
     runner
         .stuck
         .lock()
@@ -1509,7 +1560,7 @@ async fn without_a_runner_sessions_are_reset_in_the_store_and_none_is_warm() {
     assert!(listed.starts_with("`helper`'s 7 sessions"), "{listed}");
     assert!(!listed.contains("warm"), "{listed}");
 
-    let runner = FakeRunner::new(&h.store);
+    let runner = FakeRunner::new(&h);
     runner.warm.lock().unwrap().insert(s.thread.id);
     let control: Arc<dyn SessionControl> = runner.clone();
     h.commands.use_sessions(Arc::downgrade(&control));
@@ -1591,7 +1642,8 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 }
 
 #[tokio::test]
-async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wait_for_them() {
+async fn every_reset_is_queued_before_the_reply_and_at_most_a_few_work_at_once() {
+    const COUNT: usize = 200;
     let h = harness().await;
     let owner = h
         .store
@@ -1601,7 +1653,7 @@ async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wai
     let agent = h.agent(owner).await;
     let channel = core_types::ScopeKey::for_conversation(ConvKind::Channel, conv("GENERAL"));
     let mut sessions = Vec::new();
-    for n in 0..9 {
+    for n in 0..COUNT {
         let root = format!("R{n}");
         let session = h
             .store
@@ -1610,13 +1662,13 @@ async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wai
             .unwrap()
             .session;
         h.store
-            .record_session_turn(session.id, true, at(n))
+            .record_session_turn(session.id, true, at(i64::try_from(n).unwrap()))
             .await
             .unwrap();
         sessions.push(session.id);
     }
     sessions.sort();
-    let runner = FakeRunner::gated(&h.store);
+    let runner = FakeRunner::gated(&h);
     runner.stuck.lock().unwrap().insert(sessions[4]);
     let control: Arc<dyn SessionControl> = runner.clone();
     h.commands.use_sessions(Arc::downgrade(&control));
@@ -1630,18 +1682,29 @@ async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wai
         .submit(key("alice"), "reset helper".to_owned(), in_dm(), Vec::new())
         .await
         .unwrap();
-    until(
-        "every reset was asked for before any was let through",
-        || runner.resets().len() == 9,
-    )
-    .await;
-    assert_eq!(runner.resets(), sessions);
     let replies = h.wait_for_replies("alice", 1).await;
     assert_eq!(
         replies[0],
-        "Resetting `helper`'s 9 sessions: the next message in each starts a new conversation. \
-         A session running a turn resets once that turn ends. If any can't be reset, I'll tell \
-         you in a direct message."
+        format!(
+            "Resetting `helper`'s {COUNT} sessions: the next message in each starts a new \
+             conversation. A session running a turn resets once that turn ends. If any can't be \
+             reset, I'll tell you in a direct message."
+        )
+    );
+    assert_eq!(
+        runner.held_before_any_post(),
+        COUNT,
+        "every reset held its session before the reply was posted"
+    );
+    assert_eq!(runner.resets(), sessions);
+    until("the first resets took every permit", || {
+        runner.working() >= super::sessions::RESETS_AT_ONCE
+    })
+    .await;
+    assert_eq!(
+        runner.working(),
+        super::sessions::RESETS_AT_ONCE,
+        "no more resets work at once than there are permits"
     );
 
     submitter
@@ -1655,7 +1718,9 @@ async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wai
         .unwrap();
     let replies = h.wait_for_replies("alice", 2).await;
     assert!(
-        replies[1].starts_with("`helper`'s 9 sessions, most recent first:"),
+        replies[1].starts_with(&format!(
+            "`helper`'s {MAX_LISTED} most recent sessions of {COUNT}:"
+        )),
         "the owner's next command ran while the resets waited: {}",
         replies[1]
     );
@@ -1663,13 +1728,17 @@ async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wai
         assert_eq!(h.store.session(*id).await.unwrap().unwrap().reset_at, None);
     }
 
-    runner.gate.add_permits(9);
+    runner.gate.add_permits(COUNT);
     let replies = h.wait_for_replies("alice", 3).await;
     assert_eq!(
         replies[2],
-        "`reset helper` couldn't reset 1 of `helper`'s 9 sessions; the other 8 are reset. \
-         Please send it again in a minute."
+        format!(
+            "`reset helper` couldn't reset 1 of `helper`'s {COUNT} sessions; the other {} are \
+             reset. Please send it again in a minute.",
+            COUNT - 1
+        )
     );
+    assert_eq!(runner.most_working(), super::sessions::RESETS_AT_ONCE);
     for (n, id) in sessions.iter().enumerate() {
         let reset = h.store.session(*id).await.unwrap().unwrap().reset_at;
         assert_eq!(reset.is_some(), n != 4, "session {n}");
@@ -1685,7 +1754,7 @@ async fn every_reset_is_queued_at_once_and_the_reply_and_later_commands_dont_wai
 async fn the_intake_waits_for_a_queued_reset_when_it_stops() {
     let h = harness().await;
     let s = h.sessions().await;
-    let runner = FakeRunner::gated(&h.store);
+    let runner = FakeRunner::gated(&h);
     let control: Arc<dyn SessionControl> = runner.clone();
     h.commands.use_sessions(Arc::downgrade(&control));
     let (intake, submitter) = CommandIntake::new(h.commands.clone());
