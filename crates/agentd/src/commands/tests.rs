@@ -27,8 +27,7 @@ use super::relink::{
 };
 use super::rocketchat::{CommandFeed, command_in, listen};
 use super::*;
-use crate::telemetry::tests::Captured;
-use crate::telemetry::{LogFormat, subscriber};
+use crate::telemetry::tests::global_logs;
 
 const TEAM: &str = "chat.example.org";
 const TOKEN_PATH: &str = "/v1/oauth/token";
@@ -265,16 +264,6 @@ fn state_of(reply: &str) -> String {
         .to_owned()
 }
 
-fn capture_logs() -> (Captured, tracing::subscriber::DefaultGuard) {
-    let captured = Captured::default();
-    let logs = subscriber(
-        LogFormat::Json,
-        tracing_subscriber::EnvFilter::new("trace"),
-        captured.clone(),
-    );
-    (captured, tracing::subscriber::set_default(logs))
-}
-
 async fn mount_exchange(oauth: &MockServer, state: &str, delay: Duration) {
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
@@ -308,7 +297,7 @@ async fn mount_exchange(oauth: &MockServer, state: &str, delay: Duration) {
 #[tokio::test]
 async fn full_login_flow_from_a_dm_links_the_account_without_logging_the_code() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let (stop, stopping) = watch::channel(false);
     let task = serve(&h, stopping);
 
@@ -338,14 +327,13 @@ async fn full_login_flow_from_a_dm_links_the_account_without_logging_the_code() 
     stop.send_replace(true);
     task.await.unwrap().unwrap();
 
-    let out = logs.text();
-    assert!(out.contains("running a command"), "{out}");
-    assert!(out.contains("\"command\":\"login\""), "{out}");
-    assert!(
-        !out.contains(CODE),
-        "the login code reached the log:\n{out}"
-    );
-    assert!(!out.contains(&pasted), "{out}");
+    logs.snapshot()
+        .assert_has("running a command")
+        .assert_has("\"command\":\"login\"");
+    global_logs()
+        .snapshot()
+        .assert_lacks(CODE)
+        .assert_lacks(&pasted);
 }
 
 #[tokio::test]
@@ -379,7 +367,7 @@ async fn one_members_commands_run_in_order_without_holding_up_others() {
 #[tokio::test]
 async fn a_login_code_in_a_channel_is_refused_and_invalidates_the_pending_login() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     h.dm("alice", "login").await;
     let state = state_of(&h.last_reply("alice"));
     let member = h.member("alice").await.unwrap();
@@ -402,8 +390,10 @@ async fn a_login_code_in_a_channel_is_refused_and_invalidates_the_pending_login(
             .iter()
             .all(|(to, _)| to.conv != conv("GENERAL"))
     );
-    let out = logs.text();
-    assert!(!out.contains(CODE), "{out}");
+    logs.snapshot()
+        .assert_has("\"command\":\"login\"")
+        .assert_has("cancelled pending logins after a public secret");
+    global_logs().snapshot().assert_lacks(CODE);
 }
 
 #[tokio::test]
@@ -425,7 +415,7 @@ async fn a_login_code_posted_publicly_by_someone_else_cancels_the_login_it_names
 #[tokio::test]
 async fn an_api_key_in_a_channel_is_refused_with_revoke_advice() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     h.channel("root", &format!("admin api-key set {API_KEY}"))
         .await;
     let reply = h.last_reply("root");
@@ -435,9 +425,9 @@ async fn an_api_key_in_a_channel_is_refused_with_revoke_advice() {
         "{reply}"
     );
     assert!(!reply.contains(API_KEY));
-    let out = logs.text();
-    assert!(out.contains("\"command\":\"admin api-key set\""), "{out}");
-    assert!(!out.contains(API_KEY), "{out}");
+    logs.snapshot()
+        .assert_has("\"command\":\"admin api-key set\"");
+    global_logs().snapshot().assert_lacks(API_KEY);
 }
 
 #[tokio::test]
@@ -452,7 +442,7 @@ async fn a_slack_token_in_a_channel_is_refused_with_revoke_advice() {
 #[tokio::test]
 async fn secret_looking_text_that_fails_to_parse_in_a_channel_cancels_logins() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     h.dm("alice", "login").await;
     let state = state_of(&h.last_reply("alice"));
 
@@ -462,7 +452,10 @@ async fn secret_looking_text_that_fails_to_parse_in_a_channel_cancels_logins() {
     assert!(reply.contains("looked like it held a secret"), "{reply}");
     assert!(reply.contains("Usage: `login [code]`"), "{reply}");
     assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
-    assert!(!logs.text().contains(CODE));
+    logs.snapshot()
+        .assert_has("command text didn't parse")
+        .assert_has("cancelled pending logins after a public secret");
+    global_logs().snapshot().assert_lacks(CODE);
 }
 
 #[tokio::test]
@@ -806,7 +799,7 @@ async fn a_relink_notice_that_fails_to_send_is_retried_after_a_backoff() {
 #[tokio::test]
 async fn an_unreachable_member_is_retried_with_growing_waits_then_given_up_once() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     broken_member(&h, "alice").await;
     let dms = Arc::new(DeadDms::default());
     let bot = Arc::new(ManagerBot::new(
@@ -841,7 +834,7 @@ async fn an_unreachable_member_is_retried_with_growing_waits_then_given_up_once(
         notifier.send_pending_at(clock(now)).await.unwrap();
     }
     assert_eq!(tries(), usize::try_from(RELINK_MAX_ATTEMPTS).unwrap());
-    let out = logs.text();
+    let out = logs.snapshot();
     assert_eq!(
         out.matches("giving up on the relink notice").count(),
         1,
