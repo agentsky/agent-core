@@ -3810,3 +3810,186 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
 - `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
+
+## T14: Agent lifecycle on Rocket.Chat
+
+No Rocket.Chat server was run for this task; the tests use `testkit`'s fake
+server, and the server behavior below comes from the notes of T11 and T12.
+
+### A paused agent's bot keeps listening
+
+**Issue.** "Pause (events ignored)" could be read as stopping the paused
+agent's connection, or as dropping what it delivers. Rocket.Chat
+deduplication is global: whichever connection records a message first
+delivers it for every bot in the room. A paused bot that dropped what it
+recorded would lose messages for the other agents there, and a paused bot
+that stopped listening would leave `!agent resume` unheard in a room it
+alone shares with agentd.
+
+**Solution.** A paused agent's connection keeps running and feeding the
+command intake. "Ignored" is decided where messages go after the intake:
+before T23, [`Acknowledge`](#before-turns-a-bot-reacts-instead-of-replying)
+skips paused agents; from T23 the router refuses them, as T22 already does.
+Only `delete` stops a connection.
+
+### A creation can stop halfway
+
+**Issue.** Creating an agent is several steps on two systems: the store,
+then `users.create`, the bot's login and token, the avatar, then the store
+again. A failure or a crash in between would leave an agent without a bot,
+or a bot user nobody records, with the agent's name taken for good.
+
+**Solution.** `create_agent` stores the agent with a binding in state
+`creating` in one transaction; the unique index on `(owner_id, name)` only
+covers agents that aren't deleted, so the name is reserved from then on.
+The bot user is recorded on the binding (`set_binding_bot_user`) as soon as
+`users.create` returns, and `activate_binding` stores the token and makes
+the binding `active` only while it is still `creating`. Any failure
+abandons the creation (`abandon_creation`): the binding is disabled, the
+agent deleted and the name freed, and a recorded bot user is deactivated. A
+creation still `creating` after `CREATION_LEASE` (ten minutes, far longer
+than its REST calls with their 30-second timeouts can take) is abandoned by
+the next supervisor pass, which covers a crash. If that races a slow
+creation, the creation's own `activate_binding` fails and it gives up. The
+one gap left is a crash between `users.create` answering and the bot user
+being recorded: that bot user has no token and no password anyone knows, so
+it can't be used, but it keeps its username until an admin removes it.
+
+### Deactivating a deleted agent's bot is owed until it happens
+
+**Issue.** `delete` deactivates the bot user with the manager's
+`users.setActiveStatus`, which can fail: the manager lacks
+`edit-other-user-active-status`, Rocket.Chat is down, the rate limiter.
+Forgetting the failure would leave an active bot user whose personal access
+token still works.
+
+**Solution.** `delete_agent` disables the agent's bindings and forgets their
+tokens in the same transaction that marks the agent deleted. A disabled
+binding with a bot user and no `retired_at` owes its retirement, in columns
+modeled on the relink notices': a claim counts an attempt and holds a
+ten-minute lease (`retire_attempts`, `retire_next_attempt_at`), success sets
+`retired_at`, and a failure defers the next attempt by a backoff from a
+minute doubling to six hours, for 20 attempts (about three days). `delete`
+tries once at once and says whether it worked; the supervisor retries every
+pass. A bot user Rocket.Chat no longer knows counts as retired.
+
+### Connections follow the store
+
+**Issue.** agentd has to start a connection when an agent is created, stop
+it when the agent is deleted, and restore every connection at startup. With
+more than one instance (a blue-green deploy), an agent created on one
+instance would be heard only there until a restart.
+
+**Solution.** The `Supervisor` owns the connections and derives them from
+the store: each pass starts one for every `active` binding of an active or
+paused agent and stops the rest. A pass runs at startup, whenever a
+command pokes it (`create`, `delete`), and every minute, so another
+instance's changes are picked up within a minute. It also abandons stale
+creations and retires what is owed. The command handlers never hold a
+`CommandFeed`, only the poke: the intake runs until every feed is dropped,
+and it owns the handlers, so a feed held there would keep it running
+forever. The supervisor drops its feed when agentd stops, after stopping its
+connections. A connection that ends on its own (a revoked token, a
+deactivated bot) is logged and started again by the next pass, so a broken
+bot logs an error once a minute until it is fixed or deleted.
+
+### Before turns, a bot reacts instead of replying
+
+**Issue.** The plan allows a fixed acknowledgement before T23, and the live
+check needs to see which bot a mention reaches. A reply is a
+`chat.postMessage`, which makes the bot join a public channel it isn't in
+(see T11's notes). Rocket.Chat deduplication is global, so a mention of an
+agent that isn't in the room can be delivered by another bot's connection,
+and replying would pull the mentioned bot into the channel. T23 has the
+same problem for real replies.
+
+**Solution.** Until T23, every connection passes the messages that aren't
+commands to `Acknowledge`, which makes each active agent a person's message
+mentions, and in a one-to-one DM the agent whose bot received it, react
+with `:eyes:` as its own bot. `chat.react` doesn't join the room. Messages
+from bots, the manager bot and managed agents are ignored whatever the
+surface flags say. T23 replaces `Acknowledge` with the pipeline, and should
+check that a mentioned agent is in the room before posting there.
+
+### Bot usernames
+
+**Issue.** The plan names the bot `<name>`, or `<owner>-<name>` when taken,
+but not what happens when both are taken, what email Rocket.Chat's required
+field gets, or how an owner's username is found; members are stored with
+their user id as display name.
+
+**Solution.**
+
+- The username is `<name>`, then `<owner>-<name>`, where `<owner>` is the
+  owner's username from `users.info`. If both are taken, the agent isn't
+  created and the owner is asked for another name. `all` and `here` go
+  straight to the prefixed form, since Rocket.Chat reads `@all` and `@here`
+  as broadcasts and nobody could mention such a bot.
+- The display name is the agent's name. The email is
+  `agent-<binding id>@agent-core.invalid`: unique, unverified (T11), and in
+  a domain that can't receive mail.
+- `agent_bindings.bot_username` records the username, which the plan's
+  columns didn't have, so `list` and the create reply can show `@username`
+  without a lookup.
+- `create` stores the owner's username as their display name, which `list`
+  shows as the owner.
+- A deleted agent's bot user stays, deactivated, so creating an agent of
+  the same name again gets the prefixed username.
+
+### Agent names are the owner's
+
+**Issue.** Names are unique per owner, so `persona helper …` from a member
+who isn't the owner can't name the owner's `helper` at all.
+
+**Solution.** Every owner-only command looks the agent up among the
+sender's own agents, so a non-owner gets "You have no agent named `helper`.
+Only an agent's owner can change it." The name is free again once the agent
+is deleted, since deleted agents keep their row for the volumes, sessions
+and message refs that name them. `visibility` is `public` or `private`;
+`list` shows private agents only to their owner, and nothing sets `private`
+yet.
+
+### A bot sets its own avatar
+
+**Issue.** Setting another user's avatar needs `edit-other-user-avatar`
+(T11's table), one more permission for the manager's role.
+
+**Solution.** The new bot sets `rocketchat.avatar_url` as its own avatar
+with its token, which Rocket.Chat allows while `Accounts_AllowUserAvatarChange`
+is on (the default). A failure is logged and the agent is created anyway.
+The Compose README's permission table drops `edit-other-user-avatar`, and
+`edit-other-user-info`, since agentd renames no bot.
+
+### The text of an upload
+
+**Issue.** A `persona.md` upload's command is the message's text. Depending
+on the client and version, Rocket.Chat puts the text typed with an upload
+in `msg` or in the file attachment's `description` (`sendFileMessage`
+builds the attachment from the upload's description and takes `msg` from
+the confirm body).
+
+**Solution.** `surface-rocketchat` takes the attachment's `description` as
+the text of a file message whose `msg` is empty. Which one a real 7.x
+client fills is for the live check. The file is downloaded from
+`<base>/file-upload/<id>/<name>` with the manager's `X-User-Id` and
+`X-Auth-Token` headers (Rocket.Chat's `requestCanAccessFiles` accepts them),
+never with the token in the URL, and refused past 64 KB by its
+`Content-Length` or while it is read. Only a file attached in the manager
+bot's DM is read: a persona uploaded to a room would be public anyway, but
+the manager may not be able to read files there.
+
+### The manager's permissions on the Community Edition are still open
+
+**Issue.** T16 found that custom roles need an Enterprise license. T14 adds
+nothing to the role T11 derived: `create-user`, `edit-other-user-active-status`
+for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
+`view-full-other-user-info` and `api-bypass-rate-limit`, plus
+`create-personal-access-tokens` on the `bot` role.
+
+**Solution.** Unresolved, as the design's open question says. On the
+Community Edition these permissions can only be added to a built-in role,
+and the built-in roles the manager would hold are shared (`user` with every
+member, `bot` with every agent), so granting them there grants them to
+everyone who holds that role. Until a live check settles it, the Compose
+README gives the manager `admin` for development. This task couldn't test
+it without a server.

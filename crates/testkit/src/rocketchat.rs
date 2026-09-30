@@ -80,6 +80,7 @@ struct State {
     rooms: BTreeMap<String, FakeRoom>,
     messages: Vec<FakeMessage>,
     uploads: HashMap<String, (String, String, String)>,
+    files: HashMap<String, (String, Vec<u8>)>,
 }
 
 impl State {
@@ -200,6 +201,10 @@ impl FakeRest {
             .respond_with(Router(Arc::clone(&state)))
             .mount(&server)
             .await;
+        Mock::given(path_regex("^/file-upload/"))
+            .respond_with(Files(Arc::clone(&state)))
+            .mount(&server)
+            .await;
         Self { server, state }
     }
 
@@ -272,6 +277,19 @@ impl FakeRest {
     ) -> String {
         let mut state = self.state();
         store_message(&mut state, room, user_id, text, tmid, None)
+    }
+
+    /// Stores a file named `name` holding `content`, as if it had been
+    /// uploaded, and returns its id. It is served at
+    /// `/file-upload/<id>/<name>` to any active user's credentials, sent as
+    /// `X-User-Id` and `X-Auth-Token` headers.
+    pub fn add_file(&self, name: &str, content: &[u8]) -> String {
+        let mut state = self.state();
+        let id = format!("file-{}", state.next());
+        state
+            .files
+            .insert(id.clone(), (name.to_owned(), content.to_vec()));
+        id
     }
 
     /// A user by username.
@@ -502,7 +520,13 @@ impl Respond for Router {
         match (post, segments.as_slice()) {
             (false, ["me"]) => ok(state.user_json(&caller)),
             (false, ["users.info"]) => {
-                let id = param("userId");
+                let id = match query.get("username") {
+                    Some(username) => state
+                        .user_by_name(username)
+                        .map(|u| u.id.clone())
+                        .unwrap_or_default(),
+                    None => param("userId"),
+                };
                 if !state.users.contains_key(&id) {
                     return failure("User not found.");
                 }
@@ -717,6 +741,30 @@ impl Respond for Router {
             }
             (false, ["chat.getThreadMessages"]) => thread_messages(&state, &query),
             _ => not_found(),
+        }
+    }
+}
+
+/// Serves the files stored with [`FakeRest::add_file`].
+struct Files(Arc<Mutex<State>>);
+
+impl Respond for Files {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if authenticate(&state, request).is_none() {
+            return ResponseTemplate::new(403).set_body_string("Forbidden");
+        }
+        let path = request.url.path().trim_start_matches("/file-upload/");
+        let file = path.split_once('/').and_then(|(id, name)| {
+            state
+                .files
+                .get(id)
+                .filter(|(stored, _)| stored == name)
+                .map(|(_, content)| content.clone())
+        });
+        match file {
+            Some(content) => ResponseTemplate::new(200).set_body_bytes(content),
+            None => ResponseTemplate::new(404).set_body_string("Not found"),
         }
     }
 }

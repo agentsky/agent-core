@@ -442,6 +442,116 @@ async fn room_info_with_a_null_room_is_not_found() {
 }
 
 #[tokio::test]
+async fn user_by_username_finds_the_user_or_fails() {
+    let fake = FakeRest::start().await;
+    let alice = fake.add_user("alice");
+    let client = manager(&fake);
+    let found = client.user_by_username("alice").await.unwrap();
+    assert_eq!(found.id.as_str(), alice);
+    assert_eq!(found.roles, ["user"]);
+    let requests = fake.requests("users.info").await;
+    assert_eq!(requests[0].url.query(), Some("username=alice"));
+    assert!(matches!(
+        client.user_by_username("nobody").await,
+        Err(SurfaceError::Api(_))
+    ));
+}
+
+#[tokio::test]
+async fn download_reads_a_file_with_the_auth_headers() {
+    let fake = FakeRest::start().await;
+    let id = fake.add_file("persona.md", b"You are terse.");
+    let client = manager(&fake);
+    let data = client.download(&id, "persona.md", 1024).await.unwrap();
+    assert_eq!(&data[..], b"You are terse.");
+    let requests = fake.server().received_requests().await.unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.url.path().starts_with("/file-upload/"))
+        .unwrap();
+    assert_eq!(request.url.path(), format!("/file-upload/{id}/persona.md"));
+    assert_eq!(request.url.query(), None, "no token in the URL");
+    assert_eq!(header(request, "x-user-id"), Some(FakeRest::MANAGER_ID));
+    assert_eq!(
+        header(request, "x-auth-token"),
+        Some(FakeRest::MANAGER_TOKEN)
+    );
+}
+
+#[tokio::test]
+async fn download_refuses_a_file_over_the_limit() {
+    let fake = FakeRest::start().await;
+    let id = fake.add_file("big.md", &[b'x'; 100]);
+    let client = manager(&fake);
+    let err = client.download(&id, "big.md", 99).await.unwrap_err();
+    assert_eq!(
+        err,
+        SurfaceError::Api("the file is larger than the 99-byte limit".into())
+    );
+    assert_eq!(
+        client.download(&id, "big.md", 100).await.unwrap().len(),
+        100
+    );
+}
+
+#[tokio::test]
+async fn download_refuses_a_body_longer_than_the_limit_without_a_length() {
+    let fake = FakeRest::start().await;
+    Mock::given(path("/file-upload/f1/chunked.md"))
+        .respond_with(ChunkedBody)
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
+    let err = manager(&fake)
+        .download("f1", "chunked.md", 10)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SurfaceError::Api("the file is larger than the 10-byte limit".into())
+    );
+}
+
+/// A body whose length the response doesn't declare.
+struct ChunkedBody;
+
+impl Respond for ChunkedBody {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .insert_header("transfer-encoding", "chunked")
+            .set_body_bytes(vec![b'y'; 64])
+    }
+}
+
+#[tokio::test]
+async fn download_errors_map_by_status() {
+    let fake = FakeRest::start().await;
+    let id = fake.add_file("persona.md", b"x");
+    let client = manager(&fake);
+    assert_eq!(
+        client.download("missing", "persona.md", 10).await,
+        Err(SurfaceError::NotFound("file".into()))
+    );
+    let stranger = client.with_credentials(Credentials {
+        user_id: "someone".into(),
+        token: SecretString::from("wrong"),
+    });
+    assert_eq!(
+        stranger.download(&id, "persona.md", 10).await,
+        Err(SurfaceError::Forbidden("file download".into()))
+    );
+    Mock::given(path("/file-upload/f2/broken.md"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
+    assert_eq!(
+        client.download("f2", "broken.md", 10).await,
+        Err(SurfaceError::Api("file download failed (HTTP 500)".into()))
+    );
+}
+
+#[tokio::test]
 async fn create_dm_returns_the_room_id() {
     let fake = FakeRest::start().await;
     let member = fake.add_user("alice");

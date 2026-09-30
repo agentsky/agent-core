@@ -202,6 +202,10 @@ pub struct RocketChatConfig {
     /// The manager bot's user `_id`, whose personal access token is
     /// `AGENTD_RC_MANAGER_TOKEN`.
     pub manager_user_id: String,
+    /// An `https://` (or `http://`) image URL each new agent's bot sets as
+    /// its avatar. Without it, bots keep Rocket.Chat's default avatar.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 /// `[limits]`. Every key has a default, so the section is optional.
@@ -509,6 +513,14 @@ impl RocketChatConfig {
             return Err(invalid(
                 "rocketchat.websocket_url",
                 "must be a ws:// or wss:// URL",
+            ));
+        }
+        if let Some(url) = &self.avatar_url
+            && !(url.starts_with("https://") || url.starts_with("http://"))
+        {
+            return Err(invalid(
+                "rocketchat.avatar_url",
+                "must be an http:// or https:// URL",
             ));
         }
         for (key, value) in [
@@ -827,6 +839,20 @@ manager_user_id = "manager-id"
         assert_eq!(rocketchat.websocket_url, None);
         assert_eq!(rocketchat.team, "chat.example.com");
         assert_eq!(rocketchat.manager_user_id, "manager-id");
+        assert_eq!(rocketchat.avatar_url, None);
+        let text = format!(
+            "{MINIMAL}{}",
+            ROCKETCHAT.replacen(
+                "team =",
+                "avatar_url = \"https://img.example/a.png\"\nteam =",
+                1
+            )
+        );
+        let config = with(&text, with_rc_token()).unwrap();
+        assert_eq!(
+            config.rocketchat.unwrap().avatar_url.as_deref(),
+            Some("https://img.example/a.png")
+        );
     }
 
     #[test]
@@ -857,6 +883,11 @@ manager_user_id = "manager-id"
                 "team =",
                 "websocket_url = \"https://chat.example.com/websocket\"\nteam =",
                 "rocketchat.websocket_url",
+            ),
+            (
+                "team =",
+                "avatar_url = \"file:///etc/passwd\"\nteam =",
+                "rocketchat.avatar_url",
             ),
         ] {
             let text = format!("{MINIMAL}{}", ROCKETCHAT.replacen(from, to, 1));

@@ -1209,7 +1209,11 @@ Deliverables:
     `pending_install`, `active` or `disabled`, `state_changed_at`, plus the
     Slack columns from the design, nullable). Unique on `(surface, team_id,
     bot_user_id)` where `bot_user_id` is set. Slack bindings exist before their
-    bot user does (T31).
+    bot user does (T31). `bot_username` records the username, and
+    `retired_at`, `retire_attempts` and `retire_next_attempt_at` the
+    deactivation a disabled binding's bot user owes
+    ([impl-notes](impl-notes.md#deactivating-a-deleted-agents-bot-is-owed-until-it-happens)).
+    The name is unique only among agents that aren't deleted.
 - Store methods for agents and bindings.
 - Handlers:
   - `create <name> [persona]` requires a linked member.
@@ -1225,13 +1229,23 @@ Deliverables:
     persona the same way. Size is capped at 64 KB.
   - `list [@user]`: an agent directory.
   - `pause`, `resume` and `delete`, owner only. Delete deactivates the bot user
-    and stops its connection; state becomes `deleted`.
+    and stops its connection; state becomes `deleted`. A paused agent's bot
+    keeps listening, since deduplication is global
+    ([impl-notes](impl-notes.md#a-paused-agents-bot-keeps-listening)).
 - The default persona is a short template in `crates/agentd/assets/persona.md`
   naming the agent and owner.
 - Joining rooms: the owner invites the bot with the normal Rocket.Chat UI, or
   the manager invites it where the manager is a member. `allow` and `deny` come
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
+  A `Supervisor` derives the connections from the store at startup, when a
+  command pokes it and every minute, abandons creations that never finished,
+  and retries deactivations that failed
+  ([impl-notes](impl-notes.md#connections-follow-the-store),
+  [impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
+- Until T23, what isn't a command goes to `Acknowledge`: each active agent a
+  person's message addresses reacts with `:eyes:`
+  ([impl-notes](impl-notes.md#before-turns-a-bot-reacts-instead-of-replying)).
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
   each surface with a store-backed `Dedup` (T13's `StoreDedup`) and the one
   `BotRoles` over the manager's client that T13 keeps in
@@ -1707,7 +1721,8 @@ Deliverables:
   exhausted, when `api_error_status` is 429 or the text says so), `auth` (401
   or 403), `other`. T26 turns these into member-facing messages.
 - The persona file is `<data>/agents/<agent>/persona.md`, written by agentd
-  when the persona changes and reached through `Container::paths()`. It stays
+  from `agents.persona` in the store (T14) when the persona changes and
+  reached through `Container::paths()`. It stays
   byte-identical across restarts, so prompt caching keeps working. A persona
   edit takes effect when the process next starts.
 
@@ -1946,7 +1961,12 @@ Deliverables:
   `https://api.anthropic.com`, sets the upstream, and
   `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
-  1. Receive `InboundEvent`s from every surface.
+  1. Receive `InboundEvent`s from every surface. On Rocket.Chat the pipeline
+     takes the place of T14's `Acknowledge` as the `onward` sender of every
+     connection. A reply is a `chat.postMessage`, which makes a bot join a
+     public channel it isn't in, so a mentioned agent whose bot isn't in the
+     room doesn't reply there
+     ([impl-notes](impl-notes.md#before-turns-a-bot-reacts-instead-of-replying)).
   2. For each candidate agent, call `router::route` with a store-backed
      `RouterView`. The store is asynchronous and the view is not, so first
      load everything the lookups listed in `RouterView`'s rustdoc need for

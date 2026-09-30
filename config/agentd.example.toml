@@ -109,3 +109,7 @@ team = "chat.example.com"
 # The manager account's user _id (Administration > Users, or `me` in the
 # REST API with its token).
 manager_user_id = "aBcD1234eFgH5678"
+
+# An image URL every new agent's bot sets as its avatar. Optional: without
+# it, bots keep Rocket.Chat's default avatar.
+# avatar_url = "https://chat.example.com/assets/agent.png"

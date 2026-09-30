@@ -7,8 +7,9 @@ use auth::Auth;
 use core_types::{Binding, BindingId, MemberKey, SurfaceKind, TeamId, UserId};
 use store::Store;
 use surface_rocketchat::rest::{Credentials, RestClient};
-use surface_rocketchat::{BotRoles, RocketChatSurface};
+use surface_rocketchat::{BotRoles, RocketChatConfig, RocketChatSurface};
 
+use crate::agents::RocketChatAgents;
 use crate::commands::rocketchat::{RocketChatDms, StoreDedup};
 use crate::commands::{Commands, ManagerBot, Replies};
 use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
@@ -30,7 +31,8 @@ pub struct App {
     rocketchat: Option<RocketChatManager>,
 }
 
-/// The Rocket.Chat manager bot: its surface and the binding it listens as.
+/// The Rocket.Chat manager bot: its surface and the binding it listens as,
+/// and the agents it manages.
 #[derive(Debug, Clone)]
 pub struct RocketChatManager {
     /// The surface, acting as the manager bot.
@@ -42,6 +44,11 @@ pub struct RocketChatManager {
     /// surface shares this one, so a sender is classified the same whichever
     /// connection records a message.
     pub bots: BotRoles,
+    /// The manager's surface configuration, which each agent's surface
+    /// copies with the bot's own credentials.
+    pub surface_config: RocketChatConfig,
+    /// The agents on this server.
+    pub agents: RocketChatAgents,
 }
 
 impl App {
@@ -73,7 +80,10 @@ impl App {
         );
         let rocketchat = rocketchat_manager(&config, &store)?;
         let replies = Replies::new(rocketchat.as_ref().map(|(_, bot)| Arc::clone(bot)));
-        let commands = Commands::new(store.clone(), Arc::clone(&auth), replies);
+        let agents = rocketchat
+            .as_ref()
+            .map(|(manager, _)| manager.agents.clone());
+        let commands = Commands::new(store.clone(), Arc::clone(&auth), replies, agents);
         Ok(Self {
             config: Arc::new(config),
             store,
@@ -164,7 +174,7 @@ fn rocketchat_manager(
     };
     let rest =
         RestClient::new(&settings.base_url, credentials.clone()).context("rocketchat.base_url")?;
-    let mut surface_config = surface_rocketchat::RocketChatConfig::new(
+    let mut surface_config = RocketChatConfig::new(
         settings.base_url.as_str(),
         identity.team.clone(),
         credentials,
@@ -175,7 +185,7 @@ fn rocketchat_manager(
     let bots = BotRoles::new(rest.clone());
     let surface = Arc::new(
         RocketChatSurface::new(
-            surface_config,
+            surface_config.clone(),
             Arc::new(StoreDedup(store.clone())),
             bots.clone(),
         )
@@ -186,6 +196,12 @@ fn rocketchat_manager(
         agent: None,
         bot: identity.clone(),
     };
+    let agents = RocketChatAgents::new(
+        store.clone(),
+        rest.clone(),
+        identity.team.clone(),
+        settings.avatar_url.clone(),
+    );
     let bot = Arc::new(ManagerBot::new(
         identity,
         surface.clone(),
@@ -196,6 +212,8 @@ fn rocketchat_manager(
             surface,
             binding,
             bots,
+            surface_config,
+            agents,
         },
         bot,
     )))

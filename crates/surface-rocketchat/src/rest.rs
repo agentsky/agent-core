@@ -287,7 +287,9 @@ pub struct Message {
     pub id: MessageId,
     /// The room it is in (`rid`).
     pub room: ConversationId,
-    /// The text (`msg`).
+    /// The text (`msg`). A file message with an empty `msg` takes its
+    /// attachment's `description` instead, where some clients put the text
+    /// typed with an upload.
     pub text: String,
     /// Who sent it (`u`).
     pub sender: UserRef,
@@ -336,6 +338,8 @@ struct RawMessage {
     files: Vec<Value>,
     #[serde(default)]
     file: Option<Value>,
+    #[serde(default)]
+    attachments: Vec<Value>,
     #[serde(default, rename = "_updatedAt")]
     updated_at: Option<Value>,
 }
@@ -351,7 +355,7 @@ impl TryFrom<RawMessage> for Message {
 
     fn try_from(raw: RawMessage) -> Result<Self, String> {
         let sent_at = parse_timestamp(&raw.ts).ok_or("invalid message timestamp")?;
-        let files = if raw.files.is_empty() {
+        let files: Vec<FileRef> = if raw.files.is_empty() {
             raw.file.iter().filter_map(file_ref).collect()
         } else {
             raw.files.iter().filter_map(file_ref).collect()
@@ -359,7 +363,10 @@ impl TryFrom<RawMessage> for Message {
         Ok(Self {
             id: raw.id.into(),
             room: raw.rid.into(),
-            text: raw.msg.unwrap_or_default(),
+            text: match raw.msg {
+                Some(msg) if !msg.is_empty() || files.is_empty() => msg,
+                _ => file_description(&raw.attachments),
+            },
             sender: raw.u,
             sent_at,
             updated_at: raw.updated_at.as_ref().and_then(parse_timestamp),
@@ -373,6 +380,16 @@ impl TryFrom<RawMessage> for Message {
             files,
         })
     }
+}
+
+/// The description of a file message's attachment. Depending on the
+/// client, the text typed with an upload lands in `msg` or here.
+fn file_description(attachments: &[Value]) -> String {
+    attachments
+        .iter()
+        .find_map(|a| a.get("description").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Reads an ISO 8601 string or EJSON `{"$date": <ms>}`.
@@ -734,6 +751,17 @@ impl RestClient {
         Ok(found.user)
     }
 
+    /// `GET users.info`: a user by username. Roles come back as for
+    /// [`RestClient::user_info`]. An unknown username fails with
+    /// [`SurfaceError::Api`], since Rocket.Chat reports it without an error
+    /// code.
+    pub async fn user_by_username(&self, username: &str) -> Result<User> {
+        let found: UserEnvelope = self
+            .call(Call::get("users.info").query("username", username))
+            .await?;
+        Ok(found.user)
+    }
+
     /// `POST im.create`: opens (or finds) the direct message with the user
     /// named `username` and returns its room id.
     pub async fn create_dm(&self, username: &str) -> Result<ConversationId> {
@@ -798,6 +826,58 @@ impl RestClient {
                 .extend(["file-upload", &file.id, &file.name]);
         }
         url.into()
+    }
+
+    /// Downloads a message's file, `<base>/file-upload/<id>/<name>`, with
+    /// this client's credentials as `X-User-Id` and `X-Auth-Token` headers,
+    /// never in the URL.
+    ///
+    /// The file is read into memory, and refused with [`SurfaceError::Api`]
+    /// once it proves larger than `max` bytes, by its `Content-Length` or
+    /// while it is read, so a large file costs at most `max + 1` bytes of
+    /// memory. A 401 or 403 is [`SurfaceError::Forbidden`], a 404
+    /// [`SurfaceError::NotFound`].
+    pub async fn download(&self, id: &str, name: &str, max: u64) -> Result<Bytes> {
+        let url = self.file_url(&FileRef {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            mime_type: None,
+            size: None,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-id", header(self.creds.user_id.as_str())?);
+        headers.insert("x-auth-token", header(self.creds.token.expose_secret())?);
+        let mut response = self
+            .http
+            .get(url)
+            .headers(headers)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    SurfaceError::Forbidden("file download".into())
+                }
+                StatusCode::NOT_FOUND => SurfaceError::NotFound("file".into()),
+                _ => SurfaceError::Api(format!("file download failed (HTTP {})", status.as_u16())),
+            });
+        }
+        let too_large =
+            || SurfaceError::Api(format!("the file is larger than the {max}-byte limit"));
+        if response.content_length().is_some_and(|length| length > max) {
+            return Err(too_large());
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport)? {
+            data.extend_from_slice(&chunk);
+            if u64::try_from(data.len()).unwrap_or(u64::MAX) > max {
+                return Err(too_large());
+            }
+        }
+        Ok(Bytes::from(data))
     }
 
     /// Uploads a file to a room, in the thread under `thread_root` if given,

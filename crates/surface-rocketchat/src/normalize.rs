@@ -249,6 +249,27 @@ mod tests {
     }
 
     #[test]
+    fn a_file_message_without_text_takes_its_attachment_description() {
+        let file = json!({ "_id": "f1", "name": "persona.md" });
+        let described = message(json!({
+            "msg": "",
+            "files": [file],
+            "attachments": [{ "title": "persona.md", "description": "persona helper" }],
+        }));
+        assert_eq!(described.text, "persona helper");
+        let typed = message(json!({
+            "msg": "persona helper",
+            "files": [file],
+            "attachments": [{ "description": "something else" }],
+        }));
+        assert_eq!(typed.text, "persona helper");
+        let no_file = message(json!({ "msg": "", "attachments": [{ "description": "quoted" }] }));
+        assert_eq!(no_file.text, "");
+        let no_description = message(json!({ "msg": null, "files": [file] }));
+        assert_eq!(no_description.text, "");
+    }
+
+    #[test]
     fn room_type_d_is_a_dm_or_a_group_dm_by_member_count() {
         assert_eq!(conv_kind(&room("d", Some(2), &[])), Some(ConvKind::Dm));
         assert_eq!(conv_kind(&room("d", None, &["a", "b"])), Some(ConvKind::Dm));
