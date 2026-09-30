@@ -129,9 +129,12 @@ pub struct ClaudeProcess {
     credential: CredentialKind,
     model: Option<String>,
     turn_timeout: Duration,
+    /// Declared before `stdin`, so a drop kills a process still waiting
+    /// for input instead of closing its input first and killing it in the
+    /// middle of exiting.
+    child: ChildHandle,
     stdin: Pin<Box<dyn AsyncWrite + Send>>,
     stdout: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
-    child: ChildHandle,
     state: State,
     line: Vec<u8>,
     process_total_cost_usd: f64,
