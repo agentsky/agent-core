@@ -240,8 +240,20 @@ impl FakeDdp {
 
     /// Waits until a client sends a frame that `matches` accepts.
     pub async fn wait_for_frame(&self, what: &str, matches: impl Fn(&Value) -> bool) {
-        self.wait_for(what, |s| s.frames.iter().any(|(_, f)| matches(f)))
-            .await;
+        self.wait_for_frames(what, 1, matches).await;
+    }
+
+    /// Waits until clients have sent `count` frames that `matches` accepts.
+    pub async fn wait_for_frames(
+        &self,
+        what: &str,
+        count: usize,
+        matches: impl Fn(&Value) -> bool,
+    ) {
+        self.wait_for(what, |s| {
+            s.frames.iter().filter(|(_, f)| matches(f)).count() >= count
+        })
+        .await;
     }
 
     /// Sends `message` as a `stream-room-messages` event to every

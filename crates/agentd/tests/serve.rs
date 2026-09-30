@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentd::server::{Addrs, Routers, Server};
+use agentd::server::{Addrs, Routers, Server, Worker};
 use agentd::{App, Config};
 use axum::routing;
 use tokio::sync::{Notify, oneshot};
@@ -213,10 +213,46 @@ async fn shutdown_drops_requests_still_running_after_the_drain_timeout() {
 }
 
 #[tokio::test]
-async fn a_forced_shutdown_drops_in_flight_requests_without_waiting_for_the_drain() {
+async fn a_worker_that_stops_early_stops_agentd_with_an_error() {
+    let running = Running::start(CONFIG, |mut routers| {
+        routers.workers.push(Worker::new("test worker", async {}));
+        routers
+    })
+    .await;
+    let result = within(Duration::from_secs(10), running.task).await.unwrap();
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the test worker stopped unexpectedly"),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_still_running_after_the_drain_timeout_is_dropped() {
+    let text = CONFIG.replace("drain_timeout_secs = 5", "drain_timeout_secs = 1");
+    let (done, finished) = oneshot::channel::<()>();
+    let running = Running::start(&text, move |mut routers| {
+        let listed = format!("{:?}", routers.workers);
+        assert!(listed.contains("Slack queue"), "{listed}");
+        routers.workers.push(Worker::new("test worker", async move {
+            std::future::pending::<()>().await;
+            let _ = done.send(());
+        }));
+        routers
+    })
+    .await;
+    let (_, result) = running.stop().await;
+    result.unwrap();
+    assert!(finished.await.is_err(), "the pending worker finished");
+}
+
+#[tokio::test]
+async fn a_forced_shutdown_drops_in_flight_work_without_waiting_for_the_drain() {
     let text = CONFIG.replace("drain_timeout_secs = 5", "drain_timeout_secs = 3600");
     let started = Arc::new(Notify::new());
     let notify = started.clone();
+    let (done, finished) = oneshot::channel::<()>();
     let running = Running::start(&text, move |mut routers| {
         routers.public = routers.public.route(
             "/hang",
@@ -225,6 +261,10 @@ async fn a_forced_shutdown_drops_in_flight_requests_without_waiting_for_the_drai
                 std::future::pending::<()>().await;
             }),
         );
+        routers.workers.push(Worker::new("test worker", async move {
+            std::future::pending::<()>().await;
+            let _ = done.send(());
+        }));
         routers
     })
     .await;
@@ -242,6 +282,7 @@ async fn a_forced_shutdown_drops_in_flight_requests_without_waiting_for_the_drai
             .unwrap()
             .is_none()
     );
+    assert!(finished.await.is_err(), "the pending worker finished");
     app.store().ping().await.unwrap_err();
 }
 

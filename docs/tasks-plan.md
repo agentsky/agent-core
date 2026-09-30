@@ -1350,16 +1350,20 @@ Deliverables:
     `CLAUDE_CODE_VERSION` build argument, with no Node.js.
   - `agentctl` copied from a multi-stage Rust build.
   - A non-root user `agent` with uid 10001, and `WORKDIR /volume`.
+  - `/bin/sh`, which `DockerSandbox::exec` runs every command through.
   - Entrypoint `tini --`. The container idles (`sleep infinity`), and the
     runner execs `claude` into it.
 - `images/agentd/Dockerfile`: a multi-stage build of agentd on a distroless or
-  Debian slim base, run as non-root.
+  Debian slim base, run as uid 10001, the sandbox user, so the volume
+  directories agentd creates are writable in sandboxes
+  ([impl-notes](impl-notes.md#agent-writable-directories-are-given-to-the-sandbox-user)).
 - `deploy/compose/compose.yaml` for development:
   - Rocket.Chat 7.x and MongoDB, on `egress` only.
   - agentd, on both networks with static addresses, binding each listener to
     its own address, with the aliases from
     [Network and deployment shape](#network-and-deployment-shape).
-  - The `sandbox` network (`internal: true`) and the `egress` network.
+  - The `sandbox` network (`internal: true`, with `name: sandbox` so Docker
+    doesn't prefix the project name) and the `egress` network.
   - A volume root on the host.
   - Access to the Docker socket for agentd, documented as a development-only
     shortcut with a note that production should use a socket proxy.
@@ -1395,13 +1399,15 @@ Deliverables:
 
 - The `Sandbox` trait:
   - `ensure_volume(VolumeKey) -> VolumeRef`.
-  - `prepare_session_dirs(volume, session)`. It creates `sessions/<id>/work`,
-    `sessions/<id>/claude`, `sessions/<id>/home` and `sessions/<id>/tmp`, and
-    writes `sessions/<id>/claude/settings.json` with `cleanupPeriodDays`
-    (configurable, default 3650).
   - `start(SessionSpec) -> Container`, where `SessionSpec` carries the session
     id, volume, image, environment, the agent's persona and skills
-    directories, and labels.
+    directories, and labels. Before creating the container it creates
+    `sessions/<id>/work`, `sessions/<id>/claude`, `sessions/<id>/home` and
+    `sessions/<id>/tmp`, and writes `sessions/<id>/claude/settings.json`
+    with `cleanupPeriodDays` (configurable, default 3650). That step is
+    crate-private, since it is safe only while the session has no running
+    container
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
   - `Container::paths()`, which gives the paths as the CLI sees them: working
     directory, `CLAUDE_CONFIG_DIR`, `HOME`, `TMPDIR`, persona file. Docker and
     process sandboxes differ here, and the runner uses only these.
@@ -1413,6 +1419,8 @@ Deliverables:
     so the runner can revoke their mappings at once (T21).
 - A migration `…_volumes.sql` for the `volumes` table (`agent_id`,
   `scope_key`, `path`, `created_at`), keyed by `(agent_id, scope_key)`.
+  `path` is relative to the data directory and unique
+  ([impl-notes](impl-notes.md#the-volumes-row-records-a-relative-path)).
 - Volumes are host directories under `volumes/` in the agentd data
   directory, at `volumes/<agent id>/<scope dir>`. `<scope dir>` is the
   lowercase hex SHA-256 of the scope key's string form: 64 characters from
@@ -1446,23 +1454,36 @@ Deliverables:
   - Network `sandbox` only, `no-new-privileges`, all capabilities dropped,
     memory, CPU and PID limits from configuration, and a read-only root
     filesystem.
-  - Labels `agentd.session=<id>`, `agentd.agent=<id>` and
-    `agentd.scope=<key>`.
-  - `exec` attaches stdin and stdout with bollard's exec API.
-  - `list_managed` finds containers by label.
+  - Labels `agentd.session=<id>`, `agentd.agent=<id>`,
+    `agentd.scope=<key>` and `agentd.instance=<[sandbox] instance>`.
+  - `exec` attaches stdin and stdout with bollard's exec API, through a
+    `/bin/sh` wrapper that reports the pid so the process can be killed
+    ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
+  - `list_managed` finds containers by the `agentd.session` label and this
+    agentd's `agentd.instance` label
+    ([impl-notes](impl-notes.md#several-agentd-or-test-runs-on-one-docker-host)).
   - `events` follows Docker's event stream, filtered to `die` events for
     managed containers.
+  - Mount sources are rewritten to `[sandbox] host_data_dir` when agentd
+    sees its data directory at another path than the Docker daemon
+    ([impl-notes](impl-notes.md#agentds-paths-arent-the-docker-daemons)).
+  - Agent-writable directories are given to the sandbox user, and nothing
+    on the host follows a symlink inside them
+    ([impl-notes](impl-notes.md#the-agent-controls-what-is-inside-its-session-directory)).
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
   given environment and working directory, and `ip` returns `127.0.0.1`. It
   isolates nothing, and says so in its rustdoc.
-- `reap_orphans()` at startup: stop every container labeled `agentd.session`.
+- `reap_orphans()` at startup: stop every container labeled `agentd.session`
+  with this agentd's `agentd.instance`.
   Placeholder mappings and agentctl tokens don't survive a restart, so no
   container from before one can be used.
 - A CI job `docker-tests`, added to `ci-passed`. It runs
   `cargo test --workspace -- --ignored docker_` on ubuntu-24.04, when code
   changed. The tests here use `debian:stable-slim` with a non-root user, since
-  they check mounts and isolation, not the CLI. The sandbox image is T16's,
+  they check mounts and isolation, not the CLI. They run as the test
+  process's own non-root uid, since a non-root test can't give directories
+  to uid 10001. The sandbox image is T16's,
   and the test that launches the real `claude` belongs to T23.
 
 Acceptance:
@@ -1500,8 +1521,15 @@ Deliverables:
   - `mint(session, container_ip, kind) -> Placeholder`: a random 32-byte token
     with a recognizable prefix per kind, for example `agentd-sub-…` and
     `agentd-key-…`.
-  - `point(placeholder, CredentialRef)`, called at turn start.
-  - `revoke(placeholder)` and `revoke_session(session)`.
+  - `point(placeholder_id, CredentialRef)`, called at turn start. It refuses a
+    credential of the other kind. Callers hold the placeholder's non-secret
+    `PlaceholderId` for this and for revoking
+    ([impl-notes](impl-notes.md#t18-credential-proxy)).
+  - `unpoint(placeholder_id)`, called at turn end, however the turn ended.
+    Until the next `point`, requests carrying the placeholder are refused.
+  - `revoke(placeholder_id)` and `revoke_session(session)`.
+  - An address belongs to one session: minting for an address revokes other
+    sessions' placeholders bound to it.
   - In memory. It is disposable, re-derivable state: containers are reaped on
     restart.
 - A reverse proxy served by agentd on the proxy listener, forwarding to the
@@ -1523,9 +1551,14 @@ Deliverables:
   - Answers `HEAD /api/hello` locally with 200.
   - Strips hop-by-hop headers.
   - Upstream is the one configured host. No `Host` header or absolute URI from
-    the client can redirect it.
+    the client can redirect it: absolute-form requests get 403.
+  - Forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and
+    `OPTIONS`. Every other method, `TRACE` and `CONNECT` included, gets 405
+    before any credential is looked up, until T19 takes `CONNECT` over on the
+    same listener.
 - Metrics hook: a `ProxyObserver` trait called with `(session, status, usage
-  headers)`. T27 uses it for the meter.
+  headers)`, and the credential the request used, since the session's
+  pointer changes from turn to turn. T27 uses it for the meter.
 
 Acceptance, as tests named after the rules:
 
@@ -1539,6 +1572,9 @@ Acceptance, as tests named after the rules:
 - `streams_sse_without_buffering`: the first event arrives before the upstream
   finishes.
 - `revoked_placeholder_is_refused`.
+- `unpointed_placeholder_is_refused`: after the turn ends, nothing reaches
+  the upstream.
+- `refuses_methods_outside_the_allowlist`: `TRACE` and an extension method.
 - An end-to-end test with `fake-claude` and `fake_anthropic()`.
 
 Out of scope: egress for other hosts (T19), bearer swap for other CLIs
@@ -1570,7 +1606,8 @@ Deliverables:
   session.
 - Absolute-form requests (`GET http://host/…`, what `HTTP_PROXY` produces for
   plain HTTP) get 403. They must never fall through to the Anthropic reverse
-  proxy. Plain HTTP egress is not offered.
+  proxy; T18's proxy already refuses them, and T19 keeps that. Plain HTTP
+  egress is not offered.
 
 Acceptance:
 
@@ -1614,7 +1651,9 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails.
+  is killed and the turn fails. If the kill fails, the container is stopped
+  instead, since nothing was signalled
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
 - Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
   new process with `--resume`.
 - Classification of `is_error` results: `usage_limit` (rate limit or credit
@@ -1663,7 +1702,9 @@ Deliverables:
     `LaunchSpec.env`.
   - `turn_starting(session, &TurnRequest)`, which points the placeholder at
     the turn's credential and records the turn on the agentctl token.
-  - `turn_finished(session, turn)`, which clears the turn from the token.
+  - `turn_finished(session, turn)`, which clears the turn from the token and
+    unpoints the placeholder. It is called on every exit from the turn:
+    success, error, timeout, interrupt and cancellation.
   - `process_stopping(session)`, which revokes the placeholder and the token. It
     is called before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.
@@ -1678,7 +1719,9 @@ Deliverables:
     `process_stopping` and then stops both.
   - It follows `Sandbox::events()`: a container that died has its process
     marked gone and `process_stopping` called at once, so its IP can't be
-    reused with a live mapping.
+    reused with a live mapping. The stream ends only after an `Err` item,
+    which means deaths may have been missed: the pool subscribes again and
+    compares `list_managed()` with the containers it holds.
   - A per-scope container cap, default 4. Turns beyond it wait in a per-scope
     queue.
   - A global cap.
@@ -1810,14 +1853,29 @@ Deliverables:
     the thread lookups below.
   - Rows exist for every message agentd posts, and for inbound messages shown
     to the model, so short ids resolve.
+- agentd's `[sandbox]` configuration section is `sandbox::SandboxConfig`
+  (T17), validated with its `validate`; `image` fills every `SessionSpec`.
+  agentd builds a `DockerSandbox` with its data directory, calls
+  `reap_orphans` at startup, and documents the section in
+  `config/agentd.example.toml`. bollard logs every request body at debug
+  level, `exec` environments with placeholders and agentctl tokens
+  included, so `telemetry::subscriber` caps the `bollard` target at `info`
+  whatever `server.log_filter` says. Any other subscriber setup, such as a
+  test harness that captures logs, must keep that cap
+  ([impl-notes](impl-notes.md#bollard-logs-request-bodies-at-debug-level)).
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
-  placeholders with T18's `Registry`, sets the egress proxy variables from
+  placeholders with T18's `Registry`, and `turn_finished` calls
+  `Registry::unpoint`. It sets the egress proxy variables from
   T19, and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
   turn's outbox, and `revoke_process_token`). It builds `App` with a
   `SurfaceLookup` for `agentctl history`, and resolves the short message ids
   it shows the model where agentctl takes a message id
   ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
+- agentd serves T18's `CredProxy` on `Routers.proxy`, with the `Registry`
+  shared with its `TurnHooks`. A `[proxy] upstream` key, default
+  `https://api.anthropic.com`, sets the upstream, and
+  `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
@@ -1837,9 +1895,13 @@ Deliverables:
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
-     3. Render and split for the surface. `MentionDirectory` is synchronous,
-        so the pipeline first builds a snapshot of the names the reply
-        mentions from agent bindings and the surface's member cache.
+     3. Render and split with `Surface::render`. The trait takes no
+        `MentionDirectory`, so each surface resolves `@Name` from its own
+        member list; on Slack that is T29's per-team member cache, which
+        includes the agents' bot users. agentd passes each team's managed
+        agents' bot user ids to `TeamDirectory::set_managed_bots`, so an
+        agent keeps a name a human shares
+        ([impl-notes](impl-notes.md#t29-slack-web-api)).
      4. Post as the agent's bot identity in the thread.
      5. Record `message_refs` for every chunk with the turn's requester and
         hop.
@@ -2055,23 +2117,34 @@ Deliverables:
 
   The app id doesn't exist until `apps.manifest.create` returns, but the
   manifest must already carry its URLs, so agentd mints the binding id first
-  (T31). The manager app uses the fixed binding `manager`. The path selects
-  the signing secret: the binding's for agent apps, the one from configuration
-  for the manager. Unknown bindings get 404.
+  (T31). The manager app uses the fixed binding `manager`, whose events carry
+  the nil UUID as their `BindingId` (`BindingRef::MANAGER_ID`). The path
+  selects the signing secret: the binding's for agent apps, the one from
+  configuration for the manager. Unknown bindings get 404.
+  ([impl-notes](impl-notes.md#t28-slack-ingress))
 - Signature verification: `v0=HMAC-SHA256(secret, "v0:{ts}:{body}")` over the
   raw body, compared in constant time, rejecting timestamps more than 5 minutes
-  old.
+  from now in either direction, missing or repeated headers, and bodies over
+  1 MiB.
 - `url_verification`: echo the challenge for a known binding, without checking
   the signature. Slack sends it during `apps.manifest.create`, before agentd
-  has the new app's signing secret. The echo has no side effects. Every other
-  request type must verify.
+  has the new app's signing secret. The echo has no side effects. The one
+  other exception is Slack's `ssl_check`: a form whose `ssl_check` is `1`,
+  posted unsigned to the command URL, gets an empty 200 on the same terms.
+  Every other request type must verify.
   This PR adds that detail to the design's Slack transport bullet.
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
-  200 at once. Slash commands and interactivity return an empty 200 and reply
-  later through `response_url`.
+  200 at once, or 503 when the queue is full (Slack retries events, not
+  commands or interactions); they never wait for the queue. The secret lookup
+  and the body read share a 2-second timeout. Slash commands and
+  interactivity return an empty 200 and reply later through `response_url`.
 - Deduplication per binding: `store.mark_event_processed("slack:<binding>",
-  event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
-  a message that reached the same app twice. `X-Slack-Retry-Num` is logged.
+  event_id)` drops retried events, and messages are keyed by `(binding,
+  channel, ts)` instead, which drops a retry and a message that reached the
+  same app twice. Messages are normalized first, so a dropped one costs no
+  store write. Slash commands and
+  interactivity, which have no event id, are deduplicated by signature, which
+  drops a replay inside the 5-minute window. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
   - Agent apps take every message from `message.channels`,
     `message.groups`, `message.im` and `message.mpim`, and don't subscribe to
@@ -2143,13 +2216,18 @@ Deliverables:
   of 3,000 chars, and `supports_edit`, `supports_buttons`, `supports_threads`
   and `per_binding_delivery` all true.
 - A member cache per team, filled from `users.list` and refreshed on a
-  TTL, mapping display and real names to user ids. The pipeline's
-  `MentionDirectory` snapshot (T23) reads it together with agent bindings.
-  `users.info` can't look a user up by name.
+  TTL, mapping display and real names (and bot users' usernames) to user
+  ids. `SlackSurface::render` reads it; bot users are listed too, so agents'
+  names resolve without the bindings, and the managed agents' bot users
+  given to `TeamDirectory::set_managed_bots` win names they share with
+  others. `users.info` can't look a user up by name.
 - `bots.info` fills `sender.user` and `sender_bot_user` with the bot's
   `user_id` for bot events that lack a `user` field, cached per bot id. A bot
   id that maps to no user keeps the `bot_id` as `sender.user` and no
-  `sender_bot_user`, so the router ignores it as an unmanaged bot.
+  `sender_bot_user`, so the router ignores it as an unmanaged bot. The
+  ingress has no bot tokens, so the lookup is
+  `SlackSurface::fill_bot_sender`, which the receiver of `SlackInbound`
+  calls before routing (T31).
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `render` converts and splits through `render`, so that
@@ -2256,6 +2334,12 @@ Deliverables:
   agentd disables the binding, stops handling its events, and tells the owner
   to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
+- agentd's receiver of T28's `SlackInbound` builds a T29 `SlackSurface` per
+  active binding, with one `TeamDirectory` per team. Whenever a team's
+  active agent bindings change, it passes their `bot_user_id`s to
+  `TeamDirectory::set_managed_bots`, so agents win names humans share. It
+  awaits `refresh_members` when a binding starts, and passes each message
+  through `fill_bot_sender` before routing it.
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 
@@ -2459,6 +2543,22 @@ Not scheduled. Each needs a decision before it becomes a task.
   Until then, owners who need GitHub use the cloud hand-off (T35) or a
   fine-grained token scoped to one repository in a private task, and accept
   that it enters that private sandbox.
+- **A path allowlist for the credential proxy.** T18 forwards any path on the
+  upstream, so a sandbox can call any Anthropic endpoint its requester's
+  token or the community key allows, such as the profile or, with the
+  community key, the Files and Batches APIs that other members' turns share.
+  Limiting it to the paths the CLI uses (`/v1/messages`,
+  `/v1/messages/count_tokens`, and whatever else a live capture with
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` shows) needs that capture
+  first, since refusing a path the CLI needs breaks turns. Methods are
+  already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
+  `DELETE` and `OPTIONS`.
+- **Killing leftover processes at turn end.** T18 unpoints the placeholder
+  when a turn ends, so a background process the model left running can't
+  spend credentials between turns. It can still spend turn N+1's
+  credential while turn N+1 runs, whoever its requester is. Only killing
+  the processes a turn leaves behind in the container when it ends removes
+  that.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.

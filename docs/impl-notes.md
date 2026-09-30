@@ -1841,9 +1841,14 @@ store's signature and contract, and `RocketChatSurface::new` takes an
 `Arc<dyn Dedup>`. agentd implements it with a one-line call to the store;
 `DEDUP_SOURCE` is `"rocketchat"`. The tests use a real in-memory `Store`
 (a dev-dependency) behind it. A copy is recorded only after it was
-normalized, and a failure to read the room or the sender's roles, or to
-record, skips that copy without recording it, so another bot's connection can
-still deliver the message. A copy recorded when the event receiver has just
+normalized, and a failure to read the room or to record skips that copy
+without recording it, so another bot's connection can still deliver the
+message. A failure to read the sender's roles doesn't skip it: every surface
+shares one `BotRoles`, so every connection would fail alike and the message
+would be lost everywhere. The sender then counts as a person, with a warning
+logged, as history already did; the router looks every sender up as a
+managed agent whatever `sender_is_bot` says, so a managed agent's post still
+takes the agent path. A copy recorded when the event receiver has just
 closed is lost, which only happens at shutdown.
 
 ### Messages don't carry the sender's roles
@@ -1867,6 +1872,15 @@ sender is a bot when the message has a non-false `bot` field or the sender has
 the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
 only to the user itself and to the manager.
 
+Without the permission, `users.info` leaves `roles` out rather than
+failing, which would have classified every bot as a person without a word.
+Every Rocket.Chat user has at least one role, so `BotRoles::is_bot` treats
+an empty or missing list as `SurfaceError::Forbidden`, naming the missing
+permission and the manager's user id (never the token), and doesn't cache
+it. Messages still flow, as above, and each one logs the error, so a
+misconfigured manager is loud until it is fixed. The cache keeps at most
+10,000 users: making room drops expired entries, then the oldest.
+
 ### Room lists and room kinds come from REST
 
 **Issue.** Nothing in the realtime API lists the rooms a user is in without
@@ -1876,7 +1890,8 @@ can't tell a DM from a group DM.
 **Solution.** Each connection lists rooms with REST `subscriptions.get`, and
 the surface reads a room's `t`, `usersCount` and `uids` with `rooms.info` the
 first time a message arrives from it, then keeps it for the surface's
-lifetime (a DM's members are fixed). `RestClient` gains `subscriptions`,
+lifetime (a DM's members are fixed), for at most 10,000 rooms, dropping the
+oldest beyond that. `RestClient` gains `subscriptions`,
 `file_url` (`<base>/file-upload/<id>/<name>`, for `InFile::url`) and
 `credentials` (the realtime login reuses the token), and `FakeRest` answers
 `subscriptions.get`. Only channels, private groups and DMs are listened to:
@@ -1929,12 +1944,21 @@ answers for another user id also ends it.
 - A stream subscription is `sub` with `params: [event, false]`; the second
   parameter turns off collection compatibility. A refused one gets `nosub`
   with `error: "not-allowed"`. A refused room is dropped and the connection
-  stays up; a refused `subscriptions-changed` reconnects.
+  stays up; a refused `subscriptions-changed` reconnects. The refused room
+  is remembered until an `inserted` notice for it or the next connection,
+  since `updated` notices would otherwise ask for it again on every unread
+  change.
 - `subscriptions-changed` carries `[action, subscription]`. `updated` fires
   on every unread-count change, so subscribing is idempotent. `removed` may
-  lack `rid`. The server also stops a room's message subscription itself when
-  the user is removed, without telling the client, and the client sends
-  `unsub` anyway.
+  lack `rid`, so each connection keeps the subscription document `_id` of
+  each room, from `subscriptions.get` (`Subscription` gains `id`) and from
+  `inserted` and `updated` notices, and resolves such a removal through it.
+  The server also stops a room's message subscription itself when the user
+  is removed, without telling the client, and the client sends `unsub`
+  anyway. Because of that, `inserted` is authoritative: for a room already
+  subscribed, the client sends `unsub` for the old subscription and
+  subscribes again, so a removal it couldn't resolve doesn't leave the bot
+  deaf after it is added back.
 
 ### Reconnecting lists the rooms again instead of remembering them
 
@@ -1947,6 +1971,34 @@ lets any user with `view-c-room` read a public channel's messages
 then, plus what `subscriptions-changed` adds, which also covers rooms joined
 while disconnected. Messages posted while a bot had no connection are not
 fetched; [Deferred work](tasks-plan.md#deferred-work) has a bullet for it.
+
+### Changes that arrive while the rooms are listed
+
+**Issue.** `subscriptions.get` runs after the `subscriptions-changed`
+subscription is ready, so a notice can arrive while the listing is in
+flight. Applied at once, a removal found nothing to unsubscribe, and the
+listing, possibly read before the removal, then subscribed to the room
+anyway.
+
+**Solution.** Notices that arrive during the listing are kept, then applied
+in order to the listed rooms before anything is subscribed: a removal takes
+its room out (resolving a missing `rid` through the listing's document ids),
+and `inserted` or `updated` puts it in. A notice about a change the listing
+already reflects changes nothing.
+
+### The backoff starts over only after a healthy connection
+
+**Issue.** The backoff reset as soon as a connection had logged in and
+subscribed, so a server that accepted and subscribed and then dropped the
+socket, or refused `subscriptions-changed` right after, was reconnected at
+the initial wait forever.
+
+**Solution.** The backoff resets only when a connection stays up for the
+longer of `backoff_max` and twice `heartbeat` (60 s by default). That is
+long enough that reconnecting at once costs no more than waiting the
+longest backoff, and longer than it takes to notice a silent server, which
+is declared dead after twice `heartbeat`. A connection that drops sooner
+counts as a failed attempt and the next wait doubles.
 
 ### Normalizing runs off the socket
 
@@ -1993,322 +2045,6 @@ messages older than the cursor message's `ts`, and adds the root once the
 replies run out, as Slack's `conversations.replies` would. It reads at most
 50 pages. Both thread and top-level history leave out system messages, so a
 call can return fewer than `limit`.
-
-## T15: agentctl
-
-### The token needs the turn's thread and message
-
-**Issue.** The plan's `ctl_tokens` columns for the current turn are
-`turn_id`, `requester`, `hop`, `kind` and `side`. The target rules need the
-current conversation ("`post` may target only the current conversation"),
-`react` without a message id needs the message that started the turn, and
-`history` needs the thread. None of them is in those columns, and T15 can't
-read T21's `sessions` table, which doesn't exist yet.
-
-**Solution.** `begin_turn` takes a `CtlTurn` that also carries the turn's
-`ThreadKey` and its trigger message, stored as `conversation` (the
-`ConvRef` string form), `thread_root` and `trigger_message`. `requester` is
-two columns, `requester_member` and `requester_key`, as in T23's
-`message_refs`, and `kind` is `kind` plus `consent_id`. A `CHECK` makes the
-turn columns all set or all NULL. The plan's T15 bullet lists the columns.
-
-### One token per session, not only per process
-
-**Issue.** The plan says one token per `claude` process, but T21's hooks are
-keyed by session, and nothing stopped two live tokens for one session if a
-process restart issued a token before revoking the old one.
-
-**Solution.** `session_id` is unique in `ctl_tokens`, and
-`issue_process_token` deletes the session's old token (and drops its
-outbox) in the same transaction it inserts the new one. A session runs one
-process at a time, so the newest process's token is the only one that
-works.
-
-### Targets needed a grammar
-
-**Issue.** `PostRequest::to` and `ReactRequest::message` are "strings as
-the model wrote them", and the plan doesn't say how the model names a
-conversation or a thread.
-
-**Solution.** `--to` takes `here` (the turn's thread), a conversation id
-(its top level), or `<conversation id>/<message id>` (a thread in it). A
-conversation id may be written `#C123` or as Slack's `<#C123|name>`, and
-names a conversation on the turn's own surface and team. Ids start with a
-letter or digit and hold only letters, digits, `.`, `_` and `-`, so `..` or
-a path never reaches a surface's URL. `react` takes a message id, or
-`<conversation id>/<message id>`, and on either side may name only messages
-in the current conversation; the plan's `Owner` rule widens `post` only.
-Channel names (`#general`) are not resolved: a public turn is refused with a
-hint to use `here`, and an owner turn's post is refused by the surface.
-
-### Message ids are platform ids until T23
-
-**Issue.** The design shows the model short message ids from a per-session
-table (T23's `message_refs`), but T15 comes first, so `react <emoji> <id>`
-and `history --before <id>` have nothing to resolve a short id against.
-
-**Solution.** Both take platform message ids for now (a Slack `ts`, a
-Rocket.Chat `_id`). T23, which introduces short ids, resolves them in the
-ctl handlers; its bullet in the plan says so.
-
-### A refused upload lost its answer
-
-**Issue.** `attach` refused a file over the cap as soon as it saw the
-`Content-Length`, without reading the body. agentctl was still sending, so
-when agentd closed the connection reqwest reported a failed request, and the
-model saw "the request failed" instead of the limit. With an 8 MiB file and a
-1 KiB cap this happened in about one run in three.
-
-**Solution.** After any refusal inside `attach` (size, name, slots, no
-turn), agentd reads the rest of the body and throws it away before
-answering, within the same 5-minute limit as an upload. Nothing is written to
-disk while draining, and only an authenticated caller gets this far. An
-unauthenticated request is refused before its body is read.
-
-### reqwest honors `HTTP_PROXY`
-
-**Issue.** Sandboxes have `HTTP_PROXY` and `HTTPS_PROXY` pointing at the
-egress proxy (T19), and reqwest reads them even with its default features
-off, so agentctl's plain-HTTP calls to `agentctl.internal` would go through
-the egress proxy.
-
-**Solution.** agentctl builds its client with `no_proxy()`. The end-to-end
-tests run it with `HTTP_PROXY`, `http_proxy` and `ALL_PROXY` pointing at a
-closed port.
-
-### Lease times are whole seconds
-
-**Issue.** Store timestamps are Unix seconds, so a lease granted at
-`now + ttl` really lasts between `ttl - 1` and `ttl` seconds, and a
-one-second lease can end almost at once.
-
-**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`) and agentctl
-renews it when a third of the remaining time has passed, at least every
-200 ms. A `ttl` below one second counts as one. Tests that renew use a
-3-second lease.
-
-### What agentctl does when it loses the lock
-
-**Issue.** The plan says the lease is renewed while the command runs, but
-not what happens when a renewal fails: agentd refused it (the lease
-expired, or the turn ended), or agentd couldn't be reached.
-
-**Solution.** A refused renewal, or transport failures until the lease's
-expiry has passed, means another command may hold the lock, so agentctl
-kills its command and exits 1 with "lost the shared/ lock (…); stopped the
-command". On `SIGTERM`, `SIGINT` or `SIGHUP` it kills the command, releases
-the lease and exits with 128 plus the signal. Killing stops the command's
-own process only: processes it started in the background keep running, and
-an agentctl killed with `SIGKILL` leaves its command running once the lease
-expires. The lock is a guard for cooperating commands, as the design's
-"scope-level lock that `agentctl` takes for writes" is. agentctl waits at
-most 100 seconds for the lock by default (`--timeout`), below the 2 minutes
-Claude Code's Bash tool gives a command by default, so the model sees why it
-failed rather than a killed command.
-
-### `lock` is refused inside private tasks
-
-**Issue.** The plan's refusal rule allows only `attach` inside a
-`TurnKind::PrivateTask` turn, which includes `lock`. An owner-requested
-private task mounts `shared/` read-write (T33), and without `lock` it can't
-take the lock that guards writes there.
-
-**Solution.** T15 follows the rule as written: every command but `attach`
-goes through the extractor that refuses private tasks, so a new command is
-refused unless it opts out. T33 should decide whether owner-requested tasks
-may take the lock.
-
-### A data directory key
-
-**Issue.** Attachments are staged "under the agentd data directory", but no
-key named one.
-
-**Solution.** `store.data_dir`, required and absolute. Attachments go in
-`ctl-outbox/<random>/` under it, one directory per turn, created with mode
-0700, holding files named by random UUIDs; the model's file name is only
-display text and is refused if it holds `/`, `\`, a control character, or is
-`.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
-directory, and startup empties `ctl-outbox/`. The cap is
-`limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
-files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in
-flight count against the 10.
-
-### A musl build is static-pie
-
-**Issue.** None; confirming the plan. `readelf -l` on the
-`x86_64-unknown-linux-musl` release build shows `Elf file type is DYN` and a
-`DYNAMIC` segment, but no `INTERP`, and `cargo tree` for the target shows no
-`cc`, `ring`, `rustls` or `openssl`.
-
-**Solution.** The `agentctl-static` CI job checks for `INTERP` only, as the
-plan says.
-
-## T22: router
-
-### The plan and the design name no order for the checks
-
-**Issue.** The design's flowchart has only the ignore and credential branches,
-and T22 lists the refusals (paused, bans, deny rules, hop cap) without saying
-where they fall, or how they rank against gating and linking. A refusal
-placed before gating would make a paused or restricted agent answer every
-channel message with a notice; a link prompt or community-key turn placed
-before a refusal would be offered to someone who is banned.
-
-**Solution.** The two documents don't disagree, so `route` takes the order
-that is safe on both counts and documents it in the crate rustdoc: the
-agent (unknown, deleted), the sender (unmanaged bot, own message), whose DM
-it is, gating, attribution, then paused, banned, allow and deny, hop cap,
-and last the credential. Every ignore precedes every refusal and every
-refusal precedes the credential. The refusals keep the plan's listing order;
-none spends anything, so it only picks the notice. `precedence_*` tests pin
-each boundary.
-
-### A DM didn't say whose DM it is
-
-**Issue.** "Or DM" in the gating rule, and "owner in a DM" for the
-`Private` scope, assumed the DM is with the agent being routed. Nothing in
-`RouterView` could check that. If the pipeline made a mentioned agent a
-candidate for the owner's DM with another bot, the manager bot included,
-the router would have run it on the owner's side in a conversation that
-isn't its own.
-
-**Solution.** `RouterView::binding_agent(BindingId)` names the agent whose
-binding received the event. A one-to-one DM has exactly one bot in it and
-only that bot's binding receives it, on Slack (`message.im` to that app) and
-on Rocket.Chat (one connection per bot, and only the agent's is in the
-room). A DM that came in through any other binding is
-`Ignore(NotThisAgentsDm)`, even if it mentions the agent. The plan's T22
-list gains the query.
-
-### `message_ref` needed the posting agent, and the requester's member may be stale
-
-**Issue.** T22's `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`
-couldn't tell which agent agentd posted the message as, so a row recorded
-for one agent would attribute another agent's message. The router doesn't
-use the turn id. And the requester's `member` is recorded at posting time:
-`None` for someone unlinked then, which would let a later ban by member be
-sidestepped through a hop.
-
-**Solution.** `message_ref` returns an `Attribution { agent, requester,
-hop }`, and the router accepts it only when `agent` is the agent that sent
-the message; otherwise the message is unattributed. A recorded member wins,
-since it names who was billed; when none was recorded the router resolves
-the key with `member_for`. `is_banned` takes the whole `Requester`, so the
-view checks the member it names and the member its key belongs to.
-
-### `LinkPrompt` didn't say whom to prompt
-
-**Issue.** For a hop, the event's sender is a bot, so a bare `LinkPrompt`
-left the pipeline to guess who should link. That happens when the inherited
-requester unlinked, or the community key was cleared, mid-chain.
-
-**Solution.** `Decision::LinkPrompt { requester }`. For a person's message it
-is the sender; for a hop it is the inherited requester.
-
-### The owner without a linked account
-
-**Issue.** The flowchart sends the owner straight to "owner credential",
-without asking whether the owner still has one. `/agent logout` can leave
-an owner unlinked. Falling through to the community key would put the
-community's key behind the owner's `Private` side in a DM.
-
-**Solution.** The owner's turns run only on the owner's credential. An
-unlinked owner gets a link prompt, in a DM and in a channel, and the
-community key is never used for them. `design.md`'s Routing section says so.
-
-### What allow and deny rules mean
-
-**Issue.** T27 says "deny wins, and the default allows everyone". With a
-default of allow, an allow rule could never change anything unless a
-non-empty allow list restricts. T27 fills the rules, but T22 evaluates
-them.
-
-**Solution.** `AgentPolicy::permits`: a requester any deny rule covers is
-refused. Otherwise an empty allow list allows everyone, and a non-empty one
-allows only requesters one of its rules covers, by member or by room (see
-[below](#member-rules-matched-one-surface-only)).
-Rules apply to the requester, so a hop is checked against the inherited
-requester. The owner is exempt, so `deny everyone` can't lock the owner out
-of their own agent. `AgentPolicy` also carries `max_hops`, since T27's
-per-agent `hops` limit lives in the same row; the view returns the effective
-cap, the global one lowered by the agent's. Until T27, the default is
-`DEFAULT_MAX_HOPS`, 3.
-
-### Surface flags aren't trusted for managed agents
-
-**Issue.** The router asked for the managed agent only when
-`sender_is_bot` was true, per T22. A surface that failed to flag a managed
-agent's post as a bot would have had it routed as a person's message:
-billed to the bot's own key, most likely on the community key, and able to
-loop.
-
-**Solution.** The router asks `managed_bot(sender)` for every sender, and
-a managed agent's post takes the agent path whatever the flags say. A sender
-flagged as a bot whose `sender_bot_user` isn't `sender.user` (a Slack bot
-known only by its bot id, or a surface bug) is an unmanaged bot without any
-lookup, so a bot id never matches a binding even by accident. A
-`sender_bot_user` alone marks the sender as a bot.
-
-### A reply naming another agent ran two turns
-
-**Issue.** A person's reply in agent A's thread counted as addressed to A
-whatever it mentioned. A reply there that mentioned only agent B ran B, as
-the mention asked, and also A, as a reply to A, so the person paid for two
-turns and got an answer they didn't ask A for.
-
-**Solution.** A reply to an agent counts only if it mentions no other
-managed agent. Mentioning nobody, A itself, the manager bot or a person
-still counts; mentioning B and not A is addressed to B alone. Mentioning
-both runs both, since both were named. A DM still counts for the agent
-whose DM it is, whatever it mentions, since no other agent can answer
-there. `design.md`'s Routing section says so, and the invariant grid gains
-a "mentions B" axis that asserts a message naming only B never engages A
-outside A's DM.
-
-### Member rules matched one surface only
-
-**Issue.** `PolicyTarget::Member(MemberKey)` matched the requester's surface
-identity only. Bans and the owner check go by `MemberId`, so a member
-denied through their Slack identity could still use the agent through
-their linked Rocket.Chat identity.
-
-**Solution.** `PolicyTarget::Member { key, member }` holds the identity the
-rule named and the member it belonged to when the rule was set.
-`AgentPolicy::permits` takes the whole `Requester`: a member rule covers a
-requester with the same key, or, when the rule has a member, a requester
-with the same member on any surface. Key equality always counts, so a rule
-set while the identity had no member still covers that identity after it
-joins one. T27 stores the member with the rule.
-
-### The manager bot had no identity in the view
-
-**Issue.** `is_managed_bot` answered only for agents' bot users. A manager
-bot post that the surface didn't flag as a bot, and that mentioned an agent,
-was routed as a person's message: the manager bot's key has no member, so
-it ran on the community key.
-
-**Solution.** The lookup is `managed_bot(key) -> Option<ManagedBot>`, where
-`ManagedBot` is `Agent(AgentId)` or `Manager`. The manager bot's posts are
-`Ignore(ManagerBot)` whatever the flags say, and a mention of the manager
-bot addresses no agent.
-
-### A synchronous view over an asynchronous store failed open
-
-**Issue.** `RouterView` is synchronous so that `route` stays pure, and the
-store is asynchronous, so T23 has to load the view's answers before calling
-`route`. Anything it forgot fell back permissively: `is_banned` answered
-false and a missing policy was `AgentPolicy::default()`, which allows
-everyone. A banned or denied requester would have been run.
-
-**Solution.** The lookups that grant or withhold permission fail closed.
-`is_banned` returns `Option<bool>` and `policy` returns
-`Option<AgentPolicy>`; `None` means the view doesn't know, and `route`
-refuses with `RefuseReason::PolicyUnavailable`, after the paused check and
-a known ban, and before the credential. The owner is refused too, since
-the policy also holds the hop cap. Every other lookup already withholds a
-turn when it has no answer. The trait's rustdoc lists every lookup `route`
-may make for an event, in order, so T23 knows what to load, and T23's and
-T27's plan text say what they fill.
 
 ## T13: account commands
 
@@ -2477,3 +2213,1116 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
 - The captured-log test logs at `trace` for every crate through a whole
   DM login, exchange included, and finds neither the code nor the pasted
   text, so reqwest, hyper and sqlx don't log request bodies either.
+
+## T15: agentctl
+
+### The token needs the turn's thread and message
+
+**Issue.** The plan's `ctl_tokens` columns for the current turn are
+`turn_id`, `requester`, `hop`, `kind` and `side`. The target rules need the
+current conversation ("`post` may target only the current conversation"),
+`react` without a message id needs the message that started the turn, and
+`history` needs the thread. None of them is in those columns, and T15 can't
+read T21's `sessions` table, which doesn't exist yet.
+
+**Solution.** `begin_turn` takes a `CtlTurn` that also carries the turn's
+`ThreadKey` and its trigger message, stored as `conversation` (the
+`ConvRef` string form), `thread_root` and `trigger_message`. `requester` is
+two columns, `requester_member` and `requester_key`, as in T23's
+`message_refs`, and `kind` is `kind` plus `consent_id`. A `CHECK` makes the
+turn columns all set or all NULL. The plan's T15 bullet lists the columns.
+
+### One token per session, not only per process
+
+**Issue.** The plan says one token per `claude` process, but T21's hooks are
+keyed by session, and nothing stopped two live tokens for one session if a
+process restart issued a token before revoking the old one.
+
+**Solution.** `session_id` is unique in `ctl_tokens`, and
+`issue_process_token` deletes the session's old token (and drops its
+outbox) in the same transaction it inserts the new one. A session runs one
+process at a time, so the newest process's token is the only one that
+works.
+
+### Targets needed a grammar
+
+**Issue.** `PostRequest::to` and `ReactRequest::message` are "strings as
+the model wrote them", and the plan doesn't say how the model names a
+conversation or a thread.
+
+**Solution.** `--to` takes `here` (the turn's thread), a conversation id
+(its top level), or `<conversation id>/<message id>` (a thread in it). A
+conversation id may be written `#C123` or as Slack's `<#C123|name>`, and
+names a conversation on the turn's own surface and team. Ids start with a
+letter or digit and hold only letters, digits, `.`, `_` and `-`, so `..` or
+a path never reaches a surface's URL. `react` takes a message id, or
+`<conversation id>/<message id>`, and on either side may name only messages
+in the current conversation; the plan's `Owner` rule widens `post` only.
+Channel names (`#general`) are not resolved: a public turn is refused with a
+hint to use `here`, and an owner turn's post is refused by the surface.
+
+### Message ids are platform ids until T23
+
+**Issue.** The design shows the model short message ids from a per-session
+table (T23's `message_refs`), but T15 comes first, so `react <emoji> <id>`
+and `history --before <id>` have nothing to resolve a short id against.
+
+**Solution.** Both take platform message ids for now (a Slack `ts`, a
+Rocket.Chat `_id`). T23, which introduces short ids, resolves them in the
+ctl handlers; its bullet in the plan says so.
+
+### A refused upload lost its answer
+
+**Issue.** `attach` refused a file over the cap as soon as it saw the
+`Content-Length`, without reading the body. agentctl was still sending, so
+when agentd closed the connection reqwest reported a failed request, and the
+model saw "the request failed" instead of the limit. With an 8 MiB file and a
+1 KiB cap this happened in about one run in three.
+
+**Solution.** After any refusal inside `attach` (size, name, slots, no
+turn), agentd reads the rest of the body and throws it away before
+answering, within the same 5-minute limit as an upload. Nothing is written to
+disk while draining, and only an authenticated caller gets this far. An
+unauthenticated request is refused before its body is read.
+
+### reqwest honors `HTTP_PROXY`
+
+**Issue.** Sandboxes have `HTTP_PROXY` and `HTTPS_PROXY` pointing at the
+egress proxy (T19), and reqwest reads them even with its default features
+off, so agentctl's plain-HTTP calls to `agentctl.internal` would go through
+the egress proxy.
+
+**Solution.** agentctl builds its client with `no_proxy()`. The end-to-end
+tests run it with `HTTP_PROXY`, `http_proxy` and `ALL_PROXY` pointing at a
+closed port.
+
+### Lease times are whole seconds
+
+**Issue.** Store timestamps are Unix seconds, so a lease granted at
+`now + ttl` really lasts between `ttl - 1` and `ttl` seconds, and a
+one-second lease can end almost at once.
+
+**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`). agentctl
+relies on it only until one second before its expiry, since another command
+may take the lock at the expiry itself, and renews it when a third of that
+remaining time has passed, at least every 200 ms. A `ttl` below one second
+counts as one, and agentctl needs a lease of at least two seconds. Tests
+that renew use a 3-second lease.
+
+### What agentctl does when it loses the lock
+
+**Issue.** The plan says the lease is renewed while the command runs, but
+not what happens when a renewal fails: agentd refused it (the lease
+expired, or the turn ended), or agentd couldn't be reached. A first version
+also awaited each renewal on its own, bounded only by the 30-second request
+timeout, so a renewal agentd never answered let the command keep writing
+past the lease's expiry, and delayed `SIGTERM` by as long.
+
+**Solution.** The renewal runs in the same `select!` as the command's exit,
+the stop signals and a deadline one second before the lease's expiry, and
+its request timeout is capped at the time left until that deadline. A
+refused renewal, or no successful renewal by the deadline, means another
+command may soon hold the lock, so agentctl kills its command and exits 1
+with "lost the shared/ lock (…); stopped the command". On `SIGTERM`,
+`SIGINT` or `SIGHUP` it kills the command, releases the lease and exits
+with 128 plus the signal. The signal handlers are installed before the
+lease is acquired and kept until the release is sent, so a signal is never
+lost in between, and the release waits at most two seconds, after which the
+lease expires on its own. agentctl waits at most 100 seconds for the lock
+by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
+a command by default, so the model sees why it failed rather than a killed
+command.
+
+### The command runs in its own process group
+
+**Issue.** Killing the command's process stopped only that process. With
+`sh -c '…'`, which the CLI help recommends, every process the shell started
+survived: it kept writing under the next holder, and it held agentctl's
+standard output and error open, so a caller reading them to the end hung.
+Tokio's `Child::kill` signals one process, and the standard library has no
+call to signal a process group.
+
+**Solution.** agentctl spawns the command with `process_group(0)` and kills
+the whole group with `SIGKILL`, through `rustix::process::kill_process_group`
+(rustix 1, the `process` feature only: safe, pure Rust, and it builds for the
+static musl target), before reaping the command. The group is signalled only
+while the command hasn't been reaped, so its id can't have been reused. A
+process that leaves the group (`setsid`, say) escapes, processes the
+command leaves running when it exits on its own are not stopped, and an
+agentctl killed with `SIGKILL` leaves its command running once the lease
+expires. Being in its own group, the command is not in the terminal's
+foreground group, so it can't read from a terminal; agentctl runs under the
+model's Bash tool, which gives it none. The lock is a guard for cooperating
+commands, as the design's "scope-level lock that `agentctl` takes for
+writes" is.
+
+### A lease outlived its turn
+
+**Issue.** Release goes through the same extractor as every command, which
+refuses a token between turns, and ending a turn or revoking a token left
+`scope_locks` alone. A lease taken in a turn that ended, or by a process
+whose token was revoked, held the lock until it expired, up to 30 seconds.
+
+**Solution.** The store deletes the session's leases in the same
+transaction that records or clears a token's turn (`set_ctl_turn`), deletes
+the token (`delete_ctl_token`), or replaces it with a new token for the
+session (`put_ctl_token`). A lease lasts no longer than the turn that took
+it, and the lock is free as soon as `end_turn` or `revoke_process_token`
+returns. An acquire authorized just before the turn ended can still land
+after the delete; that lease can't be renewed, and expires on its own.
+
+### `lock` is refused inside private tasks
+
+**Issue.** The plan's refusal rule allows only `attach` inside a
+`TurnKind::PrivateTask` turn, which includes `lock`. An owner-requested
+private task mounts `shared/` read-write (T33), and without `lock` it can't
+take the lock that guards writes there.
+
+**Solution.** T15 follows the rule as written: every command but `attach`
+goes through the extractor that refuses private tasks, so a new command is
+refused unless it opts out. T33 should decide whether owner-requested tasks
+may take the lock.
+
+### A data directory key
+
+**Issue.** Attachments are staged "under the agentd data directory", but no
+key named one.
+
+**Solution.** `store.data_dir`, required and absolute. Attachments go in
+`ctl-outbox/<random>/` under it, one directory per turn, created with mode
+0700, holding files named by random UUIDs; the model's file name is only
+display text and is refused if it holds `/`, `\`, a control character, an
+invisible formatting character (bidirectional controls such as U+202E, which
+can make `exe.txt` read as `txt.exe`, zero-width characters, tag characters,
+or a line or paragraph separator), or is `.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
+directory, and startup empties `ctl-outbox/`. The cap is
+`limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
+files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in
+flight count against the 10.
+
+### A musl build is static-pie
+
+**Issue.** None; confirming the plan. `readelf -l` on the
+`x86_64-unknown-linux-musl` release build shows `Elf file type is DYN` and a
+`DYNAMIC` segment, but no `INTERP`, and `cargo tree` for the target shows no
+`cc`, `ring`, `rustls` or `openssl`.
+
+**Solution.** The `agentctl-static` CI job checks for `INTERP` only, as the
+plan says.
+
+## T17: sandbox
+
+### Docker can't signal an exec'd process
+
+**Issue.** T20 kills a turn's process on timeout, but Docker's API has no
+way to signal a process started with `exec`: `kill` reaches only a
+container's PID 1, and the pid `inspect_exec` reports is in the host's PID
+namespace, which agentd, itself in a container, can't see. Killing the
+container would force the runner to start a new one for every timeout.
+
+**Solution.** `DockerSandbox::exec` runs argv as
+`/bin/sh -c 'echo $$; exec "$@"' sh <argv…>`. The shell prints its pid,
+then `exec` replaces it with the command under the same pid, and `"$@"`
+passes argv through without shell interpretation. The sandbox strips that
+first line from stdout, and `ChildHandle::kill` runs
+`sh -c 'kill -s KILL "$1"'` in the container as the same user. The image
+needs `/bin/sh` (Debian has it). Only the process is killed; processes it
+started are reparented to the container's init and end when the container
+stops. If the pid line hasn't arrived within 2 seconds, `kill` returns an
+error instead of `Ok`: nothing was signalled, so `wait` could hang, and the
+caller must stop the container. `ProcessSandbox` kills the child's whole
+process group instead, through the `kill` command, since a direct
+`kill(2)` would need `unsafe`; it runs the command with `tokio::process`,
+and from `Drop`, which can't wait, in a spawned task (or blocking, off a
+runtime).
+
+### Agent-writable directories are given to the sandbox user
+
+**Issue.** The sandbox runs as uid 10001, but agentd creates the volume
+directories. Created by root, or by another non-root user, they aren't
+writable in the container.
+
+**Solution.** `shared/`, `memory/`, each session's `work/`, `claude/`,
+`home/` and `tmp/`, and `settings.json` are given to the configured
+`uid:gid` with `lchown` when their owner differs. That works when agentd
+runs as root or as the sandbox user itself, and fails with an error naming
+the cause otherwise. T16's agentd image should therefore run as uid 10001
+(the plan's T16 says so).
+
+That makes agentd and the agent the same user, so the agent owns its
+`sessions/<id>/` too and can rename, replace or remove `work/`, `claude/`
+and the rest. What it can't reach is everything above its mounts:
+`volumes/` (`0700`), the volume directory and its `sessions/` are mounted
+into no sandbox. Host-side code therefore treats everything inside a
+session directory as hostile (next entry).
+
+The Docker tests can't use 10001: on the CI runner the test process is not
+root, so it can't give directories away. They run the sandbox as the test
+process's own uid, which is still not root, and 10001 when the tests run
+as root.
+
+### The agent controls what is inside its session directory
+
+**Issue.** agentd writes `claude/settings.json` on the host before every
+start, and Docker mounts the skills directory at `claude/skills`. Both are
+inside the session's read-write mount, so a previous run of the agent could
+have replaced `claude` with a symlink to a host path, and agentd (possibly
+root) would write through it.
+
+**Solution.** Nothing on the host follows a symlink inside an
+agent-writable tree. Before each start, each of `work/`, `claude/`,
+`home/` and `tmp/` that isn't a real directory (checked with
+`symlink_metadata`) is removed and created again, as is `claude/skills`
+when there are skills to mount there. It is rewritten on every start, so
+an agent can't lower `cleanupPeriodDays` and lose its transcripts.
+Ownership changes use `lchown`.
+
+The plan made this step a public `prepare_session_dirs` on the trait. Run
+while the session's container was up, the agent could swap `claude` for a
+symlink between its repair and the write, and agentd would write, and
+give away, a file wherever the symlink pointed. So the step is
+crate-private and runs only in `start`, before the container is created;
+`start`'s rustdoc says the session must have no running container, and the
+runner never runs two containers of one session.
+
+`settings.json` doesn't rely on that. std has no `openat` (`std::fs::Dir`
+is unstable), so the sandbox crate adds `rustix`, whose `openat` and
+`renameat` are safe functions. `claude/` is opened with `O_NOFOLLOW |
+O_DIRECTORY`, its owner checked on the handle, and the new file is created
+relative to that handle with `O_EXCL | O_NOFOLLOW`, given away with
+`fchown`, and renamed over `settings.json` within the same directory,
+which replaces a symlink instead of following it. A directory in its place
+is renamed aside to a random name first, then removed.
+
+### Several agentd, or test runs, on one Docker host
+
+**Issue.** The plan's `reap_orphans` stops every container labeled
+`agentd.session`, and `list_managed` and `events` filter on the same label.
+Two agentd on one host, or a Docker test running next to another, would
+stop each other's sandboxes.
+
+**Solution.** Every container also gets `agentd.instance=<name>`, from
+`[sandbox] instance` (default `agentd`), and listing, reaping and events
+select on both labels. Each Docker test uses its own instance name and its
+own internal network. The plan's T17 bullet says so.
+
+### agentd's paths aren't the Docker daemon's
+
+**Issue.** Bind mount sources are paths on the Docker host. agentd runs in
+a container (plan: Network and deployment shape), where its data directory
+may be mounted somewhere else than on the host.
+
+**Solution.** `[sandbox] host_data_dir` names the data directory as the
+daemon sees it. Every mount source under agentd's data directory (the
+volume, the persona and skills directories) is rewritten to that prefix,
+and one outside it is refused while the key is set. Unset, paths are used
+as they are, which fits a data directory mounted at the same path. Docker
+refuses a bind mount whose source doesn't exist, so a wrong setting fails
+at start instead of mounting an empty directory.
+
+### What the sandbox refuses in a `SessionSpec`
+
+**Issue.** The plan leaves open what a spec may carry.
+
+**Solution.** `container_config` and `ProcessSandbox::start` refuse a spec
+that sets `HOME` or `TMPDIR` (the sandbox sets them), an environment name
+that is empty or holds `=`, NUL anywhere, a label under `agentd.`, a
+persona or skills path that isn't absolute or holds `..`, and `memory`
+on any volume but the agent's `Private` one, which is the only one with a
+`memory/` directory. The container environment is visible to anyone who
+can inspect the container, so its rustdoc says it holds no secrets; the
+placeholder, the agentctl token and the proxy variables go to `exec`.
+Errors from `exec` requests never carry Docker's message, since the request
+held that environment. `SessionSpec::new` gives the least access:
+`shared/` read-only and no `memory/`.
+
+### The volumes row records a relative path
+
+**Issue.** The plan's `volumes.path` doesn't say relative to what.
+
+**Solution.** It is `volumes/<agent id>/<digest>`, relative to the data
+directory, so moving the data directory doesn't make every row wrong. The
+path column is unique, and `Store::volume_by_path` answers which key a
+directory holds. Recording a key again keeps its `created_at`.
+
+### bollard's API version and Docker on the runner
+
+**Issue.** bollard 0.21 sends API version 1.53 by default. An older daemon
+refuses a client version it doesn't know.
+
+**Solution.** `DockerSandbox::connect` calls `negotiate_version`, which
+drops to the daemon's version. bollard's 2-minute request timeout covers
+only the response headers, so long `exec` and event streams aren't cut.
+A stop request's headers, though, come only after the container stopped,
+up to `stop_timeout_secs` later, and a stop that timed out would leave the
+container stopping and not removed. `stop_timeout_secs` is therefore at
+most 60, not the 300 first allowed. That grace applies only to the init
+and its `sleep`, the processes SIGTERM reaches; processes started with
+`exec` are killed without one when the container stops.
+
+### No curl in `debian:stable-slim`
+
+**Issue.** The plan's test runs `curl https://example.com`, which in
+`debian:stable-slim` fails only because curl isn't installed.
+
+**Solution.** The test opens a TCP connection with bash's `/dev/tcp`, by
+name (`example.com:443`) and by address (`1.1.1.1:443`), under `timeout`.
+As a control, the same probe must succeed from a container on a network
+the test creates without `internal`, so the test can't pass because the
+probe itself is broken. The control used to run on Docker's `bridge`
+network, but `[sandbox] network` now refuses `bridge`, along with `host`,
+`none`, `default` and anything with a `:` (`container:<id>`): those are
+Docker network modes, not the internal sandbox network, and `validate`
+had only checked that the name wasn't empty. `container_config`, which is
+public, validates the configuration too.
+
+### A `ChildStdin` closes only when dropped
+
+**Issue.** Shutting down a Docker exec's stdin half-closes the connection,
+and the process sees end of input. A tokio `ChildStdin` ignores
+`shutdown`: the pipe closes only when it is dropped, so a runner that
+shut stdin down would hang `fake-claude` under `ProcessSandbox`.
+
+**Solution.** `ProcessSandbox` wraps the pipe so that `shutdown` drops it,
+and both sandboxes document that shutting stdin down closes the stream.
+
+### bollard's event stream starts when it is first polled
+
+**Issue.** `Docker::events` returns a stream that sends its request only
+when first polled. A container that died between `Sandbox::events` and the
+first poll would be missed, and the runner would keep a mapping for a dead
+container's IP.
+
+**Solution.** `DockerSandbox::events` passes `since` with the time of the
+call, and Docker replays the buffered events from then. The stream ends
+only after one `EventsMissed` item, so the runner re-subscribes and
+compares `list_managed` with what it holds. That item comes on an error,
+and also when Docker ends the stream cleanly, as a daemon restart does:
+that used to end the stream with no item, which the runner could take for
+a quiet stream and never re-subscribe. `ProcessSandbox` keeps the same
+contract: it ends after `EventsMissed` when it lags or its sender is gone.
+
+### bollard logs request bodies at debug level
+
+**Issue.** bollard 0.21 logs every request body with `log::debug!`
+(`serialize_payload`, which `create_exec` uses), and agentd forwards
+`log` records to `tracing`. An `exec` body holds the process's
+environment: the placeholder and the agentctl token. With
+`server.log_filter` at `debug` or `trace`, both would be logged. A
+`bollard=info` directive appended to the operator's filter isn't enough:
+a more specific one such as `bollard::docker=trace`, or a span filter
+such as `[turn]=trace`, outranks it.
+
+**Solution.** `telemetry::subscriber` adds a separate `Targets` filter,
+layered next to the operator's `EnvFilter`, that caps `bollard` at `info`
+whatever that filter enables; a test feeds `log` records with target
+`bollard::docker` through the bridge under filters from `trace` to
+`bollard::docker=trace` and finds none. `Sandbox::exec`'s rustdoc says the
+environment is kept out of logs only with that cap, and the plan's T23
+says any other subscriber setup must keep it.
+
+## T18: credential proxy
+
+### Placeholders are looked up by digest and handled by id
+
+**Issue.** The plan asks for a timing-safe placeholder check, and gives
+`point(placeholder, …)` and `revoke(placeholder)`, which would have T23's
+turn hooks keep the secret text around only to name the placeholder again.
+
+**Solution.** The registry is a map keyed by `PlaceholderId`, the SHA-256 of
+the placeholder's text. A presented token is hashed and looked up, so no
+stored token is ever compared byte by byte with a guess, and lookup time says
+nothing about how close the guess was. `point` and `revoke` take the
+`PlaceholderId`, which is `Copy` and not secret; `Placeholder` itself isn't
+`Clone`, redacts its text from `Debug`, and exposes it only through
+`ExposeSecret`, with `env_var()` naming `CLAUDE_CODE_OAUTH_TOKEN` or
+`ANTHROPIC_API_KEY` so the runner sets exactly one. `point` refuses a
+credential of the other kind, so a placeholder can never be pointed across
+kinds, whatever the caller does.
+
+### An address belongs to one session
+
+**Issue.** The plan binds a placeholder to its container's address and
+relies on revocation before stop and on death, because Docker can give a dead
+container's address to a new one. It doesn't say what the registry does if a
+revocation is missed and a new session's container arrives at an address
+that still has a live placeholder.
+
+**Solution.** `mint` revokes every placeholder of another session bound to
+the same address, and logs it (session and address only). The newest
+container at an address owns it, so a stale mapping never outlives the next
+mint there. Placeholders of the same session at that address are kept:
+they are the session's own, and T21 revokes them itself when it restarts the
+process. Tests that
+need two sessions use two loopback addresses: the second client binds
+`127.0.0.2`, which works on Linux, where all of `127.0.0.0/8` is loopback,
+but not on a default macOS setup.
+
+### What the proxy refuses, and how
+
+**Issue.** The plan lists what the proxy must reject but not the answers,
+and the answers reach the CLI, which reports `api_error_status` (T20 and T23
+classify on it).
+
+**Solution.** Every refusal is an Anthropic-style JSON error
+(`{"type":"error","error":{"type":…,"message":…}}`) whose message is fixed
+text, so nothing the client sent is echoed; a test checks the body and
+headers of each refusal against the token presented. In order of checking:
+
+| Case | Status |
+| --- | --- |
+| No `ConnectInfo` on the request (a wiring bug) | 500 |
+| Peer address with no live placeholder, `HEAD /api/hello` included | 403 |
+| Any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` (`TRACE`, `TRACK`, `CONNECT` until T19, extension methods) | 405, with `Allow` |
+| Absolute-form target on HTTP/1 | 403 |
+| `HEAD /api/hello` from a known address | 200, answered locally |
+| No credential header, or `Authorization` that isn't `Bearer` | 401 |
+| Both `Authorization` and `x-api-key`, or either one repeated | 400 |
+| Unknown or revoked placeholder, or one bound to another address | 401 |
+| Placeholder in the header of the other kind | 401 |
+| Placeholder not pointed at a credential: before its first turn or between turns | 403 |
+| `NotLinked` or `RelinkRequired` from `TokenSource`, or no community key | 401 |
+| Any other credential error | 503 |
+| Upstream unreachable | 502 |
+
+A placeholder bound to another address gets exactly the answer of an unknown
+one, so the answer doesn't confirm that a stolen token exists; the log line
+tells them apart. An end-to-end test shows `fake-claude` reporting
+`api_error_status: 401` for a revoked placeholder.
+
+The method check is an allowlist, not a refusal of `CONNECT` alone: a
+`TRACE` forwarded with the swapped header would have an echoing upstream
+send the real credential back into the sandbox, and an extension method
+means nothing the CLI needs. It runs before any credential lookup.
+
+HTTP/2 requests always carry `:authority`, so the absolute-form check applies
+to HTTP/1 only; for HTTP/2 the authority is ignored like `Host`. Every
+upstream URL is built from the configured base and the request's path and
+query, and must keep the base's origin and path prefix after the URL parser
+resolves dot segments, or the request gets 400.
+
+### Credentials are read once, and revocation is checked again
+
+**Issue.** The plan requires a request in flight to keep the credential it
+started with, but a request waits on `TokenSource` (a refresh can take
+seconds), and the placeholder can be re-pointed or revoked meanwhile.
+
+**Solution.** The pointer is read once, under the registry's lock, when the
+request is authorized; re-pointing afterwards changes only later requests. A
+test holds the token lookup, re-points, and sees the first member's token
+upstream and the second member's on the next request. After the lookup the
+proxy checks that the placeholder is still live and bound to the peer, and
+refuses with 401 if it was revoked meanwhile, since revocation means the
+container is going away. A request already forwarded is not cut off by
+revocation; stopping the container ends it.
+
+`unpoint` clears the pointer at turn end (T21's `turn_finished`, on every
+exit), so between turns every request is refused with 403 "No turn is
+running for this placeholder." Like re-pointing, it changes only later
+requests: a request authorized before the turn ended keeps its credential,
+through its token lookup and its whole response. That is a choice. Checking
+the pointer again after the token lookup, as liveness is, would also refuse
+a request that arrived during the turn and was still waiting on a refresh
+when it ended; since `turn_finished` runs once the turn's result is in, such
+a request is the model's own last call or a leftover process's, and the
+window is one token lookup long.
+
+What remains: a background process left from turn N can still spend turn
+N+1's credential while N+1 runs, whoever its requester is. Only killing the
+processes a turn leaves behind when it ends removes that; the plan's
+Deferred work has an entry.
+
+### Headers the proxy changes besides the credential
+
+**Issue.** The plan says every other header passes untouched, but some
+can't, and reqwest adds one.
+
+**Solution.**
+
+- Hop-by-hop headers (`Connection` and every header it names, `Keep-Alive`,
+  `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`,
+  `Trailer`, `Transfer-Encoding`, `Upgrade`) are dropped both ways. The
+  credential header is set after that, so naming it in `Connection` doesn't
+  remove it.
+- `Host` is dropped and reqwest sends the upstream's. `Expect` is dropped,
+  since the proxy's own server already answered `100 Continue`.
+- A request that came with `Transfer-Encoding` loses any `Content-Length`,
+  so the upstream never sees conflicting framing. hyper's server already
+  drops it; the check keeps the proxy safe under any server.
+- reqwest adds `Accept: */*` when the client sent no `Accept`, from its
+  builder's default headers, which can't be removed. The CLI sends its own
+  `Accept`, so nothing changes for it.
+- The client follows no redirects (a 3xx goes back to the CLI as it came,
+  and `x-api-key` would otherwise follow it to any host), decompresses
+  nothing (`no_gzip` and friends, in case a feature elsewhere in the
+  workspace enables them), and honors the system proxy settings like `auth`'s
+  client does.
+
+### Streaming needs reqwest's `stream` feature
+
+**Issue.** reqwest's `Body::wrap` takes any `http_body::Body`, but only one
+that is `Sync`, which axum's request body isn't.
+
+**Solution.** `cred-proxy` enables reqwest's `stream` feature and sends the
+request body with `Body::wrap_stream(body.into_data_stream())`, frame by
+frame. The feature adds no crate to the lockfile (`futures-util` and
+`tokio-util` were already there). A request whose body is already at its end
+is sent without one, so a `GET` doesn't become a chunked request. The
+response goes back through reqwest's `http::Response<reqwest::Body>`
+conversion, frame by frame too. Tests hold the upstream's SSE stream after
+its first event and read that event through the proxy, and hold the client's
+request body after its first chunk until the upstream has read it.
+
+### The observer also gets the credential
+
+**Issue.** The plan's `ProxyObserver` gets `(session, status, usage
+headers)`. The session's pointer changes from turn to turn, so T27's meter
+couldn't tell from the session alone whose request it was.
+
+**Solution.** `observe` takes an `Observation` with the session, the
+`CredentialRef` the request used, the status and the usage headers (every
+`anthropic-ratelimit-*` header and `retry-after`), and is marked
+`#[non_exhaustive]` so fields can be added. It is called once per forwarded
+request when the upstream's response head arrives, before the body streams;
+refusals and unreachable upstreams aren't observed.
+
+### The proxy forwards any path
+
+**Issue.** A placeholder lets the sandbox use its requester's token, or the
+community key, on any path of the upstream, not only the Messages API. With
+the community key that includes the Files and Batches APIs, which all
+members' turns on that key share.
+
+**Solution.** Not restricted in T18: which paths the real CLI needs isn't
+known without a live capture, and refusing one it needs would break turns.
+The plan's Deferred work has an entry for a path allowlist. Methods are
+limited already (see the refusal table).
+
+## T22: router
+
+### The plan and the design name no order for the checks
+
+**Issue.** The design's flowchart has only the ignore and credential branches,
+and T22 lists the refusals (paused, bans, deny rules, hop cap) without saying
+where they fall, or how they rank against gating and linking. A refusal
+placed before gating would make a paused or restricted agent answer every
+channel message with a notice; a link prompt or community-key turn placed
+before a refusal would be offered to someone who is banned.
+
+**Solution.** The two documents don't disagree, so `route` takes the order
+that is safe on both counts and documents it in the crate rustdoc: the
+agent (unknown, deleted), the sender (unmanaged bot, own message), whose DM
+it is, gating, attribution, then paused, banned, allow and deny, hop cap,
+and last the credential. Every ignore precedes every refusal and every
+refusal precedes the credential. The refusals keep the plan's listing order;
+none spends anything, so it only picks the notice. `precedence_*` tests pin
+each boundary.
+
+### A DM didn't say whose DM it is
+
+**Issue.** "Or DM" in the gating rule, and "owner in a DM" for the
+`Private` scope, assumed the DM is with the agent being routed. Nothing in
+`RouterView` could check that. If the pipeline made a mentioned agent a
+candidate for the owner's DM with another bot, the manager bot included,
+the router would have run it on the owner's side in a conversation that
+isn't its own.
+
+**Solution.** `RouterView::binding_agent(BindingId)` names the agent whose
+binding received the event. A one-to-one DM has exactly one bot in it and
+only that bot's binding receives it, on Slack (`message.im` to that app) and
+on Rocket.Chat (one connection per bot, and only the agent's is in the
+room). A DM that came in through any other binding is
+`Ignore(NotThisAgentsDm)`, even if it mentions the agent. The plan's T22
+list gains the query.
+
+### `message_ref` needed the posting agent, and the requester's member may be stale
+
+**Issue.** T22's `message_ref(msg) -> Option<(TurnId, Requester, Hop)>`
+couldn't tell which agent agentd posted the message as, so a row recorded
+for one agent would attribute another agent's message. The router doesn't
+use the turn id. And the requester's `member` is recorded at posting time:
+`None` for someone unlinked then, which would let a later ban by member be
+sidestepped through a hop.
+
+**Solution.** `message_ref` returns an `Attribution { agent, requester,
+hop }`, and the router accepts it only when `agent` is the agent that sent
+the message; otherwise the message is unattributed. A recorded member wins,
+since it names who was billed; when none was recorded the router resolves
+the key with `member_for`. `is_banned` takes the whole `Requester`, so the
+view checks the member it names and the member its key belongs to.
+
+### `LinkPrompt` didn't say whom to prompt
+
+**Issue.** For a hop, the event's sender is a bot, so a bare `LinkPrompt`
+left the pipeline to guess who should link. That happens when the inherited
+requester unlinked, or the community key was cleared, mid-chain.
+
+**Solution.** `Decision::LinkPrompt { requester }`. For a person's message it
+is the sender; for a hop it is the inherited requester.
+
+### The owner without a linked account
+
+**Issue.** The flowchart sends the owner straight to "owner credential",
+without asking whether the owner still has one. `/agent logout` can leave
+an owner unlinked. Falling through to the community key would put the
+community's key behind the owner's `Private` side in a DM.
+
+**Solution.** The owner's turns run only on the owner's credential. An
+unlinked owner gets a link prompt, in a DM and in a channel, and the
+community key is never used for them. `design.md`'s Routing section says so.
+
+### What allow and deny rules mean
+
+**Issue.** T27 says "deny wins, and the default allows everyone". With a
+default of allow, an allow rule could never change anything unless a
+non-empty allow list restricts. T27 fills the rules, but T22 evaluates
+them.
+
+**Solution.** `AgentPolicy::permits`: a requester any deny rule covers is
+refused. Otherwise an empty allow list allows everyone, and a non-empty one
+allows only requesters one of its rules covers, by member or by room (see
+[below](#member-rules-matched-one-surface-only)).
+Rules apply to the requester, so a hop is checked against the inherited
+requester. The owner is exempt, so `deny everyone` can't lock the owner out
+of their own agent. `AgentPolicy` also carries `max_hops`, since T27's
+per-agent `hops` limit lives in the same row; the view returns the effective
+cap, the global one lowered by the agent's. Until T27, the default is
+`DEFAULT_MAX_HOPS`, 3.
+
+### Surface flags aren't trusted for managed agents
+
+**Issue.** The router asked for the managed agent only when
+`sender_is_bot` was true, per T22. A surface that failed to flag a managed
+agent's post as a bot would have had it routed as a person's message:
+billed to the bot's own key, most likely on the community key, and able to
+loop.
+
+**Solution.** The router asks `managed_bot(sender)` for every sender, and
+a managed agent's post takes the agent path whatever the flags say. A sender
+flagged as a bot whose `sender_bot_user` isn't `sender.user` (a Slack bot
+known only by its bot id, or a surface bug) is an unmanaged bot without any
+lookup, so a bot id never matches a binding even by accident. A
+`sender_bot_user` alone marks the sender as a bot.
+
+### A reply naming another agent ran two turns
+
+**Issue.** A person's reply in agent A's thread counted as addressed to A
+whatever it mentioned. A reply there that mentioned only agent B ran B, as
+the mention asked, and also A, as a reply to A, so the person paid for two
+turns and got an answer they didn't ask A for.
+
+**Solution.** A reply to an agent counts only if it mentions no other
+managed agent. Mentioning nobody, A itself, the manager bot or a person
+still counts; mentioning B and not A is addressed to B alone. Mentioning
+both runs both, since both were named. A DM still counts for the agent
+whose DM it is, whatever it mentions, since no other agent can answer
+there. `design.md`'s Routing section says so, and the invariant grid gains
+a "mentions B" axis that asserts a message naming only B never engages A
+outside A's DM.
+
+### Member rules matched one surface only
+
+**Issue.** `PolicyTarget::Member(MemberKey)` matched the requester's surface
+identity only. Bans and the owner check go by `MemberId`, so a member
+denied through their Slack identity could still use the agent through
+their linked Rocket.Chat identity.
+
+**Solution.** `PolicyTarget::Member { key, member }` holds the identity the
+rule named and the member it belonged to when the rule was set.
+`AgentPolicy::permits` takes the whole `Requester`: a member rule covers a
+requester with the same key, or, when the rule has a member, a requester
+with the same member on any surface. Key equality always counts, so a rule
+set while the identity had no member still covers that identity after it
+joins one. T27 stores the member with the rule.
+
+### The manager bot had no identity in the view
+
+**Issue.** `is_managed_bot` answered only for agents' bot users. A manager
+bot post that the surface didn't flag as a bot, and that mentioned an agent,
+was routed as a person's message: the manager bot's key has no member, so
+it ran on the community key.
+
+**Solution.** The lookup is `managed_bot(key) -> Option<ManagedBot>`, where
+`ManagedBot` is `Agent(AgentId)` or `Manager`. The manager bot's posts are
+`Ignore(ManagerBot)` whatever the flags say, and a mention of the manager
+bot addresses no agent.
+
+### A synchronous view over an asynchronous store failed open
+
+**Issue.** `RouterView` is synchronous so that `route` stays pure, and the
+store is asynchronous, so T23 has to load the view's answers before calling
+`route`. Anything it forgot fell back permissively: `is_banned` answered
+false and a missing policy was `AgentPolicy::default()`, which allows
+everyone. A banned or denied requester would have been run.
+
+**Solution.** The lookups that grant or withhold permission fail closed.
+`is_banned` returns `Option<bool>` and `policy` returns
+`Option<AgentPolicy>`; `None` means the view doesn't know, and `route`
+refuses with `RefuseReason::PolicyUnavailable`, after the paused check and
+a known ban, and before the credential. The owner is refused too, since
+the policy also holds the hop cap. Every other lookup already withholds a
+turn when it has no answer. The trait's rustdoc lists every lookup `route`
+may make for an event, in order, so T23 knows what to load, and T23's and
+T27's plan text say what they fill.
+
+## T28: Slack ingress
+
+### The manager binding needs a `BindingId`
+
+**Issue.** `InboundEvent::binding` is a `BindingId`, a UUID, but the plan
+gives the manager app the fixed path segment `manager`, and the manager has no
+row in `agent_bindings` (its secret comes from configuration).
+
+**Solution.** `surface_slack::BindingRef` is `Manager` or `Agent(BindingId)`,
+parsed from the path: `manager`, or a binding id in canonical lowercase form;
+anything else is 404 without a lookup. Manager events carry
+`BindingRef::MANAGER_ID`, the nil UUID, which agentd never mints for an agent
+(the parser refuses it as an agent path too). Deduplication sources use the
+path form, so the manager's are `slack:manager…`.
+
+### Signing secret and bot user come from one lookup
+
+**Issue.** The plan's `SigningSecrets` trait returns a secret, but
+normalization also needs the binding's bot user id to keep channel messages
+that mention it, and T31 needs a binding in state `creating` to answer
+`url_verification` before any secret exists.
+
+**Solution.** `SigningSecrets::lookup(BindingRef)` returns
+`Option<SlackApp { signing_secret: Option<SecretString>, bot_user:
+Option<UserId> }>`. `None` is 404. A known binding without a secret answers
+only the challenge, and everything else gets 401. Without a bot user, channel
+messages pass only as thread replies; the manager has none until T30 reads it
+with `auth.test`, which doesn't matter while it subscribes only to
+`message.im`. agentd's `ConfigSigningSecrets` knows only the manager; T31
+adds the store-backed agent bindings in front of it.
+
+### Where the ack ends and processing begins
+
+**Issue.** The plan says handlers enqueue and return 200 at once, and
+deduplicate through the store. A store write before the ack could wait up to
+SQLite's 5-second `busy_timeout` and miss Slack's 3 seconds, and the plan
+doesn't say what a full queue does.
+
+**Solution.** The handler does only what needs no I/O beyond the secret
+lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
+bounded queue. A full or closed queue answers 503; Slack retries an event
+that gets one, but not a slash command or an interaction, whose user sees
+Slack's error. The handler never waits for the queue. `Queue::run` then deduplicates through the
+`Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
+and sends `SlackInbound` items, one at a time and in order, to a
+`core_types::Sender`. A failed dedup write drops the request rather than risk
+a duplicate turn. Until T29 and T30 consume it, agentd's sink (`Unrouted`)
+logs each item's binding and kind and drops it. agentd runs the queue as a
+`server::Worker` next to the listeners: `Routers` gained a `workers` field,
+and the queue ends once the public listener's router is dropped, so every
+acknowledged request is handled within the drain timeout. An acknowledged
+request is lost if agentd dies before handling it; Slack won't retry it.
+
+### Replays inside the five-minute window
+
+**Issue.** Signature verification with a five-minute window still lets a
+captured request be replayed within those minutes. Events are covered by
+`event_id` deduplication, but slash commands and interactivity have no id.
+
+**Solution.** Commands and interactions are deduplicated by their signature,
+lowercased (the verifier accepts either hex case, so an uppercased copy would
+otherwise pass), under `slack:<binding>:request`. Slack doesn't retry them, so
+a second copy is never legitimate. Timestamps are also refused when more than
+five minutes in the future, not only in the past.
+
+### Current Slack apps post without a subtype
+
+**Issue.** The plan ignores every subtype but `file_share` and
+`thread_broadcast`, and describes bot events without a `user` field. In the
+payloads of Slack's SDK test suites (`slackapi/bolt-python`
+`tests/scenario_tests/test_message_bot.py`), a current app's bot post has no
+subtype, with `bot_id`, `bot_profile` and its bot user in `user`; the
+`bot_message` subtype, without `user`, is for classic integrations and
+`response_url` posts.
+
+**Solution.** Kept as the plan says: agent posts arrive with no subtype and a
+`user`, and `bot_message` is ignored. The "no `user`" rule still applies to a
+bot event that passes the subtype filter (a fixture covers one). T32 should
+record which shape another agent's post has.
+
+### Mentions typed inside a rich-text block
+
+**Issue.** "Mentions come from `<@U…>` tokens in the text and in `blocks`"
+could be read as scanning every string in the blocks. In a `rich_text` block,
+a member who types `<@U123>` literally gets a `text` element holding it,
+while a real mention is a `user` element (and the message `text` escapes the
+literal as `&lt;@U123&gt;`).
+
+**Solution.** Mentions are the tokens in `text`, the `user` elements of
+`rich_text` blocks, and the tokens in `mrkdwn` text objects (section and
+context blocks, which bots post). `plain_text` and rich-text `text` elements
+are not scanned. Each user appears once, in order of first appearance; the
+ids already seen are kept in a `HashSet`, since a 40,000-character message
+can carry thousands of mentions.
+
+### A misspelled manager secret went unnoticed
+
+**Issue.** T10 accepts any `AGENTD_SLACK_MANAGER_<NAME>`, so a misspelled
+`…_SIGNING_SECRET` would silently leave the manager binding unknown.
+
+**Solution.** When any `AGENTD_SLACK_MANAGER_*` variable is set,
+`AGENTD_SLACK_MANAGER_SIGNING_SECRET` must be too; the error asks whether one
+is misspelled. The manager is known exactly when the secret is set, and
+agentd logs at startup which it is.
+
+T10's rule for other `AGENTD_*` variables still applies around it: near
+misses of the prefix are refused, and names nobody reads land in
+`Config::unknown_env`. Kubernetes service links are now recognized before
+the Slack prefix, because a Service named `agentd-slack-manager` would set
+`AGENTD_SLACK_MANAGER_PORT` and `…_SERVICE_HOST`; read as secrets, those
+would fail this check (or become junk entries next to the signing secret).
+No Slack secret's name ends like a service link.
+
+### Slack's `ssl_check` is unsigned
+
+**Issue.** The plan lets only `url_verification` skip the signature. Slack
+also posts `ssl_check=1` (with the legacy verification token) to a slash
+command's URL to check its certificate, unsigned; agentd answered it 401, or
+400 when signed, since it isn't a command form. Bolt for JavaScript and for
+Python answer it with 200 before verifying.
+
+**Solution.** On `/commands`, a known binding answers a form whose
+`ssl_check` is exactly `1` with an empty 200 before the signature check,
+reading nothing else and queueing nothing, like the challenge echo. The
+design's transport bullet and the plan name it as the second exception.
+
+### Unaddressed messages cost a store write each
+
+**Issue.** Agent apps receive every message in their channels, and
+`Queue::run` recorded each event's `event_id` in `processed_events` (kept for
+seven days) before normalization dropped the unaddressed ones: a store write
+per channel message per agent.
+
+**Solution.** `message` events are normalized first, which is pure, and a
+dropped one costs no I/O. A kept message is deduplicated only by
+`<channel>:<ts>` under `slack:<binding>:message`, which catches Slack's
+retries as well as the event_id key did, so messages no longer write an
+`event_id` row. Other events are still deduplicated by `event_id`.
+
+### A slow body held up shutdown
+
+**Issue.** Nothing bounded the secret lookup or the body read before the
+ack. A client that sent headers and then trickled or withheld the body kept
+its connection in flight, so a graceful shutdown waited the whole drain
+timeout for it.
+
+**Solution.** The handler every route goes through gives the lookup and the
+body read one shared deadline, `PRE_ACK_TIMEOUT` (2 seconds, inside Slack's
+3): 503 if the lookup is still running, 408 if the body hasn't arrived.
+
+### Refusals before verification are throttled in the log
+
+**Issue.** Anyone can send unsigned or forged requests and challenges, and
+each was logged at warn or info, so a flood of them floods the log.
+
+**Solution.** Like agentd's `RefuseSubnet`, the ingress logs such refusals
+(bad signature, no secret yet, body refused or too slow) as a warning at most
+once per `WARNING_INTERVAL` (a minute), with how many went quiet since, and
+the rest at debug level. Answered challenges are throttled the same way at
+info level. `ssl_check` is logged at debug level only.
+
+### A trailing newline in a secret failed every request
+
+**Issue.** T10's `secret()` refused only empty or all-white-space values. A
+signing secret mounted from a file with a trailing newline was accepted, and
+every Slack request then failed verification with 401.
+
+**Solution.** Every secret read from the environment (`AGENTD_MASTER_KEY`,
+`AGENTD_RC_MANAGER_TOKEN` and `AGENTD_SLACK_MANAGER_*`) is refused at startup
+when it starts or ends with white space; the error names the variable, never
+the value. That includes the master key, whose base64 decoding (T05) would
+have ignored the newline: the rule is simpler kept the same for all secrets,
+and `export AGENTD_MASTER_KEY="$(agentd gen-key)"` strips the newline anyway.
+
+## T29: Slack Web API
+
+Method parameters, response shapes and rate-limit tiers were read from
+Slack's SDKs (`slackapi/python-slack-sdk` `slack_sdk/web/client.py` and
+`internal_utils.py`, `slackapi/java-slack-sdk` `MethodsRateLimits.java` and
+`MethodsRateLimitTier.java`), since Slack's own documentation site wasn't
+reachable. None of it has run against real Slack yet.
+
+### `Surface::render` has no directory to pass
+
+**Issue.** T23 has the pipeline build a `MentionDirectory` snapshot from
+agent bindings and the surface's member cache before rendering, but
+`Surface::render(&self, markdown)` takes no directory, and the pipeline only
+holds a `dyn Surface`, so it can reach neither Slack's member cache nor a
+way to pass a snapshot in.
+
+**Solution.** `SlackSurface::render` resolves `@Name` through its workspace's
+member cache as last read. `users.list` lists bot users too, so agents'
+names resolve without the bindings. `render` never blocks: when the cache is
+older than its TTL (15 minutes by default) it starts a refresh on the
+current Tokio runtime for the next call. agentd (T31) awaits
+`SlackSurface::refresh_members` when it starts a binding, so the first reply
+already has names, and gives each team's `TeamDirectory` its agents' bot
+user ids with `set_managed_bots` (see below). `render_with` takes an
+explicit directory for callers that have one. T23's delivery step, T29's
+member-cache bullet and T31's receiver bullet say so.
+
+### The ingress can't look bots up
+
+**Issue.** A bot message without a `user` needs `bots.info` to fill
+`sender.user` and `sender_bot_user`, but T28's `Queue` normalizes events for
+every binding without any bot token.
+
+**Solution.** `SlackSurface::fill_bot_sender(&mut InboundEvent)` does it with
+the receiving binding's token, caching the answer per team and bot id
+(`bot_not_found` and a bot without a user are cached as "no user"; other
+errors are not cached and leave the event unchanged). The receiver of
+`SlackInbound` calls it before routing; T31's deliverables in the plan now
+say agentd's Slack receiver does. `history` names bot senders the same way.
+
+### Request encoding and the upload flow
+
+**Issue.** Slack accepts JSON bodies for some methods and only forms for
+others, and the plan didn't say how the upload step of the external upload
+flow authenticates.
+
+**Solution.** As in the Python SDK: `chat.postMessage`, `chat.update` and
+`chat.postEphemeral` send JSON (`application/json; charset=utf-8`); every
+other method sends a form POST, which Slack accepts for read methods too.
+The token is only ever in `Authorization: Bearer`. Posts send
+`unfurl_links: false` and `mrkdwn: true`, never `link_names` or `parse`
+(tested on the request bodies).
+
+The upload is `files.getUploadURLExternal` (`filename`, `length`) per file,
+a POST of the bytes to the returned `upload_url`, then one
+`files.completeUploadExternal` with `files` as a JSON array of
+`{id, title}`, `channel_id` and `thread_ts`. Both the Python and the Node
+SDK post the file's raw bytes to `upload_url`, the Python one with no token
+at all (Node adds one only for a per-call token), so the client posts raw
+bytes as `application/octet-stream` without the bot token, and treats
+`upload_url` as a secret since it is presigned. No multipart form is
+needed, so the crate doesn't enable reqwest's `multipart` feature. If any file fails, nothing is completed, so
+nothing is shared. Files are read into memory whole, which is fine for
+staged attachments but not for very large files.
+
+### Rate limits: tiers and 429s
+
+**Issue.** The plan asks for a per-token limiter by tier and for honoring
+`Retry-After`, without saying what a long `Retry-After` does to later calls.
+
+**Solution.** Each method carries the Java SDK's tier: Tier 2 (20 per
+minute: `users.list`, `reactions.remove`), Tier 3 (50: `conversations.*`,
+`chat.update`, `reactions.add`, `bots.info`), Tier 4 (100:
+`chat.postEphemeral`, `users.info`, `files.*`), `auth.test` (600) and
+`chat.postMessage` (60 per minute per channel). The limiter keeps, per
+token digest and method (and channel for `chat.postMessage`), the times of
+the calls in the last minute, and a call waits while the quota is used up.
+It is in memory and per process, which is enough to stay under Slack's
+limits; Slack's 429 remains the authority.
+
+A 429, or `ok: false` with `ratelimited`, blocks that bucket until
+`Retry-After` has passed, so concurrent callers wait too. A call is retried
+up to three times while the wait is at most `max_retry_wait` (60 s by
+default); a longer wait fails at once with `SurfaceError::RateLimited`, and
+so does any later call in that bucket while it stays blocked, instead of
+sleeping silently. `Retry-After` is read as whole seconds and capped at a
+day so it can't overflow a deadline.
+
+### Error codes Slack answers with HTTP 200
+
+**Issue.** Slack reports failures as `{"ok": false, "error": "<code>"}` with
+HTTP 200, and some codes aren't failures for agentd.
+
+**Solution.** `web::map_error`: `invalid_auth`, `not_authed`,
+`token_revoked`, `token_expired` and `account_inactive` are `Unauthorized`;
+`missing_scope` (with the scope from `needed`), `not_in_channel`,
+`is_archived`, `cant_update_message`, `edit_window_closed`,
+`restricted_action*`, `method_not_supported_for_channel_type` and similar
+are `Forbidden`; `channel_not_found`, `message_not_found`,
+`thread_not_found`, `user_not_found`, `bot_not_found`, `file_not_found` and
+similar are `NotFound`; anything else is `Api` with the code. A code is
+kept only if it is at most 64 lowercase letters, digits and underscores, so
+an error never carries arbitrary response text. `already_reacted` from
+`reactions.add` and `no_reaction` from `reactions.remove` count as success.
+A non-2xx status other than 429 is `Api("HTTP <status>")`, an unreadable
+body is `Transport`, and redirects are never followed. Transport errors drop
+the request URL, so a `response_url` or upload URL can't leak through one.
+
+### Names two members share
+
+**Issue.** Display names aren't unique in Slack, and the plan didn't say
+what an `@Name` shared by two members resolves to.
+
+**Solution.** The member directory maps each active member's display name
+and full name, compared ignoring case and runs of white space, and a bot
+user's username too. A human's username is left out: it is often the local
+part of their email address, and would let a human shadow an agent called
+the same. A name that belongs to more than one member resolves to no one,
+so it stays text: a missed mention is better than pinging the wrong person.
+The exception is agents: agentd knows its agents' bot user ids from the
+bindings and passes each team's to `TeamDirectory::set_managed_bots`, and a
+shared name with exactly one managed agent among its members resolves to
+that agent. The directory keeps every member id per name, so a new managed
+set applies to the current list at once, without reading `users.list`
+again. A managed bot the list lacks, such as an agent installed since the
+last read, marks the list stale instead, so the next `refresh_members` or
+render reads `users.list` even within the TTL (T31's `refresh_members` when
+a binding starts would otherwise return the cached list without the new
+agent for up to 15 minutes). That still goes through the one shared
+refresh and honours the wait after a failed read. If the bot is set while
+a read is running, the list that read produces stays stale too, since the
+read may have started before the install. A bot still missing afterwards
+causes no further reads until the managed set changes again. Deactivated
+members are left out.
+
+If a refresh fails, the next attempt waits a minute (or the TTL, if
+shorter). Meanwhile an older list is kept; with none, `refresh_members`
+returns the same error without calling Slack and `render` starts no
+refresh, so a workspace whose `users.list` fails doesn't get one call per
+rendered reply. `Debug` on `SlackSurface`, `TeamDirectory` and
+`MemberDirectory` shows the team and counts, never member names or ids.
+
+### Refresh cost in large workspaces
+
+**Issue.** `users.list` is Tier 2 (20 calls a minute per token), and a
+refresh reads every page, so a large workspace's refresh is slow.
+
+**Solution.** `users.list` asks for 999 members a page, the largest size the
+client asks any list method for; Slack's spec gives `users.list` no maximum
+and says it may return fewer than asked. At a full 999 a page a refresh of
+N members takes about N / 20,000 minutes of that token's `users.list` quota:
+a 10,000-member workspace needs 11 calls, and 100,000 members about 101
+calls, five minutes of waiting in the limiter. That stays well inside the
+default 15-minute TTL, runs in the background after the first load, and
+uses one binding's token per team, so other bindings' quotas are
+untouched. If Slack returns much smaller pages, the refresh takes
+proportionally longer; a very large workspace should raise the TTL with
+`TeamDirectory::with_ttl`.
+
+### Reading a thread's newest messages
+
+**Issue.** `Surface::history` wants the newest `limit` messages before a
+cursor, but `conversations.replies` pages from the thread's oldest message
+(root first) and has no reverse order.
+
+**Solution.** A thread read follows every page (with `latest` set to the
+cursor and `inclusive=false`) and keeps only the last `limit` content
+messages, filtering by `ts` on the client too, and skipping a `ts` it has
+already kept, in case a later page repeats the root. `conversations.history`
+pages from the newest, so a top-level read stops once it has `limit`. Both
+always ask for 200 a page, never just the count still missing: skipped
+joins and edits would otherwise cost a call each.
+Content means no subtype, or `file_share`, `thread_broadcast` or
+`bot_message`; joins, edits and tombstones are skipped.
+
+### Smaller choices
+
+- `SlackSurface::events` returns `Unsupported("events")`: Slack pushes
+  events to T28's ingress, and no surface loop exists to run.
+- A conversation or message from another workspace, or another surface, is
+  refused before anything is sent.
+- `auth.test` gives a bot token's team, bot user and `bot_id`, but not the
+  app's id or name; T30's `/agent me` can get the app id and bot name from
+  `bots.info` on that `bot_id`.
+- `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
+  the `response_url` with no token. Slack answers `ok` (text or JSON) on
+  success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.

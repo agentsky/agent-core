@@ -8,6 +8,7 @@
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.
 //! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
+//! - [`slack`]: Slack request signing and payload fixtures.
 
 #![warn(missing_docs)]
 
@@ -15,6 +16,7 @@ pub mod anthropic;
 pub mod claude;
 pub mod fixtures;
 pub mod rocketchat;
+pub mod slack;
 pub mod surface;
 
 pub use anthropic::{FakeAnthropic, fake_anthropic};

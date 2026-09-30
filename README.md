@@ -46,6 +46,9 @@ starting with `AGENTD_` is ignored with a warning. Each listener binds
 agentd's own address on its network, never `0.0.0.0`, and the proxy and ctl
 listeners must be inside `internal.sandbox_subnet`.
 `GET /healthz` on the public listener answers 200 while the database does.
+It also serves Slack's request URLs, `/slack/b/<binding>/events`,
+`…/interactivity` and `…/commands`; the manager app's binding is `manager`,
+and its requests are verified with `AGENTD_SLACK_MANAGER_SIGNING_SECRET`.
 The ctl listener serves the agentctl API that sandboxed agents call back
 through; at startup agentd deletes every agentctl token and scope lock and
 empties `ctl-outbox/` under `store.data_dir`, since the containers they
@@ -87,6 +90,13 @@ newly published advisory fails a run of its own. Run it locally with
 `cargo install cargo-deny --locked`,
 `cargo deny --workspace --locked check -W unmaintained` and
 `sh scripts/ci/check-path-deps.sh`.
+
+The `docker-tests` job runs the tests that need a Docker daemon: they are
+named `docker_*` and marked ignored, so the other jobs skip them. Run them
+locally, with Docker running, as
+`cargo test --workspace -- --ignored docker_`. They pull
+`debian:stable-slim` and create and remove their own networks and
+containers.
 
 A change that touches only documentation (Markdown files and `LICENSE`, as
 decided by `scripts/ci/docs-only.sh`) skips the build and test jobs and runs

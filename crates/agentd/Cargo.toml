@@ -30,6 +30,7 @@ serde_path_to_error.workspace = true
 sha2.workspace = true
 store.workspace = true
 surface-rocketchat.workspace = true
+surface-slack.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -41,6 +42,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+log.workspace = true
 testkit.workspace = true
 tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true
+tracing-log.workspace = true

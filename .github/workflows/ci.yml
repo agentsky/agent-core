@@ -255,6 +255,29 @@ jobs:
       - name: Check
         run: cargo check --locked --all-targets --all-features
 
+  # Tests that need a Docker daemon: every test named `docker_*` in the
+  # workspace. They are marked `#[ignore = "needs docker"]`, so the other
+  # jobs skip them, and they run here with `--ignored`. The runner has a
+  # Docker daemon; the tests pull the images they use.
+  docker-tests:
+    name: Docker tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Show the Docker daemon
+        run: docker version
+
+      - name: Run Docker tests
+        run: cargo test --locked --workspace --all-features -- --ignored docker_
+
   # agentctl ships in the sandbox image as one static binary, with no TLS
   # and no C dependencies, so the musl target needs no system packages.
   # musl builds are static-pie, which `file` doesn't call "statically
@@ -331,7 +354,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, rust, docs, coverage, msrv, deny, agentctl-static]
+    needs: [changes, rust, docs, coverage, msrv, deny, docker-tests, agentctl-static]
     runs-on: ubuntu-24.04
     steps:
       - name: Check job results
