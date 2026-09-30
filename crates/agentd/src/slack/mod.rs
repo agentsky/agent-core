@@ -107,9 +107,11 @@ impl Dedup for StoreDedup {
 
 /// Where the Slack queue hands verified requests.
 ///
-/// Requests to the manager app: an `/agent` slash command or a DM to the
-/// app goes to the command intake, and a `user_change` whose user is
-/// `deleted` deletes that member's configuration token for the workspace.
+/// Requests to the manager app from the workspace agentd serves: an
+/// `/agent` slash command or a DM to the app goes to the command intake,
+/// and a `user_change` whose user is `deleted` deletes that member's
+/// configuration token for the workspace. A request from any other
+/// workspace, or one that names none, is dropped.
 /// Everything else, agents' messages included, is logged by binding and
 /// kind and dropped until the turn pipeline (T31) takes it.
 #[derive(Debug, Clone)]
@@ -166,6 +168,14 @@ impl Sink<SlackInbound> for Inbound {
             tracing::debug!(%binding, kind, "no handler for this Slack request yet; dropped it");
             return Ok(());
         };
+        if item.team() != Some(&identity.team) {
+            tracing::debug!(
+                kind,
+                team = ?item.team(),
+                "a request to the Slack manager app from another workspace; dropped it"
+            );
+            return Ok(());
+        }
         let command = match item {
             SlackInbound::Command(command) => slash_command(command),
             SlackInbound::Message(event) => dm_command(&event, identity),

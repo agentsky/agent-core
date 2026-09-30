@@ -3838,6 +3838,14 @@ the variable, never the token. A new, optional `[slack]` section has one key,
 channel messages that mention the manager's bot user, which no longer
 matters to the manager app itself, since it subscribes only to `message.im`.
 
+A signed request only proves it came through the manager app, which a
+workspace admin elsewhere could install from the same manifest. So
+`slack::Inbound` drops, with a debug line, any command, message or event
+whose workspace (`SlackInbound::team`: the sender's, the conversation's or
+the envelope's `team_id`) isn't the manager's, or that names none; before,
+a slash command from another workspace could register a configuration
+token there.
+
 ### A configuration token is checked by rotating it
 
 **Issue.** The plan offers two checks, `auth.test` with the configuration
@@ -3883,6 +3891,24 @@ loses the new pair; the next rotation is refused, and the member is told to
 register a new token. The encrypted columns' associated data is the row's
 `member_id:team_id`.
 
+Once Slack has rotated, the old refresh token is used up and the new pair
+exists only in memory, so a store write that fails once would lose the
+token. Both writers, `/agent slack-token` and the rotator, go through
+`store_rotated`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
+250 ms, then 500 ms, then 1 s. If the last try fails, the command tells the
+member that the refresh token is used up and to generate a new one.
+
+Nothing fences a write after the claim's lease ran out, so the rotator
+keeps within it: `tooling.tokens.rotate` gets `ROTATE_TIMEOUT` (2 minutes,
+rate-limit waits included), after which the claim counts as a failed
+renewal. Should a rotation still finish after its lease, a second instance
+has claimed the same row and, with the used refresh token, marked it broken
+(the version doesn't change on a break). The late writer's pair is the one
+that works, so `update_rotated_slack_config_token` also clears `broken_at`,
+`notified_at` and `notice_attempts`, and the token is renewed again. A
+rotation whose row was replaced or deleted meanwhile (`/agent logout`, a
+`user_change`) stores nothing and drops its pair.
+
 ### Which failures a member hears about
 
 **Issue.** The plan says the rotation loop "DMs the member on failure". Most
@@ -3897,7 +3923,9 @@ one DM from the manager app, claimed with a 10-minute lease
 member no manager bot reaches waits unclaimed. Any other failure keeps the
 claim's lease, so the token is tried again when it ends, well within the
 2 hours it still has. `/agent me` shows whether the token is registered,
-renewed automatically, or refused.
+renewed automatically, refused, or expired because renewing it keeps
+failing; the last says agentd keeps trying and to register a new token if
+it lasts.
 
 ### One command intake for every surface
 
@@ -3936,8 +3964,8 @@ T31 routes agents' messages.
   a member typed look like a mention token to anything that reads mentions
   from text later.
 - A `user_change` deletes the token for the event's workspace only (the
-  envelope's `team_id`, or the user's own when the envelope has none), since
-  the member may still be in another workspace; `/agent logout` deletes the
+  envelope's `team_id`, which must be the manager's), since the member may
+  still be in another workspace; `/agent logout` deletes the
   member's tokens in every workspace. Neither revokes the token at Slack:
   the SDKs have no revoke method for configuration tokens, and whether
   `auth.revoke` accepts one is unverified.

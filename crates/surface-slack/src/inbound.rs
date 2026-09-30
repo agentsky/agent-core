@@ -35,6 +35,20 @@ impl SlackInbound {
         }
     }
 
+    /// The workspace the request came from: a message's conversation's, an
+    /// event's envelope's, a command's or an interaction's sender's.
+    /// `None` when Slack named none.
+    pub fn team(&self) -> Option<&TeamId> {
+        match self {
+            Self::Message(event) => Some(&event.conv.team),
+            Self::Event(event) => event.team.as_ref(),
+            Self::Command(command) => Some(&command.sender.team),
+            Self::Interaction(interaction) => {
+                interaction.sender.as_ref().map(|sender| &sender.team)
+            }
+        }
+    }
+
     /// What kind of request this is, for logs: `message`, `event`,
     /// `command` or `interaction`.
     pub fn kind(&self) -> &'static str {

@@ -323,9 +323,15 @@ impl Store {
     }
 
     /// Stores the tokens a rotation of `row` returned, at `now`, with a new
-    /// version and the lease ended. Returns the new version, or `None`,
-    /// changing nothing, if the row is gone or has a version other than
-    /// `row`'s (the member registered a new token meanwhile).
+    /// version, the lease ended, and no break or notice. Returns the new
+    /// version, or `None`, changing nothing, if the row is gone or has a
+    /// version other than `row`'s (the member registered a new token
+    /// meanwhile).
+    ///
+    /// A row marked broken since the claim is repaired: a claim whose lease
+    /// ran out while Slack was rotating lets a second caller try the same,
+    /// already used refresh token, and Slack's refusal marks the row
+    /// broken, but the pair the first caller stores works.
     ///
     /// # Errors
     ///
@@ -343,7 +349,8 @@ impl Store {
         let version = new_version();
         let result = sqlx::query(
             "UPDATE slack_config_tokens SET token_enc = ?, refresh_token_enc = ?, \
-             expires_at = ?, version = ?, updated_at = ?, lease_until = NULL \
+             expires_at = ?, version = ?, updated_at = ?, lease_until = NULL, \
+             broken_at = NULL, notified_at = NULL, notice_attempts = 0 \
              WHERE member_id = ? AND team_id = ? AND version = ?",
         )
         .bind(token_enc)
@@ -780,6 +787,74 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(read.token.expose_secret(), "xoxe.new");
+    }
+
+    #[tokio::test]
+    async fn a_late_rotation_repairs_a_row_its_lapsed_lease_let_break() {
+        let store = memory_store().await;
+        let ada = member(&store, "ada").await;
+        let row = store
+            .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
+            .await
+            .unwrap();
+        store
+            .claim_slack_config_token(&row, at(3_000), at(3_300))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = store
+            .claim_slack_config_token(&row, at(3_300), at(3_600))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.row, row, "the lapsed lease lets a second claim in");
+        assert!(
+            store
+                .mark_slack_config_token_broken(&row, at(3_310))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .claim_slack_config_token_notice(&row, at(3_320), at(3_920), MAX)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let rotated = store
+            .update_rotated_slack_config_token(&row, &tokens("xoxe.c", 50_000), at(3_330))
+            .await
+            .unwrap()
+            .unwrap();
+        let status = store
+            .slack_config_token_status(ada, &team())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.broken);
+        assert_eq!(status.expires_at, at(50_000));
+        assert!(
+            store
+                .pending_slack_config_token_notices(at(9_000), MAX)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no notice is owed for a working token"
+        );
+        assert_eq!(
+            store
+                .due_slack_config_tokens(at(60_000), at(3_340))
+                .await
+                .unwrap(),
+            std::slice::from_ref(&rotated),
+            "the repaired token is renewed again"
+        );
+        let attempts: i64 = sqlx::query_scalar("SELECT notice_attempts FROM slack_config_tokens")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(attempts, 0);
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@
 //! member typed it. Messages from bots, the manager's own replies included,
 //! are never commands.
 
-use core_types::{ConvKind, InboundEvent, MemberKey, SurfaceKind, TeamId, UserId};
+use core_types::{ConvKind, InboundEvent, MemberKey, SurfaceKind, UserId};
 use serde_json::Value;
 use surface_slack::normalize::unescape;
 use surface_slack::{SlackEvent, SlashCommand};
@@ -62,8 +62,8 @@ pub fn dm_command(
 }
 
 /// The member a `user_change` event says was deleted (left the workspace or
-/// was deactivated), in the workspace of the event's envelope, or of the
-/// user when the envelope names none.
+/// was deactivated), in the workspace of the event's envelope; `None` when
+/// the envelope names none.
 pub fn member_who_left(event: &SlackEvent) -> Option<MemberKey> {
     if event.event_type != "user_change" {
         return None;
@@ -76,15 +76,9 @@ pub fn member_who_left(event: &SlackEvent) -> Option<MemberKey> {
         .get("id")
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())?;
-    let team = event.team.clone().or_else(|| {
-        user.get("team_id")
-            .and_then(Value::as_str)
-            .filter(|team| !team.is_empty())
-            .map(TeamId::new)
-    })?;
     Some(MemberKey {
         surface: SurfaceKind::Slack,
-        team,
+        team: event.team.clone()?,
         user: UserId::new(id),
     })
 }

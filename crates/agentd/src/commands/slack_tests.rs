@@ -22,7 +22,7 @@ use super::intake::CommandIntake;
 use super::slack::{dm_command, member_who_left, slash_command};
 use super::slack_tokens::{
     ConfigTokenRotator, NOTICE_LEASE, NOTICE_MAX_ATTEMPTS, ROTATION_LEASE, RotationPass,
-    broken_token_notice,
+    STORE_ATTEMPTS, broken_token_notice,
 };
 use super::*;
 use crate::slack::Inbound;
@@ -73,6 +73,10 @@ async fn slack_harness() -> SlackHarness {
         Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
             .await
             .unwrap();
+    slack_harness_on(store).await
+}
+
+async fn slack_harness_on(store: Store) -> SlackHarness {
     let oauth = OAuthConfig {
         token_url: "http://127.0.0.1:9/token".to_owned(),
         revoke_url: "http://127.0.0.1:9/revoke".to_owned(),
@@ -179,9 +183,13 @@ impl SlackHarness {
     }
 
     async fn linked(&self, user: &str) -> MemberId {
+        self.linked_as(&slack_key(user)).await
+    }
+
+    async fn linked_as(&self, key: &MemberKey) -> MemberId {
         let member = self
             .store
-            .ensure_member(&slack_key(user), user, OffsetDateTime::now_utc())
+            .ensure_member(key, key.user.as_str(), OffsetDateTime::now_utc())
             .await
             .unwrap();
         self.store
@@ -1016,8 +1024,8 @@ fn only_a_deleted_user_in_a_user_change_has_left() {
     );
     assert_eq!(
         member_who_left(&event("user_change", None, left.clone())),
-        Some(slack_key("U0HUMAN02")),
-        "the user's own team_id when the envelope has none"
+        None,
+        "only the envelope's team_id counts"
     );
     assert_eq!(
         member_who_left(&event("team_join", Some(TEAM), left.clone())),
@@ -1101,5 +1109,274 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         "xoxe-1-R1"
     );
     store.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn me_says_when_a_token_expired_because_renewing_it_keeps_failing() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.store
+        .put_slack_config_token(
+            alice,
+            &TeamId::new(TEAM),
+            &NewSlackConfigToken {
+                token: SecretString::from("t"),
+                refresh_token: SecretString::from("r"),
+                expires_at: OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    let reply = h.slash("U0HUMAN01", "me").await.remove(0);
+    assert!(
+        reply.contains(
+            "Slack configuration token: expired, because renewing it keeps failing. I keep \
+             trying; if this lasts, send a new one with `/agent slack-token"
+        ),
+        "{reply}"
+    );
+    assert!(!reply.contains("renewed automatically"), "{reply}");
+}
+
+#[tokio::test]
+async fn requests_from_another_workspace_are_dropped() {
+    let h = slack_harness().await;
+    let other = TeamId::new("T0OTHER01");
+    let outsider = MemberKey {
+        surface: SurfaceKind::Slack,
+        team: other.clone(),
+        user: UserId::new("U0HUMAN02"),
+    };
+    let grace_there = h.linked_as(&outsider).await;
+    let grace_here = h.linked("U0HUMAN02").await;
+    for (member, team) in [
+        (grace_there, other.clone()),
+        (grace_here, TeamId::new(TEAM)),
+    ] {
+        h.store
+            .put_slack_config_token(
+                member,
+                &team,
+                &NewSlackConfigToken {
+                    token: SecretString::from("t"),
+                    refresh_token: SecretString::from("r"),
+                    expires_at: OffsetDateTime::now_utc() + time::Duration::hours(12),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+    let running = Running::start(&h);
+
+    let (response_url, _) = h.response_url();
+    let mut command = slash(
+        &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        response_url,
+    );
+    command.sender = outsider.clone();
+    command.conv.team = other.clone();
+    running.send(SlackInbound::Command(command)).await;
+
+    let mut dm = dm_event("U0HUMAN02", "me");
+    dm.sender = outsider.clone();
+    dm.conv.team = other.clone();
+    dm.message.conv.team = other.clone();
+    running.send(SlackInbound::Message(Box::new(dm))).await;
+
+    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
+    for team in [Some(other.clone()), None] {
+        running
+            .send(SlackInbound::Event(SlackEvent {
+                binding: BindingRef::MANAGER_ID,
+                team,
+                event_id: "Ev0USERCHG1".to_owned(),
+                event_type: "user_change".to_owned(),
+                event: envelope["event"].clone(),
+                received_at: OffsetDateTime::now_utc(),
+            }))
+            .await;
+    }
+    running.stop().await;
+
+    assert!(h.requests().await.is_empty(), "nothing reached Slack");
+    assert!(
+        h.store
+            .slack_config_token_status(grace_there, &other)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(h.stored(grace_here).await.is_some());
+}
+
+/// A store in a new SQLite file, its URL, and the file's directory.
+async fn file_store() -> (Store, String, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("agentd-slack-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("agentd.db").display());
+    let store = Store::open(
+        &url,
+        Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
+    (store, url, dir)
+}
+
+const FAIL_TOKEN_WRITES: &str = "\
+    CREATE TABLE token_write_failures (remaining INTEGER NOT NULL); \
+    INSERT INTO token_write_failures VALUES (0); \
+    CREATE TRIGGER fail_token_insert BEFORE INSERT ON slack_config_tokens \
+    WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
+    UPDATE token_write_failures SET remaining = remaining - 1; \
+    SELECT RAISE(FAIL, 'injected write failure'); END; \
+    CREATE TRIGGER fail_token_update BEFORE UPDATE OF token_enc ON slack_config_tokens \
+    WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
+    UPDATE token_write_failures SET remaining = remaining - 1; \
+    SELECT RAISE(FAIL, 'injected write failure'); END;";
+
+/// Makes the next `failures` writes of configuration tokens to the store
+/// at `url` fail: inserts, and updates that set the tokens.
+async fn fail_token_writes(url: &str, failures: i64) {
+    use sqlx::Connection as _;
+    let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
+    sqlx::raw_sql(FAIL_TOKEN_WRITES)
+        .execute(&mut db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE token_write_failures SET remaining = ?")
+        .bind(failures)
+        .execute(&mut db)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+}
+
+/// How many of the failures [`fail_token_writes`] set up are left.
+async fn failures_left(url: &str) -> i64 {
+    use sqlx::Connection as _;
+    let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
+    let left = sqlx::query_scalar("SELECT remaining FROM token_write_failures")
+        .fetch_one(&mut db)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    left
+}
+
+#[tokio::test]
+async fn a_renewed_pair_is_stored_although_the_first_writes_fail() {
+    let (store, url, dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    let start = OffsetDateTime::now_utc();
+    h.store
+        .put_slack_config_token(
+            alice,
+            &TeamId::new(TEAM),
+            &NewSlackConfigToken {
+                token: SecretString::from("xoxe.xoxp-1-T0"),
+                refresh_token: SecretString::from("xoxe-1-R0"),
+                expires_at: start + time::Duration::minutes(30),
+            },
+            start,
+        )
+        .await
+        .unwrap();
+    mount_rotation(
+        &h.slack,
+        "xoxe-1-R0",
+        "xoxe.xoxp-1-T1",
+        "xoxe-1-R1",
+        "U0HUMAN01",
+        in_hours(12),
+    )
+    .await;
+    fail_token_writes(&url, 2).await;
+
+    assert_eq!(h.rotator().pass_at(clock(start)).await.unwrap().renewed, 1);
+    assert_eq!(failures_left(&url).await, 0);
+    assert_eq!(
+        h.stored(alice).await,
+        Some(("xoxe.xoxp-1-T1".to_owned(), "xoxe-1-R1".to_owned()))
+    );
+    h.store.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_checked_pair_is_stored_although_the_first_write_fails() {
+    let (store, url, dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    mount_rotation(
+        &h.slack,
+        GIVEN_REFRESH,
+        "xoxe.xoxp-1-NEW-SECRET-token",
+        "xoxe-1-NEW-SECRET-refresh",
+        "U0HUMAN01",
+        in_hours(12),
+    )
+    .await;
+    fail_token_writes(&url, 1).await;
+
+    let replies = h
+        .slash(
+            "U0HUMAN01",
+            &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        )
+        .await;
+    assert!(
+        replies[0].starts_with("Your Slack configuration token is registered."),
+        "{replies:?}"
+    );
+    assert_eq!(failures_left(&url).await, 0);
+    assert_eq!(
+        h.stored(alice).await,
+        Some((
+            "xoxe.xoxp-1-NEW-SECRET-token".to_owned(),
+            "xoxe-1-NEW-SECRET-refresh".to_owned()
+        ))
+    );
+    h.store.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
+    let (store, url, dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let (logs, _guard) = capture_logs();
+    let alice = h.linked("U0HUMAN01").await;
+    mount_rotation(
+        &h.slack,
+        GIVEN_REFRESH,
+        "xoxe.xoxp-1-NEW-SECRET-token",
+        "xoxe-1-NEW-SECRET-refresh",
+        "U0HUMAN01",
+        in_hours(12),
+    )
+    .await;
+    fail_token_writes(&url, 10).await;
+
+    let replies = h
+        .slash(
+            "U0HUMAN01",
+            &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        )
+        .await;
+    assert!(
+        replies[0].starts_with(
+            "I couldn't save that configuration token, and checking it used up its refresh token."
+        ),
+        "{replies:?}"
+    );
+    assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
+    assert_eq!(h.stored(alice).await, None);
+    assert!(!logs.text().contains("SECRET"));
+    h.store.close().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
