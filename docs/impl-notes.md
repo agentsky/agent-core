@@ -6642,6 +6642,21 @@ that don't read refuse everyone, the owner too, as `PolicyUnavailable`,
 since the same row holds the hop cap, and `allow <name> everyone` clears
 them.
 
+### An agent's settings change in one transaction
+
+**Issue.** `limits`, `allow` and `deny` read an agent's settings, changed
+them and wrote them back as separate queries, so two commands sent at once
+could each write over the other's change: of eight `allow`s sent together,
+one was kept.
+
+**Solution.** `Store::update_agent_settings` reads the row, applies the
+command's change, a plain function of the settings, and writes it in one
+`BEGIN IMMEDIATE` transaction, and replaces `put_agent_limits` and
+`put_agent_rules`. Resolving the target (a user or room lookup) happens
+before it, outside the transaction. `Rules::write` puts the lists in the
+settings; serializing a rule can't fail, and if it ever did the list
+would be empty text, which doesn't read and so refuses everyone.
+
 ### A ban leaves `me`, and still warns about a leaked secret
 
 **Issue.** A ban blocks a member's commands other than `me`, but a

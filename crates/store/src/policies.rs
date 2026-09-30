@@ -60,80 +60,45 @@ impl Store {
     /// [`StoreError::Database`] if the query fails,
     /// [`StoreError::Corrupt`] if a limit is out of range.
     pub async fn agent_settings(&self, agent: AgentId) -> Result<AgentSettings> {
-        let row: Option<(Option<i64>, Option<i64>, String, String)> = sqlx::query_as(
-            "SELECT turns_per_day, max_hops, allow_json, deny_json FROM agent_policies \
-             WHERE agent_id = ?",
-        )
-        .bind(agent.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some((turns, hops, allow_json, deny_json)) = row else {
-            return Ok(AgentSettings::default());
-        };
-        let corrupt = |column| StoreError::Corrupt {
-            table: POLICIES,
-            column,
-        };
-        Ok(AgentSettings {
-            turns_per_day: turns
-                .map(|turns| u32::try_from(turns).map_err(|_| corrupt("turns_per_day")))
-                .transpose()?,
-            max_hops: hops
-                .map(|hops| u8::try_from(hops).map_err(|_| corrupt("max_hops")))
-                .transpose()?,
-            allow_json,
-            deny_json,
-        })
+        settings_of(&self.pool, agent).await
     }
 
-    /// Sets `agent`'s daily turn cap and hop limit, keeping its rules.
+    /// Changes `agent`'s settings with `change`, which gets them as they
+    /// are (the [`Default`] if its owner set none) and may change them, and
+    /// returns what `change` returns. The read and the write are one
+    /// transaction, so changes made at once are all kept.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails, for example because
-    /// there is no such agent.
-    pub async fn put_agent_limits(
+    /// [`StoreError::Database`] if a query fails, for example because
+    /// there is no such agent, [`StoreError::Corrupt`] if a limit is out of
+    /// range.
+    pub async fn update_agent_settings<T>(
         &self,
         agent: AgentId,
-        turns_per_day: Option<u32>,
-        max_hops: Option<u8>,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO agent_policies (agent_id, turns_per_day, max_hops) VALUES (?, ?, ?) \
-             ON CONFLICT (agent_id) DO UPDATE SET turns_per_day = excluded.turns_per_day, \
-             max_hops = excluded.max_hops",
-        )
-        .bind(agent.to_string())
-        .bind(turns_per_day.map(i64::from))
-        .bind(max_hops.map(i64::from))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Sets `agent`'s allow and deny rules, keeping its limits.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] if the query fails, for example because
-    /// there is no such agent.
-    pub async fn put_agent_rules(
-        &self,
-        agent: AgentId,
-        allow_json: &str,
-        deny_json: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO agent_policies (agent_id, allow_json, deny_json) VALUES (?, ?, ?) \
-             ON CONFLICT (agent_id) DO UPDATE SET allow_json = excluded.allow_json, \
-             deny_json = excluded.deny_json",
-        )
-        .bind(agent.to_string())
-        .bind(allow_json)
-        .bind(deny_json)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        change: impl FnOnce(&mut AgentSettings) -> T,
+    ) -> Result<T> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let before = settings_of(&mut *tx, agent).await?;
+        let mut settings = before.clone();
+        let changed = change(&mut settings);
+        if settings != before {
+            sqlx::query(
+                "INSERT INTO agent_policies (agent_id, turns_per_day, max_hops, allow_json, \
+                 deny_json) VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent_id) DO UPDATE SET \
+                 turns_per_day = excluded.turns_per_day, max_hops = excluded.max_hops, \
+                 allow_json = excluded.allow_json, deny_json = excluded.deny_json",
+            )
+            .bind(agent.to_string())
+            .bind(settings.turns_per_day.map(i64::from))
+            .bind(settings.max_hops.map(i64::from))
+            .bind(&settings.allow_json)
+            .bind(&settings.deny_json)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        Ok(changed)
     }
 
     /// Bans `member`, recording that `by` did at `now` and why. Returns
@@ -212,6 +177,37 @@ impl Store {
     }
 }
 
+/// `agent`'s settings, read through `executor`.
+async fn settings_of<'c>(
+    executor: impl sqlx::SqliteExecutor<'c>,
+    agent: AgentId,
+) -> Result<AgentSettings> {
+    let row: Option<(Option<i64>, Option<i64>, String, String)> = sqlx::query_as(
+        "SELECT turns_per_day, max_hops, allow_json, deny_json FROM agent_policies \
+         WHERE agent_id = ?",
+    )
+    .bind(agent.to_string())
+    .fetch_optional(executor)
+    .await?;
+    let Some((turns, hops, allow_json, deny_json)) = row else {
+        return Ok(AgentSettings::default());
+    };
+    let corrupt = |column| StoreError::Corrupt {
+        table: POLICIES,
+        column,
+    };
+    Ok(AgentSettings {
+        turns_per_day: turns
+            .map(|turns| u32::try_from(turns).map_err(|_| corrupt("turns_per_day")))
+            .transpose()?,
+        max_hops: hops
+            .map(|hops| u8::try_from(hops).map_err(|_| corrupt("max_hops")))
+            .transpose()?,
+        allow_json,
+        deny_json,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,42 +229,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limits_and_rules_are_set_apart() {
+    async fn settings_change_in_place_and_an_unchanged_agent_keeps_no_row() {
         let store = memory_store().await;
         let alice = store
             .ensure_member(&member_key("alice"), "alice", at(1))
             .await
             .unwrap();
         let helper = agent(&store, alice, "helper").await;
+        let rows = async || -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_policies")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap()
+        };
+        let seen = store
+            .update_agent_settings(helper, |settings| settings.clone())
+            .await
+            .unwrap();
+        assert_eq!(seen, AgentSettings::default());
+        assert_eq!(rows().await, 0, "nothing changed, so nothing is written");
+
         store
-            .put_agent_limits(helper, Some(50), Some(2))
+            .update_agent_settings(helper, |settings| {
+                settings.turns_per_day = Some(50);
+                settings.max_hops = Some(2);
+                settings.allow_json = r#"["a"]"#.into();
+            })
             .await
             .unwrap();
         store
-            .put_agent_rules(helper, r#"["a"]"#, r#"["d"]"#)
+            .update_agent_settings(helper, |settings| {
+                settings.deny_json = r#"["d"]"#.into();
+                settings.max_hops = None;
+            })
             .await
             .unwrap();
         assert_eq!(
             store.agent_settings(helper).await.unwrap(),
             AgentSettings {
                 turns_per_day: Some(50),
-                max_hops: Some(2),
+                max_hops: None,
                 allow_json: r#"["a"]"#.into(),
                 deny_json: r#"["d"]"#.into(),
             }
         );
-        store.put_agent_limits(helper, None, Some(0)).await.unwrap();
-        let settings = store.agent_settings(helper).await.unwrap();
-        assert_eq!((settings.turns_per_day, settings.max_hops), (None, Some(0)));
-        assert_eq!(settings.allow_json, r#"["a"]"#, "the rules stay");
-
-        let fresh = agent(&store, alice, "other").await;
-        store
-            .put_agent_rules(fresh, NO_RULES, r#"["x"]"#)
-            .await
-            .unwrap();
-        let settings = store.agent_settings(fresh).await.unwrap();
-        assert_eq!((settings.turns_per_day, settings.max_hops), (None, None));
+        assert_eq!(rows().await, 1);
+        assert!(
+            store
+                .update_agent_settings(AgentId::new_v4(), |settings| settings.max_hops = Some(1))
+                .await
+                .is_err(),
+            "no such agent"
+        );
     }
 
     #[tokio::test]

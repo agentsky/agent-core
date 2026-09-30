@@ -2343,12 +2343,29 @@ async fn allow_and_deny_change_the_owners_rules() {
     assert_eq!(policy().await, router::AgentPolicy::default());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changes_sent_at_once_are_all_kept() {
+    let h = harness().await;
+    let (helper, _) = helper_and_bob(&h).await;
+    let mut texts: Vec<String> = (0..8).map(|n| format!("allow helper <@U{n}>")).collect();
+    texts.push("limits helper turns=5".to_owned());
+    texts.push("limits helper hops=1".to_owned());
+    futures::future::join_all(texts.iter().map(|text| h.dm("alice", text))).await;
+    let settings = h.store.agent_settings(helper).await.unwrap();
+    let rules = crate::policy::Rules::read(&settings).unwrap();
+    assert_eq!(rules.allow.len(), 8, "{rules:?}");
+    assert_eq!(
+        (settings.turns_per_day, settings.max_hops),
+        (Some(5), Some(1))
+    );
+}
+
 #[tokio::test]
 async fn unreadable_rules_are_cleared_by_allow_everyone() {
     let h = harness().await;
     let (helper, _) = helper_and_bob(&h).await;
     h.store
-        .put_agent_rules(helper, "not json", "[]")
+        .update_agent_settings(helper, |settings| settings.allow_json = "not json".into())
         .await
         .unwrap();
     h.dm("alice", "deny helper <@BOB>").await;

@@ -167,17 +167,14 @@ impl Rules {
         })
     }
 
-    /// The allow and deny lists as JSON, for
-    /// [`put_agent_rules`](store::Store::put_agent_rules).
-    ///
-    /// # Errors
-    ///
-    /// The JSON error, which a rule can't cause.
-    pub fn to_json(&self) -> Result<(String, String), serde_json::Error> {
-        Ok((
-            serde_json::to_string(&self.allow)?,
-            serde_json::to_string(&self.deny)?,
-        ))
+    /// Writes the lists into `settings` as JSON, for
+    /// [`update_agent_settings`](store::Store::update_agent_settings). A
+    /// rule always serializes; if one ever didn't, its list would be empty
+    /// text, which doesn't read, so the agent would refuse everyone rather
+    /// than drop a deny.
+    pub fn write(&self, settings: &mut AgentSettings) {
+        settings.allow_json = serde_json::to_string(&self.allow).unwrap_or_default();
+        settings.deny_json = serde_json::to_string(&self.deny).unwrap_or_default();
     }
 
     /// Applies `allow <rule>`; see the [module docs](self).
@@ -319,11 +316,8 @@ mod tests {
     }
 
     fn permits(rules: &Rules, user: &str, room: &str) -> bool {
-        let settings = AgentSettings {
-            allow_json: serde_json::to_string(&rules.allow).unwrap(),
-            deny_json: serde_json::to_string(&rules.deny).unwrap(),
-            ..AgentSettings::default()
-        };
+        let mut settings = AgentSettings::default();
+        rules.write(&mut settings);
         let policy = agent_policy(&settings, &Limits::default(), 0).unwrap();
         policy.permits(
             &Requester {
@@ -451,12 +445,8 @@ mod tests {
         });
         rules.allow(room("C1"));
         rules.deny(Rule::Everyone);
-        let (allow_json, deny_json) = rules.to_json().unwrap();
-        let settings = AgentSettings {
-            allow_json,
-            deny_json,
-            ..AgentSettings::default()
-        };
+        let mut settings = AgentSettings::default();
+        rules.write(&mut settings);
         assert_eq!(Rules::read(&settings).unwrap(), rules);
         let bad = AgentSettings {
             deny_json: r#"[{"kind":"nobody"}]"#.into(),

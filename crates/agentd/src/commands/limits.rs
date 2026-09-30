@@ -30,12 +30,14 @@ impl Commands {
         let Some(agent) = self.own_agent(key, name).await? else {
             return Ok(no_such_agent(name));
         };
-        let store = &self.inner.store;
-        let settings = store.agent_settings(agent.id).await?;
-        let turns_per_day = apply(turns, settings.turns_per_day);
-        let max_hops = apply(hops, settings.max_hops);
-        store
-            .put_agent_limits(agent.id, turns_per_day, max_hops)
+        let (turns_per_day, max_hops) = self
+            .inner
+            .store
+            .update_agent_settings(agent.id, |settings| {
+                settings.turns_per_day = apply(turns, settings.turns_per_day);
+                settings.max_hops = apply(hops, settings.max_hops);
+                (settings.turns_per_day, settings.max_hops)
+            })
             .await?;
         tracing::info!(agent = %agent.id, ?turns_per_day, ?max_hops, "set an agent's limits");
         Ok(self.describe_limits(name, turns_per_day, max_hops))
@@ -82,13 +84,39 @@ impl Commands {
             Ok(rule) => rule,
             Err(reply) => return Ok(reply),
         };
-        let store = &self.inner.store;
-        let settings = store.agent_settings(agent.id).await?;
-        let read = Rules::read(&settings);
-        let unreadable = read.is_err();
-        let mut rules = match read {
-            Ok(rules) => rules,
-            Err(_) if allow && rule == Rule::Everyone => Rules::default(),
+        let allows_some = allow && rule != Rule::Everyone;
+        let changed = self
+            .inner
+            .store
+            .update_agent_settings(agent.id, |settings| {
+                let mut rules = match Rules::read(settings) {
+                    Ok(rules) => rules,
+                    Err(_) if allow && rule == Rule::Everyone => Rules::default(),
+                    Err(err) => return Err(err),
+                };
+                let change = if allow {
+                    rules.allow(rule)
+                } else {
+                    rules.deny(rule)
+                };
+                if change != Change::Full {
+                    rules.write(settings);
+                }
+                Ok((change, rules))
+            })
+            .await?;
+        let rules = match changed {
+            Ok((Change::Full, _)) => {
+                return Ok(format!(
+                    "`{name}` has {MAX_RULES} rules of that kind already, the most it can have."
+                ));
+            }
+            Ok((change, rules)) => {
+                if change == Change::Changed {
+                    tracing::info!(agent = %agent.id, allow, "changed an agent's rules");
+                }
+                rules
+            }
             Err(err) => {
                 tracing::warn!(agent = %agent.id, kind = ?err.classify(), "an agent's rules don't read");
                 return Ok(format!(
@@ -97,27 +125,6 @@ impl Commands {
                 ));
             }
         };
-        let allows_some = allow && rule != Rule::Everyone;
-        let change = if allow {
-            rules.allow(rule)
-        } else {
-            rules.deny(rule)
-        };
-        match change {
-            Change::Full => {
-                return Ok(format!(
-                    "`{name}` has {MAX_RULES} rules of that kind already, the most it can have."
-                ));
-            }
-            Change::Unchanged if !unreadable => {}
-            Change::Unchanged | Change::Changed => {
-                let (allow_json, deny_json) = rules.to_json()?;
-                store
-                    .put_agent_rules(agent.id, &allow_json, &deny_json)
-                    .await?;
-                tracing::info!(agent = %agent.id, allow, "changed an agent's rules");
-            }
-        }
         let mut reply = rules.describe(name);
         if allows_some && rules.denies_everyone() {
             reply.push_str(&format!(

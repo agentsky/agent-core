@@ -249,8 +249,6 @@ enum Failure {
     Surface(#[from] core_types::SurfaceError),
     #[error(transparent)]
     Skill(#[from] crate::skills::SkillError),
-    #[error("an agent's rules didn't serialize")]
-    Rules(#[from] serde_json::Error),
 }
 
 fn now() -> OffsetDateTime {

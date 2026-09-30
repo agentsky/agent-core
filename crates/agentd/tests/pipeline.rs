@@ -1053,7 +1053,7 @@ async fn past_the_daily_cap_the_thread_is_told_once_and_the_owner_still_runs() {
     let stack = start().await;
     let store = stack.store();
     store
-        .put_agent_limits(stack.agent, Some(1), None)
+        .update_agent_settings(stack.agent, |settings| settings.turns_per_day = Some(1))
         .await
         .unwrap();
     stack.next_turn(Turn::reply("Once."));
@@ -1144,9 +1144,8 @@ async fn bans_and_deny_rules_refuse_a_requester() {
         member: Some(bob),
         label: "@bob".into(),
     });
-    let (allow, deny) = rules.to_json().unwrap();
     store
-        .put_agent_rules(stack.agent, &allow, &deny)
+        .update_agent_settings(stack.agent, |settings| rules.write(settings))
         .await
         .unwrap();
     let before = stack.mock.calls().len();
@@ -1161,7 +1160,7 @@ async fn bans_and_deny_rules_refuse_a_requester() {
     );
 
     store
-        .put_agent_rules(stack.agent, "[oops", "[]")
+        .update_agent_settings(stack.agent, |settings| settings.allow_json = "[oops".into())
         .await
         .unwrap();
     let before = stack.mock.calls().len();
