@@ -2482,7 +2482,10 @@ variable the kind uses. `LaunchSpec.env` is refused if it sets any variable
 the runner sets (`HOME`, `TMPDIR`, the design's credential proxy block) or
 any `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` variable. The placeholder must be
 non-empty printable ASCII. `LaunchSpec`'s `Debug` shows the environment's
-names only. `ClaudeProcess::start` also takes a `ProcessConfig` (the
+names only, and its values are `SecretString`s, as the plan's secrets rule
+asks for the agentctl token: they are exposed only in the map built for
+`Sandbox::exec`, which is dropped once the process has started.
+`ClaudeProcess::start` also takes a `ProcessConfig` (the
 `claude` binary, `ANTHROPIC_BASE_URL`, the turn timeout), which the plan's
 three-argument signature had no place for. The plan's T20 bullet says so.
 
@@ -2507,6 +2510,12 @@ message. The plan's T21 now marks a session started after a turn with
 and `init_seen` false, and a `--resume` of a session that never started gives
 a `Finished` error result with subtype `error_during_execution`.
 
+That refusal also left the session looking unstarted forever: every
+`--resume` gives it again, with `init_seen` false. `TurnOutcome::resume_refused()`
+names it (an error result with that subtype and no `init` line), the
+process is reaped since the CLI exits after it, and the plan's T21 resets
+the session to `--session-id` under the same id and runs the turn again.
+
 ### A failed write can follow the CLI's answer
 
 **Issue.** For a `--resume` without a transcript the CLI prints its result
@@ -2515,8 +2524,11 @@ exit: when the write lost, with `EPIPE`, the driver reported a crash and
 dropped the result line waiting in the pipe.
 
 **Solution.** A failed write is logged and the driver still reads stdout to
-its end, so a result printed before the process went is returned. The next
-turn on that process then finds the pipe closed and crashes.
+its end, so a result printed before the process went is returned. Review
+found the process then still counted as running, and the next turn crashed
+on it. Now a result after a failed write, or a resume refusal (where the
+write can win the race), reaps the process before `Finished` is returned,
+so `is_running()` is false and the next turn gets `NotRunning`.
 
 ### Codes and tool names can carry text
 
@@ -2549,7 +2561,9 @@ rather than an error. A result line without `is_error` counts as an error
 unless its subtype is `success`. Lines are read with a 16 MiB cap
 (`MAX_LINE_BYTES`): a longer line is skipped, and logged with its length, so
 a huge tool result can't grow the buffer without bound. Result lines hold
-only the final reply and stay far below it.
+only the final reply and stay far below it. The line buffer is cleared and
+shrunk back to 64 KiB after each turn, so a warm process doesn't keep a
+large line's capacity, or its bytes, between turns.
 
 ### Classifying errors by the assistant line's code
 
@@ -2577,17 +2591,53 @@ result included, as its own.
 **Solution.** The process records that a turn is in progress, and a
 `send_turn` that finds one still in progress kills the process and returns
 `RunnerError::NotRunning`, as after a crash, so the caller resumes on a new
-process. A timeout ends the turn the same way, with the process killed and
-reaped (up to five more seconds) before `TimedOut` is returned. The timeout
-counts from the call, so it includes writing the message.
+process. A timeout ends the turn the same way, with the process killed
+before `TimedOut` is returned. The timeout counts from the call, so it
+includes writing the message.
 
-### serde_json doesn't round floats exactly
+### A kill is not an exit
 
-**Issue.** The fixture's `total_cost_usd` of `0.00014000000000000001`
-parsed to a value one unit in the last place away from the Rust literal:
-serde_json's default float parser is fast, not correctly rounded, unless
-its `float_roundtrip` feature is on.
+**Issue.** The timeout and cancelled-turn paths said the process was killed
+and reaped, but a failed kill was only logged, a wait that didn't return
+within the five-second grace was dropped, and the process was marked dead
+either way. Under Docker a kill can signal nothing: the sandbox's kill
+finds the process by a pid it may never have learned (T17's review fix
+makes that an error that says to stop the container instead). A process marked dead might still be writing
+the transcript the next process resumes.
 
-**Solution.** Left as is. T27 sums the cost per member and day, and an
-error of one unit in the last place per turn stays far below a cent. The
-test compares with a tolerance.
+**Solution.** The process records whether a wait returned after the kill
+(or after stdin closed, for `stop`), and `ClaudeProcess::may_be_alive()`
+reports it: false only once the exit was seen. It covers every way a
+process ends, crash, timeout, cancelled turn, refused resume and `stop`
+(which now takes `&mut self` so the answer can be read afterwards), rather
+than a flag on each outcome. The plan's T21 stops the container when a
+dead process may still be alive. `ChildHandle` is a concrete type, so the
+kill-and-wait logic is written against a private two-method trait, and
+unit tests drive it with a double whose kill fails or is ignored.
+
+### `total_cost_usd` is the process's running total
+
+**Issue.** The result line's `total_cost_usd` was passed on as the turn's
+cost. T04's `tool-turns.jsonl` shows it is the process's running total:
+the first turn reports usage 20/10 and 0.00014, the second usage 10/5 and
+0.00021, which is 1.5 times the first, the cost of 30/15. `usage` is the
+turn's own. T27 would have billed a member again for every earlier turn
+on the process, including other members' turns on a shared warm process.
+
+**Solution.** `ClaudeProcess` keeps the last total it saw, 0 on each new
+process, and `TurnResult::cost_usd` is the rise since then, never below 0;
+the raw value stays as `process_total_cost_usd`. The fixture test checks
+that the second turn costs about 0.00007, and `fake-claude` now reports a
+running total (`testkit::claude::REPLY_COST_USD` per reply, a power of two
+so the sums are exact) for the integration tests. Whether the real CLI
+starts a `--resume`d process's total from 0, as `fake-claude` does, or
+restores the session's total, is unverified: no kept capture holds a
+result from a `--resume`d process. A restored total would make
+the first turn of every resumed process count the session's earlier turns
+again. The plan's T23 live check now covers it.
+
+serde_json's default float parser is not correctly rounded (its
+`float_roundtrip` feature is off), so the fixture's
+`0.00014000000000000001` parses one unit in the last place away from the
+literal, and the differences carry such errors too. That stays far below
+a cent in T27's daily sums; the fixture test compares with a tolerance.

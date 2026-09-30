@@ -93,11 +93,11 @@ impl Harness {
             env: BTreeMap::from([
                 (
                     testkit::claude::SCRIPT_ENV.to_string(),
-                    self.script.to_str().unwrap().to_owned(),
+                    SecretString::from(self.script.to_str().unwrap()),
                 ),
                 (
                     "AGENTCTL_TOKEN".to_string(),
-                    "ctl-token-for-test".to_string(),
+                    SecretString::from("ctl-token-for-test"),
                 ),
             ]),
         }

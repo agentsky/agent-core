@@ -6,7 +6,9 @@ use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use testkit::claude::{API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, SCRIPT_ENV};
+use testkit::claude::{
+    API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, REPLY_COST_USD, SCRIPT_ENV,
+};
 use testkit::{FakeAnthropic, Turn, fake_anthropic, fake_claude_path, fixtures, write_script};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -447,6 +449,16 @@ async fn a_resumed_session_continues_the_script_and_the_transcript() {
     );
     let replies: Vec<&Value> = run.results().iter().map(|r| &r["result"]).collect();
     assert_eq!(replies, ["second", "third"]);
+    let totals: Vec<f64> = run
+        .results()
+        .iter()
+        .map(|r| r["total_cost_usd"].as_f64().unwrap())
+        .collect();
+    assert_eq!(
+        totals,
+        [REPLY_COST_USD, 2.0 * REPLY_COST_USD],
+        "the cost is the process's running total, from 0 on a resumed process"
+    );
 
     let entries = transcript_entries(&setup.transcript());
     let users: Vec<&Value> = entries

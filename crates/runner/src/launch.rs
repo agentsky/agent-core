@@ -70,9 +70,11 @@ pub struct LaunchSpec {
     /// egress proxy variables. It may not set `HOME`, `TMPDIR`, the
     /// variables of the design's credential proxy block, or any
     /// `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` variable: the runner sets
-    /// those. Values may be secrets; they go only to
-    /// [`Sandbox::exec`](sandbox::Sandbox::exec).
-    pub env: BTreeMap<String, String>,
+    /// those. Values are secrets, such as the agentctl token: they are
+    /// exposed only in the environment handed to
+    /// [`Sandbox::exec`](sandbox::Sandbox::exec), which is dropped once the
+    /// process has started.
+    pub env: BTreeMap<String, SecretString>,
 }
 
 impl fmt::Debug for LaunchSpec {
@@ -176,7 +178,11 @@ pub(crate) fn env(
         CredentialKind::Subscription => OAUTH_TOKEN_ENV,
         CredentialKind::ApiKey => API_KEY_ENV,
     };
-    let mut env = spec.env.clone();
+    let mut env: BTreeMap<String, String> = spec
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.expose_secret().to_owned()))
+        .collect();
     let session = session.to_string();
     let set = [
         (credential_var, placeholder),
@@ -220,10 +226,13 @@ mod tests {
             credential,
             placeholder: SecretString::from(PLACEHOLDER),
             env: BTreeMap::from([
-                ("AGENTCTL_TOKEN".to_string(), "ctl-secret".to_string()),
+                (
+                    "AGENTCTL_TOKEN".to_string(),
+                    SecretString::from("ctl-secret"),
+                ),
                 (
                     "HTTPS_PROXY".to_string(),
-                    "http://cred-proxy.internal:8080".to_string(),
+                    SecretString::from("http://cred-proxy.internal:8080"),
                 ),
             ]),
         }
@@ -367,7 +376,8 @@ mod tests {
             "ANTHROPIC_BASE_URL",
         ] {
             let mut spec = spec(SessionStart::New, CredentialKind::Subscription);
-            spec.env.insert(key.into(), "sk-ant-real".into());
+            spec.env
+                .insert(key.into(), SecretString::from("sk-ant-real"));
             let err = env(
                 &ProcessConfig::default(),
                 &paths(),
@@ -422,6 +432,21 @@ mod tests {
             &spec,
         );
         assert!(matches!(result, Err(RunnerError::InvalidSpec(_))));
+    }
+
+    #[test]
+    fn env_values_are_secrets_until_the_exec_environment() {
+        let spec = spec(SessionStart::New, CredentialKind::Subscription);
+        let token: &SecretString = &spec.env["AGENTCTL_TOKEN"];
+        assert!(!format!("{token:?}").contains("ctl-secret"));
+        let built = env(
+            &ProcessConfig::default(),
+            &paths(),
+            SessionId::new_v4(),
+            &spec,
+        )
+        .unwrap();
+        assert_eq!(built["AGENTCTL_TOKEN"], "ctl-secret");
     }
 
     #[test]

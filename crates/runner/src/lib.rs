@@ -11,7 +11,14 @@
 //!    reads lines until the `result` line, giving a [`TurnOutcome`]: a
 //!    [`TurnResult`], a [`Crashed`](TurnOutcome::Crashed) process, or a
 //!    [`TimedOut`](TurnOutcome::TimedOut) turn whose process was killed.
+//!    A result's [`cost_usd`](TurnResult::cost_usd) is the turn's own,
+//!    although the CLI reports a running total for its process.
 //! 3. [`ClaudeProcess::stop`] closes stdin and waits for the process.
+//!
+//! A kill doesn't always end a process: it can fail, and under Docker
+//! signal nothing. Once a process is gone,
+//! [`ClaudeProcess::may_be_alive`] says whether its exit was seen; if not,
+//! stop the container before starting another process in it.
 //!
 //! # What is kept and logged
 //!

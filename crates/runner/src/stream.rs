@@ -31,7 +31,9 @@ pub enum TurnOutcome {
     /// input. Start a new process with
     /// [`SessionStart::Resume`](crate::SessionStart::Resume) for the next
     /// turn, or with [`SessionStart::New`](crate::SessionStart::New) if the
-    /// session had never started and [`TurnStats::init_seen`] is false.
+    /// session had never started and [`TurnStats::init_seen`] is false. If
+    /// [`ClaudeProcess::may_be_alive`](crate::ClaudeProcess::may_be_alive)
+    /// is true, stop the container first.
     Crashed {
         /// The exit code, or 128 plus the signal, when it could be read.
         exit_code: Option<i32>,
@@ -39,7 +41,10 @@ pub enum TurnOutcome {
         stats: TurnStats,
     },
     /// The turn took longer than the configured timeout, and its process
-    /// was killed. Resume as after a crash.
+    /// was killed. Resume as after a crash. The kill may not have taken
+    /// (under Docker it can signal nothing): if
+    /// [`ClaudeProcess::may_be_alive`](crate::ClaudeProcess::may_be_alive)
+    /// is true, stop the container before starting another process in it.
     TimedOut {
         /// What the turn printed before it was killed.
         stats: TurnStats,
@@ -58,6 +63,23 @@ impl TurnOutcome {
     /// Whether the turn finished with a result that isn't an error.
     pub fn is_success(&self) -> bool {
         matches!(self, Self::Finished(result) if !result.is_error)
+    }
+
+    /// Whether the CLI refused a `--resume` because the session has no
+    /// transcript: an error result with subtype `error_during_execution`
+    /// before the turn's `system`/`init` line, so the CLI never read the
+    /// message. The process exits after it. The session never started:
+    /// start the next process with
+    /// [`SessionStart::New`](crate::SessionStart::New) under the same id,
+    /// and run the turn again there.
+    pub fn resume_refused(&self) -> bool {
+        matches!(
+            self,
+            Self::Finished(result)
+                if result.is_error
+                    && !result.stats.init_seen
+                    && result.subtype.as_deref() == Some("error_during_execution")
+        )
     }
 }
 
@@ -84,10 +106,15 @@ pub struct TurnResult {
     pub terminal_reason: Option<String>,
     /// The API's HTTP status for an API error, such as 429 or 401.
     pub api_error_status: Option<u16>,
-    /// Token counts for the turn.
+    /// Token counts for the turn. The CLI reports them per turn.
     pub usage: Option<Usage>,
-    /// The turn's cost in US dollars, as the CLI reckons it.
-    pub total_cost_usd: Option<f64>,
+    /// The turn's cost in US dollars, as the CLI reckons it: the rise in
+    /// [`process_total_cost_usd`](Self::process_total_cost_usd) since the
+    /// process's previous result, never below 0.
+    pub cost_usd: Option<f64>,
+    /// The line's `total_cost_usd`: the CLI's running total for its
+    /// process, not the turn's cost. On a new process it counts from 0.
+    pub process_total_cost_usd: Option<f64>,
     /// The session the CLI reports.
     pub session_id: Option<SessionId>,
     /// Structural metadata from the lines before the result.
@@ -104,7 +131,8 @@ impl fmt::Debug for TurnResult {
             .field("terminal_reason", &self.terminal_reason)
             .field("api_error_status", &self.api_error_status)
             .field("usage", &self.usage)
-            .field("total_cost_usd", &self.total_cost_usd)
+            .field("cost_usd", &self.cost_usd)
+            .field("process_total_cost_usd", &self.process_total_cost_usd)
             .field("session_id", &self.session_id)
             .field("stats", &self.stats)
             .finish()
@@ -224,7 +252,16 @@ pub(crate) struct ResultLine {
 }
 
 impl ResultLine {
-    pub(crate) fn into_result(self, stats: TurnStats) -> TurnResult {
+    /// The turn's result. `process_total` is the running
+    /// `total_cost_usd` of the process's previous results, 0 on a new
+    /// process; the turn's cost is what this line adds to it, and it is
+    /// moved on to this line's total.
+    pub(crate) fn into_result(self, stats: TurnStats, process_total: &mut f64) -> TurnResult {
+        let cost_usd = self.total_cost_usd.map(|total| {
+            let cost = (total - *process_total).max(0.0);
+            *process_total = total;
+            cost
+        });
         let error_kind = self.is_error.then(|| {
             ErrorKind::classify(
                 self.api_error_status,
@@ -240,7 +277,8 @@ impl ResultLine {
             terminal_reason: self.terminal_reason,
             api_error_status: self.api_error_status,
             usage: self.usage,
-            total_cost_usd: self.total_cost_usd,
+            cost_usd,
+            process_total_cost_usd: self.total_cost_usd,
             session_id: self.session_id,
             stats,
         }
@@ -451,10 +489,11 @@ mod tests {
         let mut reader = capture.as_bytes();
         let mut buf = Vec::new();
         let mut results = Vec::new();
+        let mut process_total = 0.0;
         loop {
             let mut stats = TurnStats::default();
             match read_turn(&mut reader, &mut buf, &mut stats).await {
-                Some(line) => results.push(line.into_result(stats)),
+                Some(line) => results.push(line.into_result(stats, &mut process_total)),
                 None => return (results, stats),
             }
         }
@@ -486,7 +525,8 @@ mod tests {
                 cache_read_input_tokens: 0,
             })
         );
-        assert!((first.total_cost_usd.unwrap() - 0.00014).abs() < 1e-12);
+        assert!((first.cost_usd.unwrap() - 0.00014).abs() < 1e-12);
+        assert_eq!(first.cost_usd, first.process_total_cost_usd);
         assert_eq!(first.session_id, Some(session));
         assert_eq!(
             first.stats,
@@ -502,7 +542,15 @@ mod tests {
         );
         assert!(!second.is_error);
         assert_eq!(second.usage.unwrap().output_tokens, 5);
-        assert!((second.total_cost_usd.unwrap() - 0.00021).abs() < 1e-12);
+        assert!(
+            (second.process_total_cost_usd.unwrap() - 0.00021).abs() < 1e-12,
+            "the CLI reports its process's running total"
+        );
+        assert!(
+            (second.cost_usd.unwrap() - 0.00007).abs() < 1e-12,
+            "the second turn costs only what it added: {:?}",
+            second.cost_usd
+        );
         assert_eq!(second.stats.assistant_messages, 1);
         assert!(second.stats.tool_calls.is_empty());
         assert_eq!(second.stats.ignored_lines, 0);
@@ -546,6 +594,9 @@ mod tests {
         assert_eq!(missing.api_error_status, None);
         assert!(!missing.stats.init_seen);
         assert_eq!(missing.error_kind, Some(ErrorKind::Other));
+        assert!(TurnOutcome::Finished(missing.clone()).resume_refused());
+        assert!(!TurnOutcome::Finished(auth.clone()).resume_refused());
+        assert!(!TurnOutcome::Finished(unreachable.clone()).resume_refused());
 
         let (results, rest) = turns(fixtures::API_RETRY).await;
         assert!(results.is_empty());
@@ -558,6 +609,59 @@ mod tests {
             let (_, rest) = turns(capture).await;
             assert_eq!(rest.malformed_lines, 0, "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn only_the_captured_resume_refusal_is_one() {
+        let (results, _) = turns(fixtures::TOOL_TURNS).await;
+        for result in results {
+            assert!(!TurnOutcome::Finished(result).resume_refused());
+        }
+        let mut stats = TurnStats::default();
+        let line = br#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
+        let mut read = note_line(line, &mut stats)
+            .unwrap()
+            .into_result(stats, &mut 0.0);
+        assert!(TurnOutcome::Finished(read.clone()).resume_refused());
+        read.stats.init_seen = true;
+        assert!(
+            !TurnOutcome::Finished(read).resume_refused(),
+            "an error after the CLI read the message is not a refusal"
+        );
+        let crashed = TurnOutcome::Crashed {
+            exit_code: Some(1),
+            stats: TurnStats::default(),
+        };
+        assert!(!crashed.resume_refused());
+    }
+
+    #[test]
+    fn a_turn_costs_what_it_adds_to_the_process_total() {
+        let result = |total: &str, process_total: &mut f64| {
+            let line = format!(r#"{{"type":"result","subtype":"success"{total}}}"#);
+            let mut stats = TurnStats::default();
+            note_line(line.as_bytes(), &mut stats)
+                .unwrap()
+                .into_result(stats, process_total)
+        };
+        let mut process_total = 0.0;
+        let first = result(r#","total_cost_usd":0.5"#, &mut process_total);
+        assert_eq!(first.cost_usd, Some(0.5));
+        assert_eq!(first.process_total_cost_usd, Some(0.5));
+        let second = result(r#","total_cost_usd":0.75"#, &mut process_total);
+        assert_eq!(second.cost_usd, Some(0.25));
+        assert_eq!(second.process_total_cost_usd, Some(0.75));
+        let none = result("", &mut process_total);
+        assert_eq!(none.cost_usd, None);
+        assert_eq!(
+            process_total, 0.75,
+            "a result without a total moves nothing"
+        );
+        let lower = result(r#","total_cost_usd":0.125"#, &mut process_total);
+        assert_eq!(lower.cost_usd, Some(0.0), "a falling total costs nothing");
+        assert_eq!(process_total, 0.125);
+        let third = result(r#","total_cost_usd":0.25"#, &mut process_total);
+        assert_eq!(third.cost_usd, Some(0.125));
     }
 
     #[test]
@@ -596,7 +700,9 @@ mod tests {
     fn result_fields_are_read_leniently() {
         let mut stats = TurnStats::default();
         let line = br#"{"type":"result","subtype":"error_max_turns","api_error_status":"x","usage":{"input_tokens":"n","output_tokens":3},"total_cost_usd":"free","session_id":"not-a-uuid","terminal_reason":"has space","extra":{"nested":[1]}}"#;
-        let result = note_line(line, &mut stats).unwrap().into_result(stats);
+        let result = note_line(line, &mut stats)
+            .unwrap()
+            .into_result(stats, &mut 0.0);
         assert!(result.is_error, "no is_error and not success");
         assert_eq!(result.subtype.as_deref(), Some("error_max_turns"));
         assert_eq!(result.api_error_status, None);
@@ -607,14 +713,15 @@ mod tests {
                 ..Usage::default()
             })
         );
-        assert_eq!(result.total_cost_usd, None);
+        assert_eq!(result.cost_usd, None);
+        assert_eq!(result.process_total_cost_usd, None);
         assert_eq!(result.session_id, None);
         assert_eq!(result.terminal_reason, None);
         assert_eq!(result.error_kind, Some(ErrorKind::Other));
 
         let mut stats = TurnStats::default();
         let ok = note_line(br#"{"type":"result","subtype":"success"}"#, &mut stats).unwrap();
-        let ok = ok.into_result(stats);
+        let ok = ok.into_result(stats, &mut 0.0);
         assert!(!ok.is_error);
         assert_eq!(ok.error_kind, None);
         assert_eq!(ok.usage, None);
@@ -722,7 +829,7 @@ mod tests {
         let result = read_turn(&mut reader, &mut Vec::new(), &mut stats)
             .await
             .unwrap()
-            .into_result(stats);
+            .into_result(stats, &mut 0.0);
         assert_eq!(result.result.as_deref(), Some("ok"));
         assert_eq!(result.stats.malformed_lines, 1);
     }
@@ -752,7 +859,9 @@ mod tests {
     fn debug_hides_the_reply_text() {
         let mut stats = TurnStats::default();
         let line = br#"{"type":"result","is_error":false,"result":"the password is hunter2"}"#;
-        let result = note_line(line, &mut stats).unwrap().into_result(stats);
+        let result = note_line(line, &mut stats)
+            .unwrap()
+            .into_result(stats, &mut 0.0);
         let outcome = TurnOutcome::Finished(result);
         let debug = format!("{outcome:?}");
         assert!(!debug.contains("hunter2"), "{debug}");

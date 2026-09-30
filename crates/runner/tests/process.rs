@@ -7,8 +7,9 @@ use common::{Harness, PLACEHOLDER};
 use core_types::CredentialKind;
 use runner::{ClaudeProcess, ErrorKind, ProcessConfig, RunnerError, SessionStart, TurnOutcome};
 use sandbox::Sandbox;
+use secrecy::SecretString;
 use testkit::Turn;
-use testkit::claude::CRASH_EXIT_CODE;
+use testkit::claude::{CRASH_EXIT_CODE, REPLY_COST_USD};
 
 fn finished(outcome: TurnOutcome) -> runner::TurnResult {
     match outcome {
@@ -42,16 +43,64 @@ async fn first_start_uses_session_id_and_later_starts_resume() {
 }
 
 #[tokio::test]
-async fn resuming_a_session_that_never_started_is_an_error_result() {
-    let h = Harness::new(&[Turn::reply("unused")]).await;
+async fn resuming_a_session_that_never_started_is_refused_and_ends_the_process() {
+    let h = Harness::new(&[Turn::reply("fresh")]).await;
     let mut process = h.start(h.launch(SessionStart::Resume)).await;
-    let result = finished(process.send_turn("hello").await.unwrap());
+    let outcome = process.send_turn("hello").await.unwrap();
+    assert!(outcome.resume_refused(), "{outcome:?}");
+    let result = finished(outcome);
     assert!(result.is_error);
     assert_eq!(result.subtype.as_deref(), Some("error_during_execution"));
     assert!(!result.stats.init_seen);
     assert_eq!(result.error_kind, Some(ErrorKind::Other));
-    let next = process.send_turn("again").await.unwrap();
-    assert!(matches!(next, TurnOutcome::Crashed { .. }), "{next:?}");
+    assert!(!process.is_running(), "the CLI exits after refusing");
+    assert!(!process.may_be_alive());
+    assert!(matches!(
+        process.send_turn("again").await,
+        Err(RunnerError::NotRunning)
+    ));
+
+    let mut fresh = h.start(h.launch(SessionStart::New)).await;
+    let outcome = fresh.send_turn("hello").await.unwrap();
+    assert!(!outcome.resume_refused());
+    assert_eq!(finished(outcome).result.as_deref(), Some("fresh"));
+    assert_eq!(h.transcript_user_messages(), ["hello"]);
+    fresh.stop().await;
+}
+
+#[tokio::test]
+async fn a_result_after_a_failed_write_ends_the_process() {
+    let mut h = Harness::new(&[]).await;
+    let bin = h._dir.0.join("closes-stdin");
+    let script = format!(
+        "#!/bin/sh\nexec 0<&-\nprintf '%s\\n' '{}'\n: > \"$TMPDIR/stdin-closed\"\n",
+        r#"{"type":"result","subtype":"success","is_error":false,"result":"early"}"#
+    );
+    std::fs::write(&bin, script).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    h.config.claude_bin = bin.to_str().unwrap().to_owned();
+    let mut process = h.start(h.launch(SessionStart::New)).await;
+    let marker = h.container.paths().tmp.join("stdin-closed");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(std::time::Instant::now() < deadline, "the script never ran");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let outcome = process.send_turn("hello").await.unwrap();
+    let result = finished(outcome);
+    assert_eq!(result.result.as_deref(), Some("early"));
+    assert!(
+        !process.is_running(),
+        "a process that stopped reading is gone"
+    );
+    assert!(!process.may_be_alive());
+    assert!(matches!(
+        process.send_turn("again").await,
+        Err(RunnerError::NotRunning)
+    ));
 }
 
 #[tokio::test]
@@ -70,7 +119,14 @@ async fn two_turns_on_one_warm_process() {
     assert!(!one.is_error && !two.is_error);
     assert_eq!(one.terminal_reason.as_deref(), Some("completed"));
     assert_eq!(one.usage.unwrap().input_tokens, 10);
-    assert_eq!(two.total_cost_usd, Some(0.0));
+    assert_eq!(two.usage.unwrap().input_tokens, 10, "usage is per turn");
+    assert_eq!(one.cost_usd, Some(REPLY_COST_USD));
+    assert_eq!(
+        two.cost_usd,
+        Some(REPLY_COST_USD),
+        "the second turn is not billed for the first"
+    );
+    assert_eq!(two.process_total_cost_usd, Some(2.0 * REPLY_COST_USD));
     assert_eq!(
         one.stats.ignored_lines, 1,
         "the OAuth rate_limit_event of the first turn is skipped"
@@ -102,6 +158,11 @@ async fn a_crash_then_a_resume() {
     let mut resumed = h.start(h.launch(SessionStart::Resume)).await;
     let result = finished(resumed.send_turn("three").await.unwrap());
     assert_eq!(result.result.as_deref(), Some("after"));
+    assert_eq!(
+        result.cost_usd,
+        Some(REPLY_COST_USD),
+        "a new process counts its cost from 0"
+    );
     assert_eq!(h.transcript_user_messages(), ["one", "two", "three"]);
 }
 
@@ -140,6 +201,7 @@ async fn a_timeout_kills_the_process_and_fails_the_turn() {
     assert!(stats.duration >= Duration::from_secs(1), "{stats:?}");
     assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
     assert!(!process.is_running());
+    assert!(!process.may_be_alive(), "the killed process was reaped");
     assert!(matches!(
         process.send_turn("three").await,
         Err(RunnerError::NotRunning)
@@ -160,10 +222,12 @@ async fn a_cancelled_turn_leaves_the_process_unusable() {
         tokio::time::timeout(Duration::from_millis(300), process.send_turn("one")).await;
     assert!(cancelled.is_err());
     assert!(!process.is_running());
+    assert!(process.may_be_alive());
     assert!(matches!(
         process.send_turn("two").await,
         Err(RunnerError::NotRunning)
     ));
+    assert!(!process.may_be_alive(), "the killed process was reaped");
     assert!(matches!(
         process.send_turn("three").await,
         Err(RunnerError::NotRunning)
@@ -330,8 +394,10 @@ async fn a_real_credential_cannot_be_passed_in_the_environment() {
         "ANTHROPIC_AUTH_TOKEN",
     ] {
         let mut spec = h.launch(SessionStart::New);
-        spec.env
-            .insert(key.into(), "sk-ant-oat01-real-credential".into());
+        spec.env.insert(
+            key.into(),
+            SecretString::from("sk-ant-oat01-real-credential"),
+        );
         let err = ClaudeProcess::start(&h.sandbox, &h.container, &h.config, spec)
             .await
             .unwrap_err();
@@ -373,7 +439,15 @@ async fn stopping_ends_the_process_and_is_quiet_after_a_crash() {
     finished(process.send_turn("one").await.unwrap());
     let debug = format!("{process:?}");
     assert!(debug.contains("Idle"), "{debug}");
+    assert!(process.may_be_alive());
     process.stop().await;
+    assert!(!process.is_running());
+    assert!(!process.may_be_alive());
+    process.stop().await;
+    assert!(matches!(
+        process.send_turn("two").await,
+        Err(RunnerError::NotRunning)
+    ));
 
     let mut crashed = h.start(h.launch(SessionStart::Resume)).await;
     assert!(matches!(
@@ -388,4 +462,7 @@ fn a_process_can_move_between_tasks() {
     fn assert_send<T: Send + 'static>() {}
     assert_send::<ClaudeProcess>();
     assert_send::<TurnOutcome>();
+    fn assert_send_future<F: std::future::Future + Send>(_: F) {}
+    let _ = |process: &mut ClaudeProcess| assert_send_future(process.send_turn("x"));
+    let _ = |process: &mut ClaudeProcess| assert_send_future(process.stop());
 }
