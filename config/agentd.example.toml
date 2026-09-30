@@ -76,6 +76,27 @@ data_dir = "/var/lib/agentd"
 # The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
 attach_max_bytes = 52428800
 
+[proxy]
+# The hosts sandboxes may open HTTPS tunnels to, through the egress proxy on
+# proxy_listen (HTTPS_PROXY=http://cred-proxy.internal:8080). An exact host,
+# or *. and a suffix for every name below it (not the suffix itself), with
+# port 443 unless the rule names another: ["github.com",
+# "*.githubusercontent.com", "git.example.com:8443"]. IP addresses aren't
+# rules. The proxy tunnels bytes without looking at them, offers no plain
+# HTTP, and always refuses api.anthropic.com. A host is refused if any
+# address it resolves to is loopback, link-local (the cloud metadata address
+# 169.254.169.254 included), agentd's own or the sandbox network's,
+# reserved, or private and not in allow_private. Empty by default: no
+# egress at all.
+allow = []
+
+# Private subnets (inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 or
+# fc00::/7) that allowed hosts may resolve to, such as a Git server on the
+# office network: ["10.20.0.0/16"]. None may overlap sandbox_subnet or hold
+# one of agentd's listener addresses. Keep the egress network's other
+# services (Rocket.Chat, MongoDB, the Docker host's gateway) out of them.
+allow_private = []
+
 [claude_oauth]
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every

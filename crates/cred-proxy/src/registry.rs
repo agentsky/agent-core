@@ -297,10 +297,14 @@ impl Registry {
         before - entries.len()
     }
 
-    /// Whether any live placeholder is bound to `ip`.
-    pub(crate) fn knows(&self, ip: IpAddr) -> bool {
+    /// The session whose live placeholders are bound to `ip`, if any. An
+    /// address belongs to at most one session.
+    pub(crate) fn session_at(&self, ip: IpAddr) -> Option<SessionId> {
         let ip = ip.to_canonical();
-        self.lock().values().any(|entry| entry.ip == ip)
+        self.lock()
+            .values()
+            .find(|entry| entry.ip == ip)
+            .map(|entry| entry.session)
     }
 
     /// Checks `token`, presented from `ip` in the header for `kind`.
@@ -497,8 +501,8 @@ mod tests {
         assert_eq!(registry.revoke_session(session), 1);
         assert_eq!(registry.revoke_session(session), 0);
         assert!(!registry.is_live(second.id(), IP));
-        assert!(!registry.knows(IP));
-        assert!(registry.knows(OTHER_IP));
+        assert_eq!(registry.session_at(IP), None);
+        assert_eq!(registry.session_at(OTHER_IP), Some(other));
         assert!(registry.is_live(kept.id(), OTHER_IP));
     }
 
@@ -530,12 +534,12 @@ mod tests {
         registry
             .point(placeholder.id(), CredentialRef::Community)
             .unwrap();
-        assert!(registry.knows(IP));
+        assert_eq!(registry.session_at(IP), Some(session));
         assert!(
             registry
                 .authorize(placeholder.expose_secret(), IP, CredentialKind::ApiKey)
                 .is_ok()
         );
-        assert!(!registry.knows(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(registry.session_at(IpAddr::V6(Ipv6Addr::LOCALHOST)), None);
     }
 }

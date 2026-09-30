@@ -45,6 +45,11 @@ service links such as `AGENTD_PORT` are skipped, and any other variable
 starting with `AGENTD_` is ignored with a warning. Each listener binds
 agentd's own address on its network, never `0.0.0.0`, and the proxy and ctl
 listeners must be inside `internal.sandbox_subnet`.
+`[proxy] allow` is the sandboxes' egress allowlist: the hosts they may open
+HTTPS tunnels to through the proxy listener. It is empty by default, and
+`api.anthropic.com`, IP addresses, and hosts that resolve to loopback,
+link-local (cloud metadata), agentd's or private addresses are refused
+whatever it says; `[proxy] allow_private` opens chosen private subnets.
 `GET /healthz` on the public listener answers 200 while the database does.
 It also serves Slack's request URLs, `/slack/b/<binding>/events`,
 `…/interactivity` and `…/commands`; the manager app's binding is `manager`,

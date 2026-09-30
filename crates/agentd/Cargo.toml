@@ -19,6 +19,7 @@ base64.workspace = true
 clap.workspace = true
 commands.workspace = true
 core-types.workspace = true
+cred-proxy.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

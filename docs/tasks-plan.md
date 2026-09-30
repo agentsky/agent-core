@@ -79,7 +79,7 @@ one move:
 
 | Crate | Kind | Notes |
 | --- | --- | --- |
-| `core-types` | lib | IDs, keys, `InboundEvent`, `Surface` trait, `Caps`, agentctl wire types. No I/O. |
+| `core-types` | lib | IDs, keys, `InboundEvent`, `Surface` trait, `Caps`, agentctl wire types, `Cidr`. No I/O. |
 | `store` | lib | sqlx on SQLite. **Owns encryption at rest** (moved from `auth`, see below). |
 | `auth` | lib | PKCE, token exchange, refresh, profile and plan lookup. |
 | `render` | lib | Markdown to Slack mrkdwn and Rocket.Chat, splitting, directives. |
@@ -1621,19 +1621,32 @@ Design: [Credential proxy](design.md#credential-proxy) (rule 3).
 
 Deliverables:
 
-- An HTTP `CONNECT` forward proxy on the same proxy listener. Sandboxes get
-  `HTTPS_PROXY` and `HTTP_PROXY` set to `http://cred-proxy.internal:8080`, and
-  `NO_PROXY=cred-proxy.internal,agentctl.internal`.
+- An HTTP `CONNECT` forward proxy on the same proxy listener
+  (`cred_proxy::EgressProxy`, served through `CredProxy::with_egress`).
+  Sandboxes get `HTTPS_PROXY` and `HTTP_PROXY` set to
+  `http://cred-proxy.internal:8080`, and
+  `NO_PROXY=cred-proxy.internal,agentctl.internal`, in both upper and lower
+  case (`cred_proxy::EGRESS_ENV`); curl, and so git, reads only the
+  lowercase `http_proxy`.
 - A host allowlist from `[proxy] allow = [...]`, with a per-agent extension
-  point (T25 adds skill-declared hosts):
-  - Exact hosts and `*.suffix` patterns.
+  point (the `EgressExtension` trait; T25 adds skill-declared hosts):
+  - Exact hosts and `*.suffix` patterns, compared lowercase without a
+    trailing dot. IP addresses are neither rules nor `CONNECT` targets.
   - Port 443 only, unless a rule names another port.
   - Tunnels bytes without TLS interception.
+- The target is the request line's authority-form `host:port` over HTTP/1;
+  `Host` is ignored.
 - Always denied, whatever the allowlist says:
   - `api.anthropic.com` (so side traffic fails loudly, per the design).
-  - Link-local and cloud metadata addresses (`169.254.0.0/16`, `fd00:ec2::254`).
-  - Private ranges.
-  - Denial is checked after DNS resolution, so a DNS rebind can't reach them.
+  - Link-local and cloud metadata addresses (`169.254.0.0/16`, `fd00:ec2::254`),
+    loopback, agentd's own addresses and the sandbox subnet, and reserved,
+    documentation, multicast and non-global IPv6 ranges
+    ([impl-notes](impl-notes.md#addresses-are-checked-after-resolution-and-the-tunnel-goes-to-them)).
+  - Private ranges, unless `[proxy] allow_private` names the subnet; it may
+    only name subnets inside the private ranges that stay clear of agentd
+    ([impl-notes](impl-notes.md#private-networks-can-be-allowed-narrowly)).
+  - Denial is checked after DNS resolution, so a DNS rebind can't reach them,
+    and the tunnel connects to the checked addresses, never the name.
 - A denied `CONNECT` returns 403 with a one-line reason, and is logged with the
   session.
 - Absolute-form requests (`GET http://host/…`, what `HTTP_PROXY` produces for
@@ -1935,14 +1948,16 @@ Deliverables:
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, and `turn_finished` calls
   `Registry::unpoint`. It sets the egress proxy variables from
-  T19, and issues agentctl tokens and records their turns with T15
+  T19 (`cred_proxy::EGRESS_ENV`), and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
   turn's outbox, and `revoke_process_token`). It builds `App` with a
   `SurfaceLookup` for `agentctl history`, and resolves the short message ids
   it shows the model where agentctl takes a message id
   ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
 - agentd serves T18's `CredProxy` on `Routers.proxy`, with the `Registry`
-  shared with its `TurnHooks`. A `[proxy] upstream` key, default
+  shared with its `TurnHooks`, and with
+  `CredProxy::with_egress(EgressProxy::new(config.egress_policy()?))`, so
+  the same listener answers `CONNECT` (T19). A `[proxy] upstream` key, default
   `https://api.anthropic.com`, sets the upstream, and
   `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
@@ -2082,7 +2097,8 @@ Deliverables:
 - `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
 - Skills may declare extra egress hosts in front matter (`allowed-hosts:`). The
   owner confirms them when adding, and they extend T19's allowlist for that
-  agent's sandboxes.
+  agent's sandboxes, through an `EgressExtension` that maps the session to
+  its agent's confirmed hosts.
 
 Acceptance: tests for add from a local Git fixture repo, add from an uploaded
 file, validation failures, rm, mounting (the path is visible in a

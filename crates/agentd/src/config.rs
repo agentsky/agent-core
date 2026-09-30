@@ -42,13 +42,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use auth::OAuthConfig;
+use core_types::Cidr;
+use cred_proxy::{EgressPolicy, HostRule};
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
 use store::Sealer;
 use tracing_subscriber::EnvFilter;
-
-use crate::net::Cidr;
 
 /// The master key for encryption at rest: 32 bytes, standard base64, as
 /// `agentd gen-key` prints it. Required.
@@ -96,6 +96,8 @@ pub struct Config {
     pub store: StoreConfig,
     /// `[limits]`: caps on what agents may do.
     pub limits: LimitsConfig,
+    /// `[proxy]`: what sandboxes may reach through the egress proxy.
+    pub proxy: ProxyConfig,
     /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
     /// accounts. Every key has a default, so the section is optional.
     pub claude_oauth: OAuthConfig,
@@ -118,6 +120,8 @@ struct File {
     store: StoreConfig,
     #[serde(default)]
     limits: LimitsConfig,
+    #[serde(default)]
+    proxy: ProxyConfig,
     #[serde(default)]
     claude_oauth: OAuthConfig,
     rocketchat: Option<RocketChatConfig>,
@@ -219,6 +223,25 @@ impl Default for LimitsConfig {
             attach_max_bytes: DEFAULT_ATTACH_MAX_BYTES,
         }
     }
+}
+
+/// `[proxy]`. Every key has a default, so the section is optional; without
+/// it sandboxes reach no host at all.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct ProxyConfig {
+    /// `allow`: the hosts sandboxes may open HTTPS tunnels to, as
+    /// [`HostRule`]s such as `github.com`, `*.githubusercontent.com` or
+    /// `git.example.com:8443`. Port 443 unless a rule names another.
+    /// `api.anthropic.com` is denied whatever this says.
+    pub allow: Vec<HostRule>,
+    /// `allow_private`: private subnets (inside `10.0.0.0/8`,
+    /// `172.16.0.0/12`, `192.168.0.0/16` or `fc00::/7`) that allowed hosts
+    /// may resolve to. Private addresses are refused otherwise. None may
+    /// overlap `internal.sandbox_subnet` or hold one of agentd's listener
+    /// addresses.
+    pub allow_private: Vec<Cidr>,
 }
 
 /// Secrets, read from the environment only.
@@ -338,11 +361,23 @@ impl Config {
             internal: file.internal,
             store: file.store,
             limits: file.limits,
+            proxy: file.proxy,
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
             secrets,
             unknown_env,
         })
+    }
+
+    /// Builds the egress proxy's policy from `[proxy]`, keeping agentd's
+    /// listener addresses and the sandbox network out of reach.
+    ///
+    /// # Errors
+    ///
+    /// Never for a loaded `Config`, whose `[proxy]` section was checked the
+    /// same way.
+    pub fn egress_policy(&self) -> Result<EgressPolicy, ConfigError> {
+        egress_policy(&self.proxy, &self.server, &self.internal)
     }
 
     /// Builds the store's [`Sealer`] from the master key.
@@ -355,6 +390,25 @@ impl Config {
         Sealer::from_base64(&self.secrets.master_key)
             .map_err(|err| invalid(MASTER_KEY_VAR, err.to_string()))
     }
+}
+
+fn egress_policy(
+    proxy: &ProxyConfig,
+    server: &ServerConfig,
+    internal: &InternalConfig,
+) -> Result<EgressPolicy, ConfigError> {
+    let mut own = vec![internal.sandbox_subnet];
+    for (key, addr) in [
+        ("server.listen", server.listen),
+        ("internal.proxy_listen", internal.proxy_listen),
+        ("internal.ctl_listen", internal.ctl_listen),
+    ] {
+        let ip = addr.ip().to_canonical();
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+        own.push(Cidr::new(ip, prefix).map_err(|err| invalid(key, err.to_string()))?);
+    }
+    EgressPolicy::new(proxy.allow.clone(), proxy.allow_private.clone(), own)
+        .map_err(|err| invalid(format!("proxy.allow_private.{}", err.index), err.reason))
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -485,6 +539,7 @@ impl File {
         if self.limits.attach_max_bytes == 0 {
             return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
         }
+        egress_policy(&self.proxy, &self.server, &self.internal)?;
         self.claude_oauth
             .validate()
             .map_err(|err| invalid(format!("claude_oauth.{}", err.key), err.reason))?;
@@ -750,7 +805,70 @@ data_dir = "/nonexistent/agentd"
         assert!(config.secrets.rc_manager_token.is_none());
         assert!(config.secrets.slack_manager.is_empty());
         assert!(config.unknown_env.is_empty());
+        assert!(config.proxy.allow.is_empty() && config.proxy.allow_private.is_empty());
+        assert!(config.egress_policy().unwrap().rules().is_empty());
         config.sealer().unwrap();
+    }
+
+    const DOCKER_ADDRESSES: &str = r#"
+[server]
+listen = "172.31.0.2:8443"
+
+[internal]
+proxy_listen = "172.30.0.2:8080"
+ctl_listen = "172.30.0.2:8081"
+sandbox_subnet = "172.30.0.0/24"
+
+[store]
+url = "sqlite::memory:"
+data_dir = "/nonexistent/agentd"
+
+[proxy]
+"#;
+
+    #[test]
+    fn proxy_rules_and_private_subnets_load() {
+        let text = format!(
+            "{DOCKER_ADDRESSES}allow = [\"GitHub.com\", \"*.example.com:8443\"]\n\
+             allow_private = [\"10.20.0.0/16\", \"172.31.0.3/32\"]\n"
+        );
+        let config = with(&text, env()).unwrap();
+        let rules: Vec<String> = config.proxy.allow.iter().map(ToString::to_string).collect();
+        assert_eq!(rules, ["github.com", "*.example.com:8443"]);
+        assert_eq!(config.proxy.allow_private.len(), 2);
+        assert_eq!(config.egress_policy().unwrap().rules().len(), 2);
+    }
+
+    #[test]
+    fn proxy_errors_name_the_entry() {
+        for (proxy, key, message) in [
+            (
+                "allow = [\"github.com\", \"1.2.3.4\"]",
+                "proxy.allow.1",
+                "IP addresses are not allowed",
+            ),
+            ("allow = [\"*.com\"]", "proxy.allow.0", "two or more labels"),
+            (
+                "allow_private = [\"169.254.0.0/16\"]",
+                "proxy.allow_private.0",
+                "must be inside",
+            ),
+            (
+                "allow_private = [\"10.0.0.0/8\", \"172.30.0.0/16\"]",
+                "proxy.allow_private.1",
+                "must not overlap",
+            ),
+            (
+                "allow_private = [\"172.31.0.0/24\"]",
+                "proxy.allow_private.0",
+                "must not overlap",
+            ),
+            ("deny = []", "proxy.deny", "unknown field"),
+        ] {
+            let err = file_err(&format!("{DOCKER_ADDRESSES}{proxy}\n"));
+            assert_eq!(err.key(), Some(key), "{proxy}: {err}");
+            assert!(err.to_string().contains(message), "{proxy}: {err}");
+        }
     }
 
     #[test]

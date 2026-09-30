@@ -3810,3 +3810,150 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
 - `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
+
+## T19: Credential proxy egress allowlist
+
+### The target comes from the request line, in one spelling
+
+**Issue.** A `CONNECT` names its target twice, in the request line and in
+`Host`, and the plan's rules (`api.anthropic.com` always denied, exact and
+`*.suffix` hosts) compare names. `API.Anthropic.COM.:443` is the same host
+as `api.anthropic.com:443` to every resolver, and forms such as `127.1`,
+`2130706433` or `0x7f.1` are addresses to `getaddrinfo` though they parse
+as no `IpAddr`.
+
+**Solution.** Only the request line counts, and it must be authority form,
+`host:port`, over HTTP/1: `Host` is ignored, and user info, a scheme, a
+path, a missing or zero port, and `CONNECT` over HTTP/2 are refused. The
+host is lowercased and loses one trailing dot before any comparison, and
+must be a DNS name of letters, digits and `-` with at least two labels, the
+last starting with a letter. That refuses every numeric form, and IP
+literals (bracketed IPv6 or dotted IPv4) are refused outright: a tunnel
+always goes to a named host that a rule allows. Rules go through the same
+function, so a rule and a request can't disagree on spelling.
+
+### Addresses are checked after resolution, and the tunnel goes to them
+
+**Issue.** The plan checks denial after DNS resolution so a rebind can't
+reach a denied address. Checking the name's addresses and then connecting
+by name would resolve twice, and a rebinding server answers the second
+lookup differently.
+
+**Solution.** The egress proxy resolves once, refuses the host if any
+address in the answer is unreachable (a mixed answer is what a rebinding
+attack looks like, and no legitimate public host answers with a metadata
+or private address), and then connects to those checked addresses, in
+order, never to the name. The system resolver is given the name with a
+trailing dot, so search domains don't apply: under Kubernetes' `ndots:5`,
+`github.com` would be tried as `github.com.<namespace>.svc.cluster.local`
+first. Resolution has a 5-second timeout and all connection attempts share
+the 10-second `CONNECT_TIMEOUT`, so a long answer of silent addresses can't
+hold a request.
+
+Never reachable, whatever resolves there: agentd's own listener addresses
+and the sandbox subnet (agentd passes them from its configuration),
+loopback, link-local (`169.254.0.0/16`, the metadata address among them),
+`fd00:ec2::254`, `0.0.0.0/8`, `100.64.0.0/10` (Alibaba's metadata address
+`100.100.100.200` is in it), `192.0.0.0/24` (Oracle's `192.0.0.192`),
+documentation, benchmarking, multicast, reserved and broadcast ranges. For
+IPv6 only global unicast (`2000::/3`) is reachable, minus `2001::/23`
+(Teredo among it), `2002::/16` (6to4), `2001:db8::/32` and `3fff::/20`:
+that also refuses IPv4-compatible, NAT64 (`64:ff9b::/96`) and other forms
+that embed an IPv4 address, which would otherwise carry a private or
+metadata address past the IPv4 checks. IPv4-mapped addresses are checked as
+the IPv4 address they hold.
+
+### Private networks can be allowed, narrowly
+
+**Issue.** The plan denies private ranges whatever the allowlist says,
+which leaves no way to reach a Git server on an office network. The
+review brief asked for RFC 1918 to be denied "unless explicitly allowed".
+
+**Solution.** `[proxy] allow_private` lists subnets that allowed hosts may
+resolve to. Each must lie inside `10.0.0.0/8`, `172.16.0.0/12`,
+`192.168.0.0/16` or `fc00::/7`, must not hold `fd00:ec2::254`, and must not
+overlap the sandbox subnet or hold one of agentd's listener addresses;
+configuration validation refuses anything else, naming the entry. It opens
+addresses only for hosts a rule already allows, and never loopback,
+link-local or the other ranges above. The egress network's subnet isn't in
+agentd's configuration, so it can't be refused as a whole: a subnet that
+holds agentd's own egress address is refused, but a narrower one covering
+Rocket.Chat, MongoDB or the Docker host's gateway is the operator's to
+avoid, as the example configuration says. The plan's T19 bullet says so.
+
+### `Cidr` moved to core-types
+
+**Issue.** The egress policy needs subnets for agentd's own networks and
+`allow_private`, and agentd's `net::Cidr` was the only implementation.
+cred-proxy can't depend on agentd.
+
+**Solution.** `Cidr` moved unchanged, with its tests, to
+`core_types::net`, which does no I/O, and gained `network`, `prefix`,
+`covers` and `overlaps`. agentd imports it from there.
+
+### The CLI honors `NO_PROXY`, and needs it
+
+**Issue.** With `HTTP_PROXY` set, a client sends plain-HTTP requests to the
+proxy in absolute form, and the proxy refuses those with 403. If the CLI
+sent its `ANTHROPIC_BASE_URL` traffic that way, every turn would fail.
+
+**Solution.** `cred_proxy::EGRESS_ENV` sets `NO_PROXY` to
+`cred-proxy.internal,agentctl.internal`, as the plan says, and every
+variable in both cases: curl, and so git, reads only the lowercase
+`http_proxy`, and tools differ on the others. Against two local capture
+servers, the npm build of Claude Code 2.1.285 (the native build wasn't
+available here) sent `POST /v1/messages?beta=true` straight to the base URL
+when `NO_PROXY` named its host, and `POST http://localhost:…/v1/messages`
+to the proxy when it didn't. T23's live check should confirm it on the
+native build in the sandbox image.
+
+### Tunnels leave agentd's drain
+
+**Issue.** hyper hands an upgraded connection to the handler and stops
+tracking it, so a tunnel isn't part of agentd's graceful shutdown or its
+drain timeout, and nothing else would end one that stays open.
+
+**Solution.** A tunnel ends when either side closes, after
+`TUNNEL_IDLE_TIMEOUT` (5 minutes) with no byte in either direction, or
+when the `EgressProxy` is dropped, which happens once the listener and its
+connections are gone. Tunnel tasks hold only a `watch` receiver, not the
+proxy. Revoking a session's placeholder doesn't cut its tunnels, as it
+doesn't cut a forwarded request in T18: the container is going away, and a
+new one at the same address can't take over a TCP connection.
+
+### What the allowlist doesn't stop
+
+**Issue.** A byte tunnel can't see what goes through it.
+
+**Solution.** Recorded, not solved: a tunnel to an allowed host that shares
+a CDN front with other sites can reach them by SNI or `Host` inside TLS
+(domain fronting), so an allowlist entry is only as narrow as its host's
+front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
+sandbox pick any public address; and egress is gated on a live placeholder
+at the source address, not on a running turn, so a process left from an
+earlier turn can use the allowlist between turns (the plan's deferred
+"Killing leftover processes" entry covers that). Tunnels aren't capped per
+session.
+
+### Testing without the network
+
+**Issue.** Every address a real test server has is loopback, which the
+policy never reaches, and tests don't touch the network. The log test
+also missed events under a scoped subscriber.
+
+**Solution.** `EgressProxy::with_network` takes a `Network` that resolves
+and connects; the tests' fake answers with public-looking addresses and
+connects them to local echo servers, and records what was resolved and
+dialed. The log test installs a global subscriber for its test binary and
+filters by its own source addresses: with `tracing::subscriber::set_default`,
+callsites first hit by other tests' threads, which have no subscriber,
+kept their "never" interest and dropped the test's events.
+
+The Docker test serves the proxy on an internal network's gateway address,
+which the host holds on the bridge, maps `cred-proxy.internal` to it with
+`extra_hosts`, and runs `alpine/git:2.54.0` with `EGRESS_ENV`: cloning
+`github.com/octocat/Hello-World` works, a GitLab clone gets
+`403 from proxy after CONNECT`, and a clone without the proxy fails. It
+needs a route to github.com, which the CI runner has. Here, outbound TLS is
+intercepted by the environment's proxy, so it passed only with that proxy's
+CA mounted into the container for the run.

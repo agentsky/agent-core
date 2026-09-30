@@ -19,6 +19,7 @@ use core_types::{CredentialKind, CredentialRef, SessionId};
 use reqwest::Url;
 use secrecy::{ExposeSecret as _, SecretString};
 
+use crate::egress::EgressProxy;
 use crate::hooks::{CommunityKey, CommunityKeyError, Observation, ProxyObserver, usage_headers};
 use crate::registry::{Denial, Grant, Registry};
 
@@ -33,7 +34,7 @@ const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 
 /// The methods the proxy forwards. Every other one is refused before any
 /// credential is looked up: `TRACE` would echo the real credential back,
-/// `CONNECT` would open a tunnel, and an extension method has no known
+/// `CONNECT` is the egress proxy's, and an extension method has no known
 /// meaning to the upstream.
 const FORWARDED_METHODS: [Method; 7] = [
     Method::GET,
@@ -86,9 +87,10 @@ pub enum ProxyError {
 /// 2. Answers `HEAD /api/hello`, the CLI's connectivity check, with 200
 ///    itself.
 /// 3. Refuses every method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
-///    `DELETE` and `OPTIONS`, so `TRACE` can't echo the real credential and
-///    `CONNECT` can't open a tunnel, and refuses absolute-form requests, so
-///    nothing the client sends can name another host. The `Host` header is
+///    `DELETE` and `OPTIONS`, so `TRACE` can't echo the real credential,
+///    and refuses absolute-form requests, so nothing the client sends can
+///    name another host. `CONNECT` goes to the [`EgressProxy`] given to
+///    [`with_egress`](Self::with_egress), and is refused without one. The `Host` header is
 ///    dropped; the upstream's own is sent.
 /// 4. Takes the placeholder from `Authorization: Bearer` or `x-api-key`,
 ///    exactly one of them, and refuses it unless it is live, bound to that
@@ -110,6 +112,7 @@ pub struct CredProxy {
     tokens: Arc<dyn TokenSource>,
     community: Arc<dyn CommunityKey>,
     observer: Option<Arc<dyn ProxyObserver>>,
+    egress: Option<EgressProxy>,
 }
 
 impl fmt::Debug for CredProxy {
@@ -117,6 +120,7 @@ impl fmt::Debug for CredProxy {
         f.debug_struct("CredProxy")
             .field("upstream", &self.upstream.base.as_str())
             .field("registry", &self.registry)
+            .field("egress", &self.egress)
             .finish_non_exhaustive()
     }
 }
@@ -153,12 +157,20 @@ impl CredProxy {
             tokens,
             community,
             observer: None,
+            egress: None,
         })
     }
 
     /// Tells `observer` about every forwarded request.
     pub fn with_observer(mut self, observer: Arc<dyn ProxyObserver>) -> Self {
         self.observer = Some(observer);
+        self
+    }
+
+    /// Serves `CONNECT` with `egress`, on the same listener. Without it,
+    /// `CONNECT` is refused like any other method outside the allowlist.
+    pub fn with_egress(mut self, egress: EgressProxy) -> Self {
+        self.egress = Some(egress);
         self
     }
 
@@ -173,7 +185,7 @@ impl CredProxy {
 
     async fn forward(&self, peer: IpAddr, request: Request) -> Result<Response, Rejected> {
         let refuse = |refusal, session| Rejected { refusal, session };
-        if !self.registry.knows(peer) {
+        if self.registry.session_at(peer).is_none() {
             return Err(refuse(Refusal::UnknownSource, None));
         }
         if !FORWARDED_METHODS.contains(request.method()) {
@@ -302,6 +314,11 @@ async fn handle(State(proxy): State<Arc<CredProxy>>, request: Request) -> Respon
         return Refusal::NoPeer.into_response();
     };
     let peer = peer.ip().to_canonical();
+    if request.method() == Method::CONNECT
+        && let Some(egress) = &proxy.egress
+    {
+        return egress.connect(&proxy.registry, peer, request).await;
+    }
     match proxy.forward(peer, request).await {
         Ok(response) => response,
         Err(Rejected { refusal, session }) => {
