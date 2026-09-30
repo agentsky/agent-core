@@ -4402,6 +4402,25 @@ nearly every normal stop.
 follower takes a dead container's death as already handled, and a stop that
 fails leaves the container marked dead, as before.
 
+### The death-log test missed its own events
+
+**Issue.** `a_normal_stop_is_not_logged_as_a_death` failed once in CI with
+no "stopped a session container" line and nothing captured at all. It
+captured logs with `tracing::subscriber::set_default`. With that one scoped
+subscriber the only dispatcher registered, `tracing-core` works out a
+callsite's interest, the first time the callsite is hit, from the dispatcher
+of the thread that hits it. Another test of the binary, on its own thread
+with no subscriber, that stopped a container first after this test had set
+its subscriber registered the callsite with "never", for every thread, and
+the test's own event was dropped. The same could turn off "a session
+container died" and make the test pass whatever the pool logged. The pool
+was right: the test failed only when another test's thread hit the
+callsite first.
+
+**Solution.** Every harness installs one global subscriber for the test
+binary, once, before any test reaches the pool, and the test reads only the
+lines naming its own session, as the egress log test does.
+
 ### A refused `--resume` is known only on a resumed process
 
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by

@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use core_types::{
@@ -277,6 +277,7 @@ struct Harness {
     manager: SessionManager<Hooks>,
     agent: AgentId,
     faults: Arc<Faults>,
+    logs: &'static Captured,
 }
 
 impl Harness {
@@ -288,6 +289,7 @@ impl Harness {
         turns: &[Turn],
         change: impl FnOnce(&mut ProcessConfig, &mut PoolConfig),
     ) -> Self {
+        let logs = Captured::global();
         let bin = testkit::fake_claude_path();
         let dir = TempDir::new();
         let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
@@ -352,6 +354,7 @@ impl Harness {
             manager,
             agent,
             faults,
+            logs,
         }
     }
 
@@ -465,8 +468,28 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
 struct Captured(Arc<Mutex<Vec<u8>>>);
 
 impl Captured {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner)).into_owned()
+    fn global() -> &'static Self {
+        static LOGS: OnceLock<Captured> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let captured = Self::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .with_writer(captured.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            captured
+        })
+    }
+
+    fn about(&self, session: SessionId) -> String {
+        let text = String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+            .into_owned();
+        let session = format!("session={session}");
+        text.lines()
+            .filter(|line| line.contains(&session))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -1326,13 +1349,6 @@ async fn a_refused_resume_is_caught_on_the_first_turn_sent_to_a_resumed_process(
 
 #[tokio::test]
 async fn a_normal_stop_is_not_logged_as_a_death() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .with_writer(captured.clone())
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
     let h = Harness::new(&[Turn::reply("one")]).await;
     let session = h.thread_session("1.1").await;
     reply(&h.run(session.id, request("1")).await);
@@ -1340,7 +1356,7 @@ async fn a_normal_stop_is_not_logged_as_a_death() {
     h.manager.stop(session.id).await;
     assert!(!h.manager.is_warm(session.id));
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let logs = captured.text();
+    let logs = h.logs.about(session.id);
     assert!(logs.contains("stopped a session container"), "{logs}");
     assert!(!logs.contains("a session container died"), "{logs}");
     let stops = h
