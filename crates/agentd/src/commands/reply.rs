@@ -187,7 +187,7 @@ impl Replies {
         text: &str,
     ) -> Result<(), ReplyError> {
         match origin {
-            Origin::SlackSlash { response_url } => self.respond(response_url, text).await,
+            Origin::SlackSlash { response_url, .. } => self.respond(response_url, text).await,
             Origin::SlackDm { channel: room } | Origin::RocketChatDm { room } => {
                 Ok(self.bot_for(member)?.post(room, text).await?)
             }

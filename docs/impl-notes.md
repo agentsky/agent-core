@@ -5055,3 +5055,95 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
+
+## T24: Session commands
+
+### Which sessions the commands act on
+
+**Issue.** The plan lists "active and recent sessions" without saying which
+rows those are. A reset marks the row reset and inserts its replacement at
+once (T21), so every thread an agent ever answered keeps a live row, and a
+thread reset once has a fresh row that never had a turn. Listing every live
+row would show each thread ever answered, and resetting them would reset
+rows that have no transcript, making yet another row each.
+
+**Solution.** Both commands act on the live sessions in use: not reset, and
+with a turn finished (`last_turn_at`), a turn gone to the CLI (`started` or
+`maybe_started`), or a warm container. `Store::live_sessions` returns the
+agent's live rows, most recently active first (the end of the last turn, or
+the creation), and agentd filters them. `sessions` shows at most 20
+(`commands::MAX_LISTED`) and says how many there are. A private task's
+session is listed and reset by `reset <name>`, but not by `here`, since it
+isn't the conversation's own session. A reset session is gone from the
+list; its replacement shows up again once it has a turn.
+
+### `here` is the conversation, not the thread
+
+**Issue.** A channel has one session per thread, so "the current
+conversation's session" is one session only in a DM. A Slack slash command
+names its channel but no thread (Slack doesn't offer slash commands in
+threads), while an `!agent` message on Rocket.Chat may be sent in one.
+
+**Solution.** `here` resets the agent's sessions of the conversation the
+command was sent in: a DM's one session, or every thread of a channel, the
+same on both surfaces. `Origin::SlackSlash` now carries the slash command's
+conversation, and `Origin::conversation` gives it, or for `!agent` the room,
+on the sender's team. In the manager bot's DM there is no conversation to
+reset, so `here` is refused there with how to send it. A DM with the agent's
+bot is a room like any other (T13), so `!agent reset <name> here` there
+resets the owner's DM session, and in a room only the agent's bot is in the
+agent's connection hears it, as T14 made every connection feed the intake.
+
+### Thread links
+
+**Issue.** "A thread link where the surface can build one" needs a URL for
+each surface, and `Surface` has no way to make one.
+
+**Solution.** Two pure functions, used for the sessions of the surface and
+team agentd serves:
+
+- Slack: `surface_slack::surface::thread_link`, the web client's
+  `https://app.slack.com/client/<team>/<channel>`, then
+  `/thread/<channel>-<ts>`, which names the workspace by id and needs no
+  Web API call (`chat.getPermalink` would, per message).
+- Rocket.Chat: `RestClient::room_link`, the web client's routes
+  `<base>/channel/<name>`, `<base>/group/<name>` or `<base>/direct/<room
+  id>`, then `/thread/<root>`. A DM's route takes its id, so the owner's DM
+  and group DMs need no call; a channel's type and name come from the
+  manager's `rooms.info`, once per room and command, which a private group
+  the manager isn't in refuses, and then the line has no link.
+
+Another member's DM with the agent has no link, since the owner can't open
+it. Neither form was checked against a live client.
+
+### The commands reach the runner through a weak handle
+
+**Issue.** `Commands` is built with `App`, before `serve` connects to Docker
+and starts the runner (`pipeline::Turns`), and many tests start agentd with
+no runner at all. A strong handle in `App` would also keep the runner's idle
+reaper and event follower running after the pipeline is dropped at
+shutdown, past the store's close.
+
+**Solution.** `commands::SessionControl` is what the commands need
+(`reset`, `is_warm`), implemented for `SessionManager`. `Turns::start`
+hands its sessions to `app.commands()` as a `Weak`, so every path that
+starts a runner for an app wires it, and dropping the runner ends it.
+Without one (no `[sandbox]`, or after shutdown) `reset` marks the session
+reset in the store alone, and nothing is warm. `is_warm` knows this
+instance's containers only. A warm process on another instance keeps its
+old session until its next turn there finds the session reset (T21's
+`RunnerError::SessionReset`), which moves the turn to the replacement, and
+the idle reaper stops the old container.
+
+### A reset waits for the session's turns
+
+**Issue.** `SessionManager::reset` runs after the turns queued before it,
+which can take up to the turn timeout each.
+
+**Solution.** The reply comes once every reset has ended, and a member's
+later commands wait for it, as T13's intake orders them. Up to 8 sessions
+reset at once, so one busy thread doesn't hold up the others and a large
+reset doesn't flood the store's writer. A session whose container can't be
+stopped isn't reset (T21), and the reply says how many couldn't be, to be
+tried again. At shutdown the intake's drain ends a reset still waiting for
+a turn, and it leaves the queue without resetting.

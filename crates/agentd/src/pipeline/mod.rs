@@ -34,6 +34,7 @@ use sandbox::{DockerSandbox, Sandbox};
 use secrecy::SecretString;
 
 use crate::app::App;
+use crate::commands::SessionControl;
 use crate::config::Config;
 
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
@@ -99,7 +100,8 @@ pub struct Turns {
 
 impl Turns {
     /// Starts the runner over `sandbox`, with hooks over `app`'s registry
-    /// and agentctl API.
+    /// and agentctl API, and hands its sessions to `app`'s commands, for
+    /// `sessions` and `reset`, for as long as the runner runs.
     ///
     /// It spawns the idle reaper and the event follower, so it must be
     /// called inside a Tokio runtime.
@@ -130,9 +132,10 @@ impl Turns {
             },
         )
         .context("starting the runner")?;
-        Ok(Self {
-            sessions: Arc::new(sessions),
-        })
+        let sessions = Arc::new(sessions);
+        let control: Arc<dyn SessionControl> = sessions.clone();
+        app.commands().use_sessions(Arc::downgrade(&control));
+        Ok(Self { sessions })
     }
 
     /// The sessions.

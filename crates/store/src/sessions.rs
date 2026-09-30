@@ -313,6 +313,27 @@ impl Store {
         row.map(Row::into_session).transpose()
     }
 
+    /// Every live session of `agent`, normal and private, most recently
+    /// active first: by the end of its last turn, or its creation if it
+    /// has had none.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if a row doesn't parse.
+    pub async fn live_sessions(&self, agent: AgentId) -> Result<Vec<Session>> {
+        let rows: Vec<Row> = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM sessions WHERE agent_id = ? AND reset_at IS NULL \
+             ORDER BY COALESCE(last_turn_at, created_at) DESC, created_at DESC, id"
+        ))
+        .bind(agent.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Row::into_session).collect()
+    }
+
     /// Resets session `id`: marks it reset and, for a normal session,
     /// inserts its replacement for the same thread and scope, unstarted and
     /// with a new v4 id, in the same transaction. Returns the replacement;
@@ -727,6 +748,66 @@ mod tests {
         );
         store.reset_session(session.id, at(5)).await.unwrap();
         assert!(!store.mark_session_turn_pending(session.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn live_sessions_are_the_agents_unreset_ones_most_recent_first() {
+        let store = memory_store().await;
+        let agent = AgentId::new_v4();
+        let old = store
+            .session_for_thread(agent, &thread("1.1"), &channel(), at(1))
+            .await
+            .unwrap()
+            .session;
+        store
+            .record_session_turn(old.id, true, at(5))
+            .await
+            .unwrap();
+        let dm = store
+            .session_for_thread(agent, &dm(), &ScopeKey::Private, at(2))
+            .await
+            .unwrap()
+            .session;
+        store.record_session_turn(dm.id, true, at(9)).await.unwrap();
+        let fresh = store
+            .session_for_thread(agent, &thread("2.2"), &channel(), at(7))
+            .await
+            .unwrap()
+            .session;
+        let task = store
+            .create_private_session(agent, ConsentId::new_v4(), &thread("1.1"), at(3))
+            .await
+            .unwrap();
+        let reset = store
+            .session_for_thread(agent, &thread("3.3"), &channel(), at(4))
+            .await
+            .unwrap()
+            .session;
+        store
+            .record_session_turn(reset.id, true, at(10))
+            .await
+            .unwrap();
+        let replacement = store.reset_session(reset.id, at(6)).await.unwrap().unwrap();
+        store
+            .session_for_thread(AgentId::new_v4(), &thread("1.1"), &channel(), at(8))
+            .await
+            .unwrap();
+
+        let live: Vec<SessionId> = store
+            .live_sessions(agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(live, [dm.id, fresh.id, replacement.id, old.id, task.id]);
+        assert!(
+            store
+                .live_sessions(AgentId::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

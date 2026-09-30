@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agentd::commands::Origin;
 use agentd::ctl::SurfaceLookup;
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
@@ -51,6 +52,7 @@ impl SurfaceLookup for Mocks {
 struct Stack {
     app: App,
     pipeline: Pipeline,
+    turns: Turns,
     mock: Arc<MockSurface>,
     script: PathBuf,
     agent: AgentId,
@@ -224,7 +226,7 @@ async fn start_with(setup: Setup) -> Stack {
     (setup.pipeline)(&mut pipeline_settings);
     let pipeline = Pipeline::new(
         store.clone(),
-        turns,
+        turns.clone(),
         Arc::clone(app.surfaces()),
         app.commands().replies().clone(),
         pipeline_settings,
@@ -240,6 +242,7 @@ async fn start_with(setup: Setup) -> Stack {
     Stack {
         app,
         pipeline,
+        turns,
         mock,
         script,
         agent: agent.id,
@@ -1172,5 +1175,107 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
             == 2
     })
     .await;
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn reset_here_stops_the_warm_process_and_the_next_turn_starts_a_new_id() {
+    let stack = start().await;
+    let argv = stack.script.with_file_name("argv");
+    let record = format!(
+        "tr '\\0' ' ' < /proc/$PPID/cmdline >> {0}; echo >> {0}",
+        argv.display()
+    );
+    stack.next_turn(Turn::reply("First.").with_command(["sh", "-c", record.as_str()]));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "u1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1);
+    let old = stack.session_of(&sent[0].2).await;
+    assert!(stack.turns.sessions().is_warm(old));
+    let launched = std::fs::read_to_string(&argv).unwrap();
+    assert!(
+        launched.contains(&format!("--session-id {old}")),
+        "{launched}"
+    );
+
+    let elsewhere = Origin::RocketChatChannel {
+        room: "RANDOM".into(),
+    };
+    let commands = stack.app.commands();
+    commands
+        .handle_text(
+            &key("bob"),
+            "reset helper here",
+            &Origin::RocketChatChannel {
+                room: "GENERAL".into(),
+            },
+            &[],
+        )
+        .await;
+    commands
+        .handle_text(&key("alice"), "reset helper here", &elsewhere, &[])
+        .await;
+    assert!(
+        stack.turns.sessions().is_warm(old),
+        "neither reset reached the thread"
+    );
+    assert_eq!(
+        stack.store().session(old).await.unwrap().unwrap().reset_at,
+        None
+    );
+
+    let here = Origin::RocketChatChannel {
+        room: "GENERAL".into(),
+    };
+    commands
+        .handle_text(&key("alice"), "reset helper here", &here, &[])
+        .await;
+    assert!(
+        !stack.turns.sessions().is_warm(old),
+        "the reset stopped the warm process"
+    );
+    assert!(
+        stack
+            .store()
+            .session(old)
+            .await
+            .unwrap()
+            .unwrap()
+            .reset_at
+            .is_some()
+    );
+
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "u2",
+            Some("u1"),
+            &[BOT],
+        ))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].1, "First.",
+        "the new session's transcript starts over"
+    );
+    let new = stack.session_of(&sent[0].2).await;
+    assert_ne!(new, old);
+    let row = stack.store().session(new).await.unwrap().unwrap();
+    assert_eq!(row.thread.root, Some("u1".into()), "the same thread");
+    let launched = std::fs::read_to_string(&argv).unwrap();
+    let last = launched.lines().last().unwrap();
+    assert!(last.contains(&format!("--session-id {new}")), "{launched}");
+    assert!(!last.contains("--resume"), "{launched}");
+    assert_eq!(
+        launched.lines().count(),
+        2,
+        "one process per session: {launched}"
+    );
     stack.stop().await;
 }

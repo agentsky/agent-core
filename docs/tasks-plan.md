@@ -1151,7 +1151,8 @@ Design: [Account linking](design.md#account-linking),
 Deliverables:
 
 - `crates/agentd/src/commands/`: a dispatcher from `(MemberKey, Command,
-  Origin)` to a handler. `Origin` is `SlackSlash { response_url }`,
+  Origin)` to a handler. `Origin` is `SlackSlash { response_url, conv }`
+  (T24 added the conversation, for `reset <name> here`),
   `RocketChatDm { room }` or `RocketChatChannel { room }`. The DM's room
   saves a `users.info` and `im.create` per reply
   ([impl-notes](impl-notes.md#a-dm-to-a-member-needs-their-username)).
@@ -2183,14 +2184,29 @@ Deliverables:
 
 - `/agent sessions <name>`: the owner's view of active and recent sessions,
   with scope, thread link where the surface can build one, last turn time and
-  whether a container is warm.
+  whether a container is warm. The sessions shown are the live ones in use:
+  not reset, and with a turn finished, one going to the CLI, or a warm
+  container, most recently active first, at most 20
+  ([impl-notes](impl-notes.md#which-sessions-the-commands-act-on)). Slack
+  links go to `app.slack.com/client/<team>/<channel>`; Rocket.Chat links
+  need the room's type, and a channel's name from the manager's
+  `rooms.info`, so a private group the manager can't read has none
+  ([impl-notes](impl-notes.md#thread-links)).
 - `/agent reset <name> [here]`: without `here`, reset every session of the
-  agent. With `here`, reset only the current conversation's session. This is
-  valid only as `!agent` in a channel on Rocket.Chat or a slash command in that
-  channel on Slack.
+  agent. With `here`, reset only the current conversation's sessions: a
+  DM's one session, or every thread of a channel, since a Slack slash
+  command names no thread
+  ([impl-notes](impl-notes.md#here-is-the-conversation-not-the-thread)). This is
+  valid only as `!agent` in a room on Rocket.Chat, the agent's own room
+  without the manager bot or a DM with the agent's bot included, or a slash
+  command in that conversation on Slack; from the manager's DM it is refused
+  with how to send it.
 - Reset stops a warm process first. `SessionManager::reset` (T21) does,
   after the turns queued before it, and `SessionManager::is_warm` answers
-  whether a container is warm.
+  whether a container is warm. They reach the commands through
+  `commands::SessionControl`, which `pipeline::Turns::start` hands to the
+  app's commands, held weakly. Without a runner a reset marks the session
+  in the store only.
 
 Acceptance: tests for both commands, owner-only enforcement, and that the next
 turn after reset uses `--session-id` with a new id.

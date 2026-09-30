@@ -1,5 +1,6 @@
-//! `/agent` command dispatch, the account commands, and the agent commands
-//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`).
+//! `/agent` command dispatch, the account commands, the agent commands
+//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), and the
+//! session commands (`sessions`, `reset`).
 //!
 //! Every surface turns a command into `(MemberKey, text, Origin, files)` and hands
 //! it to [`Commands::handle_text`], which parses it with
@@ -18,6 +19,8 @@
 //! - [`relink`]: the notice a member gets, once, when their Claude link
 //!   breaks.
 //! - [`reply`]: private replies through each surface's manager bot.
+//! - `sessions`: `sessions` and `reset`, which reach the runner through a
+//!   [`SessionControl`].
 //!
 //! # Secrets
 //!
@@ -35,6 +38,7 @@ pub mod intake;
 pub mod relink;
 pub mod reply;
 pub mod rocketchat;
+mod sessions;
 pub mod slack;
 pub mod slack_tokens;
 
@@ -44,11 +48,11 @@ mod slack_tests;
 mod tests;
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
-use core_types::{ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
+use core_types::{ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
 use store::{Store, StoreError};
 use time::OffsetDateTime;
@@ -58,6 +62,7 @@ use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
 pub use reply::{ManagerBot, OpenDm, Replies, ReplyError};
+pub use sessions::{MAX_LISTED, SessionControl};
 
 /// Where a command came from. It decides where the reply goes and whether
 /// the command may carry a secret.
@@ -68,6 +73,8 @@ pub enum Origin {
         /// Where Slack takes the ephemeral reply. Anyone holding it can post
         /// there for a while, so it is kept secret.
         response_url: SecretString,
+        /// The conversation it was run in.
+        conv: ConvRef,
     },
     /// A direct message with the Slack manager app, in `channel`.
     SlackDm {
@@ -90,7 +97,10 @@ pub enum Origin {
 impl fmt::Debug for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SlackSlash { .. } => f.write_str("SlackSlash"),
+            Self::SlackSlash { conv, .. } => f
+                .debug_struct("SlackSlash")
+                .field("conv", conv)
+                .finish_non_exhaustive(),
             Self::SlackDm { channel } => {
                 f.debug_struct("SlackDm").field("channel", channel).finish()
             }
@@ -109,6 +119,22 @@ impl Origin {
     /// Whether only the member (and the manager bot) can read what they sent.
     pub fn is_private(&self) -> bool {
         !matches!(self, Self::RocketChatChannel { .. })
+    }
+
+    /// The conversation the command was sent in, where `reset <name>
+    /// here` acts, for `member`'s command: the room of an `!agent` message
+    /// or the conversation of a slash command. `None` in a direct message
+    /// with the manager bot, where no agent answers.
+    pub fn conversation(&self, member: &MemberKey) -> Option<ConvRef> {
+        match self {
+            Self::SlackSlash { conv, .. } => Some(conv.clone()),
+            Self::RocketChatChannel { room } => Some(ConvRef {
+                surface: member.surface,
+                team: member.team.clone(),
+                conversation: room.clone(),
+            }),
+            Self::SlackDm { .. } | Self::RocketChatDm { .. } => None,
+        }
     }
 
     /// A short name for logs.
@@ -161,6 +187,7 @@ struct Inner {
     replies: Replies,
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
+    sessions: Mutex<Option<Weak<dyn SessionControl>>>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -197,6 +224,7 @@ impl Commands {
                 replies,
                 rocketchat,
                 slack,
+                sessions: Mutex::new(None),
             }),
         }
     }
@@ -295,6 +323,10 @@ impl Commands {
                     self.set_paused(member, name.as_str(), false, origin).await
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
+                Command::Sessions { name } => self.sessions(member, name.as_str(), origin).await,
+                Command::Reset { name, here } => {
+                    self.reset(member, name.as_str(), here, origin).await
+                }
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         };
