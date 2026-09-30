@@ -2,10 +2,42 @@
 //! for one event and one candidate agent.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use core_types::{AgentId, BindingId, InboundEvent, MemberId, MemberKey, MsgRef, Requester};
 use router::{AgentPolicy, AgentState, Attribution, ManagedBot, RouterView};
-use store::{Store, StoreError};
+use store::{MessageRef, Store, StoreError};
+use tokio::time::Instant;
+
+/// How long the attribution of a message an agent's bot sent is waited
+/// for: agentd records it just after posting, and the platform may deliver
+/// the message sooner.
+pub(crate) const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
+
+/// The first pause between two reads of an attribution; each next one is
+/// twice as long.
+const ATTRIBUTION_FIRST_PAUSE: Duration = Duration::from_millis(25);
+
+/// The row attributing `msg` to the agent agentd posted it as. When
+/// `from_agent`, the message was sent by an agent's bot, so its row is
+/// read again, with growing pauses, for up to [`ATTRIBUTION_WAIT`].
+async fn attribution(
+    store: &Store,
+    msg: &MsgRef,
+    from_agent: bool,
+) -> Result<Option<MessageRef>, StoreError> {
+    let deadline = Instant::now() + ATTRIBUTION_WAIT;
+    let mut pause = ATTRIBUTION_FIRST_PAUSE;
+    loop {
+        let posted = store.posted_message_ref(msg).await?;
+        let now = Instant::now();
+        if posted.is_some() || !from_agent || now >= deadline {
+            return Ok(posted);
+        }
+        tokio::time::sleep(pause.min(deadline - now)).await;
+        pause *= 2;
+    }
+}
 
 /// Everything [`router::route`] may ask about one event and one agent,
 /// loaded first, since the store is asynchronous and the view isn't.
@@ -13,7 +45,8 @@ use store::{Store, StoreError};
 /// It loads each lookup the [`RouterView`] rustdoc lists: the agent's owner
 /// and state, which bots the sender and every mention are (the manager
 /// bots included), whose binding received the event, the attribution of
-/// the event's message and whether its reply-to message is the agent's,
+/// the event's message (waited for when an agent's bot sent it) and whether
+/// its reply-to message is the agent's,
 /// the members of the sender and of an attributed requester, and whether
 /// the owner and those members are linked. The community key isn't
 /// configurable yet (T26), so it answers false. Until T27, `policy` answers
@@ -63,7 +96,8 @@ impl StoreView {
         if let Some(bound) = store.agent_for_binding(event.binding).await? {
             view.binding = Some((event.binding, bound.id));
         }
-        if let Some(posted) = store.posted_message_ref(&event.message).await?
+        let from_agent = matches!(view.bots.get(&event.sender), Some(ManagedBot::Agent(_)));
+        if let Some(posted) = attribution(store, &event.message, from_agent).await?
             && let Some(poster) = posted.agent
         {
             view.member(store, &posted.requester.key).await?;

@@ -39,8 +39,9 @@ use crate::config::Config;
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
 pub use message::HISTORY_LIMIT;
 pub use run::{
-    DEFAULT_WORKING_EMOJI, FAILED_TEXT, LOGIN_EXPIRED_TEXT, Pipeline, PipelineSettings,
-    TIMED_OUT_TEXT, USAGE_LIMIT_TEXT,
+    DEFAULT_MAX_PENDING, DEFAULT_QUEUE_PER_THREAD, DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT,
+    FAILED_TEXT, LOGIN_EXPIRED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TIMED_OUT_TEXT,
+    TRUNCATED_NOTE, USAGE_LIMIT_TEXT,
 };
 pub use surfaces::StoreSurfaces;
 
@@ -142,7 +143,8 @@ impl Turns {
 
 impl PipelineSettings {
     /// The settings `app` gives: its data directory, its manager bots, and
-    /// `[runner]`'s working emoji and models.
+    /// `[runner]`'s working emoji and models, with the default queue
+    /// bounds.
     pub fn from_app(app: &App) -> Self {
         let managers = app
             .rocketchat()
@@ -156,6 +158,8 @@ impl PipelineSettings {
             managers,
             working_emoji: runner.working_emoji.clone(),
             models: runner.models.clone(),
+            queue_per_thread: DEFAULT_QUEUE_PER_THREAD,
+            max_pending: DEFAULT_MAX_PENDING,
         }
     }
 }

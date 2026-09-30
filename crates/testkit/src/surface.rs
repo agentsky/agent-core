@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use core_types::surface_trait::Result;
@@ -107,7 +108,8 @@ pub struct UploadedFile {
 ///   [`SurfaceError::Unsupported`]`("threads")`.
 /// - [`fail_next`](Self::fail_next) makes the next call of an operation
 ///   fail with a given error, such as [`SurfaceError::RateLimited`] or
-///   [`SurfaceError::Unauthorized`], as the platform would.
+///   [`SurfaceError::Unauthorized`], as the platform would, and
+///   [`delay_next`](Self::delay_next) makes it slow.
 /// - `post` returns references `m1`, `m2`, … in the target conversation.
 /// - [`keep_out_of`](Self::keep_out_of) makes the bot not a member of a
 ///   conversation: [`can_post`](Surface::can_post) answers false there,
@@ -147,6 +149,7 @@ struct State {
     history: HashMap<ThreadKey, Vec<Msg>>,
     outside: HashSet<ConvRef>,
     failures: HashMap<Op, VecDeque<SurfaceError>>,
+    delays: HashMap<Op, VecDeque<Duration>>,
     queues: HashMap<BindingId, Queue>,
 }
 
@@ -247,6 +250,25 @@ impl MockSurface {
             .push_back(error);
     }
 
+    /// Makes the next call of `op` wait `delay` before it does anything,
+    /// as a slow platform would. Delays queued for one operation are used
+    /// in order, one per call.
+    pub fn delay_next(&self, op: Op, delay: Duration) {
+        self.state().delays.entry(op).or_default().push_back(delay);
+    }
+
+    /// Waits the delay queued for `op`, if there is one.
+    async fn pause(&self, op: Op) {
+        let delay = self
+            .state()
+            .delays
+            .get_mut(&op)
+            .and_then(VecDeque::pop_front);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// Queues `event` for the [`Surface::events`] loop of `event.binding`.
     ///
     /// # Panics
@@ -340,6 +362,7 @@ impl Surface for MockSurface {
     }
 
     async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
+        self.pause(Op::Post).await;
         let mut state = self.begin(Op::Post, to.thread_root.as_ref())?;
         Self::check_member(&state, &to.conv)?;
         state.posted += 1;
@@ -356,6 +379,7 @@ impl Surface for MockSurface {
     }
 
     async fn edit(&self, msg: &MsgRef, text: &str) -> Result<()> {
+        self.pause(Op::Edit).await;
         self.begin(Op::Edit, None)?.calls.push(Call::Edit {
             msg: msg.clone(),
             text: text.to_owned(),
@@ -364,6 +388,7 @@ impl Surface for MockSurface {
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) -> Result<()> {
+        self.pause(Op::React).await;
         self.begin(Op::React, None)?.calls.push(Call::React {
             msg: msg.clone(),
             emoji: emoji.to_owned(),
@@ -372,6 +397,7 @@ impl Surface for MockSurface {
     }
 
     async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<()> {
+        self.pause(Op::Unreact).await;
         self.begin(Op::Unreact, None)?.calls.push(Call::Unreact {
             msg: msg.clone(),
             emoji: emoji.to_owned(),
@@ -387,6 +413,7 @@ impl Surface for MockSurface {
     /// fails the call with [`SurfaceError::NotFound`], and nothing is
     /// recorded.
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {
+        self.pause(Op::Upload).await;
         {
             let state = self.begin(Op::Upload, to.thread_root.as_ref())?;
             Self::check_member(&state, &to.conv)?;
@@ -416,6 +443,7 @@ impl Surface for MockSurface {
         before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Msg>> {
+        self.pause(Op::History).await;
         let mut state = self.begin(Op::History, thread.root.as_ref())?;
         state.calls.push(Call::History {
             thread: thread.clone(),

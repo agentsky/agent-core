@@ -1,6 +1,6 @@
 //! [`RocketChatSurface`]: the [`Surface`] for one Rocket.Chat bot user.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -41,10 +41,6 @@ const MAX_CACHED_USERS: usize = 10_000;
 
 /// The most rooms a [`RocketChatSurface`] remembers `rooms.info` for.
 const MAX_CACHED_ROOMS: usize = 10_000;
-
-/// How long a [`RocketChatSurface`] trusts its list of the rooms its bot is
-/// in. A room missing from the list is always looked for again.
-const JOINED_TTL: Duration = Duration::from_secs(60);
 
 /// A map whose entries expire after `ttl` and which holds at most `cap` of
 /// them: making room drops the expired entries, then the oldest.
@@ -257,10 +253,12 @@ impl RocketChatConfig {
 /// - Posting, editing, reacting, uploading and reading history go through
 ///   the REST client as the bot. `chat.postMessage` joins the poster to a
 ///   public channel it isn't in, so [`post`](Surface::post) and
-///   [`upload`](Surface::upload) first check with `subscriptions.get` that
-///   the bot is in the room, and refuse with [`SurfaceError::Forbidden`]
-///   otherwise ([`can_post`](Surface::can_post)). The list is trusted for a
-///   minute; a room missing from it is looked for again at once.
+///   [`upload`](Surface::upload) first check with `subscriptions.getOne`
+///   that the bot is in the room, and refuse with
+///   [`SurfaceError::Forbidden`] otherwise
+///   ([`can_post`](Surface::can_post)). Membership is asked afresh every
+///   time: a bot removed from a room a moment ago must not post there,
+///   since the post would add it back.
 /// - [`render`](Surface::render) converts with
 ///   [`render::rocketchat::to_markdown`] and splits to the message limit.
 ///   `@Name` mentions are left as written: `Surface::render` has no
@@ -274,7 +272,6 @@ pub struct RocketChatSurface {
     dedup: Arc<dyn Dedup>,
     bots: BotRoles,
     rooms: Mutex<Cache<ConversationId, RoomInfo>>,
-    joined: Mutex<Option<(HashSet<ConversationId>, Instant)>>,
 }
 
 impl fmt::Debug for RocketChatSurface {
@@ -304,7 +301,6 @@ impl RocketChatSurface {
             dedup,
             bots,
             rooms: Mutex::new(Cache::new(Duration::MAX, MAX_CACHED_ROOMS)),
-            joined: Mutex::new(None),
         })
     }
 
@@ -336,32 +332,9 @@ impl RocketChatSurface {
         }
     }
 
-    /// Whether the bot is in `room`, from its rooms as `subscriptions.get`
-    /// listed them within [`JOINED_TTL`]. A room missing from the list is
-    /// looked for in a new listing.
+    /// Whether the bot is in `room` now, from `subscriptions.getOne`.
     async fn is_joined(&self, room: &ConversationId) -> Result<bool> {
-        let known = self
-            .joined_rooms()
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < JOINED_TTL)
-            .map(|(rooms, _)| rooms.contains(room));
-        if known == Some(true) {
-            return Ok(true);
-        }
-        let rooms: HashSet<ConversationId> = self
-            .rest
-            .subscriptions()
-            .await?
-            .into_iter()
-            .map(|subscription| subscription.room)
-            .collect();
-        let joined = rooms.contains(room);
-        *self.joined_rooms() = Some((rooms, Instant::now()));
-        Ok(joined)
-    }
-
-    fn joined_rooms(&self) -> MutexGuard<'_, Option<(HashSet<ConversationId>, Instant)>> {
-        self.joined.lock().unwrap_or_else(PoisonError::into_inner)
+        Ok(self.rest.subscription(room).await?.is_some())
     }
 
     fn cached_rooms(&self) -> MutexGuard<'_, Cache<ConversationId, RoomInfo>> {

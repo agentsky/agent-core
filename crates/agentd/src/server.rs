@@ -51,7 +51,7 @@ use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
-use crate::pipeline::{NoCommunityKey, Pipeline, Turns};
+use crate::pipeline::{NoCommunityKey, Pipeline};
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -197,7 +197,7 @@ pub struct Server {
     proxy: TcpListener,
     ctl: TcpListener,
     addrs: Addrs,
-    turns: Option<Turns>,
+    pipeline: Option<Pipeline>,
 }
 
 impl Server {
@@ -225,7 +225,7 @@ impl Server {
             proxy,
             ctl,
             addrs,
-            turns: None,
+            pipeline: None,
         })
     }
 
@@ -234,20 +234,30 @@ impl Server {
         self.addrs
     }
 
-    /// Runs turns with `turns` while serving. Without it agentd runs none.
-    pub fn with_turns(mut self, turns: Turns) -> Self {
-        self.turns = Some(turns);
+    /// Passes the connections' messages to `pipeline`, which runs turns,
+    /// while serving. Without it agentd runs none.
+    pub fn with_pipeline(mut self, pipeline: Pipeline) -> Self {
+        self.pipeline = Some(pipeline);
         self
     }
 
     /// Serves until `shutdown` completes, then shuts down gracefully:
     ///
-    /// 1. Every listener stops accepting, and idle connections are closed.
-    /// 2. In-flight requests, the workers and the sweeper get
-    ///    `server.drain_timeout_secs` to finish. Whatever is still running
-    ///    then is dropped. If `abort` completes first, as a second shutdown
-    ///    signal does, it is dropped at once instead.
-    /// 3. The store is closed.
+    /// 1. The public listener stops accepting, idle connections are closed,
+    ///    and the chat connections stop. The turn [`Pipeline`] takes no more
+    ///    messages.
+    /// 2. The turns already taken get `server.drain_timeout_secs` to finish,
+    ///    while the proxy and ctl listeners still serve them. Those still
+    ///    running then are dropped, their working emoji taken off and their
+    ///    threads told to ask again ([`Pipeline::cut_short`]).
+    /// 3. The proxy and ctl listeners stop accepting too, and in-flight
+    ///    requests, the workers and the sweeper get what is left of the
+    ///    same timeout to finish. Whatever is still running then is
+    ///    dropped.
+    /// 4. The pipeline is dropped, and the store is closed.
+    ///
+    /// If `abort` completes before the drain ends, as a second shutdown
+    /// signal does, what is still running is dropped at once instead.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
@@ -256,7 +266,7 @@ impl Server {
     /// the agents' connections. Every connection feeds the commands it hears
     /// to the intake like the Slack queue does, and passes other messages to
     /// the turn [`Pipeline`] when agentd runs turns
-    /// ([`with_turns`](Self::with_turns)), or else to [`Acknowledge`]. The
+    /// ([`with_pipeline`](Self::with_pipeline)), or else to [`Acknowledge`]. The
     /// intake finishes the commands it received once they all stop.
     ///
     /// # Errors
@@ -275,10 +285,11 @@ impl Server {
             proxy,
             ctl,
             addrs,
-            turns,
+            pipeline,
         } = self;
         let drain_timeout = app.config().server.drain_timeout();
         let (stop, stopping) = watch::channel(false);
+        let (stop_internal, internal_stopping) = watch::channel(false);
 
         let mut tasks = JoinSet::new();
         tasks.spawn(serve_listener(
@@ -291,13 +302,13 @@ impl Server {
             "proxy listener",
             proxy,
             routers.proxy,
-            stopping.clone(),
+            internal_stopping.clone(),
         ));
         tasks.spawn(serve_listener(
             "ctl listener",
             ctl,
             routers.ctl,
-            stopping.clone(),
+            internal_stopping,
         ));
         for worker in routers.workers {
             tasks.spawn(async move {
@@ -337,7 +348,6 @@ impl Server {
                 "Slack configuration token rotator"
             });
         }
-        let pipeline = turns.clone().map(|turns| Pipeline::for_app(&app, turns));
         if let Some(manager) = app.rocketchat() {
             let feed = CommandFeed::new(commands.clone(), manager.binding.clone());
             let onward = match &pipeline {
@@ -382,10 +392,11 @@ impl Server {
             public = %addrs.public,
             proxy = %addrs.proxy,
             ctl = %addrs.ctl,
-            turns = turns.is_some(),
+            turns = pipeline.is_some(),
             "listening"
         );
 
+        let mut abort = std::pin::pin!(abort);
         let mut failure = tokio::select! {
             () = shutdown => None,
             Some(joined) = tasks.join_next() => Some(stopped_early(joined)),
@@ -394,26 +405,48 @@ impl Server {
             drain_timeout_secs = drain_timeout.as_secs(),
             "shutting down: no longer accepting connections"
         );
+        let deadline = tokio::time::Instant::now() + drain_timeout;
         stop.send_replace(true);
 
-        let drain = async {
-            while let Some(joined) = tasks.join_next().await {
-                if let Err(err) = joined {
-                    failure.get_or_insert(panicked(err));
+        let mut forced = false;
+        if let Some(pipeline) = &pipeline {
+            pipeline.close();
+            let drained = tokio::select! {
+                drained = tokio::time::timeout_at(deadline, pipeline.drain()) => drained.is_ok(),
+                () = abort.as_mut() => {
+                    forced = true;
+                    false
                 }
+            };
+            if !drained {
+                tracing::warn!("turns still running at the drain's end; dropping them");
+                pipeline.cut_short().await;
             }
-        };
-        let cut_short = tokio::select! {
-            drained = tokio::time::timeout(drain_timeout, drain) => {
-                drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
+        }
+        stop_internal.send_replace(true);
+
+        let cut_short = if forced {
+            Some("shutdown forced; dropping in-flight work")
+        } else {
+            let drain = async {
+                while let Some(joined) = tasks.join_next().await {
+                    if let Err(err) = joined {
+                        failure.get_or_insert(panicked(err));
+                    }
+                }
+            };
+            tokio::select! {
+                drained = tokio::time::timeout_at(deadline, drain) => {
+                    drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
+                }
+                () = abort.as_mut() => Some("shutdown forced; dropping in-flight work"),
             }
-            () = abort => Some("shutdown forced; dropping in-flight work"),
         };
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
-        drop(turns);
+        drop(pipeline);
         app.store().close().await;
         tracing::info!("stopped");
         failure.map_or(Ok(()), Err)

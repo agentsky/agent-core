@@ -174,15 +174,54 @@ async fn a_bot_never_posts_where_posting_would_join_it() {
         .post(&target("OTHER", Some(&root)), "answer")
         .await
         .unwrap();
-    let listings = s.fake.requests("subscriptions.get").await.len();
+    assert!(
+        s.fake.requests("subscriptions.get").await.is_empty(),
+        "membership is asked room by room, never by listing every room"
+    );
+}
+
+#[tokio::test]
+async fn a_bot_removed_from_a_room_a_moment_ago_does_not_post_there() {
+    let s = setup().await;
+    let before = s.fake.requests("chat.postMessage").await.len();
     s.surface
-        .post(&target("GENERAL", None), "again")
+        .post(&target("GENERAL", None), "first")
         .await
         .unwrap();
+    assert!(s.surface.can_post(&conv("GENERAL")).await.unwrap());
+    s.fake.remove_member("GENERAL", &s.bot);
+    assert!(!s.surface.can_post(&conv("GENERAL")).await.unwrap());
+    let err = s
+        .surface
+        .post(&target("GENERAL", None), "second")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SurfaceError::Forbidden(_)), "{err:?}");
+    let file = OutFile {
+        name: "x.txt".into(),
+        path: PathBuf::from("/nonexistent"),
+    };
+    let err = s
+        .surface
+        .upload(&target("GENERAL", None), &[file])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SurfaceError::Forbidden(_)), "{err:?}");
     assert_eq!(
-        s.fake.requests("subscriptions.get").await.len(),
-        listings,
-        "a room known to be joined isn't listed again"
+        s.fake.requests("chat.postMessage").await.len(),
+        before + 1,
+        "only the post made while the bot was in the room went out"
+    );
+    assert!(
+        !s.fake.members("GENERAL").contains(&s.bot),
+        "the refused post didn't add the bot back"
+    );
+    let asked = s.fake.requests("subscriptions.getOne").await;
+    assert!(
+        asked
+            .iter()
+            .all(|request| request.url.query() == Some("roomId=GENERAL")),
+        "{asked:?}"
     );
 }
 

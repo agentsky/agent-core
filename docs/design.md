@@ -455,8 +455,9 @@ sandbox[^cc-bypass].
   fixed layout is for predictability and backups, not a resume requirement.
 - `cleanupPeriodDays` is raised from its 30-day default in each session's
   `settings.json` so idle threads keep their transcripts.
-- Each turn's user message carries only what the transcript lacks: thread
-  messages since the session's last reply that it hasn't been shown,
+- Each turn's user message carries only what the transcript lacks: the
+  thread's recent messages it hasn't been shown or posted, those said while
+  an earlier turn ran included,
   messages agentd posted as the agent in the same thread from other sessions
   (a private task's result, and its declined or expired outcomes, which
   never enter the channel session's transcript; found in `MESSAGE_REF` by

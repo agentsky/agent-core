@@ -107,9 +107,10 @@ own DM). Its bot reacts with `[runner] working_emoji` while the turn runs,
 answers only in rooms it was added to, and a member without a linked account
 gets a direct message from the manager bot saying how to link one. Without
 `[sandbox]`, each agent reacts with :eyes: to messages that mention it.
-On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
-requests `server.drain_timeout_secs` to finish; a second signal drops them at
-once. Logs go to standard error,
+On SIGTERM or SIGINT agentd stops accepting connections and messages and
+gives running turns and in-flight requests `server.drain_timeout_secs` to
+finish; a turn still running then is dropped, and its thread told to ask
+again. A second signal drops them at once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
 
 ### Slack

@@ -4816,9 +4816,13 @@ way to tell before it ran the turn.
 
 **Solution.** `Surface` gains `unreact` (Rocket.Chat's `chat.react` with
 `shouldReact: false`, Slack's `reactions.remove`) and `can_post`. On
-Rocket.Chat `can_post` looks the room up in the bot's `subscriptions.get`,
-trusted for a minute, with a room missing from it always listed again, so
-a DM the manager bot just opened is found. `post` and `upload` refuse a
+Rocket.Chat `can_post` asks `subscriptions.getOne?roomId=` (whose answer
+is `{"subscription": null}` for a room the user isn't in, per
+`@rocket.chat/rest-typings`) every time. A first version trusted a listing
+of `subscriptions.get` for a minute, and a bot removed from a room in that
+minute posted there and was added back by the post; asking room by room
+also spares the full listing, and finds a DM the manager bot just opened.
+`post` and `upload` refuse a
 room the bot isn't in with `SurfaceError::Forbidden`, which also gives
 agentctl's owner-side posts the refusal T15 left to the surface. Slack
 never joins a poster to a conversation and refuses the post itself
@@ -4853,36 +4857,56 @@ refused as `react`'s rule refuses any, and `--before` must name a message
 in the turn's conversation. A short id the session doesn't have is
 `not_found`. Anything else is read as a platform id, as before.
 
-### The turn message starts after the session's last reply
+### The turn message shows what the session has no row for
 
 **Issue.** "Thread messages since the agent's last reply" read as the
 agent's bot's last message in the history. But a private task's result is
 posted as the same bot from another session, and would then count as the
 agent's reply, hiding both the result and what came before it from the
-channel session.
+channel session. A first version started after the last message the
+session itself posted instead, and that still hid what people said while a
+turn ran: such a message comes before the turn's reply in the thread, so
+the next turn skipped it. It also recorded what it showed before the turn
+ran, so a turn that failed before reaching the model hid its own request
+from every later turn.
 
 **Solution.** The builder reads up to 50 messages of the thread before the
-event, and starts after the last one the session itself posted (a
-`message_refs` row of the session with `agent_id` set). Of the rest it
-shows those the session has no row for: a person's message, or the agent's
-own post from another session, marked as such. Each message shown is
-recorded in the session, which gives it its short id and keeps it out of
-the next turn. Posts from other sessions that the 50 messages didn't reach
-come from `Store::posted_elsewhere`, listed by short id for
-`agentctl history`, since `message_refs` keeps no text. The event's own
-message is recorded and shown last, with the requester when it isn't the
-sender (a hop). Message text is kept to one line in the context block, so
-a message can't forge its structure. A thread the event starts has no
+event and shows every one the session has no row for: a person's message,
+said before or during an earlier turn, or the agent's own post from
+outside the session, marked as such. The session's own replies and what it
+was shown have rows and are left out. Each message shown is recorded in the
+session, which gives it its short id and keeps it out of the next turn;
+the builder returns the short ids it recorded, and the pipeline deletes
+those rows (`Store::forget_message_refs`, inbound rows only) when
+`run_turn` fails, which covers every failure before the CLI read the
+message, a `SessionReset` included, so the next turn shows them again. A
+failed write the CLI still read would be shown twice, which is better than
+never. Building that fails halfway forgets what it recorded too. Posts from
+other sessions that the 50 messages didn't reach come from
+`Store::posted_elsewhere`, listed by short id for `agentctl history`, since
+`message_refs` keeps no text. The event's own message is shown last, with
+the requester when it isn't the sender (a hop). Message text is kept to one
+line in the context block, so a message can't forge its structure; the
+event's own text keeps its line breaks, since a request often holds code,
+but every line after the first is indented, so none of it starts where a
+`[#N] name:` entry or a block would. A thread the event starts has no
 history to read.
 
-### Refusal notices have no message ref
+### Notices have no message ref
 
 **Issue.** `message_refs` rows belong to a session, and a refused message
-starts none.
+starts none. A turn that failed before reaching the model has a session,
+but a row with `agent_id` set would attribute the notice to a turn that
+never ran.
 
-**Solution.** The one-line refusal is posted without a row. Nothing reads
-one: no turn is billed for it, and a reply in its thread replies to the
-thread's root, not to the notice.
+**Solution.** agentd's own notices are posted without a row: a refusal,
+a failure before the turn reached the model (a second `SessionReset`
+included), the busy line, the notice that part of a reply was lost, and
+the one a shutdown posts. Nothing reads one: no turn is billed for it, and
+a reply in its thread replies to the thread's root, not to the notice. The
+next turn shows one as the agent's post from outside the session. A turn's
+own failure message (a usage limit, a login that expired, a crash, a
+timeout) comes from a turn that ran, and is recorded as its reply.
 
 ### `SurfaceLookup` is asynchronous, and the pipeline posts through it
 
@@ -4900,18 +4924,68 @@ pass their own through `App::with_surfaces`. Slack agents' messages still
 reach no pipeline until T31 routes them, as T30's note says, but their
 replies would already go out through this lookup.
 
-### Each candidate's turn runs in a task of its own
+### Each agent answers a thread's messages in order, in the pipeline's tasks
 
 **Issue.** A turn takes minutes, and a Rocket.Chat connection hands each
-message to its onward sender and waits.
+message to its onward sender and waits. A first version spawned a task per
+message and per candidate: two messages in one thread could reach the
+session's queue in either order, and since each built its turn message
+before queueing, the later one could show the earlier as history and the
+earlier then run too, answered twice. Nothing bounded the tasks, and
+`Server::run` neither waited for them nor stopped them: a shutdown returned
+at once mid-turn, and the late reply was posted with the store already
+closed.
 
-**Solution.** The pipeline's sink spawns a task per message and returns at
-once, and each candidate agent runs in a task of its own, so neither the
-connection nor another agent waits. Two messages in one thread that arrive
-together may reach the session's queue in either order. Like the runner's
-queue, these tasks live in memory: a message whose turn hadn't finished
-when agentd stopped isn't retried, since the store already recorded it as
-handled.
+**Solution.** The sink looks the candidates up and queues the message for
+each in a lane per agent and thread, whose task answers its messages one
+at a time in arrival order, so the turn message is built only once the
+turn before it has delivered. A lane holds at most 8 waiting messages, and
+the pipeline at most 64 waiting or running; a message past either gets one
+line in its thread saying the agent is busy, posted from the sink, which
+also slows the connection down. The lanes' tasks run in a `JoinSet` of the
+pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
+panicking message doesn't stop its lane. On shutdown `Server::run` stops
+the public listener and the chat connections, closes the pipeline, and
+gives the turns taken the drain timeout while the proxy and ctl listeners,
+which a running turn's CLI and agentctl need, still serve; only then do
+those stop, and the pipeline is dropped before the store is closed. Turns
+still running at the timeout are aborted, their working emoji taken off
+and their threads told to ask again, within five seconds. That is the
+simplest option that tells people: the turns and their queue stay in
+memory rather than the store, so a crash, unlike a shutdown, still loses
+them silently, and messages still waiting in a lane at the timeout are
+dropped without a word, since no decision was made about them. The
+working emoji is held by a guard, so a panicking turn takes it off too.
+
+### An agent's post can arrive before its attribution
+
+**Issue.** agentd records a post's `message_refs` row just after
+`chat.postMessage` returns, and the platform may deliver the post to
+another agent's connection first. The router then saw a managed bot's
+message with no attribution and ignored it, dropping the hop.
+
+**Solution.** When the sender is an agent's bot and the message has no
+attribution yet, the view reads it again, with pauses doubling from 25 ms,
+for up to two seconds before routing. Only that candidate's lane waits.
+
+### Delivery goes on past a failed part
+
+**Issue.** A failed post of the reply ended the delivery: the directives'
+reactions, the outbox's reactions and the queued agentctl posts were lost,
+and so were the chunks after a failed one. The reply had no size cap,
+while `agentctl post` caps its text at `MAX_POST_BYTES`.
+
+**Solution.** Each chunk, the upload, each reaction and each queued post
+is tried whatever happened to the others; a chunk refused with a rate
+limit is posted once more after the wait the platform asks for, up to five
+seconds. If any part was lost, the thread gets one line saying so. The
+reply is cut at `MAX_POST_BYTES` on a character boundary, with a note that
+it was cut. Failures before the turn reached the model (writing the
+persona, reading the plan's model, building the turn message, starting the
+process) post the short failure notice too, once the bot is known to be
+able to post; a link prompt waits for the same check. The usage-limit and
+login texts name "the Claude account this request runs on" rather than
+"your", since a turn may run on the community key.
 
 ### A turn whose start hook failed stops the process
 

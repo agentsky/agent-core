@@ -777,6 +777,15 @@ impl RestClient {
         Ok(found.update)
     }
 
+    /// `GET subscriptions.getOne`: this client's user's subscription to
+    /// `room`, or `None` when the user isn't in it.
+    pub async fn subscription(&self, room: &ConversationId) -> Result<Option<Subscription>> {
+        let found: SubscriptionEnvelope = self
+            .call(Call::get("subscriptions.getOne").query("roomId", room.as_str()))
+            .await?;
+        Ok(found.subscription)
+    }
+
     /// `GET users.info`: a user by id.
     ///
     /// Rocket.Chat includes `roles` only for the caller itself, or when the
@@ -1417,6 +1426,12 @@ struct MessageEnvelope {
 #[derive(Deserialize)]
 struct SubscriptionsEnvelope {
     update: Vec<Subscription>,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionEnvelope {
+    #[serde(default)]
+    subscription: Option<Subscription>,
 }
 
 #[derive(Deserialize)]

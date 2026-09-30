@@ -7,22 +7,26 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentd::ctl::SurfaceLookup;
-use agentd::pipeline::{Pipeline, TurnSettings, Turns, USAGE_LIMIT_TEXT};
+use agentd::pipeline::{
+    DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
+    Turns, USAGE_LIMIT_TEXT,
+};
 use agentd::server::{Routers, Server};
 use agentd::{App, Config};
 use core_types::{
-    AgentId, BindingId, Caps, ConvKind, ConvRef, InboundEvent, MemberId, MemberKey, MessageId,
-    MsgRef, ReplyTarget, ScopeKey, SessionId, Surface, SurfaceKind, UserId, VolumeKey,
+    AgentId, BindingId, Caps, ConvKind, ConvRef, InboundEvent, MemberId, MemberKey, MessageId, Msg,
+    MsgRef, ReplyTarget, ScopeKey, SessionId, Surface, SurfaceError, SurfaceKind, ThreadKey,
+    UserId, VolumeKey,
 };
 use runner::{PoolConfig, ProcessConfig};
 use sandbox::ProcessSandbox;
 use secrecy::SecretString;
 use store::{AgentCreation, NewAgent, NewClaudeLink, Store, Visibility};
 use testkit::{
-    Call, FakeAnthropic, MockSurface, Turn, agentctl_path, fake_anthropic, fake_claude_path,
+    Call, FakeAnthropic, MockSurface, Op, Turn, agentctl_path, fake_anthropic, fake_claude_path,
 };
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
@@ -101,17 +105,45 @@ async fn link(store: &Store, user: &str) -> MemberId {
     member
 }
 
+/// How [`start_with`] differs from the defaults.
+struct Setup {
+    drain_timeout_secs: u64,
+    pipeline: fn(&mut PipelineSettings),
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            drain_timeout_secs: 5,
+            pipeline: |_| {},
+        }
+    }
+}
+
 /// agentd with its listeners and a runner over a process sandbox running
 /// `fake-claude`, alice and bob linked, and alice's agent `helper`, whose
-/// bot is `UBOT`.
+/// bot is `UBOT`. The store is a file in the stack's directory.
 async fn start() -> Stack {
+    start_with(Setup::default()).await
+}
+
+async fn start_with(setup: Setup) -> Stack {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
     let dir = TempDir::new();
     let fake = fake_anthropic().await;
     let text = format!(
         "{}\n[proxy]\nupstream = \"{}\"\n[runner]\nworking_emoji = \"hourglass\"\n",
-        common::CONFIG.replace("/nonexistent/agentd", &dir.path().display().to_string()),
+        common::CONFIG
+            .replace("/nonexistent/agentd", &dir.path().display().to_string())
+            .replace(
+                "sqlite::memory:",
+                &format!("sqlite://{}", dir.path().join("agentd.db").display())
+            )
+            .replace(
+                "drain_timeout_secs = 5",
+                &format!("drain_timeout_secs = {}", setup.drain_timeout_secs)
+            ),
         fake.uri()
     );
     let config = Config::parse(&text, env()).unwrap();
@@ -188,8 +220,16 @@ async fn start() -> Stack {
     };
     let sandbox = ProcessSandbox::new(store.clone(), dir.path()).unwrap();
     let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
-    let pipeline = Pipeline::for_app(&app, turns.clone());
-    let server = server.with_turns(turns);
+    let mut pipeline_settings = PipelineSettings::from_app(&app);
+    (setup.pipeline)(&mut pipeline_settings);
+    let pipeline = Pipeline::new(
+        store.clone(),
+        turns,
+        Arc::clone(app.surfaces()),
+        app.commands().replies().clone(),
+        pipeline_settings,
+    );
+    let server = server.with_pipeline(pipeline.clone());
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
         async {
@@ -667,34 +707,470 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
         .unwrap();
     let bob = store.member_for_identity(&key("bob")).await.unwrap();
     let by_writer = msg("GENERAL", "w1");
-    store
-        .record_message_ref(
-            &store::NewMessageRef {
-                session: SessionId::new_v4(),
-                msg: &by_writer,
-                thread_root: None,
-                agent: Some(writer.id),
-                turn: None,
-                requester: &core_types::Requester {
-                    member: bob,
-                    key: key("bob"),
+    let recording = store.clone();
+    let recorded = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        recording
+            .record_message_ref(
+                &store::NewMessageRef {
+                    session: SessionId::new_v4(),
+                    msg: &by_writer,
+                    thread_root: None,
+                    agent: Some(writer.id),
+                    turn: None,
+                    requester: &core_types::Requester {
+                        member: bob,
+                        key: key("bob"),
+                    },
+                    hop: core_types::Hop(1),
                 },
-                hop: core_types::Hop(1),
-            },
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap();
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    });
     let before = stack.mock.calls().len();
     stack.next_turn(Turn::reply("Picking this up."));
     let mut hop = stack.event("UWRITER", "GENERAL", ConvKind::Channel, "w1", None, &[BOT]);
     hop.sender_is_bot = true;
     hop.sender_bot_user = Some(UserId::new("UWRITER"));
     stack.handle(hop).await;
+    recorded.await.unwrap();
     let sent = posts(&stack.calls_since(before));
-    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent.len(),
+        1,
+        "the writer's post is attributed a moment after it arrives, and still starts a turn"
+    );
     let attributed = store.posted_message_ref(&sent[0].2).await.unwrap().unwrap();
     assert_eq!(attributed.requester.key, key("bob"), "the hop is bob's");
     assert_eq!(attributed.hop.0, 2);
+    stack.stop().await;
+}
+
+/// Waits up to 30 seconds for `done`.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn said(id: &str, sender: &str, text: &str) -> Msg {
+    Msg {
+        id: id.into(),
+        sender: key(sender),
+        sender_is_bot: sender == BOT,
+        text: text.into(),
+        files: vec![],
+        sent_at: OffsetDateTime::now_utc(),
+    }
+}
+
+fn thread(conv_id: &str, root: &str) -> ThreadKey {
+    ThreadKey {
+        conv: conv(conv_id),
+        root: Some(root.into()),
+    }
+}
+
+fn working_on(id: &str) -> Call {
+    Call::React {
+        msg: msg("GENERAL", id),
+        emoji: "hourglass".into(),
+    }
+}
+
+impl Stack {
+    /// Answers `id`, a mention of the agent starting a thread in GENERAL,
+    /// with `reply`, and returns the reply's message.
+    async fn answered_root(&self, id: &str, reply: &str) -> MsgRef {
+        let before = self.mock.calls().len();
+        self.next_turn(Turn::reply(reply));
+        self.handle(self.event("alice", "GENERAL", ConvKind::Channel, id, None, &[BOT]))
+            .await;
+        let sent = posts(&self.calls_since(before));
+        assert_eq!(sent.len(), 1);
+        sent[0].2.clone()
+    }
+
+    async fn upstream_bodies_since(&self, from: usize) -> Vec<String> {
+        self.fake
+            .message_requests()
+            .await
+            .split_off(from)
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
+    let stack = start_with(Setup {
+        drain_timeout_secs: 30,
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Finished anyway.").with_delay(Duration::from_millis(1500)));
+    let event = stack.event("alice", "GENERAL", ConvKind::Channel, "s1", None, &[BOT]);
+    stack
+        .pipeline
+        .sink(MockSurface::DEFAULT_CAPS)
+        .send(event)
+        .await
+        .unwrap();
+    wait_until("the turn runs", || {
+        stack.mock.calls().contains(&working_on("s1"))
+    })
+    .await;
+    let Stack {
+        app,
+        pipeline,
+        mock,
+        agent,
+        stop,
+        task,
+        _dir: dir,
+        ..
+    } = stack;
+    drop(pipeline);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    let sent = posts(&mock.calls());
+    assert_eq!(sent.len(), 1, "{:#?}", mock.calls());
+    assert_eq!(sent[0].1, "Finished anyway.");
+    let store = agentd::app::open_store(app.config()).await.unwrap();
+    let attributed = store
+        .posted_message_ref(&sent[0].2)
+        .await
+        .unwrap()
+        .expect("the reply was recorded before the store closed");
+    assert_eq!(attributed.agent, Some(agent));
+    drop(dir);
+}
+
+#[tokio::test]
+async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
+    let stack = start_with(Setup {
+        drain_timeout_secs: 1,
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Too late.").with_delay(Duration::from_secs(20)));
+    let event = stack.event("alice", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]);
+    stack
+        .pipeline
+        .sink(MockSurface::DEFAULT_CAPS)
+        .send(event)
+        .await
+        .unwrap();
+    wait_until("the turn runs", || {
+        stack.mock.calls().contains(&working_on("c1"))
+    })
+    .await;
+    let Stack {
+        pipeline,
+        mock,
+        stop,
+        task,
+        ..
+    } = stack;
+    drop(pipeline);
+    let started = Instant::now();
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&Call::Unreact {
+            msg: msg("GENERAL", "c1"),
+            emoji: "hourglass".into()
+        }),
+        "{calls:#?}"
+    );
+    let sent = posts(&calls);
+    assert_eq!(sent.len(), 1, "{calls:#?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("c1")));
+    assert_eq!(sent[0].1, RESTARTING_TEXT);
+}
+
+#[tokio::test]
+async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_ref() {
+    let stack = start().await;
+    let store = stack.store();
+    let first = stack.answered_root("r1", "First.").await;
+    let s1 = stack.session_of(&first).await;
+
+    let before = stack.mock.calls().len();
+    let delay = Duration::from_secs(2);
+    stack.mock.delay_next(Op::History, delay);
+    stack.mock.delay_next(Op::History, delay);
+    let handling = stack.handle(stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "r2",
+        Some("r1"),
+        &[BOT],
+    ));
+    let resetting = async {
+        wait_until("the second turn starts", || {
+            stack.calls_since(before).contains(&working_on("r2"))
+        })
+        .await;
+        let s2 = store
+            .reset_session(s1, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .expect("a replacement")
+            .id;
+        wait_until("the first read of the thread ends", || {
+            stack
+                .calls_since(before)
+                .iter()
+                .any(|call| matches!(call, Call::History { .. }))
+        })
+        .await;
+        tokio::time::sleep(delay / 2).await;
+        store
+            .reset_session(s2, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        s2
+    };
+    let ((), s2) = tokio::join!(handling, resetting);
+    let calls = stack.calls_since(before);
+    let sent = posts(&calls);
+    assert_eq!(sent.len(), 1, "{calls:#?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("r1")));
+    assert_eq!(sent[0].1, FAILED_TEXT);
+    assert_eq!(
+        store.posted_message_ref(&sent[0].2).await.unwrap(),
+        None,
+        "a notice of agentd's own isn't attributed to the agent"
+    );
+    for session in [s1, s2] {
+        assert_eq!(
+            store
+                .session_message_ref(session, &msg("GENERAL", "r2"))
+                .await
+                .unwrap(),
+            None,
+            "what a turn that never ran recorded is forgotten"
+        );
+    }
+    assert!(calls.contains(&Call::Unreact {
+        msg: msg("GENERAL", "r2"),
+        emoji: "hourglass".into()
+    }));
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_message_said_while_a_turn_ran_reaches_the_next_turn() {
+    let stack = start().await;
+    let first = stack.answered_root("r1", "First.").await;
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT hello"),
+            said("x1", "carol", "said while the turn ran"),
+            said(first.id.as_str(), BOT, "First."),
+            said("r2", "alice", "@UBOT again"),
+        ],
+    );
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::reply("Second."));
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "r2",
+            Some("r1"),
+            &[BOT],
+        ))
+        .await;
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("said while the turn ran"),
+        "{}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("outside this session"),
+        "the session's own reply isn't shown again: {}",
+        bodies[0]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
+    let stack = start().await;
+    let first = stack.answered_root("r1", "First.").await;
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT hello"),
+            said(first.id.as_str(), BOT, "First."),
+            said("q2", "alice", "@UBOT question two"),
+            said("q3", "alice", "@UBOT question three"),
+        ],
+    );
+    let upstream = stack.fake.message_requests().await.len();
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Answer."));
+    stack.mock.delay_next(Op::History, Duration::from_secs(1));
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    for (id, text) in [("q2", "question two"), ("q3", "question three")] {
+        let mut event = stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            id,
+            Some("r1"),
+            &[BOT],
+        );
+        event.text = format!("@UBOT {text}");
+        sink.send(event).await.unwrap();
+    }
+    wait_until("both are answered", || {
+        posts(&stack.calls_since(before)).len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(posts(&stack.calls_since(before)).len(), 2);
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 2, "one turn each");
+    assert!(bodies[0].contains("question two"), "{}", bodies[0]);
+    assert!(!bodies[0].contains("question three"), "{}", bodies[0]);
+    assert!(bodies[1].contains("question three"), "{}", bodies[1]);
+    assert!(
+        !bodies[1].contains("question two"),
+        "the first message was answered by its own turn: {}",
+        bodies[1]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_reply_post_still_delivers_the_rest_and_says_so() {
+    let stack = start().await;
+    stack.next_turn(
+        Turn::reply("Here. [[react: eyes]]")
+            .with_command(["agentctl", "post", "--to", "GENERAL", "A note."]),
+    );
+    stack
+        .mock
+        .fail_next(Op::Post, SurfaceError::Api("boom".into()));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "d1", None, &[BOT]))
+        .await;
+    let calls = stack.calls_since(0);
+    assert!(
+        calls.contains(&Call::React {
+            msg: msg("GENERAL", "d1"),
+            emoji: "eyes".into()
+        }),
+        "{calls:#?}"
+    );
+    let sent: Vec<_> = posts(&calls)
+        .into_iter()
+        .map(|(to, text, _)| (to, text))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (in_thread("GENERAL", None), "A note.".to_owned()),
+            (
+                in_thread("GENERAL", Some("d1")),
+                DELIVERY_FAILED_TEXT.to_owned()
+            ),
+        ]
+    );
+
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Again."));
+    stack.mock.fail_next(
+        Op::Post,
+        SurfaceError::RateLimited {
+            retry_after: Duration::from_millis(10),
+        },
+    );
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "d2", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "a rate-limited post is tried again");
+    assert_eq!(sent[0].1, "Again.");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
+    let stack = start_with(Setup {
+        pipeline: |settings| {
+            settings.queue_per_thread = 0;
+            settings.max_pending = 2;
+        },
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Done.").with_delay(Duration::from_millis(1500)));
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("the first turn runs", || {
+        stack.mock.calls().contains(&working_on("b1"))
+    })
+    .await;
+    sink.send(stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "b2",
+        Some("b1"),
+        &[BOT],
+    ))
+    .await
+    .unwrap();
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b3", None, &[BOT]))
+        .await
+        .unwrap();
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b4", None, &[BOT]))
+        .await
+        .unwrap();
+    let busy: Vec<_> = posts(&stack.mock.calls())
+        .into_iter()
+        .map(|(to, text, _)| (to, text))
+        .collect();
+    let line = "helper is busy with other requests. Ask again in a few minutes.".to_owned();
+    assert_eq!(
+        busy,
+        [
+            (in_thread("GENERAL", Some("b1")), line.clone()),
+            (in_thread("GENERAL", Some("b4")), line),
+        ],
+        "one line for the message past its thread's queue, one for the message past the total"
+    );
+    wait_until("the two messages taken are answered", || {
+        stack
+            .mock
+            .posts()
+            .iter()
+            .filter(|(_, text)| text == "Done.")
+            .count()
+            == 2
+    })
+    .await;
     stack.stop().await;
 }

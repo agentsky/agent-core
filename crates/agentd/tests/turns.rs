@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentd::pipeline::{TurnSettings, Turns};
+use agentd::pipeline::{Pipeline, TurnSettings, Turns};
 use agentd::server::{Addrs, Routers, Server};
 use agentd::{App, Config};
 use core_types::{
@@ -84,7 +84,7 @@ async fn start(turns: &[Turn]) -> Running {
     let settings = settings(server.addrs(), claude, agentctl, &script, dir.path());
     let sandbox = ProcessSandbox::new(app.store().clone(), dir.path()).unwrap();
     let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
-    let server = server.with_turns(turns.clone());
+    let server = server.with_pipeline(Pipeline::for_app(&app, turns.clone()));
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
         async {
