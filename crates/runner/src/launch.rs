@@ -11,7 +11,9 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::{ProcessConfig, Result, RunnerError};
 
 /// The tools the agent gets: Claude Code's built-ins, and nothing else.
-pub(crate) const TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep";
+/// `Skill` is among them because Claude Code tells the model about the
+/// skills in `$CLAUDE_CONFIG_DIR/skills` only when that tool is enabled.
+pub(crate) const TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep,Skill";
 
 /// The variable that carries a subscription placeholder.
 pub(crate) const OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -258,7 +260,7 @@ mod tests {
             "stream-json",
             "--verbose",
             "--tools",
-            "Bash,Read,Edit,Write,Glob,Grep",
+            "Bash,Read,Edit,Write,Glob,Grep,Skill",
             "--strict-mcp-config",
             "--setting-sources",
             "user",
@@ -272,6 +274,24 @@ mod tests {
         .map(String::from)
         .into();
         assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn the_skill_tool_is_enabled_so_mounted_skills_reach_the_model() {
+        let session = SessionId::new_v4();
+        let argv = argv(
+            &ProcessConfig::default(),
+            &paths(),
+            session,
+            &spec(SessionStart::New, CredentialKind::Subscription),
+        )
+        .unwrap();
+        let tools = argv.iter().position(|arg| arg == "--tools").unwrap();
+        assert!(
+            argv[tools + 1].split(',').any(|tool| tool == "Skill"),
+            "{}",
+            argv[tools + 1]
+        );
     }
 
     #[test]

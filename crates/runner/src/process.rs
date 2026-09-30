@@ -153,7 +153,7 @@ impl ClaudeProcess {
     /// Starts `claude` in `container` for the container's session.
     ///
     /// The argv is the design's launch flags: `-p`, stream-json input and
-    /// output, `--verbose`, `--tools "Bash,Read,Edit,Write,Glob,Grep"`,
+    /// output, `--verbose`, `--tools "Bash,Read,Edit,Write,Glob,Grep,Skill"`,
     /// `--strict-mcp-config`, `--setting-sources user`, `--permission-mode
     /// bypassPermissions`, `--append-system-prompt-file` with the persona
     /// file from [`Container::paths`], `--model` when `spec` names one, and

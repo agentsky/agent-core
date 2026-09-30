@@ -96,7 +96,7 @@ impl Setup {
             "stream-json",
             "--verbose",
             "--tools",
-            "Bash,Read,Edit,Write,Glob,Grep",
+            "Bash,Read,Edit,Write,Glob,Grep,Skill",
             "--strict-mcp-config",
             "--setting-sources",
             "user",
@@ -254,7 +254,7 @@ async fn plays_a_turn_with_the_design_flags() {
     assert_eq!(init["model"], "claude-opus-test");
     assert_eq!(
         init["tools"],
-        serde_json::json!(["Bash", "Edit", "Glob", "Grep", "Read", "Write"])
+        serde_json::json!(["Bash", "Edit", "Glob", "Grep", "Read", "Skill", "Write"])
     );
     assert_eq!(init["permissionMode"], "bypassPermissions");
     assert_eq!(init["apiKeySource"], "none");
