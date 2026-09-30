@@ -1025,9 +1025,20 @@ impl Turned {
 
     /// The record of the agent's post `ts`, once the pipeline made it.
     async fn posted(&self, ts: &str) -> store::MessageRef {
+        self.posted_in(fixtures::CHANNEL, ts).await
+    }
+
+    /// The record of the agent's post `ts` in `channel`, once the pipeline
+    /// made it.
+    async fn posted_in(&self, channel: &str, ts: &str) -> store::MessageRef {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            if let Some(posted) = self.store.posted_message_ref(&reply_ref(ts)).await.unwrap() {
+            if let Some(posted) = self
+                .store
+                .posted_message_ref(&msg_in(channel, ts))
+                .await
+                .unwrap()
+            {
                 return posted;
             }
             assert!(Instant::now() < deadline, "the post was never recorded");
@@ -1677,13 +1688,7 @@ async fn an_owners_forged_message_in_a_members_dm_resets_nothing() {
     );
     assert_eq!(turned.post(0, SIGNING_SECRET, bobs).await, 200);
     turned.wait_for_posts(AGENT_TOKEN, 1).await;
-    let bobs_session = turned
-        .store
-        .posted_message_ref(&msg_in(dm, HELPER.posted_ts))
-        .await
-        .unwrap()
-        .expect("bob's DM was answered")
-        .session;
+    let bobs_session = turned.posted_in(dm, HELPER.posted_ts).await.session;
 
     let forged_ts = recent_ts(5, 200);
     let forged = message_event(

@@ -24,8 +24,7 @@ use crate::commands::intake::CommandIntake;
 use crate::commands::{Commands, Replies};
 use crate::slack::manager::ManagerIdentity;
 use crate::slack::{Inbound, Messages};
-use crate::telemetry::tests::Captured;
-use crate::telemetry::{LogFormat, subscriber};
+use crate::telemetry::tests::global_logs;
 
 const TEAM: &str = "T0TEAM001";
 const MANAGER_TOKEN: &str = "xoxb-manager-SECRET";
@@ -230,13 +229,7 @@ fn state_of(url: &str) -> String {
 #[tokio::test]
 async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
     let h = harness().await;
-    let captured = Captured::default();
-    let logs = subscriber(
-        LogFormat::Json,
-        tracing_subscriber::EnvFilter::new("trace"),
-        captured.clone(),
-    );
-    let _guard = tracing::subscriber::set_default(logs);
+    let logs = global_logs().tag();
 
     let Creation::Created {
         install_url,
@@ -271,10 +264,10 @@ async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
         [AppDeletion::Deleted]
     );
 
-    let text = captured.text();
-    assert!(text.contains("installed an agent's Slack app"), "{text}");
+    logs.snapshot().assert_has("installed an agent's Slack app");
+    let everything = global_logs().snapshot();
     for secret in SECRETS {
-        assert!(!text.contains(secret), "{secret} was logged");
+        everything.assert_lacks(secret);
     }
 }
 
