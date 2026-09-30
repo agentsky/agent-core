@@ -210,9 +210,10 @@ impl FollowUp {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
-/// The reply to a banned member's commands, `me` aside.
-const BANNED: &str = "A community admin banned you, so agents won't take your requests and \
-                      `me` is the only command you can run.";
+/// The reply to a banned member's commands, those that only take
+/// something away aside.
+const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
+                      can still run `me`, `logout`, and `pause` or `delete` your agents.";
 
 /// Runs `/agent` commands and sends their replies. Agents are created on
 /// Rocket.Chat through [`RocketChatAgents`], and on Slack, as apps, through
@@ -437,15 +438,22 @@ impl Commands {
     }
 
     /// Whether `command` from `key` is refused because a community admin
-    /// banned them. `me` never is, nor a secret-bearing command sent where
-    /// others can read it, whose refusal tells them to revoke the secret.
+    /// banned them. An admin never is, nor are the commands that only take
+    /// something away from the member (`me`, `logout`, and `pause` and
+    /// `delete` of their own agents), nor a secret-bearing command sent
+    /// where others can read it, whose refusal tells them to revoke the
+    /// secret.
     async fn banned(
         &self,
         key: &MemberKey,
         command: &Command,
         origin: &Origin,
     ) -> Result<bool, Failure> {
-        if matches!(command, Command::Me) || (command.is_secret_bearing() && !origin.is_private()) {
+        let reduces = matches!(
+            command,
+            Command::Me | Command::Logout | Command::Pause { .. } | Command::Delete { .. }
+        );
+        if reduces || self.is_admin(key) || (command.is_secret_bearing() && !origin.is_private()) {
             return Ok(false);
         }
         match self.member(key).await? {
@@ -632,7 +640,7 @@ impl Commands {
         if let Some(member) = member
             && let Some(ban) = self.inner.store.ban(member).await?
         {
-            reply.push_str("\nA community admin banned you: agents won't take your requests, and `me` is the only command you can run.");
+            reply.push_str("\nA community admin banned you: agents won't take your requests, and you can only run `me`, `logout`, and `pause` or `delete` your agents.");
             if let Some(reason) = ban.reason.filter(|reason| !reason.trim().is_empty()) {
                 let reason: String = reason
                     .chars()

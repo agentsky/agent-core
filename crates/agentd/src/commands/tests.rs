@@ -2380,7 +2380,7 @@ async fn unreadable_rules_are_cleared_by_allow_everyone() {
 }
 
 #[tokio::test]
-async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_me() {
+async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
     let h = harness().await;
     let (_, bob) = helper_and_bob(&h).await;
 
@@ -2391,8 +2391,8 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_me() {
     h.dm(ADMIN, "admin ban <@BOB> posts spam\nall day").await;
     assert_eq!(
         h.last_reply(ADMIN),
-        "Banned `@BOB`. Agents refuse their requests, and `me` is the only command they can \
-         run. Undo it with `admin unban`."
+        "Banned `@BOB`. Agents refuse their requests, and they can only run `me`, `logout`, \
+         and `pause` or `delete` their agents. Undo it with `admin unban`."
     );
     let ban = h.store.ban(bob).await.unwrap().unwrap();
     assert_eq!(ban.banned_by, key(ADMIN));
@@ -2408,8 +2408,9 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_me() {
     assert_eq!(
         h.last_reply("BOB"),
         format!(
-            "{}\nA community admin banned you: agents won't take your requests, and `me` is \
-             the only command you can run. Reason: posts spam all day",
+            "{}\nA community admin banned you: agents won't take your requests, and you can \
+             only run `me`, `logout`, and `pause` or `delete` your agents. Reason: posts spam \
+             all day",
             me("Claude account: not linked. Send `login` to link one.")
         )
     );
@@ -2459,6 +2460,41 @@ async fn a_ban_creates_the_member_and_admins_cant_be_banned() {
         "A reason is at most 500 characters. I didn't ban `@LATE`."
     );
     assert_eq!(h.member("LATE").await, None);
+}
+
+#[tokio::test]
+async fn a_banned_owner_may_still_take_away_and_an_admin_is_never_held_back() {
+    let h = harness().await;
+    helper_and_bob(&h).await;
+    let alice = h.member("alice").await.unwrap();
+    h.store
+        .ban_member(alice, &key(ADMIN), None, at(1))
+        .await
+        .unwrap();
+    for text in ["logout", "pause helper", "delete nothing"] {
+        h.dm("alice", text).await;
+        assert_ne!(h.last_reply("alice"), BANNED, "{text}");
+    }
+    for text in [
+        "limits helper turns=1",
+        "allow helper everyone",
+        "resume helper",
+    ] {
+        h.dm("alice", text).await;
+        assert_eq!(h.last_reply("alice"), BANNED, "{text}");
+    }
+
+    let admin = h
+        .store
+        .ensure_member(&key(ADMIN), ADMIN, at(1))
+        .await
+        .unwrap();
+    h.store
+        .ban_member(admin, &key("OTHER"), None, at(1))
+        .await
+        .unwrap();
+    h.dm(ADMIN, "list").await;
+    assert_ne!(h.last_reply(ADMIN), BANNED);
 }
 
 #[tokio::test]

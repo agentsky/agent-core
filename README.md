@@ -156,8 +156,9 @@ Community admins are the member identities `[community] admins` lists, as
 logs it, and only the credential proxy uses it: sandboxes hold a placeholder.
 `me` tells an admin whether a key is set. An admin bans a member with
 `admin ban @member [reason]`, which covers every identity they linked:
-agents refuse their requests, and `me` is the only command they may run,
-until `admin unban @member`. Admins can't be banned.
+agents refuse their requests, and they may only run `me`, `logout`, and
+`pause` or `delete` their own agents, until `admin unban @member`. Their
+agents still answer others. Admins can't be banned.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask

@@ -6683,20 +6683,33 @@ before it, outside the transaction. `Rules::write` puts the lists in the
 settings; serializing a rule can't fail, and if it ever did the list
 would be empty text, which doesn't read and so refuses everyone.
 
-### A ban leaves `me`, and still warns about a leaked secret
+### A ban leaves what only takes away, and still warns about a leaked secret
 
-**Issue.** A ban blocks a member's commands other than `me`, but a
+**Issue.** A ban blocks a member's commands, but a
 secret-bearing command sent in a channel is refused with advice to revoke
 the secret, which a banned member needs as much as anyone.
 
 **Solution.** `Commands::run` refuses a banned member's command before it
-runs, except `me` and a secret-bearing command sent where others can read
-it. `admin ban @member [reason]` bans the member the identity belongs to,
-creating it if needed, so every identity they link is covered; the reason
-is at most 500 characters and shown to them by `me`, never logged. Admins,
-matched by identity as T26 does, can't be banned. The router's view loads
+runs, except the commands that only take something away from them (`me`,
+`logout`, and `pause` and `delete` of their own agents) and a
+secret-bearing command sent where others can read it. `admin ban @member
+[reason]` bans the member the identity belongs to, creating it if needed,
+so every identity they link is covered; an identity of theirs they never
+linked is another member to agentd, and isn't. The reason is at most 500
+characters and shown to them by `me`, never logged. Admins, matched by
+identity as T26 does, can't be banned, and `Commands::run` never holds an
+admin back, so a ban row left on an admin's member (made before they
+were listed) can't lock the community out of `admin unban`. Deleting a
+member deletes their ban (`ON DELETE CASCADE`). The router's view loads
 bans for every member it knows (the sender's, the attributed requester's
 and its key's) and fails closed if the store can't say.
+
+A banned owner's agents go on answering others. A ban limits what the
+member may ask for and change; each of their agents' turns runs on its own
+requester's credential, and the agent stays as its owner left it, since
+the owner can't change it while banned, only pause or delete it. An admin
+who wants such an agent silent asks the owner to pause it, or removes its
+bot on the platform.
 
 ### The proxy's path allowlist stays deferred
 
