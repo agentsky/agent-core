@@ -615,7 +615,7 @@ async fn commands_that_come_later_say_so() {
 #[tokio::test]
 async fn an_admin_sets_and_clears_the_community_key_privately_and_it_is_never_logged() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
 
     h.dm(ADMIN, &format!("admin api-key set {API_KEY}")).await;
     let reply = h.last_reply(ADMIN);
@@ -659,11 +659,11 @@ async fn an_admin_sets_and_clears_the_community_key_privately_and_it_is_never_lo
         h.last_reply(ADMIN)
     );
 
-    let out = logs.text();
-    assert!(out.contains("\"command\":\"admin api-key set\""), "{out}");
-    assert!(out.contains("set the community API key"), "{out}");
-    assert!(out.contains("cleared the community API key"), "{out}");
-    assert!(!out.contains(API_KEY), "the key reached the log:\n{out}");
+    logs.snapshot()
+        .assert_has("\"command\":\"admin api-key set\"")
+        .assert_has("set the community API key")
+        .assert_has("cleared the community API key");
+    global_logs().snapshot().assert_lacks(API_KEY);
     for (_, text) in h.mock.posts() {
         assert!(!text.contains(API_KEY), "a reply repeated the key: {text}");
     }
@@ -672,7 +672,7 @@ async fn an_admin_sets_and_clears_the_community_key_privately_and_it_is_never_lo
 #[tokio::test]
 async fn only_admins_change_the_community_key() {
     let h = harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     h.dm("alice", &format!("admin api-key set {API_KEY}")).await;
     assert_eq!(h.last_reply("alice"), admin::NOT_AN_ADMIN);
     assert!(h.store.community_api_key().await.unwrap().is_none());
@@ -692,7 +692,7 @@ async fn only_admins_change_the_community_key() {
         team: TeamId::new("another.example.org"),
         ..key(ADMIN)
     };
-    let reply = h
+    let (reply, _) = h
         .commands
         .run(
             &other_team,
@@ -709,7 +709,10 @@ async fn only_admins_change_the_community_key() {
         "the same user id on another server isn't the admin"
     );
     assert!(h.store.community_api_key().await.unwrap().is_some());
-    assert!(!logs.text().contains(API_KEY));
+    logs.snapshot()
+        .assert_has("\"command\":\"admin api-key set\"")
+        .assert_has("\"command\":\"admin api-key clear\"");
+    global_logs().snapshot().assert_lacks(API_KEY);
 }
 
 #[tokio::test]
@@ -753,14 +756,20 @@ async fn an_admin_sets_the_key_with_the_slack_slash_command() {
         team: TeamId::new("T0TEAM"),
         user: UserId::new("U0ADMIN"),
     };
+    let origin = Origin::SlackSlash {
+        response_url: SecretString::from("https://hooks.slack.test/r"),
+        conv: ConvRef {
+            surface: SurfaceKind::Slack,
+            team: TeamId::new("T0TEAM"),
+            conversation: "C0GENERAL".into(),
+        },
+    };
     let commands = h.commands.clone().with_admins([slack_admin.clone()]);
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_admin,
             commands::parse(&format!("admin api-key set {API_KEY}")).unwrap(),
-            &Origin::SlackSlash {
-                response_url: SecretString::from("https://hooks.slack.test/r"),
-            },
+            &origin,
             &[],
         )
         .await;
@@ -769,14 +778,12 @@ async fn an_admin_sets_the_key_with_the_slack_slash_command() {
         "{reply}"
     );
     assert!(h.store.community_api_key().await.unwrap().is_some());
-    let reply = h
+    let (reply, _) = h
         .commands
         .run(
             &slack_admin,
             commands::parse("admin api-key clear").unwrap(),
-            &Origin::SlackSlash {
-                response_url: SecretString::from("https://hooks.slack.test/r"),
-            },
+            &origin,
             &[],
         )
         .await;
