@@ -48,6 +48,7 @@ mod slack_tests;
 mod tests;
 
 use std::fmt;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
@@ -169,6 +170,33 @@ impl Origin {
     }
 }
 
+/// What a command still has to do once its reply is sent. It no longer
+/// holds up the member's later commands.
+#[must_use = "a follow-up does nothing unless it is run"]
+#[derive(Default)]
+pub struct FollowUp(Option<Pin<Box<dyn Future<Output = ()> + Send>>>);
+
+impl fmt::Debug for FollowUp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FollowUp")
+            .field(&self.0.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+impl FollowUp {
+    fn new(work: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(Some(Box::pin(work)))
+    }
+
+    /// Does what is left, if anything.
+    pub async fn run(self) {
+        if let Some(work) = self.0 {
+            work.await;
+        }
+    }
+}
+
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
@@ -235,8 +263,8 @@ impl Commands {
     }
 
     /// Parses `text` from `member`, sent with `files` attached, and runs
-    /// it, replying privately. Text that doesn't parse gets the parser's
-    /// message (help or usage).
+    /// it to the end, replying privately. Text that doesn't parse gets the
+    /// parser's message (help or usage).
     pub async fn handle_text(
         &self,
         member: &MemberKey,
@@ -244,8 +272,23 @@ impl Commands {
         origin: &Origin,
         files: &[InFile],
     ) {
+        self.answer_text(member, text, origin, files)
+            .await
+            .run()
+            .await;
+    }
+
+    /// As [`handle_text`](Self::handle_text), but returns once the reply
+    /// is sent, with what the command still has to do.
+    pub async fn answer_text(
+        &self,
+        member: &MemberKey,
+        text: &str,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> FollowUp {
         match commands::parse(text) {
-            Ok(command) => self.dispatch(member, command, origin, files).await,
+            Ok(command) => self.answer(member, command, origin, files).await,
             Err(err) => {
                 tracing::info!(
                     %member,
@@ -256,12 +299,13 @@ impl Commands {
                 );
                 let reply = self.unparsed(member, &err, origin).await;
                 self.reply(member, origin, &reply).await;
+                FollowUp::default()
             }
         }
     }
 
-    /// Runs `command` from `member`, sent with `files` attached, and
-    /// replies privately.
+    /// Runs `command` from `member`, sent with `files` attached, to the
+    /// end, and replies privately.
     pub async fn dispatch(
         &self,
         member: &MemberKey,
@@ -269,6 +313,21 @@ impl Commands {
         origin: &Origin,
         files: &[InFile],
     ) {
+        self.answer(member, command, origin, files)
+            .await
+            .run()
+            .await;
+    }
+
+    /// Runs `command` until its reply is sent, and returns what it still
+    /// has to do.
+    async fn answer(
+        &self,
+        member: &MemberKey,
+        command: Command,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> FollowUp {
         tracing::info!(
             %member,
             origin = origin.kind(),
@@ -276,8 +335,9 @@ impl Commands {
             files = files.len(),
             "running a command"
         );
-        let reply = self.run(member, command, origin, files).await;
+        let (reply, follow_up) = self.run(member, command, origin, files).await;
         self.reply(member, origin, &reply).await;
+        follow_up
     }
 
     async fn reply(&self, member: &MemberKey, origin: &Origin, text: &str) {
@@ -286,16 +346,38 @@ impl Commands {
         }
     }
 
-    /// The reply to `command`.
+    /// The reply to `command`, and what it still has to do after it.
     async fn run(
         &self,
         member: &MemberKey,
         command: Command,
         origin: &Origin,
         files: &[InFile],
-    ) -> String {
+    ) -> (String, FollowUp) {
         let name = command.name();
-        let result = if command.is_secret_bearing() && !origin.is_private() {
+        let result = match command {
+            Command::Reset { name, here } => self.reset(member, name.as_str(), here, origin).await,
+            command => self
+                .reply_to(member, command, origin, files)
+                .await
+                .map(|reply| (reply, FollowUp::default())),
+        };
+        result.unwrap_or_else(|err| {
+            tracing::warn!(%member, command = name, error = %err, "a command failed");
+            (FAILED.to_owned(), FollowUp::default())
+        })
+    }
+
+    /// The reply to `command`, for a command that is done once it has one.
+    async fn reply_to(
+        &self,
+        member: &MemberKey,
+        command: Command,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> Result<String, Failure> {
+        let name = command.name();
+        if command.is_secret_bearing() && !origin.is_private() {
             self.refuse_public_secret(member, &command, origin).await
         } else {
             match command {
@@ -324,16 +406,9 @@ impl Commands {
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
                 Command::Sessions { name } => self.sessions(member, name.as_str(), origin).await,
-                Command::Reset { name, here } => {
-                    self.reset(member, name.as_str(), here, origin).await
-                }
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
-        };
-        result.unwrap_or_else(|err| {
-            tracing::warn!(%member, command = name, error = %err, "a command failed");
-            FAILED.to_owned()
-        })
+        }
     }
 
     async fn member(&self, key: &MemberKey) -> Result<Option<MemberId>, Failure> {

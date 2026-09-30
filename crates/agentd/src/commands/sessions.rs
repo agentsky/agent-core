@@ -1,22 +1,29 @@
 //! The session commands: `sessions <name>` and `reset <name> [here]`, for
 //! an agent's owner.
 //!
-//! Both act on the agent's sessions in use: the live ones (not reset) that
-//! have had a turn, have one running, or have a warm container. A live
-//! session that never had a turn, such as the one a reset put in place of
-//! another, has nothing to show or to reset.
+//! Both act on the agent's sessions in use ([`Store::sessions_in_use`]):
+//! the live ones (not reset) that have had a turn, have one running, or
+//! have a warm container. A live session that never had a turn, such as
+//! the one a reset put in place of another, has nothing to show or to
+//! reset.
 //!
 //! - `sessions` lists them, most recently active first, with where each
-//!   one is (a link where one can be built), when its last turn ended, and
-//!   whether its container is warm on this instance.
+//!   one is (a link where one can be built and the owner can open it),
+//!   when its last turn ended, and whether its container is warm on this
+//!   instance.
 //! - `reset` resets every one of them, or with `here` those of the
 //!   conversation the command was sent in: every thread of a channel, or a
-//!   DM's one session. `here` needs a conversation, so it is refused in the
-//!   direct message with the manager bot. A reset runs after the turns
-//!   queued before it on the session, stops its warm process and container
-//!   first ([`SessionManager::reset`]), and gives the conversation a new
-//!   session id, which its next turn starts with `--session-id`. A session
-//!   whose container can't be stopped isn't reset, and the reply says so.
+//!   DM's one session. `here` needs a conversation an agent answers in, so
+//!   it is refused in the direct message with the manager bot. Every reset
+//!   joins its session's queue at once, behind the turns queued before it
+//!   ([`SessionManager::reset`]), so a message sent after the command
+//!   starts the new conversation. It stops the warm process and container
+//!   first, and gives the conversation a new session id, which its next
+//!   turn starts with `--session-id`. The reply comes as soon as the
+//!   resets are queued, and waiting for them to end is a [`FollowUp`],
+//!   which holds up none of the owner's later commands. A session whose
+//!   container can't be stopped isn't reset, and the owner is told in a
+//!   direct message from the manager bot.
 //!
 //! The runner reaches the commands through [`SessionControl`], which
 //! [`Turns`](crate::pipeline::Turns) hands over when it starts. Without a
@@ -25,13 +32,15 @@
 //! instance's warm containers aren't seen: its next turn on a reset session
 //! finds it reset and moves to the replacement, and the idle reaper stops
 //! the old container.
+//!
+//! [`Store::sessions_in_use`]: store::Store::sessions_in_use
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 
 use async_trait::async_trait;
 use core_types::{ConvRef, ConversationId, MemberKey, ScopeKey, SessionId, SurfaceKind};
-use futures::StreamExt as _;
 use runner::{RunnerError, SessionManager, TurnHooks};
 use store::{Session, SessionKind};
 use surface_rocketchat::rest::RoomType;
@@ -39,20 +48,18 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 
 use super::agents::no_such_agent;
-use super::{Commands, Failure, Origin};
+use super::{Commands, Failure, FollowUp, Origin};
 
 /// The most sessions `sessions` lists.
 pub const MAX_LISTED: usize = 20;
-
-/// How many sessions `reset` resets at once.
-const RESETS_AT_ONCE: usize = 8;
 
 /// What the session commands need from the runner.
 #[async_trait]
 pub trait SessionControl: Send + Sync {
     /// Resets `session` once the turns queued before it have run, stopping
     /// its warm process and container first. Returns its replacement, or
-    /// `None` for a private task's session and one already reset.
+    /// `None` for a private task's session and one already reset. The reset
+    /// joins the session's queue when the future is first polled.
     ///
     /// # Errors
     ///
@@ -60,8 +67,8 @@ pub trait SessionControl: Send + Sync {
     /// and the session isn't reset; [`RunnerError::Store`].
     async fn reset(&self, session: SessionId) -> Result<Option<Session>, RunnerError>;
 
-    /// Whether `session` has a warm container, or a turn running.
-    fn is_warm(&self, session: SessionId) -> bool;
+    /// The sessions that have a warm container, or a turn running.
+    fn warm_sessions(&self) -> Vec<SessionId>;
 }
 
 #[async_trait]
@@ -70,14 +77,9 @@ impl<H: TurnHooks> SessionControl for SessionManager<H> {
         SessionManager::reset(self, session).await
     }
 
-    fn is_warm(&self, session: SessionId) -> bool {
-        SessionManager::is_warm(self, session)
+    fn warm_sessions(&self) -> Vec<SessionId> {
+        SessionManager::warm_sessions(self)
     }
-}
-
-/// Whether `session` has had a turn, or has one going to its CLI.
-fn has_run(session: &Session) -> bool {
-    session.started || session.maybe_started || session.last_turn_at.is_some()
 }
 
 /// What `reset` did.
@@ -89,6 +91,24 @@ struct Resets {
 
 fn sessions_word(count: usize) -> &'static str {
     if count == 1 { "session" } else { "sessions" }
+}
+
+/// What the owner is told when some of the resets `asked` for `name`'s
+/// sessions failed; `None` when none did.
+fn failed_resets(resets: &Resets, name: &str, asked: &str) -> Option<String> {
+    let what = match *resets {
+        Resets { failed: 0, .. } => return None,
+        Resets { done: 0, failed: 1 } => format!("`{name}`'s session"),
+        Resets { done: 0, failed } => format!("any of `{name}`'s {failed} sessions"),
+        Resets { done, failed } => format!(
+            "{failed} of `{name}`'s {} sessions; the other {done} {} reset",
+            done + failed,
+            if done == 1 { "is" } else { "are" }
+        ),
+    };
+    Some(format!(
+        "{asked} couldn't reset {what}. Please send it again in a minute."
+    ))
 }
 
 impl Commands {
@@ -112,25 +132,9 @@ impl Commands {
             .and_then(Weak::upgrade)
     }
 
-    /// `agent`'s sessions in use, most recently active first, each with
-    /// whether it is warm.
-    async fn sessions_in_use(
-        &self,
-        agent: core_types::AgentId,
-        control: Option<&dyn SessionControl>,
-    ) -> Result<Vec<(Session, bool)>, Failure> {
-        Ok(self
-            .inner
-            .store
-            .live_sessions(agent)
-            .await?
-            .into_iter()
-            .map(|session| {
-                let warm = control.is_some_and(|control| control.is_warm(session.id));
-                (session, warm)
-            })
-            .filter(|(session, warm)| *warm || has_run(session))
-            .collect())
+    /// The sessions warm on this instance's runner, if there is one.
+    fn warm_sessions(control: Option<&dyn SessionControl>) -> Vec<SessionId> {
+        control.map_or_else(Vec::new, SessionControl::warm_sessions)
     }
 
     pub(super) async fn sessions(
@@ -142,14 +146,27 @@ impl Commands {
         let Some(agent) = self.own_agent(key, name).await? else {
             return Ok(no_such_agent(name));
         };
-        let control = self.session_control();
-        let sessions = self.sessions_in_use(agent.id, control.as_deref()).await?;
+        let warm = Self::warm_sessions(self.session_control().as_deref());
+        let store = &self.inner.store;
+        let sessions = store
+            .sessions_in_use(agent.id, &warm, Some(MAX_LISTED))
+            .await?;
         if sessions.is_empty() {
             return Ok(format!("`{name}` has no sessions yet."));
         }
-        let total = sessions.len();
-        let mut reply = if total > MAX_LISTED {
-            format!("`{name}`'s {MAX_LISTED} most recent sessions of {total}:")
+        let total = if sessions.len() < MAX_LISTED {
+            sessions.len()
+        } else {
+            store
+                .count_sessions_in_use(agent.id, &warm)
+                .await?
+                .max(sessions.len())
+        };
+        let mut reply = if total > sessions.len() {
+            format!(
+                "`{name}`'s {} most recent sessions of {total}:",
+                sessions.len()
+            )
         } else {
             format!(
                 "`{name}`'s {} {}, most recent first:",
@@ -157,14 +174,19 @@ impl Commands {
                 sessions_word(total)
             )
         };
+        let warm: HashSet<SessionId> = warm.into_iter().collect();
         let mut rooms = HashMap::new();
-        for (session, warm) in sessions.iter().take(MAX_LISTED) {
+        for session in &sessions {
             let last = session.last_turn_at.map_or_else(
                 || "no turn finished yet".to_owned(),
                 |at| format!("last turn {}", when(at)),
             );
-            let warm = if *warm { "warm" } else { "cold" };
-            reply.push_str(&format!("\n- {}, {last}, {warm}", place(session)));
+            let state = if warm.contains(&session.id) {
+                "warm"
+            } else {
+                "cold"
+            };
+            reply.push_str(&format!("\n- {}, {last}, {state}", place(session)));
             if let Some(link) = self.link(session, &mut rooms).await {
                 reply.push_str(": ");
                 reply.push_str(&link);
@@ -184,76 +206,113 @@ impl Commands {
         name: &str,
         here: bool,
         origin: &Origin,
-    ) -> Result<String, Failure> {
+    ) -> Result<(String, FollowUp), Failure> {
+        let done = |reply: String| Ok((reply, FollowUp::default()));
         let Some(agent) = self.own_agent(key, name).await? else {
-            return Ok(no_such_agent(name));
+            return done(no_such_agent(name));
         };
         let conv = match (here, origin.conversation(key)) {
             (false, _) => None,
             (true, Some(conv)) => Some(conv),
-            (true, None) => return Ok(here_elsewhere(key.surface, name, origin)),
+            (true, None) => return done(here_elsewhere(key.surface, name, origin)),
         };
         let control = self.session_control();
-        let sessions: Vec<Session> = self
-            .sessions_in_use(agent.id, control.as_deref())
+        let warm = Self::warm_sessions(control.as_deref());
+        let ids: Vec<SessionId> = self
+            .inner
+            .store
+            .sessions_in_use(agent.id, &warm, None)
             .await?
             .into_iter()
-            .map(|(session, _)| session)
             .filter(|session| {
                 conv.as_ref()
                     .is_none_or(|conv| in_conversation(session, conv))
             })
+            .map(|session| session.id)
             .collect();
-        if sessions.is_empty() {
-            return Ok(if here {
-                format!("`{name}` has no session here to reset.")
-            } else {
-                format!("`{name}` has no sessions to reset.")
+        if ids.is_empty() {
+            return done(match &conv {
+                Some(conv) if self.is_manager_dm(key, conv).await => {
+                    here_elsewhere(key.surface, name, origin)
+                }
+                Some(_) => format!("`{name}` has no session here to reset."),
+                None => format!("`{name}` has no sessions to reset."),
             });
         }
-        let resets = self.reset_all(control.as_deref(), &sessions).await;
-        tracing::info!(
-            agent = %agent.id,
-            here,
-            reset = resets.done,
-            failed = resets.failed,
-            "reset an agent's sessions"
-        );
-        let count = sessions.len();
+        let count = ids.len();
+        let mut resets = Box::pin(self.clone().reset_all(control, ids));
+        let queued = futures::poll!(resets.as_mut());
         let place = if here { " here" } else { "" };
-        let what = if count == 1 {
-            format!("`{name}`'s session{place}")
+        let reply = if count == 1 {
+            format!(
+                "Resetting `{name}`'s session{place}: the next message in it starts a new \
+                 conversation. If it is running a turn, it resets once that turn ends. If it \
+                 can't be reset, I'll tell you in a direct message."
+            )
         } else {
-            format!("`{name}`'s {count} sessions{place}")
+            format!(
+                "Resetting `{name}`'s {count} sessions{place}: the next message in each starts \
+                 a new conversation. A session running a turn resets once that turn ends. If \
+                 any can't be reset, I'll tell you in a direct message."
+            )
         };
-        Ok(match resets {
-            Resets { failed: 0, .. } if count == 1 => {
-                format!("Reset {what}: its next message starts a new conversation.")
+        let asked = if here {
+            reset_here(key.surface, name)
+        } else {
+            origin.command(&format!("reset {name}"))
+        };
+        let commands = self.clone();
+        let owner = key.clone();
+        let name = name.to_owned();
+        let agent = agent.id;
+        let follow_up = FollowUp::new(async move {
+            let resets = match queued {
+                Poll::Ready(resets) => resets,
+                Poll::Pending => resets.await,
+            };
+            tracing::info!(
+                %agent,
+                here,
+                reset = resets.done,
+                failed = resets.failed,
+                "reset an agent's sessions"
+            );
+            if let Some(notice) = failed_resets(&resets, &name, &asked)
+                && let Err(error) = commands.inner.replies.dm(&owner, &notice).await
+            {
+                tracing::warn!(member = %owner, %error, "couldn't tell an owner a reset failed");
             }
-            Resets { failed: 0, .. } => {
-                format!("Reset {what}: the next message in each starts a new conversation.")
-            }
-            Resets { done: 0, .. } => {
-                format!("I couldn't reset {what}. Please try again in a minute.")
-            }
-            Resets { done, failed } => format!(
-                "Reset {done} of {what}; {failed} couldn't be reset. Please try again in a minute."
-            ),
-        })
+        });
+        Ok((reply, follow_up))
     }
 
-    /// Resets `sessions`, a few at once.
+    /// Whether `conv` is the manager bot's direct message with `key`, where
+    /// no agent answers. A Slack slash command sent there names it.
+    async fn is_manager_dm(&self, key: &MemberKey, conv: &ConvRef) -> bool {
+        if conv.surface != key.surface || conv.team != key.team {
+            return false;
+        }
+        match self.inner.replies.dm_room(key).await {
+            Ok(room) => room == conv.conversation,
+            Err(error) => {
+                tracing::debug!(member = %key, %error, "couldn't find the manager bot's DM");
+                false
+            }
+        }
+    }
+
+    /// Resets the sessions `ids`, all at once, so each joins its session's
+    /// queue as soon as this is first polled.
     async fn reset_all(
-        &self,
-        control: Option<&dyn SessionControl>,
-        sessions: &[Session],
+        self,
+        control: Option<Arc<dyn SessionControl>>,
+        ids: Vec<SessionId>,
     ) -> Resets {
-        let ids: Vec<SessionId> = sessions.iter().map(|session| session.id).collect();
-        let results: Vec<bool> = futures::stream::iter(ids)
-            .map(|id| self.reset_one(control, id))
-            .buffer_unordered(RESETS_AT_ONCE)
-            .collect()
-            .await;
+        let results = futures::future::join_all(
+            ids.into_iter()
+                .map(|id| self.reset_one(control.as_deref(), id)),
+        )
+        .await;
         let done = results.iter().filter(|done| **done).count();
         Resets {
             done,
@@ -280,10 +339,12 @@ impl Commands {
         reset.is_ok()
     }
 
-    /// A link to `session`'s thread, where one can be built: on Slack
-    /// always, on Rocket.Chat from the room's type, and for a channel its
-    /// name, which `rooms` caches per room. No link to another member's DM
-    /// with the agent, which the owner can't open.
+    /// A link to `session`'s thread, where one can be built and the owner
+    /// can open it: on Slack always, on Rocket.Chat from the room's type,
+    /// and for a channel its name, which `rooms` caches per room. No link
+    /// to another member's DM with the agent or a private task's thread,
+    /// which may be in one, nor to a Rocket.Chat private group, whose name
+    /// the owner may not be allowed to see.
     async fn link(
         &self,
         session: &Session,
@@ -291,9 +352,9 @@ impl Commands {
     ) -> Option<String> {
         let thread = &session.thread;
         let direct = match (&session.kind, &session.scope) {
-            (_, ScopeKey::Dm(_)) => return None,
+            (SessionKind::Private(_), _) | (SessionKind::Normal, ScopeKey::Dm(_)) => return None,
             (SessionKind::Normal, ScopeKey::Private | ScopeKey::GroupDm(_)) => true,
-            _ => false,
+            (SessionKind::Normal, ScopeKey::Channel(_)) => false,
         };
         match thread.conv.surface {
             SurfaceKind::Slack => surface_slack::surface::thread_link(thread),
@@ -319,6 +380,9 @@ impl Commands {
                     }
                     rooms.get(room).cloned().flatten()?
                 };
+                if room_type == RoomType::Group {
+                    return None;
+                }
                 agents
                     .rest()
                     .room_link(&room_type, room, name.as_deref(), thread.root.as_ref())

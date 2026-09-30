@@ -473,7 +473,7 @@ async fn slack_token_needs_a_linked_member_on_slack() {
         team: TeamId::new("chat.example.org"),
         user: UserId::new("alice"),
     };
-    let reply = h
+    let (reply, _) = h
         .commands
         .run(
             &rocketchat,
@@ -496,7 +496,7 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
             .unwrap();
     let auth = Arc::new(Auth::new(OAuthConfig::default(), store.clone()).unwrap());
     let commands = Commands::new(store, auth, Replies::default(), None, None);
-    let reply = commands
+    let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
             commands::parse(&format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}")).unwrap(),
@@ -1451,6 +1451,31 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
             .unwrap();
         sessions.push(session.id);
     }
+    for thread in [
+        core_types::ThreadKey {
+            conv: slack_channel("D0BOBSDM1"),
+            root: None,
+        },
+        core_types::ThreadKey {
+            conv: slack_channel("C0CHAN001"),
+            root: Some("1727700002.000300".into()),
+        },
+    ] {
+        let task = h
+            .store
+            .create_private_session(
+                agent.id,
+                core_types::ConsentId::new_v4(),
+                &thread,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        h.store
+            .record_session_turn(task.id, true, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+    }
 
     let listed = h.slash("U0HUMAN01", "sessions helper").await.remove(0);
     for link in [
@@ -1459,7 +1484,19 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
     ] {
         assert!(listed.contains(link), "{listed}");
     }
-    assert!(listed.starts_with("`helper`'s 2 sessions"), "{listed}");
+    assert!(listed.starts_with("`helper`'s 4 sessions"), "{listed}");
+    let tasks: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.contains("A private task"))
+        .collect();
+    assert_eq!(tasks.len(), 2, "{listed}");
+    for task in tasks {
+        assert!(
+            !task.contains("https://"),
+            "a private task has no link: {task}"
+        );
+    }
+    assert!(!listed.contains("D0BOBSDM1"), "{listed}");
     assert!(
         listed.ends_with(
             "Start them all over with `/agent reset helper`, or one conversation's with \
@@ -1468,7 +1505,7 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
         "{listed}"
     );
 
-    let in_dm = h
+    let (in_dm, _) = h
         .commands
         .run(
             &slack_key("U0HUMAN01"),
@@ -1485,6 +1522,29 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
          this one. Send `/agent reset helper here` in the conversation to reset, or \
          `reset helper` here to reset them all."
     );
+    let slashed_in_dm = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("D0DM00001"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(
+        slashed_in_dm,
+        [
+            "`reset helper here` resets the conversation it is sent in, and no agent answers in \
+          this one. Send `/agent reset helper here` in the conversation to reset, or \
+          `/agent reset helper` here to reset them all."
+        ]
+    );
+    let in_agents_dm = h
+        .slash_in(
+            "U0HUMAN01",
+            &slack_channel("D0AGENTS1"),
+            "reset helper here",
+        )
+        .await;
+    assert_eq!(in_agents_dm, ["`helper` has no session here to reset."]);
 
     let replies = h
         .slash_in(
@@ -1495,7 +1555,11 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
         .await;
     assert_eq!(
         replies,
-        ["Reset `helper`'s session here: its next message starts a new conversation."]
+        [
+            "Resetting `helper`'s session here: the next message in it starts a new \
+          conversation. If it is running a turn, it resets once that turn ends. If it can't be \
+          reset, I'll tell you in a direct message."
+        ]
     );
     let reset_at = async |id| h.store.session(id).await.unwrap().unwrap().reset_at;
     assert!(reset_at(sessions[0]).await.is_some());

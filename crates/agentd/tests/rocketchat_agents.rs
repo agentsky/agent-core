@@ -791,6 +791,7 @@ async fn session_commands_work_as_agent_in_a_room_only_the_agents_bot_is_in() {
     chat.fake.remove_member("AGENTS", FakeRest::MANAGER_ID);
     chat.fake.add_room("SECRET", "p", "secret");
     chat.fake.remove_member("SECRET", FakeRest::MANAGER_ID);
+    chat.fake.add_room("STAFF", "p", "staff");
     let running = Running::start(&chat, "sqlite::memory:").await;
     running.link(&chat.alice).await;
     let helper = chat.create(&running, "alice", "helper").await;
@@ -800,6 +801,7 @@ async fn session_commands_work_as_agent_in_a_room_only_the_agents_bot_is_in() {
     let agents = seed_session(&running, agent, "AGENTS", Some("R2"), None).await;
     let dm = seed_session(&running, agent, "HELPER-DM", None, Some(ScopeKey::Private)).await;
     let secret = seed_session(&running, agent, "SECRET", Some("R3"), None).await;
+    let staff = seed_session(&running, agent, "STAFF", Some("R4"), None).await;
     let mut manager_dm = [FakeRest::MANAGER_ID.to_owned(), chat.alice.clone()];
     manager_dm.sort();
     let manager_dm = manager_dm.concat();
@@ -817,20 +819,23 @@ async fn session_commands_work_as_agent_in_a_room_only_the_agents_bot_is_in() {
     assert_eq!(
         listed.lines().filter(|line| line.contains(&uri)).count(),
         3,
-        "a private group the manager isn't in has no link: {listed}"
+        "no private group has a link, the manager in it or not: {listed}"
     );
+    assert!(!listed.contains("staff"), "{listed}");
     assert!(listed.contains("`!agent reset helper here`"), "{listed}");
 
     chat.say("alice", "AGENTS", "!agent reset helper here", json!({}));
     let reply = chat.wait_for_posts(&manager_dm, 2).await.remove(1);
     assert_eq!(
         reply,
-        "Reset `helper`'s session here: its next message starts a new conversation."
+        "Resetting `helper`'s session here: the next message in it starts a new conversation. \
+         If it is running a turn, it resets once that turn ends. If it can't be reset, I'll \
+         tell you in a direct message."
     );
     let store = running.app.store();
     let reset_at = async |id| store.session(id).await.unwrap().unwrap().reset_at;
     assert!(reset_at(agents).await.is_some());
-    for id in [general, dm, secret] {
+    for id in [general, dm, secret, staff] {
         assert!(reset_at(id).await.is_none());
     }
     for room in ["GENERAL", "AGENTS", "SECRET"] {

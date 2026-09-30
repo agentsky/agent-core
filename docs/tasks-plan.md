@@ -2202,8 +2202,8 @@ Deliverables:
   command in that conversation on Slack; from the manager's DM it is refused
   with how to send it.
 - Reset stops a warm process first. `SessionManager::reset` (T21) does,
-  after the turns queued before it, and `SessionManager::is_warm` answers
-  whether a container is warm. They reach the commands through
+  after the turns queued before it, and `SessionManager::warm_sessions`
+  lists the sessions whose container is warm. They reach the commands through
   `commands::SessionControl`, which `pipeline::Turns::start` hands to the
   app's commands, held weakly. Without a runner a reset marks the session
   in the store only.

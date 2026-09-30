@@ -667,6 +667,7 @@ async fn the_global_cap_reaps_an_idle_container_of_another_scope() {
     assert_eq!(h.sandbox.most.load(Ordering::SeqCst), 1);
     assert!(!h.manager.is_warm(first.id));
     assert!(h.manager.is_warm(second.id));
+    assert_eq!(h.manager.warm_sessions(), [second.id]);
     let events = h.events();
     assert!(
         position(&events, &Event::ProcessStopping(first.id, 1))

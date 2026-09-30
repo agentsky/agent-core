@@ -20,6 +20,21 @@ macro_rules! columns {
     };
 }
 
+/// The condition for an agent's session in use, binding the agent id and
+/// the warm session ids as a JSON array, in that order.
+macro_rules! in_use {
+    () => {
+        "agent_id = ? AND reset_at IS NULL \
+         AND (started OR maybe_started OR last_turn_at IS NOT NULL \
+              OR id IN (SELECT value FROM json_each(?)))"
+    };
+}
+
+/// `ids` as a JSON array of strings, for `json_each`.
+fn ids_json(ids: &[SessionId]) -> sqlx::types::Json<Vec<String>> {
+    sqlx::types::Json(ids.iter().map(ToString::to_string).collect())
+}
+
 /// What kind of session a row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionKind {
@@ -313,25 +328,52 @@ impl Store {
         row.map(Row::into_session).transpose()
     }
 
-    /// Every live session of `agent`, normal and private, most recently
-    /// active first: by the end of its last turn, or its creation if it
-    /// has had none.
+    /// The sessions of `agent` in use, normal and private, most recently
+    /// active first (by the end of the last turn, or the creation), at most
+    /// `limit` of them, or all with `None`. A session in use is live (not
+    /// reset) and has had a turn finish, has had one go to its CLI, or is
+    /// one of `warm`.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
     /// if a row doesn't parse.
-    pub async fn live_sessions(&self, agent: AgentId) -> Result<Vec<Session>> {
+    pub async fn sessions_in_use(
+        &self,
+        agent: AgentId,
+        warm: &[SessionId],
+        limit: Option<usize>,
+    ) -> Result<Vec<Session>> {
+        let limit = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
         let rows: Vec<Row> = sqlx::query_as(concat!(
             "SELECT ",
             columns!(),
-            " FROM sessions WHERE agent_id = ? AND reset_at IS NULL \
-             ORDER BY COALESCE(last_turn_at, created_at) DESC, created_at DESC, id"
+            " FROM sessions WHERE ",
+            in_use!(),
+            " ORDER BY COALESCE(last_turn_at, created_at) DESC, created_at DESC, id LIMIT ?"
         ))
         .bind(agent.to_string())
+        .bind(ids_json(warm))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Row::into_session).collect()
+    }
+
+    /// How many sessions of `agent` are in use, as
+    /// [`sessions_in_use`](Self::sessions_in_use) counts them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn count_sessions_in_use(&self, agent: AgentId, warm: &[SessionId]) -> Result<usize> {
+        let count: i64 =
+            sqlx::query_scalar(concat!("SELECT COUNT(*) FROM sessions WHERE ", in_use!()))
+                .bind(agent.to_string())
+                .bind(ids_json(warm))
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     /// Resets session `id`: marks it reset and, for a normal session,
@@ -751,7 +793,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_sessions_are_the_agents_unreset_ones_most_recent_first() {
+    async fn sessions_in_use_are_the_live_ones_that_ran_or_are_warm_most_recent_first() {
         let store = memory_store().await;
         let agent = AgentId::new_v4();
         let old = store
@@ -769,13 +811,28 @@ mod tests {
             .unwrap()
             .session;
         store.record_session_turn(dm.id, true, at(9)).await.unwrap();
-        let fresh = store
+        let unused = store
             .session_for_thread(agent, &thread("2.2"), &channel(), at(7))
             .await
             .unwrap()
             .session;
+        let warm = store
+            .session_for_thread(agent, &thread("4.4"), &channel(), at(3))
+            .await
+            .unwrap()
+            .session;
+        let pending = store
+            .session_for_thread(agent, &thread("5.5"), &channel(), at(4))
+            .await
+            .unwrap()
+            .session;
+        assert!(store.mark_session_turn_pending(pending.id).await.unwrap());
         let task = store
             .create_private_session(agent, ConsentId::new_v4(), &thread("1.1"), at(3))
+            .await
+            .unwrap();
+        store
+            .record_session_turn(task.id, false, at(8))
             .await
             .unwrap();
         let reset = store
@@ -788,22 +845,49 @@ mod tests {
             .await
             .unwrap();
         let replacement = store.reset_session(reset.id, at(6)).await.unwrap().unwrap();
-        store
+        let other = store
             .session_for_thread(AgentId::new_v4(), &thread("1.1"), &channel(), at(8))
+            .await
+            .unwrap()
+            .session;
+        store
+            .record_session_turn(other.id, true, at(8))
             .await
             .unwrap();
 
-        let live: Vec<SessionId> = store
-            .live_sessions(agent)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|session| session.id)
-            .collect();
-        assert_eq!(live, [dm.id, fresh.id, replacement.id, old.id, task.id]);
+        let ids = |sessions: Vec<Session>| -> Vec<SessionId> {
+            sessions.into_iter().map(|session| session.id).collect()
+        };
+        let warm_ids = [warm.id, reset.id, other.id];
+        assert_eq!(
+            ids(store.sessions_in_use(agent, &warm_ids, None).await.unwrap()),
+            [dm.id, task.id, old.id, pending.id, warm.id]
+        );
+        assert_eq!(
+            store.count_sessions_in_use(agent, &warm_ids).await.unwrap(),
+            5
+        );
+        assert_eq!(
+            ids(store
+                .sessions_in_use(agent, &warm_ids, Some(2))
+                .await
+                .unwrap()),
+            [dm.id, task.id]
+        );
+        assert_eq!(
+            ids(store.sessions_in_use(agent, &[], None).await.unwrap()),
+            [dm.id, task.id, old.id, pending.id]
+        );
+        assert_eq!(store.count_sessions_in_use(agent, &[]).await.unwrap(), 4);
+        for left_out in [unused.id, replacement.id] {
+            assert!(
+                !ids(store.sessions_in_use(agent, &warm_ids, None).await.unwrap())
+                    .contains(&left_out)
+            );
+        }
         assert!(
             store
-                .live_sessions(AgentId::new_v4())
+                .sessions_in_use(AgentId::new_v4(), &warm_ids, None)
                 .await
                 .unwrap()
                 .is_empty()

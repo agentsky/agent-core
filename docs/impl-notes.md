@@ -5099,13 +5099,16 @@ rows that have no transcript, making yet another row each.
 
 **Solution.** Both commands act on the live sessions in use: not reset, and
 with a turn finished (`last_turn_at`), a turn gone to the CLI (`started` or
-`maybe_started`), or a warm container. `Store::live_sessions` returns the
-agent's live rows, most recently active first (the end of the last turn, or
-the creation), and agentd filters them. `sessions` shows at most 20
-(`commands::MAX_LISTED`) and says how many there are. A private task's
-session is listed and reset by `reset <name>`, but not by `here`, since it
-isn't the conversation's own session. A reset session is gone from the
-list; its replacement shows up again once it has a turn.
+`maybe_started`), or a warm container. `Store::sessions_in_use` selects them
+in SQL, most recently active first (the end of the last turn, or the
+creation), with the ids warm on this instance
+(`SessionManager::warm_sessions`) passed in as a JSON array for `json_each`,
+so the rows a reset leaves behind are never read. `sessions` asks for at
+most 20 (`commands::MAX_LISTED`), and only when it gets that many counts
+them all (`Store::count_sessions_in_use`) to say how many there are. A
+private task's session is listed and reset by `reset <name>`, but not by
+`here`, since it isn't the conversation's own session. A reset session is
+gone from the list; its replacement shows up again once it has a turn.
 
 A session left out is one the CLI never read a message of, so it has no
 transcript, and its next turn starts with `--session-id` whether it is
@@ -5127,10 +5130,15 @@ command was sent in: a DM's one session, or every thread of a channel, the
 same on both surfaces. `Origin::SlackSlash` now carries the slash command's
 conversation, and `Origin::conversation` gives it, or for `!agent` the room,
 on the sender's team. In the manager bot's DM there is no conversation to
-reset, so `here` is refused there with how to send it. A DM with the agent's
-bot is a room like any other (T13), so `!agent reset <name> here` there
-resets the owner's DM session, and in a room only the agent's bot is in the
-agent's connection hears it, as T14 made every connection feed the intake.
+reset, so `here` is refused there with how to send it. A message there has
+no conversation, but a Slack slash command sent there names the DM like any
+other, so when `here` finds no session, the conversation is compared with
+the manager's DM with the owner (`Replies::dm_room`, a
+`conversations.open`) and the command refused the same way. A DM with the
+agent's bot is a room like any other (T13), so `!agent reset <name> here`
+there resets the owner's DM session, and in a room only the agent's bot is
+in the agent's connection hears it, as T14 made every connection feed the
+intake.
 
 ### Thread links
 
@@ -5148,11 +5156,17 @@ team agentd serves:
   `<base>/channel/<name>`, `<base>/group/<name>` or `<base>/direct/<room
   id>`, then `/thread/<root>`. A DM's route takes its id, so the owner's DM
   and group DMs need no call; a channel's type and name come from the
-  manager's `rooms.info`, once per room and command, which a private group
-  the manager isn't in refuses, and then the line has no link.
+  manager's `rooms.info`, once per room and command, and a room the manager
+  can't read has no link.
 
 Another member's DM with the agent has no link, since the owner can't open
-it. Neither form was checked against a live client.
+it, and neither has a private task's session, whose thread (where its
+result goes) may be such a DM. A Rocket.Chat private group has no link
+either: the manager may be in groups the owner isn't, and the link would
+show them the group's name. Rocket.Chat has no cheap call for whether a
+given user is in a room (`groups.members` pages through every member), so
+the owner's membership isn't checked. Neither form was checked against a
+live client.
 
 ### The commands reach the runner through a weak handle
 
@@ -5163,25 +5177,39 @@ reaper and event follower running after the pipeline is dropped at
 shutdown, past the store's close.
 
 **Solution.** `commands::SessionControl` is what the commands need
-(`reset`, `is_warm`), implemented for `SessionManager`. `Turns::start`
+(`reset`, `warm_sessions`), implemented for `SessionManager`. `Turns::start`
 hands its sessions to `app.commands()` as a `Weak`, so every path that
 starts a runner for an app wires it, and dropping the runner ends it.
 Without one (no `[sandbox]`, or after shutdown) `reset` marks the session
-reset in the store alone, and nothing is warm. `is_warm` knows this
+reset in the store alone, and nothing is warm. `warm_sessions` knows this
 instance's containers only. A warm process on another instance keeps its
 old session until its next turn there finds the session reset (T21's
 `RunnerError::SessionReset`), which moves the turn to the replacement, and
 the idle reaper stops the old container.
 
-### A reset waits for the session's turns
+### A reset waits for the session's turns, the reply doesn't
 
 **Issue.** `SessionManager::reset` runs after the turns queued before it,
-which can take up to the turn timeout each.
+which can take up to the turn timeout each, and it joins the session's
+queue only when its future is first polled. Resetting a few sessions at a
+time left the others out of their queues until an earlier reset ended, so a
+message sent in one of them after `reset` ran on the old conversation and
+was then wiped. Waiting for every reset before replying also held up the
+owner's later commands, which the intake runs one at a time (T13), and
+could outlast a Slack `response_url`, which expires after 30 minutes.
 
-**Solution.** The reply comes once every reset has ended, and a member's
-later commands wait for it, as T13's intake orders them. Up to 8 sessions
-reset at once, so one busy thread doesn't hold up the others and a large
-reset doesn't flood the store's writer. A session whose container can't be
-stopped isn't reset (T21), and the reply says how many couldn't be, to be
-tried again. At shutdown the intake's drain ends a reset still waiting for
-a turn, and it leaves the queue without resetting.
+**Solution.** Every reset is issued at once (`join_all`) and polled once
+before the reply, so each is queued on its session before the owner reads
+"Resetting". There is no cap on how many run at once: the idle sessions'
+containers stop in parallel, and their rows' short write transactions wait
+their turn in the store's pool and busy timeout. Waiting for them to end is
+the command's `FollowUp`: the intake releases the member's command order
+once the reply is sent and then runs the follow-up in the same task, so the
+owner's next command goes ahead. If a reset fails (a container that can't be
+stopped isn't reset, T21), the owner is told in a direct message from the
+manager bot, with the command to send again. At shutdown the intake waits
+for follow-ups as for commands, within the drain; one still waiting when the
+drain ends is dropped with the intake's tasks, and its reset leaves the
+queue without resetting. The follow-up lives only in memory: if the instance
+dies, the queued resets die with it and nothing is reset, which the owner
+sees in `sessions` and can send again.

@@ -203,6 +203,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether `slot` holds a container, or is locked for a turn or a stop.
+fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
+    slot.try_lock().map_or(true, |warm| warm.held.is_some())
+}
+
 /// Sessions, their turn queues, and the warm pool: one container and one
 /// `claude` process per active session.
 ///
@@ -433,7 +438,20 @@ impl<H: TurnHooks> SessionManager<H> {
     /// Whether `session` has a warm container, or a turn running.
     pub fn is_warm(&self, session: SessionId) -> bool {
         let slot = lock(&self.inner.slots).get(&session).cloned();
-        slot.is_some_and(|slot| slot.try_lock().map_or(true, |warm| warm.held.is_some()))
+        slot.is_some_and(|slot| is_warm(&slot))
+    }
+
+    /// The sessions that have a warm container, or a turn running.
+    pub fn warm_sessions(&self) -> Vec<SessionId> {
+        let slots: Vec<(SessionId, Slot<H>)> = lock(&self.inner.slots)
+            .iter()
+            .map(|(session, slot)| (*session, Arc::clone(slot)))
+            .collect();
+        slots
+            .into_iter()
+            .filter(|(_, slot)| is_warm(slot))
+            .map(|(session, _)| session)
+            .collect()
     }
 
     /// Runs one turn on `session`, after the turns queued before it.
@@ -516,9 +534,7 @@ impl<H: TurnHooks> Inner<H> {
     /// Forgets slots nobody uses that hold no container, and scope caps
     /// nobody holds or waits for.
     fn prune(&self) {
-        lock(&self.slots).retain(|_, slot| {
-            Arc::strong_count(slot) > 1 || slot.try_lock().map_or(true, |warm| warm.held.is_some())
-        });
+        lock(&self.slots).retain(|_, slot| Arc::strong_count(slot) > 1 || is_warm(slot));
         let cap = self.config.pool.scope_container_cap;
         lock(&self.scope_caps).retain(|_, semaphore| {
             Arc::strong_count(semaphore) > 1 || semaphore.available_permits() < cap
