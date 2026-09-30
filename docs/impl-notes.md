@@ -2322,6 +2322,36 @@ first end, then one interval, doubling up to 32 intervals (32 minutes), and
 one that ran that long starts over. A broken bot so logs an error about
 twice an hour, not every minute, until it is fixed or deleted.
 
+### Retiring a bot and stopping its connection happen in either order
+
+**Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
+failed under CPU load, always at "the pass retired the bot": 1 of 200
+runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
+server to count no connections, then read the binding once. A pass stops a connection by signalling its task, which
+closes the socket on its own while the pass goes on to `abandon_stale` and
+`retire_pending`, so the socket can close before `mark_retired` runs.
+Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
+The order can also flip: a delete that lands between a pass's `reconcile`
+and its `retire_pending` is retired by that pass and disconnected by the
+next, and the `delete` command retires the bot before it pokes.
+
+**Solution.** The supervisor stays as it is. Both steps follow from the
+disabled binding, every pass does both, and a delete pokes after disabling
+it, so the end state is the same in either order within a pass: the bot
+user deactivated, `retired_at` set, and no connection. The test now waits
+for that whole end state through a shared `eventually` helper, and passed
+200 of 200 runs with 8 busy loops, 200 of 200 with 16, and 10 of 10 with
+the 300 ms added.
+
+`a_bot_made_after_its_creation_was_abandoned_owes_retirement` had the same
+shape: a 100 ms sleep stood in for "`create_bot` has recorded the username
+and sent `users.create`", and a 300 ms response delay for "the abandonment
+lands before the response". Adding 150 ms before the username is recorded
+failed it 10 of 10 runs. Its `users.create` response is now held until the
+test has abandoned the creation, so the abandonment always lands while the
+request is in flight; it passes 10 of 10 with the 150 ms added. The tests install no tracing subscriber, so
+`RUST_LOG` doesn't change their timing.
+
 ### Before turns, a bot reacts instead of replying
 
 **Issue.** The plan allows a fixed acknowledgement before T23, and the live
@@ -3589,6 +3619,32 @@ found the process then still counted as running, and the next turn crashed
 on it. Now a result after a failed write, or a resume refusal (where the
 write can win the race), reaps the process before `Finished` is returned,
 so `is_running()` is false and the next turn gets `NotRunning`.
+
+### A spawn on another thread can hold the pipe open
+
+**Issue.** The test for that, `a_result_after_a_failed_write_ends_the_process`,
+failed once in CI's Coverage job with the process still running: the write
+to a script that had closed its stdin succeeded. Locally it failed in 2 of
+100 runs of the test binary, 5 of 150 with four busy loops on the CPUs, 1 of
+150 under `cargo llvm-cov`, and never alone or with `--test-threads=1`. The
+tests run in parallel and each spawns processes through `ProcessSandbox`. A
+child starts with a copy of every descriptor open in the test process and
+holds it until its exec closes it (`O_CLOEXEC`). A child forked on another
+thread while this test's spawn had the stdin pipe open, and not scheduled
+until after the script had closed its end, was still a reader when the
+driver wrote. The same leak failed the test once with `ETXTBSY`: a child
+forked while `std::fs::write` had the script open for writing still held it
+when the script was exec'd. The driver was right; the test process broke
+the precondition.
+
+**Solution.** `ProcessSandbox::exec` holds a process-wide lock around the
+spawn. A spawn returns only once its child has exec'd, so with one spawn at
+a time no child is left holding another's pipes, or a file written before
+the spawn. After the change: 0 failures in 300 runs with the busy loops,
+and 0 in 150 under `cargo llvm-cov` with them. testkit's `fake_claude` test
+binary spawns `fake-claude` directly, and one test writes a script for it
+to run, so it holds its own lock, for the same reason, around its spawns
+and that write.
 
 ### Codes and tool names can carry text
 
