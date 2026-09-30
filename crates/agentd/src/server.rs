@@ -568,10 +568,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
-    use crate::telemetry::tests::Captured;
-    use crate::telemetry::{LogFormat, subscriber};
+    use crate::telemetry::tests::global_logs;
 
-    async fn routers_logs(upstream: Option<&str>) -> String {
+    async fn build_routers(upstream: Option<&str>) {
         let text = match upstream {
             Some(upstream) => format!("{MINIMAL}\n[proxy]\nupstream = \"{upstream}\"\n"),
             None => MINIMAL.to_owned(),
@@ -581,32 +580,35 @@ mod tests {
             .await
             .unwrap();
         let app = App::new(config, store, None).unwrap();
-        let captured = Captured::default();
-        let logs = subscriber(
-            LogFormat::Json,
-            tracing_subscriber::EnvFilter::new("warn"),
-            captured.clone(),
-        );
-        let _guard = tracing::subscriber::set_default(logs);
         Routers::new(&app).unwrap();
-        captured.text()
     }
 
     #[tokio::test]
     async fn another_upstream_than_the_default_is_logged_as_a_warning() {
         let upstream = "https://llm-gateway.example.com";
-        let out = routers_logs(Some(upstream)).await;
-        let lines: Vec<serde_json::Value> = out
+        let logs = global_logs().tag();
+        build_routers(Some(upstream)).await;
+        let out = logs.snapshot();
+        let warnings: Vec<serde_json::Value> = out
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| matches!(line["level"].as_str(), Some("WARN" | "ERROR")))
             .collect();
-        assert_eq!(lines.len(), 1, "{out}");
-        assert_eq!(lines[0]["level"], "WARN");
-        assert_eq!(lines[0]["fields"]["upstream"], upstream);
+        assert_eq!(warnings.len(), 1, "{out}");
+        assert_eq!(warnings[0]["level"], "WARN");
+        assert_eq!(warnings[0]["fields"]["upstream"], upstream);
+
         for quiet in [None, Some(cred_proxy::DEFAULT_UPSTREAM)] {
-            let out = routers_logs(quiet).await;
-            assert!(out.is_empty(), "{quiet:?}: {out}");
+            build_routers(quiet).await;
         }
+        global_logs()
+            .snapshot()
+            .matching("forwards real credentials to proxy.upstream")
+            .assert_has(&format!("\"upstream\":\"{upstream}\""))
+            .assert_lacks(&format!(
+                "\"upstream\":\"{}\"",
+                cred_proxy::DEFAULT_UPSTREAM
+            ));
     }
 
     #[test]
