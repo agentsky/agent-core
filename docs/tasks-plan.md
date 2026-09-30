@@ -80,7 +80,7 @@ one move:
 | `render` | lib | Markdown to Slack mrkdwn and Rocket.Chat, splitting, directives. |
 | `commands` | lib | `/agent` grammar and its parsed `Command` type. Handlers live in agentd. |
 | `router` | lib | **Added.** The design has "Router and turn policy" in the architecture diagram but no crate for it. It holds pure routing, gating and credential-selection logic. |
-| `runner` | lib | stream-json driver, per-session queue, warm pool, reaping. It never calls agentd: placeholder minting and turn tokens reach it through a `TurnHooks` trait that agentd implements (T23). |
+| `runner` | lib | stream-json driver, per-session queue, warm pool, reaping. It never calls agentd: placeholder minting and agentctl tokens reach it through a `TurnHooks` trait that agentd implements (T23). |
 | `sandbox` | lib | `Sandbox` trait, Docker implementation (bollard), process implementation for tests and development. |
 | `cred-proxy` | lib | Header-swap reverse proxy and egress allowlist proxy. Served by agentd. |
 | `surface-rocketchat` | lib | REST and DDP clients, `Surface` implementation. |
@@ -180,8 +180,8 @@ description, and must pass T02's policy.
   `docker inspect` after start. The proxy and the ctl API map the source IP of
   each connection to a session, and reject any IP they don't know. Docker can
   give a dead container's IP to a new one, so mappings are revoked before a
-  container is stopped and again when Docker reports it died (T21), and turn
-  tokens are purged at startup (T15).
+  container is stopped and again when Docker reports it died (T21), and
+  agentctl tokens are purged at startup (T15).
 - agentd terminates no TLS itself. The operator puts a TLS terminator in front
   of the public listener; the README documents a Caddy example.
 
@@ -191,10 +191,18 @@ description, and must pass T02's policy.
   volume per `(agent, scope)`. Two agents in one channel never share a volume
   or its `shared/` directory.
 - The owner's DMs with their agent and the agent's private tasks use one
-  volume, `VolumeKey { agent, scope: Private }`. Its `shared/` directory holds
-  what the owner granted: repositories and memory. Sessions stay separate
-  (each mounts only its own `sessions/<id>/`), so a private task can't read the
-  owner's DM transcript, as the design requires.
+  volume, `VolumeKey { agent, scope: Private }`. Sessions stay separate (each
+  mounts only its own `sessions/<id>/`), so a private task can't read the
+  owner's DM transcript, as the design requires. Two directories on it are
+  shared across sessions:
+  - `shared/` holds what the owner granted for work: repositories and files.
+    Owner-requested sessions mount it read-write. A private task a non-owner
+    requested mounts it read-only, and the consent card says the task can read
+    it.
+  - `memory/` holds anything built from DM conversations. Only owner-requested
+    sessions mount it. A non-owner's approved task never sees it, so DM
+    context can't reach the channel through a private task, and the task
+    can't plant text in the owner's future DM sessions.
 - A non-owner's DM with an agent is a `Dm` scope with its own volume, and runs
   on the public side.
 - Channel and group DM scopes each get their own volume per agent.
@@ -313,7 +321,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T29](#t29) | Slack Web API and `Surface` | `slack-web-api` | T07, T28 | M4 |
 | [T30](#t30) | Slack manager app and configuration token | `slack-manager-app` | T13, T29 | M4 |
 | [T31](#t31) | Slack agent apps from manifests | `slack-agent-apps` | T30, T23 | M4 |
-| [T32](#t32) | Verify Slack bot-to-bot mentions | `slack-bot-mention-check` | T31 | M5 gate |
+| [T32](#t32) | Verify Slack bot-to-bot delivery | `slack-bot-mention-check` | T31 | M5 gate |
 | [T33](#t33) | Consent cards and private tasks | `private-tasks` | T26, T31 | M5 |
 | [T34](#t34) | Agent-to-agent hand-off | `agent-to-agent` | T32, T33 | M5 |
 | [T35](#t35) | Cloud hand-off (design first) | `cloud-handoff-design` | T34 | M6 |
@@ -569,8 +577,14 @@ Deliverables:
     later.
 - `fake_claude_path()`, as described in [Testing](#testing), so other crates
   can spawn the binary.
-- `fake_anthropic()`: a `wiremock` server that answers `/v1/messages` and
-  `HEAD /api/hello`, and records the headers it received.
+- `fake_anthropic()`: a `wiremock` server that records every request and its
+  headers, answers `HEAD /api/hello`, and answers `POST /v1/messages` the way
+  the real CLI needs. A request with `"stream": true` gets an SSE stream of
+  `message_start`, `content_block_start`, `content_block_delta`
+  (`text_delta`), `content_block_stop`, `message_delta` (`stop_reason:
+  end_turn`, `usage`) and `message_stop`, with the text from a script. Other
+  requests get the equivalent JSON message. The fixture is checked against
+  the real CLI in T23's Docker test.
 - A `fixtures/` directory with the `stream-json` sample lines listed in
   [Claude Code CLI](#claude-code-cli). Capture them from a real CLI with an
   unreachable base URL, as in this plan's research, and redact the paths.
@@ -634,7 +648,7 @@ Acceptance:
 - The migration applies to an empty database and is idempotent.
 
 Out of scope: every other table. Each task that needs one adds its own
-migration: agents and bindings (T14), turn tokens and scope locks (T15),
+migration: agents and bindings (T14), agentctl tokens and scope locks (T15),
 volumes (T17), sessions (T21), message refs (T23), community settings (T26),
 usage, policies, bans and thread usage (T27), Slack configuration tokens
 (T30), consents (T33).
@@ -1059,22 +1073,33 @@ Deliverables:
   "statically linked"). agentctl has no TLS and no C dependencies, so the
   target needs no extra system packages. The job is added to `ci-passed`.
 - The ctl API server in agentd, `crates/agentd/src/ctl/`, on the ctl listener:
-  - Bearer token auth. Tokens are 32 random bytes stored as a SHA-256 hash in a
-    new `turn_tokens` table (`hash`, `session_id`, `turn_id`, `agent_id`,
-    `scope_key`, `requester`, `hop`, `kind`, `container_ip`, `expires_at`).
-    That table's migration belongs to this task. agentd deletes every row at
-    startup: containers from before a restart are reaped (T17), and Docker can
-    give their IPs to new containers.
-  - The connection's source IP must match `container_ip`.
-  - `issue_turn_token(...)` and `revoke_turn_token(...)` for the runner.
+  - Bearer token auth, one token per `claude` process. A warm process is fed
+    turns over stdin and its environment is fixed at start, so a token issued
+    per turn could never reach it. Instead agentd tracks the current turn on
+    the server, and a token authorizes nothing between turns. That gives the
+    design's "expires with the turn" for everything the token can do; the PR
+    notes it in the design's `agentctl` paragraph.
+  - Tokens are 32 random bytes, stored as a SHA-256 hash in a new
+    `ctl_tokens` table (`hash`, `session_id`, `agent_id`, `volume_key`,
+    `container_ip`, and the current turn: `turn_id`, `requester`, `hop`,
+    `kind`, `side`, nullable). That table's migration belongs to this task.
+    agentd deletes every row at startup: containers from before a restart are
+    reaped (T17), and Docker can give their IPs to new containers.
+  - The connection's source IP must match `container_ip`, and `turn_id` must
+    be set. Otherwise the request is refused.
+  - `issue_process_token(...)`, `begin_turn(token, turn)`, `end_turn(token)`
+    and `revoke_process_token(...)`, called through T21's hooks.
   - Handlers write to a per-turn outbox (attachments staged on disk under the
     agentd data directory, reactions and posts queued) that the turn pipeline
     (T23) drains.
-  - Target rules, checked when the request arrives:
-    - On the public side (any turn a non-owner requested), `post` may target
-      only the current conversation, and `react` only messages in it.
-    - On the owner side, `post` may target any conversation the agent is bound
-      in and the owner is a member of.
+  - Target rules, checked when the request arrives, from the turn's `side`
+    (T22's `Decision.side`, stored at `begin_turn`):
+    - `Public` (every channel turn, the owner's included, since channel text
+      is untrusted): `post` may target only the current conversation, and
+      `react` only messages in it.
+    - `Owner` (the owner's DMs and owner-requested private tasks): `post` may
+      target any conversation the agent's bot is a member of. The surface
+      refuses the rest.
     - Anything else is refused with a reason the model can read.
   - `history` calls `Surface::history`.
   - `ask-agent` and `private` return "not available yet" until T33 and T34.
@@ -1083,8 +1108,8 @@ Deliverables:
 
 Acceptance:
 
-- Tests for token hashing, expiry, IP binding, the startup purge, refusal
-  inside private tasks, each target rule, and a `lock` lease that a second
+- Tests for token hashing, IP binding, refusal between turns, the startup
+  purge, refusal inside private tasks, each target rule, and a `lock` lease that a second
   session waits for and that expires when its holder dies.
 - `agentctl` against the server for each subcommand, through the `fake-claude`
   script path from T04.
@@ -1127,7 +1152,8 @@ Deliverables:
   3. Configure agentd.
   4. Run the live checks listed in T11, T14 and T23.
 - CI: a job that builds both images (no push) when `images/**` or the Rust code
-  changes, added to `ci-passed`.
+  changes, added to `ci-passed`. The same job runs this task's image and
+  network tests below; T17's `docker-tests` job comes later.
 
 Acceptance:
 
@@ -1173,7 +1199,9 @@ Deliverables:
   config` is a pure function with unit tests, and the rest is a thin sender:
   - The pinned image, as user 10001.
   - `sessions/<id>/` mounted read-write at `/volume/sessions/<id>`, `shared/`
-    at `/volume/shared`, skills read-only at
+    at `/volume/shared` (read-write or read-only, per `SessionSpec`),
+    `memory/` at `/volume/memory` when `SessionSpec` asks for it (see
+    [Volumes and scopes](#volumes-and-scopes)), skills read-only at
     `/volume/sessions/<id>/claude/skills`, and the agent's persona directory
     read-only at `/agent`.
   - `HOME` and `TMPDIR` point into the session's `home/` and `tmp/`
@@ -1194,7 +1222,7 @@ Deliverables:
   given environment and working directory, and `ip` returns `127.0.0.1`. It
   isolates nothing, and says so in its rustdoc.
 - `reap_orphans()` at startup: stop every container labeled `agentd.session`.
-  Placeholder mappings and turn tokens don't survive a restart, so no
+  Placeholder mappings and agentctl tokens don't survive a restart, so no
   container from before one can be used.
 - A CI job `docker-tests`, added to `ci-passed`. It runs
   `cargo test --workspace -- --ignored docker_` on ubuntu-24.04, when code
@@ -1213,6 +1241,8 @@ Acceptance:
   - A session can't see another session's directory.
   - `shared/` is visible.
   - Skills and the persona are read-only.
+  - `shared/` is read-only when `SessionSpec` says so, and `memory/` is
+    absent unless requested.
   - It runs as a non-root user.
   - `HOME` and `/tmp` are writable, and a script in `/tmp` runs.
   - The internet is unreachable: `curl https://example.com` fails.
@@ -1245,7 +1275,8 @@ Deliverables:
     IP, is pointed at a credential, and the header kind matches the placeholder
     kind.
   - Replaces only that header's value: a subscription credential from
-    `TokenSource`, or the community API key.
+    `TokenSource`, or the community API key from a `CommunityKey` trait.
+    T26 implements it over the store; until then tests use a fixed key.
   - Leaves the body and every other header untouched, and streams request and
     response bodies (SSE) without buffering.
   - Answers `HEAD /api/hello` locally with 200.
@@ -1327,9 +1358,9 @@ Deliverables:
     `--append-system-prompt-file <persona path>`.
   - `--model <m>` when the router chose one.
   - The environment from the design's credential proxy block, plus
-    `HOME` and `TMPDIR` from `Container::paths()`. The placeholder,
-    `AGENTCTL_TOKEN` and the egress proxy variables come from the caller in
-    `LaunchSpec.env`. The runner doesn't know how they are made.
+    `HOME` and `TMPDIR` from `Container::paths()`. The placeholder, the
+    process's `AGENTCTL_TOKEN` and the egress proxy variables come from the
+    caller in `LaunchSpec.env`. The runner doesn't know how they are made.
 - `send_turn(user_message) -> TurnOutcome`. It writes one stream-json user line
   and reads lines until `type == "result"`. The outcome carries:
   - `is_error`, `result` text, `terminal_reason`, `api_error_status`.
@@ -1381,11 +1412,12 @@ Deliverables:
     doesn't collide with its replacement.
 - The `TurnHooks` trait, the runner's only way out:
   - `process_starting(session, container_ip, kind) -> ProcessEnv`, which
-    returns the placeholder and proxy variables for `LaunchSpec.env`.
-  - `turn_starting(session, &TurnRequest) -> TurnEnv`, which points the
-    placeholder at the turn's credential and returns the turn token.
-  - `turn_finished(session, turn)`, which revokes the turn token.
-  - `process_stopping(session)`, which revokes the placeholder. It is called
+    returns the placeholder, the agentctl token and the proxy variables for
+    `LaunchSpec.env`.
+  - `turn_starting(session, &TurnRequest)`, which points the placeholder at
+    the turn's credential and records the turn on the agentctl token.
+  - `turn_finished(session, turn)`, which clears the turn from the token.
+  - `process_stopping(session)`, which revokes the placeholder and the token. It is called
     before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.
 - `SessionManager`:
@@ -1460,7 +1492,8 @@ Deliverables:
   - Managed bot that doesn't mention the agent, ignored.
   - Managed bot that mentions the agent inherits requester and hop plus one.
   - Human, not addressed, ignored.
-  - Owner in a DM, owner credential on the owner side.
+  - Owner in a DM, owner credential on the owner side, `ScopeKind::Private`
+    (so the agent's `Private` volume).
   - Owner in a channel, owner credential on the public side.
   - Linked non-owner, requester credential, channel scope.
   - Unlinked with the community key, community credential.
@@ -1487,7 +1520,8 @@ Design: [Architecture](design.md#architecture),
 Deliverables:
 
 - A migration `…_message_refs.sql`: `message_refs` (`session_id`,
-  `short_id` per session, `surface`, `platform_ref`, `agent_id` nullable,
+  `short_id` per session, `surface`, `team_id`, `conversation`,
+  `platform_ref`, `agent_id` nullable,
   `turn_id` nullable, `requester_member`, `requester_key`, `hop`,
   `posted_at`), unique on `(surface, team_id, conversation, platform_ref)`,
   since a Slack `ts` is unique only within a channel. Rows exist for every
@@ -1495,7 +1529,7 @@ Deliverables:
   ids resolve.
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, sets the egress proxy variables from
-  T19, and issues and revokes turn tokens with T15.
+  T19, and issues agentctl tokens and records their turns with T15.
 - `crates/agentd/src/pipeline/`:
   1. Receive `InboundEvent`s from every surface.
   2. For each candidate agent, call `router::route` with a store-backed
@@ -1547,12 +1581,16 @@ Acceptance:
   - A human reply in a thread whose root the agent posted, without a mention,
     starts a turn.
   - A queued `agentctl post` to the current conversation is delivered.
+- The `docker-tests` job (T17) gains a step that builds T16's sandbox image
+  first.
 - A Docker test (`docker_real_claude_starts`) with T16's image and T17's
   container configuration: the real `claude` starts on a read-only root,
   resumes a session through the proxy, and writes its transcript where
   [Claude Code CLI](#claude-code-cli) says. It uses a test network that is
   not internal, and `host-gateway` to reach the proxy and `fake_anthropic()`
-  in the test process, so it needs no account.
+  in the test process, so it needs no account. It asserts that the fake saw
+  every request the CLI made, through the proxy. Blocking direct side traffic
+  is T17's and T16's network tests' job, since this network isn't internal.
 
 Live check (manual, recorded in the PR): with the Compose stack from T16 and a
 real linked account, mention an agent in a channel on Rocket.Chat, run a turn
@@ -1718,18 +1756,20 @@ Deliverables:
 - Every request is acknowledged within 3 seconds. Handlers enqueue and return
   200 at once. Slash commands and interactivity return an empty 200 and reply
   later through `response_url`.
-- Deduplication by `event_id` through `store.mark_event_processed("slack",
-  event_id)`. `X-Slack-Retry-Num` is logged.
+- Deduplication per binding: `store.mark_event_processed("slack:<binding>",
+  event_id)` drops retries, and a second key, `(binding, channel, ts)`, drops
+  a message that reached the same app twice. `X-Slack-Retry-Num` is logged.
 - Normalization to `InboundEvent`:
-  - `app_mention`, `message.im` and `message.mpim`, plus `message.channels`
-    and `message.groups` for replies in threads. A channel message without a
-    mention that isn't a thread reply is dropped here. Agent apps subscribe to
-    the channel message events because otherwise Slack never delivers a reply
-    to the agent's own message that doesn't mention it. The design's gating
-    counts such replies.
-  - A message that both mentions the app and is a thread reply arrives twice,
-    as `app_mention` and as `message.channels`. The two are deduplicated per
-    binding by `(channel, ts)`.
+  - Agent apps take every message from `message.channels`,
+    `message.groups`, `message.im` and `message.mpim`, and don't subscribe to
+    `app_mention`. `app_mention` can't deliver a reply to the agent's own
+    message that doesn't mention it, which the design's gating counts. The
+    message events carry mentions too, and subscribing to both would deliver
+    every mention twice. Mentions are read from the text, as below.
+  - A channel message that neither mentions the app's bot user nor is a
+    thread reply is dropped here.
+  - This PR updates the design's identities table ("How the bot hears it")
+    to match.
   - `message` subtypes other than none, `file_share` and `thread_broadcast`
     are ignored.
   - `thread_ts` becomes `thread_root` and `reply_to`.
@@ -1764,8 +1804,8 @@ Deliverables:
   - `chat.update`, `chat.postEphemeral`, `reactions.add` and
     `reactions.remove`.
   - `conversations.replies` and `conversations.history`, `conversations.info`
-    and `conversations.join` (public channels only; the design requires
-    membership for `app_mention`).
+    and `conversations.join` (public channels only; an app hears only the
+    channels its bot user is in).
   - `users.info`, `users.list` (paginated), `bots.info`, `auth.test`.
   - The file upload flow: `files.getUploadURLExternal`, then upload, then
     `files.completeUploadExternal` with `channel_id` and `thread_ts`.
@@ -1803,7 +1843,7 @@ Deliverables:
   - Interactivity, events and command request URLs under
     `/slack/b/manager/…`, with the public URL substituted.
   - Scopes: `commands`, `chat:write`, `im:write`, `im:history`,
-    `users:read`, `files:read`, `app_mentions:read`.
+    `users:read`, `files:read`.
   - Bot events: `message.im` (commands and file uploads in the manager DM)
     and `user_change` (to notice members who leave).
   - `README.md` steps to install it once per workspace and put its
@@ -1849,9 +1889,9 @@ Deliverables:
 - A generated agent manifest:
   - The bot user display name is the agent name.
   - No slash commands.
-  - Bot events `app_mention`, `message.im`, `message.mpim`,
-    `message.channels` and `message.groups` (T28 explains the last two).
-  - Scopes: `app_mentions:read`, `chat:write`, `chat:write.public` (off by
+  - Bot events `message.channels`, `message.groups`, `message.im` and
+    `message.mpim` (T28 explains why not `app_mention`).
+  - Scopes: `chat:write`, `chat:write.public` (off by
     default, a configuration switch), `channels:history`, `groups:history`,
     `im:history`, `mpim:history`, `im:write`, `reactions:write`,
     `files:read`, `files:write`, `users:read`, `channels:join`.
@@ -1888,8 +1928,8 @@ Deliverables:
 Acceptance: wiremock tests for the full create, install and callback
 sequence (including a challenge answered while the binding is `creating`),
 the pending-install reminder, delete, a callback with a forged or replayed
-state refused, and a pipeline test where a Slack `app_mention` produces a reply
-posted with the agent's bot token.
+state refused, and a pipeline test where a Slack channel message mentioning
+the agent produces a reply posted with the agent's bot token.
 
 Live check (manual): on the Slack development workspace, create two agents,
 install them, invite them to a channel, mention each, and get replies. That
@@ -1899,20 +1939,23 @@ completes design milestone 4.
 
 ### T32
 
-**Verify Slack bot-to-bot mentions.** Branch `claude/slack-bot-mention-check`.
+**Verify Slack bot-to-bot delivery.** Branch `claude/slack-bot-mention-check`.
 Depends on T31. Docs-only PR, and a gate for T34's Slack half.
 
 Design: [Chat identities and mentions](design.md#chat-identities-and-mentions)
 (the "expected but not yet verified" row), [Milestones](design.md#milestones)
-item 5.
+item 5. T28 moved agent apps from `app_mention` to the `message.*` events, so
+the open question becomes whether those deliver one app's bot posts to
+another app.
 
 Deliverables:
 
 - A live experiment on the Slack development workspace, using two agent apps
   from T31:
-  1. Agent A posts `<@B>` in a channel both are in, and in a thread.
-  2. Record whether B's app receives `app_mention`, with which `subtype`,
-     `bot_id` and `user` fields. Redact the payload.
+  1. Agent A posts `<@B>` in a channel both are in, at top level and in a
+     thread.
+  2. Record whether B's app receives the `message.channels` event, with which
+     `subtype`, `bot_id` and `user` fields. Redact the payload.
 - Update `docs/design.md`: the table row, the open question, and footnote
   `slack-botmention`, with the result and date.
 - If Slack doesn't deliver it, propose the fallback in the same PR, and change
@@ -1961,8 +2004,12 @@ Deliverables:
   2. The turn message is only the task text plus the staged attachments,
      copied into the session's work directory. No thread transcript.
   3. The credential is the owner's.
-  4. The turn token has `TurnKind::PrivateTask`, so agentctl allows only
-     `attach` (T15's rule).
+  4. Mounts follow [Volumes and scopes](#volumes-and-scopes): a task the owner
+     requested gets `shared/` read-write and `memory/`. A task a non-owner
+     requested gets `shared/` read-only and no `memory/`, and its consent card
+     says it can read the owner's shared files.
+  5. The turn recorded on the agentctl token has `TurnKind::PrivateTask`, so
+     agentctl allows only `attach` (T15's rule).
 - Delivery: the final reply and attached files are posted to the recorded
   thread as a new message from the agent. Its `message_refs` row carries the
   original requester and hop. Declined and expired outcomes are posted the same
@@ -1984,6 +2031,7 @@ Acceptance, as tests named after the design's rules:
 - `result_message_ref_inherits_requester_and_hop`.
 - `only_owner_can_decide`.
 - `channel_volume_never_mounts_private_paths`.
+- `non_owner_task_gets_read_only_shared_and_no_memory`.
 
 ### T34
 
