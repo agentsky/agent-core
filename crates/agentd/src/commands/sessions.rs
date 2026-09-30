@@ -38,11 +38,13 @@
 //! [`Store::sessions_in_use`]: store::Store::sessions_in_use
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::task::Poll;
 
 use async_trait::async_trait;
 use core_types::{ConvRef, ConversationId, MemberKey, ScopeKey, SessionId, SurfaceKind};
+use futures::future::{self, Future};
 use runner::{RunnerError, SessionManager, TurnHooks};
 use store::{Session, SessionKind};
 use surface_rocketchat::rest::RoomType;
@@ -243,7 +245,7 @@ impl Commands {
         }
         let count = ids.len();
         let mut resets = Box::pin(self.clone().reset_all(control, ids));
-        let queued = futures::poll!(tokio::task::unconstrained(resets.as_mut()));
+        let queued = futures::poll!(resets.as_mut());
         let place = if here { " here" } else { "" };
         let reply = if count == 1 {
             format!(
@@ -308,22 +310,34 @@ impl Commands {
         }
     }
 
-    /// Resets the sessions `ids`, all at once, so each joins its session's
-    /// queue as soon as this is first polled.
+    /// Resets the sessions `ids`, all at once. The first poll polls every
+    /// reset once, outside tokio's cooperative budget, so each joins its
+    /// session's queue before that poll returns.
     async fn reset_all(
         self,
         control: Option<Arc<dyn SessionControl>>,
         ids: Vec<SessionId>,
     ) -> Resets {
-        let results = futures::future::join_all(
-            ids.into_iter()
-                .map(|id| self.reset_one(control.as_deref(), id)),
-        )
+        let mut resets: Vec<_> = ids
+            .into_iter()
+            .map(|id| future::maybe_done(Box::pin(self.reset_one(control.as_deref(), id))))
+            .collect();
+        tokio::task::unconstrained(future::poll_fn(|cx| {
+            for reset in &mut resets {
+                _ = Pin::new(reset).poll(cx);
+            }
+            Poll::Ready(())
+        }))
         .await;
-        let done = results.iter().filter(|done| **done).count();
+        future::join_all(resets.iter_mut()).await;
+        let done = resets
+            .iter_mut()
+            .filter_map(|reset| Pin::new(reset).take_output())
+            .filter(|done| *done)
+            .count();
         Resets {
             done,
-            failed: results.len() - done,
+            failed: resets.len() - done,
         }
     }
 

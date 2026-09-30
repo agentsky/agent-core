@@ -5201,25 +5201,28 @@ was then wiped. Waiting for every reset before replying also held up the
 owner's later commands, which the intake runs one at a time (T13), and
 could outlast a Slack `response_url`, which expires after 30 minutes.
 
-**Solution.** Every reset is issued at once (`join_all`) and polled once
-before the reply, so each is queued on its session before the owner reads
-"Resetting". That poll runs under `tokio::task::unconstrained`: Tokio's
-cooperative budget allows 128 operations per task poll (tokio 1.53), each
-lock taken on an idle session spends one, and once it is spent a lock
-returns `Pending` before joining the mutex's queue, so a plain poll left
-every idle session past about the 128th out of its queue until after the
-reply.
+**Solution.** Every reset is issued at once and polled once before the
+reply, so each is queued on its session before the owner reads
+"Resetting". The first poll of `reset_all` polls every reset future itself,
+in a plain loop, and only then awaits them all with `join_all`. That loop
+runs under `tokio::task::unconstrained`: Tokio's cooperative budget allows
+128 operations per task poll (tokio 1.53), each lock taken on an idle
+session spends one, and once it is spent a lock returns `Pending` before
+joining the mutex's queue, so a plain poll left every idle session past
+about the 128th out of its queue until after the reply.
 
-The guarantee also relies on that first poll not stopping early.
-`join_all` drives more than 30 futures through `FuturesOrdered`, whose
-`FuturesUnordered` returns `Pending` once two futures have woken themselves
-while being polled (`yielded >= 2`, futures 0.3.34). `unconstrained`
-removes the cause that hit every big reset, the cooperative budget. A rare
-case remains: a reset is woken inside its own poll when its session's lock
-is handed over, its spawned task ends, or a store permit is let go on
-another worker between it registering its waker and returning `Pending`.
-Two of those in one poll leave the resets after them to join their queues
-on the next poll, after the reply. The first poll never yields: for 10,000
+The loop polls every reset whatever the others do, so every reset has
+joined its session's queue when the first poll returns, without exception.
+`join_all` alone didn't promise that: it drives more than 30 futures
+through `FuturesOrdered`, whose `FuturesUnordered` returns `Pending` once
+two futures have woken themselves while being polled (`yielded >= 2`,
+futures 0.3.34), and leaves the rest for the next poll, after the reply. A
+reset is woken inside its own poll when its session's lock is handed over,
+its spawned task ends, or a store permit is let go on another worker
+between it registering its waker and returning `Pending`. The agentd
+test's fake runner wakes itself once in every reset's first poll: with
+`join_all` alone 2 of 200 resets held their session before the reply, and
+without `unconstrained` 128. The first poll never yields: for 10,000
 sessions it took 71-75 ms with a runner (a slot lock and a spawned task
 each) and 18-19 ms without one, in a debug build on a loaded machine, two
 runs each, holding one worker thread that long.
@@ -5239,11 +5242,12 @@ Stopping a container never used the pool and is bounded by
 stop as well, about 10 seconds or 120 with a degraded Docker daemon, which
 held up every other reset, cold ones and other owners' too, each holding
 its session meanwhile, so turns queued there filled the pipeline's
-`max_pending` and `evict_idle` couldn't free their containers. `SessionManager::reset` stops the container and then
-writes, with the session held, so the reset is already queued while it
-waits for a permit, and it waits on no other session while it holds one. A
-turn sent to a session whose reset waits for a permit waits for it, as it
-would for the reset itself.
+`max_pending` and `evict_idle` couldn't free their containers.
+`SessionManager::reset` stops the container and then writes, with the
+session held, so the reset is already queued while it waits for a permit,
+and it waits on no other session while it holds one. A turn sent to a
+session whose reset waits for a permit waits for it, as it would for the
+reset itself.
 
 SQLite has one writer, so more permits add no throughput and only park
 more of the pool's connections in the busy handler. A throwaway probe
@@ -5264,13 +5268,16 @@ do while a write is open, so it waits only for a connection, and both caps
 leave it some; 2 leaves 8 of the 10 free rather than 2. An unrelated write
 still waits about half a second at p99: SQLite's busy handler retries after
 sleeps of up to 100 ms and loses to resets that write back to back, which
-no cap on resets alone makes fair.
+no cap on resets alone makes fair. A single reset can queue for a permit
+behind another owner's mass reset: at these rates one of about 10,000
+sessions holds the permits for 20-25 seconds. That is accepted.
 
 Waiting for the resets to end is the command's `FollowUp`: the intake
 releases the member's command order once the reply is sent and then runs
-the follow-up in the same task, so the owner's next command goes ahead. If a reset fails (a container that can't be
-stopped isn't reset, T21), the owner is told in a direct message from the
-manager bot, with the command to send again. At shutdown the intake waits
+the follow-up in the same task, so the owner's next command goes ahead. If
+a reset fails (a container that can't be stopped isn't reset, T21), the
+owner is told in a direct message from the manager bot, with the command
+to send again. At shutdown the intake waits
 for follow-ups as for commands, within the drain; one still waiting when the
 drain ends is dropped with the intake's tasks. A reset still queued behind
 its session's turns then leaves the queue without resetting. One that holds

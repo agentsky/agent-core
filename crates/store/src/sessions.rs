@@ -717,6 +717,14 @@ mod tests {
             .execute(&mut writer)
             .await
             .unwrap();
+        let settled = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while usize::try_from(store.pool.size()).unwrap() > store.pool.num_idle() {
+            assert!(
+                tokio::time::Instant::now() < settled,
+                "the setup's connections go back to the pool"
+            );
+            tokio::task::yield_now().await;
+        }
         let resets: Vec<_> = ids
             .into_iter()
             .map(|id| {

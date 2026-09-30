@@ -820,41 +820,27 @@ async fn reset_starts_with_a_new_id() {
 }
 
 #[tokio::test]
-async fn a_reset_holds_its_session_until_a_permit_is_free() {
+async fn a_reset_holds_its_session_while_its_store_write_waits() {
     let h = Harness::new(&[Turn::reply("old")]).await;
     let warm = h.thread_session("1.1").await;
     reply(&h.run(warm.id, request("one")).await);
-    let mut cold = Vec::new();
-    for n in 0..store::RESETS_AT_ONCE {
-        cold.push(h.thread_session(&format!("2.{n}")).await.id);
-    }
     let mut writer = h.lock_writes().await;
-    let mut resets = Vec::new();
-    for session in cold {
-        let mut reset = Box::pin(h.manager.reset(session));
-        assert!(futures::poll!(reset.as_mut()).is_pending());
-        resets.push(reset);
-    }
-    tokio::task::yield_now().await;
     let mut reset = Box::pin(h.manager.reset(warm.id));
     assert!(futures::poll!(reset.as_mut()).is_pending());
-    eventually("the container stops while every permit is taken", || {
+    eventually("the container stops while the store is locked", || {
         h.events().contains(&Event::ContainerStopped(warm.id))
     })
     .await;
     let mut turn = Box::pin(h.manager.run_turn(warm.id, request("two")));
     assert!(
         futures::poll!(turn.as_mut()).is_pending(),
-        "a turn sent while the reset waits for a permit waits behind it"
+        "a turn sent while the reset waits for the store waits behind it"
     );
     assert_eq!(
         h.store.session(warm.id).await.unwrap().unwrap().reset_at,
         None
     );
     sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
-    for cold in resets {
-        assert!(cold.await.unwrap().is_some());
-    }
     assert!(reset.await.unwrap().is_some());
     assert!(matches!(turn.await, Err(RunnerError::SessionReset)));
 }

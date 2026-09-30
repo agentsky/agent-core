@@ -1037,8 +1037,10 @@ async fn agent_commands_without_rocketchat_agents() {
 }
 
 /// A runner for the session commands: warm sessions are listed, and a
-/// reset holds its session's lock, then goes to the store once the gate
-/// lets it through, except for sessions whose sandbox won't stop.
+/// reset holds its session's lock, wakes itself and yields once, which
+/// makes a `FuturesUnordered` stop polling the others after two, then goes
+/// to the store once the gate lets it through, except for sessions whose
+/// sandbox won't stop.
 struct FakeRunner {
     store: Store,
     mock: Arc<MockSurface>,
@@ -1109,6 +1111,16 @@ impl SessionControl for FakeRunner {
         let _held = slot.lock_owned().await;
         let posts = self.mock.posts().len();
         self.resets.lock().unwrap().push((session, posts));
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return std::task::Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
         self.gate.acquire().await.unwrap().forget();
         if self.stuck.lock().unwrap().contains(&session) {
             return Err(sandbox::SandboxError::NotFound.into());
