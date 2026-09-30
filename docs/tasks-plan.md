@@ -222,8 +222,8 @@ description, and must pass T02's policy.
   a build argument (2.1.285 when this plan was written). It uses the native
   installer, not npm, so the image has no Node.js.
 - The stream-json output shapes the runner relies on, observed on 2.1.285:
-  - `{"type":"system","subtype":"init",…}` at start, with `session_id`,
-    `model` and `tools`.
+  - `{"type":"system","subtype":"init",…}` at the start of every turn, not
+    only once per process, with `session_id`, `model` and `tools`.
   - `{"type":"assistant","message":{…}}` and `{"type":"user",…}` during the
     turn.
   - A final `{"type":"result",…}` line with `subtype`, `is_error`, `result`,
@@ -232,13 +232,18 @@ description, and must pass T02's policy.
     `is_error` decides failure, not `subtype`. An unreachable upstream produced
     `subtype: "success"` with `is_error: true` and
     `terminal_reason: "api_error"`.
-  - Other line types, such as `active_goal`, `autocompact_state` and
-    `system/commands_changed`, appear too and must be ignored. Parse every line
+  - Other line types, such as `rate_limit_event`, `system/api_retry`,
+    `active_goal`, `autocompact_state` and `system/commands_changed`, appear
+    too and must be ignored. Parse every line
     leniently: unknown `type` values are skipped, and unknown fields are
     allowed.
 - The transcript lands at
   `$CLAUDE_CONFIG_DIR/projects/$CLAUDE_CODE_PROJECT_DIR_NAME/<session id>.jsonl`
-  (verified on 2.1.285).
+  (verified on 2.1.285). It is created by the first user message, not when
+  the process starts, so a process stopped before its first turn leaves no
+  transcript to `--resume` ([impl-notes](impl-notes.md#t04-testkit)).
+- With both `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` set, the CLI
+  sends the API key. The runner sets exactly one of them.
 - Input is one JSON object per line:
   `{"type":"user","message":{"role":"user","content":"…"}}`.
 
@@ -261,8 +266,10 @@ description, and must pass T02's policy.
   sets `CARGO_BIN_EXE_<name>` for a package's own integration tests. The helper
   runs `$CARGO build -p testkit --bin fake-claude --message-format=json` once
   per test process and reads the executable path from the artifact message.
-  That respects whatever target directory is in effect, including
-  `cargo llvm-cov`'s.
+  It passes `--target-dir` with the directory the running test executable
+  was built in, because `cargo llvm-cov` names its target directory on the
+  command line, where a nested cargo can't see it
+  ([impl-notes](impl-notes.md#fake_claude_path-built-outside-cargo-llvm-covs-target-directory)).
 - Tests that need Docker are named `docker_*` and marked
   `#[ignore = "needs docker"]`. CI runs them with
   `cargo test --workspace -- --ignored docker_` in a separate job (added in
@@ -633,9 +640,10 @@ Deliverables:
   - With `--session-id`, fails if the transcript already exists. With
     `--resume`, fails if it doesn't.
   - Reads stream-json user lines from stdin. For each, it sends
-    `POST $ANTHROPIC_BASE_URL/v1/messages` with `Authorization: Bearer
-    $CLAUDE_CODE_OAUTH_TOKEN`, or `x-api-key: $ANTHROPIC_API_KEY` when only
-    that is set, and expects a 200.
+    `POST $ANTHROPIC_BASE_URL/v1/messages` with `x-api-key:
+    $ANTHROPIC_API_KEY` when that is set, and `Authorization: Bearer
+    $CLAUDE_CODE_OAUTH_TOKEN` otherwise, as the real CLI does, and expects
+    a 200.
   - Emits the `init`, `assistant` and `result` lines from the script file named
     by `FAKE_CLAUDE_SCRIPT` (JSON: a list of turns, each with reply text,
     `is_error`, optional delay, optional crash).

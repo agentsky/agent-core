@@ -297,3 +297,87 @@ line is still scanned. Names are passed to the directory as written;
 `MentionDirectory` implementations own case folding. The scanner lives in
 `render::mention` so T07's Rocket.Chat renderer can reuse it with its own
 broadcast names.
+
+## T04: testkit
+
+### `fake_claude_path` built outside `cargo llvm-cov`'s target directory
+
+**Issue.** The plan expected a nested `$CARGO build` to respect "whatever
+target directory is in effect, including `cargo llvm-cov`'s". It doesn't.
+`cargo llvm-cov` passes `--target-dir target/llvm-cov-target` on cargo's
+command line, and a test process sees only the environment, which does carry
+`cargo llvm-cov`'s `RUSTC_WRAPPER`. The nested build therefore went to
+`target/debug`, instrumented, where no coverage report looks and where it
+disturbs the next plain build. `fake-claude.rs` showed 3.7% line coverage and
+pulled the workspace under the 85% gate.
+
+**Solution.** `fake_claude_path()` finds the directory the running test
+executable was built in (its nearest ancestor with cargo's `CACHEDIR.TAG`)
+and passes it as `--target-dir`. With the inherited wrapper environment the
+nested build then matches the outer one: a workspace run reuses the binary
+it already built, and a run that didn't build it builds it instrumented in
+the same place. `fake-claude.rs` is now at 96% line coverage. The plan's
+Testing section says so.
+
+### Clearing the environment loses `fake-claude`'s coverage
+
+**Issue.** Under `cargo llvm-cov`, `fake-claude` is instrumented and writes
+its profile where `LLVM_PROFILE_FILE` says. A test that starts it with
+`env_clear()`, as a runner passing an explicit launch environment would,
+drops that variable: the counts are lost and `default.profraw` lands in the
+child's working directory.
+
+**Solution.** testkit's own tests pass `LLVM_PROFILE_FILE` through when it is
+set, and `fake_claude_path()`'s rustdoc tells other crates to do the same
+(T17's `ProcessSandbox`, T20, T21).
+
+### The real CLI prefers `ANTHROPIC_API_KEY`
+
+**Issue.** T04 said `fake-claude` sends `Authorization: Bearer` from
+`CLAUDE_CODE_OAUTH_TOKEN`, and `x-api-key` only when the API key is the only
+credential. Against a local capture server, Claude Code 2.1.285 with both
+variables set sent only `x-api-key` and reported `apiKeySource:
+"ANTHROPIC_API_KEY"`.
+
+**Solution.** `fake-claude` does the same, and its `init` line reports
+`apiKeySource` like the real one. The T04 bullet and the plan's Claude Code
+CLI section say so, and note that the runner sets exactly one of the two.
+
+### What capturing the fixtures showed
+
+**Issue.** Capturing with an unreachable `ANTHROPIC_BASE_URL`, as the plan
+describes, gave ten `system/api_retry` lines and no result within two
+minutes: the CLI retries with backoff. It also left open how the CLI behaves
+on the paths `fake-claude` imitates.
+
+**Solution.** The captures set `CLAUDE_CODE_MAX_RETRIES=0` (and `IS_SANDBOX=1`,
+since the capture ran as root and `bypassPermissions` refuses root otherwise).
+Two captures ran against a local server that answers with the same SSE
+stream as `fake_anthropic()`, which the CLI accepted, with `--session-id`
+and then `--resume`. `fake-claude` follows what they showed:
+
+- `system/init` starts every turn, not only the process. The plan's Claude
+  Code CLI section now says so.
+- The transcript appears with the first user message, not at start. A
+  process reaped before its first turn leaves nothing to `--resume`, so T21
+  should mark a session started only after a turn.
+- `--session-id` with an existing transcript prints `Error: Session ID … is
+  already in use.` to stderr and exits 1. `--resume` without one prints `No
+  conversation found with session ID: …` and a `result` line with `subtype:
+  "error_during_execution"` and an `errors` list, but no `result`,
+  `terminal_reason` or `api_error_status`, then exits 1. Unknown flags and
+  both session flags also exit 1 on the real CLI; `fake-claude` keeps the
+  plan's status 2 for them so tests can tell usage errors apart.
+- Requests go to `/v1/messages?beta=true`, so T18's proxy must forward the
+  query string. The CLI also sends `HEAD /api/hello` before the first
+  request of each process, and an `x-claude-code-session-id` header.
+- A 401 gives `api_error_status: 401` and a synthetic assistant message with
+  `error: "authentication_failed"`. The CLI exits 1 when its last result was
+  an error and 0 otherwise.
+- `rate_limit_event` lines appear after a streamed reply. The
+  `active_goal`, `autocompact_state` and `system/commands_changed` lines the
+  plan lists didn't appear in these short runs; the fixtures hold only what
+  was captured.
+
+Absolute paths in the captures are rewritten to the sandbox layout
+(`/volume/sessions/<id>/work` and `…/claude`).
