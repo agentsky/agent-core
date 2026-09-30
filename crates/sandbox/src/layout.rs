@@ -11,29 +11,40 @@
 //!     memory/                              Private volumes only
 //! ```
 //!
-//! agentd runs as the sandbox user, so the agent can rename, replace or
-//! remove anything inside its session directory, and inside `shared/` and
-//! `memory/`. Host-side code here therefore never follows a symlink there:
-//! an entry that should be a directory but is a symlink or a file is
-//! replaced, and `settings.json` is written to a new file and renamed into
-//! place. The directories above those mounts (`volumes/`, the volume and
-//! its `sessions/`) are reachable from no sandbox, so they are only
-//! created, never replaced.
+//! agentd runs as the sandbox user, so the agent can rename, replace,
+//! remove or `chmod` anything inside its session directory, and inside
+//! `shared/` and `memory/`. Host-side code here therefore never follows a
+//! symlink there: an entry that should be a directory but is a symlink or
+//! a file is replaced, each of those directories is given back to the
+//! sandbox user with mode `0755`, and `settings.json` is written to a new
+//! file and renamed into place. The directories above those mounts
+//! (`volumes/`, the volume and its `sessions/`) are reachable from no
+//! sandbox, so they are only created, never replaced.
+//!
+//! Inside the session directory every step goes through handles: the
+//! session directory is opened once, each entry is looked up, replaced and
+//! opened relative to its parent's handle, with `O_NOFOLLOW`, and the
+//! `claude/` handle is where `settings.json` and `claude/skills` are
+//! written. A handle is opened with `O_PATH`, which needs no permission on
+//! the directory itself, so a directory the agent made mode `0` can still
+//! be repaired. Linux has no `fchmod` for an `O_PATH` handle, so modes,
+//! owners and recursive removals go through `/proc/self/fd/<handle>`,
+//! which names the handle's directory and not whatever its path names
+//! now.
 //!
 //! The repair runs only in [`Sandbox::start`](crate::Sandbox::start),
 //! before the session's container exists, so nothing in the sandbox races
-//! it. Writing `settings.json` doesn't rely on that: it goes through a
-//! handle on `claude/` opened without following a symlink, so a `claude`
-//! swapped for a symlink after its repair makes the write fail instead of
-//! landing elsewhere.
+//! it; the handles make it not rely on that.
 
-use std::fs::{self, DirBuilder, File};
+use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, fchown, lchown};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, chown, fchown};
 use std::path::{Path, PathBuf};
 
 use core_types::{ScopeKey, SessionId, VolumeKey};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use store::Store;
 
@@ -44,6 +55,15 @@ pub const VOLUMES_DIR: &str = "volumes";
 
 /// The four directories each session gets inside `sessions/<id>/`.
 pub const SESSION_SUBDIRS: [&str; 4] = ["work", "claude", "home", "tmp"];
+
+/// The session subdirectory that is `CLAUDE_CONFIG_DIR`.
+const CLAUDE_DIR: &str = "claude";
+
+/// Where the skills directory appears in `claude/`.
+const SKILLS_DIR: &str = "skills";
+
+/// The mode of every directory the agent can write, reset on each start.
+const DIR_MODE: u32 = 0o755;
 
 /// A volume's directory name for `scope`: the lowercase hex SHA-256 of the
 /// scope key's string form. It is 64 characters from `[0-9a-f]` for every
@@ -69,6 +89,19 @@ pub fn volume_rel_path(key: &VolumeKey) -> PathBuf {
     Path::new(VOLUMES_DIR)
         .join(key.agent.to_string())
         .join(scope_dir_name(&key.scope))
+}
+
+/// What [`Layout::prepare_session_dirs`] makes of `claude/skills`.
+#[derive(Debug, Clone)]
+pub(crate) enum SkillsEntry {
+    /// Nothing: it is left as it is.
+    Untouched,
+    /// A real directory owned by the sandbox user, for Docker to mount the
+    /// skills directory on.
+    MountPoint,
+    /// A symlink to the skills directory, or with `None` no symlink: one an
+    /// earlier start left is removed.
+    Link(Option<PathBuf>),
 }
 
 /// Creates volumes and session directories. Shared by both sandboxes.
@@ -103,6 +136,7 @@ impl Layout {
         &self,
         volume: &VolumeRef,
         session: SessionId,
+        skills: SkillsEntry,
     ) -> Result<PathBuf> {
         let this = self.clone();
         let volume = volume.clone();
@@ -110,28 +144,36 @@ impl Layout {
             this.create_volume_dirs(&volume)?;
             let dir = volume.session_dir(session);
             create_dir(&dir, None)?;
-            for sub in SESSION_SUBDIRS {
-                this.repair_dir(&dir.join(sub))?;
+            let session_dir = open_dir(&dir)?;
+            set_mode(&session_dir)?;
+            for sub in SESSION_SUBDIRS.into_iter().filter(|sub| *sub != CLAUDE_DIR) {
+                this.repair_dir_at(&session_dir, sub)?;
             }
-            this.write_settings(&dir.join("claude"))?;
+            let claude = this.repair_dir_at(&session_dir, CLAUDE_DIR)?;
+            this.write_settings(&claude)?;
+            this.place_skills(&claude, &skills)?;
             Ok(dir)
         })
         .await
     }
 
-    /// Makes `path`, inside an agent-writable tree, a real directory owned
-    /// by the sandbox user.
-    pub(crate) fn repair_dir(&self, path: &Path) -> Result<()> {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_dir() => {}
+    /// Makes `name` in `parent`, an agent-writable directory, a real
+    /// directory owned by the sandbox user with mode `0755`, and returns a
+    /// handle on it.
+    fn repair_dir_at(&self, parent: &File, name: &str) -> Result<File> {
+        match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Directory => {}
             Ok(_) => {
-                fs::remove_file(path).map_err(io_err("replacing a non-directory"))?;
-                create_dir(path, None)?;
+                rustix::fs::unlinkat(parent, name, AtFlags::empty())
+                    .map_err(errno("replacing a non-directory"))?;
+                mkdir_at(parent, name)?;
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => create_dir(path, None)?,
-            Err(err) => return Err(io_err("inspecting a session directory")(err)),
+            Err(Errno::NOENT) => mkdir_at(parent, name)?,
+            Err(err) => return Err(errno("inspecting a session directory")(err)),
         }
-        self.own(path)
+        let dir = open_dir_at(parent, name)?;
+        self.claim(&dir)?;
+        Ok(dir)
     }
 
     fn create_volume_dirs(&self, volume: &VolumeRef) -> Result<()> {
@@ -143,82 +185,94 @@ impl Layout {
         create_dir(&volume.path.join("sessions"), None)?;
         let shared = volume.shared_dir();
         create_dir(&shared, None)?;
-        self.own(&shared)?;
+        self.claim(&open_dir(&shared)?)?;
         if let Some(memory) = volume.memory_dir() {
             create_dir(&memory, None)?;
-            self.own(&memory)?;
+            self.claim(&open_dir(&memory)?)?;
         }
         Ok(())
     }
 
-    /// Writes `settings.json` into `claude_dir` through a new file renamed
-    /// over the old one, so a symlink the agent left there is replaced, not
-    /// followed. Every step is relative to a handle on `claude_dir` opened
-    /// without following a symlink and checked to be owned as expected, so
-    /// nothing is written outside it.
-    pub(crate) fn write_settings(&self, claude_dir: &Path) -> Result<()> {
+    /// Writes `settings.json` into the `claude/` directory `dir` through a
+    /// new file renamed over the old one, so a symlink the agent left there
+    /// is replaced, not followed. A directory in its place is renamed aside
+    /// and removed. Every step is relative to `dir`, so nothing is written
+    /// outside it.
+    fn write_settings(&self, dir: &File) -> Result<()> {
         const TARGET: &str = "settings.json";
-        let dir = rustix::fs::open(
-            claude_dir,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(|err| io_err("opening the claude directory")(err.into()))?;
-        let meta = dir
-            .metadata()
-            .map_err(io_err("inspecting the claude directory"))?;
-        if self
-            .owner
-            .is_some_and(|owner| owner != (meta.uid(), meta.gid()))
-        {
-            return Err(SandboxError::Io {
-                what: "checking the claude directory",
-                source: io::Error::other("it changed owner while it was prepared"),
-            });
-        }
-        let is_dir = rustix::fs::statat(&dir, TARGET, AtFlags::SYMLINK_NOFOLLOW)
+        let is_dir = rustix::fs::statat(dir, TARGET, AtFlags::SYMLINK_NOFOLLOW)
             .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory);
         if is_dir {
             let aside = format!(".settings.json.{}.old", uuid::Uuid::new_v4());
-            rustix::fs::renameat(&dir, TARGET, &dir, &aside)
-                .map_err(|err| io_err("replacing settings.json")(err.into()))?;
-            let _ = fs::remove_dir_all(claude_dir.join(&aside));
+            rustix::fs::renameat(dir, TARGET, dir, &aside)
+                .map_err(errno("replacing settings.json"))?;
+            let _ = fs::remove_dir_all(handle_path(dir).join(&aside));
         }
         let body = settings_json(self.cleanup_period_days);
         let temp = format!(".settings.json.{}", uuid::Uuid::new_v4());
         let file = rustix::fs::openat(
-            &dir,
+            dir,
             &temp,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
         .map(File::from)
-        .map_err(|err| io_err("writing settings.json")(err.into()))?;
+        .map_err(errno("writing settings.json"))?;
         let written = (|| {
             (&file).write_all(body.as_bytes())?;
             if let Some((uid, gid)) = self.owner {
                 fchown(&file, Some(uid), Some(gid))?;
             }
-            rustix::fs::renameat(&dir, &temp, &dir, TARGET).map_err(io::Error::from)
+            rustix::fs::renameat(dir, &temp, dir, TARGET).map_err(io::Error::from)
         })();
         if written.is_err() {
-            let _ = rustix::fs::unlinkat(&dir, &temp, AtFlags::empty());
+            let _ = rustix::fs::unlinkat(dir, &temp, AtFlags::empty());
         }
         written.map_err(io_err("writing settings.json"))
     }
 
-    fn own(&self, path: &Path) -> Result<()> {
-        let Some((uid, gid)) = self.owner else {
-            return Ok(());
+    /// Makes `skills` in the `claude/` directory `dir` what `entry` says,
+    /// relative to `dir`.
+    fn place_skills(&self, dir: &File, entry: &SkillsEntry) -> Result<()> {
+        let target = match entry {
+            SkillsEntry::Untouched => return Ok(()),
+            SkillsEntry::MountPoint => return self.repair_dir_at(dir, SKILLS_DIR).map(drop),
+            SkillsEntry::Link(target) => target.as_deref(),
         };
-        let meta = fs::symlink_metadata(path).map_err(io_err("inspecting a directory"))?;
-        if meta.uid() != uid || meta.gid() != gid {
-            lchown(path, Some(uid), Some(gid)).map_err(io_err(
-                "giving a directory to the sandbox user (agentd must run as that user or as root)",
-            ))?;
+        let what = "linking the skills directory";
+        match rustix::fs::statat(dir, SKILLS_DIR, AtFlags::SYMLINK_NOFOLLOW)
+            .map(|stat| FileType::from_raw_mode(stat.st_mode))
+        {
+            Ok(FileType::Directory) if target.is_some() => {
+                fs::remove_dir_all(handle_path(dir).join(SKILLS_DIR)).map_err(io_err(what))?;
+            }
+            Ok(kind)
+                if kind == FileType::Symlink
+                    || (kind != FileType::Directory && target.is_some()) =>
+            {
+                rustix::fs::unlinkat(dir, SKILLS_DIR, AtFlags::empty()).map_err(errno(what))?;
+            }
+            Ok(_) | Err(Errno::NOENT) => {}
+            Err(err) => return Err(errno(what)(err)),
+        }
+        if let Some(target) = target {
+            rustix::fs::symlinkat(target, dir, SKILLS_DIR).map_err(errno(what))?;
         }
         Ok(())
+    }
+
+    /// Gives the directory `dir` to the sandbox user, when its owner
+    /// differs, and sets its mode to `0755`.
+    fn claim(&self, dir: &File) -> Result<()> {
+        if let Some((uid, gid)) = self.owner {
+            let meta = dir.metadata().map_err(io_err("inspecting a directory"))?;
+            if meta.uid() != uid || meta.gid() != gid {
+                chown(handle_path(dir), Some(uid), Some(gid)).map_err(io_err(
+                    "giving a directory to the sandbox user (agentd must run as that user or as root)",
+                ))?;
+            }
+        }
+        set_mode(dir)
     }
 }
 
@@ -253,8 +307,59 @@ fn create_dir(path: &Path, mode: Option<u32>) -> Result<()> {
     }
 }
 
+/// Opens the directory `path` as a handle, failing on anything but a real
+/// directory.
+fn open_dir(path: &Path) -> Result<File> {
+    rustix::fs::open(path, DIR_HANDLE, Mode::empty())
+        .map(File::from)
+        .map_err(errno("opening a directory"))
+}
+
+/// [`open_dir`] for `name` in `parent`.
+fn open_dir_at(parent: &File, name: &str) -> Result<File> {
+    rustix::fs::openat(parent, name, DIR_HANDLE, Mode::empty())
+        .map(File::from)
+        .map_err(errno("opening a session directory"))
+}
+
+/// A handle on a directory that follows no symlink and needs no
+/// permission on the directory itself.
+const DIR_HANDLE: OFlags = OFlags::PATH
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+fn mkdir_at(parent: &File, name: &str) -> Result<()> {
+    rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(DIR_MODE))
+        .map_err(errno("creating a session directory"))
+}
+
+/// The path of the directory a handle is open on, whatever its own path
+/// names now: `/proc/self/fd/<fd>`, a link the kernel resolves to the
+/// handle itself.
+fn handle_path(dir: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+}
+
+/// Sets the mode of the directory `dir` to `0755` unless it is already.
+fn set_mode(dir: &File) -> Result<()> {
+    let meta = dir.metadata().map_err(io_err("inspecting a directory"))?;
+    if meta.mode() & 0o7777 != DIR_MODE {
+        fs::set_permissions(handle_path(dir), Permissions::from_mode(DIR_MODE))
+            .map_err(io_err("resetting a directory's mode"))?;
+    }
+    Ok(())
+}
+
 fn io_err(what: &'static str) -> impl Fn(io::Error) -> SandboxError {
     move |source| SandboxError::Io { what, source }
+}
+
+fn errno(what: &'static str) -> impl Fn(Errno) -> SandboxError {
+    move |err| SandboxError::Io {
+        what,
+        source: err.into(),
+    }
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
@@ -401,7 +506,10 @@ mod fs_tests {
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
-        let session_dir = layout.prepare_session_dirs(&volume, session).await.unwrap();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
         assert_eq!(session_dir, volume.session_dir(session));
         for sub in SESSION_SUBDIRS {
             assert!(session_dir.join(sub).is_dir(), "{sub}");
@@ -416,7 +524,10 @@ mod fs_tests {
             .collect();
         assert_eq!(names, ["settings.json"]);
         fs::write(session_dir.join("work/file"), "x").unwrap();
-        layout.prepare_session_dirs(&volume, session).await.unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
         assert!(session_dir.join("work/file").is_file());
     }
 
@@ -431,13 +542,19 @@ mod fs_tests {
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
-        let session_dir = layout.prepare_session_dirs(&volume, session).await.unwrap();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
 
         fs::remove_dir_all(session_dir.join("claude")).unwrap();
         symlink(&outside.0, session_dir.join("claude")).unwrap();
         fs::remove_dir_all(session_dir.join("work")).unwrap();
         fs::write(session_dir.join("work"), "not a dir").unwrap();
-        layout.prepare_session_dirs(&volume, session).await.unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
         assert!(
             fs::symlink_metadata(session_dir.join("claude"))
                 .unwrap()
@@ -451,13 +568,19 @@ mod fs_tests {
         let settings = session_dir.join("claude/settings.json");
         fs::remove_file(&settings).unwrap();
         symlink(&target, &settings).unwrap();
-        layout.prepare_session_dirs(&volume, session).await.unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
         assert!(fs::symlink_metadata(&settings).unwrap().is_file());
 
         fs::remove_file(&settings).unwrap();
         fs::create_dir_all(settings.join("nested")).unwrap();
-        layout.prepare_session_dirs(&volume, session).await.unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
         assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
         let names: Vec<_> = fs::read_dir(session_dir.join("claude"))
             .unwrap()
@@ -467,7 +590,7 @@ mod fs_tests {
     }
 
     #[tokio::test]
-    async fn settings_are_never_written_through_a_swapped_claude_directory() {
+    async fn settings_are_written_through_the_claude_handle_not_its_path() {
         let dir = TempDir::new();
         let outside = TempDir::new();
         let layout = layout(&dir, None).await;
@@ -477,15 +600,130 @@ mod fs_tests {
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session_dir = layout
-            .prepare_session_dirs(&volume, SessionId::new_v4())
+            .prepare_session_dirs(&volume, SessionId::new_v4(), SkillsEntry::Untouched)
             .await
             .unwrap();
         let claude = session_dir.join("claude");
+        let handle = open_dir(&claude).unwrap();
+        fs::remove_file(claude.join("settings.json")).unwrap();
+        fs::create_dir_all(claude.join("settings.json/nested")).unwrap();
         fs::rename(&claude, session_dir.join("claude-old")).unwrap();
         symlink(&outside.0, &claude).unwrap();
-        let err = layout.write_settings(&claude).unwrap_err();
-        assert!(matches!(err, SandboxError::Io { .. }), "{err:?}");
+        layout.write_settings(&handle).unwrap();
+        layout
+            .place_skills(&handle, &SkillsEntry::MountPoint)
+            .unwrap();
         assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+        let old = session_dir.join("claude-old");
+        let mut names: Vec<_> = fs::read_dir(&old)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["settings.json", "skills"]);
+        assert!(
+            fs::symlink_metadata(old.join("settings.json"))
+                .unwrap()
+                .is_file()
+        );
+        assert!(fs::symlink_metadata(old.join("skills")).unwrap().is_dir());
+        assert!(open_dir(&claude).is_err());
+    }
+
+    #[tokio::test]
+    async fn skills_mount_points_and_links_replace_what_the_agent_left() {
+        let dir = TempDir::new();
+        let outside = TempDir::new();
+        let skills = TempDir::new();
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
+        let entry = session_dir.join("claude/skills");
+        symlink(&outside.0, &entry).unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
+            .await
+            .unwrap();
+        assert!(fs::symlink_metadata(&entry).unwrap().is_dir());
+        fs::write(entry.join("left"), "x").unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
+        assert!(entry.join("left").is_file());
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Link(Some(skills.0.clone())))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_link(&entry).unwrap(), skills.0);
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Link(None))
+            .await
+            .unwrap();
+        assert!(fs::symlink_metadata(&entry).is_err());
+        assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+        assert!(skills.0.is_dir());
+    }
+
+    #[tokio::test]
+    async fn modes_the_agent_set_are_reset() {
+        let dir = TempDir::new();
+        let me = fs::metadata(&dir.0).unwrap();
+        let owner = if me.uid() == 0 {
+            (54321, 54322)
+        } else {
+            (me.uid(), me.gid())
+        };
+        let layout = layout(&dir, Some(owner)).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
+            .await
+            .unwrap();
+        fs::write(session_dir.join("work/kept"), "x").unwrap();
+        let chmod = |path: &Path, mode: u32| {
+            fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+        };
+        chmod(&session_dir.join("claude/skills"), 0);
+        chmod(&session_dir.join("claude"), 0);
+        chmod(&session_dir.join("work"), 0o555);
+        chmod(&session_dir.join("home"), 0o2700);
+        chmod(&session_dir.join("tmp"), 0);
+        chmod(&volume.shared_dir(), 0);
+        chmod(&volume.memory_dir().unwrap(), 0o500);
+        chmod(&session_dir, 0);
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
+            .await
+            .unwrap();
+        let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        for path in [
+            session_dir.clone(),
+            session_dir.join("claude"),
+            session_dir.join("claude/skills"),
+            session_dir.join("work"),
+            session_dir.join("home"),
+            session_dir.join("tmp"),
+            volume.shared_dir(),
+            volume.memory_dir().unwrap(),
+        ] {
+            assert_eq!(mode(&path), 0o755, "{}", path.display());
+        }
+        assert!(session_dir.join("work/kept").is_file());
+        assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
     }
 
     #[tokio::test]
@@ -517,7 +755,7 @@ mod fs_tests {
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session_dir = layout
-            .prepare_session_dirs(&volume, SessionId::new_v4())
+            .prepare_session_dirs(&volume, SessionId::new_v4(), SkillsEntry::Untouched)
             .await
             .unwrap();
         let owned = |path: &Path| {

@@ -353,21 +353,26 @@ impl Store {
         Ok(CtlPurged { tokens, locks })
     }
 
-    /// Takes `volume`'s `shared/` lock for `holder` under a new lease until
-    /// `now + ttl`, if no unexpired lease holds it. Returns `None` when one
-    /// does, whichever session it belongs to, `holder`'s included.
+    /// Takes the `shared/` lock of the volume of the token with digest
+    /// `token` for its session, under a new lease until `now + ttl`, if
+    /// `turn` is still the token's turn and no unexpired lease holds the
+    /// lock. Returns `None` otherwise, whichever session the lease holding
+    /// it belongs to, the token's own included.
     ///
-    /// It is one statement: an insert that, on the volume's unique key,
-    /// takes over the existing row only if it has expired. Times are whole
-    /// seconds, and `ttl` is at least one.
+    /// It is one statement: an insert, from the token's row only while it
+    /// records `turn`, that on the volume's unique key takes over the
+    /// existing row only if it has expired. So an acquire authorized under a
+    /// turn that has since been replaced or ended grants nothing, even when
+    /// it lands after [`set_ctl_turn`](Self::set_ctl_turn) deleted the
+    /// session's leases. Times are whole seconds, and `ttl` is at least one.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails.
     pub async fn acquire_scope_lock(
         &self,
-        volume: &VolumeKey,
-        holder: SessionId,
+        token: &TokenHash,
+        turn: TurnId,
         now: OffsetDateTime,
         ttl: Duration,
     ) -> Result<Option<ScopeLease>> {
@@ -376,16 +381,16 @@ impl Store {
         let expires_at = now.saturating_add(ttl_seconds(ttl));
         let granted: Option<String> = sqlx::query_scalar(
             "INSERT INTO scope_locks (lease_id, volume_key, holder_session, expires_at) \
-             VALUES (?, ?, ?, ?) \
+             SELECT ?, volume_key, session_id, ? FROM ctl_tokens WHERE hash = ? AND turn_id = ? \
              ON CONFLICT (volume_key) DO UPDATE SET lease_id = excluded.lease_id, \
              holder_session = excluded.holder_session, expires_at = excluded.expires_at \
              WHERE scope_locks.expires_at <= ? \
              RETURNING lease_id",
         )
         .bind(lease.to_string())
-        .bind(volume.to_string())
-        .bind(holder.to_string())
         .bind(expires_at)
+        .bind(&token.0[..])
+        .bind(turn.to_string())
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
@@ -398,18 +403,18 @@ impl Store {
         }
     }
 
-    /// Extends `lease` on `volume`'s lock to `now + ttl`, if it is the
-    /// volume's current lease, `holder` holds it, and it hasn't expired.
-    /// Returns the new expiry, or `None` if the lease doesn't hold the lock,
-    /// in which case nothing changes.
+    /// Extends `lease` to `now + ttl`, if `turn` is still the turn of the
+    /// token with digest `token`, and `lease` is the current, unexpired
+    /// lease on the token's volume, held by its session. Returns the new
+    /// expiry, or `None`, changing nothing, otherwise.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails.
     pub async fn renew_scope_lock(
         &self,
-        volume: &VolumeKey,
-        holder: SessionId,
+        token: &TokenHash,
+        turn: TurnId,
         lease: LeaseId,
         now: OffsetDateTime,
         ttl: Duration,
@@ -418,14 +423,15 @@ impl Store {
         let expires_at = now.saturating_add(ttl_seconds(ttl));
         let renewed: Option<i64> = sqlx::query_scalar(
             "UPDATE scope_locks SET expires_at = ? \
-             WHERE lease_id = ? AND volume_key = ? AND holder_session = ? AND expires_at > ? \
+             WHERE lease_id = ? AND expires_at > ? AND (volume_key, holder_session) IN \
+             (SELECT volume_key, session_id FROM ctl_tokens WHERE hash = ? AND turn_id = ?) \
              RETURNING expires_at",
         )
         .bind(expires_at)
         .bind(lease.to_string())
-        .bind(volume.to_string())
-        .bind(holder.to_string())
         .bind(now)
+        .bind(&token.0[..])
+        .bind(turn.to_string())
         .fetch_optional(&self.pool)
         .await?;
         renewed
@@ -433,25 +439,20 @@ impl Store {
             .transpose()
     }
 
-    /// Gives up `lease` on `volume`'s lock, if it is the volume's current
-    /// lease and `holder` holds it. Returns false, changing nothing, for any
-    /// other lease.
+    /// Gives up `lease`, if it is the current lease on the volume of the
+    /// token with digest `token`, held by its session. Returns false,
+    /// changing nothing, for any other lease.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails.
-    pub async fn release_scope_lock(
-        &self,
-        volume: &VolumeKey,
-        holder: SessionId,
-        lease: LeaseId,
-    ) -> Result<bool> {
+    pub async fn release_scope_lock(&self, token: &TokenHash, lease: LeaseId) -> Result<bool> {
         let result = sqlx::query(
-            "DELETE FROM scope_locks WHERE lease_id = ? AND volume_key = ? AND holder_session = ?",
+            "DELETE FROM scope_locks WHERE lease_id = ? AND (volume_key, holder_session) IN \
+             (SELECT volume_key, session_id FROM ctl_tokens WHERE hash = ?)",
         )
         .bind(lease.to_string())
-        .bind(volume.to_string())
-        .bind(holder.to_string())
+        .bind(&token.0[..])
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -613,64 +614,150 @@ mod tests {
         assert_eq!(stored.container_ip, "172.30.0.7".parse::<IpAddr>().unwrap());
     }
 
-    /// Takes `volume`'s lock for `holder` at 1,000 s, and says whether it was
-    /// free.
-    async fn free(store: &Store, volume: &VolumeKey, holder: SessionId) -> bool {
-        store
-            .acquire_scope_lock(volume, holder, at(1_000), TTL)
-            .await
-            .unwrap()
-            .is_some()
+    /// A request authorized under a token's turn.
+    #[derive(Debug, Clone, Copy)]
+    struct Holder {
+        hash: TokenHash,
+        turn: TurnId,
+    }
+
+    impl Holder {
+        /// Stores a token for a new session on `volume` and begins a turn on
+        /// it.
+        async fn new(store: &Store, byte: u8, volume: &VolumeKey) -> Self {
+            let token = NewCtlToken {
+                volume: volume.clone(),
+                ..new_token(byte, SessionId::new_v4())
+            };
+            store.put_ctl_token(&token).await.unwrap();
+            Self::begin(store, token.hash).await
+        }
+
+        /// Begins a new turn on the token with digest `hash`.
+        async fn begin(store: &Store, hash: TokenHash) -> Self {
+            let running = turn(TurnKind::Normal, Side::Public);
+            assert!(store.set_ctl_turn(&hash, Some(&running)).await.unwrap());
+            Self {
+                hash,
+                turn: running.id,
+            }
+        }
+
+        async fn acquire(self, store: &Store, now: i64) -> Option<ScopeLease> {
+            store
+                .acquire_scope_lock(&self.hash, self.turn, at(now), TTL)
+                .await
+                .unwrap()
+        }
+
+        async fn renew(self, store: &Store, lease: LeaseId, now: i64) -> Option<OffsetDateTime> {
+            store
+                .renew_scope_lock(&self.hash, self.turn, lease, at(now), TTL)
+                .await
+                .unwrap()
+        }
+
+        async fn release(self, store: &Store, lease: LeaseId) -> bool {
+            store.release_scope_lock(&self.hash, lease).await.unwrap()
+        }
+    }
+
+    /// Whether `probe`, another session on the volume, can take the lock at
+    /// 1,000 s. It gives the lock back if it can.
+    async fn free(store: &Store, probe: Holder) -> bool {
+        match probe.acquire(store, 1_000).await {
+            Some(lease) => probe.release(store, lease.lease).await,
+            None => false,
+        }
     }
 
     #[tokio::test]
     async fn a_sessions_leases_end_with_its_turn_and_its_token() {
         let store = memory_store().await;
-        let other = new_token(9, SessionId::new_v4());
-        store.put_ctl_token(&other).await.unwrap();
-        assert!(free(&store, &other.volume, other.session).await);
-        let session = SessionId::new_v4();
-        let first = new_token(1, session);
+        let elsewhere = Holder::new(&store, 9, &volume(AgentId::new_v4())).await;
+        let kept = elsewhere.acquire(&store, 1_000).await.unwrap();
+        let first = NewCtlToken {
+            volume: volume(AgentId::new_v4()),
+            ..new_token(1, SessionId::new_v4())
+        };
         let second = NewCtlToken {
             hash: TokenHash([2; 32]),
             ..first.clone()
         };
-        let volume = &first.volume;
         store.put_ctl_token(&first).await.unwrap();
-        let running = turn(TurnKind::Normal, Side::Public);
+        let probe = Holder::new(&store, 3, &first.volume).await;
 
-        assert!(free(&store, volume, session).await);
-        assert!(
-            store
-                .set_ctl_turn(&first.hash, Some(&running))
-                .await
-                .unwrap()
-        );
-        assert!(free(&store, volume, session).await, "a new turn");
+        let holder = Holder::begin(&store, first.hash).await;
+        holder.acquire(&store, 1_000).await.unwrap();
+        assert!(!free(&store, probe).await);
+        Holder::begin(&store, first.hash).await;
+        assert!(free(&store, probe).await, "a new turn");
+
+        let holder = Holder::begin(&store, first.hash).await;
+        holder.acquire(&store, 1_000).await.unwrap();
         assert!(store.set_ctl_turn(&first.hash, None).await.unwrap());
-        assert!(free(&store, volume, session).await, "the turn ended");
+        assert!(free(&store, probe).await, "the turn ended");
+
+        let holder = Holder::begin(&store, first.hash).await;
+        holder.acquire(&store, 1_000).await.unwrap();
         store.put_ctl_token(&second).await.unwrap();
-        assert!(free(&store, volume, session).await, "a new token");
+        assert!(free(&store, probe).await, "a new token");
+
+        let holder = Holder::begin(&store, second.hash).await;
+        holder.acquire(&store, 1_000).await.unwrap();
         assert!(store.delete_ctl_token(&second.hash).await.unwrap());
-        assert!(free(&store, volume, SessionId::new_v4()).await, "revoked");
+        assert!(free(&store, probe).await, "revoked");
         assert!(
-            !free(&store, &other.volume, SessionId::new_v4()).await,
+            elsewhere.renew(&store, kept.lease, 1_010).await.is_some(),
             "another session's lease is untouched"
         );
     }
 
     #[tokio::test]
+    async fn an_acquire_or_renew_authorized_under_a_replaced_turn_does_nothing() {
+        let store = memory_store().await;
+        let key = volume(AgentId::new_v4());
+        let first = Holder::new(&store, 1, &key).await;
+        let probe = Holder::new(&store, 2, &key).await;
+
+        let second = Holder::begin(&store, first.hash).await;
+        assert_eq!(
+            first.acquire(&store, 1_000).await,
+            None,
+            "an acquire authorized under the first turn, landing after the second began"
+        );
+        assert!(
+            probe.acquire(&store, 1_000).await.is_some(),
+            "the lock stayed free"
+        );
+        store.set_ctl_turn(&probe.hash, None).await.unwrap();
+
+        let held = second.acquire(&store, 1_000).await.unwrap();
+        let third = Holder::begin(&store, first.hash).await;
+        assert_eq!(second.renew(&store, held.lease, 1_010).await, None);
+        assert_eq!(third.renew(&store, held.lease, 1_010).await, None);
+
+        let held = third.acquire(&store, 1_000).await.unwrap();
+        assert_eq!(
+            second.renew(&store, held.lease, 1_010).await,
+            None,
+            "a renewal authorized under an earlier turn"
+        );
+        assert_eq!(
+            third.renew(&store, held.lease, 1_010).await,
+            Some(at(1_040))
+        );
+        assert!(store.set_ctl_turn(&first.hash, None).await.unwrap());
+        assert_eq!(third.acquire(&store, 1_000).await, None, "between turns");
+    }
+
+    #[tokio::test]
     async fn purge_deletes_every_token_and_lock() {
         let store = memory_store().await;
-        let a = new_token(1, SessionId::new_v4());
-        let b = new_token(2, SessionId::new_v4());
-        store.put_ctl_token(&a).await.unwrap();
-        store.put_ctl_token(&b).await.unwrap();
-        store
-            .acquire_scope_lock(&a.volume, a.session, at(1_000), TTL)
-            .await
-            .unwrap()
-            .unwrap();
+        let key = volume(AgentId::new_v4());
+        let a = Holder::new(&store, 1, &key).await;
+        Holder::new(&store, 2, &volume(AgentId::new_v4())).await;
+        a.acquire(&store, 1_000).await.unwrap();
         assert_eq!(
             store.purge_ctl().await.unwrap(),
             CtlPurged {
@@ -679,13 +766,8 @@ mod tests {
             }
         );
         assert_eq!(store.ctl_token(&a.hash).await.unwrap(), None);
-        assert!(
-            store
-                .acquire_scope_lock(&a.volume, b.session, at(1_000), TTL)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        let b = Holder::new(&store, 3, &key).await;
+        assert!(b.acquire(&store, 1_000).await.is_some());
     }
 
     #[tokio::test]
@@ -745,42 +827,20 @@ mod tests {
     #[tokio::test]
     async fn a_lease_is_exclusive_even_within_one_session() {
         let store = memory_store().await;
-        let agent = AgentId::new_v4();
-        let (a, b) = (SessionId::new_v4(), SessionId::new_v4());
-        let held = store
-            .acquire_scope_lock(&volume(agent), a, at(1_000), TTL)
-            .await
-            .unwrap()
-            .unwrap();
+        let key = volume(AgentId::new_v4());
+        let (a, b) = (
+            Holder::new(&store, 1, &key).await,
+            Holder::new(&store, 2, &key).await,
+        );
+        let held = a.acquire(&store, 1_000).await.unwrap();
         assert_eq!(held.expires_at, at(1_030));
         for holder in [a, b] {
-            assert_eq!(
-                store
-                    .acquire_scope_lock(&volume(agent), holder, at(1_029), TTL)
-                    .await
-                    .unwrap(),
-                None
-            );
+            assert_eq!(holder.acquire(&store, 1_029).await, None);
         }
-        let other_volume = volume(AgentId::new_v4());
-        assert!(
-            store
-                .acquire_scope_lock(&other_volume, b, at(1_000), TTL)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            store
-                .release_scope_lock(&volume(agent), a, held.lease)
-                .await
-                .unwrap()
-        );
-        let next = store
-            .acquire_scope_lock(&volume(agent), a, at(1_001), TTL)
-            .await
-            .unwrap()
-            .unwrap();
+        let elsewhere = Holder::new(&store, 3, &volume(AgentId::new_v4())).await;
+        assert!(elsewhere.acquire(&store, 1_000).await.is_some());
+        assert!(a.release(&store, held.lease).await);
+        let next = a.acquire(&store, 1_001).await.unwrap();
         assert_ne!(next.lease, held.lease);
     }
 
@@ -788,86 +848,38 @@ mod tests {
     async fn an_expired_lease_is_taken_over_and_can_no_longer_act() {
         let store = memory_store().await;
         let key = volume(AgentId::new_v4());
-        let (a, b) = (SessionId::new_v4(), SessionId::new_v4());
-        let dead = store
-            .acquire_scope_lock(&key, a, at(1_000), TTL)
-            .await
-            .unwrap()
-            .unwrap();
+        let (a, b) = (
+            Holder::new(&store, 1, &key).await,
+            Holder::new(&store, 2, &key).await,
+        );
+        let dead = a.acquire(&store, 1_000).await.unwrap();
         assert_eq!(
-            store
-                .renew_scope_lock(&key, a, dead.lease, at(1_030), TTL)
-                .await
-                .unwrap(),
+            a.renew(&store, dead.lease, 1_030).await,
             None,
             "an expired lease can't be renewed"
         );
-        let live = store
-            .acquire_scope_lock(&key, b, at(1_030), TTL)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!store.release_scope_lock(&key, a, dead.lease).await.unwrap());
-        assert_eq!(
-            store
-                .renew_scope_lock(&key, a, dead.lease, at(1_031), TTL)
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            store
-                .renew_scope_lock(&key, b, live.lease, at(1_040), TTL)
-                .await
-                .unwrap(),
-            Some(at(1_070))
-        );
-        assert_eq!(
-            store
-                .acquire_scope_lock(&key, a, at(1_069), TTL)
-                .await
-                .unwrap(),
-            None,
-            "the renewal held"
-        );
+        let live = b.acquire(&store, 1_030).await.unwrap();
+        assert!(!a.release(&store, dead.lease).await);
+        assert_eq!(a.renew(&store, dead.lease, 1_031).await, None);
+        assert_eq!(b.renew(&store, live.lease, 1_040).await, Some(at(1_070)));
+        assert_eq!(a.acquire(&store, 1_069).await, None, "the renewal held");
     }
 
     #[tokio::test]
     async fn renew_and_release_must_match_volume_holder_and_lease() {
         let store = memory_store().await;
         let key = volume(AgentId::new_v4());
-        let other = volume(AgentId::new_v4());
-        let (a, b) = (SessionId::new_v4(), SessionId::new_v4());
-        let held = store
-            .acquire_scope_lock(&key, a, at(1_000), TTL)
-            .await
-            .unwrap()
-            .unwrap();
+        let a = Holder::new(&store, 1, &key).await;
+        let b = Holder::new(&store, 2, &key).await;
+        let other = Holder::new(&store, 3, &volume(AgentId::new_v4())).await;
+        let held = a.acquire(&store, 1_000).await.unwrap();
         let stranger = LeaseId::new_v4();
-        for (volume, holder, lease) in [
-            (&key, a, stranger),
-            (&key, b, held.lease),
-            (&other, a, held.lease),
-        ] {
-            assert_eq!(
-                store
-                    .renew_scope_lock(volume, holder, lease, at(1_010), TTL)
-                    .await
-                    .unwrap(),
-                None
-            );
-            assert!(
-                !store
-                    .release_scope_lock(volume, holder, lease)
-                    .await
-                    .unwrap()
-            );
+        for (holder, lease) in [(a, stranger), (b, held.lease), (other, held.lease)] {
+            assert_eq!(holder.renew(&store, lease, 1_010).await, None);
+            assert!(!holder.release(&store, lease).await);
         }
         assert_eq!(
-            store
-                .acquire_scope_lock(&key, b, at(1_010), TTL)
-                .await
-                .unwrap(),
+            b.acquire(&store, 1_010).await,
             None,
             "the lease is untouched"
         );
@@ -876,9 +888,9 @@ mod tests {
     #[tokio::test]
     async fn a_zero_ttl_still_lasts_a_second() {
         let store = memory_store().await;
-        let key = volume(AgentId::new_v4());
+        let holder = Holder::new(&store, 1, &volume(AgentId::new_v4())).await;
         let held = store
-            .acquire_scope_lock(&key, SessionId::new_v4(), at(1_000), Duration::ZERO)
+            .acquire_scope_lock(&holder.hash, holder.turn, at(1_000), Duration::ZERO)
             .await
             .unwrap()
             .unwrap();
@@ -892,12 +904,12 @@ mod tests {
         let key = volume(AgentId::new_v4());
         let now = OffsetDateTime::now_utc();
         let mut tasks = Vec::new();
-        for _ in 0..8 {
+        for byte in 0..8 {
+            let holder = Holder::new(&store, byte, &key).await;
             let store = store.clone();
-            let key = key.clone();
             tasks.push(tokio::spawn(async move {
                 store
-                    .acquire_scope_lock(&key, SessionId::new_v4(), now, TTL)
+                    .acquire_scope_lock(&holder.hash, holder.turn, now, TTL)
                     .await
                     .unwrap()
             }));
