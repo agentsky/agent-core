@@ -16,7 +16,7 @@ use secrecy::SecretString;
 
 use crate::help::{self, SPECS, Spec};
 use crate::names::{
-    Reason, parse_agent_name, parse_skill_name, parse_target, parse_user, unwrap_slack_link,
+    Reason, parse_agent_name, parse_skill_name, parse_skill_source, parse_target, parse_user,
 };
 use crate::{
     AdminCommand, AgentName, ApiKeyCommand, Command, ParseError, ParseErrorKind, SkillCommand,
@@ -45,28 +45,30 @@ use crate::{
 /// ```
 pub fn parse(text: &str) -> Result<Command, ParseError> {
     let tokens = tokenize(text);
+    parse_tokens(text, &tokens).map_err(|err| ParseError {
+        secret_bearing: looks_secret_bearing(&tokens),
+        ..err
+    })
+}
+
+fn parse_tokens(text: &str, tokens: &[Token<'_>]) -> Result<Command, ParseError> {
     let Some(first) = tokens.first() else {
-        return Err(help_error(ParseErrorKind::Help, help::help()));
+        return Err(ParseError::new(ParseErrorKind::Help, help::help()));
     };
     if first.text.eq_ignore_ascii_case("help") {
         return Err(help_topic(tokens.get(1)));
     }
-    let words = command_words(&tokens);
+    let words = command_words(tokens);
     if words.is_empty() {
         return Err(unknown_command());
     }
     let spec = SPECS
         .iter()
         .find(|spec| spec.words().eq(words.iter().copied()));
-    let secret_bearing = is_secret_bearing_input(&words, &tokens);
-    let args = clap_args(text, &tokens, &words, spec);
+    let args = clap_args(text, tokens, &words, spec);
     let invalid = |problem: String| {
         let usage = spec.map_or_else(|| help::prefix_usage(&words), Spec::usage_line);
-        ParseError::new(
-            ParseErrorKind::Invalid,
-            format!("{problem}\n{usage}"),
-            secret_bearing,
-        )
+        ParseError::new(ParseErrorKind::Invalid, format!("{problem}\n{usage}"))
     };
     if args[words.len()..].contains(&"--") {
         return Err(invalid("A lone `--` isn't an argument.".to_owned()));
@@ -134,21 +136,46 @@ fn command_words(tokens: &[Token<'_>]) -> Vec<&'static str> {
     words
 }
 
-/// Whether the text is a secret-bearing command with arguments, parsed or
-/// not. `admin api-key` followed by anything but a bare `set` or `clear`
-/// counts, since a key typed in place of `set` is still a key.
-fn is_secret_bearing_input(words: &[&str], tokens: &[Token<'_>]) -> bool {
-    match words {
-        ["login" | "slack-token", ..] => tokens.len() > 1,
-        ["admin", "api-key", ..] => match &tokens[2..] {
-            [] => false,
-            [only] => !["set", "clear"]
-                .iter()
-                .any(|word| only.text.eq_ignore_ascii_case(word)),
-            _ => true,
-        },
-        _ => false,
-    }
+/// Whether text that failed to parse may hold a secret, so callers treat
+/// it like a secret-bearing command.
+///
+/// It does when a word naming a secret (`login`, `api-key` or
+/// `slack-token`, ignoring case, `-` and `_`, and surrounding punctuation)
+/// is followed by anything but a bare `set` or `clear`, wherever the word
+/// stands, so misspelt commands such as `api-key set <key>` without
+/// `admin`, `slack_token <token>` or `admin apikey set <key>` count. It also
+/// does when any word holds a known token prefix (`sk-ant-`, `xoxb-`,
+/// `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`), whatever the command.
+fn looks_secret_bearing(tokens: &[Token<'_>]) -> bool {
+    const TOKEN_PREFIXES: [&str; 6] = ["sk-ant-", "xoxb-", "xoxp-", "xoxe.", "xoxe-", "xapp-"];
+    let names_a_secret = |token: &Token<'_>| {
+        let word: String = token
+            .text
+            .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_'))
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        matches!(word.as_str(), "login" | "apikey" | "slacktoken")
+    };
+    let is_verb = |token: &Token<'_>| {
+        ["set", "clear"]
+            .iter()
+            .any(|verb| token.text.eq_ignore_ascii_case(verb))
+    };
+    let keyword_with_value = tokens.iter().enumerate().any(|(i, token)| {
+        names_a_secret(token)
+            && match &tokens[i + 1..] {
+                [] => false,
+                [only] => !is_verb(only),
+                _ => true,
+            }
+    });
+    keyword_with_value
+        || tokens.iter().any(|token| {
+            let word = token.text.to_ascii_lowercase();
+            TOKEN_PREFIXES.iter().any(|prefix| word.contains(prefix))
+        })
 }
 
 /// The arguments for clap: the command words in lowercase, then the other
@@ -172,12 +199,8 @@ fn clap_args<'a>(
     args
 }
 
-fn help_error(kind: ParseErrorKind, message: String) -> ParseError {
-    ParseError::new(kind, message, false)
-}
-
 fn unknown_command() -> ParseError {
-    help_error(
+    ParseError::new(
         ParseErrorKind::UnknownCommand,
         format!("Unknown command.\n\n{}", help::help()),
     )
@@ -185,10 +208,10 @@ fn unknown_command() -> ParseError {
 
 fn help_topic(topic: Option<&Token<'_>>) -> ParseError {
     let Some(topic) = topic else {
-        return help_error(ParseErrorKind::Help, help::help());
+        return ParseError::new(ParseErrorKind::Help, help::help());
     };
     help::group_help(&topic.text.to_ascii_lowercase()).map_or_else(unknown_command, |text| {
-        help_error(ParseErrorKind::Help, text)
+        ParseError::new(ParseErrorKind::Help, text)
     })
 }
 
@@ -334,7 +357,7 @@ enum SkillCmd {
     Add {
         #[arg(value_name = "name", value_parser = parse_agent_name)]
         name: AgentName,
-        #[arg(value_name = "source")]
+        #[arg(value_name = "source", value_parser = parse_skill_source)]
         source: Option<String>,
     },
     Rm {
@@ -388,10 +411,7 @@ impl Cmd {
             Cmd::Create { name, persona } => Command::Create { name, persona },
             Cmd::Persona { name, text } => Command::Persona { name, text },
             Cmd::Skill { command } => Command::Skill(match command {
-                SkillCmd::Add { name, source } => SkillCommand::Add {
-                    name,
-                    source: source.map(|source| unwrap_slack_link(&source).to_owned()),
-                },
+                SkillCmd::Add { name, source } => SkillCommand::Add { name, source },
                 SkillCmd::Rm { name, skill } => SkillCommand::Rm { name, skill },
             }),
             Cmd::Allow { name, target } => Command::Allow { name, target },
