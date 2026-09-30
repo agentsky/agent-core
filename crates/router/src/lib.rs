@@ -152,34 +152,62 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
     };
 
     if state == AgentState::Paused {
-        return Decision::Refuse(RefuseReason::Paused);
+        return Decision::Refuse {
+            reason: RefuseReason::Paused,
+            requester,
+        };
     }
     match view.is_banned(&requester) {
         Some(false) => {}
-        Some(true) => return Decision::Refuse(RefuseReason::Banned),
-        None => return Decision::Refuse(RefuseReason::PolicyUnavailable),
+        Some(true) => {
+            return Decision::Refuse {
+                reason: RefuseReason::Banned,
+                requester,
+            };
+        }
+        None => {
+            return Decision::Refuse {
+                reason: RefuseReason::PolicyUnavailable,
+                requester,
+            };
+        }
     }
     let Some(policy) = view.policy(agent) else {
-        return Decision::Refuse(RefuseReason::PolicyUnavailable);
+        return Decision::Refuse {
+            reason: RefuseReason::PolicyUnavailable,
+            requester,
+        };
     };
     let is_owner = requester.member == Some(owner);
     if !is_owner && !policy.permits(&requester, &event.conv) {
-        return Decision::Refuse(RefuseReason::Denied);
+        return Decision::Refuse {
+            reason: RefuseReason::Denied,
+            requester,
+        };
     }
     let Some(hop) = hop.filter(|hop| *hop <= policy.max_hops) else {
-        return Decision::Refuse(RefuseReason::HopCap {
-            max: policy.max_hops,
-        });
+        return Decision::Refuse {
+            reason: RefuseReason::HopCap {
+                max: policy.max_hops,
+            },
+            requester,
+        };
     };
     if !is_owner && let Some(max) = policy.turns_per_day.filter(|_| policy.daily_cap_reached()) {
-        return Decision::Refuse(RefuseReason::DailyCap { max });
+        return Decision::Refuse {
+            reason: RefuseReason::DailyCap { max },
+            requester,
+        };
     }
     if !event.is_dm() {
         let Some(budget) = view.thread_budget() else {
-            return Decision::Refuse(RefuseReason::PolicyUnavailable);
+            return Decision::Refuse {
+                reason: RefuseReason::PolicyUnavailable,
+                requester,
+            };
         };
         if let Some(reason) = budget.exceeded() {
-            return Decision::Refuse(reason);
+            return Decision::Refuse { reason, requester };
         }
     }
 

@@ -29,6 +29,10 @@ use crate::commands::Replies;
 use crate::ctl::{MAX_POST_BYTES, Outbox, SurfaceLookup};
 use crate::policy::Limits;
 
+/// How long after the manager bot told a requester that an agent refused
+/// them (its rules deny them, or they are banned) it may tell them again.
+pub const REFUSAL_DM_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The emoji an agent's bot reacts with to the message a turn answers,
 /// while the turn runs, unless `[runner] working_emoji` says otherwise.
 pub const DEFAULT_WORKING_EMOJI: &str = "hourglass_flowing_sand";
@@ -166,8 +170,11 @@ pub struct PipelineSettings {
 ///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
 ///    one saying their link stopped working and how to link it again, when
 ///    the agent's bot may post in the conversation; nothing runs for them.
-///    [`Decision::Refuse`] posts one line in the thread, and
-///    [`Decision::Ignore`] does nothing.
+///    [`Decision::Refuse`] posts one line in the thread, or, for a refusal
+///    of the requester themselves (banned, or denied by the agent's rules),
+///    sends it to them from the manager bot at most once per
+///    [`REFUSAL_DM_INTERVAL`] for each agent (for a ban, for all agents
+///    together). [`Decision::Ignore`] does nothing.
 ///
 /// Notices the pipeline posts on its own, such as refusals and failures
 /// before a turn reached the model, have no `message_refs` row.
@@ -751,7 +758,9 @@ impl Pipeline {
                 self.link_prompt(event, agent, &requester, relink_text)
                     .await
             }
-            Decision::Refuse(reason) => self.refuse(event, agent, caps, reason).await,
+            Decision::Refuse { reason, requester } => {
+                self.refuse(event, agent, caps, reason, &requester).await
+            }
             Decision::Run {
                 requester,
                 hop,
@@ -798,16 +807,18 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Posts one line in `event`'s thread saying why `agent` won't answer.
-    /// A limit that counts turns or tokens over a day or an hour says so
-    /// once per thread in that window, so a capped agent doesn't answer
-    /// every message with the same line.
+    /// Says why `agent` won't answer `event` for `requester`: privately to
+    /// them for a refusal of them ([`RefuseReason::is_personal`]), or in
+    /// one line in the thread. A limit that counts turns or tokens over a
+    /// day or an hour says so once per thread in that window, so a capped
+    /// agent doesn't answer every message with the same line.
     async fn refuse(
         &self,
         event: &InboundEvent,
         agent: AgentId,
         caps: Caps,
         reason: RefuseReason,
+        requester: &Requester,
     ) -> Result<(), PipelineError> {
         let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
             return Ok(());
@@ -816,6 +827,10 @@ impl Pipeline {
             return Ok(());
         }
         let text = refusal_text(&self.agent_name(agent).await?, reason);
+        if reason.is_personal() {
+            self.tell_refused(agent, requester, reason, &text).await;
+            return Ok(());
+        }
         let target = reply_target(event, caps);
         let Some((kind, window)) = limit_window(reason, OffsetDateTime::now_utc()) else {
             say(surface.as_ref(), &target, &text).await?;
@@ -845,6 +860,51 @@ impl Pipeline {
         }
         tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
         Ok(())
+    }
+
+    /// Tells `requester` privately, in `text`, that `agent` refused them
+    /// for `reason`, unless they were told within [`REFUSAL_DM_INTERVAL`]:
+    /// about this agent's rules, or about their ban by any agent. A message
+    /// that fails to send releases its claim.
+    async fn tell_refused(
+        &self,
+        agent: AgentId,
+        requester: &Requester,
+        reason: RefuseReason,
+        text: &str,
+    ) {
+        let store = &self.inner.store;
+        let kind = match reason {
+            RefuseReason::Banned => "refused/banned".to_owned(),
+            _ => format!("refused/{agent}"),
+        };
+        let now = OffsetDateTime::now_utc();
+        let claimed = match store
+            .claim_failure_notice(&requester.key, &kind, now, REFUSAL_DM_INTERVAL)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::debug!(%agent, requester = %requester.key, %reason, "refused a message; the requester was told recently");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(%agent, requester = %requester.key, error = %err, "couldn't check when the requester was last told; telling them anyway");
+                false
+            }
+        };
+        if let Err(err) = self.inner.replies.dm(&requester.key, text).await {
+            tracing::warn!(%agent, requester = %requester.key, error = %err, "couldn't tell the requester why they were refused");
+            if claimed
+                && let Err(err) = store
+                    .release_failure_notice(&requester.key, &kind, now)
+                    .await
+            {
+                tracing::warn!(%agent, requester = %requester.key, error = %err, "couldn't release the claim on telling the requester");
+            }
+            return;
+        }
+        tracing::info!(%agent, %reason, "refused a message, and told the requester privately");
     }
 
     /// Bills `turn`, whose outcome is `outcome`, to its requester, and
@@ -1206,8 +1266,14 @@ fn relink_text(name: &str) -> String {
 fn refusal_text(name: &str, reason: RefuseReason) -> String {
     match reason {
         RefuseReason::Paused => format!("{name} is paused by its owner."),
-        RefuseReason::Banned => format!("{name} can't take requests from you."),
-        RefuseReason::Denied => format!("{name}'s owner hasn't allowed you to use it here."),
+        RefuseReason::Banned => {
+            "A community admin banned you, so agents won't take your requests. Send `me` to \
+             me to see why."
+                .to_owned()
+        }
+        RefuseReason::Denied => {
+            format!("{name}'s owner hasn't allowed you to use it where you asked it.")
+        }
         RefuseReason::HopCap { max } => format!(
             "{name} won't answer: this chain of agents has reached its limit of {max} hops."
         ),

@@ -244,8 +244,14 @@ impl World {
         }
     }
 
+    /// The router's decision, with a refusal's requester left out: the
+    /// tests of who is refused compare [`refused`], and
+    /// `a_refusal_names_the_requester_to_tell` checks the requester.
     fn route(&self, event: &InboundEvent) -> Decision {
-        route(event, self.a, &self.view)
+        match route(event, self.a, &self.view) {
+            Decision::Refuse { reason, .. } => refused(reason),
+            decision => decision,
+        }
     }
 
     /// A rule naming `key`, and the member it belongs to, if any.
@@ -281,7 +287,13 @@ fn ignored(reason: IgnoreReason) -> Decision {
 }
 
 fn refused(reason: RefuseReason) -> Decision {
-    Decision::Refuse(reason)
+    Decision::Refuse {
+        reason,
+        requester: Requester {
+            member: None,
+            key: key("UANY"),
+        },
+    }
 }
 
 #[test]
@@ -1244,6 +1256,33 @@ fn banned_requester_cannot_spend_through_another_agent() {
 }
 
 #[test]
+fn a_refusal_names_the_requester_to_tell() {
+    let mut w = World::new();
+    w.view.banned_members.insert(w.linked);
+    assert_eq!(
+        route(&w.mention(&w.linked_key), w.a, &w.view),
+        Decision::Refuse {
+            reason: RefuseReason::Banned,
+            requester: w.requester(&w.linked_key.clone()),
+        },
+        "a person's own message names them"
+    );
+    let requester = w.requester(&w.linked_key.clone());
+    let event = w.b_mentions_a(requester.clone(), Hop::ZERO);
+    assert_eq!(
+        route(&event, w.a, &w.view),
+        Decision::Refuse {
+            reason: RefuseReason::Banned,
+            requester,
+        },
+        "a hop names the requester it inherited, not the agent that posted"
+    );
+    assert!(RefuseReason::Banned.is_personal() && RefuseReason::Denied.is_personal());
+    assert!(!RefuseReason::Paused.is_personal());
+    assert!(!RefuseReason::DailyCap { max: 1 }.is_personal());
+}
+
+#[test]
 fn deny_rule_refuses_and_deny_wins_over_allow() {
     let mut w = World::new();
     w.set_policy(AgentPolicy {
@@ -1574,7 +1613,7 @@ fn decision_matches_exhaustively() {
                 "run for {} at hop {hop}: {credential:?} {scope:?} {side:?}",
                 requester.key
             ),
-            Decision::Refuse(reason) => format!("refuse: {reason}"),
+            Decision::Refuse { reason, .. } => format!("refuse: {reason}"),
         }
     }
 
@@ -1803,7 +1842,7 @@ fn check_invariants(case: Case) -> usize {
                 LinkState::Broken,
                 "only a requester whose link broke gets a relink prompt: {case:?}"
             ),
-            Decision::Ignore(_) | Decision::Refuse(_) => {}
+            Decision::Ignore(_) | Decision::Refuse { .. } => {}
             Decision::Run { .. } => unreachable!(),
         }
         return 0;

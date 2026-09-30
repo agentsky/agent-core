@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentd::commands::Origin;
+use agentd::commands::{ManagerBot, OpenDm, Origin, Replies};
 use agentd::ctl::SurfaceLookup;
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
@@ -198,11 +198,25 @@ impl Surface for Held {
     }
 }
 
+/// The manager bot's DM with a member is `dm-<user>`.
+struct Dms;
+
+#[async_trait::async_trait]
+impl OpenDm for Dms {
+    async fn open_dm(
+        &self,
+        member: &MemberKey,
+    ) -> Result<core_types::ConversationId, SurfaceError> {
+        Ok(format!("dm-{}", member.user.as_str()).into())
+    }
+}
+
 struct Stack {
     app: App,
     pipeline: Pipeline,
     turns: Turns,
     mock: Arc<MockSurface>,
+    manager: Arc<MockSurface>,
     holds: Arc<Holds>,
     script: PathBuf,
     agent: AgentId,
@@ -378,11 +392,17 @@ async fn start_with(setup: Setup) -> Stack {
     let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
     let mut pipeline_settings = PipelineSettings::from_app(&app);
     (setup.pipeline)(&mut pipeline_settings);
+    let manager = Arc::new(MockSurface::new());
+    let replies = Replies::new(Some(Arc::new(ManagerBot::new(
+        key("manager"),
+        manager.clone(),
+        Arc::new(Dms),
+    ))));
     let pipeline = Pipeline::new(
         store.clone(),
         turns.clone(),
         Arc::clone(app.surfaces()),
-        app.commands().replies().clone(),
+        replies,
         pipeline_settings,
     );
     let server = server.with_pipeline(pipeline.clone());
@@ -398,6 +418,7 @@ async fn start_with(setup: Setup) -> Stack {
         pipeline,
         turns,
         mock,
+        manager,
         holds,
         script,
         agent: agent.id,
@@ -413,6 +434,17 @@ async fn start_with(setup: Setup) -> Stack {
 impl Stack {
     fn store(&self) -> &Store {
         self.app.store()
+    }
+
+    /// Every text the manager bot sent `user` in their DM.
+    fn dms_to(&self, user: &str) -> Vec<String> {
+        let dm = conv(&format!("dm-{user}"));
+        self.manager
+            .posts()
+            .into_iter()
+            .filter(|(to, _)| to.conv == dm)
+            .map(|(_, text)| text)
+            .collect()
     }
 
     /// Alice's second agent, `name`, whose bot is `bot`.
@@ -1142,7 +1174,7 @@ async fn the_owners_own_turns_leave_the_daily_cap_to_others() {
 }
 
 #[tokio::test]
-async fn bans_and_deny_rules_refuse_a_requester() {
+async fn bans_and_deny_rules_refuse_a_requester_privately_once_a_day() {
     let stack = start().await;
     let store = stack.store();
     let bob = store
@@ -1154,12 +1186,31 @@ async fn bans_and_deny_rules_refuse_a_requester() {
         .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
         .await
         .unwrap();
-    stack
-        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "b1", None, &[BOT]))
-        .await;
-    let sent = posts(&stack.calls_since(0));
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].1, "helper can't take requests from you.");
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    for id in ["b1", "b2"] {
+        stack
+            .handle(stack.event(
+                "bob",
+                "GENERAL",
+                ConvKind::Channel,
+                id,
+                None,
+                &[BOT, "UWRITER"],
+            ))
+            .await;
+    }
+    assert!(
+        posts(&stack.calls_since(0)).is_empty(),
+        "nothing is said in the thread"
+    );
+    assert_eq!(
+        stack.dms_to("bob"),
+        [
+            "A community admin banned you, so agents won't take your requests. Send `me` to me \
+          to see why."
+        ],
+        "one message a day, however many agents and messages"
+    );
     store.unban_member(bob).await.unwrap();
 
     let mut rules = agentd::policy::Rules::default();
@@ -1168,19 +1219,35 @@ async fn bans_and_deny_rules_refuse_a_requester() {
         member: Some(bob),
         label: "@bob".into(),
     });
-    store
-        .update_agent_settings(stack.agent, |settings| rules.write(settings))
-        .await
-        .unwrap();
+    for agent in [stack.agent, writer] {
+        store
+            .update_agent_settings(agent, |settings| rules.write(settings))
+            .await
+            .unwrap();
+    }
     let before = stack.mock.calls().len();
-    stack
-        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "b2", None, &[BOT]))
-        .await;
-    let sent = posts(&stack.calls_since(before));
-    assert_eq!(sent.len(), 1);
+    for id in ["d1", "d2"] {
+        stack
+            .handle(stack.event(
+                "bob",
+                "GENERAL",
+                ConvKind::Channel,
+                id,
+                None,
+                &[BOT, "UWRITER"],
+            ))
+            .await;
+    }
+    assert!(posts(&stack.calls_since(before)).is_empty());
+    let mut told = stack.dms_to("bob")[1..].to_vec();
+    told.sort();
     assert_eq!(
-        sent[0].1,
-        "helper's owner hasn't allowed you to use it here."
+        told,
+        [
+            "helper's owner hasn't allowed you to use it where you asked it.",
+            "writer's owner hasn't allowed you to use it where you asked it.",
+        ],
+        "once a day for each agent"
     );
 
     store

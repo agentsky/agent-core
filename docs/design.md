@@ -391,7 +391,10 @@ agent, a banned requester, the agent's deny rules, the hop cap, the agent's
 daily cap and the per-thread caps) apply only to
 messages that pass the gate above, so an unaddressed message never draws a
 notice, and they come before the credential, so nobody is offered a link
-prompt or a community-key turn they would then be refused. If the router
+prompt or a community-key turn they would then be refused. A refusal of the
+requester themselves (a ban, or the agent's deny rules) is told to them
+privately by the manager bot, at most once a day per agent, and never in the
+thread; the others are one line in the thread. If the router
 can't tell whether the requester is banned, or what the agent's rules are, it
 refuses rather than assume the requester is allowed. The router's rustdoc
 gives the full order.

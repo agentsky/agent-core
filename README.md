@@ -145,7 +145,9 @@ by name; the owner may always use their own agent. `[limits]` caps every
 thread outside one-to-one DMs, whatever agents are in it:
 `thread_turns_per_hour` (default 30) and `thread_tokens_per_day` (default
 2,000,000), and chains of agents at `max_hops` (default 3). A capped agent
-says so once per thread and window.
+says so once per thread and window; when an agent refuses someone because
+they are banned or denied, the manager bot tells them privately, at most
+once a day.
 Community admins are the member identities `[community] admins` lists, as
 `<surface>:<team>:<user>`. An admin sets the community API key with
 `admin api-key set <key>` in the manager bot's direct message (or with

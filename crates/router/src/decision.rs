@@ -47,8 +47,15 @@ pub enum Decision {
         /// when `scope` is [`ScopeKind::Private`].
         side: Side,
     },
-    /// Don't run, and tell the thread why in one line.
-    Refuse(RefuseReason),
+    /// Don't run, and say why: to `requester` privately when the refusal
+    /// is of them ([`RefuseReason::Banned`] and [`RefuseReason::Denied`]),
+    /// and otherwise to the thread, in one line.
+    Refuse {
+        /// Why.
+        reason: RefuseReason,
+        /// Whose request is refused, as for [`Decision::LinkPrompt`].
+        requester: Requester,
+    },
 }
 
 /// Why the router ignored an event. Ignored events get no reply.
@@ -106,6 +113,10 @@ impl fmt::Display for IgnoreReason {
 
 /// Why the router refused an addressed event. The pipeline renders each as a
 /// one-line notice.
+///
+/// [`Banned`](Self::Banned) and [`Denied`](Self::Denied) are about the
+/// requester, so the pipeline tells them privately; see
+/// [`is_personal`](Self::is_personal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefuseReason {
     /// The owner paused the agent.
@@ -142,6 +153,12 @@ pub enum RefuseReason {
 }
 
 impl RefuseReason {
+    /// Whether the refusal is about who the requester is, not about the
+    /// agent, the chain or the thread, so only the requester is told.
+    pub const fn is_personal(self) -> bool {
+        matches!(self, Self::Banned | Self::Denied)
+    }
+
     /// A short, stable description for logs.
     pub const fn as_str(self) -> &'static str {
         match self {

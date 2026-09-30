@@ -6612,8 +6612,26 @@ thread caps would otherwise answer every message with the same line.
 **Solution.** `limit_notices` holds one row per agent, thread, kind and
 window (the UTC day for the daily cap and the token budget, the hour for
 the turn cap), claimed with an insert before posting and released if the
-post fails, as `failure_notices` does. Other refusals still post each
-time, as before.
+post fails, as `failure_notices` does. A pause, the hop cap and an
+unreadable policy still post each time, as before.
+
+### A refusal of the requester is told to them alone, once a day
+
+**Issue.** A banned member's message, or one an agent's rules deny, drew a
+public line in the thread, every time: a banned member mentioning k agents
+had k lines posted per message, and the thread learnt who was banned or
+denied.
+
+**Solution.** `Decision::Refuse` now carries the requester, as the link
+prompts do (for a hop, the requester the turn inherited), and
+`RefuseReason::is_personal` marks `Banned` and `Denied`. For those the
+pipeline sends the line to the requester from the manager bot, like a link
+prompt, and only if the agent's bot could have answered there. It claims a
+`failure_notices` row first, so the requester is told at most once per
+`REFUSAL_DM_INTERVAL` (a day): about a ban once for all agents
+(`refused/banned`), and about each agent's rules once for that agent
+(`refused/<agent id>`); a DM that fails releases the claim. Those rows
+are kept like the other failure notices, one per requester and kind.
 
 ### Allow and deny undo each other
 
