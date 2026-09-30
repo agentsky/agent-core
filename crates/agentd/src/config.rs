@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use auth::OAuthConfig;
-use core_types::Cidr;
+use core_types::{Cidr, MemberKey};
 use cred_proxy::{DEFAULT_UPSTREAM, EgressLimits, EgressPolicy, EgressProxy, HostRule};
 use router::ModelPolicy;
 use runner::{
@@ -126,6 +126,8 @@ pub struct Config {
     pub runner: RunnerConfig,
     /// `[agents]`: caps on members' agents.
     pub agents: AgentsConfig,
+    /// `[community]`: who the community admins are.
+    pub community: CommunityConfig,
     /// `[claude_oauth]`: Claude Code's OAuth parameters, for linking
     /// accounts. Every key has a default, so the section is optional.
     pub claude_oauth: OAuthConfig,
@@ -159,6 +161,8 @@ struct File {
     runner: RunnerConfig,
     #[serde(default)]
     agents: AgentsConfig,
+    #[serde(default)]
+    community: CommunityConfig,
     #[serde(default)]
     claude_oauth: OAuthConfig,
     rocketchat: Option<RocketChatConfig>,
@@ -441,6 +445,43 @@ impl Default for AgentsConfig {
     }
 }
 
+/// `[community]`. Every key has a default, so the section is optional.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct CommunityConfig {
+    /// `admins`: the community admins, each named by one surface identity
+    /// in its string form, `<surface>:<team>:<user>`, such as
+    /// `slack:T0123ABCD:U0456EFGH` or `rocketchat:chat.example.com:aBcD1234`.
+    /// Only they may run `/agent admin …`. An identity is matched exactly,
+    /// so an admin who uses two surfaces is listed once for each. Empty by
+    /// default: nobody is an admin.
+    #[serde(deserialize_with = "member_keys")]
+    pub admins: Vec<MemberKey>,
+}
+
+impl CommunityConfig {
+    /// Whether `member` is a community admin.
+    pub fn is_admin(&self, member: &MemberKey) -> bool {
+        self.admins.contains(member)
+    }
+}
+
+/// Reads a list of member keys in their string form.
+fn member_keys<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<MemberKey>, D::Error> {
+    Vec::<String>::deserialize(de)?
+        .iter()
+        .map(|text| {
+            text.parse().map_err(|_| {
+                serde::de::Error::custom(
+                    "not a member identity: write <surface>:<team>:<user>, such as \
+                     slack:T0123ABCD:U0456EFGH",
+                )
+            })
+        })
+        .collect()
+}
+
 /// Secrets, read from the environment only.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -568,6 +609,7 @@ impl Config {
             sandbox: file.sandbox,
             runner: file.runner,
             agents: file.agents,
+            community: file.community,
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
             slack: file.slack,
@@ -1887,6 +1929,30 @@ manager_user_id = "manager-id"
         assert_eq!(with(&text, env()).unwrap().agents.max_per_owner, 3);
         let err = file_err(&format!("{MINIMAL}\n[agents]\nmax_per_owner = 0\n"));
         assert_eq!(err.key(), Some("agents.max_per_owner"), "{err}");
+    }
+
+    #[test]
+    fn community_admins_are_member_identities_and_none_by_default() {
+        assert!(with(MINIMAL, env()).unwrap().community.admins.is_empty());
+        let text = format!(
+            "{MINIMAL}\n[community]\nadmins = [\"slack:T0123:U0456\", \
+             \"rocketchat:chat.example.com:aBcD\"]\n"
+        );
+        let community = with(&text, env()).unwrap().community;
+        let slack: MemberKey = "slack:T0123:U0456".parse().unwrap();
+        let rocket: MemberKey = "rocketchat:chat.example.com:aBcD".parse().unwrap();
+        assert_eq!(community.admins, [slack.clone(), rocket]);
+        assert!(community.is_admin(&slack));
+        assert!(!community.is_admin(&"slack:T0123:U9999".parse().unwrap()));
+        assert!(!community.is_admin(&"slack:T9999:U0456".parse().unwrap()));
+
+        let err = file_err(&format!(
+            "{MINIMAL}\n[community]\nadmins = [\"slack:T0123:U0456\", \"U0456\"]\n"
+        ));
+        assert_eq!(err.key(), Some("community.admins"), "{err}");
+        assert!(err.to_string().contains("<surface>:<team>:<user>"), "{err}");
+        let err = file_err(&format!("{MINIMAL}\n[community]\nadmin = []\n"));
+        assert!(err.to_string().contains("admin"), "{err}");
     }
 
     #[test]

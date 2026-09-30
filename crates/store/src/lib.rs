@@ -23,9 +23,10 @@
 //! [`scope_locks`](Store::acquire_scope_lock),
 //! [`volumes`](Store::put_volume), [`sessions`](Store::session_for_thread),
 //! [`message_refs`](Store::record_message_ref),
-//! [`slack_config_tokens`](Store::put_slack_config_token), and
+//! [`slack_config_tokens`](Store::put_slack_config_token),
 //! [`agents`](Store::create_agent) with their bindings and
-//! [retirements](Store::claim_retirement).
+//! [retirements](Store::claim_retirement), and
+//! [`community_settings`](Store::set_community_api_key).
 
 #![warn(missing_docs)]
 
@@ -39,6 +40,7 @@ use time::OffsetDateTime;
 
 mod agents;
 mod claude_links;
+mod community;
 mod ctl;
 mod events;
 mod members;
@@ -55,6 +57,7 @@ pub use agents::{
     NewAgent, PendingRetirement, Visibility,
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
+pub use community::CommunityKeyStatus;
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use message_refs::{MessageRef, NewMessageRef};
@@ -358,6 +361,7 @@ mod tests {
                 "agents",
                 "claude_link_generations",
                 "claude_links",
+                "community_settings",
                 "ctl_tokens",
                 "members",
                 "message_refs",

@@ -709,6 +709,9 @@ erDiagram
         bytes verifier_enc
         timestamp expires_at
     }
+    COMMUNITY_SETTINGS {
+        bytes api_key_enc
+    }
 ```
 
 Identities are `(surface, team_id, user_id)`, never a bare user id. One member

@@ -47,9 +47,9 @@ async fn attribution(
 /// bots included), whose binding received the event, the attribution of
 /// the event's message (waited for when an agent's bot sent it) and whether
 /// its reply-to message is the agent's,
-/// the members of the sender and of an attributed requester, and whether
-/// the owner and those members are linked. The community key isn't
-/// configurable yet (T26), so it answers false. Until T27, `policy` answers
+/// the members of the sender and of an attributed requester, whether the
+/// owner and those members are linked, and whether a community admin has
+/// set the community API key. Until T27, `policy` answers
 /// [`AgentPolicy::default`] and `is_banned` `Some(false)`.
 #[derive(Debug, Default)]
 pub(crate) struct StoreView {
@@ -60,6 +60,7 @@ pub(crate) struct StoreView {
     replied: Option<(MsgRef, AgentId)>,
     members: HashMap<MemberKey, MemberId>,
     linked: HashSet<MemberId>,
+    community_key: bool,
 }
 
 impl StoreView {
@@ -120,6 +121,7 @@ impl StoreView {
             view.replied = Some((reply_to.clone(), poster));
         }
         view.member(store, &event.sender).await?;
+        view.community_key = store.community_api_key_status().await?.set;
         Ok(view)
     }
 
@@ -173,7 +175,7 @@ impl RouterView for StoreView {
     }
 
     fn community_key_configured(&self) -> bool {
-        false
+        self.community_key
     }
 
     fn agent_owner(&self, agent: AgentId) -> Option<MemberId> {

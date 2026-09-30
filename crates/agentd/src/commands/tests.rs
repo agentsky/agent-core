@@ -10,7 +10,7 @@ use core_types::{
     Binding, BindingId, ConvKind, ConvRef, ConversationId, InboundEvent, MemberKey, MsgRef,
     ReplyTarget, SurfaceError, SurfaceKind, TeamId, UserId,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
 use store::{NewClaudeLink, Sealer, Store};
 use testkit::{MockSurface, Op};
@@ -35,6 +35,8 @@ const REVOKE_PATH: &str = "/v1/oauth/token/revoke";
 const PROFILE_PATH: &str = "/api/oauth/profile";
 const CODE: &str = "SECRETCODE-4f2a9c";
 const API_KEY: &str = "sk-ant-api03-SECRETKEY-77b1";
+/// The one community admin.
+const ADMIN: &str = "root";
 
 fn key(user: &str) -> MemberKey {
     MemberKey {
@@ -105,7 +107,8 @@ async fn harness() -> Harness {
         Replies::new(Some(bot)),
         None,
         None,
-    );
+    )
+    .with_admins([key(ADMIN)]);
     Harness {
         store,
         auth,
@@ -606,11 +609,179 @@ async fn commands_that_come_later_say_so() {
     let h = harness().await;
     h.dm("alice", "skill rm helper tool").await;
     assert_eq!(h.last_reply("alice"), "`skill rm` isn't available yet.");
-    h.dm("root", &format!("admin api-key set {API_KEY}")).await;
-    assert_eq!(
-        h.last_reply("root"),
-        "`admin api-key set` isn't available yet."
+    h.dm(ADMIN, "admin ban @alice").await;
+    assert_eq!(h.last_reply(ADMIN), "`admin ban` isn't available yet.");
+}
+
+#[tokio::test]
+async fn an_admin_sets_and_clears_the_community_key_privately_and_it_is_never_logged() {
+    let h = harness().await;
+    let (logs, _guard) = capture_logs();
+
+    h.dm(ADMIN, &format!("admin api-key set {API_KEY}")).await;
+    let reply = h.last_reply(ADMIN);
+    assert!(
+        reply.starts_with("The community API key is set."),
+        "{reply}"
     );
+    assert_eq!(
+        h.store
+            .community_api_key()
+            .await
+            .unwrap()
+            .unwrap()
+            .expose_secret(),
+        API_KEY
+    );
+    h.dm(ADMIN, "me").await;
+    let me = h.last_reply(ADMIN);
+    assert!(
+        me.contains("Community API key: set (last changed by `rocketchat:"),
+        "{me}"
+    );
+    assert!(me.contains("You are a community admin."), "{me}");
+    h.dm("alice", "me").await;
+    assert!(!h.last_reply("alice").contains("Community API key"));
+
+    h.dm(ADMIN, "admin api-key clear").await;
+    assert!(
+        h.last_reply(ADMIN)
+            .starts_with("The community API key is cleared."),
+        "{}",
+        h.last_reply(ADMIN)
+    );
+    assert!(h.store.community_api_key().await.unwrap().is_none());
+    h.dm(ADMIN, "admin api-key clear").await;
+    assert_eq!(h.last_reply(ADMIN), "No community API key was set.");
+    h.dm(ADMIN, "me").await;
+    assert!(
+        h.last_reply(ADMIN).contains("Community API key: not set"),
+        "{}",
+        h.last_reply(ADMIN)
+    );
+
+    let out = logs.text();
+    assert!(out.contains("\"command\":\"admin api-key set\""), "{out}");
+    assert!(out.contains("set the community API key"), "{out}");
+    assert!(out.contains("cleared the community API key"), "{out}");
+    assert!(!out.contains(API_KEY), "the key reached the log:\n{out}");
+    for (_, text) in h.mock.posts() {
+        assert!(!text.contains(API_KEY), "a reply repeated the key: {text}");
+    }
+}
+
+#[tokio::test]
+async fn only_admins_change_the_community_key() {
+    let h = harness().await;
+    let (logs, _guard) = capture_logs();
+    h.dm("alice", &format!("admin api-key set {API_KEY}")).await;
+    assert_eq!(h.last_reply("alice"), admin::NOT_AN_ADMIN);
+    assert!(h.store.community_api_key().await.unwrap().is_none());
+
+    h.store
+        .set_community_api_key(
+            &SecretString::from(API_KEY),
+            &key(ADMIN),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    h.dm("alice", "admin api-key clear").await;
+    assert_eq!(h.last_reply("alice"), admin::NOT_AN_ADMIN);
+    assert!(h.store.community_api_key().await.unwrap().is_some());
+    let other_team = MemberKey {
+        team: TeamId::new("another.example.org"),
+        ..key(ADMIN)
+    };
+    let reply = h
+        .commands
+        .run(
+            &other_team,
+            commands::parse("admin api-key clear").unwrap(),
+            &Origin::RocketChatDm {
+                room: "dm-root".into(),
+            },
+            &[],
+        )
+        .await;
+    assert_eq!(
+        reply,
+        admin::NOT_AN_ADMIN,
+        "the same user id on another server isn't the admin"
+    );
+    assert!(h.store.community_api_key().await.unwrap().is_some());
+    assert!(!logs.text().contains(API_KEY));
+}
+
+#[tokio::test]
+async fn an_admins_key_in_a_channel_is_refused_and_not_stored() {
+    let h = harness().await;
+    h.channel(ADMIN, &format!("admin api-key set {API_KEY}"))
+        .await;
+    let reply = h.last_reply(ADMIN);
+    assert!(reply.contains("I didn't store it"), "{reply}");
+    assert!(h.store.community_api_key().await.unwrap().is_none());
+    assert!(
+        h.mock
+            .posts()
+            .iter()
+            .all(|(to, _)| to.conv != conv("GENERAL")),
+        "nothing is said in the channel"
+    );
+
+    h.channel(ADMIN, "admin api-key clear").await;
+    assert_eq!(h.last_reply(ADMIN), "No community API key was set.");
+}
+
+#[tokio::test]
+async fn a_key_that_cant_be_a_header_value_is_refused_without_repeating_it() {
+    let h = harness().await;
+    let long = format!("sk-ant-{}", "x".repeat(crate::community::MAX_API_KEY_BYTES));
+    for key in ["sk-ant-\u{7f}", "sk-ant-é", long.as_str()] {
+        h.dm(ADMIN, &format!("admin api-key set {key}")).await;
+        let reply = h.last_reply(ADMIN);
+        assert!(reply.contains("I didn't store it"), "{reply}");
+        assert!(!reply.contains(key));
+    }
+    assert!(h.store.community_api_key().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_admin_sets_the_key_with_the_slack_slash_command() {
+    let h = harness().await;
+    let slack_admin = MemberKey {
+        surface: SurfaceKind::Slack,
+        team: TeamId::new("T0TEAM"),
+        user: UserId::new("U0ADMIN"),
+    };
+    let commands = h.commands.clone().with_admins([slack_admin.clone()]);
+    let reply = commands
+        .run(
+            &slack_admin,
+            commands::parse(&format!("admin api-key set {API_KEY}")).unwrap(),
+            &Origin::SlackSlash {
+                response_url: SecretString::from("https://hooks.slack.test/r"),
+            },
+            &[],
+        )
+        .await;
+    assert!(
+        reply.starts_with("The community API key is set."),
+        "{reply}"
+    );
+    assert!(h.store.community_api_key().await.unwrap().is_some());
+    let reply = h
+        .commands
+        .run(
+            &slack_admin,
+            commands::parse("admin api-key clear").unwrap(),
+            &Origin::SlackSlash {
+                response_url: SecretString::from("https://hooks.slack.test/r"),
+            },
+            &[],
+        )
+        .await;
+    assert_eq!(reply, admin::NOT_AN_ADMIN, "admins are the ones configured");
 }
 
 #[tokio::test]

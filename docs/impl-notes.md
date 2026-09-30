@@ -5055,3 +5055,128 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
+
+## T26: Requester-pays routing
+
+### The community key lives in one sealed row, read on every request
+
+**Issue.** The plan makes `/agent admin api-key set` the key's only
+source and asks for it sealed, never logged and never reachable from a
+sandbox but through the proxy's swap. It doesn't say how the proxy gets
+it, how a change reaches a running agentd (or a second instance), or what
+an operator can read back about it.
+
+**Solution.** `community_settings` holds one row (`id` is 1 by a `CHECK`,
+inserted by the migration) with `api_key_enc`, sealed with
+`community_settings/api_key_enc/1` as its associated data, and
+`api_key_changed_by` (a member key's string form) and
+`api_key_changed_at`, which record who last set or cleared it; `me` shows
+them to admins. `StoreCommunityKey`, the proxy's `CommunityKey`, reads and
+opens the row on every request, with no cache, so a key set or cleared on
+one instance applies at once on every instance sharing the store. The
+router's view reads only whether the column is set, without opening it.
+The key reaches memory only in the proxy's request and in the `admin
+api-key set` command, both as `SecretString`; commands are logged by name,
+and a captured-log test at `trace` finds the key in neither the log nor
+any reply. Sandboxes get an `agentd-key-…` placeholder, as T18 made it,
+and a test shows the proxy swaps in the stored key, refuses with 401 once
+it is cleared, and with 403 between turns.
+
+### Admins are identities, matched exactly
+
+**Issue.** "Admins are listed in configuration, by `MemberKey`" names no
+section or key, and says nothing about members with identities on two
+surfaces.
+
+**Solution.** `[community] admins` is a list of member keys in their string
+form, `<surface>:<team>:<user>`, checked at load with the key named in the
+error. It is empty by default, so nobody is an admin until the operator
+says so. An identity is matched exactly, surface and team included: the
+same user id on another Rocket.Chat server or Slack workspace is not the
+admin, and an admin who uses both surfaces is listed twice. A non-admin
+gets one line saying only admins can change the key, and a key they sent
+privately is dropped unstored; a key sent where others can read it is
+refused first, admin or not, as T13 does. T27's `admin ban` and `unban`
+should use the same list.
+
+### A key is only checked for being a header value
+
+**Issue.** Nothing said whether `admin api-key set` validates the key.
+
+**Solution.** It must be 1 to 512 bytes of visible ASCII, which is what an
+`x-api-key` header value can carry; anything else is refused without
+being repeated. agentd doesn't try the key against Anthropic before
+storing it: that would send it upstream outside any turn and make the
+command depend on the network. A key Anthropic refuses shows up on the
+first community turn, whose thread and requester are told the community
+key was refused and an admin can set a working one.
+
+### Whose account hit the limit, and who is told
+
+**Issue.** T26 asks that usage-limit and auth errors be "shown to the
+requester, never the owner, and name whose account hit the limit". T23b
+posts a failure message in the thread, where everyone, the owner
+included, reads it, and its texts said "the Claude account this request
+runs on". `Surface::render` has no way to mention a member by id, so the
+thread text can't name the requester as a mention.
+
+**Solution.** Two messages. The thread gets the turn's recorded reply,
+naming the account by whose it is: "the Claude account of the person who
+asked" or "the community API key", for a usage limit or a refusal
+(`USAGE_LIMIT_TEXT`, `LOGIN_EXPIRED_TEXT`, `COMMUNITY_USAGE_LIMIT_TEXT`,
+`COMMUNITY_KEY_REFUSED_TEXT`). The requester, and only the requester,
+also gets a direct message from the manager bot through the same
+`Replies::dm` the link prompt uses, saying it was their account (or, with
+no account linked, the community key) and what to do. The owner is never
+messaged unless they asked; for a hop the requester is the inherited one.
+In the requester's own DM with the agent the reply there is private
+already, so no second message is sent. A refused login whose link is
+already marked broken gets none either: the relink notice (T13) tells the
+member once. A test refuses
+bob's refresh mid-thread and sees the thread told, the link broken and no
+message from the pipeline.
+
+### The pipeline also refuses a private scope for anyone but the owner
+
+**Issue.** The router never gives a non-owner `ScopeKind::Private` (its
+invariant grid checks it), and the hooks refuse the owner's side outside
+the private session, but the pipeline mapped whatever scope the decision
+named to a `ScopeKey`, so a router change could put a non-owner's turn,
+with the requester's own credential and the public side, on the agent's
+`Private` volume, where the owner's `shared/` is.
+
+**Solution.** `turn_scope` resolves the private scope only for the owner's
+own turn on the owner's side and credential, and the conversation's own
+scope only for a public-side turn; any other combination fails the turn
+before a session is looked up, logged as an error. A unit test walks every
+requester, credential, scope kind, side and conversation kind, and a
+pipeline test runs a non-owner's DM on its `Dm` scope with no private
+volume created.
+
+### A plan read at a refresh counts from the next turn
+
+**Issue.** The model is picked from the requester's plan before the turn
+starts, and `auth` reads the profile after it has handed the refreshed
+token out (T09), so the turn whose request triggered the refresh can't
+use a plan that refresh found.
+
+**Solution.** As the plan says, the change takes effect on the next turn:
+the pipeline reads `claude_links.plan` again for every turn, and the
+runner restarts the process when the model differs. A test refreshes bob's
+token mid-thread with a profile that moves him to Claude Max, and sees the
+first turn on the refreshed token with the old model, the next on the new
+model, in a new process.
+
+### Seeing a process restart from a test
+
+**Issue.** The acceptance wants a process restart between a linked
+member's turn and the community key's, but nothing outside the runner
+says which process ran a turn: every process of a session sends the same
+`x-claude-code-session-id`.
+
+**Solution.** The tests' scripted turns run `sh -c 'echo $PPID >> pids'`
+through `fake-claude`, which records the pid of the `claude` process that
+ran each turn. A change of credential kind or model shows as a new pid,
+and a test with two linked members on one model shows the same pid for
+both turns, with each turn's own bearer token upstream: the warm process's
+placeholder follows the requester.

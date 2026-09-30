@@ -138,7 +138,8 @@ description, and must pass T02's policy.
 - `agentd gen-key` prints a new master key.
 - The file's sections, each added by the task that first needs it: `[server]`,
   `[internal]`, `[store]`, `[claude_oauth]`, `[sandbox]`, `[runner]`,
-  `[proxy]`, `[rocketchat]`, `[slack]`, `[limits]`. `config/agentd.example.toml` documents
+  `[proxy]`, `[rocketchat]`, `[slack]`, `[limits]`, `[community]` (T26's
+  community admins). `config/agentd.example.toml` documents
   every key and is kept current by each task.
 - Claude OAuth defaults, observed in the Claude Code 2.1.285 binary on
   2026-09-30. Configuration, not constants, per the design's
@@ -2248,18 +2249,28 @@ Deliverables:
   - The owner's credential is used only for owner-requested turns.
 - `/agent admin api-key set <key>` and `/agent admin api-key clear` for
   community admins. A migration `…_community_settings.sql` adds a
-  single-row `community_settings` table with `api_key_enc`. This is the only
-  source of the key. The command is secret-bearing: refused in channels
-  (T13's rule) and never logged. Admins are listed in configuration, by
-  `MemberKey`.
+  single-row `community_settings` table with `api_key_enc`, and who last
+  changed it and when, which `me` shows admins. This is the only
+  source of the key; the proxy reads it from the store on every request,
+  so a change applies at once on every instance. The command is
+  secret-bearing: refused in channels (T13's rule) and never logged.
+  Admins are listed in configuration, by `MemberKey`: `[community]
+  admins`, matched exactly
+  ([impl-notes](impl-notes.md#admins-are-identities-matched-exactly)).
 - The model is picked per requester plan through T22's `ModelPolicy`. A plan
   change after a token refresh takes effect on the next turn, and restarts the
   process when the model differs (T21's rule).
 - Usage-limit and auth errors from T20 are shown to the requester, never the
-  owner, and name whose account hit the limit.
+  owner, and name whose account hit the limit: the thread is told whether
+  it was the requester's own account or the community key, and the
+  requester alone also gets a DM from the manager bot, unless a relink
+  notice already tells them
+  ([impl-notes](impl-notes.md#whose-account-hit-the-limit-and-who-is-told)).
 - Public-side enforcement: a non-owner's turn runs on the conversation's own
   channel, group DM or DM volume, never the agent's `Private` volume. Add a
-  test that fails if a non-owner decision ever resolves to `Private`.
+  test that fails if a non-owner decision ever resolves to `Private`. The
+  pipeline also refuses such a decision itself
+  ([impl-notes](impl-notes.md#the-pipeline-also-refuses-a-private-scope-for-anyone-but-the-owner)).
 
 Acceptance: pipeline tests with two linked members and one unlinked member in
 one thread, each turn's credential checked through the fake Anthropic's
@@ -2314,9 +2325,9 @@ Deliverables:
   - A token budget per thread per day.
   - A global hop cap. Per-agent `hops` can only lower it.
 - `/agent admin ban @user [reason]` and `/agent admin unban @user`, for
-  community admins. The router refuses a banned member's turns through
-  `RouterView::is_banned`, and a ban also blocks their commands other than
-  `me`.
+  community admins (T26's `[community] admins`). The router refuses a
+  banned member's turns through `RouterView::is_banned`, and a ban also
+  blocks their commands other than `me`.
 
 Acceptance: router tests for each limit, rule and ban, including the hop cap,
 and command tests. The pipeline test of two agents mentioning each other

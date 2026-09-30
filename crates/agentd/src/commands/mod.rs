@@ -1,5 +1,7 @@
-//! `/agent` command dispatch, the account commands, and the agent commands
-//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`).
+//! `/agent` command dispatch, the account commands, the agent commands
+//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), and the
+//! community admins' `admin api-key set` and `clear`, which only the
+//! identities [`Commands::with_admins`] names may run.
 //!
 //! Every surface turns a command into `(MemberKey, text, Origin, files)` and hands
 //! it to [`Commands::handle_text`], which parses it with
@@ -30,6 +32,7 @@
 //! secret-bearing gets the same treatment. Commands are logged by name only,
 //! never with their text or arguments.
 
+mod admin;
 mod agents;
 pub mod intake;
 pub mod relink;
@@ -152,6 +155,7 @@ const FAILED: &str = "Something went wrong on my side. Please try again in a min
 #[derive(Debug, Clone)]
 pub struct Commands {
     inner: Arc<Inner>,
+    admins: Arc<[MemberKey]>,
 }
 
 #[derive(Debug)]
@@ -198,7 +202,22 @@ impl Commands {
                 rocketchat,
                 slack,
             }),
+            admins: Arc::new([]),
         }
+    }
+
+    /// The same commands, with `admins` as the community admins: the only
+    /// members whose `/agent admin …` commands run. Without it nobody is an
+    /// admin.
+    #[must_use]
+    pub fn with_admins(mut self, admins: impl IntoIterator<Item = MemberKey>) -> Self {
+        self.admins = admins.into_iter().collect();
+        self
+    }
+
+    /// Whether `member` is a community admin.
+    fn is_admin(&self, member: &MemberKey) -> bool {
+        self.admins.contains(member)
     }
 
     /// The private reply plumbing.
@@ -295,6 +314,9 @@ impl Commands {
                     self.set_paused(member, name.as_str(), false, origin).await
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
+                Command::Admin(AdminCommand::ApiKey(command)) => {
+                    self.api_key(member, command).await
+                }
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         };
@@ -409,6 +431,10 @@ impl Commands {
                 None => "Claude account: linked. Plan: unknown.".to_owned(),
             },
         };
+        if self.is_admin(key) {
+            reply.push('\n');
+            reply.push_str(&self.community_key_status().await?);
+        }
         if key.surface == SurfaceKind::Slack
             && let Some(slack) = &self.inner.slack
         {

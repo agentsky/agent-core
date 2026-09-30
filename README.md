@@ -105,11 +105,23 @@ deactivation that fails is retried for about three days. A bot sets
 `rocketchat.avatar_url` as its own avatar, if configured. With `[sandbox]`,
 an agent answers a person who mentions it, replies in a thread it started,
 or DMs it, and another agent's message that mentions it, in the thread, as
-its own bot, on the Claude account of whoever asked (the owner's in their
-own DM). Its bot reacts with `[runner] working_emoji` while the turn runs,
-answers only in rooms it was added to, and a member without a linked account
-gets a direct message from the manager bot saying how to link one. Without
-`[sandbox]`, each agent reacts with :eyes: to messages that mention it.
+its own bot, on the Claude account of whoever asked, never the owner's
+unless the owner asked, and on the model `[runner.models]` gives that
+account's plan. Its bot reacts with `[runner] working_emoji` while the turn
+runs, and answers only in rooms it was added to. A member without a linked
+account runs on the community API key if a community admin set one, and
+otherwise gets a direct message from the manager bot saying how to link an
+account. When the account or key a turn ran on hits its usage limit or is
+refused, the thread is told whose it was, and the member who asked gets a
+direct message from the manager bot. Without `[sandbox]`, each agent reacts
+with :eyes: to messages that mention it.
+Community admins are the member identities `[community] admins` lists, as
+`<surface>:<team>:<user>`. An admin sets the community API key with
+`admin api-key set <key>` in the manager bot's direct message (or with
+`/agent admin api-key set <key>` on Slack) and removes it with
+`admin api-key clear`. agentd stores it encrypted with the master key, never
+logs it, and only the credential proxy uses it: sandboxes hold a placeholder.
+`me` tells an admin whether a key is set.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask
