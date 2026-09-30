@@ -44,17 +44,26 @@
 //! 3. Sends `POST $ANTHROPIC_BASE_URL/v1/messages?beta=true` with
 //!    `"stream": true` and the message content. The credential is
 //!    `x-api-key: $ANTHROPIC_API_KEY` when that is set, and otherwise
-//!    `Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN` with
-//!    `anthropic-beta: oauth-2025-04-20`. The real CLI also prefers the API
-//!    key when both are set. If neither is set, or the answer isn't a 200
-//!    with a complete body, the turn ends with an `is_error` result carrying
-//!    `api_error_status`, like the real CLI's, and the script turn is used
-//!    up without running.
+//!    `Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN`. The real CLI also
+//!    prefers the API key when both are set. `anthropic-beta` is the real
+//!    CLI's list for that credential, [`API_KEY_BETA`] or [`OAUTH_BETA`],
+//!    and `anthropic-version`, `x-app: cli` and `x-claude-code-session-id`
+//!    are sent as it sends them. If neither credential is set, or the answer
+//!    isn't a 200 with a complete body, the turn ends with an `is_error`
+//!    result carrying `api_error_status`, like the real CLI's, and the
+//!    script turn is used up without running.
 //! 4. Plays the next [`Turn`] of the script in `FAKE_CLAUDE_SCRIPT`: waits
 //!    [`Turn::delay_ms`], exits with [`CRASH_EXIT_CODE`] if
-//!    [`Turn::crash`], runs [`Turn::commands`], then prints the reply as an
-//!    `assistant` line and a `result` line, and appends it to the
-//!    transcript.
+//!    [`Turn::crash`], runs [`Turn::commands`], prints
+//!    [`Turn::extra_lines`], then prints the reply as an `assistant` line
+//!    and a `result` line, and appends it to the transcript.
+//!
+//! With the OAuth token, the first successful turn of each process also
+//! prints a `rate_limit_event` line right after its first `assistant` line,
+//! shaped like the one in [`fixtures::TOOL_TURNS`](crate::fixtures::TOOL_TURNS).
+//! The real CLI prints one when a subscription's rate-limit status changes,
+//! which against a local server is once per process, and never with an API
+//! key. It is a line the runner must skip.
 //!
 //! The script is read again for every turn, and turn *n* of a session plays
 //! script turn *n*: the count comes from the user messages already in the
@@ -80,6 +89,14 @@ pub const CRASH_EXIT_CODE: i32 = 70;
 /// The model `fake-claude` reports without `--model`: the real CLI's default
 /// when this was written.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
+
+/// The `anthropic-beta` header `fake-claude` sends with the OAuth token:
+/// what Claude Code 2.1.285 sent with `CLAUDE_CODE_OAUTH_TOKEN`.
+pub const OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,effort-2025-11-24,extended-cache-ttl-2025-04-11";
+
+/// The `anthropic-beta` header `fake-claude` sends with an API key: what
+/// Claude Code 2.1.285 sent with `ANTHROPIC_API_KEY`.
+pub const API_KEY_BETA: &str = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,effort-2025-11-24";
 
 /// One turn of a `fake-claude` script. A script is a JSON list of turns; see
 /// [`write_script`].
@@ -117,6 +134,13 @@ pub struct Turn {
     /// failed. A failed command doesn't fail the turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<Vec<String>>,
+    /// Lines to print verbatim after the commands and before the reply,
+    /// such as line types a parser must skip (`{"type":"active_goal"}`) or
+    /// lines that aren't JSON at all. They are printed for an
+    /// [`is_error`](Self::is_error) turn too, and not written to the
+    /// transcript.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_lines: Vec<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -166,6 +190,13 @@ impl Turn {
             .push(argv.into_iter().map(Into::into).collect());
         self
     }
+
+    /// Prints `line` verbatim before the reply; see
+    /// [`extra_lines`](Self::extra_lines).
+    pub fn with_extra_line(mut self, line: impl Into<String>) -> Self {
+        self.extra_lines.push(line.into());
+        self
+    }
 }
 
 /// Writes `turns` to `path` as a `fake-claude` script: the file to name in
@@ -178,12 +209,20 @@ pub fn write_script(path: &Path, turns: &[Turn]) -> io::Result<()> {
 ///
 /// Cargo sets `CARGO_BIN_EXE_<name>` only for a package's own integration
 /// tests, so other crates call this instead. The first call in a process
-/// runs `$CARGO build -p testkit --bin fake-claude --message-format=json`
-/// and reads the executable's path from the artifact message. It builds in
-/// the target directory the running test executable was built in, and with
-/// the environment cargo gave the test, so under `cargo llvm-cov` the binary
-/// is instrumented and built in its target directory. Later calls return the
-/// same path. The build blocks the calling thread.
+/// runs `$CARGO build --locked -p testkit --bin fake-claude
+/// --message-format=json` and reads the executable's path from the artifact
+/// message. It builds in the target directory the running test executable
+/// was built in, and with the environment cargo gave the test, so under
+/// `cargo llvm-cov` the binary is instrumented and built in its target
+/// directory. Later calls return the same path.
+///
+/// The first call blocks the calling thread until the build ends. After a
+/// workspace `cargo test` that is a fraction of a second, but it can take
+/// tens of seconds when the binary isn't built yet, for example when the
+/// calling crate's tests resolved testkit's dependencies with other
+/// features. Call it before starting any timeout, such as a turn timeout or
+/// a `tokio::time::timeout` around a spawn, and outside code that measures
+/// elapsed time.
 ///
 /// Code that starts `fake-claude` with a cleared environment should pass
 /// `LLVM_PROFILE_FILE` through when it is set. Under `cargo llvm-cov` the
@@ -206,7 +245,8 @@ fn build_bin(name: &str) -> PathBuf {
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
-        .args(["-p", "testkit", "--bin", name, "--message-format=json"]);
+        .args(["--locked", "-p", "testkit", "--bin", name])
+        .arg("--message-format=json");
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = target_dir(&exe)
     {
@@ -277,6 +317,9 @@ mod tests {
                 .with_delay(Duration::from_millis(5))
                 .with_command(["agentctl", "react", "eyes"]),
             Turn::crash(),
+            Turn::reply("raw")
+                .with_extra_line(r#"{"type":"active_goal"}"#)
+                .with_extra_line("not json"),
         ];
         let json = serde_json::to_value(&turns).unwrap();
         assert_eq!(
@@ -291,6 +334,7 @@ mod tests {
                     "commands": [["agentctl", "react", "eyes"]],
                 },
                 {"reply": "", "crash": true},
+                {"reply": "raw", "extra_lines": [r#"{"type":"active_goal"}"#, "not json"]},
             ])
         );
         let back: Vec<Turn> = serde_json::from_value(json).unwrap();
