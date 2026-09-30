@@ -7,7 +7,8 @@
 #    own): `claude --version` prints the pinned CLAUDE_CODE_VERSION, it runs
 #    as uid 10001 in /volume, has no entrypoint and idles under Docker's
 #    init, has the tools agents use, and has no `node`. The agentd image
-#    runs as uid 10001 and has `git`, which clones skills.
+#    runs as uid 10001 and has `git`, which clones skills, and a `/bin/sh`
+#    whose `ulimit -f` caps what a clone writes.
 # 2. The stack: Rocket.Chat's first admin, from RC_ADMIN_PASS, can log in.
 # 3. The Compose networks: a container on `sandbox` reaches agentd's proxy
 #    and ctl ports (8080 and 8081), and not its public port (8443),
@@ -138,10 +139,11 @@ check_output "the sandbox idles under Docker's init" "/sbin/docker-init -- sleep
 docker rm -f "$idle" >/dev/null
 check_output "the agentd image runs as 10001:10001" 10001:10001 \
     docker image inspect -f '{{.Config.User}}' "$agentd_image"
-if docker run --rm --entrypoint git "$agentd_image" --version; then
-    pass "the agentd image has git for skill clones"
+if docker run --rm --entrypoint /bin/sh "$agentd_image" \
+    -c 'ulimit -f 81920 && exec git --version'; then
+    pass "the agentd image has git for skill clones, under ulimit -f"
 else
-    fail "git doesn't run in the agentd image"
+    fail "git doesn't run under ulimit -f in the agentd image"
 fi
 
 echo "== Compose stack"

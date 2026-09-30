@@ -11,22 +11,30 @@
 //!   private, loopback, link-local and metadata addresses, agentd's own
 //!   networks. `git` then connects only to the addresses checked
 //!   (`http.curloptResolve`, Git 2.37 or later), so a second lookup can't
-//!   rebind the name, and follows no redirect.
+//!   rebind the name, and follows no redirect. The URL `git` gets is
+//!   rebuilt from the checked host, so it names the host exactly as the
+//!   pin does: curl matches the pin by name, and `GitHub.com.` in the URL
+//!   would miss a pin for `github.com` and be resolved again.
 //! - `git clone --depth=1 --single-branch --no-recurse-submodules
 //!   --no-tags`, the ref only inside `--branch=<ref>` and the URL after
 //!   `--`, so neither can be read as an option.
 //! - Only the `https` transport (`protocol.allow=never`), no credential
-//!   helper or prompt, no system or global configuration, objects checked
-//!   as they arrive (`transfer.fsckObjects`), and symlinks checked out as
-//!   plain files (`core.symlinks=false`).
-//! - An environment of its own, so nothing of agentd's reaches it, and a
-//!   process group of its own, which is killed as a whole when the clone
-//!   takes longer than [`CLONE_TIMEOUT`] or its directory grows past
-//!   [`MAX_CLONE_BYTES`].
+//!   helper or prompt, no system or global configuration, no bundle URIs
+//!   or file system monitor, objects checked as they arrive
+//!   (`transfer.fsckObjects`), and symlinks checked out as plain files
+//!   (`core.symlinks=false`).
+//! - An environment of its own, so nothing of agentd's reaches it (an
+//!   operator's `HTTPS_PROXY` included), and a process group of its own,
+//!   which is killed as a whole when the clone takes longer than
+//!   [`CLONE_TIMEOUT`] or its directory grows past [`MAX_CLONE_BYTES`].
+//!   `git` starts through `/bin/sh` with `ulimit -f`, so no file it or its
+//!   helpers write can pass [`MAX_CLONE_BYTES`] between two measurements;
+//!   `git` killed by `SIGXFSZ` is [`CloneError::TooLarge`].
 
 use std::ffi::OsString;
 use std::fmt;
 use std::net::IpAddr;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -46,6 +54,11 @@ const MAX_CLONE_ENTRIES: usize = 20_000;
 const MEASURE_EVERY: Duration = Duration::from_millis(250);
 /// The `PATH` `git` runs with.
 const PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+/// The shell that caps the size of the files `git` writes, then runs it.
+const SHELL: &str = "/bin/sh";
+/// The script [`SHELL`] runs: `$1` is the cap in 512-byte blocks, and the
+/// rest is the command.
+const CAPPED: &str = "ulimit -f \"$1\" && shift && exec \"$@\"";
 
 /// Why a clone failed. Its message is for the owner, and names nothing
 /// but the host.
@@ -96,6 +109,7 @@ pub struct Git {
     program: PathBuf,
     policy: EgressPolicy,
     network: Arc<dyn Network>,
+    #[cfg(test)]
     local: Option<(String, PathBuf)>,
     timeout: Duration,
     max_bytes: u64,
@@ -105,7 +119,6 @@ impl fmt::Debug for Git {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Git")
             .field("program", &self.program)
-            .field("local", &self.local)
             .finish_non_exhaustive()
     }
 }
@@ -118,6 +131,7 @@ impl Git {
             program: PathBuf::from("git"),
             policy,
             network: Arc::new(SystemNetwork),
+            #[cfg(test)]
             local: None,
             timeout: CLONE_TIMEOUT,
             max_bytes: MAX_CLONE_BYTES,
@@ -127,7 +141,7 @@ impl Git {
     /// Runs `program` instead of `git`, with a shorter `timeout` and
     /// `max_bytes`, so tests reach the limits quickly.
     #[cfg(test)]
-    fn with_limits(mut self, program: &Path, timeout: Duration, max_bytes: u64) -> Self {
+    pub(crate) fn with_limits(mut self, program: &Path, timeout: Duration, max_bytes: u64) -> Self {
         self.program = program.to_owned();
         self.timeout = timeout;
         self.max_bytes = max_bytes;
@@ -135,19 +149,40 @@ impl Git {
     }
 
     /// Resolves hosts through `network` instead.
-    pub fn with_network(mut self, network: Arc<dyn Network>) -> Self {
+    #[cfg(test)]
+    fn with_network(mut self, network: Arc<dyn Network>) -> Self {
         self.network = network;
         self
     }
 
-    /// For tests only: clones every source starting with `prefix`, an
-    /// `https://` URL prefix, from the local directory `dir` instead,
-    /// without resolving the host, so a test serves a fixture repository
-    /// with no network. agentd never calls it, and no configuration key
-    /// reaches it.
-    pub fn serving_prefix_from_directory_for_tests(mut self, prefix: &str, dir: &Path) -> Self {
+    /// Clones every source starting with `prefix`, an `https://` URL
+    /// prefix, from the local directory `dir` instead, without resolving
+    /// the host, so a test serves a fixture repository with no network.
+    #[cfg(test)]
+    pub(crate) fn serving_prefix_from_directory_for_tests(
+        mut self,
+        prefix: &str,
+        dir: &Path,
+    ) -> Self {
         self.local = Some((prefix.to_owned(), dir.to_owned()));
         self
+    }
+
+    /// The configuration that serves `url` from the test directory, when
+    /// its prefix is the one served.
+    #[cfg(test)]
+    fn local_config(&self, url: &str) -> Option<Vec<String>> {
+        let (prefix, dir) = self
+            .local
+            .as_ref()
+            .filter(|(prefix, _)| url.starts_with(prefix.as_str()))?;
+        Some(vec![
+            format!(
+                "url.file://{}/.insteadOf={prefix}",
+                dir.display().to_string().trim_end_matches('/')
+            ),
+            "protocol.file.allow=always".into(),
+        ])
     }
 
     /// Clones `source`, an `https://` URL with an optional `#ref` that
@@ -161,39 +196,46 @@ impl Git {
             Some((url, git_ref)) => (url, Some(git_ref)),
             None => (source, None),
         };
-        let local = self
-            .local
-            .as_ref()
-            .filter(|(prefix, _)| url.starts_with(prefix.as_str()));
-        let pin = match local {
-            Some(_) => None,
-            None => Some(self.pin(url).await?),
-        };
-        let args = clone_args(url, git_ref, dest, pin.as_deref(), local);
-        self.run(&args, dest).await
+        #[cfg(test)]
+        if let Some(config) = self.local_config(url) {
+            return self
+                .run(&clone_args(url, git_ref, dest, &config), dest)
+                .await;
+        }
+        let remote = Remote::parse(url).ok_or(CloneError::Host)?;
+        let pin = self.pin(&remote).await?;
+        let config = [format!("http.curloptResolve={pin}")];
+        self.run(&clone_args(&remote.url, git_ref, dest, &config), dest)
+            .await
     }
 
-    /// The `http.curloptResolve` entry pinning `url`'s host to the
+    /// The `http.curloptResolve` entry pinning `remote`'s host to the
     /// addresses it resolves to, once all are known to be reachable.
-    async fn pin(&self, url: &str) -> Result<String, CloneError> {
-        let (host, port) = host_and_port(url).ok_or(CloneError::Host)?;
-        let addresses = tokio::time::timeout(RESOLVE_TIMEOUT, self.network.resolve(&host, port))
+    async fn pin(&self, remote: &Remote) -> Result<String, CloneError> {
+        let Remote { host, port, .. } = remote;
+        let addresses = tokio::time::timeout(RESOLVE_TIMEOUT, self.network.resolve(host, *port))
             .await
             .ok()
             .and_then(Result::ok)
             .filter(|addresses| !addresses.is_empty())
             .ok_or_else(|| CloneError::Resolve(host.clone()))?;
         if let Some(why) = addresses.iter().find_map(|&ip| self.policy.unreachable(ip)) {
-            return Err(CloneError::Unreachable { host, why });
+            return Err(CloneError::Unreachable {
+                host: host.clone(),
+                why,
+            });
         }
-        Ok(resolve_entry(&host, port, &addresses))
+        Ok(resolve_entry(host, *port, &addresses))
     }
 
     async fn run(&self, args: &[OsString], dest: &Path) -> Result<(), CloneError> {
         let home = dest
             .parent()
             .ok_or_else(|| CloneError::Internal("the clone has no parent directory".into()))?;
-        let mut child = tokio::process::Command::new(&self.program)
+        let mut child = tokio::process::Command::new(SHELL)
+            .args(["-c", CAPPED, "git"])
+            .arg(self.max_bytes.div_ceil(512).to_string())
+            .arg(&self.program)
             .args(args)
             .env_clear()
             .env("PATH", PATH)
@@ -271,6 +313,8 @@ impl Drop for Group {
 fn exited(status: ExitStatus) -> Result<(), CloneError> {
     if status.success() {
         Ok(())
+    } else if status.signal() == Some(rustix::process::Signal::XFSZ.as_raw()) {
+        Err(CloneError::TooLarge)
     } else {
         tracing::info!(code = ?status.code(), "git clone of a skill failed");
         Err(CloneError::Failed)
@@ -306,17 +350,31 @@ fn too_large(dir: &Path, max_bytes: u64) -> bool {
     false
 }
 
-/// The host of an `https://` URL, [normalized](normalize_host), and its
-/// port, 443 unless the URL names one; `None` unless the host is a DNS
-/// name.
-fn host_and_port(url: &str) -> Option<(String, u16)> {
-    let rest = url.strip_prefix("https://")?;
-    let authority = rest.split('/').next()?;
-    let (host, port) = match authority.split_once(':') {
-        Some((host, port)) => (host, port.parse().ok().filter(|&port| port != 0)?),
-        None => (authority, 443),
-    };
-    Some((normalize_host(host)?, port))
+/// A Git server to clone from, from an `https://` URL.
+#[derive(Debug, PartialEq, Eq)]
+struct Remote {
+    /// The URL's host, [normalized](normalize_host).
+    host: String,
+    /// Its port, 443 unless the URL names one.
+    port: u16,
+    /// The URL `git` gets: `https://`, the normalized host and the port,
+    /// then the original URL's path, so it names the host as the pin does.
+    url: String,
+}
+
+impl Remote {
+    /// `None` unless `url` is `https://` with a DNS name for its host.
+    fn parse(url: &str) -> Option<Self> {
+        let rest = url.strip_prefix("https://")?;
+        let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, port.parse().ok().filter(|&port| port != 0)?),
+            None => (authority, 443),
+        };
+        let host = normalize_host(host)?;
+        let url = format!("https://{host}:{port}{path}");
+        Some(Self { host, port, url })
+    }
 }
 
 /// A curl `--resolve` entry, `host:port:addr[,addr…]`, with IPv6 addresses
@@ -332,36 +390,27 @@ fn resolve_entry(host: &str, port: u16, addresses: &[IpAddr]) -> String {
     format!("{host}:{port}:{}", addresses.join(","))
 }
 
-/// `git`'s arguments for cloning `url` at `git_ref` into `dest`, pinned to
-/// `pin` when given, or served from `local`'s directory for tests.
-fn clone_args(
-    url: &str,
-    git_ref: Option<&str>,
-    dest: &Path,
-    pin: Option<&str>,
-    local: Option<&(String, PathBuf)>,
-) -> Vec<OsString> {
-    let mut config: Vec<String> = vec![
-        "protocol.allow=never".into(),
-        "protocol.https.allow=always".into(),
-        "http.followRedirects=false".into(),
-        "credential.helper=".into(),
-        "core.symlinks=false".into(),
-        "core.hooksPath=/dev/null".into(),
-        "transfer.fsckObjects=true".into(),
+/// `git`'s arguments for cloning `url` at `git_ref` into `dest`, with the
+/// `extra` configuration: the pin, or a test's local directory.
+fn clone_args(url: &str, git_ref: Option<&str>, dest: &Path, extra: &[String]) -> Vec<OsString> {
+    let config = [
+        "protocol.allow=never",
+        "protocol.https.allow=always",
+        "http.followRedirects=false",
+        "credential.helper=",
+        "core.symlinks=false",
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        "transfer.fsckObjects=true",
+        "transfer.bundleURI=false",
+        "fetch.bundleURI=",
     ];
-    if let Some(pin) = pin {
-        config.push(format!("http.curloptResolve={pin}"));
-    }
-    if let Some((prefix, dir)) = local {
-        config.push(format!(
-            "url.file://{}/.insteadOf={prefix}",
-            dir.display().to_string().trim_end_matches('/')
-        ));
-        config.push("protocol.file.allow=always".into());
-    }
     let mut args: Vec<OsString> = Vec::new();
-    for entry in config {
+    for entry in config
+        .iter()
+        .copied()
+        .chain(extra.iter().map(String::as_str))
+    {
         args.push("-c".into());
         args.push(entry.into());
     }
@@ -414,15 +463,48 @@ mod tests {
         Git::new(EgressPolicy::new(Vec::new(), own)).with_network(Arc::new(Answers(answers)))
     }
 
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("agentd-clone-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn hosts_must_be_dns_names() {
+    fn hosts_must_be_dns_names_and_the_url_is_rebuilt_from_the_checked_host() {
+        let remote = |url: &str| Remote::parse(url).map(|r| (r.host, r.port, r.url));
         assert_eq!(
-            host_and_port("https://GitHub.com./o/r.git"),
-            Some(("github.com".into(), 443))
+            remote("https://GitHub.com./o/r.git"),
+            Some((
+                "github.com".into(),
+                443,
+                "https://github.com:443/o/r.git".into()
+            ))
         );
         assert_eq!(
-            host_and_port("https://git.example.org:8443/r"),
-            Some(("git.example.org".into(), 8443))
+            remote("https://git.example.org:8443/r"),
+            Some((
+                "git.example.org".into(),
+                8443,
+                "https://git.example.org:8443/r".into()
+            ))
+        );
+        assert_eq!(
+            remote("https://Git.Example.org."),
+            Some((
+                "git.example.org".into(),
+                443,
+                "https://git.example.org:443".into()
+            ))
         );
         for url in [
             "https://169.254.169.254/latest",
@@ -434,7 +516,7 @@ mod tests {
             "https://git.example.org:99999/r",
             "http://github.com/r",
         ] {
-            assert_eq!(host_and_port(url), None, "{url}");
+            assert_eq!(Remote::parse(url), None, "{url}");
         }
     }
 
@@ -454,11 +536,10 @@ mod tests {
     #[test]
     fn the_url_follows_a_lone_dash_dash_and_the_ref_stays_in_its_option() {
         let args = clone_args(
-            "https://github.com/o/r.git",
+            "https://github.com:443/o/r.git",
             Some("v1.2"),
             Path::new("/work/src"),
-            Some("github.com:443:140.82.112.3"),
-            None,
+            &["http.curloptResolve=github.com:443:140.82.112.3".to_owned()],
         );
         let args: Vec<String> = args
             .iter()
@@ -467,7 +548,7 @@ mod tests {
         let dashes = args.iter().position(|a| a == "--").unwrap();
         assert_eq!(
             &args[dashes..],
-            ["--", "https://github.com/o/r.git", "/work/src"]
+            ["--", "https://github.com:443/o/r.git", "/work/src"]
         );
         assert!(args.contains(&"--branch=v1.2".to_owned()));
         assert!(!args.contains(&"v1.2".to_owned()));
@@ -476,7 +557,10 @@ mod tests {
             "protocol.https.allow=always",
             "http.followRedirects=false",
             "core.symlinks=false",
+            "core.fsmonitor=false",
             "transfer.fsckObjects=true",
+            "transfer.bundleURI=false",
+            "fetch.bundleURI=",
             "http.curloptResolve=github.com:443:140.82.112.3",
         ] {
             let at = args.iter().position(|a| a == config).unwrap();
@@ -486,6 +570,51 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("file")));
         for flag in ["--depth=1", "--single-branch", "--no-recurse-submodules"] {
             assert!(args[..dashes].contains(&flag.to_owned()), "{flag}");
+        }
+    }
+
+    /// A stand-in for `git` at `dir/git` running `body`, with `$dest` set
+    /// to the clone's directory.
+    fn stand_in(dir: &Path, body: &str) -> PathBuf {
+        let script = dir.join("git");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        script
+    }
+
+    #[tokio::test]
+    async fn git_is_given_the_url_with_the_host_it_is_pinned_to() {
+        for (source, pinned) in [
+            ("https://GitHub.com./o/r.git", "github.com:443"),
+            ("https://GIT.example.org.:8443/r#v1", "git.example.org:8443"),
+            ("https://github.com/o/r", "github.com:443"),
+        ] {
+            let dir = TempDir::new();
+            let program = stand_in(&dir.0, "printf '%s\\n' \"$@\" > \"$dest/../args\"\nexit 1");
+            let err = git(vec![IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3))])
+                .with_limits(&program, CLONE_TIMEOUT, MAX_CLONE_BYTES)
+                .clone_into(source, &dir.0.join("work/src"))
+                .await
+                .unwrap_err();
+            assert_eq!(err, CloneError::Failed, "{source}");
+            let args = std::fs::read_to_string(dir.0.join("work/args")).unwrap();
+            let args: Vec<&str> = args.lines().collect();
+            let pin = args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("http.curloptResolve="))
+                .unwrap();
+            assert_eq!(pin, format!("{pinned}:140.82.112.3"), "{source}");
+            let url = args[args.iter().position(|arg| *arg == "--").unwrap() + 1];
+            let authority = url
+                .strip_prefix("https://")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap();
+            assert_eq!(authority, pinned, "{source}: git got {url}");
         }
     }
 
@@ -526,7 +655,8 @@ mod tests {
 
     #[test]
     fn a_directory_is_too_large_by_bytes_or_entries() {
-        let dir = std::env::temp_dir().join(format!("agentd-clone-{}", uuid::Uuid::new_v4()));
+        let dir = TempDir::new();
+        let dir = dir.0.join("clone");
         assert!(!too_large(&dir, 10), "a directory not made yet");
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::write(dir.join("a/b/f"), b"x").unwrap();
@@ -534,25 +664,6 @@ mod tests {
         let big = std::fs::File::create(dir.join("big")).unwrap();
         big.set_len(11).unwrap();
         assert!(too_large(&dir, 10));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A stand-in for `git` that starts a child in its group, notes the
-    /// child's pid in `pid` next to the clone, then writes `bytes` bytes
-    /// into the clone and sleeps.
-    fn stand_in(dir: &Path, bytes: u64) -> PathBuf {
-        let script = dir.join("git");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nfor dest; do :; done\nmkdir -p \"$dest\"\nsleep 60 &\n\
-                 echo $! > \"$dest/../pid\"\nhead -c {bytes} /dev/zero > \"$dest/pack\"\nsleep 60\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
-        script
     }
 
     /// Whether the process `pid` is gone or a zombie.
@@ -561,31 +672,73 @@ mod tests {
             .map_or(true, |stat| stat.contains(") Z "))
     }
 
-    async fn stopped_clone(bytes: u64) -> CloneError {
-        let dir = std::env::temp_dir().join(format!("agentd-clone-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("repos")).unwrap();
+    /// Clones with a stand-in running `body`, within `timeout` and a cap of
+    /// 1,024 bytes. When the stand-in got as far as noting the pid of the
+    /// child it starts in `work/pid`, that child must be gone too.
+    async fn stopped_clone(body: &str, timeout: Duration) -> CloneError {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(dir.0.join("repos")).unwrap();
         let git = git(Vec::new())
-            .with_limits(&stand_in(&dir, bytes), Duration::from_secs(2), 1024)
-            .serving_prefix_from_directory_for_tests("https://git.test/", &dir.join("repos"));
+            .with_limits(&stand_in(&dir.0, body), timeout, 1024)
+            .serving_prefix_from_directory_for_tests("https://git.test/", &dir.0.join("repos"));
         let started = tokio::time::Instant::now();
         let err = git
-            .clone_into("https://git.test/r.git", &dir.join("work/src"))
+            .clone_into("https://git.test/r.git", &dir.0.join("work/src"))
             .await
             .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let pid = std::fs::read_to_string(dir.join("work/pid")).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !gone(&pid) {
-            assert!(std::time::Instant::now() < deadline, "git's child survived");
-            std::thread::sleep(Duration::from_millis(20));
+        assert!(started.elapsed() < timeout + Duration::from_secs(10));
+        if let Ok(pid) = std::fs::read_to_string(dir.0.join("work/pid"))
+            && !pid.trim().is_empty()
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !gone(&pid) {
+                assert!(std::time::Instant::now() < deadline, "git's child survived");
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
-        std::fs::remove_dir_all(&dir).unwrap();
         err
     }
 
+    const CHILD: &str = "sleep 60 &\necho $! > \"$dest/../pid\"";
+
     #[tokio::test]
-    async fn a_clone_past_its_time_or_size_is_killed_with_its_children() {
-        assert_eq!(stopped_clone(10).await, CloneError::TimedOut);
-        assert_eq!(stopped_clone(4096).await, CloneError::TooLarge);
+    async fn a_clone_past_its_time_is_killed_with_its_children() {
+        let body = format!("{CHILD}\nhead -c 10 /dev/zero > \"$dest/pack\"\nsleep 60");
+        assert_eq!(
+            stopped_clone(&body, Duration::from_secs(2)).await,
+            CloneError::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clone_whose_files_add_up_past_the_cap_is_killed_with_its_children() {
+        let body = format!(
+            "{CHILD}\nfor n in 1 2 3; do head -c 600 /dev/zero > \"$dest/pack$n\"; done\nsleep 60"
+        );
+        assert_eq!(
+            stopped_clone(&body, Duration::from_secs(60)).await,
+            CloneError::TooLarge
+        );
+    }
+
+    #[tokio::test]
+    async fn no_file_a_clone_writes_passes_the_cap() {
+        let dir = TempDir::new();
+        let body = "exec head -c 4096 /dev/zero > \"$dest/pack\"";
+        assert_eq!(
+            stopped_clone(body, Duration::from_secs(60)).await,
+            CloneError::TooLarge
+        );
+        let program = stand_in(
+            &dir.0,
+            "head -c 4096 /dev/zero > \"$dest/pack\"\nwc -c < \"$dest/pack\" > \"$dest/../size\"",
+        );
+        let _ = git(Vec::new())
+            .with_limits(&program, Duration::from_secs(60), 1024)
+            .serving_prefix_from_directory_for_tests("https://git.test/", &dir.0)
+            .clone_into("https://git.test/r.git", &dir.0.join("work/src"))
+            .await;
+        let size = std::fs::read_to_string(dir.0.join("work/size")).unwrap();
+        assert_eq!(size.trim(), "1024");
     }
 }
