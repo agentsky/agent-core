@@ -8438,8 +8438,9 @@ space-separated string, as RFC 6749 has it, or an array of strings,
 allowed if it names a scope and unstated if not (absent, `null`, blank,
 an empty array or an array of blank strings, since no scope is no grant
 and a server using it for "as requested" would reopen the hole); and
-unreadable for any other shape: a number, a nested array, `{}`, or an
-object whose every key is an allowed scope.
+unreadable for any other shape that names no wider scope, such as a
+number, `true`, `[7]`, a nested array of allowed scopes, `{}` or
+`{"user:profile": true}`.
 
 - A login keeps only an allowed grant. A wider one is
   `AuthError::ScopeRefused`, whose reply tells the member to open the
@@ -8449,20 +8450,23 @@ object whose every key is an allowed scope.
   login attempt, not again by the command handler, and the reply says so
   and to tell an admin rather than inviting retries.
 - A refresh sent the scopes itself, so an unstated or unreadable grant
-  keeps the link: a change to a shape other than an object doesn't break
-  every member's link and revoke every token. An object-shaped `scope`
-  with label keys does, by design, since its keys can't be told from
-  scope names. An unreadable one is logged at warn, once per process. A
-  wider one, in any shape, marks the link broken, as a dead refresh token
-  does, so the member gets the relink notice and the token isn't served
-  again.
+  keeps the link, and an unreadable one is logged at warn, once per
+  process. A wider one, in any shape, marks the link broken, as a dead
+  refresh token does, so the member gets the relink notice and the token
+  isn't served again. Any string, or any object key at any depth, that
+  isn't an allowed scope makes the grant wider, labelled objects such as
+  `{"granted": ...}` included, even inside an array, since a label can't
+  be told from a scope name. So a format change that adds such a string
+  or key breaks every member's link and revokes every token at its next
+  refresh, by design.
 - A refused grant's refresh token is revoked, as `logout` revokes one,
   best effort: before the login's reply, and after a refresh releases the
   member's lock, the new refresh token if the answer had one and the
   link's old one otherwise. A refused login without a refresh token logs
   that its access token lives until it expires. A known gap: an answer
   that fails as `InvalidResponse` (one that doesn't parse, nests past
-  serde_json's depth limit, or has a bad `expires_in`) is never sorted
+  serde_json's depth limit, has an empty `access_token` or has a bad
+  `expires_in`) is never sorted
   into a `Grant`, so a wider grant in it isn't revoked, though nothing of
   it is stored or served.
 

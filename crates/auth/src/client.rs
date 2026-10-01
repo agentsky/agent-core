@@ -103,11 +103,11 @@ pub(crate) enum Grant {
     /// an object with any key that isn't an allowed scope, such as
     /// `{"granted": "user:profile"}`, is wider too.
     Wider,
-    /// A `scope` that is neither a string nor an array of strings and names
-    /// no scope outside [`ALLOWED_SCOPES`]: a number, a nested array, `{}`,
-    /// or an object whose every key is an allowed scope. A login counts it
-    /// as unstated, and a refresh, which sent the scopes itself, keeps the
-    /// link and warns.
+    /// Any other shape that names no scope outside [`ALLOWED_SCOPES`], in
+    /// its strings or its keys, such as a number, `true`, `[7]`, a nested
+    /// array of allowed scopes, `{}` or `{"user:profile": true}`. A login
+    /// counts it as unstated, and a refresh, which sent the scopes itself,
+    /// keeps the link and warns.
     Unreadable,
 }
 
