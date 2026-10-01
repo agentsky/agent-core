@@ -698,6 +698,38 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
 }
 
 #[tokio::test]
+async fn only_the_pass_records_no_answer() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let no_answer = CloudOutcome::Unknown {
+        status: None,
+        reason: CloudUnknownReason::NoAnswer,
+    };
+    let id = begin(&store, ada, "t", 100).await;
+    let err = store
+        .finish_cloud_handoff(id, &no_answer, at(110))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Refused { .. }), "{err:?}");
+    let row = handoff(&store, ada, id).await;
+    assert_eq!(row.state, CloudHandoffState::Sending);
+    assert!(finish(&store, id, &fired("session_1"), 120).await);
+
+    let pass_marked = unknown(&store, ada, 200).await;
+    assert!(
+        store
+            .finish_cloud_handoff(pass_marked, &no_answer, at(210))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        handoff(&store, ada, pass_marked).await.notified_at,
+        None,
+        "the notice is still owed"
+    );
+}
+
+#[tokio::test]
 async fn a_late_unknown_answer_marks_the_notice_done() {
     let store = memory_store().await;
     let ada = member(&store, "ada").await;
@@ -1037,12 +1069,14 @@ async fn a_token_is_bound_to_its_label() {
     let ada = member(&store, "ada").await;
     put(&store, ada, "deploy", "trig_1", "DEPLOY", 10).await;
     put(&store, ada, "prod", "trig_2", "PROD", 10).await;
-    sqlx::query(
-        "UPDATE cloud_routines SET label = CASE label WHEN 'deploy' THEN 'x' ELSE 'deploy' END",
-    )
-    .execute(&store.pool)
-    .await
-    .unwrap();
+    for (from, to) in [("deploy", "swap"), ("prod", "deploy"), ("swap", "prod")] {
+        sqlx::query("UPDATE cloud_routines SET label = ? WHERE label = ?")
+            .bind(to)
+            .bind(from)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
     let err = store.cloud_routine(ada, "deploy").await.unwrap_err();
     assert!(
         matches!(
@@ -1059,13 +1093,13 @@ async fn a_token_is_bound_to_its_label() {
 #[tokio::test]
 async fn the_stale_pass_reads_only_sending_rows() {
     let store = memory_store().await;
-    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-        "EXPLAIN QUERY PLAN UPDATE cloud_handoffs SET state = 'unknown' \
-         WHERE state = 'sending' AND created_at < 1",
-    )
-    .fetch_all(&store.pool)
-    .await
-    .unwrap();
+    let plan: Vec<(i64, i64, i64, String)> =
+        sqlx::query_as(concat!("EXPLAIN QUERY PLAN ", stale_update!()))
+            .bind(1)
+            .bind(1)
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
     assert!(
         plan.iter()
             .any(|row| row.3.contains("cloud_handoffs_sending")),
@@ -1151,6 +1185,9 @@ async fn the_schema_refuses_rows_that_contradict_their_state() {
         "UPDATE cloud_handoffs SET state = 'fired', answered_at = 1, session_id = 's', \
          retry_after_secs = 1 WHERE id = ?",
         "UPDATE cloud_handoffs SET routine_id = 'routine_1' WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'fired', answered_at = 1, session_id = 's' \
+         WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'rejected', answered_at = 1 WHERE id = ?",
         "UPDATE cloud_handoffs SET routine_id = 'trig_' WHERE id = ?",
     ] {
         let err = sqlx::query(sql)
@@ -1175,6 +1212,11 @@ async fn the_schema_refuses_a_routine_id_without_trig() {
             .unwrap_err();
         assert!(err.to_string().contains("CHECK"), "{bad}: {err}");
     }
+    let err = sqlx::query("UPDATE cloud_routines SET label = 'a:b'")
+        .execute(&store.pool)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("CHECK"), "{err}");
 }
 
 #[tokio::test]

@@ -60,6 +60,19 @@ macro_rules! handoff_columns {
     };
 }
 
+/// The stale pass's statement: it marks `sending` rows asked before the
+/// time bound second `unknown`, answered at the time bound first.
+macro_rules! stale_update {
+    () => {
+        concat!(
+            "UPDATE cloud_handoffs SET state = 'unknown', answered_at = ?, \
+             unknown_reason = 'no_answer' \
+             WHERE state = 'sending' AND created_at < ? RETURNING ",
+            handoff_columns!()
+        )
+    };
+}
+
 /// The conditions under which a hand-off's notice is owed and may be claimed
 /// at `now` (bound first), for a row answered after `give_up` (bound
 /// second), the time [`CLOUD_NOTICE_GIVE_UP`] before `now`.
@@ -260,7 +273,10 @@ pub enum CloudUnknownReason {
     Redirect,
     /// The endpoint answered with success, but the answer can't be read.
     UnreadableAnswer,
-    /// No answer was recorded: a pass gave up waiting for one.
+    /// No answer was recorded: a pass gave up waiting for one. Only
+    /// [`Store::stale_cloud_handoffs`] sets it;
+    /// [`Store::finish_cloud_handoff`] refuses it, since a row with it is
+    /// the one row that still takes a late answer.
     NoAnswer,
 }
 
@@ -756,8 +772,12 @@ impl Store {
     /// the claim's mark then returns false. Nothing retries a record that
     /// fails.
     ///
+    /// An `unknown` outcome with [`CloudUnknownReason::NoAnswer`], which
+    /// only the pass records, is refused with [`StoreError::Refused`].
+    ///
     /// # Errors
     ///
+    /// [`StoreError::Refused`] for [`CloudUnknownReason::NoAnswer`],
     /// [`StoreError::Database`] if the query fails.
     pub async fn finish_cloud_handoff(
         &self,
@@ -789,6 +809,15 @@ impl Store {
             ),
             CloudOutcome::Unknown { status, .. } => (*status, None, None, None, None),
         };
+        if let CloudOutcome::Unknown {
+            reason: CloudUnknownReason::NoAnswer,
+            ..
+        } = outcome
+        {
+            return Err(StoreError::Refused {
+                what: "cloud_handoffs.unknown_reason no_answer, which only the pass sets",
+            });
+        }
         let unknown_reason = match outcome {
             CloudOutcome::Unknown { reason, .. } => Some(reason.as_str()),
             CloudOutcome::Fired { .. } | CloudOutcome::Rejected { .. } => None,
@@ -874,16 +903,11 @@ impl Store {
         before: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<Vec<CloudHandoff>> {
-        let rows: Vec<HandoffRow> = sqlx::query_as(concat!(
-            "UPDATE cloud_handoffs SET state = 'unknown', answered_at = ?, \
-             unknown_reason = 'no_answer' \
-             WHERE state = 'sending' AND created_at < ? RETURNING ",
-            handoff_columns!()
-        ))
-        .bind(to_unix(now))
-        .bind(to_unix(before))
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<HandoffRow> = sqlx::query_as(stale_update!())
+            .bind(to_unix(now))
+            .bind(to_unix(before))
+            .fetch_all(&self.pool)
+            .await?;
         let mut stale = handoffs(rows)?;
         stale.sort_by_key(|handoff| (handoff.created_at, handoff.id));
         Ok(stale)
