@@ -1,5 +1,6 @@
 //! UUID newtypes for the things agentd mints: members, agents, sessions,
-//! turns, consents, bindings and scope-lock leases.
+//! turns, consents, bindings, scope-lock leases, and cloud hand-off routines
+//! and hand-offs.
 //!
 //! Each type has one string form, the lowercase hyphenated UUID
 //! (`67e55044-10b1-426f-9247-bb680e5fe0c8`). `Display` writes it, and
@@ -115,6 +116,18 @@ uuid_id!(
     LeaseId,
     "lease id"
 );
+uuid_id!(
+    /// A routine a member registered for cloud hand-off: one
+    /// `cloud_routines` row.
+    CloudRoutineId,
+    "cloud routine id"
+);
+uuid_id!(
+    /// One cloud hand-off: a `cloud run` that fired, or tried to fire, a
+    /// member's routine.
+    CloudHandoffId,
+    "cloud hand-off id"
+);
 
 #[cfg(test)]
 mod tests {
@@ -203,6 +216,16 @@ mod tests {
         assert_eq!(
             json_round_trip(&lease),
             serde_json::json!(lease.to_string())
+        );
+        let routine = CloudRoutineId::new_v4();
+        assert_eq!(
+            json_round_trip(&routine),
+            serde_json::json!(routine.to_string())
+        );
+        let handoff = CloudHandoffId::new_v4();
+        assert_eq!(
+            json_round_trip(&handoff),
+            serde_json::json!(handoff.to_string())
         );
     }
 

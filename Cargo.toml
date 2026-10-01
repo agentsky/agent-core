@@ -80,6 +80,7 @@ tower = "0.5.3"
 tracing = "0.1.44"
 tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 wiremock = "0.6.5"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

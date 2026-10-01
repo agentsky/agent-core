@@ -538,6 +538,7 @@ dependencies = [
  "core-types",
  "secrecy",
  "thiserror",
+ "url",
 ]
 
 [[package]]

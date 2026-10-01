@@ -32,8 +32,10 @@
 //! [`community_settings`](Store::set_community_api_key),
 //! [`failure_notices`](Store::claim_failure_notice), the usage meter
 //! ([`usage`](Store::record_turn_usage), with `thread_usage` and
-//! `limit_notices`), [`agent_policies`](Store::agent_settings) and
-//! [`bans`](Store::ban_member).
+//! `limit_notices`), [`agent_policies`](Store::agent_settings),
+//! [`bans`](Store::ban_member), and cloud hand-off's
+//! [`cloud_routines`](Store::put_cloud_routine) and
+//! [`cloud_handoffs`](Store::begin_cloud_handoff).
 
 #![warn(missing_docs)]
 
@@ -48,6 +50,7 @@ use tokio::sync::Semaphore;
 
 mod agents;
 mod claude_links;
+mod cloud;
 mod community;
 mod consents;
 mod ctl;
@@ -72,6 +75,11 @@ pub use agents::{
     NewAgent, PendingRetirement, Visibility,
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
+pub use cloud::{
+    CLOUD_NOTICE_GIVE_UP, CLOUD_NOTICE_LEASE, CloudDeleted, CloudHandoff, CloudHandoffState,
+    CloudOrigin, CloudOutcome, CloudRoutine, CloudRoutinePut, CloudRoutineToken,
+    MAX_CLOUD_ROUTINES, NewCloudHandoff, RecentCloudHandoff,
+};
 pub use community::CommunityKeyStatus;
 pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
@@ -411,6 +419,8 @@ mod tests {
                 "bans",
                 "claude_link_generations",
                 "claude_links",
+                "cloud_handoffs",
+                "cloud_routines",
                 "community_settings",
                 "consents",
                 "ctl_tokens",

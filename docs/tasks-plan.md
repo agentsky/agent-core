@@ -123,6 +123,7 @@ associated data, so a ciphertext copied into another row fails to decrypt.
 | Docker | `bollard` |
 | Dyn async traits | `async-trait` (the `Surface` trait is used as `dyn`) |
 | HTTP fakes in tests | `wiremock` |
+| URL parsing | `url`, already in the tree through `reqwest`; `commands` uses it for a routine's fire URL (T35a), so its origin compares with a `reqwest::Url`'s |
 
 Adding a dependency that isn't in this table needs a sentence in the PR
 description, and must pass T02's policy.
@@ -3126,6 +3127,19 @@ Acceptance, as tests named after the rules:
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
 - `a_handoff_notice_is_given_up_after_a_day`.
 - `old_handoffs_are_purged`.
+
+Decided in T35a ([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
+`cloud_handoffs` also has `notice_leased_until`, so a late outcome can
+tell a claim still sending from one that a failed send ended. The shared
+types are `core_types::RoutineId`, `CloudRoutineId` and `CloudHandoffId`,
+and the store's `CloudOrigin`, `CloudHandoffState` and `CloudOutcome`,
+for T35b's `fire` to take a `RoutineId` and for T35c to map
+`FireOutcome` onto `CloudOutcome`. `RoutineUrl::origin()` is a `url::Origin`.
+A notice's mark needs a claim that was made, not the latest one; its
+deferral needs the latest. `CloudCommand`'s `Debug` leaves out the task,
+and the store hands a task back only as a `SecretString`. agentd's
+public-secret refusal has its `cloud add` arm already; the other `cloud`
+commands answer "isn't available yet" until T35c.
 
 ### T35b
 
