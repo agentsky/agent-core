@@ -2477,3 +2477,80 @@ async fn an_installation_elsewhere_is_still_dropped() {
     assert_eq!(turned.confirmations(AGENT_TOKEN).await.len(), 1);
     turned.stop().await;
 }
+
+/// The rules of the agent bound by `binding`.
+async fn rules_of(store: &Store, binding: BindingId) -> agentd::policy::Rules {
+    let agent = store.binding(binding).await.unwrap().unwrap().agent;
+    agentd::policy::Rules::read(&store.agent_settings(agent).await.unwrap()).unwrap()
+}
+
+/// Rules that deny `channel`.
+fn denying_room(channel: &str) -> agentd::policy::Rules {
+    let mut rules = agentd::policy::Rules::default();
+    rules.deny(agentd::policy::Rule::Room {
+        conv: msg_in(channel, "1.0").conv,
+        label: "#plans".into(),
+    });
+    rules
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_private_channel_keeps_the_agents_rules() {
+    let turned = Turned::start(&[HELPER]).await;
+    let binding = turned.bindings[0];
+    let agent = turned.store.binding(binding).await.unwrap().unwrap().agent;
+    let rules = denying_room(fixtures::PRIVATE_CHANNEL);
+    turned
+        .store
+        .update_agent_settings(agent, |settings| rules.write(settings))
+        .await
+        .unwrap();
+    turned
+        .conversation_is(
+            fixtures::PRIVATE_CHANNEL_SHARED,
+            json!({"is_channel": true, "is_private": true, "is_ext_shared": true, "is_member": true}),
+        )
+        .await;
+    let changed = fixtures::CHANNEL_ID_CHANGED.to_owned();
+    assert_eq!(turned.post(0, SIGNING_SECRET, changed.clone()).await, 200);
+    let moved = denying_room(fixtures::PRIVATE_CHANNEL_SHARED);
+    settle("the agent's rules never moved", || async {
+        rules_of(&turned.store, binding).await == moved
+    })
+    .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, changed).await, 200);
+
+    let ts = recent_ts(5, 100);
+    let text = format!("<@{AGENT_BOT}> what's the plan?");
+    let message = message_event(
+        fixtures::OTHER_USER,
+        &ts,
+        "Ev0SHARED1",
+        &text,
+        json!({"channel": fixtures::PRIVATE_CHANNEL_SHARED, "channel_type": "group"}),
+    );
+    turned
+        .slack_has(
+            &ts,
+            json!({"ts": ts, "user": fixtures::OTHER_USER, "text": text}),
+        )
+        .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, message).await, 200);
+    turned.wait_for_confirmation(AGENT_TOKEN).await;
+    turned.nothing_billed_to_bob().await;
+    assert!(
+        turned.posts(AGENT_TOKEN).await.is_empty(),
+        "the deny on the old id holds on the new one"
+    );
+    let asked: Vec<_> = turned
+        .requests("conversations.info", AGENT_TOKEN)
+        .await
+        .into_iter()
+        .filter(|request| {
+            String::from_utf8_lossy(&request.body)
+                .contains(&format!("channel={}", fixtures::PRIVATE_CHANNEL_SHARED))
+        })
+        .collect();
+    assert!(!asked.is_empty(), "the new id is confirmed with the agent's token");
+    turned.stop().await;
+}

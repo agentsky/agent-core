@@ -2313,3 +2313,53 @@ async fn conv_info_fresh_refreshes_the_cache() {
         .unwrap_err();
     assert!(matches!(err, SurfaceError::NotFound(_)), "{err:?}");
 }
+
+#[tokio::test]
+async fn a_channel_is_confirmed_under_its_exact_id_with_the_bot_in_it() {
+    let refused = |error: &str| {
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": error}))
+    };
+    let answers = [
+        (
+            ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": true}})),
+            Some(true),
+        ),
+        (
+            ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": false}})),
+            Some(false),
+        ),
+        (
+            ok(json!({"channel": {"id": "C0ELSE001", "is_channel": true, "is_member": true}})),
+            Some(false),
+        ),
+        (refused("channel_not_found"), Some(false)),
+        (refused("invalid_auth"), Some(false)),
+        (refused("internal_error"), None),
+        (ResponseTemplate::new(503), None),
+    ];
+    for (answer, confirmed) in answers {
+        let (server, surface) = setup().await;
+        mount(&server, "conversations.info", answer).await;
+        assert_eq!(
+            surface.confirms_channel(&CHANNEL.into()).await.ok(),
+            confirmed
+        );
+        assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_forgotten_channel_is_asked_about_again_and_confirming_skips_the_cache() {
+    let (server, surface) = confirming_setup(public_channel()).await;
+    let channel = CHANNEL.into();
+    let directory = surface.directory();
+    for _ in 0..2 {
+        directory.conv_info(surface.api(), &channel).await.unwrap();
+    }
+    assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
+    assert_eq!(surface.confirms_channel(&channel).await, Ok(true));
+    assert_eq!(lookups(&server, "conversations.info").await.len(), 2);
+    directory.forget_conv(&channel);
+    directory.conv_info(surface.api(), &channel).await.unwrap();
+    assert_eq!(lookups(&server, "conversations.info").await.len(), 3);
+}

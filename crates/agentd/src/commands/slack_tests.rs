@@ -2515,3 +2515,145 @@ async fn slack_command_text_is_decoded_once_before_it_is_parsed() {
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
     assert_eq!(row.persona, "x <y> &amp; z");
 }
+
+impl SlackHarness {
+    fn slack_agents(&self) -> crate::slack::agents::SlackAgents {
+        let bots = crate::slack::bots::SlackBots::new(
+            self.store.clone(),
+            self.manager.client().clone(),
+            self.manager.surface(),
+        );
+        crate::slack::agents::SlackAgents::new(
+            self.store.clone(),
+            self.manager.clone(),
+            bots,
+            crate::slack::agents::AgentAppSettings {
+                public_url: Some("https://agentd.example.com".to_owned()),
+                public_posting: false,
+                reminder_after: Duration::from_secs(3600),
+                max_per_owner: 10,
+            },
+        )
+    }
+
+    async fn installed_before_the_manifest_version(&self, owner: MemberId, name: &str) {
+        let team = TeamId::new(TEAM);
+        let now = OffsetDateTime::now_utc();
+        let store::AgentCreation::Created(_, binding) = self
+            .store
+            .create_agent(
+                &store::NewAgent {
+                    owner,
+                    name,
+                    persona: "You help.",
+                    visibility: store::Visibility::Public,
+                    surface: SurfaceKind::Slack,
+                    team: &team,
+                },
+                10,
+                now,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        let app = surface_slack::manifest::AgentApp {
+            name,
+            public_url: "https://agentd.example.com",
+            binding,
+            public_posting: false,
+        };
+        self.store
+            .set_slack_app(
+                binding,
+                &store::NewSlackApp {
+                    app_id: "A0SCRIBE1".to_owned(),
+                    client_id: "3333.4444".to_owned(),
+                    client_secret: SecretString::from("client-SECRET"),
+                    signing_secret: SecretString::from("signing-SECRET"),
+                    scopes: app.scopes().join(","),
+                    redirect_url: app.redirect_url(),
+                    manifest_version: 0,
+                },
+                name,
+                now,
+            )
+            .await
+            .unwrap();
+        self.store
+            .install_slack_app(
+                binding,
+                "A0SCRIBE1",
+                &UserId::new("U0SCRIBE1"),
+                &SecretString::from("xoxb-scribe-SECRET"),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_failed_manifest_update_is_retried_and_me_says_so() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.installed_before_the_manifest_version(alice, "scribe").await;
+    let agents = h.slack_agents();
+    let start = OffsetDateTime::now_utc();
+    assert_eq!(agents.pass_at(|| start).await.unwrap().updated, 0);
+    assert!(
+        h.calls("apps.manifest.update").await.is_empty(),
+        "nothing is updated without a configuration token"
+    );
+    let reply = h.slash("U0HUMAN01", "me").await.remove(0);
+    assert!(reply.contains("haven't updated yet: `scribe`"), "{reply}");
+    assert!(
+        reply.contains("won't follow a private channel that is shared"),
+        "{reply}"
+    );
+
+    h.store
+        .put_slack_config_token(
+            alice,
+            &TeamId::new(TEAM),
+            &NewSlackConfigToken {
+                token: SecretString::from(GIVEN_TOKEN),
+                refresh_token: SecretString::from(GIVEN_REFRESH),
+                expires_at: start + time::Duration::hours(12),
+            },
+            start,
+        )
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.update"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.update"))
+        .respond_with(ok(json!({"app_id": "A0SCRIBE1", "permissions_updated": false})))
+        .mount(&h.slack)
+        .await;
+    assert_eq!(agents.pass_at(|| start).await.unwrap().updated, 0);
+    assert_eq!(h.calls("apps.manifest.update").await.len(), 1);
+    let reply = h.slash("U0HUMAN01", "me").await.remove(0);
+    assert!(reply.contains("haven't updated yet: `scribe`"), "{reply}");
+    assert!(reply.contains("try again every hour"), "{reply}");
+
+    let soon = start + Duration::from_secs(60);
+    assert_eq!(agents.pass_at(|| soon).await.unwrap().updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.update").await.len(),
+        1,
+        "not again within the lease"
+    );
+    let later = start + crate::slack::agents::MANIFEST_UPDATE_LEASE;
+    assert_eq!(agents.pass_at(|| later).await.unwrap().updated, 1);
+    assert_eq!(h.calls("apps.manifest.update").await.len(), 2);
+    let reply = h.slash("U0HUMAN01", "me").await.remove(0);
+    assert!(!reply.contains("haven't updated yet"), "{reply}");
+}
