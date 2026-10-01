@@ -27,6 +27,8 @@ fn name(s: &str) -> AgentName {
 
 const CONSENT: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
 
+const FIRE: &str = "https://api.anthropic.com/v1/claude_code/routines/trig_01AB/fire";
+
 #[test]
 fn tokenize_splits_at_any_white_space_and_records_offsets() {
     let tokens = tokenize(" a\tbc\n\u{a0}d  ");
@@ -713,6 +715,161 @@ fn approve_and_decline() {
 }
 
 #[test]
+fn cloud_add() {
+    let Command::Cloud(CloudCommand::Add {
+        label,
+        routine,
+        token,
+    }) = ok(&format!(
+        "Cloud ADD agentsky/agent-core {FIRE} sk-ant-oat01-abc"
+    ))
+    else {
+        panic!()
+    };
+    assert_eq!(label.as_str(), "agentsky/agent-core");
+    assert_eq!(routine.routine_id().as_str(), "trig_01AB");
+    assert_eq!(
+        routine.origin().ascii_serialization(),
+        "https://api.anthropic.com"
+    );
+    assert_eq!(token.expose_secret(), "sk-ant-oat01-abc");
+
+    let Command::Cloud(CloudCommand::Add { routine, .. }) =
+        ok(&format!("cloud add r <{FIRE}|api.anthropic.com/v1/x> t"))
+    else {
+        panic!()
+    };
+    assert_eq!(routine.routine_id().as_str(), "trig_01AB");
+
+    let usage = "Usage: `cloud add <routine> <url> <token>`";
+    invalid(
+        &format!("cloud add r {FIRE}"),
+        &format!("Missing `<token>`.\n{usage}"),
+    );
+    invalid(
+        "cloud add",
+        &format!("Missing `<routine>`, `<url>`, `<token>`.\n{usage}"),
+    );
+    invalid(
+        &format!("cloud add r {FIRE} t extra"),
+        &format!("Too many arguments.\n{usage}"),
+    );
+    invalid(
+        &format!("cloud add -r {FIRE} t"),
+        &format!(
+            "A routine's label is 1 to 64 characters, each an ASCII letter, a digit or ._/-, \
+             starting with a letter or a digit.\n{usage}"
+        ),
+    );
+    invalid(
+        "cloud add r https://api.anthropic.com/v1/claude_code/routines/trig_1/fire/ t",
+        &format!(
+            "A routine's URL is its API trigger's URL from claude.ai/code/routines, \
+             https://api.anthropic.com/v1/claude_code/routines/trig_…/fire, \
+             with nothing before or after it.\n{usage}"
+        ),
+    );
+}
+
+#[test]
+fn cloud_add_is_secret_bearing() {
+    let command = ok(&format!("cloud add r {FIRE} sk-ant-oat01-x"));
+    assert_eq!(command.name(), "cloud add");
+    assert!(command.is_secret_bearing());
+    for text in ["cloud run r task", "cloud list", "cloud rm r"] {
+        assert!(!ok(text).is_secret_bearing(), "{text}");
+    }
+}
+
+#[test]
+fn cloud_add_debug_redacts_the_token() {
+    let command = ok(&format!("cloud add r {FIRE} sk-ant-oat01-SECRET"));
+    let debug = format!("{command:?} {command:#?}");
+    assert!(!debug.contains("SECRET"), "{debug}");
+    assert!(!debug.contains("sk-ant"), "{debug}");
+    assert!(debug.contains("REDACTED"), "{debug}");
+    let command = ok("cloud run r TASK-TEXT");
+    assert!(!format!("{command:?} {command:#?}").contains("TASK-TEXT"));
+}
+
+#[test]
+fn a_cloud_add_that_fails_to_parse_is_secret_bearing() {
+    for text in [
+        "cloud add SECRET",
+        "cloud add r SECRET",
+        "cloud add r not-a-url SECRET",
+        &format!("cloud add r {FIRE}"),
+        &format!("cloud add r {FIRE} SECRET extra"),
+        &format!("cloud add -bad {FIRE} SECRET"),
+        &format!("Cloud Add r {FIRE}/ SECRET"),
+        &format!("!agent cloud add r {FIRE} SECRET"),
+        &format!("cloud: add r {FIRE} SECRET"),
+        &format!("help cloud add r {FIRE} SECRET"),
+    ] {
+        let err = fail(text);
+        assert!(err.is_secret_bearing(), "{text:?}");
+        assert!(!err.to_string().contains("SECRET"), "{text:?}");
+    }
+    for text in ["cloud add", "cloud ad r x y", "cloud run r", "cloud rm a b"] {
+        assert!(!fail(text).is_secret_bearing(), "{text:?}");
+    }
+}
+
+#[test]
+fn cloud_run_task_is_the_rest_verbatim() {
+    let text = "cloud run agent-core   Fix the \"flaky\" test in `ci.yml`.\n\n  - then open a PR -- as draft\n";
+    let Command::Cloud(CloudCommand::Run { label, task }) = ok(text) else {
+        panic!()
+    };
+    assert_eq!(label.as_str(), "agent-core");
+    assert_eq!(
+        task,
+        "Fix the \"flaky\" test in `ci.yml`.\n\n  - then open a PR -- as draft"
+    );
+    let Command::Cloud(CloudCommand::Run { task, .. }) = ok("CLOUD RUN r <@U1|ada> &amp; --")
+    else {
+        panic!()
+    };
+    assert_eq!(task, "<@U1|ada> &amp; --");
+    let usage = "Usage: `cloud run <routine> <task>`";
+    invalid("cloud run r", &format!("Missing `<task>`.\n{usage}"));
+    invalid(
+        "cloud run r --",
+        &format!("A lone `--` isn't an argument.\n{usage}"),
+    );
+    invalid(
+        "cloud run .r task",
+        &format!(
+            "A routine's label is 1 to 64 characters, each an ASCII letter, a digit or ._/-, \
+             starting with a letter or a digit.\n{usage}"
+        ),
+    );
+}
+
+#[test]
+fn cloud_list_and_rm() {
+    assert!(matches!(
+        ok("cloud list"),
+        Command::Cloud(CloudCommand::List)
+    ));
+    let Command::Cloud(CloudCommand::Rm { label }) = ok("cloud rm a.b/c") else {
+        panic!()
+    };
+    assert_eq!(label.as_str(), "a.b/c");
+    invalid("cloud list x", "Too many arguments.\nUsage: `cloud list`");
+    invalid(
+        "cloud rm",
+        "Missing `<routine>`.\nUsage: `cloud rm <routine>`",
+    );
+    invalid(
+        "cloud",
+        "Missing a subcommand.\nUsage: `cloud add <routine> <url> <token>`, \
+         `cloud run <routine> <task>`, `cloud list`, `cloud rm <routine>`",
+    );
+    assert_eq!(fail("help cloud").to_string().lines().count(), 4);
+}
+
+#[test]
 fn secret_bearing_variants_redact_themselves_in_debug() {
     for (text, secrets) in [
         ("login code-SECRET-1", &["code-SECRET-1"][..]),
@@ -734,8 +891,14 @@ fn secret_bearing_variants_redact_themselves_in_debug() {
 }
 
 #[test]
-fn only_the_three_secret_bearing_commands_say_so() {
-    let secret = ["login x", "slack-token a b", "admin api-key set k"];
+fn only_the_four_secret_bearing_commands_say_so() {
+    let add = format!("cloud add r {FIRE} sk-ant-oat01-x");
+    let secret = [
+        "login x",
+        "slack-token a b",
+        "admin api-key set k",
+        add.as_str(),
+    ];
     let plain = [
         "login",
         "logout",
@@ -758,6 +921,9 @@ fn only_the_three_secret_bearing_commands_say_so() {
         "admin ban @x",
         "admin unban @x",
         "admin slack",
+        "cloud run r sk-ant-in-a-task",
+        "cloud list",
+        "cloud rm r",
     ];
     for text in secret {
         assert!(ok(text).is_secret_bearing(), "{text}");
@@ -797,6 +963,10 @@ fn every_command_has_its_own_help_line() {
         "admin slack",
         &format!("approve {CONSENT}"),
         &format!("decline {CONSENT}"),
+        &format!("cloud add r {FIRE} t"),
+        "cloud run r task",
+        "cloud list",
+        "cloud rm r",
     ];
     for text in texts {
         let command = ok(text);
@@ -827,6 +997,14 @@ fn errors_never_repeat_the_text() {
         "api-key set SECRET1",
         "slack_token SECRET1 SECRET2",
         "admin apikey set SECRET1",
+        "cloud add SECRET1",
+        "cloud add r SECRET1 SECRET2",
+        "cloud add -SECRET1 https://x.io/v1/claude_code/routines/trig_1/fire SECRET2",
+        "cloud add r https://SECRET1@x.io/v1/claude_code/routines/trig_1/fire SECRET2",
+        "cloud add r https://x.io/v1/claude_code/routines/trig_1/fire SECRET1 SECRET2",
+        "cloud run -SECRET1 task",
+        "cloud rm SECRET1 SECRET2",
+        "cloud SECRET1",
     ] {
         let err = fail(text);
         assert!(!err.to_string().contains("SECRET"), "{text}: {err}");
@@ -914,6 +1092,12 @@ fn errors_without_a_secret_are_not_secret_bearing() {
         "skill add helper http://x.io/r",
         "persona Bad-Name xox",
         "login-page",
+        "cloud",
+        "cloud add",
+        "cloud list now",
+        "cloud run r",
+        "cloud rm",
+        "add cloud x",
     ] {
         assert!(!fail(text).is_secret_bearing(), "{text:?}");
     }

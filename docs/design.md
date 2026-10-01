@@ -1231,6 +1231,7 @@ erDiagram
         timestamp answered_at
         int notice_attempts
         timestamp notice_next_attempt_at
+        timestamp notice_leased_until
         timestamp notified_at
     }
     VOLUME {
