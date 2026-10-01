@@ -514,6 +514,25 @@ async fn a_manager_dm_through_an_installation_elsewhere_is_dropped() {
 }
 
 #[tokio::test]
+async fn agentd_does_not_start_when_auth_test_names_no_workspace() {
+    let slack = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth.test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"ok": true, "team_id": "", "user_id": "U0MANAGER", "bot_id": "B0MANAGER"}),
+        ))
+        .mount(&slack)
+        .await;
+    let err = App::open(config(Some(&slack))).await.unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("AGENTD_SLACK_MANAGER_BOT_TOKEN"), "{text}");
+    assert!(
+        text.contains("unexpected response from auth.test"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn agentd_does_not_start_when_slack_refuses_the_manager_token() {
     let slack = MockServer::start().await;
     Mock::given(method("POST"))

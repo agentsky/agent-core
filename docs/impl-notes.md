@@ -8524,9 +8524,14 @@ cached "not home" for answers that say nothing about the user.
 **Solution.** Only `user_not_found` and, since review round 2,
 `user_not_visible` (`directory::NOT_HOME_CODES`) are a verdict, cached like
 any answer and not warned of, since an ordinary outsider may cause either;
-any other `NotFound` is returned uncached like the rest. A `users.info` answer with no
-`team_id`, or one not shaped like a team id, is `Ok(false)` and cached: it
-is an answer, and it doesn't name the workspace.
+any other `NotFound` is returned uncached like the rest. A `users.info`
+answer with no `team_id` is `Ok(false)` and cached unless its
+`enterprise_user` places it in the workspace (below); one with a `team_id`
+not shaped like a team id is `Ok(false)` and cached. Either is an answer,
+and doesn't name the workspace. Since review
+round 3, a `user_not_visible` is noted at info level at most once a
+minute, so a stream of them, which would refuse everyone, leaves a
+trace.
 
 ### The answer cache numbers its entries
 
@@ -8636,8 +8641,9 @@ workspace or whose `enterprise_user` is of the home organization and lists
 the workspace in its `teams`; and every team the answer names
 (`team_id`, `profile.team`, `enterprise_user.enterprise_id`) is the
 workspace, the organization or one of those `teams`. A team field that
-isn't a string, or an `enterprise_user` that isn't an object, is read as
-naming no team, so it fails the rule. It is sound for outside members: a
+isn't a string, a `team_id` not shaped like a team id (since review round
+3), or an `enterprise_user` that isn't an object, is read as naming no
+team, so it fails the rule. It is sound for outside members: a
 member of another organization has its own `enterprise_id` or `team_id`,
 and Slack lists only the workspaces a member belongs to. Two Grid cases
 still fail closed, as the design now says: a message whose own fields name
@@ -8769,6 +8775,31 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
 - The design says guests count as home, and the T36e plan asks for each
   field the home check reads, in both `users.info` and `users.list`.
 
+### Smaller fixes from review round 3
+
+- `notice_grid` warns only for a user whose own `team_id` is the
+  workspace: on a workspace not on Grid, an outside member of a Grid
+  organization looked up in a shared channel named an organization and
+  set off a false "every member is refused".
+- `User::team_id` reads a present value not shaped like a team id as an
+  empty id, which no team matches, rather than as absent, so it fails the
+  home rule like `profile.team` and `enterprise_user`.
+- `bot_user` refuses a `bots.info` answer about another bot, as
+  `home_user` and `conv_info` do, and caches "no user" only for
+  `bot_not_found`, not for any `NotFound`.
+- The T36e plan asks whether `users.info` echoes the id asked for exactly
+  (`U…` or `W…`), and for a Grid member's deactivation `user_change`.
+
+### Smaller fixes from review round 4
+
+- `notice_grid` also counts a user whose `enterprise_user.teams` lists the
+  workspace, so a locked-out Grid member whose `team_id` names a sibling
+  workspace or the organization is warned of too; an outside
+  organization's member lists only its own workspaces and still isn't.
+- `AuthTest::team_id` must be shaped like a workspace's id (`T…`), or the
+  answer doesn't read and agentd doesn't start: an empty workspace id
+  would have matched the empty id an unreadable `team_id` reads as.
+
 ### Left as they are
 
 - A click passes on `user.team_id` alone, with no lookup: the payload is
@@ -8787,6 +8818,10 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   the meantime is home for at most that hour, as they are when the list is
   all agentd asks.
 - `pipeline::message::record` keeps writing `outside: None` (above).
+- `web::is_unreadable` tells `decode`'s error by its message's prefix, a
+  shared constant, rather than by type: a typed marker would mean a new
+  `SurfaceError` variant that every caller matching `Transport` must
+  handle, and the prefix is pinned by a test that asserts the warning.
 
 ## T35c: Cloud hand-off: commands
 

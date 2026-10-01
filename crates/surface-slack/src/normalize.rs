@@ -269,9 +269,9 @@ fn user_id_or_nothing<'de, D: Deserializer<'de>>(value: D) -> Result<Option<User
 }
 
 /// A string [`is_team_id`] accepts, or `None` for any other value, read
-/// without keeping what it skips: how a Web API answer's team id is read,
-/// so one Slack sends in another form makes the field absent rather than
-/// the answer unreadable.
+/// without keeping what it skips: how an Events API payload's
+/// `authorizations[0].team_id` is read, so one in another form is no
+/// installation rather than an unreadable body.
 pub(crate) fn team_id_or_nothing<'de, D: Deserializer<'de>>(
     value: D,
 ) -> Result<Option<TeamId>, D::Error> {
