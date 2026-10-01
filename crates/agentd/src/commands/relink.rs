@@ -18,7 +18,7 @@
 use std::time::Duration;
 
 use core_types::{MemberId, MemberKey};
-use store::{Store, StoreError};
+use store::{PendingRelinkNotice, Store, StoreError};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -81,7 +81,8 @@ impl RelinkNotifier {
     ///
     /// # Errors
     ///
-    /// A [`StoreError`] if the store fails; notices already sent stay sent.
+    /// The first [`StoreError`] the pass met. A notice the store fails on
+    /// is logged and left for a later pass, and the others still go out.
     pub async fn send_pending(&self) -> Result<usize, StoreError> {
         self.send_pending_at(OffsetDateTime::now_utc).await
     }
@@ -91,53 +92,75 @@ impl RelinkNotifier {
         &self,
         now: impl Fn() -> OffsetDateTime,
     ) -> Result<usize, StoreError> {
-        let mut told = 0;
         let pending = self
             .store
             .pending_relink_notices(now(), RELINK_MAX_ATTEMPTS)
             .await?;
+        let mut told = 0;
+        let mut first_err = None;
         for notice in pending {
             let member = notice.member;
-            let reachable: Vec<MemberKey> = self
-                .store
-                .member_identities(member)
-                .await?
-                .into_iter()
-                .filter(|identity| self.replies.can_dm(identity))
-                .collect();
-            if reachable.is_empty() {
-                tracing::debug!(%member, "no manager bot reaches this member; the relink notice waits");
-                continue;
-            }
-            let claimed_at = now();
-            let Some(attempt) = self
-                .store
-                .claim_relink_notice(
-                    member,
-                    notice.generation,
-                    claimed_at,
-                    claimed_at + RELINK_LEASE,
-                    RELINK_MAX_ATTEMPTS,
-                )
-                .await?
-            else {
-                continue;
-            };
-            if self.send(member, &reachable).await {
-                self.store
-                    .mark_relink_notice_sent(member, notice.generation, now())
-                    .await?;
-                told += 1;
-                continue;
-            }
-            self.store
-                .defer_relink_notice(member, notice.generation, now() + backoff(attempt))
-                .await?;
-            if attempt >= RELINK_MAX_ATTEMPTS {
-                tracing::warn!(%member, attempts = attempt, "giving up on the relink notice");
+            match self.send_one(&notice, &now).await {
+                Ok(true) => told += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(%member, error = %err, "a relink notice failed in the store; left it for a later pass");
+                    first_err.get_or_insert(err);
+                }
             }
         }
-        Ok(told)
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(told),
+        }
+    }
+
+    /// Claims and sends `notice`, or defers it if no send worked; true if
+    /// the member was told.
+    async fn send_one(
+        &self,
+        notice: &PendingRelinkNotice,
+        now: &impl Fn() -> OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        let member = notice.member;
+        let reachable: Vec<MemberKey> = self
+            .store
+            .member_identities(member)
+            .await?
+            .into_iter()
+            .filter(|identity| self.replies.can_dm(identity))
+            .collect();
+        if reachable.is_empty() {
+            tracing::debug!(%member, "no manager bot reaches this member; the relink notice waits");
+            return Ok(false);
+        }
+        let claimed_at = now();
+        let Some(attempt) = self
+            .store
+            .claim_relink_notice(
+                member,
+                notice.generation,
+                claimed_at,
+                claimed_at + RELINK_LEASE,
+                RELINK_MAX_ATTEMPTS,
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        if self.send(member, &reachable).await {
+            self.store
+                .mark_relink_notice_sent(member, notice.generation, now())
+                .await?;
+            return Ok(true);
+        }
+        self.store
+            .defer_relink_notice(member, notice.generation, now() + backoff(attempt))
+            .await?;
+        if attempt >= RELINK_MAX_ATTEMPTS {
+            tracing::warn!(%member, attempts = attempt, "giving up on the relink notice");
+        }
+        Ok(false)
     }
 
     /// Sends the notice to each of `identities`; true if any send worked.

@@ -599,10 +599,10 @@ pub struct CloudConfig {
     /// `retention_days`: how long hand-offs are kept after they were asked
     /// for, from 1 to 365, default [`DEFAULT_CLOUD_RETENTION_DAYS`].
     pub retention_days: u64,
-    /// `handoffs_per_hour`: how many `cloud run`s one member may ask for
-    /// in an hour, from 1 to 100, default
-    /// [`DEFAULT_CLOUD_HANDOFFS_PER_HOUR`]. Every one counts, whatever its
-    /// outcome, and one past the cap is refused before anything is written
+    /// `handoffs_per_hour`: how many hand-offs one member may ask for in an
+    /// hour, from 1 to 100, default [`DEFAULT_CLOUD_HANDOFFS_PER_HOUR`]: the
+    /// `cloud run`s that passed their checks and were recorded, each
+    /// whatever came of it. One past the cap is refused before anything is written
     /// or sent.
     pub handoffs_per_hour: u32,
 }

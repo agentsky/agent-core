@@ -18,7 +18,7 @@ use crate::commands::rocketchat::command_in;
 use crate::commands::slack::dm_command;
 use crate::commands::slack_tests::{
     Running, SlackHarness, dm_event, file_store, identity, json_body, slack_channel, slack_harness,
-    slack_harness_on, slack_key,
+    slack_harness_on, slack_key, sql,
 };
 use crate::commands::tests::{Harness, conv, dm_room, harness, key, serve};
 use crate::config::CloudConfig;
@@ -1342,10 +1342,12 @@ fn a_retry_after_reads_in_whole_minutes_or_hours() {
     assert_eq!(wait_in_words(59), "a minute");
     assert_eq!(wait_in_words(61), "2 minutes");
     assert_eq!(wait_in_words(3600), "60 minutes");
-    assert_eq!(wait_in_words(3601), "2 hours");
-    assert_eq!(wait_in_words(7200), "2 hours");
-    assert_eq!(wait_in_words(7201), "3 hours");
+    assert_eq!(wait_in_words(3601), "61 minutes");
+    assert_eq!(wait_in_words(7200), "120 minutes");
+    assert_eq!(wait_in_words(7201), "2 hours");
+    assert_eq!(wait_in_words(9_000), "3 hours");
     assert_eq!(wait_in_words(86_400), "24 hours");
+    assert_eq!(wait_in_words(u32::MAX), "1193046 hours");
 }
 
 #[test]
@@ -1383,16 +1385,6 @@ fn a_session_without_its_link_is_shown_by_id() {
 }
 
 /// Runs `statements` on the SQLite database at `url`.
-async fn sql(url: &str, statements: &str) {
-    use sqlx::Connection as _;
-    let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
-    sqlx::raw_sql(sqlx::AssertSqlSafe(statements.to_owned()))
-        .execute(&mut db)
-        .await
-        .unwrap();
-    db.close().await.unwrap();
-}
-
 /// A Slack harness on a database file, whose commands fire routines at
 /// `endpoint`, with `U0HUMAN01` linked and the routine registered; the
 /// database's URL and directory.
@@ -1626,4 +1618,35 @@ async fn a_slack_dm_points_to_the_slash_command_to_add_a_routine() {
         assert!(text.contains("`/agent cloud add "), "{text}");
         assert!(!text.contains("`cloud add"), "{text}");
     }
+}
+
+#[tokio::test]
+async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_again() {
+    let endpoint = MockServer::start().await;
+    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let alice = h
+        .store
+        .member_for_identity(&slack_key("U0HUMAN01"))
+        .await
+        .unwrap()
+        .unwrap();
+    sql(
+        &url,
+        "CREATE TRIGGER no_forgetting BEFORE DELETE ON cloud_routines \
+         BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+    )
+    .await;
+    assert_eq!(h.slash("U0HUMAN01", "logout").await, [FAILED.to_owned()]);
+    assert!(h.store.get_claude_link(alice).await.unwrap().is_none());
+    assert_eq!(h.store.cloud_routines(alice).await.unwrap().len(), 1);
+    sql(&url, "DROP TRIGGER no_forgetting;").await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(reply.starts_with("No Claude account is linked."), "{reply}");
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(
+        reply.contains("I can't revoke a routine's token: revoke each"),
+        "{reply}"
+    );
+    assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -8921,8 +8921,8 @@ as "(nothing to show)". The cut is by characters and ends in `…`.
 - The reply never shows `error_type`, which the endpoint chooses: each
   status gets the failure table's fixed line, worded tentatively for 403
   and 404 as T35b's review asked. A 429 says when the limit resets, from
-  `Retry-After`, in whole minutes rounded up, or in whole hours past an
-  hour.
+  `Retry-After`, in whole minutes rounded up to two hours, and in hours,
+  to the nearest, past that.
 - `cloud add` replies with the routine id, also when it replaces a label,
   and says which label already holds a routine registered twice.
 - `logout` names what it forgot, routines and hand-offs each only when
@@ -8989,8 +8989,8 @@ deleted with the member's routines while its request was out.
 - One row's store failure no longer ends a notifier pass: each step and
   each notice runs whatever another met, the failure is logged with the
   hand-off, and the purge still runs. The pass returns the first failure
-  after doing the rest. The relink notifier keeps its shape; it has no
-  purge for a failure to starve.
+  after doing the rest. Review round 2 gave the relink notifier the same
+  shape.
 - A test now runs `persona` with entities through a slash command and a
   manager DM, so removing the decoding in `answer_text` fails it, and one
   renders a hostile task line in Slack's `cloud list`.
@@ -9033,6 +9033,66 @@ later" well inside an attribution window (300 ms of 2 s, and 200 ms of
 marks; `tests/slack.rs`'s
 half-sent-request shutdown test sleeps for the server to read the request,
 which nothing the test can see marks.
+
+### Review round 2: a gate never opened hangs instead of failing
+
+**Issue.** The drain-timeout post test holds "Posted too late." at a gate
+it never opens, and awaited the server task without a bound. A regression
+that made shutdown wait for in-flight work instead of cutting it short
+would hang the test, and CI's job has no timeout short of GitHub's six
+hours. Three hand-off tests cut short work held at gates they never open
+in the same way.
+
+**Solution.** `tests/pipeline.rs` has a `bounded(what, future)` helper that
+panics after a minute, longer than any drain timeout there. Every wait on
+the server task, on `cut_short` and on a pipeline drain goes through it,
+`Stack::stop` included. With `cut_short` changed to join its tasks instead
+of shutting them down, the drain-timeout test now fails in about 66 s with
+"timed out waiting until the server stops"; without the bound it was still
+running when killed at 240 s. The history gates are now kept per thread,
+and `Gate::pass` counts its waiter down when it is dropped as well as when
+it passes.
+
+### Review round 2: barrier sleeps outside agentd
+
+- `runner`'s `a_panicked_turn_wakes_a_session_waiting_for_its_container`
+  started the second turn 200 ms after the first. It now starts it once
+  the first turn has started, and so holds the one container. Nothing marks
+  the second turn waiting for the container, but if it arrived after the
+  first let go, it would take the container without waiting and the test
+  would still pass, rather than flake.
+- `cred-proxy`'s refusal-log test slept 100 ms before reading the logs.
+  The lines it looks for are written before the responses it awaits, but
+  the sleep also gave late lines a chance to show a secret. It now waits
+  for the tunnel's "an egress tunnel ended" line instead, the last line the
+  test causes.
+- `tests/slack.rs`'s half-sent-request shutdown test keeps its 200 ms
+  sleep. Nothing marks the server having read the request: agentd logs no
+  request start, and the integration tests capture no logs. Marking it
+  would mean a log line in the server for a test's sake.
+
+### Review round 2: smaller fixes
+
+- design.md's threat row says a `logout` deletes the rows the cap counts,
+  and that the member must link through OAuth again before the next run.
+- The relink notifier carries on past one notice's store failure and
+  returns the first failure after the rest, as the cloud notifier does.
+- A test covers a `logout` that fails after unlinking: the member is
+  unlinked with their routines kept, and sending `logout` again says "No
+  Claude account is linked", deletes them and says to revoke the tokens.
+- Unlinking first widens, by the revoke call's latency, the window in which
+  a `cloud run` that passed its link check before the unlink still records
+  and fires; its row is then deleted with the rest. The run's own reply
+  has the link, so nothing is lost but the record.
+- A `Retry-After` up to two hours reads in minutes (61 minutes, not 2
+  hours) and past that in hours to the nearest.
+- A test races eight hand-offs at one under the cap on a database file, so
+  a deferred transaction would let two through.
+- A refusal past the cap logs at debug, so a looping member stays out of
+  the logs. Its reply names the configured cap, not the count, which
+  differs only when the cap was lowered within the hour.
+- The example config and `CloudConfig`'s rustdoc say "hand-offs", the runs
+  that passed their checks and were recorded, rather than "`cloud run`s".
 
 ## T36d: Slack Connect: channel ids that change
 
