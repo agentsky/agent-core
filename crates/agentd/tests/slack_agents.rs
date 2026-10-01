@@ -1421,9 +1421,10 @@ async fn a_hop_from_another_agents_post_with_a_forged_mention_bills_no_one() {
         "thread_ts": asked,
     });
     turned.slack_has(&reply, scouts_post.clone()).await;
+    let forged_text = format!("<@{}> Hello from helper.", HELPER.bot);
     let mut extra = scouts_post;
-    extra["blocks"] = mention_block(HELPER.bot);
-    let forged = message_event(SCOUT.bot, &reply, "Ev0HOP", "Hello from helper.", extra);
+    extra["text"] = json!(forged_text);
+    let forged = message_event(SCOUT.bot, &reply, "Ev0HOP", &forged_text, extra);
     assert_eq!(turned.post(0, HELPER.secret, forged).await, 200);
     turned.wait_for_confirmation(HELPER.token).await;
     assert!(turned.posts(HELPER.token).await.is_empty());

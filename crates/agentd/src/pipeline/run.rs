@@ -267,11 +267,10 @@ struct Inner {
 /// records one or a replay takes one until its job is dropped: a cache in
 /// front of the rows, which [`Pipeline::replay_hand_offs`] keeps leasing
 /// rather than queueing again, draining included. It also holds whether
-/// the pipeline is closed: a row let go after that is set aside, and the
-/// end of [`Pipeline::drain`] or [`Pipeline::cut_short`] makes it due at
-/// once for the next instance, and so does the hand-off worker as it stops
-/// ([`Pipeline::run_hand_offs`]), since its last pass may let go of a row,
-/// or lease one again, after those.
+/// the pipeline is closed: a row let go after that is set aside until
+/// [`Pipeline::release_cut_hand_offs`] makes it due at once for the next
+/// instance, at the end of [`Pipeline::drain`] or [`Pipeline::cut_short`],
+/// and from the server once the hand-off worker is done.
 #[derive(Clone, Default)]
 struct Holder {
     ids: Arc<Mutex<HeldIds>>,
@@ -300,10 +299,17 @@ impl Holder {
         lock(&self.ids).live.iter().copied().collect()
     }
 
-    /// The rows let go since the pipeline closed. They stay set aside, so a
-    /// release that fails, or is cancelled, is made again by the next.
+    /// The rows let go since the pipeline closed and not released yet.
+    /// They stay set aside until [`released`](Self::released), so a release
+    /// that fails, or is cancelled, is made again by the next.
     fn cut(&self) -> Vec<i64> {
         lock(&self.ids).cut.clone()
+    }
+
+    /// Forgets the rows `ids` set aside, now released: another instance
+    /// may hold them next, and a later release would take them from it.
+    fn released(&self, ids: &[i64]) {
+        lock(&self.ids).cut.retain(|id| !ids.contains(id));
     }
 }
 
@@ -536,19 +542,26 @@ impl Pipeline {
     }
 
     /// Makes the `hand_offs` rows let go since the pipeline closed due at
-    /// once, for the next instance to take rather than wait out a lease.
-    async fn release_cut_hand_offs(&self) {
+    /// once, for the next instance to take rather than wait out a lease,
+    /// each once. [`drain`](Self::drain) and [`cut_short`](Self::cut_short)
+    /// call it as they end; call it again once nothing can let go of a row
+    /// any more, as the server does after its hand-off worker
+    /// ([`run_hand_offs`](Self::run_hand_offs)), whose last pass may.
+    pub async fn release_cut_hand_offs(&self) {
         let cut = self.inner.holder.cut();
         if cut.is_empty() {
             return;
         }
-        if let Err(err) = self
+        match self
             .inner
             .store
             .release_hand_offs(&cut, (self.inner.settings.now)())
             .await
         {
-            tracing::warn!(error = %err, hand_offs = cut.len(), "couldn't make the hand-offs let go at shutdown due at once; they are taken after their lease");
+            Ok(()) => self.inner.holder.released(&cut),
+            Err(err) => {
+                tracing::warn!(error = %err, hand_offs = cut.len(), "couldn't make the hand-offs let go at shutdown due at once; they are taken after their lease");
+            }
         }
     }
 
@@ -1666,10 +1679,7 @@ impl Pipeline {
 
     /// Calls [`replay_hand_offs`](Self::replay_hand_offs) now and then
     /// every [`PipelineSettings::hand_off_sweep`], until `stopping` becomes
-    /// true or its sender is dropped. Then, if the pipeline is closed, it makes the rows let go
-    /// since then due at once, once more: its last pass may have let go of
-    /// a row, or leased one again, after the drain or the cut released
-    /// them.
+    /// true or its sender is dropped.
     pub async fn run_hand_offs(self, mut stopping: watch::Receiver<bool>) {
         loop {
             if let Err(err) = self.replay_hand_offs().await {
@@ -1681,7 +1691,6 @@ impl Pipeline {
                 () = tokio::time::sleep(self.inner.settings.hand_off_sweep) => {}
             }
         }
-        self.release_cut_hand_offs().await;
     }
 
     /// What a turn of `agent` in `conv` needs before its session: its
@@ -2590,8 +2599,10 @@ mod tests {
         assert_eq!(
             holder.cut(),
             [7],
-            "it stays set aside for the next release, in case this one fails"
+            "it stays set aside until released, in case a release fails"
         );
+        holder.released(&[7]);
+        assert!(holder.cut().is_empty(), "a row released is forgotten");
     }
 
     /// An agent of a new owner whose bot, `bot`, is active on Slack's team

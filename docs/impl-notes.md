@@ -7716,14 +7716,29 @@ read with the same helper the inbound path uses (no broadcasts, each once,
 at most `MAX_MENTIONS`). Slack's response has no parsed mentions, so the
 surface reads the `<@U…>` tokens of each chunk it sent, as `normalize`
 reads an event's text; the renderer turns an `@<bot user id>` into one for
-managed bots. The surface reads them only outside what Slack shows as code
-(`render::slack::without_code`): a fence runs to the next fence, any two
-other backticks pair whatever lies between them, and a backtick left
-alone is text. That is the check every post passes, in the layer that
-decides what hands off, so whatever the renderer or the splitter leaves
-around a mention, agentd counts it only where Slack shows it. A mention
-Slack would show after all (if it doesn't pair backticks inside words,
-say) hands off to no one, which is the safe way to be wrong. The renderer
+managed bots. `normalize::mentions`, which reads both agentd's own posts
+and the platform's copies of them (and every other event), counts a
+`<@U…>` token only when no backtick lies both before and after it in the
+same text (`render::slack::without_code` drops all from the first
+backtick to the last). Code, fenced or inline, has a backtick on each
+side of what it holds, so whatever rule Slack pairs backticks by (any
+two, no empty spans, not across lines, links first) and whatever the
+renderer or the splitter left around a mention, a mention counted is one
+Slack shows. An earlier version modelled Slack as pairing any two
+backticks; a review showed plausible rules under which it counted a
+mention shown as code, and that the platform's copy, read by the inbound
+path, skipped the check. The cost, chosen to fail closed: a mention
+between two backticks that Slack shows as text, as in `` `a` @writer
+`b` ``, or between two code blocks, hands off to no one, which SKILL.md
+tells agents. A bot's mentions are read from its `text` alone, as
+agentd reads what it posted: Slack may attach `rich_text` blocks it makes
+from an app's text-only post, whose `user` elements (or a code-styled one)
+would otherwise count a mention agentd's own read dropped, running a hop
+with no `hand_offs` row behind it. Agentd's agents post text, and the
+router ignores every other bot, so nothing that routes is lost. A
+person's mentions are still read from the blocks too, so a person who
+writes `` `foo` @agent `bar` `` is addressed through the `user` element
+their client sends; only a person's message without blocks loses it. The renderer
 changes went back out: the scan makes them unneeded, and they made code
 holding a backtick paste with invisible characters. A backtick in a link's
 URL is percent-encoded (`%60`), so a URL never holds one; such a URL
@@ -7820,7 +7835,7 @@ post; and the lane deletes the row only then. The "hand-off worker" calls
 leases this instance's held rows again, so neither it nor another
 instance takes them, then leases up to 64 due rows, drops rows recorded
 over an hour ago that are due (logging how many; a held row is never due,
-whichever instance holds it), and
+whichever instance holds it, while its holder's worker runs), and
 queues each again, unless its hop's claim is taken, when the row is done
 with. A row that doesn't parse, whose agent is gone or has no active
 binding there, or whose posting turn can't be read is left for later or
@@ -7830,15 +7845,33 @@ after the drain or cut, only leases the held rows again, so a drain
 longer than the lease keeps them. A hold let go while the pipeline is
 closed, by a job that never settled its row or a delivery cut short, is
 set aside, and the end of `drain` or `cut_short` makes those rows due at
-once, so the next instance takes them on its first look; the worker does
-it once more as it stops, since its last pass can let go of a row, or
-lease one again, after them, and a release that failed or was cancelled
-is made again then, as the rows stay set aside. The sweep interval is
-`PipelineSettings::hand_off_sweep` (30 s), so a test drives the server's
-worker through a drain. A hand-off past
+once, so the next instance takes them on its first look, and the server
+does it once more after its hand-off worker is joined or aborted
+(`Pipeline::release_cut_hand_offs`), since the worker's last pass can let
+go of a row after them. A row stays set aside until a release of it
+succeeds, so one that failed or was cancelled is made again by the next,
+and is then forgotten, so a later release can't take it from an instance
+that holds it by then. A drain cut by its timeout while its release is in
+flight may have committed it without forgetting the rows, and
+`cut_short` then releases them again a few milliseconds later; a row
+another instance took in between has its lease reset, which the claim
+keeps from running twice. The server's last release gets a second on a
+forced shutdown, and otherwise runs until a second signal; one cut short
+leaves those rows to their lease. A pass whose re-lease of a row commits after the
+cut released it leaves that row to its lease, five minutes at most. The
+sweep interval is `PipelineSettings::hand_off_sweep` (30 s), so a test
+drives the server's worker through a drain. A hand-off past
 a full queue keeps its row and is taken again after the lease rather than
 answered with a busy line, which no one would read. The record and the
 replay read `PipelineSettings::now`.
+
+A held row can still come due, and so be dropped as stale once it is an
+hour old while its job runs on in memory, when its holder can't lease it
+for more than about four and a half minutes: the instance frozen
+(SIGSTOP, a paused VM, a blocked runtime), its store writes failing, or
+two instances' clocks that far apart. That is the exposure the lease
+already has for takes; such a job still runs from memory, but a cut or
+an unsettled end then has no row to fall back on.
 
 Delivery is at least once until the hop is claimed, and at most once
 after: a crash between the claim and the turn loses that hop, and a cut

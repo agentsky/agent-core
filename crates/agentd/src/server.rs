@@ -62,6 +62,11 @@ use crate::sweeper::{self, SWEEP_INTERVAL};
 /// How long `/healthz` waits for the store before reporting it unavailable.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a forced shutdown still gives the last release of the
+/// hand-offs let go ([`Pipeline::release_cut_hand_offs`]), so a store
+/// write that hangs can't hold the process.
+const FORCED_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The routes each listener serves, and the workers behind them.
 #[derive(Debug)]
 pub struct Routers {
@@ -295,7 +300,11 @@ impl Server {
     ///    requests, the workers and the sweeper get what is left of the
     ///    same timeout to finish. Whatever is still running then is
     ///    dropped.
-    /// 4. The pipeline is dropped, and the store is closed.
+    /// 4. The hand-offs let go since the drain began, by the hand-off
+    ///    worker's last pass included, are made due at once
+    ///    ([`Pipeline::release_cut_hand_offs`]), within a second if the
+    ///    shutdown was forced and until a second signal otherwise, the
+    ///    pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -521,12 +530,32 @@ impl Server {
                 drained = tokio::time::timeout_at(deadline, drain) => {
                     drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
                 }
-                () = abort.as_mut() => Some("shutdown forced; dropping in-flight work"),
+                () = abort.as_mut() => {
+                    forced = true;
+                    Some("shutdown forced; dropping in-flight work")
+                }
             }
         };
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
+        }
+        if let Some(pipeline) = &pipeline {
+            let released = if forced {
+                tokio::time::timeout(FORCED_RELEASE_TIMEOUT, pipeline.release_cut_hand_offs())
+                    .await
+                    .is_ok()
+            } else {
+                tokio::select! {
+                    () = pipeline.release_cut_hand_offs() => true,
+                    () = abort.as_mut() => false,
+                }
+            };
+            if !released {
+                tracing::warn!(
+                    "shutdown forced; the hand-offs let go last are taken after their lease"
+                );
+            }
         }
         drop(pipeline);
         app.store().close().await;
