@@ -669,7 +669,7 @@ async fn a_refresh_whose_grant_is_unstated_or_unreadable_keeps_the_link() {
         Some(json!("")),
         Some(json!([])),
         Some(json!(7)),
-        Some(json!({"granted": ["user:profile"]})),
+        Some(json!({"user:profile": true})),
         Some(json!(["user:inference", null])),
     ] {
         let h = harness().await;
@@ -709,6 +709,7 @@ async fn a_wider_scope_in_any_shape_refuses_a_login_and_breaks_a_refresh() {
         json!(["user:profile", "user:sessions:claude_code", 7]),
         json!([["user:sessions:claude_code"]]),
         json!({"granted": ["user:profile", "user:sessions:claude_code"]}),
+        json!({"user:sessions:claude_code": true}),
     ] {
         let wide = || {
             ResponseTemplate::new(200).set_body_json(json!({
@@ -778,7 +779,7 @@ async fn a_login_whose_scope_is_unreadable_is_refused_as_unstated() {
         "access_token": "access-odd",
         "refresh_token": "refresh-odd",
         "expires_in": 28800,
-        "scope": {"granted": "user:profile user:inference"},
+        "scope": {"user:profile": "user:inference"},
     }));
     let err = login_answered(&h, answer).await;
     assert!(matches!(err, AuthError::ScopeUnstated), "{err:?}");

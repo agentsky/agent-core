@@ -8428,14 +8428,15 @@ out when it is what the request asked for, which for a login is the URL
 the member may have changed.
 
 **Solution.** `auth` reads a token response's `scope` as any JSON value
-and splits every string in it, at any depth of arrays and objects, on
-blanks into scopes, so no shape hides a wider one. It sorts the result
-into a `Grant`: wider if any scope is outside `ALLOWED_SCOPES`, whatever
-the shape; unstated if there is none (absent, `null`, blank, an empty
-array, or a shape holding no string, since no scope is no grant and a
-server using it for "as requested" would reopen the hole); and otherwise
-allowed for a space-separated string, as RFC 6749 has it, or an array of
-strings, and unreadable for any other shape.
+and splits every string in it, at any depth of arrays and objects and
+objects' keys included, on blanks into scopes, so no shape hides a wider
+one. It sorts the result into a `Grant`: wider if any scope is outside
+`ALLOWED_SCOPES`, whatever the shape; for a space-separated string, as
+RFC 6749 has it, an array of strings, or `null`, allowed if it names a
+scope and unstated if not (absent, `null`, blank or an empty array, since
+no scope is no grant and a server using it for "as requested" would
+reopen the hole); and unreadable for any other shape, a number or an
+object naming no wider scope among them.
 
 - A login keeps only an allowed grant. A wider one is
   `AuthError::ScopeRefused`, whose reply tells the member to open the
