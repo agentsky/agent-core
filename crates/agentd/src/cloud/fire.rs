@@ -51,6 +51,7 @@ pub struct FireClient {
     base: Url,
     origin: String,
     beta: HeaderValue,
+    handoffs_per_hour: u32,
 }
 
 impl fmt::Debug for FireClient {
@@ -215,7 +216,14 @@ impl FireClient {
             base,
             origin,
             beta,
+            handoffs_per_hour: config.handoffs_per_hour,
         })
+    }
+
+    /// `[cloud] handoffs_per_hour`: how many hand-offs one member may ask
+    /// for in an hour.
+    pub fn handoffs_per_hour(&self) -> u32 {
+        self.handoffs_per_hour
     }
 
     /// The origin `[cloud] base_url` names, as

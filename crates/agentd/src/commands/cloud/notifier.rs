@@ -85,8 +85,9 @@ impl CloudNotifier {
     ///
     /// # Errors
     ///
-    /// A [`StoreError`] if the store fails; what was done before stays
-    /// done.
+    /// The first [`StoreError`] the pass met. Every step runs whatever
+    /// another met, and so does every notice: a hand-off the store fails
+    /// on is logged and left for a later pass, and the purge still runs.
     pub async fn pass(&self) -> Result<CloudPass, StoreError> {
         self.pass_at(OffsetDateTime::now_utc).await
     }
@@ -96,11 +97,20 @@ impl CloudNotifier {
         &self,
         now: impl Fn() -> OffsetDateTime,
     ) -> Result<CloudPass, StoreError> {
+        let mut first_err = None;
         let at = now();
-        let stale = self
+        let stale = match self
             .store
             .stale_cloud_handoffs(earlier(at, self.stale_after), at)
-            .await?;
+            .await
+        {
+            Ok(stale) => stale,
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't mark unanswered cloud hand-offs");
+                first_err.get_or_insert(err);
+                Vec::new()
+            }
+        };
         for handoff in &stale {
             tracing::warn!(
                 handoff = %handoff.id,
@@ -109,25 +119,49 @@ impl CloudNotifier {
                 "a cloud hand-off got no recorded answer; marked it unknown"
             );
         }
+        let due = match self.store.due_cloud_handoff_notices(now()).await {
+            Ok(due) => due,
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't read the cloud hand-off notices owed");
+                first_err.get_or_insert(err);
+                Vec::new()
+            }
+        };
         let mut told = 0;
-        for handoff in self.store.due_cloud_handoff_notices(now()).await? {
-            if self.notify(&handoff, &now).await? {
-                told += 1;
+        for handoff in &due {
+            match self.notify(handoff, &now).await {
+                Ok(true) => told += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(handoff = %handoff.id, member = %handoff.member, error = %err, "a cloud hand-off notice failed in the store; left it for a later pass");
+                    first_err.get_or_insert(err);
+                }
             }
         }
         let at = now();
-        let purged = self
+        let purged = match self
             .store
             .purge_cloud_handoffs(earlier(at, self.retention), at)
-            .await?;
+            .await
+        {
+            Ok(purged) => purged,
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't delete old cloud hand-offs");
+                first_err.get_or_insert(err);
+                0
+            }
+        };
         if purged > 0 {
             tracing::info!(purged, "deleted old cloud hand-offs");
         }
-        Ok(CloudPass {
-            marked: stale.len(),
-            told,
-            purged,
-        })
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(CloudPass {
+                marked: stale.len(),
+                told,
+                purged,
+            }),
+        }
     }
 
     /// Claims `handoff`'s notice and sends it to each of the member's
@@ -200,7 +234,9 @@ impl CloudNotifier {
                     tracing::debug!(?pass, "cloud hand-off pass");
                 }
                 Ok(_) => {}
-                Err(err) => tracing::warn!(error = %err, "the cloud hand-off pass failed"),
+                Err(err) => {
+                    tracing::debug!(error = %err, "the cloud hand-off pass met a store failure")
+                }
             }
         }
     }

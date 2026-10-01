@@ -282,9 +282,10 @@ Once per repository, a member:
    token, which is shown once.
 4. Registers both under a label of their choosing, such as the repository's
    name: `/agent cloud add <routine> <url> <token>` on Slack, as a slash
-   command, whose text isn't kept anywhere (a direct message would keep the
-   token in Slack's history), or `cloud add …` in the Rocket.Chat manager
-   bot's direct message. The URL must be on `[cloud] base_url`'s origin.
+   command, whose text isn't posted anywhere (a direct message would keep the
+   token in Slack's history, and replies on Slack always point to the slash
+   command), or `cloud add …` in the Rocket.Chat manager bot's direct
+   message. The URL must be on `[cloud] base_url`'s origin.
    Sending it again with a new token replaces it.
 
 `cloud run <routine> <task>` then starts a session with the task, and the
@@ -298,11 +299,15 @@ member can add or run routines, and no agent can start a session: there is no
 `agentctl` command for it. On Slack, mentions, channels and links in a task
 reach the session as Slack showed them (`@name`, `#name`, the link's URL, or
 `label (url)` when a link's label isn't its URL), and a broadcast, a user group
-or a date is refused. A task is refused when it holds characters that don't
+or a date is refused. In a direct message to the manager app Slack sends a
+mention without its name, so a mention is refused there too: write the name as
+plain text, or use the slash command. A task is refused when it holds characters that don't
 show (control or invisible characters), a line indented more than 32 columns,
 a run of blanks wider than 16 columns, more than two blank lines in a row, or
 more than 4 combining marks stacked on a character, so pasted code may need
-reflowing; and when it is empty or over 65,536 bytes.
+reflowing; and when it is empty or over 65,536 bytes. A member may ask for
+`[cloud] handoffs_per_hour` hand-offs an hour (default 10), whatever came of
+them; one more is refused before anything is recorded or sent.
 
 After the link, agentd does nothing more: it can't read the session (the
 routine's token has no read access), so the member follows it at the link,
@@ -311,8 +316,9 @@ on the account that owns the routine and uses its subscription. A request
 whose answer agentd can't tell, such as a server error or a timeout, may have
 started a session, and agentd says so rather than retrying. If agentd stops
 while a request is out, the hand-off is marked unknown after twice
-`[cloud] timeout_secs`, and the member gets a direct message from the manager
-bot, once, saying to check claude.ai/code before running it again. Hand-offs
+`[cloud] timeout_secs`, and the member gets one direct message about it on
+each surface where a manager bot reaches them, saying to check claude.ai/code
+before running it again. Hand-offs
 are kept for `[cloud] retention_days` (default 90). `logout` deletes the
 member's routines and hand-offs, and so does Slack reporting the member
 deleted; agentd can't revoke a routine's token, so the replies to `logout`

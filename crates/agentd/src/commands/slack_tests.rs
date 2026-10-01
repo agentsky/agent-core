@@ -2459,3 +2459,59 @@ async fn outside_commands_dms_and_clicks_never_run() {
          commands, and its team_id must be this workspace"
     );
 }
+
+#[tokio::test]
+async fn slack_command_text_is_decoded_once_before_it_is_parsed() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let reply = h
+        .slash("U0HUMAN01", "persona helper a &lt;b&gt; &amp;amp; c")
+        .await;
+    assert!(
+        reply[0].starts_with("Replaced `helper`'s persona."),
+        "{reply:?}"
+    );
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "a <b> &amp; c");
+
+    let (intake, submitter) = CommandIntake::new(h.commands.clone());
+    let inbound = Sender::new(Inbound::new(h.store.clone(), Some(identity()), submitter));
+    let running = tokio::spawn(intake.run());
+    inbound
+        .send(SlackInbound::Message(
+            Box::new(dm_event(
+                "U0HUMAN01",
+                "persona helper x &lt;y&gt; &amp;amp; z",
+            )),
+            InFlight::untracked(),
+        ))
+        .await
+        .unwrap();
+    drop(inbound);
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "x <y> &amp; z");
+}

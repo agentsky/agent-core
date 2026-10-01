@@ -351,3 +351,9 @@ connect_timeout_secs = 10
 
 # How many days hand-offs are kept after they were asked for (1 to 365).
 retention_days = 90
+
+# How many `cloud run`s one member may ask for in an hour (1 to 100). Each
+# counts whatever came of it, and one past this is refused before anything is
+# recorded or sent, so a looping member can't fill the store or send a flood of
+# requests from agentd's address.
+handoffs_per_hour = 10

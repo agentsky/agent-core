@@ -3399,6 +3399,16 @@ uses it too instead of comparing strings. `consents::unshowable` is
 out, and never the endpoint's `error_type`. `cloud rm` is named wherever a
 ban's replies list what a banned member may still run. The pass is
 `commands::cloud::CloudNotifier`, run every minute from `Server::run`.
+Review round 1 added a per-member cap, `[cloud] handoffs_per_hour` (default
+10, from 1 to 100), which `Store::begin_cloud_handoff` counts in the
+transaction that writes the row, refusing one more before anything is
+written or sent; that transaction also checks the routine is still the
+member's, so a `logout` racing a `cloud run` either comes first or deletes
+the row, and `finish_cloud_handoff` says when the row is gone. On Slack,
+replies name `/agent cloud add` even in a DM. `logout` unlinks before it
+deletes routines, so a failed `logout` sent again still says to revoke
+tokens. One row's store failure no longer ends a notifier pass or skips its
+purge.
 
 ## Phase 7: Slack Connect (design milestone 7)
 

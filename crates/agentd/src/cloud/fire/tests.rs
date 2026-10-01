@@ -3,7 +3,10 @@ use std::time::Duration;
 use core_types::{CloudRoutineId, MemberKey, RoutineToken, SurfaceKind, TeamId, UserId};
 use secrecy::SecretString;
 use serde_json::json;
-use store::{CloudHandoffState, CloudOrigin, NewCloudHandoff, Sealer, Store};
+use store::{
+    CloudBegun, CloudFinished, CloudHandoffState, CloudOrigin, NewCloudHandoff, NewCloudRoutine,
+    Sealer, Store,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use wiremock::matchers::{method, path};
@@ -886,8 +889,22 @@ async fn every_outcome_is_recorded_as_it_is() {
     let now = time::OffsetDateTime::now_utc();
     let member = store.ensure_member(&key, "Ada", now).await.unwrap();
     let routine_id: RoutineId = ROUTINE.parse().unwrap();
+    store
+        .put_cloud_routine(
+            &NewCloudRoutine {
+                member,
+                label: "agent-core",
+                routine_id: &routine_id,
+                url_origin: "https://api.anthropic.com",
+                token: &RoutineToken::parse(SecretString::from(TOKEN)).unwrap(),
+                added_by: &key,
+            },
+            now,
+        )
+        .await
+        .unwrap();
     for outcome in &outcomes {
-        let id = store
+        let begun = store
             .begin_cloud_handoff(
                 &NewCloudHandoff {
                     member,
@@ -897,12 +914,17 @@ async fn every_outcome_is_recorded_as_it_is() {
                     origin: CloudOrigin::RocketChatDm,
                     task: TASK,
                 },
+                u32::MAX,
                 now,
             )
             .await
             .unwrap();
-        assert!(
+        let CloudBegun::Begun(id) = begun else {
+            panic!("{begun:?}");
+        };
+        assert_eq!(
             store.finish_cloud_handoff(id, outcome, now).await.unwrap(),
+            CloudFinished::Recorded,
             "{outcome:?}"
         );
         let recent = store.recent_cloud_handoffs(member, 1).await.unwrap();
