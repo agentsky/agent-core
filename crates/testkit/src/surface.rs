@@ -165,6 +165,15 @@ struct Queue {
     changed: Arc<Notify>,
 }
 
+/// The names [`MockSurface::name_user`] gave, as a member directory.
+struct Names<'a>(&'a HashMap<String, UserId>);
+
+impl render::MentionDirectory for Names<'_> {
+    fn resolve(&self, name: &str) -> Option<String> {
+        self.0.get(&name.to_lowercase()).map(ToString::to_string)
+    }
+}
+
 impl Default for MockSurface {
     fn default() -> Self {
         Self::new()
@@ -225,31 +234,29 @@ impl MockSurface {
         self.state().history.insert(thread, messages);
     }
 
-    /// Makes a post's `@username` mention the user `user`, as a platform
-    /// that resolves usernames does.
-    pub fn name_user(&self, username: &str, user: UserId) {
-        self.state().usernames.insert(username.to_owned(), user);
+    /// Makes a post's `@name` mention the user `user`. A post's mentions
+    /// are read as Slack's renderer reads them ([`render::slack`]), with
+    /// the names given here as the member directory: so a name followed by
+    /// a capitalized word, a broadcast or a name in code mentions no one,
+    /// and a name never given here mentions no one either.
+    pub fn name_user(&self, name: &str, user: UserId) {
+        self.state().usernames.insert(name.to_lowercase(), user);
     }
 
-    /// The users a post of `text` mentions: each word `@name` without
-    /// trailing punctuation, read as the user [`name_user`](Self::name_user)
-    /// named `name`, or else as the user id `name`; each once, at most
-    /// [`MAX_MENTIONS`].
+    /// The users a post of `text` mentions: see
+    /// [`name_user`](Self::name_user). Each once, at most [`MAX_MENTIONS`].
     fn mentions_in(state: &State, text: &str) -> Vec<UserId> {
+        let rendered = render::slack::to_mrkdwn(text, &Names(&state.usernames));
         let mut found: Vec<UserId> = Vec::new();
-        for word in text.split_whitespace() {
-            let Some(name) = word.strip_prefix('@') else {
-                continue;
-            };
-            let name = name.trim_end_matches(|c: char| !c.is_alphanumeric());
-            let user = state
-                .usernames
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| UserId::from(name));
-            if !name.is_empty() && !found.contains(&user) && found.len() < MAX_MENTIONS {
+        let mut rest = rendered.as_str();
+        while let Some(at) = rest.find("<@") {
+            rest = &rest[at + 2..];
+            let end = rest.find(['>', '|']).unwrap_or(rest.len());
+            let user = UserId::from(&rest[..end]);
+            if !found.contains(&user) && found.len() < MAX_MENTIONS {
                 found.push(user);
             }
+            rest = &rest[end..];
         }
         found
     }
@@ -639,19 +646,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_post_mentions_its_at_words_each_once() {
+    async fn a_post_mentions_whom_slacks_renderer_would() {
         let mock = MockSurface::new();
         mock.name_user("writer", UserId::from("UWRITER"));
+        mock.name_user("UBOT", UserId::from("UBOT"));
         let to = target("C1", None);
         let posted = mock
-            .post(&to, "@UBOT, ask @writer and @UBOT. mail a@b @ @UWRITER")
+            .post(&to, "@UBOT, ask @writer and @UBOT. mail a@b @ @UNKNOWN")
             .await
             .unwrap();
         assert_eq!(
             posted.mentions,
             [UserId::from("UBOT"), UserId::from("UWRITER")]
         );
-        assert!(mock.post(&to, "no one").await.unwrap().mentions.is_empty());
+        for unread in ["no one", "@writer Please look", "`@writer` @here"] {
+            let posted = mock.post(&to, unread).await.unwrap();
+            assert!(posted.mentions.is_empty(), "{unread}");
+        }
+        let colon = mock.post(&to, "@writer: Please look").await.unwrap();
+        assert_eq!(colon.mentions, [UserId::from("UWRITER")]);
     }
 
     #[tokio::test]

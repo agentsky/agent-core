@@ -1506,6 +1506,7 @@ impl Turned {
                     },
                     hop: Hop(0),
                     consent: None,
+                    hands_off: false,
                 },
                 OffsetDateTime::now_utc(),
             )
@@ -2116,22 +2117,33 @@ async fn agentd_hands_an_agents_mention_off_itself_and_drops_slacks_copy() {
         "the hop inherits bob"
     );
     assert_eq!(helpers_ref.hop, scouts_ref.hop.next().unwrap());
-    assert_eq!(
-        turned.confirmations(HELPER.token).await.len(),
-        1,
-        "helper read scout's post back before its turn"
+    assert!(
+        turned.confirmations(HELPER.token).await.is_empty(),
+        "agentd's own copy isn't read back: agentd posted it"
     );
 
     let duplicate = message_event(SCOUT.bot, &reply, "Ev0HOP", &handoff, scouts_post);
     assert_eq!(turned.post(0, HELPER.secret, duplicate).await, 200);
-    turned.wait_for_confirmations(HELPER.token, 2).await;
+    let later = recent_ts(1, 400);
+    let again = format!("<@{}> and the docs?", HELPER.bot);
+    let bobs =
+        json!({"ts": later, "user": fixtures::OTHER_USER, "text": again, "thread_ts": asked});
+    turned.slack_has(&later, bobs.clone()).await;
+    let after = message_event(fixtures::OTHER_USER, &later, "Ev0AFTER", &again, bobs);
+    assert_eq!(turned.post(0, HELPER.secret, after).await, 200);
+    turned.wait_for_posts(HELPER.token, 2).await;
+    let (slack, fake) = turned.drained().await;
     assert_eq!(
-        turned.posts(HELPER.token).await.len(),
-        1,
-        "Slack's copy, arriving second, starts no second turn"
+        posts_with(&slack, HELPER.token).await.len(),
+        2,
+        "Slack's copy, arriving second, started no turn: helper answered its hop and bob"
     );
-    assert_eq!(turned.fake.message_requests().await.len(), 2);
-    turned.stop().await;
+    assert_eq!(
+        confirmations_with(&slack, HELPER.token).await,
+        1,
+        "only bob's message was read back; Slack's copy was dropped before its read-back"
+    );
+    assert_eq!(fake.message_requests().await.len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2166,4 +2178,119 @@ async fn an_unmanaged_bots_mention_starts_no_turn() {
     );
     assert_eq!(turned.fake.message_requests().await.len(), 1, "one turn");
     turned.stop().await;
+}
+
+impl Turned {
+    /// Stops agentd once what it took is done, and returns the fake Slack
+    /// and Anthropic to look at what it did.
+    async fn drained(self) -> (MockServer, testkit::FakeAnthropic) {
+        let Self {
+            slack,
+            fake,
+            stop,
+            task,
+            _dir,
+            ..
+        } = self;
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(_dir);
+        (slack, fake)
+    }
+
+    /// Makes the agent whose bot token is `token` post its next messages
+    /// at `ts`, one each, in order.
+    async fn posts_in_turn_at(&self, token: &str, ts: &[&str]) {
+        for (priority, ts) in (1..).zip(ts) {
+            Mock::given(method("POST"))
+                .and(path("/api/chat.postMessage"))
+                .and(header("authorization", format!("Bearer {token}").as_str()))
+                .respond_with(ok(json!({"ts": ts})))
+                .up_to_n_times(1)
+                .with_priority(priority)
+                .mount(&self.slack)
+                .await;
+        }
+    }
+}
+
+/// The `chat.postMessage` bodies Slack got with the bot token `token`.
+async fn posts_with(slack: &MockServer, token: &str) -> Vec<Value> {
+    slack
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.url.path() == "/api/chat.postMessage"
+                && request.headers.get("authorization").unwrap()
+                    == format!("Bearer {token}").as_str()
+        })
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+        .collect()
+}
+
+/// How many messages Slack was asked to read back with `token`.
+async fn confirmations_with(slack: &MockServer, token: &str) -> usize {
+    slack
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| {
+            request.url.path().starts_with("/api/conversations.")
+                && request.headers.get("authorization").unwrap()
+                    == format!("Bearer {token}").as_str()
+                && String::from_utf8_lossy(&request.body).contains("oldest=")
+        })
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ask_agent_hands_a_capitalized_task_off_on_slack() {
+    let turned = Turned::start(&[HELPER, SCOUT]).await;
+    turned.every_turn(Turn::reply("Asked.").with_command([
+        "agentctl",
+        "ask-agent",
+        "helper",
+        "Check the changelog",
+    ]));
+    let asked = recent_ts(10, 100);
+    let (reply, task) = (recent_ts(5, 300), recent_ts(5, 400));
+    turned
+        .posts_in_turn_at(SCOUT.token, &[reply.as_str(), task.as_str()])
+        .await;
+    let text = format!("<@{}> summarize the release", SCOUT.bot);
+    turned
+        .slack_has(
+            &asked,
+            json!({"ts": asked, "user": fixtures::OTHER_USER, "text": text}),
+        )
+        .await;
+    let question = channel_message(fixtures::OTHER_USER, &asked, "Ev0ASKSCOUT", &text);
+    assert_eq!(turned.post(1, SCOUT.secret, question).await, 200);
+
+    let scouts = turned.wait_for_posts(SCOUT.token, 2).await;
+    assert_eq!(
+        scouts[1]["text"],
+        format!("<@{}>: Check the changelog", HELPER.bot),
+        "the handle is a mention, whatever the task starts with"
+    );
+    let helpers = turned.wait_for_posts(HELPER.token, 1).await;
+    assert_eq!(helpers[0]["thread_ts"], asked.as_str());
+    let asking = turned.posted(&task).await;
+    let helpers_ref = turned.posted(HELPER.posted_ts).await;
+    assert_eq!(asking.requester.member, Some(turned.bob));
+    assert_eq!(
+        helpers_ref.requester, asking.requester,
+        "the hop inherits bob"
+    );
+    assert_eq!(helpers_ref.hop, asking.hop.next().unwrap());
+    let (slack, fake) = turned.drained().await;
+    assert_eq!(posts_with(&slack, HELPER.token).await.len(), 1);
+    assert_eq!(fake.message_requests().await.len(), 2);
 }

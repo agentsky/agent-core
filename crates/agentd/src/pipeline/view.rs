@@ -69,10 +69,13 @@ async fn attribution(
 /// The attribution is waited for only when the router reads it: another
 /// agent's bot sent the message, mentioning this agent. A post of an
 /// agent's bot that has none, such as a file a turn uploaded, holds no lane
-/// up otherwise. A private task's result or outcome, whose row names its
-/// consent, is given no attribution, so the router never takes a mention
-/// in it as a hop: private context doesn't flow to another agent's turn,
-/// and no hop chains on the owner's credential from it.
+/// up otherwise. Only a post whose row hands off (`hands_off`: a turn's
+/// post in the turn's own thread) is given its attribution, so the router
+/// takes a mention as a hop only there. A private task's result or
+/// outcome never hands off, so private context doesn't flow to another
+/// agent's turn and no hop chains on the owner's credential from it; nor
+/// does a post a turn made in another thread or conversation, so a hop
+/// never starts a thread of its own with a fresh budget.
 #[derive(Debug, Default)]
 pub(crate) struct StoreView {
     agent: Option<(AgentId, MemberId, AgentState)>,
@@ -151,7 +154,7 @@ impl StoreView {
             .any(|key| view.bots.get(key) == Some(&ManagedBot::Agent(agent)));
         let wait = from_other_agent && mentions_agent;
         if let Some(posted) = attribution(store, &event.message, wait).await?
-            && posted.consent.is_none()
+            && posted.hands_off
             && let Some(poster) = posted.agent
         {
             view.member(store, &posted.requester.key).await?;

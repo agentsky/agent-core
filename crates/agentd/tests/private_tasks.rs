@@ -1189,6 +1189,7 @@ async fn owner_requester_at_hop_one_needs_a_card() {
                 },
                 hop: core_types::Hop::ZERO,
                 consent: None,
+                hands_off: true,
             },
             OffsetDateTime::now_utc(),
         )

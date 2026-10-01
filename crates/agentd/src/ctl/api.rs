@@ -634,9 +634,12 @@ async fn lock(
 /// another agent, at the next hop.
 ///
 /// Only in a channel or a group DM, where another agent can answer. The
-/// agent is named by its name or its bot's handle, among the agents with a
-/// bot on this surface and team that the turn's requester may see: public
-/// ones, and the requester's own.
+/// agent is named by its bot's handle, or by its name when no handle
+/// matches, among the agents with a bot on this surface and team that the
+/// turn's requester may see: public ones, and the requester's own. The
+/// handle ends at a colon, so no word of the task is read as part of a
+/// name, and the renderers resolve a managed bot's handle before anyone's
+/// name.
 async fn ask_agent(
     State(ctl): State<Ctl>,
     Caller(caller): Caller,
@@ -662,7 +665,7 @@ async fn ask_agent(
     }
     let conv = &caller.turn.thread.conv;
     let asker = caller.turn.requester.member;
-    let found: Vec<_> = ctl
+    let visible: Vec<_> = ctl
         .store()
         .directory(conv.surface, &conv.team, None)
         .await
@@ -672,11 +675,25 @@ async fn ask_agent(
             entry.agent.visibility == Visibility::Public || Some(entry.agent.owner) == asker
         })
         .filter_map(|entry| {
-            let handle = entry.handle(conv.surface)?;
-            (entry.agent.name.eq_ignore_ascii_case(wanted) || handle.eq_ignore_ascii_case(wanted))
-                .then_some((entry.agent.id, handle))
+            Some((
+                entry.agent.id,
+                entry.handle(conv.surface)?,
+                entry.agent.name,
+            ))
         })
         .collect();
+    let by_handle: Vec<_> = visible
+        .iter()
+        .filter(|(_, handle, _)| handle.eq_ignore_ascii_case(wanted))
+        .collect();
+    let found: Vec<_> = if by_handle.is_empty() {
+        visible
+            .iter()
+            .filter(|(_, _, name)| name.eq_ignore_ascii_case(wanted))
+            .collect()
+    } else {
+        by_handle
+    };
     let handle = match found.as_slice() {
         [] => {
             return Err(error(
@@ -684,14 +701,14 @@ async fn ask_agent(
                 format!("no agent called {wanted} has a bot here"),
             ));
         }
-        [(agent, _)] if *agent == caller.token.agent => {
+        [(agent, _, _)] if *agent == caller.token.agent => {
             return Err(error(CtlErrorCode::Refused, "an agent can't ask itself"));
         }
-        [(_, handle)] => handle,
+        [(_, handle, _)] => handle,
         several => {
             let handles: Vec<String> = several
                 .iter()
-                .map(|(_, handle)| format!("@{handle}"))
+                .map(|(_, handle, _)| format!("@{handle}"))
                 .collect();
             return Err(error(
                 CtlErrorCode::BadRequest,
@@ -702,7 +719,7 @@ async fn ask_agent(
             ));
         }
     };
-    let text = format!("@{handle} {task}");
+    let text = format!("@{handle}: {task}");
     if text.len() > MAX_POST_BYTES {
         return Err(error(
             CtlErrorCode::TooLarge,

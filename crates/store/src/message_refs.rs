@@ -16,7 +16,8 @@ const TABLE: &str = "message_refs";
 macro_rules! columns {
     () => {
         "session_id, short_id, surface, team_id, conversation, thread_root, platform_ref, \
-         agent_id, turn_id, requester_member, requester_key, hop, posted_at, consent_id"
+         agent_id, turn_id, requester_member, requester_key, hop, posted_at, consent_id, \
+         hands_off"
     };
 }
 
@@ -42,6 +43,9 @@ pub struct NewMessageRef<'a> {
     /// The consent whose private task's result or outcome the message
     /// reports, if it does: a mention in it starts no agent's turn.
     pub consent: Option<ConsentId>,
+    /// Whether a mention in it hands off to the agent mentioned: a turn's
+    /// post in the turn's own thread, never a private task's.
+    pub hands_off: bool,
 }
 
 /// A `message_refs` row.
@@ -69,6 +73,8 @@ pub struct MessageRef {
     /// The consent whose private task's result or outcome the message
     /// reports, if it does.
     pub consent: Option<ConsentId>,
+    /// Whether a mention in it hands off to the agent mentioned.
+    pub hands_off: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -87,6 +93,7 @@ struct Row {
     hop: i64,
     posted_at: i64,
     consent_id: Option<String>,
+    hands_off: i64,
 }
 
 fn corrupt(column: &'static str) -> StoreError {
@@ -132,6 +139,7 @@ impl Row {
                 .consent_id
                 .map(|consent| parse_column(&consent, TABLE, "consent_id"))
                 .transpose()?,
+            hands_off: self.hands_off != 0,
         })
     }
 }
@@ -164,7 +172,8 @@ async fn in_session(
 async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Result<MessageRef> {
     let row: Row = sqlx::query_as(concat!(
         "UPDATE message_refs SET agent_id = ?, turn_id = ?, requester_member = ?, \
-         requester_key = ?, hop = ?, consent_id = ? WHERE session_id = ? AND surface = ? \
+         requester_key = ?, hop = ?, consent_id = ?, hands_off = ? WHERE session_id = ? \
+         AND surface = ? \
          AND team_id = ? AND conversation = ? AND platform_ref = ? RETURNING ",
         columns!()
     ))
@@ -174,6 +183,7 @@ async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Resu
     .bind(new.requester.key.to_string())
     .bind(i64::from(new.hop.0))
     .bind(new.consent.map(|consent| consent.to_string()))
+    .bind(i64::from(new.hands_off))
     .bind(new.session.to_string())
     .bind(new.msg.conv.surface.as_str())
     .bind(new.msg.conv.team.as_str())
@@ -217,9 +227,9 @@ impl Store {
         let row: Row = sqlx::query_as(concat!(
             "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
              thread_root, platform_ref, agent_id, turn_id, requester_member, requester_key, hop, \
-             posted_at, consent_id) \
+             posted_at, consent_id, hands_off) \
              SELECT ?1, COALESCE(MAX(short_id), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, \
-             ?12, ?13 FROM message_refs WHERE session_id = ?1 RETURNING ",
+             ?12, ?13, ?14 FROM message_refs WHERE session_id = ?1 RETURNING ",
             columns!()
         ))
         .bind(new.session.to_string())
@@ -235,6 +245,7 @@ impl Store {
         .bind(i64::from(new.hop.0))
         .bind(to_unix(now))
         .bind(new.consent.map(|consent| consent.to_string()))
+        .bind(i64::from(new.hands_off))
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -432,6 +443,7 @@ mod tests {
             requester,
             hop: Hop::ZERO,
             consent: None,
+            hands_off: false,
         }
     }
 
@@ -518,6 +530,7 @@ mod tests {
                     requester: &payer,
                     hop: Hop(2),
                     consent: None,
+                    hands_off: true,
                 },
                 at(5),
             )
@@ -527,6 +540,7 @@ mod tests {
         assert_eq!(posted.turn, Some(turn));
         assert_eq!(posted.requester, payer);
         assert_eq!(posted.hop, Hop(2));
+        assert!(posted.hands_off);
         assert_eq!(
             store.posted_message_ref(&reply).await.unwrap(),
             Some(posted.clone())
@@ -554,6 +568,7 @@ mod tests {
                     requester: &payer,
                     hop: Hop::ZERO,
                     consent: None,
+                    hands_off: false,
                 },
                 at(7),
             )
@@ -570,6 +585,7 @@ mod tests {
                     requester: &payer,
                     hop: Hop::ZERO,
                     consent: None,
+                    hands_off: false,
                 },
                 at(8),
             )
@@ -653,6 +669,7 @@ mod tests {
             requester: &payer,
             hop: Hop(3),
             consent: None,
+            hands_off: true,
         };
         store
             .record_message_ref(&inbound(session, &msg("C1", "1.1"), None, &sender), at(1))
@@ -676,6 +693,8 @@ mod tests {
         assert_eq!(attributed.turn, Some(turn));
         assert_eq!(attributed.requester, payer);
         assert_eq!(attributed.hop, Hop(3));
+        assert!(attributed.hands_off, "the post's own row hands off");
+        assert!(!shown.hands_off);
         assert_eq!(
             store.posted_message_ref(&reply).await.unwrap(),
             Some(attributed.clone())
@@ -740,6 +759,7 @@ mod tests {
                             requester: &payer,
                             hop: Hop::ZERO,
                             consent: None,
+                            hands_off: false,
                         },
                         at(20),
                     )

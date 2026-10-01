@@ -852,7 +852,7 @@ async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
         ("reviewer", " look at this "),
         ("@U0REVIEW", "and this"),
         ("<@U0REVIEW|reviewer>", "and that"),
-        ("REVIEWER", "once more"),
+        ("REVIEWER", "Once more"),
     ] {
         let (status, value) = fixture.ask(&token, named, task).await;
         assert_eq!(status, 200, "{named}: {value}");
@@ -868,11 +868,50 @@ async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
     assert_eq!(
         texts,
         [
-            "@U0REVIEW look at this",
-            "@U0REVIEW and this",
-            "@U0REVIEW and that",
-            "@U0REVIEW once more",
+            "@U0REVIEW: look at this",
+            "@U0REVIEW: and this",
+            "@U0REVIEW: and that",
+            "@U0REVIEW: Once more",
         ]
+    );
+}
+
+#[tokio::test]
+async fn ask_agent_finds_a_handle_before_a_name_that_spells_it() {
+    let fixture = Fixture::new().await;
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    fixture
+        .bot_agent("U0OWNER", "reviewer", "U0REVIEW", public)
+        .await;
+    fixture
+        .bot_agent("U0SQUAT", "u0review", "U0SQUATBOT", public)
+        .await;
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    for named in ["@U0REVIEW", "<@U0REVIEW|reviewer>", "U0REVIEW", "reviewer"] {
+        let (status, value) = fixture.ask(&token, named, "Look").await;
+        assert_eq!(status, 200, "{named}: {value}");
+    }
+    let (status, value) = fixture.ask(&token, "@U0SQUATBOT", "Look").await;
+    assert_eq!(status, 200, "{value}");
+    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+    let texts: Vec<&str> = outbox
+        .posts()
+        .iter()
+        .map(|post| post.text.as_str())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "@U0REVIEW: Look",
+            "@U0REVIEW: Look",
+            "@U0REVIEW: Look",
+            "@U0REVIEW: Look",
+            "@U0SQUATBOT: Look",
+        ],
+        "an agent whose name spells another's handle takes nothing from it"
     );
 }
 
@@ -1425,6 +1464,7 @@ async fn short_ids_name_messages_the_session_was_shown() {
                     requester: &sender,
                     hop: Hop::ZERO,
                     consent: None,
+                    hands_off: false,
                 },
                 time::OffsetDateTime::now_utc(),
             )

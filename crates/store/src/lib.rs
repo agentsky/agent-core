@@ -53,6 +53,7 @@ mod consents;
 mod ctl;
 mod events;
 mod failure_notices;
+mod hand_offs;
 mod members;
 mod message_refs;
 mod pending_logins;
@@ -75,6 +76,7 @@ pub use community::CommunityKeyStatus;
 pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
+pub use hand_offs::HandOff;
 pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
 pub use policies::{AgentSettings, Ban, NO_RULES};
@@ -413,6 +415,7 @@ mod tests {
                 "consents",
                 "ctl_tokens",
                 "failure_notices",
+                "hand_offs",
                 "limit_notices",
                 "members",
                 "message_refs",

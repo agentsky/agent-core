@@ -1,9 +1,9 @@
 //! [`SlackSurface`]: the [`Surface`] for one Slack binding.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, MemberKey, Msg, MsgRef, OutFile,
@@ -97,7 +97,15 @@ pub struct SlackSurface {
     members_api: WebApi,
     directory: Arc<TeamDirectory>,
     bot_user: Option<UserId>,
+    member_of: Arc<Mutex<HashMap<ConversationId, Instant>>>,
 }
+
+/// How long [`Surface::can_post`] trusts that the bot is a member of a
+/// conversation, once Slack said so.
+pub const MEMBERSHIP_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The most conversations whose membership one surface remembers.
+const MAX_MEMBERSHIPS: usize = 10_000;
 
 impl SlackSurface {
     /// A surface acting through `api` (the binding's bot token) in the
@@ -109,6 +117,7 @@ impl SlackSurface {
             api,
             directory,
             bot_user: None,
+            member_of: Arc::default(),
         }
     }
 
@@ -228,6 +237,12 @@ impl SlackSurface {
     }
 
     /// The channel id of `conv`, which must be in this workspace.
+    fn lock_member_of(&self) -> MutexGuard<'_, HashMap<ConversationId, Instant>> {
+        self.member_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn channel<'a>(&self, conv: &'a ConvRef) -> Result<&'a ConversationId> {
         if conv.surface != SurfaceKind::Slack || conv.team != *self.directory.team() {
             return Err(SurfaceError::Api(
@@ -407,10 +422,31 @@ impl Surface for SlackSurface {
     }
 
     /// Slack never joins a bot to a conversation it posts in; it refuses
-    /// the post with `not_in_channel` instead. So this only checks that the
-    /// conversation is in this surface's workspace.
+    /// the post with `not_in_channel` instead. So this checks that the
+    /// conversation is in this surface's workspace and, with
+    /// `conversations.info`, that the bot is a member, or that it is a DM.
+    /// Slack's yes is trusted for [`MEMBERSHIP_TTL`]; a no is asked again
+    /// each time, so a bot just added posts at once.
     async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
-        self.channel(conv).map(|_| true)
+        let channel = self.channel(conv)?;
+        let now = Instant::now();
+        if self
+            .lock_member_of()
+            .get(channel)
+            .is_some_and(|until| *until > now)
+        {
+            return Ok(true);
+        }
+        let info = self.api.conversation_info(channel).await?;
+        let member = info.is_member || info.is_im || info.is_mpim;
+        if member {
+            let mut member_of = self.lock_member_of();
+            if member_of.len() >= MAX_MEMBERSHIPS {
+                member_of.clear();
+            }
+            member_of.insert(channel.clone(), now + MEMBERSHIP_TTL);
+        }
+        Ok(member)
     }
 
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {

@@ -479,7 +479,6 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
         .await
         .unwrap();
     surface.unreact(&msg, "eyes").await.unwrap();
-    assert!(surface.can_post(&conv()).await.unwrap());
     let sent = requests(&server).await;
     let update: Value = serde_json::from_slice(&sent[0].body).unwrap();
     assert_eq!(
@@ -494,6 +493,39 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
     let ephemeral: Value = serde_json::from_slice(&sent[2].body).unwrap();
     assert_eq!(ephemeral["user"], USER);
     assert_eq!(ephemeral["thread_ts"], "1.1");
+}
+
+#[tokio::test]
+async fn can_post_only_where_the_bot_is_a_member_and_trusts_a_yes_for_a_while() {
+    let (server, surface) = setup().await;
+    let elsewhere = ConvRef {
+        team: "T0OTHER01".into(),
+        ..conv()
+    };
+    assert!(surface.can_post(&elsewhere).await.is_err());
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": false}})),
+    )
+    .await;
+    assert!(!surface.can_post(&conv()).await.unwrap());
+    assert!(!surface.can_post(&conv()).await.unwrap());
+    server.reset().await;
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": true}})),
+    )
+    .await;
+    assert!(surface.can_post(&conv()).await.unwrap());
+    assert!(surface.can_post(&conv()).await.unwrap());
+    let asked = requests(&server)
+        .await
+        .iter()
+        .filter(|request| request.url.path() == "/api/conversations.info")
+        .count();
+    assert_eq!(asked, 1, "a yes is trusted for a while");
 }
 
 #[tokio::test]

@@ -53,7 +53,7 @@ use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::community::StoreCommunityKey;
 use crate::consents::CONSENT_SWEEP_INTERVAL;
 use crate::net::RefuseSubnet;
-use crate::pipeline::Pipeline;
+use crate::pipeline::{HAND_OFF_SWEEP_INTERVAL, Pipeline};
 use crate::skills::SkillHosts;
 use crate::slack;
 use crate::slack::agents::INSTALL_SWEEP_INTERVAL;
@@ -304,7 +304,8 @@ impl Server {
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
     /// with a pipeline the consents' worker
     /// ([`Consents::run`](crate::consents::Consents::run)), whose private
-    /// tasks the pipeline drains like its turns,
+    /// tasks the pipeline drains like its turns, and the hand-off worker
+    /// ([`Pipeline::run_hand_offs`]),
     /// with the Slack manager app the configuration token rotator and the
     /// sweeper of agents' apps (install reminders, stale creations), and with
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
@@ -385,6 +386,16 @@ impl Server {
                     .run(pipeline, CONSENT_SWEEP_INTERVAL, settling)
                     .await;
                 "consent worker"
+            });
+        }
+        if let Some(pipeline) = &pipeline {
+            let pipeline = pipeline.clone();
+            let replaying = stopping.clone();
+            tasks.spawn(async move {
+                pipeline
+                    .run_hand_offs(HAND_OFF_SWEEP_INTERVAL, replaying)
+                    .await;
+                "hand-off worker"
             });
         }
         let intake = routers.intake;

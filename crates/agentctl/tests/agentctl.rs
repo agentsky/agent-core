@@ -412,7 +412,7 @@ async fn each_subcommand_works_against_the_server() {
         posts,
         [
             ("all done", thread().into()),
-            ("@U0REVIEW look at this", thread().into()),
+            ("@U0REVIEW: look at this", thread().into()),
         ]
     );
     assert_eq!(outbox.reactions().len(), 1);
@@ -1142,7 +1142,7 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
         .iter()
         .map(|post| post.text.as_str())
         .collect();
-    assert_eq!(texts, ["see the plot", "@U0REVIEW review"]);
+    assert_eq!(texts, ["see the plot", "@U0REVIEW: review"]);
     assert_eq!(outbox.reactions()[0].msg.id, MessageId::new("99.9"));
 }
 
