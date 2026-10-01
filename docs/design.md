@@ -1422,8 +1422,10 @@ in on terms the community and each agent's owner set:
 - They have no commands, agentd never DMs them, and they never see or decide a
   consent card. Hand-offs on their behalf are off unless the community turns
   them on, and they can never ask for a private task.
-- A private task's result, or a post from the owner's side, reaches another
-  organization only when the owner could see it would.
+- A private task's result, or a post from the owner's side, isn't posted
+  into a conversation that another organization reads unless the owner
+  could see it would. What a conversation already holds when it is shared
+  later becomes visible to the new organization; that is accepted.
 
 qm-core refuses external members by default. agentd does too, but lets the
 community and owners open the door.
@@ -1481,13 +1483,15 @@ member they name. The person's own organization is a separate field,
 
 - **The workspace an event came through** is its installation's,
   `authorizations[0].team_id`. An event without one, or with a null one, is
-  acknowledged and dropped, with a warning throttled per binding. Slack
-  replaced `authed_teams` with `authorizations` in 2021[^slack-authed], and
-  agentd never falls back to the envelope's
-  `team_id`, which in an externally shared channel may hold the team of
-  whoever acted, per some of Bolt's fixtures[^bolt-actor]. Slash commands
-  and interactions carry no `authorizations`; theirs is the payload's
-  `team_id` or `team.id`, as today. Until T36a, the ingress takes the team
+  acknowledged and dropped, with a warning throttled per binding. This
+  applies to `event_callback` envelopes only; `url_verification` and
+  `app_rate_limited` are handled as T28 handles them. Slack replaced
+  `authed_teams` with `authorizations` in 2021[^slack-authed], and agentd
+  never falls back to the envelope's `team_id`, which in an externally
+  shared channel may hold the team of whoever acted, per some of Bolt's
+  fixtures[^bolt-actor]. Slash commands and interactions carry no
+  `authorizations`; theirs is the payload's `team_id` or `team.id`, as
+  today. Until T36a, the ingress takes the team
   from the envelope (T28) and agentd drops requests from another workspace
   (T30, T31), so it may drop outside members' messages by accident, per
   the SDK's `message` fixtures. T36a makes that a rule.
@@ -1517,7 +1521,11 @@ member they name. The person's own organization is a separate field,
   `user_profile.team`[^bolt-actor]. A lookup that fails, or that Slack
   answers for no home user, leaves the sender outside with no known
   organization, which no list admits. Until the lookup is done, the sender
-  counts as outside. No path defaults to home, with one exception: a slash
+  counts as outside. The check runs only for messages the ingress kept,
+  which outside one-to-one DMs are only mentions of the agent and replies
+  in threads it may have started (T28), so unaddressed traffic in a shared
+  channel costs no lookup; the cached member list answers most of the
+  rest. No path defaults to home, with one exception: a slash
   command carries no sender team at all, so its guard is Slack's own rule
   that only the installing workspace's members can run an app's
   commands[^slack-connect-apps], plus the existing check that the
@@ -1525,11 +1533,17 @@ member they name. The person's own organization is a separate field,
 - **Enterprise Grid.** A member of another workspace in the home
   workspace's own organization is outside unless their workspace or
   organization is listed: their fields may name the home organization, but
-  the independent source names another workspace. Both manifests keep
-  `org_deploy_enabled: false`, so no installation is organization-wide.
-- **Requesters carry it.** A turn's `Requester` has `outside`, and so do
-  the records a turn's requester is read back from: `MESSAGE_REF`, so a hop
-  inherits it, and the `agentctl` token's turn, so `ask-agent` and `private`
+  the independent source names another workspace. That also refuses a
+  home member whose `users.info` names another workspace of the same
+  organization as their own, such as someone moved between workspaces;
+  it fails closed, and T36e checks it on a Grid workspace if one is at
+  hand. Both manifests keep `org_deploy_enabled: false`, so no
+  installation is organization-wide.
+- **Requesters carry it.** A person's turn takes `outside` from their
+  message. A hop's requester is the one its post's `MESSAGE_REF` records,
+  with that row's `outside`; the posting bot's own `outside` decides
+  nothing, and the hand-off events agentd makes itself (T34) carry none.
+  The `agentctl` token's turn records it too, so `ask-agent` and `private`
   know it. A consent never has an outside requester (below).
 - **Names.** Outside members aren't in the home workspace's `users.list`, so
   `@Name` for one stays text when rendered, as an ambiguous name does
@@ -1587,7 +1601,9 @@ never home:
   the requesters' keys match, and an outside member's key names the home
   workspace like a home member's; so the copy takes the event's `outside`
   when the event's says outside and the copy's doesn't, and `copy_stands`
-  compares the whole requester, `outside` included. An owner who forges
+  compares the requester's key and `outside`. It still ignores the member
+  a key belongs to, which may be made between the two routings (T27). An
+  owner who forges
   `outside` onto a home member's message only keeps their own agent from
   answering it.
 
@@ -1677,10 +1693,15 @@ see [Deferred work](tasks-plan.md#deferred-work).
   `deny` may name a shared channel as a `#room`.
 - agentd never DMs an outside member, from the manager bot or an agent's:
   no link prompt, relink notice, usage-limit notice (T26) or personal
-  refusal. The guard sits where every Slack DM is opened, not at each
-  caller: the reply path refuses to open a DM with a user the home check
-  above doesn't place in the home workspace. What they would have been
-  told privately, they are told in the thread as above, or not at all.
+  refusal. The guard sits where every Slack DM agentd sends is opened, not
+  at each caller: opening the manager bot's DM with a user
+  (`conversations.open`) is refused when the home check above says the
+  user isn't in the home workspace. A check that can't be answered at
+  that moment, such as a `users.info` that times out, is a failure to
+  retry, like any other failed send, not a verdict, so a passing Slack
+  error never makes a home member unreachable. What outside members would
+  have been told privately, they are told in the thread as above, or not
+  at all.
 
 ### Consent cards and private tasks
 
@@ -1710,11 +1731,11 @@ see [Deferred work](tasks-plan.md#deferred-work).
   retries give up. A list that is malformed or longer than agentd keeps
   counts as no list. A card that could name no organizations, because
   Slack gave no list, said so, and the owner consented to that. When a
-  result is withheld, the
-  thread is told in one line that it wasn't posted because the
-  conversation's sharing changed, the owner is told in the manager bot's
-  DM, and the task's work is deleted as on every other path. Declined and
-  expired outcomes are posted as before; they say nothing private.
+  result is withheld, the thread is told in one line that it wasn't posted
+  because the conversation's sharing changed, the owner is told in the
+  manager bot's DM, and the task's work is deleted as on every other
+  path. Declined and expired outcomes are posted as before; they say
+  nothing private.
 - The withholding guards only results not yet posted. A conversation shared
   later shows its history to the new organization, results and owner-side
   posts already in it included, as it shows everything members posted
@@ -1881,10 +1902,11 @@ Direct calls would also need our own agent loop.
   the event and in the copy agentd reads back, and what `authorizations` and
   `conversations.info` hold for a bot token, are read from documentation
   excerpts and SDK fixtures, not seen. Most wrong guesses keep outside
-  members out, or refuse home members in shared channels. The one that
-  would let someone in is Slack naming an outside sender with the home
-  workspace's team, which T36e checks first (see
-  [Verified and assumed](#verified-and-assumed-1)).
+  members out, or refuse home members in shared channels. Letting someone
+  in would take two wrong guesses at once: Slack naming an outside sender
+  with the home workspace's team in every field, and the home member list
+  or `users.info` placing them in the home workspace. T36e checks both
+  first (see [Verified and assumed](#verified-and-assumed-1)).
 - An Enterprise Grid home workspace. Members of its own organization's other
   workspaces are outside unless listed, and Slack may name a sender only by
   the organization's `E…` id. Whether that reads right in practice needs a

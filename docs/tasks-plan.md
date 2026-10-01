@@ -3330,10 +3330,17 @@ Deliverables:
     Rocket.Chat, with `#[serde(default)]` so stored requesters and agentctl
     wire types read as before. `MemberKey`'s rustdoc says that on Slack its
     `team` is the workspace agentd serves, for outside members too.
-  - The router's view builds a `Requester` with the event's `outside`.
+  - The router's view builds a person's `Requester` with the event's
+    `outside`. A hop's requester comes from its post's attribution, which
+    carries no `outside` until T36b's column; the event's `outside` on a
+    managed agent's post describes the bot and never makes a hop ignored.
+    T34's hand-off events, which agentd makes itself, carry `outside:
+    None`.
 - `surface-slack` ingress (`ingress.rs`):
   - The workspace an event came through is `authorizations[0].team_id`,
-    shaped like a team id (`normalize::is_team_id`). An event without one,
+    shaped like a team id (`normalize::is_team_id`). For an
+    `event_callback` envelope (not `url_verification` or
+    `app_rate_limited`, which T28 handles as before), an event without one,
     or with a null one, gets its 200 and is dropped, with a warning
     throttled per binding; the envelope's `team_id` is never used instead.
     `SlackEvent::team` and `normalize::Context::team` take it. Nothing reads
@@ -3373,17 +3380,22 @@ Deliverables:
     `team_id` is the workspace, beside the names. `TeamDirectory::home_user`
     answers from them, then from `users.info` (Tier 4) with the manager
     app's token, as T31 reads the member list, caching each answer for an
-    hour. It says home only when the answer's `team_id` is the workspace; a
-    failed lookup is not cached and answers not home.
+    hour. It returns `Ok(true)` only when the answer's `team_id` is the
+    workspace, `Ok(false)` for another `team_id` or `user_not_found`, and
+    the lookup's error otherwise, uncached. Routing takes an error as not
+    home; the DM guard below returns it to be retried.
   - `SlackSurface::fill_sender_team(&mut InboundEvent)` sets `outside` to
     `None` only when the fields left it pending and `home_user` says home.
     agentd's Slack receiver calls it with `fill_bot_sender`, before the
-    first routing, and `confirm` on the copy.
+    first routing, and `confirm` on the copy. The ingress has already
+    dropped what isn't addressed to the agent (T28), so unaddressed traffic
+    costs no lookup.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): when the event's
   `outside` is set and the copy's isn't, the copy takes the event's before
-  it is routed, and `copy_stands`, which lets a copy stand when only a
-  limit's refusal differs, compares the whole `Requester`, `outside`
-  included, not only its `MemberKey`.
+  it is routed. `copy_stands`, which lets a copy stand when only a limit's
+  refusal differs, compares the requester's `MemberKey` and `outside`. It
+  keeps ignoring the requester's `member`, which may be made for the
+  identity between the two routings, as its rustdoc says (T27).
 - agentd (`crates/agentd/src/slack/mod.rs`):
   - The other-workspace checks of T30 and T31 compare the workspace above.
   - `slack::Inbound` passes a manager DM to `CommandIntake` only after
@@ -3394,13 +3406,20 @@ Deliverables:
     its `team_id`. The rest are dropped with a debug line throttled per
     binding as the ingress throttles its warnings. That closes T33's open
     item about interactions with a `team` the manager doesn't serve.
-- The DM guard (`crates/agentd/src/commands/reply.rs`): the Slack arm of
-  `Replies::dm`, `dm_room` and `dm_rich` opens a DM only with a user
-  `home_user` places in the workspace, and otherwise fails with a new
-  `ReplyError::Outside`, which callers treat as a member no manager bot
-  reaches. That covers every DM the pipeline sends a requester: the link
-  prompt, the relink notice, the personal refusal and T26's
-  credential-failure notice.
+- The DM guard (`crates/agentd/src/slack/manager.rs`), in
+  `SlackDms::open_dm`, through which every Slack DM the manager bot sends
+  is opened, whether it comes through `Replies` or a direct
+  `manager_bot().dm()` call such as those in `slack/agents.rs`:
+  - `home_user` saying the user isn't home fails it with
+    `SurfaceError::Forbidden`, which callers already treat as a refused
+    send.
+  - A `home_user` lookup that failed returns its own `Transport` or
+    `RateLimited` error, which callers retry as they retry any failed send,
+    so a passing Slack error doesn't make a home member unreachable.
+
+  That covers every DM sent to a requester or owner: the link prompt, the
+  relink notice, the personal refusal, T26's credential-failure notice,
+  consent cards and the install and token notices.
 - `router`: until T36b, a requester with `outside` set gets
   `Decision::Ignore(IgnoreReason::Outside)`. The router's rustdoc order says
   where it sits: after the gate, before any refusal.
@@ -3428,11 +3447,14 @@ Acceptance:
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
 - `a_failed_home_check_is_outside`.
 - `an_event_saying_outside_keeps_the_copy_outside`.
-- `copy_stands_compares_the_whole_requester`.
+- `copy_stands_compares_key_and_outside`.
+- `copy_stands_still_lets_a_member_be_made_between_routings`.
 - `confirm_drops_an_event_that_claims_home_for_an_outside_copy`.
 - `a_teamless_manager_dm_from_outside_never_reaches_the_intake`.
 - `an_interaction_without_user_team_is_dropped`.
 - `no_dm_is_opened_with_an_outside_user`.
+- `a_failed_home_lookup_makes_a_dm_retry_not_give_up`.
+- `a_hop_takes_outside_from_its_attribution_not_the_bot`.
 - `conv_info_reads_sharing_and_connected_teams`.
 - `a_malformed_or_overflowing_team_list_is_unknown`.
 - `conv_info_fresh_refreshes_the_cache`.
@@ -3634,9 +3656,8 @@ Deliverables:
   the agent already has a rule on the new id, the rules merge: a deny on
   either id stays a deny, and duplicates are dropped. Only an old id
   starting with `G` is expected; any other is logged and handled the same
-  way.
-  Sessions, volumes, `thread_usage`, `limit_notices` and `message_refs`
-  aren't touched.
+  way. Sessions, volumes, `thread_usage`, `limit_notices` and
+  `message_refs` aren't touched.
 
 Acceptance:
 
@@ -3667,9 +3688,22 @@ Connect.
 
 Deliverables:
 
+- The capture method. agentd's ingress keeps none of the fields this task
+  records (T28's envelope parsing skips them, and normalization drops
+  `source_team` and `user_profile`), so the capture doesn't go through it:
+  - Two scratch apps made from T31's agent manifest in the home workspace,
+    not agentd's bindings, with their event and interactivity request URLs
+    pointed at a capture endpoint: a small HTTPS server, behind the same
+    kind of TLS terminator as agentd, that answers `url_verification`,
+    returns 200 to everything else, and writes each raw body to a file.
+  - Web API reads (`conversations.history`, `conversations.replies`,
+    `conversations.info`, `users.info`, `users.list`) made with `curl` on
+    the scratch apps' bot tokens and the manager app's token.
+  - A redaction script that replaces every id with a stable made-up one of
+    the same shape, keeping which ids are equal, and drops names, emails,
+    avatars and message text.
 - A live capture on two paid Slack workspaces joined by a Slack Connect
-  channel, with two agent apps from T31 installed in the home one. Record,
-  redacted:
+  channel. Record, redacted:
   1. First, for a message from an outside member and one from a home
      member, in a channel and in a thread: the envelope's `team_id`,
      `context_team_id`, `is_ext_shared_channel` and `authorizations`, and
@@ -3677,30 +3711,36 @@ Deliverables:
      `user_profile.team`. Above all, whether any of them names an outside
      member with the home workspace's team.
   2. The same message read back with `conversations.history` and
-     `conversations.replies` on an agent's token: the same fields.
-  3. `conversations.info` with an agent's token on the shared channel, and
-     on a Slack Connect DM between an outside member and an agent's bot, if
-     one can be opened.
-  4. The `event_id` each of the two apps got for one message.
+     `conversations.replies` on a scratch app's token: the same fields.
+  3. `conversations.info` with a scratch app's token on the shared channel,
+     and on a Slack Connect DM between an outside member and a scratch
+     app's bot, if one can be opened.
+  4. The `event_id` each of the two scratch apps got for one message.
   5. Whether an outside member can run `/agent`, DM the manager app, or DM
-     an agent's bot, and what agentd logged.
+     a scratch app's bot, and what agentd logged for the first two.
   6. An outside member's `<@U…>` id as both organizations see it.
   7. What `users.info` on the manager's token answers for an outside
      member, and for a home member, and whether the home `users.list`
      lists any outside member.
+  8. Whether `app_uninstalled` and `tokens_revoked`, sent when a scratch
+     app is uninstalled at the end, carry `authorizations`, for the
+     deferred work on uninstalls.
 - On an Enterprise Grid workspace, if one is available, the same for a
-  member of another workspace of the home organization.
-- The redacted payloads as fixture files in `crates/testkit/fixtures/slack/`,
-  under a `connect/` directory, for `testkit::slack` to load in place of
-  T36a's made-up ones; whichever of T36a and T36e lands second switches
-  T36a's tests to them.
+  member of another workspace of the home organization, and for a home
+  member whose `users.info` names another workspace of the organization.
+- The redacted payloads as fixture files under
+  `crates/testkit/fixtures/slack/connect/`, for `testkit::slack` to load in
+  place of T36a's made-up ones. Whichever of T36a and T36e lands second
+  switches T36a's tests to them.
 - Update the design's Slack Connect "Verified and assumed" and open
   questions with the results and the date. If a result contradicts the
   design, propose the change in the same PR and change T36a to T36d in this
   file to match.
 
-Acceptance: the redacted payloads are in the PR description, and the design
-and this plan are updated.
+Acceptance: the redacted fixtures are under
+`crates/testkit/fixtures/slack/connect/`, the PR description lists them and
+what each showed, the scratch apps are deleted, and the design and this
+plan are updated.
 
 ## Deferred work
 
