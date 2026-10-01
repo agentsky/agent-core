@@ -492,7 +492,7 @@ impl Renderer<'_> {
             Kind::Code(code) if ctx.plain => out.push_str(code),
             Kind::Code(code) => {
                 out.push('`');
-                push_backticks_apart(&escape(code), out);
+                out.push_str(&escape(code));
                 out.push('`');
             }
             Kind::Break if ctx.plain || ctx.label || ctx.heading => out.push(' '),
@@ -629,9 +629,8 @@ impl Renderer<'_> {
 
     /// Escapes text outside code and neutralizes broadcasts. The formatting
     /// characters at the byte offsets in `literal` are kept from pairing up
-    /// into Slack formatting, and so is every backtick, even inside a word
-    /// ([`push_backticks_apart`]). With `arm`, it also resolves `@Name`
-    /// mentions and gives bare URLs explicit bounds.
+    /// into Slack formatting. With `arm`, it also resolves `@Name` mentions
+    /// and gives bare URLs explicit bounds.
     fn slack_text(&self, text: &str, literal: &[usize], arm: bool, out: &mut String) {
         let mut i = 0;
         while let Some(c) = text[i..].chars().next() {
@@ -668,11 +667,6 @@ impl Renderer<'_> {
             if arm && let Some(url) = bare_url(text, i) {
                 push_slack_link(url, "", out);
                 i += url.len();
-                continue;
-            }
-            if c == '`' {
-                push_backticks_apart("`", out);
-                i += 1;
                 continue;
             }
             if literal.binary_search(&i).is_ok() {
@@ -885,12 +879,40 @@ fn looks_like_domain(host: &str) -> bool {
         && (named || tld.starts_with("xn--") || ipv4)
 }
 
+/// `mrkdwn` with what Slack shows as code left out, so the `<@U…>`
+/// tokens left are those Slack shows as mentions. A fence (```` ``` ````)
+/// runs to the next fence; otherwise any two backticks pair, whatever lies
+/// between them, as Slack pairs them, and a backtick that pairs with none
+/// is text. It reads the text as sent, wherever [`to_mrkdwn`] or
+/// [`split`](crate::split) left a backtick, so the mentions read from it
+/// are never more than those Slack shows.
+pub fn without_code(mrkdwn: &str) -> String {
+    let mut out = String::with_capacity(mrkdwn.len());
+    let mut rest = mrkdwn;
+    while let Some(open) = rest.find('`') {
+        out.push_str(&rest[..open]);
+        let from = &rest[open..];
+        let fenced = from
+            .strip_prefix(FENCE)
+            .and_then(|inside| inside.find(FENCE))
+            .map(|end| 2 * FENCE.len() + end);
+        let Some(code) = fenced.or_else(|| from[1..].find('`').map(|end| end + 2)) else {
+            out.push_str(from);
+            return out;
+        };
+        out.push(' ');
+        rest = &from[code..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Writes `<url>` or `<url|label>`. `label` must already be escaped.
 fn push_slack_link(url: &str, label: &str, out: &mut String) {
     out.push('<');
     for (i, c) in url.char_indices() {
         match c {
-            '|' | ' ' => out.push_str(&percent(c)),
+            '|' | ' ' | '`' => out.push_str(&percent(c)),
             '@' | '#' | '!' if i == 0 => out.push_str(&percent(c)),
             _ => push_escaped(c, out),
         }
@@ -948,23 +970,6 @@ fn push_literal(text: &str, at: usize, c: char, out: &mut String) {
         out.push(ZERO_WIDTH_SPACE);
         out.push(c);
         out.push(ZERO_WIDTH_SPACE);
-    }
-}
-
-/// Pushes `text` with each backtick between zero-width spaces, so Slack
-/// pairs it with no other: Markdown leaves backticks of unequal runs as
-/// text and keeps those inside inline code as its content, but Slack pairs
-/// any two, and would show whatever lies between, a mention included, as
-/// code.
-fn push_backticks_apart(text: &str, out: &mut String) {
-    for c in text.chars() {
-        if c == '`' {
-            out.push(ZERO_WIDTH_SPACE);
-            out.push(c);
-            out.push(ZERO_WIDTH_SPACE);
-        } else {
-            out.push(c);
-        }
     }
 }
 

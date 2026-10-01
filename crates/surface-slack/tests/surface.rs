@@ -454,6 +454,17 @@ async fn post_sends_one_chunk_in_the_thread() {
         .await
         .unwrap();
     assert_eq!(mentioning.mentions, [UserId::from("U0HELPER")]);
+    let in_code = surface
+        .post(
+            &thread("1727697600.000100"),
+            "`a <@U0HELPER>` and `x`y` <@U0OTHER> `z`, as a cut can leave it",
+        )
+        .await
+        .unwrap();
+    assert!(
+        in_code.mentions.is_empty(),
+        "Slack shows these as code, so they hand off to no one"
+    );
 }
 
 #[tokio::test]

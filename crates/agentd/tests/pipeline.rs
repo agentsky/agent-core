@@ -3025,6 +3025,72 @@ async fn a_hand_off_a_shutdown_cut_is_delivered_by_the_next_instance() {
 }
 
 #[tokio::test]
+async fn the_hand_off_worker_makes_what_was_let_go_due_once_more_as_it_stops() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let busy = Gate::closed();
+    stack.hand_off_behind_a_busy_writer(writer, &busy).await;
+    stack.pipeline.cut_short().await;
+    let now = pinned_now();
+    let leased = stack
+        .store()
+        .take_due_hand_offs(
+            now,
+            agentd::pipeline::HAND_OFF_LEASE,
+            now - Duration::from_secs(60),
+            64,
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        leased.taken.len(),
+        1,
+        "a pass that read the hold before the cut leases it again after the cut released it"
+    );
+    let (_stop, stopping) = watch::channel(true);
+    stack.pipeline.clone().run_hand_offs(stopping).await;
+    let next = stack.another_pipeline();
+    assert_eq!(
+        next.replay_hand_offs().await.unwrap(),
+        1,
+        "the worker's last release made it due at once"
+    );
+    stack.wait_for_posts(2).await;
+    next.close();
+    next.drain().await;
+    assert_eq!(stack.writers_hops(writer).await, [1]);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
+    let mut stack = start_with(Setup {
+        drain_timeout_secs: 30,
+        pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+    })
+    .await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let busy = Gate::closed();
+    stack.hand_off_behind_a_busy_writer(writer, &busy).await;
+    let (still, _still_open) = oneshot::channel();
+    std::mem::replace(&mut stack.stop, still).send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stack.hand_offs_due_now().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stack.kept_due_at().await != [pinned_now() + agentd::pipeline::HAND_OFF_LEASE] {
+        assert!(
+            Instant::now() < deadline,
+            "the worker stopped leasing the held hand-off while the server drained"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    busy.open();
+    stack.wait_for_posts(3).await;
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_hand_off_is_taken_again_only_when_no_job_holds_it_and_its_hop_never_ran() {
     let stack = start().await;
     let writer = stack.other_agent("writer", "UWRITER").await;
@@ -3278,6 +3344,22 @@ async fn a_hand_off_past_a_full_queue_keeps_its_row_and_is_taken_again() {
 }
 
 impl Stack {
+    /// When each `hand_offs` row kept is due, read without taking them.
+    async fn kept_due_at(&self) -> Vec<OffsetDateTime> {
+        let db = self.dir.path().join("agentd.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
+            .await
+            .unwrap();
+        let rows: Vec<(i64,)> = sqlx::query_as("SELECT due_at FROM hand_offs ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        rows.into_iter()
+            .map(|(due,)| OffsetDateTime::from_unix_timestamp(due).unwrap())
+            .collect()
+    }
+
     /// The agents of the `hand_offs` rows kept, read without taking them.
     async fn kept_hand_offs(&self) -> Vec<AgentId> {
         let db = self.dir.path().join("agentd.db");
@@ -3439,9 +3521,12 @@ async fn a_failed_membership_check_answers_a_read_back_message_and_retries_a_han
     let writer = stack.other_agent("writer", "UWRITER").await;
     let reply = "@UWRITER over to you.";
     stack.next_turn(Turn::reply(reply));
-    let unreachable = || SurfaceError::Transport("unreachable".into());
-    stack.holds.fail_can_post(stack.agent, unreachable());
-    stack.holds.fail_can_post(writer, unreachable());
+    stack
+        .holds
+        .fail_can_post(stack.agent, SurfaceError::Api("internal_error".into()));
+    stack
+        .holds
+        .fail_can_post(writer, SurfaceError::Transport("unreachable".into()));
     stack
         .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
         .await;

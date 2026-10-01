@@ -173,6 +173,7 @@ impl PipelineSettings {
             limits: Limits::from_config(&app.config().limits),
             now: OffsetDateTime::now_utc,
             attribution_wait: ATTRIBUTION_WAIT,
+            hand_off_sweep: HAND_OFF_SWEEP_INTERVAL,
         }
     }
 }

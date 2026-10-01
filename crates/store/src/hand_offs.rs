@@ -96,9 +96,10 @@ impl Store {
     /// makes each due again `lease` later, so a taker that never finishes
     /// one leaves it to the next. The rows `held`, whose jobs the caller
     /// still has, are made due `lease` later first, so no one takes them
-    /// while the caller lives. Rows recorded before `stale_before` that
-    /// aren't held are deleted instead: a hand-off that old is no longer
-    /// wanted. A `limit` of 0 only leases the held rows again.
+    /// while the caller lives. Rows recorded before `stale_before` that are
+    /// due are deleted instead: a hand-off that old is no longer wanted.
+    /// A held row isn't due, whichever instance holds it, as its holder
+    /// keeps leasing it. A `limit` of 0 only leases the held rows again.
     ///
     /// # Errors
     ///
@@ -120,15 +121,12 @@ impl Store {
             .bind(sqlx::types::Json(held))
             .execute(&mut *tx)
             .await?;
-        let stale = sqlx::query(
-            "DELETE FROM hand_offs WHERE created_at < ? \
-             AND id NOT IN (SELECT value FROM json_each(?))",
-        )
-        .bind(to_unix(stale_before))
-        .bind(sqlx::types::Json(held))
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        let stale = sqlx::query("DELETE FROM hand_offs WHERE created_at < ? AND due_at <= ?")
+            .bind(to_unix(stale_before))
+            .bind(to_unix(now))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
             "UPDATE hand_offs SET due_at = ?1 WHERE id IN \
              (SELECT id FROM hand_offs WHERE due_at <= ?2 ORDER BY due_at, id LIMIT ?3) \
@@ -317,6 +315,24 @@ mod tests {
                 stale: 1,
             },
             "a row its job still holds isn't dropped as stale, and a limit of 0 takes none"
+        );
+        let elsewhere = store
+            .take_due_hand_offs(
+                old + lease / 2,
+                lease,
+                now + Duration::from_secs(1),
+                10,
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            elsewhere,
+            DueHandOffs {
+                taken: Vec::new(),
+                stale: 0,
+            },
+            "nor by another instance, while its holder keeps it leased"
         );
         store.release_hand_offs(&[held], later).await.unwrap();
         let released = store

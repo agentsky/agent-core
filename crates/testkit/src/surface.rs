@@ -235,10 +235,11 @@ impl MockSurface {
     }
 
     /// Makes a post's `@name` mention the user `user`. A post's mentions
-    /// are read as Slack's renderer reads them ([`render::slack`]), with
-    /// the names given here as the member directory: so a name followed by
-    /// a capitalized word, a broadcast or a name in code mentions no one,
-    /// and a name never given here mentions no one either.
+    /// are read as Slack's renderer writes them and the Slack surface reads
+    /// them back ([`render::slack::without_code`]), with the names given
+    /// here as the member directory: so a name followed by a capitalized
+    /// word, a broadcast or a name Slack shows in code mentions no one, and
+    /// a name never given here mentions no one either.
     pub fn name_user(&self, name: &str, user: UserId) {
         self.state().usernames.insert(name.to_lowercase(), user);
     }
@@ -246,7 +247,8 @@ impl MockSurface {
     /// The users a post of `text` mentions: see
     /// [`name_user`](Self::name_user). Each once, at most [`MAX_MENTIONS`].
     fn mentions_in(state: &State, text: &str) -> Vec<UserId> {
-        let rendered = render::slack::to_mrkdwn(text, &Names(&state.usernames));
+        let rendered =
+            render::slack::without_code(&render::slack::to_mrkdwn(text, &Names(&state.usernames)));
         let mut found: Vec<UserId> = Vec::new();
         let mut rest = rendered.as_str();
         while let Some(at) = rest.find("<@") {
@@ -659,7 +661,12 @@ mod tests {
             posted.mentions,
             [UserId::from("UBOT"), UserId::from("UWRITER")]
         );
-        for unread in ["no one", "@writer Please look", "`@writer` @here"] {
+        for unread in [
+            "no one",
+            "@writer Please look",
+            "`@writer` @here",
+            "``x`y`` @writer `z`",
+        ] {
             let posted = mock.post(&to, unread).await.unwrap();
             assert!(posted.mentions.is_empty(), "{unread}");
         }

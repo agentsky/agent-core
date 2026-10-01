@@ -53,7 +53,7 @@ use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::community::StoreCommunityKey;
 use crate::consents::CONSENT_SWEEP_INTERVAL;
 use crate::net::RefuseSubnet;
-use crate::pipeline::{HAND_OFF_SWEEP_INTERVAL, Pipeline};
+use crate::pipeline::Pipeline;
 use crate::skills::SkillHosts;
 use crate::slack;
 use crate::slack::agents::INSTALL_SWEEP_INTERVAL;
@@ -393,9 +393,7 @@ impl Server {
             let pipeline = pipeline.clone();
             let replaying = internal_stopping.clone();
             tasks.spawn(async move {
-                pipeline
-                    .run_hand_offs(HAND_OFF_SWEEP_INTERVAL, replaying)
-                    .await;
+                pipeline.run_hand_offs(replaying).await;
                 "hand-off worker"
             });
         }

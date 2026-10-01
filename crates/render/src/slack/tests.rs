@@ -274,21 +274,16 @@ fn code_is_untouched_except_for_escaping() {
                 "```\nUse ``\u{200B}`bash\nls\n``\u{200B}` to fence\n```",
             ),
             (
-                "qm-core, differs: an unclosed backtick run after a tilde fence is kept from \
-                 pairing with a later one",
+                "qm-core: an unclosed backtick run after a tilde fence",
                 "~~~\na\n~~~\nthen ``` dangling",
-                "```\na\n```\nthen \u{200b}`\u{200b}\u{200b}`\u{200b}\u{200b}`\u{200b} dangling",
+                "```\na\n```\nthen ``` dangling",
             ),
             (
                 "an unclosed fence runs to the end, as CommonMark says",
                 "```\n**a**\n\nb",
                 "```\n**a**\n\nb\n```",
             ),
-            (
-                "a code span holding a backtick keeps it from closing the span",
-                "`` a`b ``",
-                "`a\u{200b}`\u{200b}b`",
-            ),
+            ("a code span holding a backtick", "`` a`b ``", "`a`b`"),
         ],
     );
 }
@@ -377,6 +372,11 @@ fn links_and_images() {
                 "a space in a URL is encoded",
                 "[x](<https://x.io/a b>)",
                 "<https://x.io/a%20b|x>",
+            ),
+            (
+                "a backtick in a URL is encoded, so it pairs with no other",
+                "[x](https://x.io/a`b) and https://x.io/c`d",
+                "<https://x.io/a%60b|x> and <https://x.io/c%60d>",
             ),
             (
                 "a URL can't become a broadcast",
@@ -1397,45 +1397,65 @@ fn many_unclosed_wire_broadcasts_stay_linear() {
 }
 
 #[test]
-fn a_literal_backtick_never_pairs_into_code_around_a_mention() {
-    check(
-        &TEAM,
-        &[
-            (
-                "a run of one and a run of two",
-                "`a @ankit``",
-                "\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b}\u{200b}`\u{200b}",
-            ),
-            (
-                "a run of two and a run of one",
-                "``a @ankit` b",
-                "\u{200b}`\u{200b}\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b} b",
-            ),
-            (
-                "a backtick inside inline code",
-                "``x`y`` @ankit `z`",
-                "`x\u{200b}`\u{200b}y` <@U111> `z`",
-            ),
-            (
-                "inline code that starts with a backtick",
-                "`` `a `` @ankit `b`",
-                "`\u{200b}`\u{200b}a` <@U111> `b`",
-            ),
-            (
-                "inline code with a backtick in a link label",
-                "[``a`b``](https://e.x) @ankit `c`",
-                "<https://e.x|`a\u{200b}`\u{200b}b`> <@U111> `c`",
-            ),
-            (
-                "backticks inside words make a code span, whose mention stays unarmed",
-                "a`b @ankit c`d",
-                "a`b @ankit c`d",
-            ),
-            (
-                "a backtick inside a word, alone",
-                "a`b @ankit",
-                "a\u{200b}`\u{200b}b <@U111>",
-            ),
-        ],
+fn without_code_leaves_out_what_slack_pairs_into_code() {
+    let cases = [
+        ("`a` <@U111>", true),
+        ("<@U111> `a`", true),
+        ("a ` <@U111>", true),
+        ("```\n<@U222>\n``` <@U111>", true),
+        ("`a <@U111>`", false),
+        ("`x`y` <@U111> `z`", false),
+        ("a`b <@U111> c`d", false),
+        ("\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b}", false),
+        ("```\n<@U111>\n```", false),
+        ("``` dangling <@U111> `z`", false),
+    ];
+    for (mrkdwn, shown) in cases {
+        assert_eq!(
+            without_code(mrkdwn).contains("<@U111>"),
+            shown,
+            "{mrkdwn:?} -> {:?}",
+            without_code(mrkdwn)
+        );
+    }
+    assert!(!without_code("```\n<@U222>\n```").contains("U222"));
+}
+
+#[test]
+fn a_mention_slack_shows_as_code_is_left_out_whatever_rendering_and_splitting_did() {
+    let long_code = format!("`{}`", "a ".repeat(1600));
+    let probes = [
+        "``x`y`` @ankit `z`".to_owned(),
+        "`` `a `` @ankit `b`".to_owned(),
+        "[``a`b``](https://e.x) @ankit `c`".to_owned(),
+        "`a @ankit``".to_owned(),
+        format!("{long_code} @ankit `z`"),
+        format!(
+            "{} ``x`y {}`` @ankit `z`",
+            "w ".repeat(1300),
+            "a ".repeat(400)
+        ),
+    ];
+    for markdown in probes {
+        let chunks = crate::split(&to_mrkdwn(&markdown, &TEAM), MESSAGE_LIMIT);
+        assert!(
+            chunks.iter().any(|chunk| chunk.contains("<@U111>")),
+            "the mention is armed somewhere: {chunks:?}"
+        );
+        let shown: Vec<String> = chunks.iter().map(|chunk| without_code(chunk)).collect();
+        assert!(
+            shown.iter().all(|chunk| !chunk.contains("<@U111>")),
+            "Slack shows the mention as code, so it isn't read as one: {chunks:?}"
+        );
+    }
+    let chunks = crate::split(
+        &to_mrkdwn(&format!("{long_code} @ankit"), &TEAM),
+        MESSAGE_LIMIT,
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| without_code(chunk).contains("<@U111>")),
+        "a backtick a cut left alone pairs with none, so the mention after it shows: {chunks:?}"
     );
 }

@@ -123,6 +123,10 @@ pub struct PipelineSettings {
     /// for: agentd records it just after posting, and the platform may
     /// deliver the message sooner. [`ATTRIBUTION_WAIT`] by default.
     pub attribution_wait: Duration,
+    /// How often the hand-off worker looks at the hand-offs due
+    /// ([`Pipeline::run_hand_offs`]). [`HAND_OFF_SWEEP_INTERVAL`] by
+    /// default.
+    pub hand_off_sweep: Duration,
 }
 
 /// The default [`PipelineSettings::attribution_wait`].
@@ -265,7 +269,9 @@ struct Inner {
 /// rather than queueing again, draining included. It also holds whether
 /// the pipeline is closed: a row let go after that is set aside, and the
 /// end of [`Pipeline::drain`] or [`Pipeline::cut_short`] makes it due at
-/// once for the next instance.
+/// once for the next instance, and so does the hand-off worker as it stops
+/// ([`Pipeline::run_hand_offs`]), since its last pass may let go of a row,
+/// or lease one again, after those.
 #[derive(Clone, Default)]
 struct Holder {
     ids: Arc<Mutex<HeldIds>>,
@@ -294,9 +300,10 @@ impl Holder {
         lock(&self.ids).live.iter().copied().collect()
     }
 
-    /// The rows let go since the pipeline closed, taken.
-    fn take_cut(&self) -> Vec<i64> {
-        std::mem::take(&mut lock(&self.ids).cut)
+    /// The rows let go since the pipeline closed. They stay set aside, so a
+    /// release that fails, or is cancelled, is made again by the next.
+    fn cut(&self) -> Vec<i64> {
+        lock(&self.ids).cut.clone()
     }
 }
 
@@ -531,7 +538,7 @@ impl Pipeline {
     /// Makes the `hand_offs` rows let go since the pipeline closed due at
     /// once, for the next instance to take rather than wait out a lease.
     async fn release_cut_hand_offs(&self) {
-        let cut = self.inner.holder.take_cut();
+        let cut = self.inner.holder.cut();
         if cut.is_empty() {
             return;
         }
@@ -1400,9 +1407,10 @@ impl Pipeline {
     /// Runs `agent`'s turn on `event` and delivers what it made, unless the
     /// agent's bot can't post in the conversation, which is asked unless
     /// `checked` says it was just now, as for a hand-off. A check the
-    /// platform couldn't answer, unreachable or asking to slow down,
-    /// answers anyway, as the message was read back with the bot's own
-    /// access ([`confirmed`](Self::confirmed)); any other failure doesn't.
+    /// platform couldn't answer, unreachable, asking to slow down or
+    /// failing on its side, answers anyway, as the message was read back
+    /// with the bot's own access ([`confirmed`](Self::confirmed)); a
+    /// refusal (not found, forbidden, unauthorized) doesn't.
     /// Once the turn may run, a failure before it reached the model posts
     /// [`FAILED_TEXT`].
     async fn run(
@@ -1424,7 +1432,11 @@ impl Pipeline {
                     tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
                     return Ok(());
                 }
-                Err(err @ (SurfaceError::RateLimited { .. } | SurfaceError::Transport(_))) => {
+                Err(
+                    err @ (SurfaceError::RateLimited { .. }
+                    | SurfaceError::Transport(_)
+                    | SurfaceError::Api(_)),
+                ) => {
                     tracing::warn!(%agent, conv = %event.conv, error = %err, "couldn't check the agent's bot can post; answering anyway");
                 }
                 Err(err) => return Err(err.into()),
@@ -1653,9 +1665,12 @@ impl Pipeline {
     }
 
     /// Calls [`replay_hand_offs`](Self::replay_hand_offs) now and then
-    /// every `every`, until `stopping` becomes true or its sender is
-    /// dropped.
-    pub async fn run_hand_offs(self, every: Duration, mut stopping: watch::Receiver<bool>) {
+    /// every [`PipelineSettings::hand_off_sweep`], until `stopping` becomes
+    /// true or its sender is dropped. Then, if the pipeline is closed, it makes the rows let go
+    /// since then due at once, once more: its last pass may have let go of
+    /// a row, or leased one again, after the drain or the cut released
+    /// them.
+    pub async fn run_hand_offs(self, mut stopping: watch::Receiver<bool>) {
         loop {
             if let Err(err) = self.replay_hand_offs().await {
                 tracing::warn!(error = %err, "looking at the hand-offs due failed");
@@ -1663,9 +1678,10 @@ impl Pipeline {
             tokio::select! {
                 biased;
                 _ = stopping.wait_for(|stop| *stop) => break,
-                () = tokio::time::sleep(every) => {}
+                () = tokio::time::sleep(self.inner.settings.hand_off_sweep) => {}
             }
         }
+        self.release_cut_hand_offs().await;
     }
 
     /// What a turn of `agent` in `conv` needs before its session: its
@@ -2163,7 +2179,7 @@ const POLICY_UNAVAILABLE_NOTICE: &str = "policy_unavailable";
 /// again on each look.
 pub const HAND_OFF_LEASE: Duration = Duration::from_secs(5 * 60);
 
-/// How often due hand-offs are looked for.
+/// The default [`PipelineSettings::hand_off_sweep`].
 pub const HAND_OFF_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How old a hand-off may grow before it is dropped undelivered.
@@ -2566,12 +2582,16 @@ mod tests {
         );
         drop(held);
         let held = holder.hold(7).unwrap();
-        assert!(holder.take_cut().is_empty());
+        assert!(holder.cut().is_empty());
         holder.closed.store(true, Ordering::SeqCst);
         drop(held);
         assert!(holder.held().is_empty());
-        assert_eq!(holder.take_cut(), [7]);
-        assert!(holder.take_cut().is_empty());
+        assert_eq!(holder.cut(), [7]);
+        assert_eq!(
+            holder.cut(),
+            [7],
+            "it stays set aside for the next release, in case this one fails"
+        );
     }
 
     /// An agent of a new owner whose bot, `bot`, is active on Slack's team

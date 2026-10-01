@@ -7695,26 +7695,34 @@ reads them, so that its own copy routes like the platform's. A review
 found one place they differed: Markdown leaves backticks of unequal runs
 as text (`` `a @writer`` ``), but Slack pairs any two backticks, so Slack
 showed the mention as code while agentd counted it, and a hand-off ran
-that the thread couldn't see.
+that the thread couldn't see. Two rounds of renderer fixes (zero-width
+spaces around literal backticks, then around backticks inside inline code)
+were each bypassed by another input: the splitter cutting a long code
+span, and a cut placed by a backtick run the splitter paired differently
+from Slack.
 
 **Solution.** `Surface::post` returns `Posted { msg, mentions }`.
 Rocket.Chat's `chat.postMessage` response carries the server's `mentions[]`,
 read with the same helper the inbound path uses (no broadcasts, each once,
 at most `MAX_MENTIONS`). Slack's response has no parsed mentions, so the
-surface reads the `<@U…>` tokens of the text it sent, as `normalize`
+surface reads the `<@U…>` tokens of each chunk it sent, as `normalize`
 reads an event's text; the renderer turns an `@<bot user id>` into one for
-managed bots. The Slack renderer now keeps every backtick outside code
-from pairing, as it does escaped formatting characters (zero-width spaces
-unless it sits inside a word), so a mention it arms is shown as one. A
-backtick inside inline code, which Markdown allows in a span opened by a
-longer run (``` ``x`y`` ```), is wrapped in zero-width spaces too, so it
-can't close Slack's span early and leave the rest of the line paired
-differently from what agentd read.
-`MockSurface` renders a post with Slack's renderer
-(`render::slack::to_mrkdwn`, with the `name_user` names as its directory)
-and reads the tokens it produces, so a test sees the mentions Slack would:
-none in code, none for `@here`, and none for a handle a word character
-follows.
+managed bots. The surface reads them only outside what Slack shows as code
+(`render::slack::without_code`): a fence runs to the next fence, any two
+other backticks pair whatever lies between them, and a backtick left
+alone is text. That is the check every post passes, in the layer that
+decides what hands off, so whatever the renderer or the splitter leaves
+around a mention, agentd counts it only where Slack shows it. A mention
+Slack would show after all (if it doesn't pair backticks inside words,
+say) hands off to no one, which is the safe way to be wrong. The renderer
+changes went back out: the scan makes them unneeded, and they made code
+holding a backtick paste with invisible characters. A backtick in a link's
+URL is percent-encoded (`%60`), so a URL never holds one; such a URL
+copies as `%60`, the same address. `MockSurface` renders a post with
+Slack's renderer (`render::slack::to_mrkdwn`, with the `name_user` names
+as its directory) and reads its tokens the same way, so a test sees the
+mentions Slack would: none in code, none for `@here`, and none for a
+handle a word character follows.
 
 ### One hop for each posting turn and agent
 
@@ -7765,11 +7773,12 @@ minutes, at most `MAX_MEMBERSHIPS` conversations) for the messages it
 read back; `can_post_now` always asks, and a no drops a kept yes, so a bot
 removed from a channel takes no hop there. A `channel_not_found`, an auth
 error (`invalid_auth`, `missing_scope`, ...) or a forbidden answer is a
-no too, and drops the kept yes; a rate limit or a transport failure stays
-an error. Where a message was read back with the bot's own access, a
-`can_post` that fails because the platform is unreachable or asks to slow
-down is taken as a yes, so a rate-limited membership check doesn't drop a
-person's message without a word; any other failure answers nothing. A
+no too, logged as a warning with Slack's error since a revoked token or a
+missing scope looks like it, and drops the kept yes; a rate limit, a
+transport failure or an error on Slack's side stays an error. Where a
+message was read back with the bot's own access, a `can_post` that fails
+that way is taken as a yes, so a rate-limited membership check doesn't
+drop a person's message without a word; a refusal answers nothing. A
 message the platform doesn't confirm from another bot gets no notice.
 
 ### Hand-offs are kept until settled
@@ -7801,7 +7810,8 @@ post; and the lane deletes the row only then. The "hand-off worker" calls
 `Pipeline::replay_hand_offs` every `HAND_OFF_SWEEP_INTERVAL` (30 s): it
 leases this instance's held rows again, so neither it nor another
 instance takes them, then leases up to 64 due rows, drops rows recorded
-over an hour ago that no job of the caller holds (logging how many), and
+over an hour ago that are due (logging how many; a held row is never due,
+whichever instance holds it), and
 queues each again, unless its hop's claim is taken, when the row is done
 with. A row that doesn't parse, whose agent is gone or has no active
 binding there, or whose posting turn can't be read is left for later or
@@ -7811,7 +7821,12 @@ after the drain or cut, only leases the held rows again, so a drain
 longer than the lease keeps them. A hold let go while the pipeline is
 closed, by a job that never settled its row or a delivery cut short, is
 set aside, and the end of `drain` or `cut_short` makes those rows due at
-once, so the next instance takes them on its first look. A hand-off past
+once, so the next instance takes them on its first look; the worker does
+it once more as it stops, since its last pass can let go of a row, or
+lease one again, after them, and a release that failed or was cancelled
+is made again then, as the rows stay set aside. The sweep interval is
+`PipelineSettings::hand_off_sweep` (30 s), so a test drives the server's
+worker through a drain. A hand-off past
 a full queue keeps its row and is taken again after the lease rather than
 answered with a busy line, which no one would read. The record and the
 replay read `PipelineSettings::now`.
@@ -7917,5 +7932,6 @@ answer.
 - Rocket.Chat's `mentions` in the `chat.postMessage` response is read as
   the realtime stream gives it; the response shape is not verified on a
   live server.
-- Slack not resolving a mention inside code, which the backtick fix
-  relies on, is not verified on a live workspace.
+- Slack not resolving a mention inside code, and pairing any two
+  backticks (the model `without_code` reads by), are not verified on a
+  live workspace.

@@ -2926,7 +2926,7 @@ post, instead of following T32's outcome. Each of a turn's posts in the
 thread the turn answered, outside a one-to-one DM and a private task, hands
 off to the other managed agents the platform reads it as mentioning
 (Rocket.Chat's `mentions[]` in the post's response, the `<@U…>` tokens in
-what was sent to Slack), each agent once for the turn: the hand-off is
+what was sent to Slack outside what Slack shows as code), each agent once for the turn: the hand-off is
 recorded in `hand_offs` as the post is, and once the delivery is done it is
 queued for that agent as the posting bot's message and goes through routing
 like any other, without a read-back. Only those posts carry attribution

@@ -10,7 +10,7 @@ use core_types::{
     Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
 };
 use render::MentionDirectory;
-use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
+use render::slack::{MESSAGE_LIMIT, to_mrkdwn, without_code};
 use time::OffsetDateTime;
 
 use crate::directory::{MemberDirectory, TeamDirectory};
@@ -247,14 +247,21 @@ impl SlackSurface {
     /// asked about, not archived, and the bot a member, or a DM. Slack not
     /// finding the conversation for the bot, refusing the bot, or no longer
     /// accepting its token is a no too; only a failure that may pass, as a
-    /// rate limit or a network error, is an error. A yes is kept for
-    /// [`MEMBERSHIP_TTL`], and a no drops it.
+    /// rate limit or a network error, is an error. Such a no is logged as
+    /// a warning with Slack's error, since a revoked token or a missing
+    /// scope looks like it. A yes is kept for [`MEMBERSHIP_TTL`], and a no
+    /// drops it.
     async fn member(&self, channel: &ConversationId) -> Result<bool> {
         let info = match self.api.conversation_info(channel).await {
             Ok(info) => Some(info),
             Err(
-                SurfaceError::NotFound(_) | SurfaceError::Forbidden(_) | SurfaceError::Unauthorized,
-            ) => None,
+                err @ (SurfaceError::NotFound(_)
+                | SurfaceError::Forbidden(_)
+                | SurfaceError::Unauthorized),
+            ) => {
+                tracing::warn!(%channel, error = %err, "Slack refused to say whether the bot is in a conversation; taking it as no");
+                None
+            }
             Err(err) => return Err(err),
         };
         let member = info.is_some_and(|info| {
@@ -422,6 +429,10 @@ impl Surface for SlackSurface {
         Err(SurfaceError::Unsupported("events"))
     }
 
+    /// Posts the mrkdwn `text`. Its mentions are the `<@U…>` tokens Slack
+    /// shows as mentions, so none it shows as code ([`without_code`]),
+    /// whatever the renderer or the splitter left around them: they hand a
+    /// post off, and a hand-off the thread can't see would run unnoticed.
     async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
         let channel = self.channel(&to.conv)?;
         let ts = self
@@ -433,7 +444,7 @@ impl Surface for SlackSurface {
                 conv: to.conv.clone(),
                 id: ts,
             },
-            mentions: normalize::mentions(text, None),
+            mentions: normalize::mentions(&without_code(text), None),
         })
     }
 
