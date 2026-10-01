@@ -3141,9 +3141,9 @@ owed. The shared types are `core_types::RoutineId`, `RoutineToken`,
 `CloudRoutineId` and `CloudHandoffId`, and the store's `CloudOrigin`,
 `CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a `u32`, and
 `Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
-`unknown_reason` column. T35b's `fire` takes a `RoutineId` and a
-`&RoutineToken` and can compare the opened routine's `url_origin` with
-`base_url`'s; T35c maps `FireOutcome` onto `CloudOutcome`. `RoutineUrl::origin()` is a `url::Origin`. A notice's mark
+`unknown_reason` column. T35b's `fire` takes the opened routine, token
+and `url_origin` included, and its `FireOutcome` is `CloudOutcome` (see
+Decided in T35b). `RoutineUrl::origin()` is a `url::Origin`. A notice's mark
 needs a claim that was made, not the latest one; its deferral needs the
 latest. `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the
 task, and the store hands a task back only as a `SecretString`. agentd's
@@ -3223,15 +3223,21 @@ Acceptance, against `wiremock`:
 - `token_and_task_never_reach_the_log` (a captured log at `trace`).
 
 Decided in T35b ([impl-notes](impl-notes.md#t35b-cloud-hand-off-fire-client)):
-`fire` takes T35a's `RoutineId` and returns
-`Result<FireOutcome, FireError>`, refusing before it sends anything a
-token that isn't visible ASCII and a task that is empty or over
-`cloud::MAX_TASK_BYTES` (65,536 bytes); T35c checks first, so an error
-there only means nothing was started. Each fire is one request on a
-connection of its own, with reqwest's own retries off.
-`CloudConfig::base_url()` is the parsed origin T35c compares a routine
-URL's with, and `FireOutcome::kind()` names the state to record. The
-configuration's scope check lists its scopes in `auth::ALLOWED_SCOPES`.
+`fire(&CloudRoutineToken, task)` takes the row `Store::cloud_routine`
+gives and returns the outcome alone: `FireOutcome` is
+`store::CloudOutcome`, recorded as it is, and never
+`CloudUnknownReason::NoAnswer`. A routine whose `url_origin` isn't
+`FireClient::origin()` and a task `cloud::check_task` refuses (empty or
+over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
+`Rejected` with no status. Building the client fails with
+`FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
+not at most equal, so a connection that never opened is always
+`rejected`. `Retry-After` is capped at a day. Each fire is one request on
+a connection of its own, with reqwest's own retries off, and no proxy is
+used for a loopback `base_url`, nor by the other clients for a loopback
+base. `auth` refuses a token response granting a scope outside
+`auth::ALLOWED_SCOPES`: a login stores nothing, and a refresh breaks the
+link.
 
 ### T35c
 
@@ -3324,6 +3330,25 @@ Acceptance, as pipeline and command tests named after the rules:
 - `cloud_notifier_uses_the_defaults_without_cloud_config`.
 - `a_routine_url_on_another_origin_is_refused`.
 - `the_link_is_never_posted_outside_the_private_reply`.
+
+Notes from T35b and its review:
+
+- `run` calls `cloud::check_task` and compares the routine's `url_origin`
+  with `FireClient::origin()` before `begin_cloud_handoff`, saying which
+  failed (for the origin, that `[cloud] base_url` changed and the routine
+  has to be added again); `fire` refuses both too, unsent, as a backstop.
+  Record whatever `fire` returns. `add` compares the pasted URL's
+  `origin().ascii_serialization()` with `FireClient::origin()`.
+- A 403 or 404 from something between agentd and the endpoint (an egress
+  proxy, a WAF, a gateway `base_url`) is `rejected` like the endpoint's
+  own, so word their lines tentatively: "the account can't fire routines,
+  or something in between refused the request", and "the routine may have
+  been deleted; if so, `cloud rm` it", so no member deletes a working
+  routine on a misleading line.
+- `error_type` is `[a-z0-9_]{1,64}` but chosen by the endpoint, and `_`
+  is emphasis in mrkdwn and Markdown. Show it, if at all, in a code span;
+  better, map statuses to the failure table's fixed lines and keep
+  `error_type` for the log and the store.
 
 Live check (manual): with a Pro or Max account, make a routine on a scratch
 repository with the design's prompt, register it, run a task, and open the

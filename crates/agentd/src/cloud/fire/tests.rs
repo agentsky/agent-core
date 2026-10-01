@@ -1,7 +1,9 @@
 use std::time::Duration;
 
+use core_types::{CloudRoutineId, MemberKey, RoutineToken, SurfaceKind, TeamId, UserId};
+use secrecy::SecretString;
 use serde_json::json;
-use store::CloudHandoffState;
+use store::{CloudHandoffState, CloudOrigin, NewCloudHandoff, Sealer, Store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use wiremock::matchers::{method, path};
@@ -46,20 +48,19 @@ fn quick(base: &str) -> FireClient {
     .unwrap()
 }
 
-fn state(outcome: &FireOutcome) -> CloudHandoffState {
-    CloudOutcome::from(outcome).state()
-}
-
-fn routine() -> RoutineId {
-    ROUTINE.parse().unwrap()
-}
-
-fn token() -> SecretString {
-    SecretString::from(TOKEN)
+/// Routine [`ROUTINE`] as the store gives it, registered for `base`'s
+/// origin.
+fn routine(base: &str) -> CloudRoutineToken {
+    CloudRoutineToken {
+        id: CloudRoutineId::new_v4(),
+        routine_id: ROUTINE.parse().unwrap(),
+        url_origin: Url::parse(base).unwrap().origin().ascii_serialization(),
+        token: RoutineToken::parse(SecretString::from(TOKEN)).unwrap(),
+    }
 }
 
 async fn fire(base: &str) -> FireOutcome {
-    client(base).fire(&routine(), &token(), TASK).await
+    client(base).fire(&routine(base), TASK).await
 }
 
 /// Fires once at a fresh fake that answers with `template`, and checks it
@@ -108,7 +109,7 @@ fn not_sent() -> FireOutcome {
     }
 }
 
-fn unknown_with(status: Option<u16>, reason: UnknownReason) -> FireOutcome {
+fn unknown_with(status: Option<u16>, reason: CloudUnknownReason) -> FireOutcome {
     FireOutcome::Unknown { status, reason }
 }
 
@@ -131,7 +132,7 @@ async fn fire_sends_the_documented_request() {
         .await;
 
     let outcome = fire(&server.uri()).await;
-    assert_eq!(state(&outcome), CloudHandoffState::Fired);
+    assert_eq!(outcome.state(), CloudHandoffState::Fired);
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -188,9 +189,9 @@ async fn a_custom_beta_header_is_sent() {
     };
     let outcome = FireClient::new(&config)
         .unwrap()
-        .fire(&routine(), &token(), TASK)
+        .fire(&routine(&server.uri()), TASK)
         .await;
-    assert_eq!(state(&outcome), CloudHandoffState::Fired);
+    assert_eq!(outcome.state(), CloudHandoffState::Fired);
     server.verify().await;
 }
 
@@ -273,7 +274,7 @@ async fn each_documented_4xx_is_rejected_with_its_type() {
     ] {
         let outcome = answered(ResponseTemplate::new(status).set_body_json(envelope(kind))).await;
         assert_eq!(outcome, rejected(status, Some(kind), None), "{status}");
-        assert_eq!(state(&outcome), CloudHandoffState::Rejected);
+        assert_eq!(outcome.state(), CloudHandoffState::Rejected);
     }
 
     let lenient = [
@@ -348,7 +349,10 @@ async fn retry_after_is_kept_in_seconds_and_a_date_is_ignored() {
     }
     assert_eq!(MAX_RETRY_AFTER_SECS, 24 * 60 * 60);
     let outcome = classify(answer(503, Some("10"), Ok(Vec::new())));
-    assert_eq!(outcome, unknown_with(Some(503), UnknownReason::ServerError));
+    assert_eq!(
+        outcome,
+        unknown_with(Some(503), CloudUnknownReason::ServerError)
+    );
 }
 
 #[tokio::test]
@@ -358,10 +362,10 @@ async fn server_errors_and_other_statuses_are_unknown() {
             answered(ResponseTemplate::new(status).set_body_json(envelope("api_error"))).await;
         assert_eq!(
             outcome,
-            unknown_with(Some(status), UnknownReason::ServerError),
+            unknown_with(Some(status), CloudUnknownReason::ServerError),
             "{status}"
         );
-        assert_eq!(state(&outcome), CloudHandoffState::Unknown);
+        assert_eq!(outcome.state(), CloudHandoffState::Unknown);
     }
     for status in [201, 202, 204, 402, 405, 409, 413, 418, 422, 451] {
         let outcome =
@@ -369,14 +373,14 @@ async fn server_errors_and_other_statuses_are_unknown() {
                 .await;
         assert_eq!(
             outcome,
-            unknown_with(Some(status), UnknownReason::OtherStatus),
+            unknown_with(Some(status), CloudUnknownReason::OtherStatus),
             "{status}"
         );
     }
     for status in [100, 199, 600, 999] {
         assert_eq!(
             classify(answer(status, None, Ok(Vec::new()))),
-            unknown_with(Some(status), UnknownReason::OtherStatus),
+            unknown_with(Some(status), CloudUnknownReason::OtherStatus),
             "{status}"
         );
     }
@@ -394,17 +398,19 @@ async fn a_timeout_after_sending_is_unknown() {
         )
         .mount(&server)
         .await;
-    let outcome = quick(&server.uri()).fire(&routine(), &token(), TASK).await;
-    assert_eq!(outcome, unknown_with(None, UnknownReason::Timeout));
+    let outcome = quick(&server.uri())
+        .fire(&routine(&server.uri()), TASK)
+        .await;
+    assert_eq!(outcome, unknown_with(None, CloudUnknownReason::Timeout));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 
     assert_eq!(
         classify(answer(200, None, Err(BodyError::TimedOut))),
-        unknown_with(Some(200), UnknownReason::Timeout)
+        unknown_with(Some(200), CloudUnknownReason::Timeout)
     );
     assert_eq!(
         classify(Exchange::TimedOut),
-        unknown_with(None, UnknownReason::Timeout)
+        unknown_with(None, CloudUnknownReason::Timeout)
     );
 }
 
@@ -486,7 +492,10 @@ async fn read_request(stream: &mut TcpStream) -> bool {
 async fn a_connection_lost_after_sending_is_unknown() {
     let (base, server) = hand_written(Then::HangUp).await;
     let outcome = fire(&base).await;
-    assert_eq!(outcome, unknown_with(None, UnknownReason::ConnectionLost));
+    assert_eq!(
+        outcome,
+        unknown_with(None, CloudUnknownReason::ConnectionLost)
+    );
     assert_eq!(server.await.unwrap(), 1, "the request was sent again");
 
     let cut = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"claude_code".to_vec();
@@ -494,13 +503,13 @@ async fn a_connection_lost_after_sending_is_unknown() {
     let outcome = fire(&base).await;
     assert_eq!(
         outcome,
-        unknown_with(Some(200), UnknownReason::ConnectionLost)
+        unknown_with(Some(200), CloudUnknownReason::ConnectionLost)
     );
     assert_eq!(server.await.unwrap(), 1);
 
     assert_eq!(
         classify(answer(200, None, Err(BodyError::Lost))),
-        unknown_with(Some(200), UnknownReason::ConnectionLost)
+        unknown_with(Some(200), CloudUnknownReason::ConnectionLost)
     );
 }
 
@@ -508,8 +517,11 @@ async fn a_connection_lost_after_sending_is_unknown() {
 async fn a_success_whose_body_stalls_or_runs_past_the_limit_is_unknown() {
     let head = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"claude_code".to_vec();
     let (base, server) = hand_written(Then::AnswerAndStall(head)).await;
-    let outcome = quick(&base).fire(&routine(), &token(), TASK).await;
-    assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Timeout));
+    let outcome = quick(&base).fire(&routine(&base), TASK).await;
+    assert_eq!(
+        outcome,
+        unknown_with(Some(200), CloudUnknownReason::Timeout)
+    );
     assert_eq!(server.await.unwrap(), 1);
 
     let mut body = session_body(SESSION, None).to_string();
@@ -528,7 +540,10 @@ async fn a_success_whose_body_stalls_or_runs_past_the_limit_is_unknown() {
     chunked.extend_from_slice(b"0\r\n\r\n");
     let (base, server) = hand_written(Then::Answer(chunked)).await;
     let outcome = fire(&base).await;
-    assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Unreadable));
+    assert_eq!(
+        outcome,
+        unknown_with(Some(200), CloudUnknownReason::UnreadableAnswer)
+    );
     assert_eq!(server.await.unwrap(), 1);
 
     let refused = b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 100\r\n\r\n{\"error".to_vec();
@@ -544,7 +559,7 @@ async fn a_refused_connection_is_rejected() {
     let base = format!("http://{}", socket.local_addr().unwrap());
     let outcome = fire(&base).await;
     assert_eq!(outcome, not_sent());
-    assert_eq!(state(&outcome), CloudHandoffState::Rejected);
+    assert_eq!(outcome.state(), CloudHandoffState::Rejected);
     drop(socket);
 }
 
@@ -571,7 +586,7 @@ async fn a_redirect_is_not_followed() {
         let outcome = fire(&server.uri()).await;
         assert_eq!(
             outcome,
-            unknown_with(Some(status), UnknownReason::Redirect),
+            unknown_with(Some(status), CloudUnknownReason::Redirect),
             "{status}"
         );
         server.verify().await;
@@ -602,17 +617,20 @@ async fn an_unreadable_success_is_unknown() {
         let shown = String::from_utf8_lossy(&body).into_owned();
         assert_eq!(
             classify(answer(200, None, Ok(body))),
-            unknown_with(Some(200), UnknownReason::Unreadable),
+            unknown_with(Some(200), CloudUnknownReason::UnreadableAnswer),
             "{shown}"
         );
     }
     assert_eq!(
         classify(answer(200, None, Err(BodyError::TooLarge))),
-        unknown_with(Some(200), UnknownReason::Unreadable)
+        unknown_with(Some(200), CloudUnknownReason::UnreadableAnswer)
     );
 
     let outcome = answered(ResponseTemplate::new(200).set_body_string("<html>ok</html>")).await;
-    assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Unreadable));
+    assert_eq!(
+        outcome,
+        unknown_with(Some(200), CloudUnknownReason::UnreadableAnswer)
+    );
 
     let padded = |len: usize| {
         let mut body = session_body(SESSION, None).to_string();
@@ -626,17 +644,20 @@ async fn an_unreadable_success_is_unknown() {
     };
     let outcome =
         answered(ResponseTemplate::new(200).set_body_string(padded(MAX_BODY_BYTES))).await;
-    assert_eq!(state(&outcome), CloudHandoffState::Fired);
+    assert_eq!(outcome.state(), CloudHandoffState::Fired);
     let outcome =
         answered(ResponseTemplate::new(200).set_body_string(padded(MAX_BODY_BYTES + 1))).await;
-    assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Unreadable));
+    assert_eq!(
+        outcome,
+        unknown_with(Some(200), CloudUnknownReason::UnreadableAnswer)
+    );
 }
 
 #[tokio::test]
 async fn fire_never_retries() {
     for status in [500, 503] {
         let outcome = answered(ResponseTemplate::new(status)).await;
-        assert_eq!(state(&outcome), CloudHandoffState::Unknown);
+        assert_eq!(outcome.state(), CloudHandoffState::Unknown);
     }
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -646,7 +667,10 @@ async fn fire_never_retries() {
         .mount(&server)
         .await;
     let outcome = fire(&server.uri()).await;
-    assert_eq!(outcome, unknown_with(Some(500), UnknownReason::ServerError));
+    assert_eq!(
+        outcome,
+        unknown_with(Some(500), CloudUnknownReason::ServerError)
+    );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
     server.verify().await;
@@ -663,8 +687,8 @@ async fn each_fire_opens_a_connection_of_its_own() {
     let (base, server) = hand_written(Then::KeepAlive(answer)).await;
     let reused = client(&base);
     for _ in 0..2 {
-        let outcome = reused.fire(&routine(), &token(), TASK).await;
-        assert_eq!(state(&outcome), CloudHandoffState::Fired);
+        let outcome = reused.fire(&routine(&base), TASK).await;
+        assert_eq!(outcome.state(), CloudHandoffState::Fired);
     }
     assert_eq!(server.await.unwrap(), 2, "a connection was reused");
 }
@@ -685,7 +709,7 @@ async fn a_loopback_base_url_is_called_without_a_proxy() {
 }
 
 #[tokio::test]
-async fn nothing_is_sent_for_a_bad_token_or_task() {
+async fn nothing_is_sent_for_another_origin_or_a_bad_task() {
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
         .respond_with(ResponseTemplate::new(200).set_body_json(session_body(SESSION, None)))
@@ -693,32 +717,41 @@ async fn nothing_is_sent_for_a_bad_token_or_task() {
         .mount(&server)
         .await;
     let refusing = client(&server.uri());
+    assert_eq!(
+        refusing.origin(),
+        Url::parse(&server.uri())
+            .unwrap()
+            .origin()
+            .ascii_serialization()
+    );
     let logs = global_logs().tag();
-    for bad in [
-        "",
-        "sk-ant oat01",
-        "sk-ant-oat01\r\nx-other: 1",
-        "sk-ant-\u{e9}",
-        "tab\there",
+    let port = Url::parse(&server.uri()).unwrap().port().unwrap();
+    for elsewhere in [
+        "https://api.anthropic.com".to_owned(),
+        format!("http://127.0.0.1:{}", port + 1),
+        format!("https://127.0.0.1:{port}"),
+        format!("http://127.0.0.2:{port}"),
+        format!("http://127.0.0.1:{port}/"),
+        String::new(),
     ] {
-        let outcome = refusing
-            .fire(&routine(), &SecretString::from(bad), TASK)
-            .await;
-        assert_eq!(outcome, not_sent(), "{bad:?}");
+        let routine = CloudRoutineToken {
+            url_origin: elsewhere.clone(),
+            ..routine(&server.uri())
+        };
+        let outcome = refusing.fire(&routine, TASK).await;
+        assert_eq!(outcome, not_sent(), "{elsewhere}");
     }
     let too_long = "x".repeat(MAX_TASK_BYTES + 1);
     for task in ["", too_long.as_str()] {
         assert_eq!(check_task(task), Err(TaskError), "{}", task.len());
-        let outcome = refusing.fire(&routine(), &token(), task).await;
+        let outcome = refusing.fire(&routine(&server.uri()), task).await;
         assert_eq!(outcome, not_sent(), "{}", task.len());
     }
     server.verify().await;
     logs.snapshot()
         .assert_has("wasn't sent")
-        .assert_has("header can't carry")
-        .assert_has("the task is empty or longer than 65536 bytes")
-        .assert_lacks("sk-ant oat01")
-        .assert_lacks("tab\there");
+        .assert_has("another origin")
+        .assert_has("the task is empty or longer than 65536 bytes");
 
     let longest_id: RoutineId = format!("trig_{}", "Z9".repeat(32)).parse().unwrap();
     let server = MockServer::start().await;
@@ -730,10 +763,12 @@ async fn nothing_is_sent_for_a_bad_token_or_task() {
         .await;
     let longest_task = "é".repeat(MAX_TASK_BYTES / 2);
     assert_eq!(check_task(&longest_task), Ok(()));
-    let outcome = client(&server.uri())
-        .fire(&longest_id, &token(), &longest_task)
-        .await;
-    assert_eq!(state(&outcome), CloudHandoffState::Fired);
+    let routine = CloudRoutineToken {
+        routine_id: longest_id,
+        ..routine(&server.uri())
+    };
+    let outcome = client(&server.uri()).fire(&routine, &longest_task).await;
+    assert_eq!(outcome.state(), CloudHandoffState::Fired);
     server.verify().await;
 }
 
@@ -783,23 +818,114 @@ fn an_answer_shows_its_body_only_by_length() {
     assert!(shown.contains("401") && shown.contains("Ok(18)"), "{shown}");
 }
 
-#[test]
-fn outcomes_map_to_what_the_store_records() {
-    assert_eq!(
-        state(&classify(Exchange::NotSent)),
-        CloudHandoffState::Rejected
-    );
-    assert_eq!(state(&classify(Exchange::Lost)), CloudHandoffState::Unknown);
-    for (reason, name) in [
-        (UnknownReason::ServerError, "server_error"),
-        (UnknownReason::Redirect, "redirect"),
-        (UnknownReason::OtherStatus, "other_status"),
-        (UnknownReason::Timeout, "timeout"),
-        (UnknownReason::ConnectionLost, "connection_lost"),
-        (UnknownReason::Unreadable, "unreadable"),
-    ] {
-        assert_eq!(reason.as_str(), name);
+/// Every shape of outcome the classifier gives, recorded on a hand-off of
+/// its own and read back: the store holds each one as it is.
+#[tokio::test]
+async fn every_outcome_is_recorded_as_it_is() {
+    let longest_session = format!("session_{}", "a".repeat(128));
+    let longest_type = "a_1".repeat(21) + "z";
+    let outcomes = vec![
+        classify(answer(
+            200,
+            None,
+            Ok(session_body(
+                &longest_session,
+                Some(&format!("{SESSION_URL_PREFIX}{longest_session}")),
+            )
+            .to_string()
+            .into_bytes()),
+        )),
+        classify(answer(
+            200,
+            None,
+            Ok(session_body(SESSION, None).to_string().into_bytes()),
+        )),
+        classify(answer(
+            429,
+            Some("99999999999"),
+            Ok(envelope(&longest_type).to_string().into_bytes()),
+        )),
+        classify(answer(401, Some("0"), Ok(Vec::new()))),
+        classify(Exchange::NotSent),
+        classify(answer(503, None, Ok(Vec::new()))),
+        classify(answer(308, None, Ok(Vec::new()))),
+        classify(answer(100, None, Ok(Vec::new()))),
+        classify(answer(999, None, Ok(Vec::new()))),
+        classify(answer(200, None, Err(BodyError::TimedOut))),
+        classify(answer(200, None, Ok(b"<html>".to_vec()))),
+        classify(Exchange::TimedOut),
+        classify(Exchange::Lost),
+    ];
+    let store =
+        Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
+            .await
+            .unwrap();
+    let key = MemberKey {
+        surface: SurfaceKind::RocketChat,
+        team: TeamId::new("chat.example.org"),
+        user: UserId::new("ada"),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let member = store.ensure_member(&key, "Ada", now).await.unwrap();
+    let routine_id: RoutineId = ROUTINE.parse().unwrap();
+    for outcome in &outcomes {
+        let id = store
+            .begin_cloud_handoff(
+                &NewCloudHandoff {
+                    member,
+                    routine_label: "agent-core",
+                    routine_id: &routine_id,
+                    requested_by: &key,
+                    origin: CloudOrigin::RocketChatDm,
+                    task: TASK,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store.finish_cloud_handoff(id, outcome, now).await.unwrap(),
+            "{outcome:?}"
+        );
+        let recent = store.recent_cloud_handoffs(member, 1).await.unwrap();
+        let stored = &recent[0].handoff;
+        assert_eq!(stored.id, id);
+        let read_back = match stored.state {
+            CloudHandoffState::Fired => CloudOutcome::Fired {
+                session_id: stored.session_id.clone().unwrap(),
+                session_url: stored.session_url.clone(),
+            },
+            CloudHandoffState::Rejected => CloudOutcome::Rejected {
+                status: stored.http_status,
+                error_type: stored.error_type.clone(),
+                retry_after_secs: stored.retry_after_secs,
+            },
+            CloudHandoffState::Unknown => CloudOutcome::Unknown {
+                status: stored.http_status,
+                reason: stored.unknown_reason.unwrap(),
+            },
+            CloudHandoffState::Sending => panic!("{outcome:?} left the hand-off sending"),
+        };
+        assert_eq!(&read_back, outcome);
     }
+    let reasons: Vec<_> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            CloudOutcome::Unknown { reason, .. } => Some(*reason),
+            _ => None,
+        })
+        .collect();
+    for reason in [
+        CloudUnknownReason::ServerError,
+        CloudUnknownReason::Redirect,
+        CloudUnknownReason::OtherStatus,
+        CloudUnknownReason::Timeout,
+        CloudUnknownReason::ConnectionLost,
+        CloudUnknownReason::UnreadableAnswer,
+    ] {
+        assert!(reasons.contains(&reason), "{reason:?}");
+    }
+    assert!(!reasons.contains(&CloudUnknownReason::NoAnswer));
 }
 
 #[tokio::test]
@@ -823,7 +949,7 @@ async fn token_and_task_never_reach_the_log() {
     let socket = TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     outcomes.push(fire(&format!("http://{}", socket.local_addr().unwrap())).await);
-    let states: Vec<_> = outcomes.iter().map(state).collect();
+    let states: Vec<_> = outcomes.iter().map(CloudOutcome::state).collect();
     assert_eq!(
         states,
         [
@@ -844,7 +970,7 @@ async fn token_and_task_never_reach_the_log() {
         .assert_has(SESSION)
         .assert_has("authentication_error")
         .assert_has("server_error")
-        .assert_has("unreadable");
+        .assert_has("unreadable_answer");
     for outcome in &outcomes {
         assert!(!format!("{outcome:?}").contains(TOKEN));
     }

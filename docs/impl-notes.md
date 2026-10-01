@@ -8213,24 +8213,34 @@ client was tested against `wiremock` and hand-written local servers only.
 The design's [Verified and assumed](design.md#verified-and-assumed) list
 still holds, and T35c's live check covers it.
 
-### The fire client refuses what it can't send
+### The fire client takes the stored routine and returns its outcome
 
-**Issue.** The plan gives `fire(routine_id, token, task)` and a
-`FireOutcome`, but the routine id goes into the request's path, the token
-into a header, and the endpoint caps the text. A line break in a token
-would make reqwest fail the request before sending it, which its errors
-report as a builder error rather than a connection error.
+**Issue.** The plan gives `fire(routine_id, token, task)` returning a
+`FireOutcome`. But T35c writes the hand-off `sending` before it fires, so
+an error from `fire` would leave a row the pass later reports as possibly
+started, after the reply said nothing was. T35a stores each routine with
+the origin of the URL it was registered with, and a token checked as
+`RoutineToken`, so a check of either here would be a second copy of a
+rule. And `FireOutcome` restated the store's `CloudOutcome` field for
+field, with a mapping to keep in step.
 
-**Solution.** `fire` takes T35a's `core_types::RoutineId`, which is only
-letters and digits after `trig_`, so the path can't be changed through it
-and the client has no check of its own to keep in step. It returns
-`Result<FireOutcome, FireError>`, and refuses before sending anything a
-token that is empty or holds a byte outside visible ASCII
-(`FireError::Token`) and a task that is empty or longer than
-`MAX_TASK_BYTES`, 65,536 bytes (`FireError::Task`). Neither repeats the
-value. T35c's checks come first, so for it an error here means only that
-nothing was started, as a store failure before the request does. A
-reqwest builder error, should one still happen, counts as not sent too.
+**Solution.** `fire(&CloudRoutineToken, task)` takes the row
+`Store::cloud_routine` gives and returns the outcome alone. `FireOutcome`
+is `store::CloudOutcome`, which T35c records as it is; every shape the
+classifier gives is recorded and read back in
+`every_outcome_is_recorded_as_it_is`, and none is `no_answer`, which only
+the store's pass sets. A routine whose `url_origin` isn't
+`FireClient::origin()` (an operator moved `[cloud] base_url` since it was
+registered, so its token isn't for this endpoint) and a task `check_task`
+refuses (empty, or over `MAX_TASK_BYTES`, 65,536 bytes) are not sent: the
+outcome is `rejected` with no status, as for a connection that failed
+first, and the log says why. T35c runs both checks before
+`begin_cloud_handoff`, so it can say what is wrong; these are the
+backstop. The token is T35a's `RoutineToken`, `sk-ant-` and printable
+ASCII, so a header always carries it. The routine id is a `RoutineId`,
+letters and digits after `trig_`, so the path can't be changed through
+it. A reqwest builder error, should one still happen, counts as not sent
+too. Building the client fails with `FireClientError` alone.
 
 ### reqwest retries some requests on its own
 
@@ -8248,7 +8258,9 @@ and `pool_max_idle_per_host(0)`, so each fire is one request on a
 connection of its own. That costs a TCP and TLS handshake per hand-off,
 which a member's command can afford. `fire_never_retries` and the
 hand-written server that hangs up after reading the request both check
-that exactly one request, on one connection, was made.
+that exactly one request, on one connection, was made, and
+`each_fire_opens_a_connection_of_its_own` fires twice at a server that
+keeps connections open and counts two.
 
 ### A connect timeout counts as not sent only when it fires first
 
@@ -8261,10 +8273,32 @@ plain timeout, reported `unknown`. Probed once against an address that
 drops packets: a 100 ms connect timeout under a 600 ms total gave
 `rejected`, and 300 ms for both gave `unknown` with reason `timeout`.
 
-**Solution.** Kept: `unknown` only tells the member to check claude.ai
-before running the task again, the cautious side, and the defaults (10 and
-30 seconds) keep the two apart. The example configuration doesn't suggest
-setting them equal.
+**Solution.** `connect_timeout_secs` must be below `timeout_secs`, not at
+most equal as the plan says, so a connection that never opened is always
+`rejected`.
+
+### No proxy reads a request to a loopback address
+
+**Issue.** The client honors the system proxy settings, as the plan asks,
+and reqwest's environment proxy has no exception of its own for loopback
+addresses. With `HTTP_PROXY` set, a plain `http` request to a loopback
+`base_url` went to the proxy in full, routine token included, and the
+proxy reached `127.0.0.1` on its own host. A `NO_PROXY` listing
+`127.0.0.1` doesn't cover all of `127.0.0.0/8` or `::ffff:127.0.0.1`,
+which the configuration accepts. The credential proxy's upstream, the
+OAuth client and the Slack and Rocket.Chat clients had the same gap with
+members' and bots' tokens.
+
+**Solution.** Each of those clients skips proxies when its configured
+base is a loopback IP address, by one rule,
+`core_types::is_loopback_ip_host`, which the `http` checks of `[cloud]`,
+`[proxy] upstream` and `[claude_oauth]` share; `[claude_oauth]` now
+refuses `http://localhost` as the other two do. Any other base still
+honors the system settings. Each client's builder takes a proxy that tests
+add as if the system had it, and `testkit::proxy::assert_loopback_skips_proxy`
+checks with a fake proxy that the loopback request goes around it while a
+request from a client built for another base goes through it, without
+setting any environment variable.
 
 ### `base_url` is checked as the `url` crate reads it
 
@@ -8278,8 +8312,9 @@ path to be `/` and no query, fragment or user info, `https`, or `http`
 only when the host is a loopback IP address (IPv4-mapped included;
 `localhost` is a name that could resolve anywhere), as `[proxy] upstream`
 does. Every request's URL is the parsed origin with the fire path set on
-it, and T35c compares a pasted routine URL's origin with this URL's
-`origin()`, so both sides go through the same normalization:
+it, and `FireClient::origin()` is its ASCII serialization, the form T35a
+stores a routine's in; T35c compares a pasted routine URL's origin with
+it, so both sides go through the same normalization:
 `cloud_config_is_checked` parses routine URLs with T35a's `RoutineUrl` and
 finds the default's origin equal to one with `:443` typed, and different
 from one with another port, scheme or host. Errors never repeat the value.
@@ -8304,18 +8339,24 @@ the edges to the implementation.
   lowercase ASCII letters, digits and `_`, so arbitrary text never reaches
   the store or a log. A body that isn't such an envelope gives none, and
   the status alone decides.
-- `Retry-After` is kept only as digits, surrounding blanks aside, up to
-  `u32::MAX`; Rust's own parse would also take `+5`. A date, a fraction
-  or a larger number is ignored.
+- `Retry-After` is kept only as digits, surrounding blanks aside; Rust's
+  own parse would also take `+5`. A date or a fraction is ignored. Any
+  number over a day, however long, is kept as a day
+  (`MAX_RETRY_AFTER_SECS`), since the endpoint's documented limits are
+  hourly and a member shouldn't be told to wait 136 years.
 - A body is read up to 64 KiB, refused at once by its `Content-Length`
   when that says more, and otherwise counted as it arrives. A 200 whose
   body runs past it, breaks off or stalls past the timeout is `unknown`
-  (`unreadable`, `connection_lost` or `timeout`); an error status whose
+  (`unreadable_answer`, `connection_lost` or `timeout`); an error status whose
   body does is still `rejected`, without an error type.
 - Each fire logs one line, `fired a cloud routine`, with the routine id,
-  the status, the outcome's kind, and the session id, the error type, the
+  the status, the outcome's state, and the session id, the error type, the
   `Retry-After` or the reason for `unknown`: at info for `fired` and at
-  warn otherwise.
+  warn otherwise. A request that wasn't sent adds a warning saying why:
+  the origin, the task, or the connect error and its causes without the
+  URL (DNS, TLS, a refused connection), which never hold a header.
+- The answer's `Debug` shows a body's length only, since a body may echo
+  what was sent; the classifier and its types are private to the module.
 
 ### Scopes outside profile and inference fail at startup
 
@@ -8324,8 +8365,25 @@ scopes` entry but `user:profile` and `user:inference`. A deployment that
 had widened them stops starting.
 
 **Solution.** That is the point: the error names `claude_oauth.scopes`.
-Members who linked while the scopes were wider keep tokens carrying them
-until their next refresh, which then asks for the narrower set; whether
-the token endpoint narrows a refreshed token that way, or refuses it as
-widening was refused (T09), is unverified, and such members can log in
-again. `auth::ALLOWED_SCOPES` lists the two.
+`auth::ALLOWED_SCOPES` lists the two.
+
+### What was asked for doesn't bound what was granted
+
+**Issue.** The scopes travel in the authorize URL agentd hands the member,
+and the code exchange doesn't send them again, so a member who added
+`user:sessions:claude_code` to the URL before approving got a linked token
+with it, which the credential proxy would forward on every turn. A token
+endpoint that grants its own defaults, or doesn't narrow a refresh, would
+do the same silently, and members who linked while the configured scopes
+were wider still hold such tokens.
+
+**Solution.** `auth` reads a token response's `scope` and refuses one
+naming anything outside `ALLOWED_SCOPES` (`AuthError::ScopeRefused`): a
+login stores nothing and the member is told to log in again without
+changing the link; a refresh marks the link broken, as a dead refresh
+token does, so the member gets the relink notice and the token isn't
+served again. The refused tokens are dropped, not revoked: the login's
+were never stored, and the broken link keeps its old refresh token until
+the next login replaces it or `logout` revokes it. A response without `scope` keeps the link: RFC
+6749 says the grant is then what was asked for, and neither the plan nor
+the design says otherwise.

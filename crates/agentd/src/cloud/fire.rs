@@ -7,10 +7,10 @@ use std::time::Duration;
 use core_types::RoutineId;
 use reqwest::header::{HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Response, Url};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use serde::Serialize;
 use serde_json::Value;
-use store::{CloudOutcome, CloudUnknownReason};
+use store::{CloudOutcome, CloudRoutineToken, CloudUnknownReason};
 
 use crate::config::{CloudConfig, ConfigError};
 
@@ -48,6 +48,7 @@ pub const MAX_RETRY_AFTER_SECS: u32 = 24 * 60 * 60;
 pub struct FireClient {
     http: Client,
     base: Url,
+    origin: String,
     beta: HeaderValue,
 }
 
@@ -90,115 +91,32 @@ pub fn check_task(task: &str) -> Result<(), TaskError> {
     Ok(())
 }
 
-/// What a fire request led to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FireOutcome {
-    /// A 200 naming the session it started.
-    Fired {
-        /// `claude_code_session_id`: `session_` and 1 to 128 ASCII letters
-        /// and digits.
-        session_id: String,
-        /// `claude_code_session_url`, kept only when it is
-        /// [`SESSION_URL_PREFIX`] followed by `session_id`.
-        session_url: Option<String>,
-    },
-    /// The endpoint refused the request with a documented status (400,
-    /// 401, 403, 404 or 429), or the request wasn't sent: the connection
-    /// failed first, or the token or task couldn't be. Assumed to have
-    /// started no session.
-    Rejected {
-        /// The status, or `None` when nothing was sent.
-        status: Option<u16>,
-        /// `error.type` from the error body, when it is 1 to 64 lowercase
-        /// ASCII letters, digits and `_`.
-        error_type: Option<String>,
-        /// `Retry-After` in whole seconds, at most
-        /// [`MAX_RETRY_AFTER_SECS`]. An HTTP date is ignored.
-        retry_after_secs: Option<u32>,
-    },
-    /// Anything else: the session may or may not have started.
-    Unknown {
-        /// The status, if one came back.
-        status: Option<u16>,
-        /// Why nobody can tell.
-        reason: UnknownReason,
-    },
-}
-
-/// The outcome to record for the hand-off.
-impl From<&FireOutcome> for CloudOutcome {
-    fn from(outcome: &FireOutcome) -> Self {
-        match outcome.clone() {
-            FireOutcome::Fired {
-                session_id,
-                session_url,
-            } => Self::Fired {
-                session_id,
-                session_url,
-            },
-            FireOutcome::Rejected {
-                status,
-                error_type,
-                retry_after_secs,
-            } => Self::Rejected {
-                status,
-                error_type,
-                retry_after_secs,
-            },
-            FireOutcome::Unknown { status, reason } => Self::Unknown {
-                status,
-                reason: match reason {
-                    UnknownReason::ServerError => CloudUnknownReason::ServerError,
-                    UnknownReason::Redirect => CloudUnknownReason::Redirect,
-                    UnknownReason::OtherStatus => CloudUnknownReason::OtherStatus,
-                    UnknownReason::Timeout => CloudUnknownReason::Timeout,
-                    UnknownReason::ConnectionLost => CloudUnknownReason::ConnectionLost,
-                    UnknownReason::Unreadable => CloudUnknownReason::UnreadableAnswer,
-                },
-            },
-        }
-    }
-}
-
-/// Why a [`FireOutcome::Unknown`] can't say whether a session started.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnknownReason {
-    /// A 5xx.
-    ServerError,
-    /// A 3xx, which the client doesn't follow.
-    Redirect,
-    /// A status that is neither 200, a documented 4xx, a 3xx nor a 5xx.
-    OtherStatus,
-    /// The request, or reading the answer, timed out after the request may
-    /// have been sent.
-    Timeout,
-    /// The connection failed after the request may have been sent.
-    ConnectionLost,
-    /// A 200 without a session id of the expected shape, or whose body
-    /// isn't JSON or is longer than [`MAX_BODY_BYTES`].
-    Unreadable,
-}
-
-impl UnknownReason {
-    /// A short name for logs.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ServerError => "server_error",
-            Self::Redirect => "redirect",
-            Self::OtherStatus => "other_status",
-            Self::Timeout => "timeout",
-            Self::ConnectionLost => "connection_lost",
-            Self::Unreadable => "unreadable",
-        }
-    }
-}
+/// What a fire request led to, which the hand-off records as it is:
+///
+/// - [`Fired`](CloudOutcome::Fired) for a 200 naming the session it
+///   started. `session_id` is `session_` and 1 to 128 ASCII letters and
+///   digits; `session_url` is kept only when it is [`SESSION_URL_PREFIX`]
+///   followed by `session_id`.
+/// - [`Rejected`](CloudOutcome::Rejected) for a documented refusal (400,
+///   401, 403, 404 or 429), or a request that wasn't sent, with no status:
+///   the connection failed first, the routine was registered for another
+///   origin, or the task can't be sent. Assumed to have started no session.
+///   `error_type` is `error.type` from the error body, when it is 1 to 64
+///   lowercase ASCII letters, digits and `_`; `retry_after_secs` is
+///   `Retry-After` in whole seconds, at most [`MAX_RETRY_AFTER_SECS`], and
+///   an HTTP date is ignored.
+/// - [`Unknown`](CloudOutcome::Unknown) for anything else: the session may
+///   or may not have started. Its reason is never
+///   [`NoAnswer`](store::CloudUnknownReason::NoAnswer), which only the
+///   store's pass sets.
+pub type FireOutcome = CloudOutcome;
 
 /// What came back from one fire request, for [`classify`].
 #[derive(Debug)]
 enum Exchange {
     /// The server answered with a status.
     Answered(Answer),
-    /// Nothing was sent: the token or task couldn't be, or connecting
+    /// Nothing was sent: the routine or task couldn't be, or connecting
     /// failed (DNS, a refused connection, TLS, or the connect timeout).
     NotSent,
     /// The request timed out after it may have been sent.
@@ -290,36 +208,51 @@ impl FireClient {
         let http = builder
             .build()
             .map_err(|err| FireClientError::Client(err.without_url()))?;
-        Ok(Self { http, base, beta })
+        let origin = base.origin().ascii_serialization();
+        Ok(Self {
+            http,
+            base,
+            origin,
+            beta,
+        })
     }
 
-    /// Fires routine `routine` with `task` as its text, authenticated by
-    /// the routine's `token`: one `POST
-    /// {base_url}/v1/claude_code/routines/{routine}/fire`, never retried,
-    /// whatever comes back. A [`RoutineId`] is only letters and digits
-    /// after `trig_`, so it can't change the path. Logs the routine id, the
-    /// status and the outcome's state, and why nothing was sent when it
-    /// wasn't, never the token, the task or the body.
+    /// The origin `[cloud] base_url` names, as
+    /// `url::Origin::ascii_serialization` writes it: the form the store
+    /// keeps a routine's with ([`CloudRoutineToken::url_origin`]), and
+    /// which [`fire`](Self::fire) requires.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Fires `routine` with `task` as its text, authenticated by the
+    /// routine's token: one `POST
+    /// {base_url}/v1/claude_code/routines/{routine_id}/fire`, never
+    /// retried, whatever comes back. A routine id is only letters and
+    /// digits after `trig_`, so it can't change the path. Logs the routine
+    /// id, the status and the outcome's state, and why nothing was sent
+    /// when it wasn't, never the token, the task or the body.
     ///
-    /// A token a header can't carry, or a task [`check_task`] refuses, is
-    /// not sent, and the outcome is [`FireOutcome::Rejected`] with no
-    /// status, as for a connection that failed first: the caller checks
-    /// the task before it writes the hand-off, and records whatever comes
-    /// back.
-    pub async fn fire(&self, routine: &RoutineId, token: &SecretString, task: &str) -> FireOutcome {
-        let token = token.expose_secret();
-        let exchange = if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+    /// A routine registered for another origin than [`origin`](Self::origin),
+    /// whose token is then not for this endpoint, and a task [`check_task`]
+    /// refuses are not sent, and the outcome is [`CloudOutcome::Rejected`]
+    /// with no status, as for a connection that failed first. The caller
+    /// checks both before it writes the hand-off, to say what is wrong, and
+    /// records whatever comes back.
+    pub async fn fire(&self, routine: &CloudRoutineToken, task: &str) -> FireOutcome {
+        let id = &routine.routine_id;
+        let exchange = if routine.url_origin != self.origin {
             not_sent(
-                routine,
-                "the routine token holds characters a header can't carry",
+                id,
+                "the routine was registered for another origin than [cloud] base_url's",
             )
         } else if let Err(err) = check_task(task) {
-            not_sent(routine, &err.to_string())
+            not_sent(id, &err.to_string())
         } else {
-            self.exchange(routine, token, task).await
+            self.exchange(id, routine.token.expose_secret(), task).await
         };
         let outcome = classify(exchange);
-        log_outcome(routine.as_str(), &outcome);
+        log_outcome(id.as_str(), &outcome);
         outcome
     }
 
@@ -406,7 +339,7 @@ fn causes(err: reqwest::Error) -> String {
 }
 
 fn log_outcome(routine: &str, outcome: &FireOutcome) {
-    let kind = CloudOutcome::from(outcome).state().as_str();
+    let kind = outcome.state().as_str();
     match outcome {
         FireOutcome::Fired { session_id, .. } => tracing::info!(
             routine,
@@ -440,10 +373,10 @@ fn log_outcome(routine: &str, outcome: &FireOutcome) {
 /// What `exchange` means for the hand-off:
 ///
 /// - a 200 whose body names a session id of the expected shape is
-///   [`FireOutcome::Fired`];
+///   [`CloudOutcome::Fired`];
 /// - 400, 401, 403, 404 and 429, whatever their body, and a request that
-///   wasn't sent, are [`FireOutcome::Rejected`];
-/// - everything else is [`FireOutcome::Unknown`]: a 5xx, a redirect,
+///   wasn't sent, are [`CloudOutcome::Rejected`];
+/// - everything else is [`CloudOutcome::Unknown`]: a 5xx, a redirect,
 ///   another status, a timeout or a connection lost after sending, and a
 ///   200 that can't be read.
 fn classify(exchange: Exchange) -> FireOutcome {
@@ -456,35 +389,35 @@ fn classify(exchange: Exchange) -> FireOutcome {
                 retry_after_secs: None,
             };
         }
-        Exchange::TimedOut => return unknown(None, UnknownReason::Timeout),
-        Exchange::Lost => return unknown(None, UnknownReason::ConnectionLost),
+        Exchange::TimedOut => return unknown(None, CloudUnknownReason::Timeout),
+        Exchange::Lost => return unknown(None, CloudUnknownReason::ConnectionLost),
     };
     let status = Some(answer.status);
     match answer.status {
         200 => match answer.body {
             Ok(body) => session(&body).map_or_else(
-                || unknown(status, UnknownReason::Unreadable),
+                || unknown(status, CloudUnknownReason::UnreadableAnswer),
                 |(session_id, session_url)| FireOutcome::Fired {
                     session_id,
                     session_url,
                 },
             ),
-            Err(BodyError::TooLarge) => unknown(status, UnknownReason::Unreadable),
-            Err(BodyError::TimedOut) => unknown(status, UnknownReason::Timeout),
-            Err(BodyError::Lost) => unknown(status, UnknownReason::ConnectionLost),
+            Err(BodyError::TooLarge) => unknown(status, CloudUnknownReason::UnreadableAnswer),
+            Err(BodyError::TimedOut) => unknown(status, CloudUnknownReason::Timeout),
+            Err(BodyError::Lost) => unknown(status, CloudUnknownReason::ConnectionLost),
         },
         400 | 401 | 403 | 404 | 429 => FireOutcome::Rejected {
             status,
             error_type: answer.body.ok().and_then(|body| error_type(&body)),
             retry_after_secs: answer.retry_after.as_deref().and_then(retry_after_secs),
         },
-        300..=399 => unknown(status, UnknownReason::Redirect),
-        500..=599 => unknown(status, UnknownReason::ServerError),
-        _ => unknown(status, UnknownReason::OtherStatus),
+        300..=399 => unknown(status, CloudUnknownReason::Redirect),
+        500..=599 => unknown(status, CloudUnknownReason::ServerError),
+        _ => unknown(status, CloudUnknownReason::OtherStatus),
     }
 }
 
-fn unknown(status: Option<u16>, reason: UnknownReason) -> FireOutcome {
+fn unknown(status: Option<u16>, reason: CloudUnknownReason) -> FireOutcome {
     FireOutcome::Unknown { status, reason }
 }
 
