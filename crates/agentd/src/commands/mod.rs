@@ -1,7 +1,9 @@
 //! `/agent` command dispatch, the account commands, the agent commands
 //! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), the skill
 //! commands (`skill add`, `skill confirm`, `skill rm`), the session
-//! commands (`sessions`, `reset`), and the community admins' `admin api-key
+//! commands (`sessions`, `reset`), `approve` and `decline`, which decide a
+//! private task's consent for the agent's owner
+//! ([`Commands::with_consents`]), and the community admins' `admin api-key
 //! set` and `clear`, which only the identities [`Commands::with_admins`]
 //! names may run.
 //!
@@ -15,8 +17,9 @@
 //! - [`rocketchat`]: which Rocket.Chat messages are commands. A DM to the
 //!   manager bot is a command as a whole; a message elsewhere is one when it
 //!   starts with `!agent`.
-//! - [`slack`]: which Slack requests are commands: `/agent`, and a DM to
-//!   the manager app as a whole.
+//! - [`slack`]: which Slack requests are commands: `/agent`, a DM to the
+//!   manager app as a whole, and a consent card's Approve or Decline
+//!   button, as `approve <id>` or `decline <id>`.
 //! - [`slack_tokens`]: members' Slack app configuration tokens, which
 //!   `/agent slack-token` registers and a background loop renews.
 //! - [`relink`]: the notice a member gets, once, when their Claude link
@@ -60,19 +63,20 @@ use std::sync::{Arc, Mutex, Weak};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
-use core_types::{ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
+use core_types::{ConsentId, ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
-use store::{MemberUsage, Store, StoreError, UsageTotals};
+use store::{ConsentState, MemberUsage, Store, StoreError, UsageTotals};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::consents::{Consents, Decided};
 use crate::policy::Limits;
 use crate::skills::Skills;
 use crate::slack::agents::SlackAgents;
 use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
-pub use reply::{ManagerBot, OpenDm, Replies, ReplyError};
+pub use reply::{ManagerBot, OpenDm, Replies, ReplyError, Rich};
 pub use sessions::{MAX_LISTED, SessionControl};
 
 /// Where a command came from. It decides where the reply goes and whether
@@ -226,6 +230,7 @@ pub struct Commands {
     admins: Arc<[MemberKey]>,
     slack_agents: Option<SlackAgents>,
     limits: Limits,
+    consents: Option<Consents>,
 }
 
 #[derive(Debug)]
@@ -282,7 +287,16 @@ impl Commands {
             admins: Arc::new([]),
             slack_agents: None,
             limits: Limits::default(),
+            consents: None,
         }
+    }
+
+    /// These commands, deciding private tasks' consents in `consents` with
+    /// `approve` and `decline`. Without it those aren't available.
+    #[must_use]
+    pub fn with_consents(mut self, consents: Consents) -> Self {
+        self.consents = Some(consents);
+        self
     }
 
     /// These commands, creating and deleting agents on Slack through
@@ -524,9 +538,47 @@ impl Commands {
                     self.allow_or_deny(member, name.as_str(), &target, false)
                         .await
                 }
+                Command::Approve { consent } => self.decide(member, consent, true).await,
+                Command::Decline { consent } => self.decide(member, consent, false).await,
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         }
+    }
+
+    /// `approve` or `decline`: `key`'s decision on a private task's
+    /// consent, which only the agent's owner may make.
+    async fn decide(
+        &self,
+        key: &MemberKey,
+        consent: ConsentId,
+        approve: bool,
+    ) -> Result<String, Failure> {
+        let Some(consents) = &self.consents else {
+            let name = if approve { "approve" } else { "decline" };
+            return Ok(format!("`{name}` isn't available yet."));
+        };
+        Ok(match consents.decide(key, consent, approve).await? {
+            Decided::Recorded if approve => {
+                format!(
+                    "Approved private task `{consent}`. Its result goes to the thread that asked."
+                )
+            }
+            Decided::Recorded => {
+                format!("Declined private task `{consent}`. The thread that asked is told.")
+            }
+            Decided::NotYours => format!(
+                "No private task `{consent}` is waiting for you: only the owner of the agent that \
+                 asked can approve or decline it."
+            ),
+            Decided::Settled(state) => format!(
+                "Private task `{consent}` was already {}.",
+                match state {
+                    ConsentState::Approved => "approved",
+                    ConsentState::Declined => "declined",
+                    ConsentState::Expired | ConsentState::Pending => "expired",
+                }
+            ),
+        })
     }
 
     async fn member(&self, key: &MemberKey) -> Result<Option<MemberId>, Failure> {

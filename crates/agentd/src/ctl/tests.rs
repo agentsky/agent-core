@@ -17,6 +17,8 @@ use tower::ServiceExt as _;
 
 use super::token::hash_token;
 use super::*;
+use crate::consents::ConsentSettings;
+use time::OffsetDateTime;
 
 const CONTAINER: &str = "172.30.0.7";
 const ALL_PATHS: [&str; 7] = [
@@ -81,6 +83,10 @@ impl Fixture {
             staging_dir: dir.0.join(STAGING_DIR),
             attach_max_bytes: 1024,
             lease_ttl: DEFAULT_LEASE_TTL,
+            consents: ConsentSettings {
+                attach_max_bytes: 1024,
+                ..ConsentSettings::in_data_dir(&dir.0)
+            },
         };
         tune(&mut settings);
         let surface = Arc::new(MockSurface::new());
@@ -753,21 +759,213 @@ async fn history_reads_the_turns_thread_through_the_surface() {
 }
 
 #[tokio::test]
-async fn ask_agent_and_private_are_not_available_yet() {
+async fn ask_agent_is_not_available_yet() {
     let fixture = Fixture::new().await;
     let (_, token) = fixture.process().await;
     fixture.ctl.begin_turn(&token, public()).await.unwrap();
-    for path in ["/v1/ask-agent", "/v1/private"] {
-        let (status, value) = fixture.call(Some(&token), path, json!({})).await;
-        assert_eq!(status, 501, "{path}");
-        assert_eq!(code(&value), "not_available");
+    let (status, value) = fixture.call(Some(&token), "/v1/ask-agent", json!({})).await;
+    assert_eq!(status, 501);
+    assert_eq!(code(&value), "not_available");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("not available yet")
+    );
+}
+
+impl Fixture {
+    /// A process of a stored agent, owned by the requester of
+    /// [`turn`] when `owners`, with a public turn running, and its session
+    /// directory's `work/` holding `in.txt` and a 2000-byte `big.bin`.
+    async fn agent_process(&self, owners: bool) -> (ProcessInfo, ProcessToken, PathBuf) {
+        let now = OffsetDateTime::now_utc();
+        let requester = turn(TurnKind::Normal, Side::Public).requester.key;
+        let owner_key = if owners {
+            requester.clone()
+        } else {
+            MemberKey {
+                user: "U0OWNER".into(),
+                ..requester.clone()
+            }
+        };
+        let owner = self
+            .store
+            .ensure_member(&owner_key, "owner", now)
+            .await
+            .unwrap();
+        let team = "T1".into();
+        let store::AgentCreation::Created(agent, _) = self
+            .store
+            .create_agent(
+                &store::NewAgent {
+                    owner,
+                    name: "helper",
+                    persona: "p",
+                    visibility: store::Visibility::Public,
+                    surface: SurfaceKind::Slack,
+                    team: &team,
+                },
+                10,
+                now,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        let info = ProcessInfo {
+            session: SessionId::new_v4(),
+            agent: agent.id,
+            volume: VolumeKey {
+                agent: agent.id,
+                scope: ScopeKey::Channel(conv("C1")),
+            },
+            container_ip: CONTAINER.parse().unwrap(),
+        };
+        let token = self.ctl.issue_process_token(info.clone()).await.unwrap();
+        let mut running = public();
+        running.requester.member = owners.then_some(owner);
+        self.ctl.begin_turn(&token, running).await.unwrap();
+        let session_dir = self
+            .dir
+            .0
+            .join(sandbox::volume_rel_path(&info.volume))
+            .join("sessions")
+            .join(info.session.to_string());
+        std::fs::create_dir_all(session_dir.join("work")).unwrap();
+        std::fs::write(session_dir.join("work/in.txt"), "input").unwrap();
+        std::fs::write(session_dir.join("work/big.bin"), vec![b'x'; 2000]).unwrap();
+        (info, token, session_dir)
+    }
+}
+
+#[tokio::test]
+async fn private_records_a_consent_and_stages_its_files_at_once() {
+    let fixture = Fixture::new().await;
+    let (info, token, _) = fixture.agent_process(false).await;
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/private",
+            json!({"task": "Summarize my notes", "files": ["work/in.txt"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let id: ConsentId = value["consent"].as_str().unwrap().parse().unwrap();
+    let consent = fixture.store.consent(id).await.unwrap().unwrap();
+    assert_eq!(consent.state, store::ConsentState::Pending);
+    assert_eq!(consent.task, "Summarize my notes");
+    assert_eq!(consent.agent, info.agent);
+    assert_eq!(consent.origin_session, info.session);
+    assert_eq!(consent.thread, thread());
+    assert_eq!(consent.requester.key.user.as_str(), "U1");
+    assert_eq!(crate::consents::attachments(&consent), ["in.txt"]);
+    let staged = fixture
+        .dir
+        .0
+        .join("consents")
+        .join(id.to_string())
+        .join("0");
+    assert_eq!(std::fs::read_to_string(staged).unwrap(), "input");
+    let ttl = consent.expires_at - consent.created_at;
+    assert_eq!(ttl, time::Duration::days(1));
+
+    for _ in 1..MAX_PRIVATE_TASKS {
+        let (status, value) = fixture
+            .call(
+                Some(&token),
+                "/v1/private",
+                json!({"task": "again", "files": []}),
+            )
+            .await;
+        assert_eq!(status, 200, "{value}");
+    }
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/private",
+            json!({"task": "again", "files": []}),
+        )
+        .await;
+    assert_eq!((status, code(&value)), (403, "refused"), "{value}");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("already asked for 3")
+    );
+
+    let (owners_info, owners, _) = fixture.agent_process(true).await;
+    let (status, value) = fixture
+        .call(
+            Some(&owners),
+            "/v1/private",
+            json!({"task": "mine", "files": []}),
+        )
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let id: ConsentId = value["consent"].as_str().unwrap().parse().unwrap();
+    let consent = fixture.store.consent(id).await.unwrap().unwrap();
+    assert_eq!(consent.state, store::ConsentState::Approved);
+    assert_eq!(consent.agent, owners_info.agent);
+}
+
+#[tokio::test]
+async fn private_refuses_bad_tasks_and_files_and_records_nothing() {
+    let fixture = Fixture::new().await;
+    let (_, token, _) = fixture.agent_process(false).await;
+    let long = "x".repeat(crate::consents::MAX_TASK_CHARS + 1);
+    let many: Vec<String> = (0..=crate::consents::MAX_FILES)
+        .map(|i| format!("work/{i}"))
+        .collect();
+    for (body, status, expected) in [
+        (json!({"task": "  ", "files": []}), 400, "the task is empty"),
+        (
+            json!({"task": long, "files": []}),
+            400,
+            "over 3000 characters",
+        ),
+        (json!({"task": "t", "files": many}), 400, "at most 10 files"),
+        (
+            json!({"task": "t", "files": ["work/none"]}),
+            404,
+            "doesn't exist",
+        ),
+        (
+            json!({"task": "t", "files": ["work/big.bin"]}),
+            413,
+            "attachment limit",
+        ),
+        (json!({"task": "t", "files": ["../x"]}), 400, "not a path"),
+        (
+            json!({"task": "t", "files": ["work"]}),
+            400,
+            "not a regular file",
+        ),
+        (json!({"task": "t"}), 400, "valid private request"),
+    ] {
+        let (got, value) = fixture.call(Some(&token), "/v1/private", body).await;
+        assert_eq!(got, status, "{value}");
         assert!(
-            value["message"]
-                .as_str()
-                .unwrap()
-                .contains("not available yet")
+            value["message"].as_str().unwrap().contains(expected),
+            "{value}"
         );
     }
+    let staged = fixture.dir.0.join("consents");
+    let left = std::fs::read_dir(&staged).map_or(0, Iterator::count);
+    assert_eq!(left, 0, "a refused request leaves no files");
+
+    let (_, unknown) = fixture.process().await;
+    fixture.ctl.begin_turn(&unknown, public()).await.unwrap();
+    let (status, value) = fixture
+        .call(
+            Some(&unknown),
+            "/v1/private",
+            json!({"task": "t", "files": []}),
+        )
+        .await;
+    assert_eq!((status, code(&value)), (403, "refused"));
 }
 
 async fn lock(fixture: &Fixture, token: &ProcessToken, body: Value) -> Value {

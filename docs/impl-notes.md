@@ -7210,3 +7210,127 @@ would let a bot post in any public channel, is off unless
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
+
+## T33: Consent cards and private tasks
+
+### What `--file` names, and how files cross in
+
+**Issue.** The plan says `--file` takes "paths in the calling session's
+directory", but the CLI sees container paths (`/volume/sessions/<id>/…` in
+Docker, host paths in the process sandbox), and the directory is the
+agent's to write, so a path could point anywhere through a symlink.
+
+**Solution.** agentctl turns each path, relative to its working directory
+or absolute, into one relative to the session directory, the parent of
+`$CLAUDE_CONFIG_DIR`, resolving `.` and `..` as written, and refuses a path
+outside it; `PrivateRequest::files` now documents that form. agentd checks
+every path again: only plain components, opened one by one from the
+session directory's handle with `O_NOFOLLOW` (directories with `O_PATH`,
+the file with `O_NONBLOCK` so a FIFO can't hold the request), a regular file
+of at most `[limits] attach_max_bytes`, a plain file name (the check
+`agentctl attach` uses), no two files of one name, at most 10. The files
+are copied at request time into `consents/<id>/` under the data directory
+(`0700`, files `0600`), so what the owner approves is what the channel turn
+had when it asked, and `attachments_json` holds their names. The task's
+session gets them in its `work/` before its first turn, through
+`SessionManager::work_dir`, which makes the new session's directory on its
+volume with the sandbox's `ensure_volume`. They are deleted once the
+consent's work is done; a sweep deletes directories no unfinished consent
+owns after ten minutes, for requests that failed half way.
+
+The task text is refused when empty or over 3000 characters, what a Slack
+plain-text section holds.
+
+### Everything a consent owes is in its row
+
+**Issue.** Consent can take a day, across deploys and instances, and the
+card, the expiry, the task and the outcome must each happen once.
+
+**Solution.** `consents` (`20260930250000`) holds the plan's columns and the
+delivery state. The card is claimed like the relink notice: a conditional
+`UPDATE` counts the attempt and sets a 10-minute lease, a failed send
+backs off a minute, and after 10 attempts the card is left to expire. A
+decision is one conditional `UPDATE` on a pending consent whose expiry
+hasn't passed, and so is an expiry, so neither overrides the other. The
+work a decided consent owes (run the task, or post the outcome) is leased
+too, 10 minutes, renewed every third of that while the task runs; only the
+latest claim can finish it. A task that fails before reaching the model is
+tried again a minute later, and after three claims the thread is told it
+couldn't be run. A task cut short by a shutdown runs again from scratch
+once its lease ends, in a new session; the thread may then see its result
+twice, never none.
+
+`Consents::run` does all of it in one loop, as the other periodic workers
+do: at startup, on a `Notify` that `agentctl private` and every decision
+wake, and every 30 seconds. `Server::run` starts it only with a pipeline,
+since without one no turn can ask. Consents read the system clock, never
+the pipeline's, which tests pin.
+
+### How the task runs
+
+**Issue.** The plan fixes the session, credential, side and kind, but not
+how the task shares the pipeline's capacity, how it is billed, or what its
+failures say.
+
+**Solution.** The pipeline does the work (`Pipeline::settle_consents`). An
+approved task holds a place under `max_pending` and one among its owner's
+agents' messages, like a message, and waits for the next pass when none is
+free; it runs in the pipeline's task set, so shutdown drains or cuts it
+like a turn. It is billed to the owner as the owner's own turn (it runs on
+their account, and doesn't count toward the agent's daily cap for others),
+and counts toward the thread's caps. A failure on the credential says it
+was the owner's account (`PRIVATE_USAGE_LIMIT_TEXT`, `PRIVATE_LOGIN_TEXT`),
+and nobody is told privately. The reply is headed ``*Private task `<id>`:*``
+so the channel's next turn can match it to what it asked. Its container is
+stopped as soon as the turn is delivered. A paused agent's approved task
+doesn't run; the thread is told it couldn't be.
+
+### Outcomes without a session
+
+**Issue.** Declined and expired outcomes are "posted the same way", with a
+`message_refs` row, but no session ran.
+
+**Solution.** Their rows carry the consent's id as the session id (the
+column has no foreign key), with the consent's requester and hop and no
+turn, so `posted_elsewhere` shows them to the channel session like a
+result.
+
+### Slack's buttons are commands
+
+**Issue.** The plan handles the buttons on `/slack/b/manager/interactivity`,
+and only the owner may decide.
+
+**Solution.** A `block_actions` payload whose action is the card's
+(`block_id` `consent`, `consent_approve` or `consent_decline`, the consent
+id as `value`) becomes `approve <id>` or `decline <id>` from whoever clicked
+(`team.id` and `user.id` of the signed payload), answered through its
+`response_url`, and goes to the command intake like a slash command. So a
+click, a Slack DM and a Rocket.Chat DM all reach `Consents::decide`, which
+maps the identity to its member and refuses anyone but the agent's owner
+with the same answer as for an unknown id. Nothing else in the payload is
+trusted: which message was clicked doesn't matter. Once decided or expired,
+the card is updated once (`chat.update` with the outcome in place of the
+buttons); on Rocket.Chat its first message is edited to the outcome.
+
+The Slack card shows the task in a `plain_text` section, so mrkdwn and
+`<!channel>` in it show as typed. The Rocket.Chat card fences it with more
+backticks than it holds. Both say the task can read the owner's shared files
+but not change them: a card is only ever sent for someone other than the
+owner. `WebApi` gains `post_blocks` and `update_blocks`, and `Replies`
+`dm_rich` and `update_rich`; `Replies::with_slack` now takes the manager
+app.
+
+### Smaller choices
+
+- `[limits] consent_ttl_secs` (default 86400, from 1 to 30 days) rather than
+  the plan's `consent_ttl`, after the other `_secs` keys.
+- A turn may ask for three private tasks (`ctl::MAX_PRIVATE_TASKS`), counted
+  on its outbox like its posts, so a turn talked into a loop can't flood the
+  owner with cards or the disk with copies. A refused request doesn't
+  count.
+- The card goes to the owner's identity on the task's surface and team, or
+  else any a manager bot reaches; with none, it waits unclaimed until it
+  expires.
+- The owner's own task is approved at once, whatever the hop, as the plan
+  says: a channel turn the owner started can ask for a task on the owner's
+  side with no card, even when another agent's post prompted it.

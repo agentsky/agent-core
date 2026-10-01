@@ -7,6 +7,7 @@ use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use agentd::consents::ConsentSettings;
 use agentd::ctl::{Ctl, CtlSettings, ProcessInfo, ProcessToken, STAGING_DIR, SurfaceLookup, Turn};
 use axum::Json;
 use axum::extract::State;
@@ -85,6 +86,7 @@ impl Server {
             staging_dir: dir.path(STAGING_DIR),
             attach_max_bytes: 1024,
             lease_ttl: Duration::from_secs(30),
+            consents: ConsentSettings::in_data_dir(&dir.0),
         };
         tune(&mut settings);
         let surface = Arc::new(MockSurface::new());
@@ -332,7 +334,19 @@ async fn each_subcommand_works_against_the_server() {
     server
         .run(&token, &["private", "--file", "notes.md", "check", "it"])
         .await
-        .refused("agentctl private is not available yet");
+        .refused("CLAUDE_CONFIG_DIR is not set");
+    let output = server
+        .agentctl(&token)
+        .env("CLAUDE_CONFIG_DIR", server.dir.path("claude"))
+        .args(["private", "--file", "../elsewhere.md", "check", "it"])
+        .output()
+        .await
+        .unwrap();
+    Run::from(output).refused("../elsewhere.md is not in this session's directory");
+    server
+        .run(&token, &["private", "check", "it"])
+        .await
+        .refused("the agent was deleted");
 
     let outbox = server.ctl.end_turn(&token).await.unwrap().unwrap();
     assert_eq!(outbox.attachments().len(), 1);
@@ -1051,10 +1065,7 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
             true,
             "Exit code 1\nagentctl: agentctl ask-agent is not available yet",
         ),
-        (
-            true,
-            "Exit code 1\nagentctl: agentctl private is not available yet",
-        ),
+        (true, "Exit code 1\nagentctl: the agent was deleted"),
     ];
     let results: Vec<(bool, &str)> = results.iter().map(|(e, c)| (*e, c.as_str())).collect();
     assert_eq!(results, expected);

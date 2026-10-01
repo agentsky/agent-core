@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -398,6 +399,42 @@ impl<H: TurnHooks> SessionManager<H> {
             .store
             .create_private_session(agent, consent, thread, OffsetDateTime::now_utc())
             .await?)
+    }
+
+    /// The `work/` directory of `session`, as agentd sees it, made with
+    /// the session's directory, and its volume if that is missing, so files
+    /// can be handed to a new session before its first turn, as a private
+    /// task's are. Directories already there are kept as they are.
+    ///
+    /// Call it only for a session no container has run yet: nothing in a
+    /// sandbox can have touched a directory made here, and the sandbox
+    /// repairs the session's directories before starting its container.
+    ///
+    /// # Errors
+    ///
+    /// [`RunnerError::Sandbox`] if the volume couldn't be made, and
+    /// [`RunnerError::Io`] if a directory couldn't.
+    pub async fn work_dir(&self, session: &Session) -> Result<PathBuf> {
+        let volume = self.inner.sandbox.ensure_volume(&session.volume()).await?;
+        let session_dir = volume.session_dir(session.id);
+        let work = session_dir.join("work");
+        let made = work.clone();
+        tokio::task::spawn_blocking(move || {
+            for dir in [&session_dir, &made] {
+                match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+                    Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err),
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RunnerError::TurnTask)?
+        .map_err(|source| RunnerError::Io {
+            what: "making a session's work directory",
+            source,
+        })?;
+        Ok(work)
     }
 
     /// Resets `session`: once the turns queued before it have run, stops

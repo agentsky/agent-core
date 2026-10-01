@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use agentd::consents::ConsentSettings;
 use agentd::ctl::{Ctl, CtlSettings, NoSurfaces};
 use agentd::pipeline::{Hooks, connect_docker};
 use agentd::{App, Config};
@@ -362,6 +363,7 @@ async fn docker_real_claude_starts() {
             staging_dir: data_dir.join("ctl-outbox"),
             attach_max_bytes: 1024,
             lease_ttl: Duration::from_secs(30),
+            consents: ConsentSettings::in_data_dir(&data_dir),
         },
         Arc::new(NoSurfaces),
     );

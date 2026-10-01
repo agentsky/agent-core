@@ -10,10 +10,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use core_types::{
-    ConvRef, ConversationId, MemberKey, ReplyTarget, Surface, SurfaceError, SurfaceKind,
+    ConvRef, ConversationId, MemberKey, MsgRef, ReplyTarget, Surface, SurfaceError, SurfaceKind,
+    TeamId,
 };
 use secrecy::SecretString;
-use surface_slack::SlackClient;
+use serde_json::Value;
+use surface_slack::{SlackClient, WebApi};
+
+use crate::slack::manager::SlackManager;
 
 use super::Origin;
 
@@ -67,8 +71,8 @@ impl ManagerBot {
         &self.identity
     }
 
-    fn serves(&self, member: &MemberKey) -> bool {
-        member.surface == self.identity.surface && member.team == self.identity.team
+    fn serves(&self, surface: SurfaceKind, team: &TeamId) -> bool {
+        surface == self.identity.surface && *team == self.identity.team
     }
 
     /// Markdown `text` rendered and split for the surface.
@@ -82,6 +86,15 @@ impl ManagerBot {
     ///
     /// The first [`SurfaceError`]; chunks after it aren't posted.
     pub async fn post(&self, room: &ConversationId, text: &str) -> Result<(), SurfaceError> {
+        self.post_first(room, text).await.map(drop)
+    }
+
+    /// [`post`](Self::post), returning the first chunk's message, if any.
+    async fn post_first(
+        &self,
+        room: &ConversationId,
+        text: &str,
+    ) -> Result<Option<MsgRef>, SurfaceError> {
         let to = ReplyTarget {
             conv: ConvRef {
                 surface: self.identity.surface,
@@ -90,10 +103,12 @@ impl ManagerBot {
             },
             thread_root: None,
         };
+        let mut first = None;
         for chunk in self.surface.render(text) {
-            self.surface.post(&to, &chunk).await?;
+            let posted = self.surface.post(&to, &chunk).await?;
+            first.get_or_insert(posted);
         }
-        Ok(())
+        Ok(first)
     }
 
     /// Sends Markdown `text` to `member` in the manager bot's DM with them.
@@ -117,6 +132,18 @@ impl ManagerBot {
     }
 }
 
+/// A message with more than Markdown where the surface shows it: a
+/// consent card, with buttons on Slack.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rich {
+    /// The whole message as Markdown, for surfaces without blocks.
+    pub markdown: String,
+    /// The notification's text on Slack, beside the blocks.
+    pub fallback: String,
+    /// The message as Slack Block Kit, when there is one.
+    pub blocks: Option<Value>,
+}
+
 /// Sends private replies through the manager bot of each surface.
 ///
 /// Cloning is cheap and shares the bots.
@@ -126,12 +153,13 @@ pub struct Replies {
     slack: Option<SlackReplies>,
 }
 
-/// The Slack manager app's bot, and the client that answers through a
-/// `response_url`.
+/// The Slack manager app's bot, the client that answers through a
+/// `response_url`, and the bot's Web API, which posts blocks.
 #[derive(Debug, Clone)]
 struct SlackReplies {
     bot: Arc<ManagerBot>,
     client: SlackClient,
+    api: WebApi,
 }
 
 impl Replies {
@@ -144,21 +172,34 @@ impl Replies {
         }
     }
 
-    /// Also replies on Slack: DMs through `bot`, the Slack manager app's
-    /// bot, and slash command replies through their `response_url` with
-    /// `client`.
-    pub fn with_slack(mut self, bot: Arc<ManagerBot>, client: SlackClient) -> Self {
-        self.slack = Some(SlackReplies { bot, client });
+    /// Also replies on Slack as the manager app `manager`: DMs through its
+    /// bot, and slash command replies through their `response_url`.
+    pub fn with_slack(mut self, manager: &SlackManager) -> Self {
+        self.slack = Some(SlackReplies {
+            bot: Arc::new(manager.manager_bot()),
+            client: manager.client().clone(),
+            api: manager.surface().api().clone(),
+        });
         self
     }
 
     fn bot_for(&self, member: &MemberKey) -> Result<&ManagerBot, ReplyError> {
-        let bot = match member.surface {
+        self.bot_on(member.surface, &member.team)
+    }
+
+    fn bot_on(&self, surface: SurfaceKind, team: &TeamId) -> Result<&ManagerBot, ReplyError> {
+        let bot = match surface {
             SurfaceKind::Slack => self.slack.as_ref().map(|slack| &*slack.bot),
             SurfaceKind::RocketChat => self.rocketchat.as_deref(),
         };
-        bot.filter(|bot| bot.serves(member))
-            .ok_or(ReplyError::NoManagerBot(member.surface))
+        bot.filter(|bot| bot.serves(surface, team))
+            .ok_or(ReplyError::NoManagerBot(surface))
+    }
+
+    fn slack_on(&self, surface: SurfaceKind, team: &TeamId) -> Option<&SlackReplies> {
+        self.slack
+            .as_ref()
+            .filter(|slack| slack.bot.serves(surface, team))
     }
 
     /// Answers a slash command privately through its `response_url`, with
@@ -223,5 +264,61 @@ impl Replies {
     /// As for [`reply_private`](Self::reply_private).
     pub async fn dm_room(&self, member: &MemberKey) -> Result<ConversationId, ReplyError> {
         Ok(self.bot_for(member)?.dm_room(member).await?)
+    }
+
+    /// Sends `message` to `member` in a DM from the manager bot: its
+    /// blocks on Slack, its Markdown elsewhere. Returns where it went, the
+    /// first chunk's message for Markdown split in several.
+    ///
+    /// # Errors
+    ///
+    /// As for [`reply_private`](Self::reply_private).
+    pub async fn dm_rich(&self, member: &MemberKey, message: &Rich) -> Result<MsgRef, ReplyError> {
+        let bot = self.bot_for(member)?;
+        let room = bot.dm_room(member).await?;
+        let conv = ConvRef {
+            surface: member.surface,
+            team: member.team.clone(),
+            conversation: room.clone(),
+        };
+        if let (Some(slack), Some(blocks)) =
+            (self.slack_on(member.surface, &member.team), &message.blocks)
+        {
+            let id = slack
+                .api
+                .post_blocks(&room, &message.fallback, blocks)
+                .await?;
+            return Ok(MsgRef { conv, id });
+        }
+        bot.post_first(&room, &message.markdown)
+            .await?
+            .ok_or_else(|| ReplyError::Surface(SurfaceError::Api("nothing to post".to_owned())))
+    }
+
+    /// Replaces the manager bot's message `msg`, which
+    /// [`dm_rich`](Self::dm_rich) sent, with `message`: its blocks on
+    /// Slack, and elsewhere the first chunk of its Markdown.
+    ///
+    /// # Errors
+    ///
+    /// As for [`reply_private`](Self::reply_private).
+    pub async fn update_rich(&self, msg: &MsgRef, message: &Rich) -> Result<(), ReplyError> {
+        let conv = &msg.conv;
+        let bot = self.bot_on(conv.surface, &conv.team)?;
+        if let (Some(slack), Some(blocks)) =
+            (self.slack_on(conv.surface, &conv.team), &message.blocks)
+        {
+            slack
+                .api
+                .update_blocks(&msg.conv.conversation, &msg.id, &message.fallback, blocks)
+                .await?;
+            return Ok(());
+        }
+        let text = bot
+            .render(&message.markdown)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Ok(bot.surface.edit(msg, &text).await?)
     }
 }

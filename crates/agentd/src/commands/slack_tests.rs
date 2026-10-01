@@ -13,18 +13,21 @@ use core_types::{
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
-use surface_slack::{BindingRef, InFlight, SlackClient, SlackEvent, SlackInbound, SlashCommand};
+use surface_slack::{
+    BindingRef, InFlight, Interaction, SlackClient, SlackEvent, SlackInbound, SlashCommand,
+};
 use time::OffsetDateTime;
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::intake::CommandIntake;
-use super::slack::{dm_command, member_who_left, slash_command};
+use super::slack::{consent_action, dm_command, member_who_left, slash_command};
 use super::slack_tokens::{
     ConfigTokenRotator, NOTICE_LEASE, NOTICE_MAX_ATTEMPTS, ROTATION_LEASE, RotationPass,
     STORE_ATTEMPTS, broken_token_notice,
 };
 use super::*;
+use crate::consents::ConsentSettings;
 use crate::slack::Inbound;
 use crate::slack::manager::{ManagerIdentity, SlackManager};
 use crate::telemetry::tests::global_logs;
@@ -71,6 +74,7 @@ struct SlackHarness {
     store: Store,
     data: TempDir,
     commands: Commands,
+    consents: Consents,
     slack: MockServer,
     manager: SlackManager,
     hooks: std::sync::atomic::AtomicUsize,
@@ -121,10 +125,11 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         client.bot(SecretString::from(BOT_TOKEN)),
         identity(),
     );
-    let replies = Replies::new(None).with_slack(Arc::new(manager.manager_bot()), client);
+    let replies = Replies::new(None).with_slack(&manager);
     let data = TempDir::new();
     let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
     let skills = crate::skills::Skills::new(store.clone(), data.0.clone(), git);
+    let consents = Consents::new(store.clone(), ConsentSettings::in_data_dir(&data.0));
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
@@ -132,11 +137,13 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         None,
         Some(manager.clone()),
         skills,
-    );
+    )
+    .with_consents(consents.clone());
     SlackHarness {
         store,
         data,
         commands,
+        consents,
         slack,
         manager,
         hooks: std::sync::atomic::AtomicUsize::new(0),
@@ -1808,5 +1815,220 @@ async fn a_slack_channel_token_is_a_rule_shown_by_its_name() {
     assert_eq!(
         h.slash("U0HUMAN01", "deny helper <#C0CHAN003>").await,
         ["Only you and `#general` may use `helper`, except `#C0CHAN003`."]
+    );
+}
+
+/// A click by `user` on the consent card button `action` of consent
+/// `value`, answered through `response_url`, from the fixture's payload.
+fn click(user: &str, action: &str, value: &str, response_url: SecretString) -> Interaction {
+    let mut payload: Value = serde_json::from_str(testkit::slack::BLOCK_ACTIONS).unwrap();
+    payload["user"]["id"] = json!(user);
+    payload["actions"][0]["action_id"] = json!(action);
+    payload["actions"][0]["value"] = json!(value);
+    let Value::Object(payload) = payload else {
+        unreachable!()
+    };
+    Interaction {
+        binding: BindingRef::MANAGER_ID,
+        kind: "block_actions".to_owned(),
+        sender: Some(slack_key(user)),
+        response_url: Some(response_url),
+        payload,
+        received_at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[test]
+fn only_a_consent_cards_buttons_are_commands() {
+    let (url, _) = (SecretString::from("https://hooks.slack.com/actions/x"), ());
+    let id = core_types::ConsentId::new_v4();
+    let (member, text, origin) = consent_action(click(
+        "U0OWNER",
+        crate::consents::card::DECLINE_ACTION,
+        &id.to_string(),
+        url.clone(),
+    ))
+    .unwrap();
+    assert_eq!(member, slack_key("U0OWNER"));
+    assert_eq!(text, format!("decline {id}"));
+    assert!(matches!(
+        origin,
+        Origin::SlackSlash { ref conv, .. } if conv.conversation.as_str() == "D0MGRDM01"
+    ));
+    let mut other = click("U0OWNER", "something_else", &id.to_string(), url.clone());
+    assert!(consent_action(other).is_none());
+    other = click("U0OWNER", "consent_approve", "not-an-id", url.clone());
+    assert!(consent_action(other).is_none());
+    other = click("U0OWNER", "consent_approve", &id.to_string(), url.clone());
+    other.kind = "view_submission".to_owned();
+    assert!(consent_action(other).is_none());
+    other = click("U0OWNER", "consent_approve", &id.to_string(), url.clone());
+    other.payload["actions"][0]["block_id"] = json!("elsewhere");
+    assert!(consent_action(other).is_none());
+    other = click("U0OWNER", "consent_approve", &id.to_string(), url.clone());
+    other.sender = None;
+    assert!(consent_action(other).is_none());
+    other = click("U0OWNER", "consent_approve", &id.to_string(), url);
+    other.response_url = None;
+    assert!(consent_action(other).is_none());
+}
+
+#[tokio::test]
+async fn only_owner_can_decide() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ok(json!({"ts": "1727700000.000100"})))
+        .mount(&h.slack)
+        .await;
+    let owner = h.linked("U0OWNER").await;
+    let bob = h.linked("U0BOB").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let id = core_types::ConsentId::new_v4();
+    let now = OffsetDateTime::now_utc();
+    h.store
+        .create_consent(
+            &store::NewConsent {
+                id,
+                agent: agent.id,
+                requester: &core_types::Requester {
+                    member: Some(bob),
+                    key: slack_key("U0BOB"),
+                },
+                hop: core_types::Hop::ZERO,
+                task: "Read my *notes* <!channel>",
+                attachments_json: "[]",
+                thread: &core_types::ThreadKey {
+                    conv: slack_channel("C0CHAN001"),
+                    root: Some("1727697600.000100".into()),
+                },
+                origin_session: core_types::SessionId::new_v4(),
+                expires_at: now + time::Duration::hours(1),
+                approved_by_owner: None,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        h.consents.send_cards(h.commands.replies()).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        h.consents.send_cards(h.commands.replies()).await.unwrap(),
+        0
+    );
+    let posted = h.calls("chat.postMessage").await;
+    assert_eq!(posted.len(), 1);
+    let card = json_body(&posted[0]);
+    assert_eq!(
+        card["channel"], "D0DM00001",
+        "the owner's DM with the manager app"
+    );
+    assert_eq!(
+        card["blocks"][1]["text"],
+        json!({"type": "plain_text", "text": "Read my *notes* <!channel>", "emoji": false})
+    );
+    assert!(
+        card["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<@U0BOB>")
+    );
+    let actions = card["blocks"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(actions["elements"][0]["value"], id.to_string());
+    let opened = h.calls("conversations.open").await;
+    assert!(String::from_utf8_lossy(&opened[0].body).contains("U0OWNER"));
+    let recorded = h.store.consent(id).await.unwrap().unwrap().card.unwrap();
+    assert_eq!(recorded.conv.conversation.as_str(), "D0DM00001");
+    assert_eq!(recorded.id.as_str(), "1727700000.000100");
+
+    let running = Running::start(&h);
+    let answer = async |user: &str, action: &str, value: &str| {
+        let (url, hook) = h.response_url();
+        running
+            .send(SlackInbound::Interaction(click(user, action, value, url)))
+            .await;
+        wait_for(async || {
+            h.requests()
+                .await
+                .into_iter()
+                .find(|request| request.url.path() == hook)
+                .map(|request| json_body(&request)["text"].as_str().unwrap().to_owned())
+        })
+        .await
+    };
+    for user in ["U0BOB", "U0EVE"] {
+        let reply = answer(user, "consent_approve", &id.to_string()).await;
+        assert!(reply.contains("is waiting for you"), "{user}: {reply}");
+        let reply = answer(user, "consent_decline", &id.to_string()).await;
+        assert!(reply.contains("only the owner"), "{user}: {reply}");
+    }
+    h.commands
+        .handle_text(
+            &slack_key("U0BOB"),
+            &format!("approve {id}"),
+            &Origin::SlackDm {
+                channel: "D0DM00002".into(),
+            },
+            &[],
+        )
+        .await;
+    assert_eq!(
+        h.store.consent(id).await.unwrap().unwrap().state,
+        store::ConsentState::Pending,
+        "nobody but the owner decided"
+    );
+    let other = core_types::ConsentId::new_v4().to_string();
+    let reply = answer("U0OWNER", "consent_approve", &other).await;
+    assert!(reply.contains("is waiting for you"), "{reply}");
+
+    let reply = answer("U0OWNER", "consent_approve", &id.to_string()).await;
+    assert!(reply.starts_with("Approved private task"), "{reply}");
+    let decided = h.store.consent(id).await.unwrap().unwrap();
+    assert_eq!(decided.state, store::ConsentState::Approved);
+    assert_eq!(decided.decided_by, Some(slack_key("U0OWNER")));
+    let reply = answer("U0OWNER", "consent_decline", &id.to_string()).await;
+    assert!(reply.contains("was already approved"), "{reply}");
+    running.stop().await;
+
+    assert_eq!(
+        h.consents.close_cards(h.commands.replies()).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        h.consents.close_cards(h.commands.replies()).await.unwrap(),
+        0
+    );
+    let updated = h.calls("chat.update").await;
+    assert_eq!(updated.len(), 1);
+    let update = json_body(&updated[0]);
+    assert_eq!(update["channel"], "D0DM00001");
+    assert_eq!(update["ts"], "1727700000.000100");
+    let text = update["blocks"].to_string();
+    assert!(text.contains("Approved by <@U0OWNER>."), "{text}");
+    assert!(
+        !text.contains("consent_approve"),
+        "the buttons are gone: {text}"
     );
 }

@@ -29,6 +29,10 @@
 //! 3. a turn is running on the token, and
 //! 4. the command is `attach`, or the turn is not a private task.
 //!
+//! `agentctl private` records a consent in [`Consents`](crate::consents)
+//! and returns its id at once; the task runs later, in a session of its
+//! own.
+//!
 //! The handlers then apply the target rules in [`target`](self) (from the
 //! turn's [`Side`](core_types::Side)) and write to the turn's [`Outbox`],
 //! which [`end_turn`](Ctl::end_turn) hands to the turn pipeline.
@@ -54,16 +58,22 @@ use axum::Router;
 use core_types::{AgentId, ConvRef, CtlErrorCode, OutFile, SessionId, Surface, TurnId, VolumeKey};
 use store::{CtlPurged, CtlTurn, NewCtlToken, Store, StoreError, TokenHash};
 
+use crate::consents::{ConsentSettings, Consents};
+
 pub use api::{DEFAULT_HISTORY_LIMIT, JSON_BODY_LIMIT, MAX_HISTORY_LIMIT};
 pub use outbox::{MAX_ATTACHMENTS, MAX_POSTS, MAX_REACTIONS, Outbox, QueuedPost, QueuedReaction};
 pub use store::CtlTurn as Turn;
 pub use token::ProcessToken;
 
-pub(crate) use api::is_invisible;
 use api::{ApiError, Authorized, no_turn};
+pub(crate) use api::{is_invisible, is_plain_file_name};
+pub(crate) use outbox::{create_private_dir, remove_dir};
 
 /// The longest message `agentctl post` accepts, in bytes.
 pub const MAX_POST_BYTES: usize = 40_000;
+/// How many private tasks one turn may ask for, so a turn steered into a
+/// loop can't flood its owner with consent cards.
+pub const MAX_PRIVATE_TASKS: usize = 3;
 /// How long a `shared/` lease lasts unless renewed.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 /// The directory under the data directory where attachments are staged.
@@ -103,6 +113,8 @@ pub struct CtlSettings {
     pub attach_max_bytes: u64,
     /// How long a `shared/` lease lasts unless renewed.
     pub lease_ttl: Duration,
+    /// How `agentctl private` records consents.
+    pub consents: ConsentSettings,
 }
 
 impl CtlSettings {
@@ -112,6 +124,7 @@ impl CtlSettings {
             staging_dir: config.store.data_dir.join(STAGING_DIR),
             attach_max_bytes: config.limits.attach_max_bytes,
             lease_ttl: DEFAULT_LEASE_TTL,
+            consents: ConsentSettings::from_config(config),
         }
     }
 }
@@ -159,14 +172,16 @@ struct Inner {
     store: Store,
     settings: CtlSettings,
     surfaces: Arc<dyn SurfaceLookup>,
+    consents: Consents,
     outboxes: Mutex<HashMap<TokenHash, Entry>>,
 }
 
-/// A running turn's outbox, and how many attachments are being uploaded
-/// into it.
+/// A running turn's outbox, how many attachments are being uploaded into
+/// it, and how many private tasks it asked for or is asking for.
 struct Entry {
     outbox: Outbox,
     uploading: usize,
+    private_tasks: usize,
 }
 
 impl std::fmt::Debug for Ctl {
@@ -178,16 +193,24 @@ impl std::fmt::Debug for Ctl {
 }
 
 impl Ctl {
-    /// A ctl server over `store`.
+    /// A ctl server over `store`, recording `agentctl private`'s consents
+    /// there.
     pub fn new(store: Store, settings: CtlSettings, surfaces: Arc<dyn SurfaceLookup>) -> Self {
+        let consents = Consents::new(store.clone(), settings.consents.clone());
         Self {
             inner: Arc::new(Inner {
                 store,
                 settings,
                 surfaces,
+                consents,
                 outboxes: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// The consents `agentctl private` asks for.
+    pub fn consents(&self) -> &Consents {
+        &self.inner.consents
     }
 
     /// The API's routes, for the ctl listener. Requests must carry the
@@ -284,6 +307,7 @@ impl Ctl {
         let entry = Entry {
             outbox: Outbox::new(turn.id, staging),
             uploading: 0,
+            private_tasks: 0,
         };
         self.outboxes().insert(hash, entry);
         match self.store().set_ctl_turn(&hash, Some(&turn)).await {
@@ -346,6 +370,37 @@ impl Ctl {
         match outboxes.get_mut(&caller.hash) {
             Some(entry) if entry.outbox.turn() == caller.turn.id => add(&mut entry.outbox),
             _ => Err(no_turn()),
+        }
+    }
+
+    /// Counts a private task the caller's turn asks for, or refuses once it
+    /// asked for [`MAX_PRIVATE_TASKS`], or with [`CtlErrorCode::NoTurn`] if
+    /// that turn has ended. A request that fails gives its count back with
+    /// [`release_private_task`](Self::release_private_task).
+    fn reserve_private_task(&self, caller: &Authorized) -> Result<(), ApiError> {
+        let mut outboxes = self.outboxes();
+        let entry = match outboxes.get_mut(&caller.hash) {
+            Some(entry) if entry.outbox.turn() == caller.turn.id => entry,
+            _ => return Err(no_turn()),
+        };
+        if entry.private_tasks >= MAX_PRIVATE_TASKS {
+            return Err(ApiError(core_types::CtlError::new(
+                CtlErrorCode::Refused,
+                format!("this turn has already asked for {MAX_PRIVATE_TASKS} private tasks"),
+            )));
+        }
+        entry.private_tasks += 1;
+        Ok(())
+    }
+
+    /// Gives back the count [`reserve_private_task`](Self::reserve_private_task)
+    /// took, for a request that failed.
+    fn release_private_task(&self, caller: &Authorized) {
+        let mut outboxes = self.outboxes();
+        if let Some(entry) = outboxes.get_mut(&caller.hash)
+            && entry.outbox.turn() == caller.turn.id
+        {
+            entry.private_tasks = entry.private_tasks.saturating_sub(1);
         }
     }
 

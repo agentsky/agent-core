@@ -148,6 +148,19 @@ thread outside one-to-one DMs, whatever agents are in it:
 says so once per thread and window; when an agent refuses someone because
 they are banned or denied, the manager bot tells them privately, at most
 once a day.
+An agent that needs its owner's private resources asks with
+`agentctl private [--file <path>]... <task>`, which returns at once. The
+owner's own request runs right away; anyone else's waits for the owner to
+approve a consent card the manager bot sends them, with Approve and Decline
+buttons on Slack and `approve <id>` or `decline <id>` on Rocket.Chat, until
+`[limits] consent_ttl_secs` (default a day) passes. The task runs on the
+owner's account in a new session on the agent's private volume, with only
+the task text and the files named with `--file`, and with the owner's
+shared files read-only and no memory when someone else asked. Its reply and
+attached files, or the refusal or expiry, are posted in the thread that
+asked. Files wait in `consents/` under `store.data_dir` until then. A
+private task's sandbox shares the sandbox network with channel sandboxes,
+so it relies on the isolation described above.
 Community admins are the member identities `[community] admins` lists, as
 `<surface>:<team>:<user>`. An admin sets the community API key with
 `admin api-key set <key>` in the manager bot's direct message (or with

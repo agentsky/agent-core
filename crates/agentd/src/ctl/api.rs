@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use core_types::{
     Ack, AskAgentRequest, AttachRequest, AttachResponse, CtlError, CtlErrorCode, CtlRequest,
     Cursor, HistoryRequest, HistoryResponse, LockRequest, LockResponse, MsgRef, OutFile,
-    PostRequest, PrivateRequest, ReactRequest, SurfaceError, TurnKind,
+    PostRequest, PrivateRequest, PrivateResponse, ReactRequest, SurfaceError, TurnKind,
 };
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
@@ -28,6 +28,7 @@ use super::outbox::{QueuedPost, QueuedReaction};
 use super::target;
 use super::token::{MAX_PRESENTED_LEN, hash_token};
 use super::{Ctl, MAX_POST_BYTES};
+use crate::consents::{RequestError, StageError};
 
 /// The largest JSON request body.
 pub const JSON_BODY_LIMIT: usize = 64 * 1024;
@@ -336,16 +337,22 @@ async fn stage(
     Ok(AttachResponse { name, size })
 }
 
-/// Checks an attachment's display name: a plain file name, never a path.
-fn attachment_name(name: &str) -> Result<String, ApiError> {
-    let ok = !name.is_empty()
+/// Whether `name` is a plain file name, never a path: at most 255 bytes,
+/// not `.` or `..`, with no slash, backslash, control or invisible
+/// formatting character.
+pub(crate) fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && name != "."
         && name != ".."
         && !name
             .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c));
-    if ok {
+            .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c))
+}
+
+/// Checks an attachment's display name: a plain file name, never a path.
+fn attachment_name(name: &str) -> Result<String, ApiError> {
+    if is_plain_file_name(name) {
         Ok(name.to_owned())
     } else {
         Err(error(
@@ -611,12 +618,41 @@ async fn ask_agent(Caller(_): Caller) -> ApiError {
     )
 }
 
-/// `POST /v1/private`: not available until private tasks (T33).
-async fn private(Caller(_): Caller) -> ApiError {
-    error(
-        CtlErrorCode::NotAvailable,
-        "agentctl private is not available yet",
-    )
+/// `POST /v1/private`: records a consent for the task, with the files it
+/// names copied out of the caller's session directory, and returns its id
+/// at once. The task runs once the owner approves it, at once when the
+/// requester is the owner. A turn may ask for [`MAX_PRIVATE_TASKS`].
+///
+/// [`MAX_PRIVATE_TASKS`]: super::MAX_PRIVATE_TASKS
+async fn private(
+    State(ctl): State<Ctl>,
+    Caller(caller): Caller,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<PrivateResponse>, ApiError> {
+    let request: PrivateRequest = json_body(body, "private")?;
+    ctl.reserve_private_task(&caller)?;
+    let requested = ctl
+        .consents()
+        .request(&caller.token, &caller.turn, request)
+        .await;
+    if requested.is_err() {
+        ctl.release_private_task(&caller);
+    }
+    let consent = requested.map_err(|err| match err {
+        RequestError::BadRequest(message) => error(CtlErrorCode::BadRequest, message),
+        RequestError::Stage(StageError::TooLarge(..)) => {
+            error(CtlErrorCode::TooLarge, err.to_string())
+        }
+        RequestError::Stage(StageError::NotFound(_)) => {
+            error(CtlErrorCode::NotFound, err.to_string())
+        }
+        RequestError::Stage(StageError::Io(ref io)) => internal("staging a file", io),
+        RequestError::Stage(_) => error(CtlErrorCode::BadRequest, err.to_string()),
+        RequestError::NoAgent => error(CtlErrorCode::Refused, "the agent was deleted"),
+        RequestError::Store(ref store) => internal("recording a consent", store),
+        RequestError::Io(ref io) => internal("staging a consent's files", io),
+    })?;
+    Ok(Json(PrivateResponse { consent }))
 }
 
 #[cfg(test)]

@@ -125,9 +125,15 @@ and sees it exactly as you wrote it, so write it plainly. When the task
 finishes, agentd posts its result to this thread; you won't see it in this
 turn, so tell the requester that the result will follow.
 
-`--file` hands a file from this conversation's directory to the task;
-repeat it for several. Refused inside a private task. Not available yet on
-this server: it answers "not available yet".
+`--file` hands a file from this session's directory (your working
+directory, or anything else under the session directory) to the task, as it
+is now; repeat it for several, up to 10, each named differently. The task
+finds them in its working directory. Nothing else of this conversation
+reaches the task: put what it needs in the task text or a file. Its result
+comes back as a new message in this thread, headed `Private task <id>:`,
+with the files it attached; if your owner declines, or doesn't answer in
+time, that is posted instead. A turn may ask for three private tasks.
+Refused inside a private task.
 
 ## Inside a private task
 

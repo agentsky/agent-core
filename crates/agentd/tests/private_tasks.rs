@@ -1,0 +1,1022 @@
+//! Private tasks end to end: a channel turn in `fake-claude` asks for one
+//! with the real `agentctl private`, the owner decides it (or doesn't),
+//! and the task runs in a fresh session of its own in a process sandbox,
+//! with the real credential proxy and agentctl API on agentd's listeners
+//! and `fake_anthropic()` upstream.
+
+mod common;
+
+use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use agentd::commands::{ManagerBot, OpenDm, Replies};
+use agentd::consents::Decided;
+use agentd::ctl::SurfaceLookup;
+use agentd::pipeline::{Pipeline, PipelineSettings, TurnSettings, Turns};
+use agentd::server::{Routers, Server};
+use agentd::{App, Config};
+use core_types::{
+    AgentId, BindingId, ConsentId, ConvKind, ConvRef, InboundEvent, MemberId, MemberKey, MessageId,
+    Msg, MsgRef, ReplyTarget, ScopeKey, SessionId, Surface, SurfaceError, SurfaceKind, ThreadKey,
+    UserId, VolumeKey,
+};
+use futures::stream::BoxStream;
+use runner::{PoolConfig, ProcessConfig};
+use sandbox::{
+    ChildIo, Container, ContainerEvent, ContainerId, ManagedContainer, ProcessSandbox, Sandbox,
+    SessionSpec, SharedAccess, VolumeRef,
+};
+use secrecy::SecretString;
+use store::{AgentCreation, ConsentState, NewAgent, NewClaudeLink, SessionKind, Store, Visibility};
+use testkit::{
+    Call, FakeAnthropic, MockSurface, Turn, agentctl_path, fake_anthropic, fake_claude_path,
+};
+use time::OffsetDateTime;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+use common::{TempDir, env};
+
+const TEAM: &str = "chat.example";
+const BOT: &str = "UBOT";
+const TASK: &str = "Summarize in.txt";
+const WAIT: Duration = Duration::from_secs(60);
+
+/// Every agent's bot acts through the one mock.
+#[derive(Debug)]
+struct Mocks(Arc<MockSurface>);
+
+#[async_trait::async_trait]
+impl SurfaceLookup for Mocks {
+    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
+        Some(self.0.clone())
+    }
+}
+
+/// The manager bot's DM with a member is `dm-<user>`.
+struct Dms;
+
+#[async_trait::async_trait]
+impl OpenDm for Dms {
+    async fn open_dm(
+        &self,
+        member: &MemberKey,
+    ) -> Result<core_types::ConversationId, SurfaceError> {
+        Ok(format!("dm-{}", member.user.as_str()).into())
+    }
+}
+
+/// What a container was started with.
+#[derive(Debug, Clone)]
+struct Started {
+    session: SessionId,
+    volume: VolumeKey,
+    volume_dir: PathBuf,
+    shared: SharedAccess,
+    memory: bool,
+}
+
+/// A [`ProcessSandbox`] that records every container's mounts.
+struct Recording {
+    inner: ProcessSandbox,
+    started: Mutex<Vec<Started>>,
+}
+
+#[async_trait::async_trait]
+impl Sandbox for Recording {
+    async fn ensure_volume(&self, key: &VolumeKey) -> sandbox::Result<VolumeRef> {
+        self.inner.ensure_volume(key).await
+    }
+
+    async fn start(&self, spec: &SessionSpec) -> sandbox::Result<Container> {
+        self.started.lock().unwrap().push(Started {
+            session: spec.session,
+            volume: spec.volume.key().clone(),
+            volume_dir: spec.volume.path().to_owned(),
+            shared: spec.shared,
+            memory: spec.memory,
+        });
+        self.inner.start(spec).await
+    }
+
+    async fn exec(
+        &self,
+        container: &Container,
+        argv: &[String],
+        env: &BTreeMap<String, String>,
+    ) -> sandbox::Result<ChildIo> {
+        self.inner.exec(container, argv, env).await
+    }
+
+    async fn ip(&self, container: &ContainerId) -> sandbox::Result<IpAddr> {
+        self.inner.ip(container).await
+    }
+
+    async fn stop(&self, container: &ContainerId) -> sandbox::Result<()> {
+        self.inner.stop(container).await
+    }
+
+    async fn list_managed(&self) -> sandbox::Result<Vec<ManagedContainer>> {
+        self.inner.list_managed().await
+    }
+
+    fn events(&self) -> BoxStream<'static, sandbox::Result<ContainerEvent>> {
+        self.inner.events()
+    }
+}
+
+struct Stack {
+    app: App,
+    turns: Turns,
+    pipeline: Pipeline,
+    mock: Arc<MockSurface>,
+    manager: Arc<MockSurface>,
+    sandbox: Arc<Recording>,
+    script: PathBuf,
+    data: PathBuf,
+    agent: AgentId,
+    binding: BindingId,
+    alice: MemberId,
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<anyhow::Result<()>>,
+    fake: FakeAnthropic,
+    _dir: TempDir,
+}
+
+fn key(user: &str) -> MemberKey {
+    MemberKey {
+        surface: SurfaceKind::RocketChat,
+        team: TEAM.into(),
+        user: user.into(),
+    }
+}
+
+fn conv(id: &str) -> ConvRef {
+    ConvRef {
+        surface: SurfaceKind::RocketChat,
+        team: TEAM.into(),
+        conversation: id.into(),
+    }
+}
+
+fn msg(conv_id: &str, id: &str) -> MsgRef {
+    MsgRef {
+        conv: conv(conv_id),
+        id: id.into(),
+    }
+}
+
+fn thread(root: &str) -> ThreadKey {
+    ThreadKey {
+        conv: conv("GENERAL"),
+        root: Some(root.into()),
+    }
+}
+
+async fn link(store: &Store, user: &str) -> MemberId {
+    let now = OffsetDateTime::now_utc();
+    let member = store.ensure_member(&key(user), user, now).await.unwrap();
+    store
+        .put_claude_link(
+            member,
+            &NewClaudeLink {
+                access_token: SecretString::from(format!("token-of-{user}")),
+                refresh_token: SecretString::from("refresh"),
+                expires_at: now + Duration::from_secs(24 * 60 * 60),
+                plan: None,
+                rate_limit_tier: None,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    member
+}
+
+/// A channel turn's script, for every session's first turn: in a channel
+/// session, whose work directory has no `in.txt`, write one and ask for a
+/// private task handed it, attaching what `agentctl private` printed; in
+/// the private task's session, where `in.txt` was handed over, run
+/// `private`.
+fn script(private: &str) -> Turn {
+    Turn::reply("Done.").with_command([
+        "sh",
+        "-c",
+        &format!(
+            "if [ -f in.txt ]; then {private}; else printf data > in.txt && \
+             agentctl private --file in.txt '{TASK}' > consent.txt && \
+             agentctl attach consent.txt; fi"
+        ),
+    ])
+}
+
+/// What the private task does unless a test says otherwise: waits a
+/// moment, then attaches a copy of the file it was handed.
+const SEEN: &str = "sleep 1; cat in.txt > seen.txt && agentctl attach seen.txt";
+
+/// agentd with its listeners and a runner over a recording process
+/// sandbox running `fake-claude`, alice and bob linked, and alice's agent
+/// `helper`, whose bot is `UBOT`. `limits` goes in `[limits]`.
+async fn start(limits: &str) -> Stack {
+    let claude = fake_claude_path();
+    let agentctl = agentctl_path();
+    let dir = TempDir::new();
+    let fake = fake_anthropic().await;
+    let text = format!(
+        "{}\n[proxy]\nupstream = \"{}\"\n[limits]\n{limits}\n",
+        common::CONFIG
+            .replace("/nonexistent/agentd", &dir.path().display().to_string())
+            .replace(
+                "sqlite::memory:",
+                &format!("sqlite://{}", dir.path().join("agentd.db").display())
+            ),
+        fake.uri()
+    );
+    let config = Config::parse(&text, env()).unwrap();
+    let store = agentd::app::open_store(&config).await.unwrap();
+    let mock = Arc::new(MockSurface::new());
+    let app =
+        App::with_surfaces(config, store.clone(), None, Arc::new(Mocks(mock.clone()))).unwrap();
+    let alice = link(&store, "alice").await;
+    link(&store, "bob").await;
+    let team = TEAM.into();
+    let AgentCreation::Created(agent, binding) = store
+        .create_agent(
+            &NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "You are helper.",
+                visibility: Visibility::Public,
+                surface: SurfaceKind::RocketChat,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("the agent was created");
+    };
+    store
+        .set_binding_bot_user(binding, &UserId::new(BOT), "helper")
+        .await
+        .unwrap();
+    store
+        .activate_binding(
+            binding,
+            &SecretString::from("bot-token"),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+        .await
+        .unwrap();
+    let addrs = server.addrs();
+    let script = dir.path().join("script.json");
+    let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
+    let mut vars = BTreeMap::from([
+        (
+            testkit::claude::SCRIPT_ENV.to_owned(),
+            script.display().to_string(),
+        ),
+        ("PATH".to_owned(), path),
+    ]);
+    for name in ["NO_PROXY", "no_proxy"] {
+        vars.insert(name.to_owned(), addrs.proxy.ip().to_string());
+    }
+    let settings = TurnSettings {
+        process: ProcessConfig {
+            claude_bin: claude.display().to_string(),
+            anthropic_base_url: format!("http://{}", addrs.proxy),
+            turn_timeout_secs: 60,
+        },
+        pool: PoolConfig {
+            global_container_cap: 1,
+            ..PoolConfig::default()
+        },
+        image: "unused".to_owned(),
+        data_dir: dir.path().to_owned(),
+        agentctl_url: format!("http://{}", addrs.ctl),
+        env: vars,
+    };
+    let sandbox = Arc::new(Recording {
+        inner: ProcessSandbox::new(store.clone(), dir.path()).unwrap(),
+        started: Mutex::default(),
+    });
+    let turns = Turns::start(&app, sandbox.clone(), settings).unwrap();
+    let manager = Arc::new(MockSurface::new());
+    let replies = Replies::new(Some(Arc::new(ManagerBot::new(
+        key("manager"),
+        manager.clone(),
+        Arc::new(Dms),
+    ))));
+    let pipeline = Pipeline::new(
+        store.clone(),
+        turns.clone(),
+        Arc::clone(app.surfaces()),
+        replies,
+        PipelineSettings::from_app(&app),
+    );
+    let server = server.with_pipeline(pipeline.clone());
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(server.run(
+        async {
+            let _ = stopped.await;
+        },
+        std::future::pending(),
+    ));
+    Stack {
+        app,
+        turns,
+        pipeline,
+        mock,
+        manager,
+        sandbox,
+        script,
+        data: dir.path().to_owned(),
+        agent: agent.id,
+        binding,
+        alice,
+        stop,
+        task,
+        fake,
+        _dir: dir,
+    }
+}
+
+impl Stack {
+    fn store(&self) -> &Store {
+        self.app.store()
+    }
+
+    /// Makes every session's next turn play `turn`.
+    fn next_turn(&self, turn: Turn) {
+        testkit::write_script(&self.script, &vec![turn; 8]).unwrap();
+    }
+
+    /// `sender`'s message `id` mentioning the agent in GENERAL, in the
+    /// thread of `root` if given.
+    fn mention(&self, sender: &str, id: &str, root: Option<&str>) -> InboundEvent {
+        InboundEvent {
+            event_id: id.to_owned(),
+            binding: self.binding,
+            sender: key(sender),
+            sender_is_bot: false,
+            sender_bot_user: None,
+            conv: conv("GENERAL"),
+            conv_kind: ConvKind::Channel,
+            thread_root: root.map(MessageId::new),
+            message: msg("GENERAL", id),
+            text: format!("@{BOT} hello from the channel"),
+            mentions: vec![UserId::new(BOT)],
+            reply_to: root.map(|root| msg("GENERAL", root)),
+            files: vec![],
+            received_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    /// Has `sender` ask the agent, in a new thread rooted at `id`, for the
+    /// private task [`script`] asks for, with the task's session doing
+    /// `private`, and returns the consent the channel turn got.
+    async fn ask(&self, sender: &str, id: &str, private: &str) -> ConsentId {
+        self.next_turn(script(private));
+        let before = self.mock.calls().len();
+        self.pipeline
+            .handle(self.mention(sender, id, None), MockSurface::DEFAULT_CAPS)
+            .await;
+        let calls = self.mock.calls().split_off(before);
+        let printed = uploads(&calls)
+            .into_iter()
+            .find(|(_, name, _)| name == "consent.txt")
+            .map(|(_, _, contents)| contents)
+            .unwrap_or_else(|| panic!("the channel turn attached its consent: {calls:#?}"));
+        let id = printed
+            .strip_prefix("Asked for consent ")
+            .and_then(|rest| rest.split('.').next())
+            .unwrap_or_else(|| panic!("{printed}"));
+        id.parse().unwrap()
+    }
+
+    /// Waits until the agent's bot posted a message containing `text`
+    /// after call number `from`, and returns it.
+    async fn posted(&self, from: usize, text: &str) -> (ReplyTarget, String, MsgRef) {
+        let started = Instant::now();
+        loop {
+            let calls = self.mock.calls().split_off(from);
+            if let Some(found) = posts(&calls)
+                .into_iter()
+                .find(|(_, posted, _)| posted.contains(text))
+            {
+                return found;
+            }
+            assert!(
+                started.elapsed() < WAIT,
+                "never posted {text:?}: {calls:#?}"
+            );
+            self.app.ctl().consents().wake();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits until consent `id`'s work is done.
+    async fn finished(&self, id: ConsentId) -> store::Consent {
+        let started = Instant::now();
+        loop {
+            let consent = self.store().consent(id).await.unwrap().unwrap();
+            if consent.finished_at.is_some() {
+                return consent;
+            }
+            assert!(started.elapsed() < WAIT, "consent {id} never finished");
+            self.app.ctl().consents().wake();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Every text the manager bot sent `user` in their DM.
+    fn dms_to(&self, user: &str) -> Vec<String> {
+        let dm = conv(&format!("dm-{user}"));
+        self.manager
+            .posts()
+            .into_iter()
+            .filter(|(to, _)| to.conv == dm)
+            .map(|(_, text)| text)
+            .collect()
+    }
+
+    /// The containers started for `session`.
+    fn started(&self, session: SessionId) -> Vec<Started> {
+        self.sandbox
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|started| started.session == session)
+            .cloned()
+            .collect()
+    }
+
+    /// The upstream request bodies of every turn so far.
+    async fn upstream_bodies(&self) -> Vec<String> {
+        self.fake
+            .message_requests()
+            .await
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect()
+    }
+
+    async fn stop(self) {
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap().unwrap();
+    }
+}
+
+fn posts(calls: &[Call]) -> Vec<(ReplyTarget, String, MsgRef)> {
+    calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::Post { to, text, msg } => Some((to.clone(), text.clone(), msg.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn uploads(calls: &[Call]) -> Vec<(ReplyTarget, String, String)> {
+    calls
+        .iter()
+        .filter_map(|call| match call {
+            Call::Upload { to, files } => Some(files.iter().map(|file| {
+                (
+                    to.clone(),
+                    file.file.name.clone(),
+                    String::from_utf8_lossy(&file.contents).into_owned(),
+                )
+            })),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn in_thread(root: &str) -> ReplyTarget {
+    ReplyTarget {
+        conv: conv("GENERAL"),
+        thread_root: Some(root.into()),
+    }
+}
+
+fn heading(id: ConsentId) -> String {
+    format!("*Private task `{id}`:*")
+}
+
+#[tokio::test]
+async fn private_returns_at_once_and_channel_turn_ends() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("alice", "t1", SEEN).await;
+    let calls = stack.mock.calls().split_off(before);
+    let replies = posts(&calls);
+    assert_eq!(replies.len(), 1, "{calls:#?}");
+    assert_eq!(replies[0].0, in_thread("t1"));
+    assert_eq!(
+        replies[0].1, "Done.",
+        "the channel turn ended with its own reply"
+    );
+    let row = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(
+        row.finished_at, None,
+        "the channel turn didn't wait for the private task"
+    );
+    assert_eq!(row.task, TASK);
+    assert_eq!(row.thread, thread("t1"));
+
+    stack.posted(before, &heading(consent)).await;
+    stack.finished(consent).await;
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn owner_requester_skips_card() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("alice", "t1", SEEN).await;
+    let row = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(row.state, ConsentState::Approved);
+    assert_eq!(row.decided_by, Some(key("alice")));
+    stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+    assert_eq!(row.card, None);
+    assert!(
+        stack.manager.posts().is_empty(),
+        "no card for the owner's own task"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn non_owner_requires_approval() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    let row = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(row.state, ConsentState::Pending);
+
+    let started = Instant::now();
+    while stack.dms_to("alice").is_empty() {
+        assert!(started.elapsed() < WAIT, "the owner never got a card");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let card = stack.dms_to("alice").join("\n");
+    assert!(card.contains(TASK), "{card}");
+    assert!(card.contains("`bob`"), "{card}");
+    assert!(card.contains(&format!("`approve {consent}`")), "{card}");
+    assert!(card.contains("can read your agent's shared files but not change them"));
+    assert!(card.contains("Files handed to it: in.txt."), "{card}");
+    assert!(stack.dms_to("bob").is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let calls = stack.mock.calls().split_off(before);
+    assert!(
+        !posts(&calls)
+            .iter()
+            .any(|(_, text, _)| text.contains(&heading(consent))),
+        "nothing runs before the owner approves"
+    );
+    let row = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(row.private_session, None);
+    assert!(row.card.is_some());
+
+    let decided = stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, true)
+        .await
+        .unwrap();
+    assert!(matches!(decided, Decided::Recorded), "{decided:?}");
+    stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+    assert!(row.private_session.is_some());
+    let started = Instant::now();
+    while !stack.manager.calls().iter().any(|call| {
+        matches!(call, Call::Edit { msg, text } if Some(msg) == row.card.as_ref() && text.contains("Approved."))
+    }) {
+        assert!(started.elapsed() < WAIT, "the card was never closed");
+        stack.app.ctl().consents().wake();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn decline_posts_outcome() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    let staged = stack.data.join("consents").join(consent.to_string());
+    assert!(staged.join("0").exists());
+    let decided = stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, false)
+        .await
+        .unwrap();
+    assert!(matches!(decided, Decided::Recorded));
+    let (to, text, posted) = stack.posted(before, "declined it").await;
+    assert_eq!(to, in_thread("t1"));
+    assert!(text.contains(&consent.to_string()), "{text}");
+    let row = stack.finished(consent).await;
+    assert_eq!(row.state, ConsentState::Declined);
+    assert_eq!(row.private_session, None, "a declined task never runs");
+    let attributed = stack
+        .store()
+        .posted_message_ref(&posted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attributed.agent, Some(stack.agent));
+    assert_eq!(attributed.session, SessionId::from_uuid(*consent.as_uuid()));
+    assert_eq!(attributed.requester.key, key("bob"));
+    assert!(!staged.exists(), "its files are deleted");
+    assert!(
+        !stack
+            .upstream_bodies()
+            .await
+            .iter()
+            .any(|body| body.contains(TASK) && !body.contains("hello")),
+        "no private turn ran"
+    );
+    assert!(matches!(
+        stack
+            .app
+            .ctl()
+            .consents()
+            .decide(&key("alice"), consent, true)
+            .await
+            .unwrap(),
+        Decided::Settled(ConsentState::Declined)
+    ));
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn expiry_posts_outcome() {
+    let stack = start("consent_ttl_secs = 1").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    let (to, text, _) = stack.posted(before, "expired").await;
+    assert_eq!(to, in_thread("t1"));
+    assert!(text.contains("within 1 second"), "{text}");
+    let row = stack.finished(consent).await;
+    assert_eq!(row.state, ConsentState::Expired);
+    assert_eq!(row.private_session, None);
+    assert!(matches!(
+        stack
+            .app
+            .ctl()
+            .consents()
+            .decide(&key("alice"), consent, true)
+            .await
+            .unwrap(),
+        Decided::Settled(ConsentState::Expired)
+    ));
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn private_session_is_fresh_and_not_dm() {
+    let stack = start("").await;
+    let dm = ThreadKey {
+        conv: conv("dm-helper-alice"),
+        root: None,
+    };
+    let owners_dm = stack
+        .store()
+        .session_for_thread(
+            stack.agent,
+            &dm,
+            &ScopeKey::Private,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+        .session;
+    let consent = stack.ask("alice", "t1", SEEN).await;
+    let row = stack.finished(consent).await;
+    let private = row.private_session.expect("the task ran in a session");
+    assert_ne!(private, owners_dm.id);
+    assert_ne!(private, row.origin_session);
+    let session = stack.store().session(private).await.unwrap().unwrap();
+    assert_eq!(session.kind, SessionKind::Private(consent));
+    assert_eq!(session.scope, ScopeKey::Private);
+    assert_eq!(session.thread, thread("t1"));
+    assert!(
+        !stack.turns.sessions().is_warm(private),
+        "its container is reaped right after the task"
+    );
+    assert_eq!(stack.started(private).len(), 1);
+
+    let again = stack.ask("alice", "t2", SEEN).await;
+    let second = stack.finished(again).await.private_session.unwrap();
+    assert_ne!(second, private, "each task gets a session of its own");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn only_task_text_and_attachments_cross_in() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, true)
+        .await
+        .unwrap();
+    stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+
+    let requests = stack.fake.message_requests().await;
+    let task_turns: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            !String::from_utf8_lossy(&request.body).contains("hello from the channel")
+        })
+        .collect();
+    assert_eq!(task_turns.len(), 1, "one turn besides the channel's");
+    let body = String::from_utf8_lossy(&task_turns[0].body);
+    assert!(
+        body.contains(&format!(
+            "{TASK}\\n\\nFiles handed to this task, in the working directory: in.txt"
+        )),
+        "{body}"
+    );
+    for leaked in ["GENERAL", "bob", "t1", "consent.txt"] {
+        assert!(!body.contains(leaked), "{leaked} crossed in: {body}");
+    }
+    assert_eq!(
+        task_turns[0]
+            .headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap()),
+        Some("Bearer token-of-alice"),
+        "it runs on the owner's account"
+    );
+
+    let session = row.private_session.unwrap();
+    let volume = stack
+        .started(session)
+        .pop()
+        .expect("the task's container")
+        .volume_dir;
+    let work = volume
+        .join("sessions")
+        .join(session.to_string())
+        .join("work");
+    let mut names: Vec<String> = std::fs::read_dir(&work)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["in.txt", "seen.txt"],
+        "only the handed file was there"
+    );
+    let calls = stack.mock.calls().split_off(before);
+    let seen = uploads(&calls)
+        .into_iter()
+        .find(|(_, name, _)| name == "seen.txt")
+        .unwrap();
+    assert_eq!(
+        seen.2, "data",
+        "the file crossed in as the channel turn wrote it"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn only_reply_and_attachments_cross_out() {
+    let stack = start("").await;
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    let before = stack.mock.calls().len();
+    let manager_before = stack.manager.calls().len();
+    stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, true)
+        .await
+        .unwrap();
+    stack.posted(before, &heading(consent)).await;
+    stack.finished(consent).await;
+    let calls = stack.mock.calls().split_off(before);
+    let sent = posts(&calls);
+    assert_eq!(sent.len(), 1, "{calls:#?}");
+    assert_eq!(sent[0].0, in_thread("t1"));
+    assert_eq!(sent[0].1, format!("{}\n\nDone.", heading(consent)));
+    let files = uploads(&calls);
+    assert_eq!(files.len(), 1, "{calls:#?}");
+    assert_eq!(
+        files[0],
+        (in_thread("t1"), "seen.txt".to_owned(), "data".to_owned())
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| matches!(call, Call::Post { .. } | Call::Upload { .. })),
+        "nothing but the reply and its files: {calls:#?}"
+    );
+    let manager = stack.manager.calls().split_off(manager_before);
+    assert!(
+        manager.iter().all(|call| matches!(call, Call::Edit { .. })),
+        "only the card's outcome, nothing about the task's content: {manager:#?}"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn ask_agent_and_private_refused_inside_private_task() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack
+        .ask(
+            "alice",
+            "t1",
+            "agentctl ask-agent other hi 2> refused.txt; agentctl private again 2>> refused.txt; \
+             agentctl post --to here hi 2>> refused.txt; agentctl attach refused.txt",
+        )
+        .await;
+    stack.posted(before, &heading(consent)).await;
+    stack.finished(consent).await;
+    let calls = stack.mock.calls().split_off(before);
+    let refused = uploads(&calls)
+        .into_iter()
+        .find(|(_, name, _)| name == "refused.txt")
+        .map(|(_, _, contents)| contents)
+        .unwrap();
+    let lines: Vec<&str> = refused.lines().collect();
+    assert_eq!(lines.len(), 3, "{refused}");
+    for line in lines {
+        assert_eq!(
+            line,
+            "agentctl: only `agentctl attach` is available inside a private task"
+        );
+    }
+    let asked = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(asked.task, TASK, "the task asked for no consent of its own");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn result_message_ref_inherits_requester_and_hop() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, true)
+        .await
+        .unwrap();
+    let (_, text, result) = stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+    let attributed = stack
+        .store()
+        .posted_message_ref(&result)
+        .await
+        .unwrap()
+        .expect("the result is attributed");
+    let bob = stack
+        .store()
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap();
+    assert_eq!(attributed.requester.key, key("bob"));
+    assert_eq!(attributed.requester.member, bob);
+    assert_eq!(attributed.hop, row.hop);
+    assert_eq!(Some(attributed.session), row.private_session);
+    assert_eq!(attributed.agent, Some(stack.agent));
+    assert!(attributed.turn.is_some());
+    assert_eq!(attributed.msg.conv, conv("GENERAL"));
+
+    let said = |id: &str, sender: &str, text: &str| Msg {
+        id: id.into(),
+        sender: key(sender),
+        sender_is_bot: sender == BOT,
+        text: text.into(),
+        files: vec![],
+        sent_at: OffsetDateTime::now_utc(),
+    };
+    stack.mock.set_history(
+        thread("t1"),
+        vec![
+            said("t1", "bob", "@UBOT hello from the channel"),
+            said(result.id.as_str(), BOT, &text),
+            said("t2", "bob", "@UBOT and now?"),
+        ],
+    );
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::reply("Seen it."));
+    stack
+        .pipeline
+        .handle(
+            stack.mention("bob", "t2", Some("t1")),
+            MockSurface::DEFAULT_CAPS,
+        )
+        .await;
+    let bodies: Vec<String> = stack.upstream_bodies().await.split_off(upstream);
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("] you, outside this session: *Private task"),
+        "the channel session's next turn sees the result: {}",
+        bodies[0]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn channel_volume_never_mounts_private_paths() {
+    let stack = start("").await;
+    let consent = stack.ask("alice", "t1", SEEN).await;
+    let row = stack.finished(consent).await;
+    let channel = stack.started(row.origin_session);
+    assert!(!channel.is_empty());
+    let private = stack.started(row.private_session.unwrap());
+    let private_volume = private[0].volume_dir.clone();
+    assert_eq!(private[0].volume.scope, ScopeKey::Private);
+    for started in &channel {
+        assert_eq!(
+            started.volume.scope,
+            ScopeKey::Channel(conv("GENERAL")),
+            "a channel session mounts its channel's volume"
+        );
+        assert!(!started.memory, "a channel session never mounts memory/");
+        assert!(!started.volume_dir.starts_with(&private_volume));
+        assert!(!private_volume.starts_with(&started.volume_dir));
+    }
+    for started in &private {
+        assert_eq!(started.shared, SharedAccess::ReadWrite);
+        assert!(started.memory, "the owner's own task gets memory/");
+    }
+    let consents = stack.data.join("consents");
+    assert!(
+        !channel
+            .iter()
+            .any(|started| started.volume_dir.starts_with(&consents))
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn non_owner_task_gets_read_only_shared_and_no_memory() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, true)
+        .await
+        .unwrap();
+    stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+    let private = stack.started(row.private_session.unwrap());
+    assert_eq!(private.len(), 1);
+    assert_eq!(private[0].volume.scope, ScopeKey::Private);
+    assert_eq!(private[0].shared, SharedAccess::ReadOnly);
+    assert!(!private[0].memory);
+    assert_eq!(
+        stack
+            .store()
+            .consent(consent)
+            .await
+            .unwrap()
+            .unwrap()
+            .requester
+            .member,
+        stack
+            .store()
+            .member_for_identity(&key("bob"))
+            .await
+            .unwrap()
+    );
+    assert_ne!(
+        Some(stack.alice),
+        stack
+            .store()
+            .member_for_identity(&key("bob"))
+            .await
+            .unwrap()
+    );
+    stack.stop().await;
+}

@@ -2766,12 +2766,14 @@ tasks, [Data model](design.md#data-model) (`CONSENT`).
 Deliverables:
 
 - A migration `…_consents.sql` for `consents`, with the design's columns plus
-  `agent_id`, `attachments_json` (paths staged by the channel turn), and
-  `decided_by` and `decided_at`.
+  `agent_id`, `attachments_json` (the names of the files staged for the
+  task, in `consents/<id>/` under the data directory), and `decided_by` and
+  `decided_at`, plus the card's and the work's delivery state.
 - `agentctl private <task>` handler:
   1. Create a `consents` row with the turn's requester, hop, reply target and
      origin session. Copy the files named with `--file` (paths in the
-     calling session's directory) into the consent's staging area. These are
+     calling session's directory, which agentctl sends relative to it) into
+     the consent's staging area. These are
      the design's "files the channel turn attached explicitly". The PR adds
      `--file` to the design's `agentctl` table.
   2. Return the consent id at once.
@@ -2786,7 +2788,9 @@ Deliverables:
     commands `approve <id>` and `decline <id>` (T08's `Approve` and `Decline`).
   - Only the owner can decide.
 - Expiry: a sweeper marks cards `expired` after `[limits]
-  consent_ttl` (default 24 hours) and posts the outcome to the thread.
+  consent_ttl_secs` (default 86400, 24 hours; the repository's `_secs`
+  convention) and posts the outcome to the thread. The Slack card is updated
+  with an expiry too.
 - Execution:
   1. `SessionManager::create_private(agent, consent, thread)` makes a fresh session on
      the owner's private volume.
@@ -2806,7 +2810,9 @@ Deliverables:
   thread as a new message from the agent. Its `message_refs` row carries the
   original requester and hop, the private session's id, and the recorded
   thread's `conversation` and `thread_root`, so the channel session's next
-  turn finds it (T23). Declined and expired outcomes are posted the same way.
+  turn finds it (T23). Declined and expired outcomes are posted the same way;
+  with no private session, their rows carry the consent's id as the session
+  id.
 - The private session is never the owner's DM session, and its container is
   reaped right after the task.
 - The private sandbox shares the `sandbox` network with channel sandboxes,

@@ -1132,6 +1132,28 @@ async fn a_side_change_on_the_private_volume_restarts_the_container() {
 }
 
 #[tokio::test]
+async fn files_put_in_a_new_sessions_work_dir_are_there_for_its_first_turn() {
+    let h = Harness::new(&[Turn::reply("done").with_command(["cp", "in.txt", "out.txt"])]).await;
+    let consent = ConsentId::new_v4();
+    let private = h
+        .manager
+        .create_private(h.agent, consent, &thread("1.1"))
+        .await
+        .unwrap();
+    let work = h.manager.work_dir(&private).await.unwrap();
+    assert!(work.ends_with(format!("sessions/{}/work", private.id)));
+    assert_eq!(h.manager.work_dir(&private).await.unwrap(), work);
+    std::fs::write(work.join("in.txt"), "handed over").unwrap();
+    let mut task = request("go");
+    task.kind = TurnKind::PrivateTask(consent);
+    assert_eq!(reply(&h.run(private.id, task).await), "done");
+    assert_eq!(
+        std::fs::read_to_string(work.join("out.txt")).unwrap(),
+        "handed over"
+    );
+}
+
+#[tokio::test]
 async fn two_dm_lookups_create_one_session_and_a_scope_change_replaces_it() {
     let h = Harness::new(&[Turn::reply("one")]).await;
     let dm = ThreadKey {

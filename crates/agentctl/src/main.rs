@@ -12,7 +12,7 @@ mod lock;
 mod output;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -178,6 +178,21 @@ async fn run(command: Command, env: &dyn Fn(&str) -> Option<String>) -> Result<E
             output::ASKED.to_owned()
         }
         Command::Private { files, task } => {
+            let files = if files.is_empty() {
+                files
+            } else {
+                let cwd = std::env::current_dir()
+                    .map_err(|err| format!("can't read the working directory: {err}"))?;
+                let config_dir =
+                    env(CONFIG_DIR_VAR).ok_or_else(|| format!("{CONFIG_DIR_VAR} is not set"))?;
+                let session_dir = Path::new(&config_dir)
+                    .parent()
+                    .ok_or_else(|| format!("{CONFIG_DIR_VAR} is not in a session directory"))?;
+                files
+                    .iter()
+                    .map(|file| in_session(file, &cwd, session_dir))
+                    .collect::<Result<_, _>>()?
+            };
             let response = client
                 .send(&PrivateRequest {
                     task: task.join(" "),
@@ -189,6 +204,45 @@ async fn run(command: Command, env: &dyn Fn(&str) -> Option<String>) -> Result<E
     };
     print!("{text}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The variable naming the session's Claude config directory, whose parent
+/// is the session's directory.
+const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
+
+/// `file`, relative to `cwd` unless absolute, as a path relative to
+/// `session_dir`, with `.` and `..` resolved as written. agentd checks the
+/// path again and opens it without following symlinks.
+fn in_session(file: &str, cwd: &Path, session_dir: &Path) -> Result<String, String> {
+    let outside = || format!("{file} is not in this session's directory");
+    let path = normalized(&cwd.join(file)).ok_or_else(outside)?;
+    let session_dir = normalized(session_dir).ok_or_else(outside)?;
+    let relative = path.strip_prefix(&session_dir).map_err(|_| outside())?;
+    if relative.as_os_str().is_empty() {
+        return Err(format!("{file} is a directory, not a file"));
+    }
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{file} isn't a valid UTF-8 path"))
+}
+
+/// `path` with `.` dropped and each `..` taking the component before it
+/// away; `None` if a `..` would climb above the root.
+fn normalized(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() || out.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 impl From<Failure> for String {
@@ -269,6 +323,44 @@ mod tests {
                 limit: Some(10)
             }
         ));
+    }
+
+    #[test]
+    fn private_files_are_named_relative_to_the_session_directory() {
+        let session = Path::new("/volume/sessions/s1");
+        let cwd = session.join("work");
+        for (file, relative) in [
+            ("in.txt", "work/in.txt"),
+            ("./out/../in.txt", "work/in.txt"),
+            ("../tmp/x.csv", "tmp/x.csv"),
+            ("/volume/sessions/s1/home/notes.md", "home/notes.md"),
+        ] {
+            assert_eq!(in_session(file, &cwd, session).unwrap(), relative, "{file}");
+        }
+        for (file, reason) in [
+            ("../../s2/work/secret", "is not in this session's directory"),
+            ("/volume/shared/x", "is not in this session's directory"),
+            ("/../../etc/passwd", "is not in this session's directory"),
+            ("..", "is a directory, not a file"),
+        ] {
+            let err = in_session(file, &cwd, session).unwrap_err();
+            assert!(err.ends_with(reason), "{file}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn private_files_need_the_session_directory() {
+        let env = |name: &str| (name == "AGENTCTL_TOKEN").then(|| "t".to_owned());
+        let err = run(
+            Command::Private {
+                files: vec!["a.txt".to_owned()],
+                task: vec!["x".to_owned()],
+            },
+            &env,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "CLAUDE_CONFIG_DIR is not set");
     }
 
     #[tokio::test]
