@@ -9033,3 +9033,133 @@ later" well inside an attribution window (300 ms of 2 s, and 200 ms of
 marks; `tests/slack.rs`'s
 half-sent-request shutdown test sleeps for the server to read the request,
 which nothing the test can see marks.
+
+## T36d: Slack Connect: channel ids that change
+
+No private channel was shared with another organization from the
+environment this was built in: the event, `conversations.info` and
+`apps.manifest.update` were tested against `wiremock`, with a
+`channel_id_changed` fixture written from Slack's documentation
+(`testkit` `CHANNEL_ID_CHANGED`). The plan's live check is still to be
+done.
+
+### A change lost on the way fails open, so it is stored until settled
+
+**Issue.** The plan has the handler confirm the new id and move the rules
+when the event arrives. Slack sends the event once, and the ingress has
+already answered it 200 by then, so a `conversations.info` that fails
+(Slack down, the bot token's quota used up) or an agentd that stops between
+the event and the move would lose the change for good: the agent's
+`deny #room` would keep naming the old id and stop denying, at the moment
+the channel gains outside members.
+
+**Solution.** A second migration, `…_channel_id_changes.sql`, adds a
+`channel_id_changes` table keyed by binding, old id and new id. The inbound
+worker records the change (one store write) and settles it at once in a
+task of its own; settling claims the row by moving `next_attempt_at` past
+the try, as T30's rotation claims a token, so two instances, or an
+immediate try and the sweeper, never ask Slack twice. A row that is
+settled, confirmed or not, is deleted. One Slack couldn't be asked about is
+tried again by the Slack agent app sweeper (`SlackAgents::pass`, every
+minute) once `CHANNEL_CHANGE_RETRY` (five minutes) has passed, at most
+`CHANNEL_CHANGES_PER_PASS` (64) a pass, and given up with a warning a day
+(`CHANNEL_CHANGE_TTL`) after it arrived. A binding has at most
+`MAX_CHANNEL_CHANGES_WAITING` (16) changes waiting; the next is dropped with
+a throttled warning. The same change recorded again, under another
+`event_id` or after the ingress's dedup window, finds its row and is left
+to the try already under way. A binding that isn't active, or whose bot
+token is gone, settles its changes as unconfirmed.
+
+### What confirms a new id
+
+**Issue.** The plan says the new id must exist, be exactly the new one and
+have the bot as a member, but not what Slack's errors mean.
+
+**Solution.** `SlackSurface::confirms_channel` asks `conversations.info`
+now, past the conversation cache, with the binding's bot token and
+without waiting for its quota (`WebApi::without_waiting`). An answer
+for another id or without the bot is no, and so are `channel_not_found`
+and the other not-found codes, a refusal of the bot (`Forbidden`) and a
+token Slack no longer accepts (`Unauthorized`): the bot can't be in that
+channel under that id, so the change is settled and nothing moves, with a
+throttled warning. A rate limit, a transport failure or a transient code
+(`internal_error` and the like, T36a's `map_error`) says nothing about the
+channel, and the change waits for its next try.
+
+### The rules move in one transaction, and a deny wins
+
+**Solution.** `Rules::move_room` rewrites every `Room` rule on the old id,
+in both lists, to the new one and then keeps the first rule on each
+target, so a rule the agent had on the new id already stays as it was and
+the moved one is dropped. A deny on either id ends up a deny on the new
+id; it wins over an allow there as any deny does. It runs inside
+`Store::update_agent_settings`, one `BEGIN IMMEDIATE` transaction with the
+read. Rules that don't read are left alone: they already refuse everyone
+but the owner (`PolicyUnavailable`), and the warning says the owner has to
+set them again. Moving a channel onto itself changes nothing.
+
+After the move, the instance that settled the change forgets the old id's
+cached `conversations.info` answer (`TeamDirectory::forget_conv`). Other
+instances keep theirs until it expires, at most an hour; nothing asks about
+the old id once Slack stops sending it.
+
+### An old id that isn't `G…`
+
+**Solution.** Logged as a throttled warning per binding and handled the
+same way, as the plan says. Only `old_channel_id` and `new_channel_id`
+shaped like channel ids reach the store: anything else is refused 400 at
+the ingress before a dedup row is written.
+
+### A manifest update must not change what the app asks for
+
+**Issue.** `apps.manifest.update` replaces the app's whole manifest. Built
+from today's configuration, it would change the scopes of an app made
+while `public_posting` was set otherwise, which takes a new install, and
+would point the app's URLs at another host if `public_url` changed since,
+which loses its events until then.
+
+**Solution.** The sweep rebuilds each app's manifest from what the store
+has of it: the public URL its redirect URL was made with
+(`AgentApp::public_url_of`) and `public_posting` read from its stored
+scopes. When the rebuilt manifest's scopes aren't exactly the stored ones,
+or the redirect URL isn't one agentd made, the app is left alone with a
+warning and asked about again once its lease ends: only the event is
+added, never a scope, so the update needs no new install. Slack saying
+`permissions_updated` anyway is logged as a warning, and the version is
+still recorded, since the event was added.
+
+### When the manifest sweep runs
+
+**Issue.** The plan asks for the sweep "once a token is registered and
+every hour", claimed with a lease as T30's rotation is.
+
+**Solution.** The migration that adds `manifest_version` also adds
+`manifest_lease_until`. The Slack agent app sweeper takes up to
+`MANIFEST_UPDATES_PER_PASS` (16) due bindings each minute: active Slack
+bindings of agents that aren't deleted, below `MANIFEST_VERSION`, not
+leased, whose owner has a usable configuration token in the workspace.
+Each is claimed for `MANIFEST_UPDATE_LEASE` (an hour) with a conditional
+`UPDATE`, so a failure is tried again an hour later, and a success raises
+the version, which only ever goes up, and clears the lease. Registering a
+configuration token (`put_slack_config_token`, now one transaction) clears
+the leases of that member's bindings in that workspace, so their apps are
+updated within a minute. A token Slack refuses is marked broken as at
+creation, and no update is tried until a new one is registered. An app
+Slack says is gone is tried again hourly like any failure; deleting the
+agent is its owner's call.
+
+`/agent me` on Slack lists the member's agents in the workspace still below
+the current version and says they won't follow a private channel shared
+with another organization until they are updated.
+
+### The events of an agent's app
+
+**Solution.** `channel_id_changed` is queued like a message: deduplicated
+by `event_id` under `slack:<binding>`, and charged to its owner's bucket
+(`InFlight::keep`) before the dedup row is written, so an owner who forges
+events with the app's signing secret writes rows at their bucket's rate
+and no faster. The log line for that drop now says "keeping events". Any
+other event an agent's app is sent is still answered 200 without being
+queued.
+The manager app doesn't subscribe to the event; one sent to it anyway is
+dropped after the queue.

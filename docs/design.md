@@ -1885,6 +1885,11 @@ moment the channel gains outside members. So agent apps subscribe to
    merge: a deny on either id is kept as a deny, and duplicates are
    dropped.
 
+Slack sends the event once, so agentd stores the change before acting on it
+and settles it from the store: a change it couldn't confirm because Slack
+didn't answer is tried again for a day rather than lost, since a lost one
+leaves a deny naming the old id.
+
 Only the receiving agent's rules move: each agent whose bot is in the channel
 gets its own event, and an owner who forges one can change only rules they
 could set anyway. Nothing else moves. Sessions, volumes, thread counts and
@@ -1897,7 +1902,9 @@ channel until it is invited, and its owner must then set the rule again.
 
 Existing agents' apps get the subscription through `apps.manifest.update`
 with their owner's configuration token (T30) when it works, and keep missing
-it until then; `/agent me` says so.
+it until then; `/agent me` says so. The update rebuilds the app's manifest
+with the scopes and redirect URL it has, so it adds the event without a new
+install.
 
 ### Verified and assumed
 

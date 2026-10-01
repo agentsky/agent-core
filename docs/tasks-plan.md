@@ -3855,18 +3855,27 @@ Deliverables:
 - `store`: a migration `…_manifest_version.sql` adds `manifest_version` to
   `agent_bindings`, `NOT NULL DEFAULT 0`, so every existing binding is
   below the current version and swept; a new app is created with the
-  current one.
+  current one. It also adds `manifest_lease_until`, the sweep's lease, which
+  registering a configuration token clears for that member's bindings in
+  the workspace. A second migration, `…_channel_id_changes.sql`, adds
+  `channel_id_changes`, which holds each change until it is settled.
 - `SlackClient::update_app` (`apps.manifest.update`, the manifest as a JSON
   string, the owner's configuration token in `Authorization`), and a sweep
   on agentd's sweeper that updates each active binding below the current
   version whose owner's configuration token is usable, once a token is
   registered and every hour, claiming each binding with a lease as T30's
-  rotation does. `/agent me` lists the owner's agents still on an older
-  manifest and says they won't follow a private channel shared later.
+  rotation does. The update keeps the app's stored scopes and redirect
+  URL, and leaves an app whose scopes agentd wouldn't rebuild alone, so it
+  never takes a new install. `/agent me` lists the owner's agents still on
+  an older manifest and says they won't follow a private channel shared
+  later.
 - Ingress: an agent's app queues `channel_id_changed`, the only event other
   than `message` it queues, deduplicated by `event_id`, with
   `old_channel_id` and `new_channel_id` shaped like channel ids, or 400.
-- The handler (`crates/agentd/src/slack/agents.rs`): confirm the new id
+- The handler (`crates/agentd/src/slack/agents.rs`) records the change in
+  `channel_id_changes` and settles it at once, claiming the row as T30's
+  rotation claims a token; the sweeper tries one Slack couldn't be asked
+  about again every five minutes, for a day. Settling it: confirm the new id
   with `conversations.info` on the binding's token (it exists, its id is
   exactly the new one, and the bot is a member), then rewrite that agent's
   `Room` targets in `agent_policies` from the old id to the new in one
