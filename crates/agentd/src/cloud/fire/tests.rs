@@ -690,21 +690,29 @@ async fn each_fire_opens_a_connection_of_its_own() {
         let outcome = reused.fire(&routine(&base), TASK).await;
         assert_eq!(outcome.state(), CloudHandoffState::Fired);
     }
-    assert_eq!(server.await.unwrap(), 2, "a connection was reused");
+    drop(reused);
+    let connections = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server is still serving a connection")
+        .unwrap();
+    assert_eq!(connections, 2, "a connection was reused");
 }
 
 #[tokio::test]
 async fn a_loopback_base_url_is_called_without_a_proxy() {
-    testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
-        FireClient::build(
-            &config(base),
-            Duration::from_secs(10),
-            Duration::from_secs(5),
-            Some(proxy),
-        )
-        .unwrap()
-        .http
-    })
+    testkit::proxy::assert_proxied_only_elsewhere(
+        |base, proxy| {
+            FireClient::build(
+                &config(base),
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                Some(proxy),
+            )
+            .unwrap()
+            .http
+        },
+        &["https://127.0.0.1:9", "https://[::1]:9"],
+    )
     .await;
 }
 

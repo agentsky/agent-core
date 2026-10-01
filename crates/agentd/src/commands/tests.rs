@@ -290,6 +290,7 @@ fn exchanged() -> ResponseTemplate {
         "access_token": "new-access",
         "refresh_token": "new-refresh",
         "expires_in": 28800,
+        "scope": "user:profile user:inference",
     }))
 }
 
@@ -636,6 +637,63 @@ async fn login_code_replies_for_each_failure() {
         h.last_reply("alice"),
         "Anthropic didn't accept that code. Start again with `login`."
     );
+}
+
+#[tokio::test]
+async fn a_login_granted_more_scope_says_to_use_the_link_unchanged() {
+    let h = harness().await;
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token_type": "Bearer",
+            "access_token": "wide-access",
+            "refresh_token": "wide-refresh",
+            "expires_in": 28800,
+            "scope": "user:profile user:inference user:sessions:claude_code",
+        })))
+        .mount(&h.oauth)
+        .await;
+    h.dm("alice", &format!("login {CODE}#{state}")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Anthropic granted this login more access than agentd uses, so nothing was linked. \
+         Open the login link exactly as it is sent, without changing it. Start again with \
+         `login`."
+    );
+    h.dm("alice", "me").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        me("Claude account: not linked. Send `login` to link one.")
+    );
+}
+
+#[tokio::test]
+async fn a_login_that_names_no_scope_says_to_tell_an_admin() {
+    let h = harness().await;
+    let logs = global_logs().tag();
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "unstated-access",
+            "refresh_token": "unstated-refresh",
+            "expires_in": 28800,
+        })))
+        .mount(&h.oauth)
+        .await;
+    h.dm("alice", &format!("login {CODE}#{state}")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Anthropic's answer didn't say what access it granted, so nothing was linked, and \
+         logging in again won't help until that changes. Tell an admin."
+    );
+    let lines = logs.snapshot();
+    let once = lines.matching("names no scope").to_string();
+    assert_eq!(once.lines().count(), 1, "{lines}");
+    lines.assert_lacks("couldn't complete a login");
 }
 
 #[tokio::test]

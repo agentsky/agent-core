@@ -701,6 +701,14 @@ impl Commands {
             Err(AuthError::CodeRejected { .. }) => {
                 format!("Anthropic didn't accept that code. {again}")
             }
+            Err(AuthError::ScopeRefused) => format!(
+                "Anthropic granted this login more access than agentd uses, so nothing was \
+                 linked. Open the login link exactly as it is sent, without changing it. {again}"
+            ),
+            Err(AuthError::ScopeUnstated) => "Anthropic's answer didn't say what access it \
+                granted, so nothing was linked, and logging in again won't help until that \
+                changes. Tell an admin."
+                .to_owned(),
             Err(err) => {
                 tracing::warn!(%member, error = %err, "couldn't complete a login");
                 format!("I couldn't finish linking your account. {again}")

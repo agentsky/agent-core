@@ -1,6 +1,7 @@
 //! [`Cidr`]: IP subnets, for the listeners' network checks and the
-//! egress proxy's address rules; and [`is_loopback_ip_host`], the one rule
-//! for which configured hosts may be reached over plain HTTP and without a
+//! egress proxy's address rules; [`is_loopback_ip_host`], the rule for
+//! which configured hosts may be reached over plain HTTP; and
+//! [`skips_proxy`], the rule for which an HTTP client reaches without a
 //! proxy.
 
 use std::fmt;
@@ -139,9 +140,7 @@ impl TryFrom<String> for Cidr {
 /// since it could resolve anywhere.
 ///
 /// It decides where a configured `http://` URL is allowed, since a request
-/// to a loopback address never crosses a network, and that an HTTP client
-/// calling such a URL uses no proxy: a proxy would read a plain request,
-/// credentials included, and resolve the address on its own host.
+/// to a loopback address never crosses a network.
 ///
 /// ```
 /// use core_types::is_loopback_ip_host;
@@ -156,6 +155,23 @@ pub fn is_loopback_ip_host(host: &str) -> bool {
         .unwrap_or(host)
         .parse::<IpAddr>()
         .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// Whether an HTTP client calls a URL with this `scheme` and `host` (as
+/// [`is_loopback_ip_host`] takes it) directly, whatever proxy the system
+/// sets: for plain `http`, since a proxy would read the request, credentials
+/// included, and for a loopback IP address, which a proxy would resolve on
+/// its own host. Everything else honors the system's proxy settings.
+///
+/// ```
+/// use core_types::skips_proxy;
+///
+/// assert!(skips_proxy("http", "rocketchat"));
+/// assert!(skips_proxy("https", "[::1]"));
+/// assert!(!skips_proxy("https", "api.anthropic.com"));
+/// ```
+pub fn skips_proxy(scheme: &str, host: &str) -> bool {
+    scheme.eq_ignore_ascii_case("http") || is_loopback_ip_host(host)
 }
 
 #[cfg(test)]
@@ -189,6 +205,29 @@ mod tests {
             "[",
         ] {
             assert!(!is_loopback_ip_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn plain_http_and_loopback_addresses_skip_the_proxy() {
+        for (scheme, host) in [
+            ("http", "rocketchat"),
+            ("http", "chat.example.com"),
+            ("HTTP", "localhost"),
+            ("http", "127.0.0.1"),
+            ("https", "127.0.0.1"),
+            ("https", "[::1]"),
+            ("https", "[::ffff:127.0.0.1]"),
+        ] {
+            assert!(skips_proxy(scheme, host), "{scheme} {host}");
+        }
+        for (scheme, host) in [
+            ("https", "api.anthropic.com"),
+            ("https", "localhost"),
+            ("https", "10.0.0.1"),
+            ("ws", "127.0.0.1.nip.io"),
+        ] {
+            assert!(!skips_proxy(scheme, host), "{scheme} {host}");
         }
     }
 

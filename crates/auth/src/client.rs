@@ -9,7 +9,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{ALLOWED_SCOPES, Urls};
+use serde_json::Value;
+
+use crate::config::ALLOWED_SCOPES;
 use crate::plan::{PlanInfo, ProfileResponse};
 use crate::{AuthError, Endpoint};
 
@@ -26,36 +28,53 @@ const MAX_EXPIRES_IN: u64 = 365 * 24 * 60 * 60;
 /// Longest OAuth `error` code kept for an error message.
 const MAX_ERROR_CODE: usize = 64;
 
-/// Builds the HTTP client. It never follows redirects: a 307 or 308 from the
-/// token endpoint would otherwise resend a body holding a code or refresh
-/// token to wherever it points.
-///
-/// It honors the system proxy settings, unless an endpoint agentd calls is
-/// on a loopback IP address, which only tests' fakes are: a proxy would
-/// read a plain `http` request, codes and tokens included, and reach the
-/// address on its own host. One client serves every endpoint, so then none
-/// of them uses a proxy. `proxy` is a proxy tests add as if the system had
-/// it.
-pub(crate) fn build_client(
-    urls: &Urls,
-    proxy: Option<reqwest::Proxy>,
-) -> Result<Client, AuthError> {
-    let mut builder = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")));
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(proxy);
+/// The HTTP clients: one honoring the system proxy settings and one using
+/// no proxy, each request taking the one its URL needs.
+pub(crate) struct Http {
+    proxied: Client,
+    direct: Client,
+}
+
+impl Http {
+    /// The client for `url`: without a proxy where
+    /// [`core_types::skips_proxy`] says so (plain `http`, which only tests'
+    /// fakes on a loopback IP address use and a proxy would read, codes and
+    /// tokens included, or a loopback IP address, which a proxy would reach
+    /// on its own host), and with the system's proxy settings otherwise.
+    /// Each endpoint is decided on its own.
+    fn to(&self, url: &Url) -> &Client {
+        if core_types::skips_proxy(url.scheme(), url.host_str().unwrap_or_default()) {
+            &self.direct
+        } else {
+            &self.proxied
+        }
     }
-    let loopback = [&urls.token, &urls.revoke, &urls.profile]
-        .into_iter()
-        .any(|url| url.host_str().is_some_and(core_types::is_loopback_ip_host));
-    if loopback {
-        builder = builder.no_proxy();
-    }
-    builder.build().map_err(|source| AuthError::Http {
-        endpoint: Endpoint::Client,
-        source: Arc::new(source.without_url()),
+}
+
+/// Builds the HTTP clients. They never follow redirects: a 307 or 308 from
+/// the token endpoint would otherwise resend a body holding a code or
+/// refresh token to wherever it points. `proxy` is a proxy tests add as if
+/// the system had it.
+pub(crate) fn build_client(proxy: Option<reqwest::Proxy>) -> Result<Http, AuthError> {
+    let builder = || {
+        Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")))
+    };
+    let build = |builder: reqwest::ClientBuilder| {
+        builder.build().map_err(|source| AuthError::Http {
+            endpoint: Endpoint::Client,
+            source: Arc::new(source.without_url()),
+        })
+    };
+    let proxied = match proxy {
+        Some(proxy) => builder().proxy(proxy),
+        None => builder(),
+    };
+    Ok(Http {
+        proxied: build(proxied)?,
+        direct: build(builder().no_proxy())?,
     })
 }
 
@@ -66,6 +85,55 @@ pub(crate) struct Tokens {
     /// the old one stays valid.
     pub(crate) refresh_token: Option<SecretString>,
     pub(crate) expires_in: Duration,
+    pub(crate) grant: Grant,
+}
+
+/// What a token response's `scope` says was granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grant {
+    /// Only scopes in [`ALLOWED_SCOPES`].
+    Allowed,
+    /// No `scope`, or a blank one, which RFC 6749 (section 5.1) reads as
+    /// what the request asked for: what agentd asked for on a refresh, but
+    /// on a login what the authorize URL asked for, which the member could
+    /// have changed.
+    Unstated,
+    /// A scope outside [`ALLOWED_SCOPES`].
+    Wider,
+    /// A `scope` that is neither a string nor an array of strings, which
+    /// says nothing about the grant: a login counts it as unstated, and a
+    /// refresh, which sent the scopes itself, keeps the link and warns.
+    Unreadable,
+}
+
+impl Tokens {
+    /// Why a login can't keep these tokens: a grant wider than
+    /// [`ALLOWED_SCOPES`] ([`AuthError::ScopeRefused`]), or one that doesn't
+    /// say ([`AuthError::ScopeUnstated`]), since the member can add scopes
+    /// to the authorize URL and the code exchange doesn't send them again.
+    pub(crate) fn login_refusal(&self) -> Option<AuthError> {
+        match self.grant {
+            Grant::Allowed => None,
+            Grant::Unstated | Grant::Unreadable => Some(AuthError::ScopeUnstated),
+            Grant::Wider => Some(AuthError::ScopeRefused),
+        }
+    }
+}
+
+/// What `parts`, each a scope or several separated by blanks, grant: none
+/// is unstated, as an empty `scope` says nothing.
+fn granted<'a>(parts: impl IntoIterator<Item = &'a str>) -> Grant {
+    let mut scopes = parts
+        .into_iter()
+        .flat_map(str::split_ascii_whitespace)
+        .peekable();
+    if scopes.peek().is_none() {
+        Grant::Unstated
+    } else if scopes.all(|scope| ALLOWED_SCOPES.contains(&scope)) {
+        Grant::Allowed
+    } else {
+        Grant::Wider
+    }
 }
 
 #[derive(Deserialize)]
@@ -74,30 +142,33 @@ struct TokenResponse {
     #[serde(default)]
     refresh_token: Option<SecretString>,
     expires_in: f64,
-    /// The scopes granted, space-separated. Left out, they are the ones
-    /// asked for (RFC 6749, section 5.1).
+    /// The scopes granted, space-separated, or as an array of strings. Read
+    /// as any JSON value, so another shape is [`Grant::Unreadable`] rather
+    /// than failing the whole response.
     #[serde(default)]
-    scope: Option<String>,
+    scope: Option<Value>,
 }
 
 impl TokenResponse {
-    /// The tokens, checked.
-    ///
-    /// A grant wider than [`ALLOWED_SCOPES`] is [`AuthError::ScopeRefused`]:
-    /// the member can add scopes to the authorize URL, and the server may
-    /// grant its own, so what was asked for doesn't bound what came back.
+    /// The tokens, checked, with what their `scope` says was granted
+    /// ([`Grant`]): the member can add scopes to the authorize URL, and the
+    /// server may grant its own, so what was asked for doesn't bound what
+    /// came back.
     fn into_tokens(self, endpoint: Endpoint) -> Result<Tokens, AuthError> {
         let invalid = |reason| AuthError::InvalidResponse { endpoint, reason };
         if self.access_token.expose_secret().is_empty() {
             return Err(invalid("empty access_token"));
         }
-        if self.scope.as_deref().is_some_and(|scope| {
-            scope
-                .split_ascii_whitespace()
-                .any(|granted| !ALLOWED_SCOPES.contains(&granted))
-        }) {
-            return Err(AuthError::ScopeRefused);
-        }
+        let grant = match &self.scope {
+            None | Some(Value::Null) => Grant::Unstated,
+            Some(Value::String(scope)) => granted([scope.as_str()]),
+            Some(Value::Array(scopes)) => scopes
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .map_or(Grant::Unreadable, granted),
+            Some(_) => Grant::Unreadable,
+        };
         let refresh_token = self
             .refresh_token
             .filter(|token| !token.expose_secret().is_empty());
@@ -109,6 +180,7 @@ impl TokenResponse {
             access_token: self.access_token,
             refresh_token,
             expires_in,
+            grant,
         })
     }
 }
@@ -211,9 +283,8 @@ fn token_is_dead(status: StatusCode, body: &[u8]) -> bool {
 /// A failed refresh.
 pub(crate) struct RefreshFailure {
     pub(crate) error: AuthError,
-    /// Whether the refresh token can't be used again, so the link has to be
-    /// marked broken: the token endpoint said it is dead
-    /// ([`token_is_dead`]), or it grants more than [`ALLOWED_SCOPES`].
+    /// Whether the token endpoint said the refresh token is dead
+    /// ([`token_is_dead`]), so the link has to be marked broken.
     pub(crate) dead: bool,
 }
 
@@ -266,7 +337,7 @@ pub(crate) struct Exchange<'a> {
 
 /// POSTs the `authorization_code` grant as JSON.
 pub(crate) async fn exchange_code(
-    client: &Client,
+    client: &Http,
     token_url: &Url,
     exchange: Exchange<'_>,
 ) -> Result<Tokens, AuthError> {
@@ -279,6 +350,7 @@ pub(crate) async fn exchange_code(
         state: exchange.state,
     };
     let request = client
+        .to(token_url)
         .post(token_url.clone())
         .json(&body)
         .timeout(TOKEN_TIMEOUT);
@@ -299,7 +371,7 @@ pub(crate) async fn exchange_code(
 
 /// POSTs the `refresh_token` grant as JSON.
 pub(crate) async fn refresh(
-    client: &Client,
+    client: &Http,
     token_url: &Url,
     refresh_token: &SecretString,
     client_id: &str,
@@ -312,6 +384,7 @@ pub(crate) async fn refresh(
         scope,
     };
     let request = client
+        .to(token_url)
         .post(token_url.clone())
         .json(&body)
         .timeout(TOKEN_TIMEOUT);
@@ -322,21 +395,17 @@ pub(crate) async fn refresh(
             dead: token_is_dead(response.status, &response.body),
         });
     }
-    parse::<TokenResponse>(&response.body, Endpoint::Token)?
-        .into_tokens(Endpoint::Token)
-        .map_err(|error| RefreshFailure {
-            dead: matches!(error, AuthError::ScopeRefused),
-            error,
-        })
+    Ok(parse::<TokenResponse>(&response.body, Endpoint::Token)?.into_tokens(Endpoint::Token)?)
 }
 
 /// GETs the profile with the access token and reads the plan from it.
 pub(crate) async fn fetch_profile(
-    client: &Client,
+    client: &Http,
     profile_url: &Url,
     access_token: &SecretString,
 ) -> Result<PlanInfo, AuthError> {
     let request = client
+        .to(profile_url)
         .get(profile_url.clone())
         .bearer_auth(access_token.expose_secret())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -351,7 +420,7 @@ pub(crate) async fn fetch_profile(
 
 /// POSTs a refresh token to the revocation endpoint.
 pub(crate) async fn revoke(
-    client: &Client,
+    client: &Http,
     revoke_url: &Url,
     refresh_token: &SecretString,
     client_id: &str,
@@ -362,6 +431,7 @@ pub(crate) async fn revoke(
         client_id,
     };
     let request = client
+        .to(revoke_url)
         .post(revoke_url.clone())
         .json(&body)
         .timeout(REVOKE_TIMEOUT);
@@ -376,22 +446,17 @@ pub(crate) async fn revoke(
 mod tests {
     use super::*;
 
-    fn urls(base: &str) -> Urls {
-        let at = |path| Url::parse(base).unwrap().join(path).unwrap();
-        Urls {
-            authorize: at("/oauth/authorize"),
-            token: at("/v1/oauth/token"),
-            revoke: at("/v1/oauth/revoke"),
-            redirect: at("/oauth/code/callback"),
-            profile: at("/api/oauth/profile"),
-        }
-    }
-
     #[tokio::test]
-    async fn loopback_endpoints_are_called_without_a_proxy() {
-        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
-            build_client(&urls(base), Some(proxy)).unwrap()
-        })
+    async fn each_endpoint_takes_a_proxy_only_for_remote_https() {
+        testkit::proxy::assert_proxied_only_elsewhere(
+            |base, proxy| {
+                build_client(Some(proxy))
+                    .unwrap()
+                    .to(&Url::parse(base).unwrap())
+                    .clone()
+            },
+            &["https://127.0.0.1:9", "http://[::1]:9"],
+        )
         .await;
     }
 
@@ -432,28 +497,61 @@ mod tests {
         }
     }
 
+    fn grant(scope: &str) -> Grant {
+        let json = format!(r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#);
+        tokens(&json).unwrap().grant
+    }
+
     #[test]
     fn a_grant_wider_than_the_allowed_scopes_is_refused() {
         for scope in [
             r#""user:profile user:inference""#,
             r#""user:inference""#,
             r#"" user:profile  user:inference ""#,
-            r#""""#,
-            "null",
+            r#"["user:profile", "user:inference"]"#,
+            r#"["user:profile user:inference"]"#,
         ] {
-            let json = format!(r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#);
-            assert!(tokens(&json).is_ok(), "{scope}");
+            assert_eq!(grant(scope), Grant::Allowed, "{scope}");
+            let allowed = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ));
+            assert!(allowed.unwrap().login_refusal().is_none(), "{scope}");
         }
-        assert!(tokens(r#"{"access_token":"a","expires_in":60}"#).is_ok());
+        for scope in ["null", r#""""#, r#""  ""#, "[]", r#"["", " "]"#] {
+            assert_eq!(grant(scope), Grant::Unstated, "{scope}");
+        }
+        let unstated = tokens(r#"{"access_token":"a","expires_in":60}"#).unwrap();
+        assert_eq!(unstated.grant, Grant::Unstated);
+        assert!(matches!(
+            unstated.login_refusal(),
+            Some(AuthError::ScopeUnstated)
+        ));
+        for scope in ["7", "{}", "true", r#"["user:profile", 7]"#] {
+            assert_eq!(grant(scope), Grant::Unreadable, "{scope}");
+            let unreadable = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ))
+            .unwrap();
+            assert!(
+                matches!(unreadable.login_refusal(), Some(AuthError::ScopeUnstated)),
+                "{scope}"
+            );
+        }
         for scope in [
-            "user:profile user:inference user:sessions:claude_code",
-            "user:sessions:claude_code",
-            "user:inference org:create_api_key",
-            "User:Profile",
-            "user:profile,user:inference",
+            r#""user:profile user:inference user:sessions:claude_code""#,
+            r#""user:sessions:claude_code""#,
+            r#""user:inference org:create_api_key""#,
+            r#""User:Profile""#,
+            r#""user:profile,user:inference""#,
+            r#"["user:profile", "user:sessions:claude_code"]"#,
+            r#"["user:inference org:create_api_key"]"#,
         ] {
-            let json = format!(r#"{{"access_token":"a","expires_in":60,"scope":"{scope}"}}"#);
-            let err = tokens(&json).err().unwrap();
+            assert_eq!(grant(scope), Grant::Wider, "{scope}");
+            let wide = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ))
+            .unwrap();
+            let err = wide.login_refusal().unwrap();
             assert!(matches!(err, AuthError::ScopeRefused), "{scope}: {err:?}");
             for allowed in ALLOWED_SCOPES {
                 assert!(err.to_string().contains(allowed), "{err}");

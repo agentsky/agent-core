@@ -1,7 +1,7 @@
 //! [`FakeProxy`]: a proxy that answers nothing and records what reached it,
 //! for tests that a client goes around, or through, a proxy it was given;
-//! and [`assert_loopback_skips_proxy`], the test every client that calls a
-//! configured URL runs.
+//! and [`assert_proxied_only_elsewhere`], the test every client that calls
+//! a configured URL runs.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -79,21 +79,25 @@ impl Drop for FakeProxy {
     }
 }
 
-/// Checks that a client goes straight to a loopback address it was
-/// configured with, though the system has a proxy, and that it does use the
-/// proxy otherwise, so the first check proves something.
+/// Checks that a client goes straight to the bases it should reach without
+/// a proxy, though the system has one, and that it does use the proxy
+/// otherwise, so the first checks prove something.
 ///
 /// `build` builds the client under test for a configured base URL, given a
-/// proxy to add as if the system had it. It is called once with a fake
-/// server's `http://127.0.0.1:<port>` and once with
-/// `https://api.example.com`; both clients then send a `GET` to the fake
-/// server.
+/// proxy to add as if the system had it. It is called with a fake server's
+/// `http://127.0.0.1:<port>`, with each of `also_direct`, and with
+/// `https://api.example.com`. Each client then sends a `GET` to the fake
+/// server: all but the last must reach it directly, and the last must go
+/// to the proxy.
 ///
 /// # Panics
 ///
-/// If the loopback client used the proxy or failed, or the other one did
-/// not reach the proxy.
-pub async fn assert_loopback_skips_proxy(build: impl Fn(&str, reqwest::Proxy) -> reqwest::Client) {
+/// If a client that should go direct used the proxy or failed, or the last
+/// one did not reach the proxy.
+pub async fn assert_proxied_only_elsewhere(
+    build: impl Fn(&str, reqwest::Proxy) -> reqwest::Client,
+    also_direct: &[&str],
+) {
     let server = MockServer::start().await;
     Mock::given(any())
         .respond_with(ResponseTemplate::new(204))
@@ -103,17 +107,21 @@ pub async fn assert_loopback_skips_proxy(build: impl Fn(&str, reqwest::Proxy) ->
     let system = || reqwest::Proxy::all(proxy.url()).expect("a proxy URL");
     let target = format!("{}/probe", server.uri());
 
-    let direct = build(&server.uri(), system())
-        .get(&target)
-        .send()
-        .await
-        .expect("the loopback request is answered");
-    assert_eq!(direct.status(), 204);
-    assert_eq!(
-        proxy.seen(),
-        Vec::<String>::new(),
-        "the proxy saw a loopback request"
-    );
+    let direct =
+        std::iter::once(server.uri()).chain(also_direct.iter().map(|base| (*base).to_owned()));
+    for base in direct {
+        let answer = build(&base, system())
+            .get(&target)
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("{base}: the request failed: {err}"));
+        assert_eq!(answer.status(), 204, "{base}");
+        assert_eq!(
+            proxy.seen(),
+            Vec::<String>::new(),
+            "{base} went through the proxy"
+        );
+    }
 
     let proxied = build("https://api.example.com", system())
         .get(&target)

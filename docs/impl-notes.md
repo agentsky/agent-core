@@ -7980,12 +7980,11 @@ answer.
 
 ## T35a: Cloud hand-off: store and grammar
 
-### A late answer marks the notice done, and takes the row only while it is owed
+### A late answer is recorded once, on a row the pass marked
 
 **Issue.** The plan records `fired`, `rejected` or `unknown` from
 `sending`, and `fired` or `rejected` from `unknown`, marking the notice
-done "unless a notice claim's lease is live". Three things went wrong with
-taking that literally:
+done "unless a notice claim's lease is live". Taken literally:
 
 - A late `unknown`, such as a reply that timed out and whose record was
   held up past the pass, was refused. Its notice then stayed owed, and the
@@ -7999,14 +7998,24 @@ taking that literally:
 - An `unknown` the command's own reply recorded could still be turned into
   `fired` later, although only a row the pass marked waits on an answer.
 
+A second version took a late answer only while the notice hadn't gone out.
+Review showed that window is about one DM long: T35c's notifier marks rows
+and sends their notices in the same tick, so a late `fired` (a blue-green
+deploy whose instances' timeouts differ, say) would almost never be
+recorded, leaving `cloud list` without the link of a session that exists,
+while refusing the record prevented no message.
+
 **Solution.** `finish_cloud_handoff` takes a row that is `sending`, or
-`unknown` with `notified_at` empty (only a pass leaves an `unknown` row so).
-It always sets `notified_at`, since the reply tells the member. A late
+`unknown` with `unknown_reason` `no_answer`, which only the pass sets, so a
+reply's own `unknown` takes no later answer. It sets `notified_at` if it is
+empty, since the reply tells the member, and keeps a notice's time. A late
 `fired` or `rejected` replaces `unknown` and sets `answered_at`; a late
 `unknown` keeps the row's time and state, fills in a status the row lacked
-and replaces the pass's `no_answer` with its own reason. A claim still sending then finds the notice done, and its mark
-returns false. Once the notice has told the member, a late answer changes
-nothing; the reply still carries it. There is no lease column.
+and replaces `no_answer` with its own reason. Either way the row no longer
+has `no_answer`, so it takes one late answer. A notice a claim is sending at
+that moment may still reach the member besides the reply, and the claim's
+mark then returns false; avoiding that would need a two-phase send. There
+is no lease column.
 
 ### Sealed values are bound to the member
 
@@ -8017,10 +8026,15 @@ without the master key, would let that member open the token and fire the
 routine, and read moved tasks in `cloud list`.
 
 **Solution.** A token's associated data key is
-`<member>:<id>:<routine id>:<url origin>` and a task's `<member>:<id>`
-(only the origin may hold `:`, and it comes last). A row moved to another
-member, or given another routine id or origin, fails with
-`SealError::Decrypt`, which tests show for both tables.
+`<member>:<id>:<routine id>:<label>:<url origin>` and a task's
+`<member>:<id>` (only the origin may hold `:`, since a label never does,
+and it comes last). A row moved to another member, or given another
+routine id, label or origin, fails with `SealError::Decrypt`, which tests
+show for both tables; the label keeps two of a member's own rows from
+swapping labels, which would fire one routine for the other's name. The
+stored routine id and origin strings are the associated data, so
+normalizing either later means re-sealing with the master key, not a SQL
+`UPDATE`.
 
 ### The `url` crate changes what it parses
 
@@ -8057,7 +8071,10 @@ would send every stored token there.
 associated data. `put_cloud_routine` takes it, and `CloudRoutineToken` and
 `CloudRoutine` return it, so a fire (T35b's client, or T35c before
 calling it) refuses a routine whose origin isn't `base_url`'s, and T35c
-tells the member to `cloud add` it again.
+tells the member to `cloud add` it again. The comparison parses the stored
+origin (`Url::parse(stored)?.origin() == base_url.origin()`) rather than
+comparing strings, so a change in how `url` writes an origin can't lock
+members out.
 
 ### A routine token is checked in one place
 
@@ -8066,16 +8083,17 @@ non-ASCII character would fail only when T35b built the `Authorization`
 header, after a hand-off row was written; and the grammar, the store and
 the fire client would each have had to agree on what a token is.
 
-**Solution.** `core_types::RoutineToken` wraps a `SecretString` and is
-made only by `RoutineToken::parse`: it starts with `sk-ant-` (the plan says
-routine tokens are `sk-ant-oat01-…`; only the family is required, in case
-the version changes), is printable ASCII and is at most 1024 bytes. Its
-`Debug` is redacted and it has no `Display` or serde form. `cloud add`'s
-clap value parser makes one at once, so no `String` copy of the token
-lives in the parsed arguments, and the refusal is a fixed sentence. The
-store seals one (`NewCloudRoutine::token`) and opens one
-(`CloudRoutineToken::token`), reporting a stored token that no longer
-passes as `Corrupt`; T35b's `fire` takes `&RoutineToken`. `core-types`
+**Solution.** `core_types::RoutineToken` wraps a `SecretString` and is made
+only by `RoutineToken::parse`: it starts with `sk-ant-` (the routine fire
+reference says its tokens are prefixed `sk-ant-oat01-`; only the family is
+required, in case the version changes), is printable ASCII and is at most
+1024 bytes. Its `Debug` is redacted and it has no `Display` or serde form.
+`cloud add`'s clap value parser makes one at once, so no `String` copy of
+the token lives in the parsed arguments, and the refusal is a fixed
+sentence. The store seals one (`NewCloudRoutine::token`) and opens one
+(`CloudRoutineToken::token`), reporting a stored token that no longer passes
+as `Corrupt`, which T35c answers by asking the member to `cloud add` the
+routine again; T35b's `fire` takes `&RoutineToken`. `core-types`
 now depends on `secrecy`, already a workspace dependency.
 
 ### Where the shared types live
@@ -8096,9 +8114,11 @@ status for a connection that failed before sending, and
 `Unknown { status, reason }`). The reason is a `CloudUnknownReason`, one
 per case of the plan's failure table: `server_error`, `other_status`,
 `timeout`, `connection_lost`, `redirect`, `unreadable_answer`, and
-`no_answer`, which the pass sets. It is kept in a column of its own,
-`unknown_reason`, set exactly while the row is `unknown`, rather than in
-`error_type`, which holds what the endpoint said. T35c maps T35b's
+`no_answer`, which only the pass sets: `finish_cloud_handoff` refuses it
+with `StoreError::Refused`, since a caller recording it would leave a row
+that takes a second answer and owes a second notice. It is kept in a column
+of its own, `unknown_reason`, set exactly while the row is `unknown`, rather
+than in `error_type`, which holds what the endpoint said. T35c maps T35b's
 `FireOutcome` onto `CloudOutcome`. `retry_after_secs` is a `u32`: T35b
 should read `Retry-After` into one, or T35c saturate into it.
 
@@ -8171,14 +8191,17 @@ T35c's handlers land.
   cut-off is the caller's, so in a blue-green deploy that changes
   `[cloud] timeout_secs`, the instance with the shorter timeout can mark a
   row the other still waits on; the member then gets the notice and the
-  reply, and the late answer is recorded unless the notice went first. A
-  per-row deadline would close that, at the cost of a column.
-- One index on `created_at` serves the pass and the purge, and one on
+  reply, and the late answer is still recorded. A per-row deadline would
+  close that, at the cost of a column.
+- A partial index on `created_at` where `state = 'sending'` serves the
+  pass, which otherwise reads the whole history for its few `sending` rows;
+  a plain one on `created_at` serves the purge; and one on
   `(member_id, created_at)` serves `recent_cloud_handoffs` (ties broken by
   `rowid`) and the member deletions.
 - `purge_cloud_handoffs(before, now)` keeps a row whose notice is still
   owed at `now`, so a `retention_days` of 1 can't cut the notice's day
-  short.
+  short, and a `sending` row, so a purge that runs before the pass, after
+  a long outage, doesn't lose its notice.
 - The schema checks what each state implies: `answered_at` is set exactly
   when the row isn't `sending`, `session_id` (never empty) exactly when it
   is `fired`, a `session_url` only then, an error type and `Retry-After`
@@ -8277,7 +8300,7 @@ drops packets: a 100 ms connect timeout under a 600 ms total gave
 most equal as the plan says, so a connection that never opened is always
 `rejected`.
 
-### No proxy reads a request to a loopback address
+### No proxy reads a plain request or one to a loopback address
 
 **Issue.** The client honors the system proxy settings, as the plan asks,
 and reqwest's environment proxy has no exception of its own for loopback
@@ -8287,17 +8310,40 @@ proxy reached `127.0.0.1` on its own host. A `NO_PROXY` listing
 `127.0.0.1` doesn't cover all of `127.0.0.0/8` or `::ffff:127.0.0.1`,
 which the configuration accepts. The credential proxy's upstream, the
 OAuth client and the Slack and Rocket.Chat clients had the same gap with
-members' and bots' tokens.
+members' and bots' tokens, and the Slack and Rocket.Chat clients accept
+plain `http` to any host: Compose's `http://rocketchat:3000` sent the bot's
+`X-Auth-Token` to the proxy in clear, and the proxy couldn't resolve
+`rocketchat` either.
 
-**Solution.** Each of those clients skips proxies when its configured
-base is a loopback IP address, by one rule,
-`core_types::is_loopback_ip_host`, which the `http` checks of `[cloud]`,
-`[proxy] upstream` and `[claude_oauth]` share; `[claude_oauth]` now
-refuses `http://localhost` as the other two do. Any other base still
-honors the system settings. Each client's builder takes a proxy that tests
-add as if the system had it, and `testkit::proxy::assert_loopback_skips_proxy`
-checks with a fake proxy that the loopback request goes around it while a
-request from a client built for another base goes through it, without
+**Solution.** One rule, `core_types::skips_proxy`, decides it for all five
+clients: a plain `http` base, or a loopback IP address over either
+scheme, is called without a proxy; any other `https` base honors the
+system settings. Skipping the proxy for every plain `http` base, rather
+than only for loopback addresses with `NO_PROXY` advice for the rest, was
+chosen because a proxy should never read a request that carries
+credentials in clear, and an operator who needs one for such a host uses
+`https`; it also needs no deployment to set anything. `auth` decides per
+endpoint, with a proxied and a direct client, so a loopback token-endpoint
+fake no longer takes the proxy away from an `https` profile endpoint. The
+Slack client keeps one client chosen by `api_url`, which also carries file
+transfers and `response_url` posts, so a plain `http` `api_url` (only
+fakes use one) takes those off the proxy too; the example configuration
+says so, rather than a second client for a case no deployment has.
+Rocket.Chat's cross-origin redirects already use their own proxied client.
+The example configuration and the Compose README tell operators the rule:
+`https://` URLs honor `HTTPS_PROXY` (or `ALL_PROXY`, its fallback in
+hyper-util's environment matcher) and `NO_PROXY`; `HTTP_PROXY` never
+applies, since no plain `http://` URL is proxied. A plain `http://` URL or a
+loopback IP address is always called directly, which `NO_PROXY` can't
+change. Rocket.Chat's realtime connection (`tokio-tungstenite`) never used
+a proxy, so a Rocket.Chat server has to be reachable directly anyway.
+Where `http` is allowed is a separate rule, `core_types::is_loopback_ip_host`,
+which `[cloud]`, `[proxy] upstream` and `[claude_oauth]` share;
+`[claude_oauth]` now refuses `http://localhost` as the other two do. Each
+client's builder takes a proxy that tests add as if the system had it,
+and `testkit::proxy::assert_proxied_only_elsewhere` checks with a fake
+proxy that the fake server's loopback address and each other direct base
+go around it while `https://api.example.com` goes through it, without
 setting any environment variable.
 
 ### `base_url` is checked as the `url` crate reads it
@@ -8354,7 +8400,9 @@ the edges to the implementation.
   `Retry-After` or the reason for `unknown`: at info for `fired` and at
   warn otherwise. A request that wasn't sent adds a warning saying why:
   the origin, the task, or the connect error and its causes without the
-  URL (DNS, TLS, a refused connection), which never hold a header.
+  URL (DNS, TLS, a refused connection), which never hold a header. The
+  causes are joined by `core_types::error_chain`, which the Slack and
+  Rocket.Chat clients' transport errors now use too.
 - The answer's `Debug` shows a body's length only, since a body may echo
   what was sent; the classifier and its types are private to the module.
 
@@ -8375,18 +8423,60 @@ and the code exchange doesn't send them again, so a member who added
 with it, which the credential proxy would forward on every turn. A token
 endpoint that grants its own defaults, or doesn't narrow a refresh, would
 do the same silently, and members who linked while the configured scopes
-were wider still hold such tokens.
+were wider still hold such tokens. RFC 6749 lets the answer leave `scope`
+out when it is what the request asked for, which for a login is the URL
+the member may have changed.
 
-**Solution.** `auth` reads a token response's `scope` and refuses one
-naming anything outside `ALLOWED_SCOPES` (`AuthError::ScopeRefused`): a
-login stores nothing and the member is told to log in again without
-changing the link; a refresh marks the link broken, as a dead refresh
-token does, so the member gets the relink notice and the token isn't
-served again. The refused tokens are dropped, not revoked: the login's
-were never stored, and the broken link keeps its old refresh token until
-the next login replaces it or `logout` revokes it. A response without `scope` keeps the link: RFC
-6749 says the grant is then what was asked for, and neither the plan nor
-the design says otherwise.
+**Solution.** `auth` reads a token response's `scope` as any JSON value:
+a space-separated string, as RFC 6749 has it, or an array of strings read
+the same way, so an array naming a wider scope can't slip through as a
+format nobody expected. It sorts what that grants into a `Grant`: only
+`ALLOWED_SCOPES`; unstated (absent, `null`, blank or an empty array, since
+no scope is no grant and a server using it for "as requested" would reopen
+the hole); wider; or unreadable, any other shape, which says nothing about
+the grant.
+
+- A login keeps only an allowed grant. A wider one is
+  `AuthError::ScopeRefused`, whose reply tells the member to open the
+  login link unchanged. An unstated or unreadable one is
+  `AuthError::ScopeUnstated`, since every login then fails until the
+  endpoint changes: its error line for the operator is logged once per
+  login attempt, not again by the command handler, and the reply says so
+  and to tell an admin rather than inviting retries.
+- A refresh sent the scopes itself, so an unstated or unreadable grant
+  keeps the link: a change of format at Anthropic doesn't break every
+  member's link and revoke every token. An unreadable one is logged at
+  warn, once per process. A wider one, string or array, marks the link
+  broken, as a dead refresh token does, so the member gets the relink
+  notice and the token isn't served again.
+- A refused grant's refresh token is revoked, as `logout` revokes one,
+  best effort: before the login's reply, and after a refresh releases the
+  member's lock, the new refresh token if the answer had one and the
+  link's old one otherwise. A refused login without a refresh token logs
+  that its access token lives until it expires.
+
+That the endpoint names `scope` is observed, not documented: Claude Code
+2.1.286's bundled JavaScript keeps `scopes: Hgn(e.scope)` in
+`formatTokens`, where `Hgn` splits a string on spaces and gives `[]` for
+anything else, and its save path `p8n` stores a login's tokens only when
+those scopes include `user:inference` (`rU`), as its auth-source detection
+and refresh eligibility also require. A login answer without `scope` would
+leave Claude Code itself without a claude.ai login, so the endpoint names
+it, at least for Claude Code's scope set; T35c's live check confirms it for
+agentd's pair. The design's Verified and assumed list footnotes this, and
+notes that `ALLOWED_SCOPES` is a constant, so a default scope the server
+starts adding would refuse every login and break every link until a
+release allows it.
+
+Revoking a refused refresh's token can't hit one a concurrent refresh
+stored: agentd runs one process, refreshes of a member are serialized,
+and a broken link isn't refreshed again. Two processes on one database
+aren't supported; if they become so, `update_claude_tokens` should also
+require `broken_at IS NULL`, since it now clears a break with only a
+generation check and could undo one the other process made. Whether
+Anthropic revokes per grant or per member and client id, which would end
+a member's healthy link when a later refused login is revoked, is
+unverified, as it is for `logout`; T35c's live check asks.
 
 ## T36a: Slack Connect: who is outside
 

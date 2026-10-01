@@ -248,7 +248,7 @@ admins = []
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every
 # key is optional; these are the defaults (Claude Code 2.1.285). URLs must be
-# https://, except http:// on a loopback host for local fakes. `scopes` may
+# https://, except http:// to a loopback IP address for local fakes. `scopes` may
 # name only user:profile and user:inference: the credential proxy forwards any
 # path, so a wider scope, such as one that controls a member's cloud sessions,
 # would be usable from every turn on their account.
@@ -266,7 +266,12 @@ profile_url = "https://api.anthropic.com/api/oauth/profile"
 # messages, and as messages starting with `!agent` in rooms it is in, and
 # answers every command in a direct message.
 [rocketchat]
-# The server's base URL.
+# The server's base URL. Its REST calls to an https:// URL honor HTTPS_PROXY
+# (or ALL_PROXY) and NO_PROXY. A plain http:// URL is always called
+# directly, so a proxy never sees a request carrying a token in clear, and
+# so is a loopback IP address, which a proxy would resolve on its own host.
+# The realtime connection never uses a proxy, so the server must be
+# reachable directly.
 base_url = "https://chat.example.com"
 
 # The realtime (DDP) endpoint. Optional: by default <base_url>/websocket,
@@ -290,7 +295,12 @@ manager_user_id = "aBcD1234eFgH5678"
 # set; README.md says how to create the app from
 # deploy/slack/manager-manifest.yaml. The section is optional.
 [slack]
-# The Web API's base URL. Change it only to point tests at a fake.
+# The Web API's base URL. Change it only to point tests at a fake. An
+# https:// URL honors HTTPS_PROXY (or ALL_PROXY) and NO_PROXY. A plain
+# http:// URL is always called directly, so no proxy reads the bot token in
+# clear, and so is a loopback IP address, which a proxy would resolve on its
+# own host. One client serves every Slack request, so with such a URL, file
+# transfers and response URLs skip the proxy too.
 api_url = "https://slack.com/api/"
 
 # agentd's public HTTPS URL, as Slack reaches the public listener through the

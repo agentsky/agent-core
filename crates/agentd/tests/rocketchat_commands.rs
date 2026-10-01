@@ -115,6 +115,7 @@ async fn the_manager_bot_runs_dm_and_channel_commands() {
             "access_token": "a",
             "refresh_token": "r",
             "expires_in": 28800,
+            "scope": "user:profile user:inference",
         })))
         .mount(&oauth)
         .await;
