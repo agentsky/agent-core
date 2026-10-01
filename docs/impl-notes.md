@@ -8083,17 +8083,17 @@ non-ASCII character would fail only when T35b built the `Authorization`
 header, after a hand-off row was written; and the grammar, the store and
 the fire client would each have had to agree on what a token is.
 
-**Solution.** `core_types::RoutineToken` wraps a `SecretString` and is
-made only by `RoutineToken::parse`: it starts with `sk-ant-` (the routine
-fire reference says its tokens are prefixed `sk-ant-oat01-`; only the
-family is required, in case the version changes), is printable ASCII and is at most 1024 bytes. Its
-`Debug` is redacted and it has no `Display` or serde form. `cloud add`'s
-clap value parser makes one at once, so no `String` copy of the token
-lives in the parsed arguments, and the refusal is a fixed sentence. The
-store seals one (`NewCloudRoutine::token`) and opens one
-(`CloudRoutineToken::token`), reporting a stored token that no longer
-passes as `Corrupt`, which T35c answers by asking the member to `cloud add`
-the routine again; T35b's `fire` takes `&RoutineToken`. `core-types`
+**Solution.** `core_types::RoutineToken` wraps a `SecretString` and is made
+only by `RoutineToken::parse`: it starts with `sk-ant-` (the routine fire
+reference says its tokens are prefixed `sk-ant-oat01-`; only the family is
+required, in case the version changes), is printable ASCII and is at most
+1024 bytes. Its `Debug` is redacted and it has no `Display` or serde form.
+`cloud add`'s clap value parser makes one at once, so no `String` copy of
+the token lives in the parsed arguments, and the refusal is a fixed
+sentence. The store seals one (`NewCloudRoutine::token`) and opens one
+(`CloudRoutineToken::token`), reporting a stored token that no longer passes
+as `Corrupt`, which T35c answers by asking the member to `cloud add` the
+routine again; T35b's `fire` takes `&RoutineToken`. `core-types`
 now depends on `secrecy`, already a workspace dependency.
 
 ### Where the shared types live
@@ -8114,9 +8114,11 @@ status for a connection that failed before sending, and
 `Unknown { status, reason }`). The reason is a `CloudUnknownReason`, one
 per case of the plan's failure table: `server_error`, `other_status`,
 `timeout`, `connection_lost`, `redirect`, `unreadable_answer`, and
-`no_answer`, which the pass sets. It is kept in a column of its own,
-`unknown_reason`, set exactly while the row is `unknown`, rather than in
-`error_type`, which holds what the endpoint said. T35c maps T35b's
+`no_answer`, which only the pass sets: `finish_cloud_handoff` refuses it
+with `StoreError::Refused`, since a caller recording it would leave a row
+that takes a second answer and owes a second notice. It is kept in a column
+of its own, `unknown_reason`, set exactly while the row is `unknown`, rather
+than in `error_type`, which holds what the endpoint said. T35c maps T35b's
 `FireOutcome` onto `CloudOutcome`. `retry_after_secs` is a `u32`: T35b
 should read `Retry-After` into one, or T35c saturate into it.
 

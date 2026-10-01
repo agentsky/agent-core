@@ -1024,15 +1024,15 @@ Two tables, both in the store:
   they have, those registered from Rocket.Chat included. agentd can't revoke a
   token at Anthropic, which has no public API for it[^cc-routines-fire], so
   the other replies tell the member to revoke it at claude.ai/code/routines.
-- `cloud_handoffs`: an id, the member, the routine's label and id (copied, so
-  the record outlives the routine's row), the identity that asked and the
+- `cloud_handoffs`: an id, the member, the routine's label and id (copied,
+  so the record outlives the routine's row), the identity that asked and the
   kind of command origin, the sealed task text, the state (`sending`,
   `fired`, `rejected` or `unknown`), the HTTP status, the error type and any
-  `Retry-After`, why an `unknown` outcome isn't known, the session id and URL, when it was asked and answered, and
-  the notice's state. `cloud list` shows each task's first line, cut to 60
-  characters, as literal text. Rows are deleted 90 days after they were
-  asked (`[cloud] retention_days`), and with the member's routines on
-  `logout`.
+  `Retry-After`, why an `unknown` outcome isn't known, the session id and
+  URL, when it was asked and answered, and the notice's state. `cloud list`
+  shows each task's first line, cut to 60 characters, as literal text. Rows
+  are deleted 90 days after they were asked (`[cloud] retention_days`), and
+  with the member's routines on `logout`.
 
 Sealed columns use their table, column and row as associated data, like
 every sealed column, and the member as well: a token also with its routine
@@ -1047,7 +1047,7 @@ with another `cloud run`, starts another session. Commands themselves run
 once: Slack's replayed slash commands are dropped by their signature, and
 Rocket.Chat edits don't run again.
 
-The member hears each outcome once:
+The member hears each outcome at least once, usually once:
 
 - The command's reply tells them, whatever the outcome, so recording an
   outcome also marks its notice done.
@@ -1102,8 +1102,8 @@ the pasted URL as typed.
 Verified, from the documentation on 2026-10-01: everything in
 [What Claude Code documents](#what-claude-code-documents), the routine
 endpoint's request, response, documented errors, limits and token scope,
-its tokens' `sk-ant-oat01-` prefix, the untrusted wrapping of fired text, how routines clone and push, and the
-GitHub proxy's limits.
+its tokens' `sk-ant-oat01-` prefix, the untrusted wrapping of fired text,
+how routines clone and push, and the GitHub proxy's limits.
 
 Assumed, until the live check in the plan's implementation tasks:
 

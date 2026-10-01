@@ -3029,45 +3029,46 @@ Design: [Cloud hand-off](design.md#cloud-hand-off), its
 Deliverables:
 
 - A migration `…_cloud_handoff.sql`:
-  - `cloud_routines`: `id`, `member_id`, `label`, `routine_id` (with its
-    `trig_` prefix), `token_enc`, `added_by` (the identity's `MemberKey`
-    string form) and `added_at`. Unique on `(member_id, label)` and on
-    `(member_id, routine_id)`.
+  - `cloud_routines`: `id`, `member_id`, `label` (no `:`), `routine_id`
+    (with its `trig_` prefix), `url_origin`, `token_enc`, `added_by` (the
+    identity's `MemberKey` string form) and `added_at`. Unique on
+    `(member_id, label)` and on `(member_id, routine_id)`.
   - `cloud_handoffs`: `id`, `member_id`, `routine_label`, `routine_id`,
     `requested_by`, `origin` (`slack_slash`, `slack_dm` or
     `rocketchat_dm`), `task_enc`, `state` with a `CHECK` on `sending`,
     `fired`, `rejected` and `unknown`, `http_status`, `error_type`,
-    `retry_after_secs`, `session_id`, `session_url`, `created_at`,
-    `answered_at`, and the notice's `notice_attempts`,
+    `retry_after_secs`, `unknown_reason`, `session_id`, `session_url`,
+    `created_at`, `answered_at`, and the notice's `notice_attempts`,
     `notice_next_attempt_at` and `notified_at`, after T13's relink
-    columns. Partial indexes serve the pass: `created_at` where
+    columns. A `fired` or `rejected` row always has `notified_at`.
+    Partial indexes serve the pass: `created_at` where
     `state = 'sending'`, and `notice_next_attempt_at` where
     `state = 'unknown' AND notified_at IS NULL`.
 - `Store` methods:
-  - `put_cloud_routine(member, label, routine_id, token, added_by, now)`.
-    The token is a `SecretString`, sealed with
-    `cloud_routines/token_enc/<id>` as associated data. An existing label
+  - `put_cloud_routine(&NewCloudRoutine, now)`, whose fields are the
+    member, label, routine id, URL origin, token and `added_by`. The token
+    is a `core_types::RoutineToken`, sealed to `cloud_routines.token_enc`
+    under `<member>:<id>:<routine id>:<label>:<url origin>`. An existing label
     is replaced in place, which is how a member registers a new token; a
     routine id registered under another label is refused; a new label past
     20 for the member is refused, counted in the insert's
     `BEGIN IMMEDIATE` transaction.
-  - `cloud_routine(member, label)` returns the routine id and the opened
-    token. `cloud_routines(member)` lists labels, ids and times, never
-    tokens.
+  - `cloud_routine(member, label)` returns the routine id, the URL origin
+    and the opened token. `cloud_routines(member)` lists labels, ids and
+    times, never tokens.
   - `delete_cloud_routine(member, label)`, and
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(…)` seals the task with
-    `cloud_handoffs/task_enc/<id>`, inserts the row as `sending` and
+  - `begin_cloud_handoff(…)` seals the task to `cloud_handoffs.task_enc`
+    under `<member>:<id>`, inserts the row as `sending` and
     returns its id.
-  - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
-    `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
-    for an answer whose record was held up past the pass. Recording any
-    outcome from `sending` sets `notified_at`, since the command's reply
-    tells the member; recording `fired` or `rejected` from `unknown` sets it
-    too unless a notice claim's lease is live. Nothing retries a record
-    that failed.
+  - `finish_cloud_handoff(id, outcome, now)` records an outcome once, from
+    `sending`, or from `unknown` when the pass gave up on the row
+    (`unknown_reason` `no_answer`), for an answer whose record was held up
+    past the pass. It sets `notified_at` if unset, since the command's
+    reply tells the member. It refuses `no_answer`, which only the pass
+    sets. Nothing retries a record that failed.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3078,7 +3079,8 @@ Deliverables:
     doubling up to an hour, naming its claim) and
     `mark_cloud_handoff_notified(id, claim, now)`. A notice is no longer
     due 24 hours after its row's `answered_at`.
-  - `purge_cloud_handoffs(before)` deletes rows asked before `before`.
+  - `purge_cloud_handoffs(before, now)` deletes rows asked before
+    `before`, keeping a `sending` row and one whose notice is still owed.
 - `commands`:
   - `Command::Cloud(CloudCommand)` with `Add { label, routine, token }`,
     `Run { label, task }`, `List` and `Rm { label }`. `name()` gives
@@ -3132,25 +3134,28 @@ Decided in T35a ([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-gramma
 `finish_cloud_handoff` takes a row that is `sending`, or `unknown` because
 the pass gave up on it (`unknown_reason` `no_answer`), once, and marks the
 notice done if it hasn't gone out; a late `unknown` keeps the row with its
-own reason. `cloud_routines` also keeps the
-fire URL's origin (`url_origin`), which `put_cloud_routine` takes and T35c
-compares with `base_url`'s before each fire, parsing the stored origin
-rather than comparing strings. Sealed values are bound to the member as
-well as the row, and a token to its routine id, label and origin too. T35c
-answers a stored token that reads as `Corrupt` (one that no longer passes
-`RoutineToken::parse`) by asking the member to `cloud add` the routine
-again, which replaces the row without reading the old token. `cloud add`'s token must start with `sk-ant-`
-and be printable ASCII, checked once by `core_types::RoutineToken::parse`.
-`purge_cloud_handoffs(before, now)` keeps a row whose notice is still
-owed, and a `sending` row. The shared types are `core_types::RoutineId`, `RoutineToken`,
-`CloudRoutineId` and `CloudHandoffId`, and the store's `CloudOrigin`,
-`CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a `u32`, and
+own reason. It refuses an `Unknown` whose reason is `NoAnswer` with
+`StoreError::Refused`, since only the pass sets it. `cloud_routines` also
+keeps the fire URL's origin (`url_origin`), which `put_cloud_routine`
+takes and T35c compares with `base_url`'s before each fire, parsing the
+stored origin rather than comparing strings. Sealed values are bound to
+the member as well as the row, and a token to its routine id, label and
+origin too; a label can't hold `:`. T35c answers a stored token that reads
+as `Corrupt` (one that no longer passes `RoutineToken::parse`) by asking
+the member to `cloud add` the routine again, which replaces the row
+without reading the old token. `cloud add`'s token must start with
+`sk-ant-` and be printable ASCII, checked once by
+`core_types::RoutineToken::parse`. `purge_cloud_handoffs(before, now)`
+keeps a row whose notice is still owed, and a `sending` row. The shared
+types are `core_types::RoutineId`, `RoutineToken`, `CloudRoutineId` and
+`CloudHandoffId`, and the store's `CloudOrigin`, `CloudHandoffState`,
+`CloudOutcome` (`retry_after_secs` a `u32`, and
 `Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
 `unknown_reason` column. T35b's `fire` takes the opened routine, token
 and `url_origin` included, and its `FireOutcome` is `CloudOutcome` (see
-Decided in T35b). `RoutineUrl::origin()` is a `url::Origin`. A notice's mark
-needs a claim that was made, not the latest one; its deferral needs the
-latest. `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the
+Decided in T35b). `RoutineUrl::origin()` is a `url::Origin`. A notice's
+mark needs a claim that was made, not the latest one; its deferral needs
+the latest. `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the
 task, and the store hands a task back only as a `SecretString`. agentd's
 public-secret refusal has its `cloud add` arm already; the other `cloud`
 commands answer "isn't available yet" until T35c.

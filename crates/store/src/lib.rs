@@ -141,6 +141,13 @@ pub enum StoreError {
         /// The column.
         column: &'static str,
     },
+    /// The caller asked to record a value the store refuses, such as one
+    /// only the store itself may set. Nothing was written.
+    #[error("refused to record {what}")]
+    Refused {
+        /// What was refused.
+        what: &'static str,
+    },
 }
 
 /// A `Result` whose error is [`StoreError`].
