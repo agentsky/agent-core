@@ -3374,7 +3374,10 @@ GitHub connection removed and, if one is at hand, its subscription paused;
 and whether any of those started a session; whether tokens are still
 `sk-ant-oat01-…`, as the reference says, since `RoutineToken` requires the
 `sk-ant-` family; whether the OAuth token endpoint's answer to a login's
-code exchange names `scope`, since agentd refuses a login without it; and
+code exchange names `scope`, since agentd refuses a login without it;
+whether revoking one refresh token ends only its grant or every grant of
+that member and client id, since agentd revokes a refused login's token
+while the member may hold a healthy link; and
 whether routine ids are case-insensitive (if so,
 normalize them, since `trig_AB` and `trig_ab` would register one routine
 under two labels; a token's associated data holds the stored routine id, so

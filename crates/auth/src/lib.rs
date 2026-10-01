@@ -159,14 +159,22 @@ pub enum AuthError {
         reason: &'static str,
     },
     /// A login's token response granted a scope outside
-    /// [`ALLOWED_SCOPES`]: nothing was stored, and the grant was revoked.
-    /// A refresh that does so breaks the link instead
-    /// ([`AuthError::RelinkRequired`]).
+    /// [`ALLOWED_SCOPES`], or named its scope in a form that isn't a
+    /// string: nothing was stored, and its refresh token, if it had one,
+    /// was revoked as far as revocation works. A refresh granted more breaks
+    /// the link instead ([`AuthError::RelinkRequired`]).
     #[error(
         "Anthropic granted more than {}; log in again without changing the login link",
         ALLOWED_SCOPES.join(" and ")
     )]
     ScopeRefused,
+    /// A login's token response didn't name the scope it granted, so
+    /// nothing shows the member didn't widen the authorize URL: nothing was
+    /// stored, and its refresh token, if it had one, was revoked as far as
+    /// revocation works. Every login fails this way until the token
+    /// endpoint names `scope`, which retrying doesn't change.
+    #[error("the token endpoint didn't say what scope it granted")]
+    ScopeUnstated,
     /// The operating system's random number generator failed.
     #[error("the system random number generator failed")]
     Random,
@@ -387,10 +395,11 @@ impl Auth {
     /// that `state`, [`AuthError::LoginExpired`] if it expired,
     /// [`AuthError::CodeRejected`] if the token endpoint refuses the code,
     /// [`AuthError::ScopeRefused`] if it grants more than [`ALLOWED_SCOPES`],
-    /// and [`AuthError::Http`], [`AuthError::Status`] or
-    /// [`AuthError::InvalidResponse`] if the exchange fails otherwise,
-    /// including a response that doesn't say what it granted. A refused
-    /// grant's refresh token is revoked, as far as revocation works.
+    /// [`AuthError::ScopeUnstated`] if it doesn't say what it granted, and
+    /// [`AuthError::Http`], [`AuthError::Status`] or
+    /// [`AuthError::InvalidResponse`] if the exchange fails otherwise. A
+    /// refused grant's refresh token is revoked, as far as revocation
+    /// works.
     pub async fn complete_login(
         &self,
         member: MemberId,
@@ -433,9 +442,16 @@ impl Auth {
                 other => other,
             })?;
         if let Some(refused) = tokens.login_refusal() {
-            tracing::warn!(%member, error = %refused, "refused a login's tokens; revoking them");
-            if let Some(refresh_token) = &tokens.refresh_token {
-                inner.revoke(member, refresh_token).await;
+            if matches!(refused, AuthError::ScopeUnstated) {
+                tracing::error!(%member, "refused a login: the token endpoint's answer names no scope, so no login can complete until it does");
+            } else {
+                tracing::warn!(%member, error = %refused, "refused a login's tokens");
+            }
+            match &tokens.refresh_token {
+                Some(refresh_token) => inner.revoke(member, refresh_token).await,
+                None => {
+                    tracing::warn!(%member, "the refused login had no refresh token to revoke; its access token lives until it expires")
+                }
             }
             return Err(refused);
         }

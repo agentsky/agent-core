@@ -669,6 +669,33 @@ async fn a_login_granted_more_scope_says_to_use_the_link_unchanged() {
 }
 
 #[tokio::test]
+async fn a_login_that_names_no_scope_says_to_tell_an_admin() {
+    let h = harness().await;
+    let logs = global_logs().tag();
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "unstated-access",
+            "refresh_token": "unstated-refresh",
+            "expires_in": 28800,
+        })))
+        .mount(&h.oauth)
+        .await;
+    h.dm("alice", &format!("login {CODE}#{state}")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Anthropic's answer didn't say what access it granted, so nothing was linked, and \
+         logging in again won't help until that changes. Tell an admin."
+    );
+    let lines = logs.snapshot();
+    let once = lines.matching("names no scope").to_string();
+    assert_eq!(once.lines().count(), 1, "{lines}");
+    lines.assert_lacks("couldn't complete a login");
+}
+
+#[tokio::test]
 async fn a_failed_exchange_and_a_failed_store_get_generic_replies() {
     let h = harness().await;
     h.dm("alice", "login").await;

@@ -8324,7 +8324,16 @@ chosen because a proxy should never read a request that carries
 credentials in clear, and an operator who needs one for such a host uses
 `https`; it also needs no deployment to set anything. `auth` decides per
 endpoint, with a proxied and a direct client, so a loopback token-endpoint
-fake no longer takes the proxy away from an `https` profile endpoint.
+fake no longer takes the proxy away from an `https` profile endpoint. The
+Slack client keeps one client chosen by `api_url`, which also carries file
+transfers and `response_url` posts, so a plain `http` `api_url` (only
+fakes use one) takes those off the proxy too; the example configuration
+says so, rather than a second client for a case no deployment has.
+Rocket.Chat's cross-origin redirects already use their own proxied client.
+The example configuration and the Compose README tell operators the rule:
+`https://` URLs honor `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`, and a
+plain `http://` URL or a loopback IP address is always called directly,
+which `NO_PROXY` can't change.
 Where `http` is allowed is a separate rule, `core_types::is_loopback_ip_host`,
 which `[cloud]`, `[proxy] upstream` and `[claude_oauth]` share;
 `[claude_oauth]` now refuses `http://localhost` as the other two do. Each
@@ -8416,19 +8425,47 @@ out when it is what the request asked for, which for a login is the URL
 the member may have changed.
 
 **Solution.** `auth` reads a token response's `scope` as any JSON value
-and sorts it into a `Grant`: only `ALLOWED_SCOPES`, unstated (absent or
-`null`), or wider, which a scope of another type counts as, since it
-can't be shown to be narrower; failing the whole response for it would
-hide why. A login keeps only an allowed grant: a wider one is
-`AuthError::ScopeRefused`, whose reply tells the member to open the login
-link unchanged, and an unstated one is `InvalidResponse` (`no scope`),
-since nothing then shows the URL wasn't widened. This depends on the
-token endpoint naming `scope` in its answer, as Claude Code expects; the
-design's Verified and assumed list and T35c's live check carry it. A
-refresh sent the scopes itself, so an unstated grant keeps the link, and
-a wider one marks the link broken, as a dead refresh token does, so the
-member gets the relink notice and the token isn't served again. A refused
-grant's refresh token is revoked, as `logout` revokes one: before the
-login's reply, and after a refresh releases the member's lock, the new
-refresh token if the answer had one and the link's old one otherwise.
-Revocation is best effort, so a failure is only logged.
+and sorts it into a `Grant`: only `ALLOWED_SCOPES`; unstated (absent,
+`null` or blank, since an empty string is no grant and a server using it
+for "as requested" would reopen the hole); wider; or unreadable, a value
+that isn't a string.
+
+- A login keeps only an allowed grant. A wider or unreadable one is
+  `AuthError::ScopeRefused`, whose reply tells the member to open the
+  login link unchanged. An unstated one is `AuthError::ScopeUnstated`,
+  logged once at error for the operator, since every login then fails
+  until the endpoint changes, and the reply says so and to tell an admin
+  rather than inviting retries.
+- A refresh sent the scopes itself, so an unstated or unreadable grant
+  keeps the link: a change of format at Anthropic doesn't break every
+  member's link and revoke every token. A wider one marks the link broken,
+  as a dead refresh token does, so the member gets the relink notice and
+  the token isn't served again.
+- A refused grant's refresh token is revoked, as `logout` revokes one,
+  best effort: before the login's reply, and after a refresh releases the
+  member's lock, the new refresh token if the answer had one and the
+  link's old one otherwise. A refused login without a refresh token logs
+  that its access token lives until it expires.
+
+That the endpoint names `scope` is observed, not documented: Claude Code
+2.1.286's bundled JavaScript keeps `scopes: Hgn(e.scope)` in
+`formatTokens`, where `Hgn` splits a string on spaces and gives `[]` for
+anything else, and its save path `p8n` stores a login's tokens only when
+those scopes include `user:inference` (`rU`), as its auth-source detection
+and refresh eligibility also require. A login answer without `scope` would
+leave Claude Code itself without a claude.ai login, so the endpoint names
+it, at least for Claude Code's scope set; T35c's live check confirms it for
+agentd's pair. The design's Verified and assumed list footnotes this, and
+notes that `ALLOWED_SCOPES` is a constant, so a default scope the server
+starts adding would refuse every login and break every link until a
+release allows it.
+
+Revoking a refused refresh's token can't hit one a concurrent refresh
+stored: agentd runs one process, refreshes of a member are serialized,
+and a broken link isn't refreshed again. Two processes on one database
+aren't supported; if they become so, `update_claude_tokens` should also
+require `broken_at IS NULL`, since it now clears a break with only a
+generation check and could undo one the other process made. Whether
+Anthropic revokes per grant or per member and client id, which would end
+a member's healthy link when a later refused login is revoked, is
+unverified, as it is for `logout`; T35c's live check asks.

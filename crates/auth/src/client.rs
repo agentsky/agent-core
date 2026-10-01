@@ -93,28 +93,30 @@ pub(crate) struct Tokens {
 pub(crate) enum Grant {
     /// Only scopes in [`ALLOWED_SCOPES`].
     Allowed,
-    /// No `scope`, which RFC 6749 (section 5.1) reads as what the request
-    /// asked for: what agentd asked for on a refresh, but on a login what
-    /// the authorize URL asked for, which the member could have changed.
+    /// No `scope`, or a blank one, which RFC 6749 (section 5.1) reads as
+    /// what the request asked for: what agentd asked for on a refresh, but
+    /// on a login what the authorize URL asked for, which the member could
+    /// have changed.
     Unstated,
-    /// A scope outside [`ALLOWED_SCOPES`], or a `scope` that isn't a
-    /// string and so can't be shown to be narrower.
+    /// A scope outside [`ALLOWED_SCOPES`].
     Wider,
+    /// A `scope` that isn't a string, which can't be shown to be narrower:
+    /// a login counts it as wider, and a refresh, which sent the scopes
+    /// itself, as unstated, so a change of format doesn't break every link.
+    Unreadable,
 }
 
 impl Tokens {
     /// Why a login can't keep these tokens: a grant wider than
-    /// [`ALLOWED_SCOPES`], or one that doesn't say, since the member can
-    /// add scopes to the authorize URL and the code exchange doesn't send
-    /// them again.
+    /// [`ALLOWED_SCOPES`] or unreadable ([`AuthError::ScopeRefused`]), or
+    /// one that doesn't say ([`AuthError::ScopeUnstated`]), since the member
+    /// can add scopes to the authorize URL and the code exchange doesn't
+    /// send them again.
     pub(crate) fn login_refusal(&self) -> Option<AuthError> {
         match self.grant {
             Grant::Allowed => None,
-            Grant::Unstated => Some(AuthError::InvalidResponse {
-                endpoint: Endpoint::Token,
-                reason: "no scope",
-            }),
-            Grant::Wider => Some(AuthError::ScopeRefused),
+            Grant::Unstated => Some(AuthError::ScopeUnstated),
+            Grant::Wider | Grant::Unreadable => Some(AuthError::ScopeRefused),
         }
     }
 }
@@ -126,8 +128,8 @@ struct TokenResponse {
     refresh_token: Option<SecretString>,
     expires_in: f64,
     /// The scopes granted, space-separated. Read as any JSON value, so one
-    /// of another type is refused as [`Grant::Wider`] rather than failing
-    /// the whole response.
+    /// of another type is [`Grant::Unreadable`] rather than failing the
+    /// whole response.
     #[serde(default)]
     scope: Option<Value>,
 }
@@ -144,6 +146,7 @@ impl TokenResponse {
         }
         let grant = match &self.scope {
             None | Some(Value::Null) => Grant::Unstated,
+            Some(Value::String(scope)) if scope.trim_ascii().is_empty() => Grant::Unstated,
             Some(Value::String(scope))
                 if scope
                     .split_ascii_whitespace()
@@ -151,7 +154,8 @@ impl TokenResponse {
             {
                 Grant::Allowed
             }
-            Some(_) => Grant::Wider,
+            Some(Value::String(_)) => Grant::Wider,
+            Some(_) => Grant::Unreadable,
         };
         let refresh_token = self
             .refresh_token
@@ -492,20 +496,21 @@ mod tests {
             r#""user:profile user:inference""#,
             r#""user:inference""#,
             r#"" user:profile  user:inference ""#,
-            r#""""#,
         ] {
             assert_eq!(grant(scope), Grant::Allowed, "{scope}");
         }
-        assert_eq!(grant("null"), Grant::Unstated);
+        for scope in ["null", r#""""#, r#""  ""#] {
+            assert_eq!(grant(scope), Grant::Unstated, "{scope}");
+        }
         let unstated = tokens(r#"{"access_token":"a","expires_in":60}"#).unwrap();
         assert_eq!(unstated.grant, Grant::Unstated);
         assert!(matches!(
             unstated.login_refusal(),
-            Some(AuthError::InvalidResponse {
-                endpoint: Endpoint::Token,
-                reason: "no scope"
-            })
+            Some(AuthError::ScopeUnstated)
         ));
+        for scope in [r#"["user:profile"]"#, "7", "{}"] {
+            assert_eq!(grant(scope), Grant::Unreadable, "{scope}");
+        }
         for scope in [
             r#""user:profile user:inference user:sessions:claude_code""#,
             r#""user:sessions:claude_code""#,
@@ -520,7 +525,6 @@ mod tests {
                 r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
             ))
             .unwrap();
-            assert_eq!(wide.grant, Grant::Wider, "{scope}");
             let err = wide.login_refusal().unwrap();
             assert!(matches!(err, AuthError::ScopeRefused), "{scope}: {err:?}");
             for allowed in ALLOWED_SCOPES {

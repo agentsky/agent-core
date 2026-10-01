@@ -657,35 +657,66 @@ async fn a_login_whose_grant_is_unstated_is_refused_and_stores_nothing() {
         "expires_in": 28800,
     }));
     let err = login_answered(&h, answer).await;
-    assert!(
-        matches!(
-            err,
-            AuthError::InvalidResponse {
-                endpoint: Endpoint::Token,
-                reason: "no scope"
-            }
-        ),
-        "{err:?}"
-    );
+    assert!(matches!(err, AuthError::ScopeUnstated), "{err:?}");
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
     h.server.verify().await;
 }
 
 #[tokio::test]
-async fn a_refresh_whose_grant_is_unstated_keeps_the_link() {
+async fn a_refresh_whose_grant_is_unstated_or_unreadable_keeps_the_link() {
+    for scope in [
+        None,
+        Some(json!("")),
+        Some(json!(["user:sessions:claude_code"])),
+    ] {
+        let h = harness().await;
+        let mut body = json!({"access_token": "access-2", "expires_in": 28800});
+        if let Some(scope) = &scope {
+            body["scope"] = scope.clone();
+        }
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&h.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(REVOKE_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&h.server)
+            .await;
+        link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+        let token = h.auth.access_token(h.member).await.unwrap();
+        assert_eq!(token.expose_secret(), "access-2", "{scope:?}");
+        let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+        assert!(stored.broken_at.is_none(), "{scope:?}");
+        h.server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn a_wider_refresh_without_a_new_refresh_token_revokes_the_old_one() {
     let h = harness().await;
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "access-2",
+            "access_token": "access-wide",
             "expires_in": 28800,
+            "scope": "user:profile user:inference user:sessions:claude_code",
         })))
         .expect(1)
         .mount(&h.server)
         .await;
+    mount_revoke(&h.server, "refresh-1").await;
     link(&h.store, h.member, "access-1", "refresh-1", 60).await;
-    let token = h.auth.access_token(h.member).await.unwrap();
-    assert_eq!(token.expose_secret(), "access-2");
+    let err = h.auth.access_token(h.member).await.unwrap_err();
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
+    eventually("the old refresh token is revoked", || async {
+        !requests_to(&h.server, REVOKE_PATH).await.is_empty()
+    })
+    .await;
+    h.server.verify().await;
 }
 
 #[tokio::test]
