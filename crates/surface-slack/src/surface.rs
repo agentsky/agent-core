@@ -154,6 +154,28 @@ impl SlackSurface {
         &self.directory
     }
 
+    /// Whether Slack says `channel` exists under that id exactly and the
+    /// bot is a member, asked now with `conversations.info`, past every
+    /// cache and [without waiting](WebApi::without_waiting) for the
+    /// token's quota. Slack not finding the conversation for the bot,
+    /// refusing the bot, or no longer accepting its token is a no.
+    ///
+    /// # Errors
+    ///
+    /// A failure that says nothing about the channel and may pass: a rate
+    /// limit, Slack unreachable or unable to answer
+    /// ([`SurfaceError::Transport`]), or an answer Slack gives for no other
+    /// reason ([`SurfaceError::Api`]).
+    pub async fn confirms_channel(&self, channel: &ConversationId) -> Result<bool> {
+        match self.api.without_waiting().conversation_info(channel).await {
+            Ok(info) => Ok(info.id == *channel && info.is_member),
+            Err(
+                SurfaceError::NotFound(_) | SurfaceError::Forbidden(_) | SurfaceError::Unauthorized,
+            ) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Reads the workspace's members again when the cache is older than its
     /// TTL, through the [members API](Self::with_members_api), and returns
     /// the snapshot [`render`](Surface::render) will use.

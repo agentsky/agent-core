@@ -99,7 +99,9 @@ fn attempt(value: i64) -> Result<u32> {
 
 impl Store {
     /// Stores `member`'s configuration token for `team` at `now`, replacing
-    /// any they had there, with a new version and no lease, break or notice.
+    /// any they had there, with a new version and no lease, break or notice,
+    /// and ends the leases of the manifest updates of `member`'s Slack apps
+    /// in `team`, so the new token updates them at once.
     ///
     /// # Errors
     ///
@@ -117,6 +119,7 @@ impl Store {
         let token_enc = self.seal(aad(TOKEN, &key), &token.token)?;
         let refresh_enc = self.seal(aad(REFRESH_TOKEN, &key), &token.refresh_token)?;
         let version = new_version();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO slack_config_tokens \
              (member_id, team_id, token_enc, refresh_token_enc, expires_at, version, updated_at) \
@@ -134,8 +137,18 @@ impl Store {
         .bind(to_unix(token.expires_at))
         .bind(&version)
         .bind(to_unix(now))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE agent_bindings SET manifest_lease_until = NULL \
+             WHERE surface = 'slack' AND team_id = ? AND manifest_lease_until IS NOT NULL \
+             AND agent_id IN (SELECT id FROM agents WHERE owner_id = ?)",
+        )
+        .bind(team.as_str())
+        .bind(member.to_string())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(SlackConfigTokenRef {
             member,
             team: team.clone(),

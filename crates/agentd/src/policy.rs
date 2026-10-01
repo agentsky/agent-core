@@ -201,6 +201,20 @@ impl Rules {
         add(&mut self.deny, rule)
     }
 
+    /// Moves the rules on the conversation `from` to `to`, as when Slack
+    /// gave a channel a new id, and says whether any moved. Where a list
+    /// already has a rule on `to`, the moved one is dropped as a duplicate,
+    /// so a deny on either id is a deny on `to`, which wins over an allow
+    /// of it as any deny does.
+    pub fn move_room(&mut self, from: &ConvRef, to: &ConvRef) -> bool {
+        if from == to {
+            return false;
+        }
+        let allow = move_room(&mut self.allow, from, to);
+        let deny = move_room(&mut self.deny, from, to);
+        allow || deny
+    }
+
     /// Whether `everyone` is denied, which leaves the agent to its owner
     /// whatever the allow list says.
     pub fn denies_everyone(&self) -> bool {
@@ -245,6 +259,30 @@ fn changed(changed: bool) -> Change {
     } else {
         Change::Unchanged
     }
+}
+
+/// Moves the rules on `from` in `rules` to `to`, keeping the first rule on
+/// each target, and says whether any moved.
+fn move_room(rules: &mut Vec<Rule>, from: &ConvRef, to: &ConvRef) -> bool {
+    let mut moved = false;
+    for rule in rules.iter_mut() {
+        if let Rule::Room { conv, .. } = rule
+            && conv == from
+        {
+            *conv = to.clone();
+            moved = true;
+        }
+    }
+    if moved {
+        let mut kept: Vec<Rule> = Vec::with_capacity(rules.len());
+        for rule in rules.drain(..) {
+            if !kept.iter().any(|known| known.same_target(&rule)) {
+                kept.push(rule);
+            }
+        }
+        *rules = kept;
+    }
+    moved
 }
 
 /// Adds `rule` to `rules` unless it names a target already there or the
@@ -536,5 +574,71 @@ mod tests {
                 max_tokens_per_day: Some(crate::config::DEFAULT_THREAD_TOKENS_PER_DAY),
             }
         );
+    }
+
+    #[test]
+    fn colliding_rules_merge_with_deny_winning() {
+        let (old, new) = (conv("G0PRIVAT1"), conv("C0PRIVAT1"));
+        let mut rules = Rules {
+            allow: vec![room("C0PRIVAT1"), member("bob"), room("C0OTHER01")],
+            deny: vec![room("G0PRIVAT1"), member("carol")],
+        };
+        assert!(permits(&rules, "dave", "C0PRIVAT1"), "allowed on the new id");
+        assert!(rules.move_room(&old, &new));
+        assert_eq!(
+            rules.deny,
+            [
+                Rule::Room {
+                    conv: new.clone(),
+                    label: "#G0PRIVAT1".to_owned()
+                },
+                member("carol")
+            ]
+        );
+        assert_eq!(
+            rules.allow,
+            [room("C0PRIVAT1"), member("bob"), room("C0OTHER01")]
+        );
+        assert!(
+            !permits(&rules, "dave", "C0PRIVAT1"),
+            "the old id's deny is a deny on the new one, over its allow"
+        );
+        assert!(!rules.move_room(&old, &new), "nothing left on the old id");
+
+        let mut duplicated = Rules {
+            allow: vec![room("G0PRIVAT1"), room("C0PRIVAT1")],
+            deny: vec![room("C0PRIVAT1"), room("G0PRIVAT1"), Rule::Everyone],
+        };
+        assert!(duplicated.move_room(&old, &new));
+        assert_eq!(duplicated.allow.len(), 1, "{:?}", duplicated.allow);
+        assert_eq!(duplicated.deny, [room("C0PRIVAT1"), Rule::Everyone]);
+
+        let mut allowed_old = Rules {
+            allow: vec![room("G0PRIVAT1")],
+            deny: vec![room("C0PRIVAT1")],
+        };
+        assert!(allowed_old.move_room(&old, &new));
+        assert!(
+            !permits(&allowed_old, "dave", "C0PRIVAT1"),
+            "a deny on the new id stays a deny"
+        );
+        assert!(!allowed_old.move_room(&new, &new));
+
+        let mut elsewhere = Rules {
+            allow: vec![Rule::Room {
+                conv: ConvRef {
+                    team: "T0OTHER01".into(),
+                    ..old.clone()
+                },
+                label: "#G0PRIVAT1".to_owned(),
+            }],
+            deny: vec![member("G0PRIVAT1")],
+        };
+        let unchanged = elsewhere.clone();
+        assert!(
+            !elsewhere.move_room(&old, &new),
+            "another workspace's channel and a member are no room on the old id"
+        );
+        assert_eq!(elsewhere, unchanged);
     }
 }

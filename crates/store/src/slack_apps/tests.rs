@@ -50,6 +50,7 @@ fn app(id: &str) -> NewSlackApp {
         signing_secret: SecretString::from(format!("{id}-signing-secret")),
         scopes: "chat:write,im:history".to_owned(),
         redirect_url: "https://agentd.example.com/slack/oauth/callback".to_owned(),
+        manifest_version: 0,
     }
 }
 
@@ -392,5 +393,254 @@ async fn reminder_attempts_are_capped() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+const CURRENT: u32 = 2;
+
+/// A Slack agent of `owner` whose app, made from the manifest of
+/// `version`, is installed.
+async fn installed(store: &Store, owner: MemberId, name: &str, version: u32) -> BindingId {
+    let (_, binding) = creating(store, owner, name, SurfaceKind::Slack).await;
+    let made = NewSlackApp {
+        manifest_version: version,
+        ..app(&format!("A{name}"))
+    };
+    assert!(
+        store
+            .set_slack_app(binding, &made, name, at(2_000))
+            .await
+            .unwrap()
+    );
+    let token = SecretString::from(format!("xoxb-{name}"));
+    let bot = UserId::new(format!("U0{}", name.to_uppercase()));
+    assert!(
+        store
+            .install_slack_app(binding, &format!("A{name}"), &bot, &token, at(3_000))
+            .await
+            .unwrap()
+    );
+    binding
+}
+
+async fn register_token(store: &Store, owner: MemberId, expires_at: i64) {
+    store
+        .put_slack_config_token(
+            owner,
+            &team(),
+            &crate::NewSlackConfigToken {
+                token: SecretString::from("config-token"),
+                refresh_token: SecretString::from("refresh-token"),
+                expires_at: at(expires_at),
+            },
+            at(1_000),
+        )
+        .await
+        .unwrap();
+}
+
+async fn due_bindings(store: &Store, now: i64) -> Vec<BindingId> {
+    store
+        .due_manifest_updates(&team(), CURRENT, at(now), 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|due| due.binding)
+        .collect()
+}
+
+#[tokio::test]
+async fn older_installed_apps_are_due_while_their_owner_has_a_usable_token() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    let old = installed(&store, ada, "old", 1).await;
+    installed(&store, ada, "current", CURRENT).await;
+    pending(&store, ada, "waiting").await;
+    assert!(due_bindings(&store, 5_000).await.is_empty(), "no token yet");
+
+    register_token(&store, ada, 10_000).await;
+    let due = store
+        .due_manifest_updates(&team(), CURRENT, at(5_000), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        due,
+        [ManifestUpdate {
+            binding: old,
+            agent_name: "old".to_owned(),
+            owner: ada,
+            app_id: "Aold".to_owned(),
+            scopes: "chat:write,im:history".to_owned(),
+            redirect_url: "https://agentd.example.com/slack/oauth/callback".to_owned(),
+        }]
+    );
+    assert!(
+        due_bindings(&store, 10_000).await.is_empty(),
+        "the token expired"
+    );
+    assert!(
+        store
+            .due_manifest_updates(&TeamId::new("T0ELSE001"), CURRENT, at(5_000), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .outdated_slack_apps(ada, &team(), CURRENT)
+            .await
+            .unwrap(),
+        ["old"]
+    );
+}
+
+#[tokio::test]
+async fn a_manifest_update_is_claimed_once_until_its_lease_ends() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    register_token(&store, ada, 100_000).await;
+    let binding = installed(&store, ada, "helper", 0).await;
+    let claim = |now: i64| store.claim_manifest_update(binding, CURRENT, at(now), at(now + 3_600));
+    assert!(claim(5_000).await.unwrap());
+    assert!(!claim(5_000).await.unwrap(), "claimed already");
+    assert!(due_bindings(&store, 8_599).await.is_empty(), "leased");
+    assert_eq!(due_bindings(&store, 8_600).await, [binding]);
+    assert!(claim(8_600).await.unwrap(), "the lease ended");
+
+    assert!(store.set_manifest_version(binding, CURRENT).await.unwrap());
+    assert!(!store.set_manifest_version(binding, CURRENT).await.unwrap());
+    assert!(!store.set_manifest_version(binding, 1).await.unwrap(), "never back");
+    assert!(due_bindings(&store, 100_000 - 1).await.is_empty());
+    assert!(!claim(100_000 - 1).await.unwrap());
+    assert!(
+        store
+            .outdated_slack_apps(ada, &team(), CURRENT)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn registering_a_token_ends_the_owners_manifest_leases_in_that_workspace() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    let bob = owner(&store, "bob").await;
+    register_token(&store, ada, 100_000).await;
+    register_token(&store, bob, 100_000).await;
+    let adas = installed(&store, ada, "helper", 0).await;
+    let bobs = installed(&store, bob, "writer", 0).await;
+    for binding in [adas, bobs] {
+        assert!(
+            store
+                .claim_manifest_update(binding, CURRENT, at(5_000), at(8_600))
+                .await
+                .unwrap()
+        );
+    }
+    register_token(&store, ada, 100_000).await;
+    assert_eq!(due_bindings(&store, 5_001).await, [adas]);
+}
+
+#[tokio::test]
+async fn deleted_agents_and_rocket_chat_bindings_are_never_due() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    register_token(&store, ada, 100_000).await;
+    let binding = installed(&store, ada, "helper", 0).await;
+    let (_, rocket) = creating(&store, ada, "rocket", SurfaceKind::RocketChat).await;
+    let agent = store.binding(binding).await.unwrap().unwrap().agent;
+    store.delete_agent(agent, at(4_000)).await.unwrap();
+    assert!(due_bindings(&store, 5_000).await.is_empty());
+    assert!(
+        !store
+            .claim_manifest_update(rocket, CURRENT, at(5_000), at(8_600))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .outdated_slack_apps(ada, &team(), CURRENT)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn existing_bindings_start_at_manifest_version_zero() {
+    use std::str::FromStr as _;
+
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    const MANIFEST_MIGRATION: i64 = 20_260_930_300_000;
+    let dir = TempDir::new();
+    let options = SqliteConnectOptions::from_str(&dir.db_url())
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let before = crate::MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version < MANIFEST_MIGRATION)
+        .max()
+        .unwrap();
+    crate::MIGRATOR.run_to(before, &pool).await.unwrap();
+    let ada = MemberId::new_v4();
+    let agent = AgentId::new_v4();
+    let binding = BindingId::new_v4();
+    for (sql, binds) in [
+        (
+            "INSERT INTO members (id, display_name, created_at) VALUES (?, 'ada', 1000)",
+            vec![ada.to_string()],
+        ),
+        (
+            "INSERT INTO agents (id, owner_id, name, persona, visibility, state, created_at) \
+             VALUES (?, ?, 'helper', 'p', 'public', 'active', 1000)",
+            vec![agent.to_string(), ada.to_string()],
+        ),
+        (
+            "INSERT INTO agent_bindings (id, agent_id, surface, team_id, bot_user_id, state, \
+             state_changed_at, app_id, app_scopes, app_redirect_url) VALUES (?, ?, 'slack', ?, \
+             'U0HELPER', 'active', 3000, 'Ahelper', 'chat:write', \
+             'https://agentd.example.com/slack/oauth/callback')",
+            vec![binding.to_string(), agent.to_string(), TEAM.to_owned()],
+        ),
+    ] {
+        let mut query = sqlx::query(sql);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        query.execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+
+    let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
+    let version: i64 =
+        sqlx::query_scalar("SELECT manifest_version FROM agent_bindings WHERE id = ?")
+            .bind(binding.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(version, 0);
+    register_token(&store, ada, 100_000).await;
+    assert_eq!(
+        store
+            .due_manifest_updates(&team(), 1, at(5_000), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|due| due.binding)
+            .collect::<Vec<_>>(),
+        [binding]
+    );
+    assert_eq!(
+        store.outdated_slack_apps(ada, &team(), 1).await.unwrap(),
+        ["helper"]
     );
 }

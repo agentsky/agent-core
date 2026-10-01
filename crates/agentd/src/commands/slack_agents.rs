@@ -3,6 +3,7 @@
 
 use core_types::{MemberKey, SurfaceKind};
 use store::{Agent, AgentBinding};
+use surface_slack::manifest::MANIFEST_VERSION;
 
 use super::agents::{default_persona, persona_problem};
 use super::{Commands, Failure, Origin};
@@ -15,6 +16,39 @@ fn shown(app_id: &str) -> String {
 }
 
 impl Commands {
+    /// The `me` line naming `key`'s agents whose Slack apps in `key`'s
+    /// workspace are on an older manifest, which don't follow a private
+    /// channel shared later; `None` when there are none.
+    pub(super) async fn outdated_apps_status(
+        &self,
+        key: &MemberKey,
+        origin: &Origin,
+    ) -> Result<Option<String>, Failure> {
+        let Some(member) = self.member(key).await? else {
+            return Ok(None);
+        };
+        let names = self
+            .inner
+            .store
+            .outdated_slack_apps(member, &key.team, MANIFEST_VERSION)
+            .await?;
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let list = names
+            .iter()
+            .map(|name| format!("`{}`", name.replace('`', "")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(Some(format!(
+            "Agents whose Slack apps I haven't updated yet: {list}. Until I do, they won't \
+             follow a private channel that is shared with another organization: their rules on \
+             it stop applying. I update them with your configuration token ({}) and try again \
+             every hour.",
+            origin.command("slack-token <token> <refresh token>")
+        )))
+    }
+
     /// `create` on Slack: the agent and its app, and an install link in a
     /// DM.
     pub(super) async fn create_on_slack(

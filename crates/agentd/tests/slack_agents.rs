@@ -911,6 +911,7 @@ impl Turned {
                             signing_secret: SecretString::from(agent.secret),
                             scopes: "chat:write".to_owned(),
                             redirect_url: format!("{PUBLIC_URL}/slack/oauth/callback"),
+                            manifest_version: surface_slack::manifest::MANIFEST_VERSION,
                         },
                         agent.name,
                         OffsetDateTime::now_utc(),

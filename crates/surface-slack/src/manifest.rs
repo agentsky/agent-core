@@ -8,7 +8,15 @@
 //! command, since only the manager app may own `/agent`, and hears every
 //! message in the conversations its bot user is in through the
 //! `message.*` events rather than `app_mention` (see
-//! [`normalize`](crate::normalize)).
+//! [`normalize`](crate::normalize)), and `channel_id_changed`, which says
+//! a private channel it is in got a new id when it was shared with another
+//! organization.
+//!
+//! An app keeps the manifest it was made from until agentd updates it with
+//! `apps.manifest.update`
+//! ([`SlackClient::update_app`](crate::SlackClient::update_app)). Each
+//! change to [`agent_manifest`] that an existing app should get raises
+//! [`MANIFEST_VERSION`], and agentd records the version each app has.
 //!
 //! A member installs the app from [`install_url`]: Slack's OAuth consent
 //! page, which redirects to agentd's [`OAUTH_CALLBACK_PATH`] with a code
@@ -27,13 +35,20 @@ pub const OAUTH_AUTHORIZE_URL: &str = "https://slack.com/oauth/v2/authorize";
 pub const OAUTH_CALLBACK_PATH: &str = "/slack/oauth/callback";
 
 /// The bot events every agent app subscribes to: every message in public
-/// and private channels, DMs and group DMs its bot user is in.
-pub const BOT_EVENTS: [&str; 4] = [
+/// and private channels, DMs and group DMs its bot user is in, and a
+/// channel it is in getting a new id.
+pub const BOT_EVENTS: [&str; 5] = [
     "message.channels",
     "message.groups",
     "message.im",
     "message.mpim",
+    "channel_id_changed",
 ];
+
+/// The version of [`agent_manifest`]: 0 for the manifest without
+/// `channel_id_changed`, 1 since. An app made, or updated, from an older
+/// version doesn't have what it added.
+pub const MANIFEST_VERSION: u32 = 1;
 
 /// The bot scopes every agent app asks for. `chat:write.public` is added
 /// only when [`AgentApp::public_posting`] is on. The `*:read` scopes let
@@ -89,6 +104,15 @@ impl AgentApp<'_> {
     /// [`OAUTH_CALLBACK_PATH`].
     pub fn redirect_url(&self) -> String {
         format!("{}{OAUTH_CALLBACK_PATH}", self.public_url)
+    }
+
+    /// The public URL an app whose manifest names `redirect_url` was made
+    /// with: `redirect_url` less [`OAUTH_CALLBACK_PATH`], if it ends with
+    /// it and what is left is a [`public_url`].
+    pub fn public_url_of(redirect_url: &str) -> Option<&str> {
+        redirect_url
+            .strip_suffix(OAUTH_CALLBACK_PATH)
+            .filter(|base| public_url(base).as_deref() == Some(*base))
     }
 
     fn request_url(&self, kind: &str) -> String {
@@ -218,7 +242,10 @@ mod tests {
                 "settings": {
                     "event_subscriptions": {
                         "request_url": "https://agentd.example.com/slack/b/0f6a1c9e-2d3b-4c5d-8e7f-0123456789ab/events",
-                        "bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"],
+                        "bot_events": [
+                            "message.channels", "message.groups", "message.im", "message.mpim",
+                            "channel_id_changed",
+                        ],
                     },
                     "interactivity": {
                         "is_enabled": true,
@@ -271,6 +298,27 @@ mod tests {
             "",
         ] {
             assert_eq!(public_url(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_apps_public_url_comes_back_from_its_redirect_url() {
+        let made = app(false);
+        assert_eq!(
+            AgentApp::public_url_of(&made.redirect_url()),
+            Some(made.public_url)
+        );
+        assert_eq!(
+            AgentApp::public_url_of("https://example.com/agentd/slack/oauth/callback"),
+            Some("https://example.com/agentd")
+        );
+        for bad in [
+            "https://agentd.example.com/slack/oauth/other",
+            "http://agentd.example.com/slack/oauth/callback",
+            "https://agentd.example.com//slack/oauth/callback",
+            "/slack/oauth/callback",
+        ] {
+            assert_eq!(AgentApp::public_url_of(bad), None, "{bad}");
         }
     }
 

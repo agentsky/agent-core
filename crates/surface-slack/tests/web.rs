@@ -1475,6 +1475,78 @@ mod apps {
     }
 
     #[tokio::test]
+    async fn update_app_sends_the_app_and_its_manifest_as_the_member() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.update"))
+            .and(header(
+                "authorization",
+                format!("Bearer {CONFIG_TOKEN}").as_str(),
+            ))
+            .respond_with(ok(json!({"app_id": "A0AGENT01", "permissions_updated": false})))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.update"))
+            .respond_with(ok(json!({"app_id": "A0AGENT01", "permissions_updated": true})))
+            .mount(&server)
+            .await;
+        let manifest = manifest();
+        let updating = client(&server).await;
+        let token = SecretString::from(CONFIG_TOKEN);
+        assert!(
+            !updating
+                .update_app(&token, "A0AGENT01", &manifest)
+                .await
+                .unwrap()
+        );
+        assert!(
+            updating
+                .update_app(&token, "A0AGENT01", &manifest)
+                .await
+                .unwrap(),
+            "Slack says the permissions changed"
+        );
+        let sent = requests(&server).await;
+        let form = form(&sent[0]);
+        assert_eq!(form["app_id"], "A0AGENT01");
+        let sent_manifest: Value = serde_json::from_str(&form["manifest"]).unwrap();
+        assert_eq!(sent_manifest, manifest);
+        assert!(!String::from_utf8_lossy(&sent[0].body).contains(CONFIG_TOKEN));
+
+        for (code, expected) in [
+            ("app_not_found", SurfaceError::NotFound("app_not_found".into())),
+            ("invalid_app_id", SurfaceError::NotFound("invalid_app_id".into())),
+            ("token_expired", SurfaceError::Unauthorized),
+            ("internal_error", SurfaceError::Transport("internal_error".into())),
+        ] {
+            let refused = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(failed(code))
+                .mount(&refused)
+                .await;
+            let err = client(&refused)
+                .await
+                .update_app(&token, "A0AGENT01", &manifest)
+                .await
+                .unwrap_err();
+            assert_eq!(err, expected, "{code}");
+        }
+        let unreadable = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok(json!({"permissions_updated": "maybe"})))
+            .mount(&unreadable)
+            .await;
+        let err = client(&unreadable)
+            .await
+            .update_app(&token, "A0AGENT01", &manifest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn an_app_that_is_gone_already_is_not_found() {
         for code in ["app_not_found", "invalid_app_id"] {
             let server = MockServer::start().await;

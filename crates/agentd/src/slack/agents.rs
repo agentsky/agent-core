@@ -28,6 +28,37 @@
 //!    configuration token; without one the owner is told to delete the app
 //!    at api.slack.com.
 //!
+//! # Manifest updates
+//!
+//! An app keeps the manifest it was made from. Each installed app made
+//! from a manifest older than [`MANIFEST_VERSION`] is updated with
+//! `apps.manifest.update` and its owner's configuration token by the
+//! sweeper, from the agent's name and the public URL and scopes the app was
+//! made with, so its scopes, request URLs and install never change. Each
+//! update is claimed for [`MANIFEST_UPDATE_LEASE`], an hour, so one that
+//! fails is tried again an hour later, and one whose owner has no usable
+//! token waits for one; registering one ends the leases. An app whose
+//! scopes aren't the ones this agentd asks for isn't updated, since that
+//! would take a new install. `/agent me` lists the owner's agents still on
+//! an older manifest.
+//!
+//! # Channels that change id
+//!
+//! Sharing a private channel (`G…`) with another organization gives it a
+//! new id, and each agent whose bot is in it gets `channel_id_changed`
+//! ([`channel_id_changed`](SlackAgents::channel_id_changed)). The change is
+//! recorded in the store, then settled in a task of its own, and by the
+//! sweeper when that fails: Slack must confirm the new id with
+//! `conversations.info` on the binding's bot token (the channel exists, its
+//! id is exactly the new one, and the bot is a member), and then the
+//! receiving agent's own rules on the old id move to the new one in one
+//! transaction ([`Rules::move_room`]), and the workspace forgets what it
+//! cached about the old id. A change Slack doesn't confirm moves nothing.
+//! One that can't be confirmed for now (a rate limit, Slack unreachable) is
+//! tried again every [`CHANNEL_CHANGE_RETRY`], for a day. Sessions,
+//! volumes, thread counts, limit notices and message references stay under
+//! the old id: agentd can't confirm that the two ids are one channel.
+//!
 //! agentd serves one workspace, the manager app's: agent apps are created
 //! there, and an install in any other workspace is refused. No token,
 //! secret or code reaches a log line, an error or a reply.
@@ -40,14 +71,20 @@ use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS};
 use axum::response::{IntoResponse, Response};
-use core_types::{BindingId, MemberId, MemberKey, SurfaceError, SurfaceKind, TeamId, UserId};
+use core_types::{
+    BindingId, ConvRef, MemberId, MemberKey, SurfaceError, SurfaceKind, TeamId, Throttle, UserId,
+};
 use secrecy::SecretString;
 use serde::Deserialize;
 use store::{
-    AgentBinding, AgentCreation, BindingState, NewAgent, NewSlackApp, SlackConfigToken, Store,
-    StoreError, Visibility,
+    AgentBinding, AgentCreation, BindingState, ChannelIdChange, ChannelIdChangeRecord,
+    ManifestUpdate, NewAgent, NewSlackApp, SlackConfigToken, Store, StoreError, Visibility,
 };
-use surface_slack::manifest::{AgentApp, agent_manifest, install_url};
+use surface_slack::ChannelIdChanged;
+use surface_slack::ingress::WARNING_INTERVAL;
+use surface_slack::manifest::{
+    AgentApp, MANIFEST_VERSION, PUBLIC_POSTING_SCOPE, agent_manifest, install_url,
+};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -56,6 +93,7 @@ use super::bots::SlackBots;
 use super::manager::SlackManager;
 use crate::agents::CREATION_LEASE;
 use crate::config::Config;
+use crate::policy::Rules;
 
 /// How often the sweeper looks for creations to abandon and reminders to
 /// send.
@@ -74,6 +112,28 @@ pub const REMINDER_MAX_ATTEMPTS: u32 = 5;
 /// within [`CREATION_LEASE`], so the sweeper never abandons a creation still
 /// waiting on Slack.
 pub const APP_CALL_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+
+/// How long a claimed manifest update keeps other instances off its app,
+/// and so how long after a failed update the next one comes.
+pub const MANIFEST_UPDATE_LEASE: Duration = Duration::from_secs(60 * 60);
+
+/// The most manifest updates one sweeper pass makes, so the install
+/// reminders and channel id changes after them never wait long.
+pub const MANIFEST_UPDATES_PER_PASS: u32 = 16;
+
+/// How long after a try at settling a channel id change the next may come,
+/// should that one not settle it.
+pub const CHANNEL_CHANGE_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// How long after it was received a channel id change is given up.
+pub const CHANNEL_CHANGE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The most channel id changes one binding may have waiting. Past that,
+/// another is dropped: only the app's owner can send so many.
+pub const MAX_CHANNEL_CHANGES_WAITING: u32 = 16;
+
+/// The most channel id changes one sweeper pass tries.
+const CHANNEL_CHANGES_PER_PASS: u32 = 64;
 
 /// What the install callback's pages call agentd when the manager app has
 /// no name.
@@ -160,6 +220,27 @@ pub struct SweepPass {
     pub abandoned: usize,
     /// Owners reminded to install their agent's app.
     pub reminded: usize,
+    /// Apps updated to the current manifest.
+    pub updated: usize,
+    /// Channel id changes settled: confirmed or not, or given up.
+    pub settled: usize,
+}
+
+/// What a try at settling a channel id change did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelChange {
+    /// Slack confirmed the new id, and the agent's rules on the old id,
+    /// if it had any, moved to it.
+    Moved {
+        /// Whether the agent had rules on the old id.
+        rules: bool,
+    },
+    /// Slack doesn't confirm the new id, or the binding isn't active; no
+    /// rule moved.
+    Unconfirmed,
+    /// Nothing is settled yet: another try holds it, or this one couldn't
+    /// ask Slack, and it is tried again later.
+    Waiting,
 }
 
 /// Agents' Slack apps in the workspace agentd serves: creating them,
@@ -176,6 +257,7 @@ struct Inner {
     manager: SlackManager,
     bots: SlackBots,
     settings: AgentAppSettings,
+    notes: Throttle<(BindingId, &'static str)>,
 }
 
 impl fmt::Debug for SlackAgents {
@@ -206,6 +288,7 @@ impl SlackAgents {
                 manager,
                 bots,
                 settings,
+                notes: Throttle::new(WARNING_INTERVAL),
             }),
         }
     }
@@ -349,6 +432,7 @@ impl SlackAgents {
                     signing_secret: created.signing_secret,
                     scopes: scopes.join(","),
                     redirect_url,
+                    manifest_version: MANIFEST_VERSION,
                 },
                 name,
                 now(),
@@ -731,8 +815,9 @@ impl SlackAgents {
         }
     }
 
-    /// Abandons the creations that stopped halfway and sends the install
-    /// reminders owed.
+    /// Settles the channel id changes due, abandons the creations that
+    /// stopped halfway, sends the install reminders owed and updates the
+    /// apps on an older manifest.
     ///
     /// # Errors
     ///
@@ -744,7 +829,10 @@ impl SlackAgents {
     /// [`pass`](Self::pass), reading the time from `now`.
     pub async fn pass_at(&self, now: impl Fn() -> OffsetDateTime) -> Result<SweepPass, StoreError> {
         let store = &self.inner.store;
-        let mut pass = SweepPass::default();
+        let mut pass = SweepPass {
+            settled: self.settle_channel_changes(&now).await?,
+            ..SweepPass::default()
+        };
         let at = now();
         let stale = at - CREATION_LEASE;
         for binding in store
@@ -775,7 +863,258 @@ impl SlackAgents {
                 }
             }
         }
+        for due in store
+            .due_manifest_updates(self.team(), MANIFEST_VERSION, now(), MANIFEST_UPDATES_PER_PASS)
+            .await?
+        {
+            match self.update_manifest(&due, &now).await {
+                Ok(true) => pass.updated += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(binding = %due.binding, error = %err, "updating an app's manifest failed in the store");
+                }
+            }
+        }
         Ok(pass)
+    }
+
+    /// Updates the app of `due` to the current manifest, if this call
+    /// claims it; true if it did.
+    async fn update_manifest(
+        &self,
+        due: &ManifestUpdate,
+        now: &impl Fn() -> OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        let store = &self.inner.store;
+        let binding = due.binding;
+        let at = now();
+        if !store
+            .claim_manifest_update(binding, MANIFEST_VERSION, at, at + MANIFEST_UPDATE_LEASE)
+            .await?
+        {
+            return Ok(false);
+        }
+        let Some(public_url) = AgentApp::public_url_of(&due.redirect_url) else {
+            tracing::warn!(%binding, "an app's redirect URL names no public URL agentd could have made it with; not updating its manifest");
+            return Ok(false);
+        };
+        let app = AgentApp {
+            name: &due.agent_name,
+            public_url,
+            binding,
+            public_posting: due.scopes.split(',').any(|scope| scope == PUBLIC_POSTING_SCOPE),
+        };
+        if app.scopes().join(",") != due.scopes {
+            tracing::warn!(%binding, "an app asks for other scopes than this agentd would; not updating its manifest, which would take a new install");
+            return Ok(false);
+        }
+        let Some(token) = store
+            .usable_slack_config_token(due.owner, self.team(), now())
+            .await?
+        else {
+            return Ok(false);
+        };
+        let updated = tokio::time::timeout(
+            APP_CALL_TIMEOUT,
+            self.inner
+                .manager
+                .client()
+                .update_app(&token.token, &due.app_id, &agent_manifest(&app)),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(SurfaceError::Transport(
+                "apps.manifest.update took too long".into(),
+            ))
+        });
+        let app_id = &due.app_id;
+        match updated {
+            Ok(permissions_updated) => {
+                if permissions_updated {
+                    tracing::warn!(%binding, app_id, "Slack says updating an app's manifest changed its permissions, which take a new install");
+                }
+                store.set_manifest_version(binding, MANIFEST_VERSION).await?;
+                tracing::info!(%binding, app_id, version = MANIFEST_VERSION, "updated an agent's Slack app to the current manifest");
+                Ok(true)
+            }
+            Err(SurfaceError::Unauthorized) => {
+                tracing::info!(%binding, app_id, "Slack refused the configuration token updating an app's manifest");
+                self.token_refused(&token).await;
+                Ok(false)
+            }
+            Err(err) => {
+                tracing::warn!(%binding, app_id, error = %err, "couldn't update an agent's Slack app to the current manifest; trying again in an hour");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Takes the channel id change the app of its binding was told of:
+    /// records it, and tries to settle it at once in a task of its own,
+    /// which leaves it to the sweeper when it can't. A change that waits
+    /// already is left to that try, and one past the binding's
+    /// [`MAX_CHANNEL_CHANGES_WAITING`] is dropped.
+    pub async fn channel_id_changed(&self, changed: ChannelIdChanged) {
+        let binding = changed.binding;
+        if !changed.old.as_str().starts_with('G') {
+            self.note(binding, "an unexpected old id", |quiet| {
+                tracing::warn!(%binding, old = %changed.old, new = %changed.new, since_last_warning = quiet, "a channel id change from an id that doesn't start with G; handling it all the same");
+            });
+        }
+        let change = ChannelIdChange {
+            binding,
+            old: changed.old,
+            new: changed.new,
+            received_at: changed.received_at,
+        };
+        match self
+            .inner
+            .store
+            .record_channel_id_change(&change, MAX_CHANNEL_CHANGES_WAITING)
+            .await
+        {
+            Ok(ChannelIdChangeRecord::Recorded) => {
+                let agents = self.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = agents.settle_channel_change(&change, &now).await {
+                        tracing::warn!(binding = %change.binding, error = %err, "settling a channel id change failed in the store; the sweeper tries again");
+                    }
+                });
+            }
+            Ok(ChannelIdChangeRecord::Known) => {
+                tracing::debug!(%binding, "a channel id change waits already");
+            }
+            Ok(ChannelIdChangeRecord::Full) => {
+                self.note(binding, "too many channel id changes", |quiet| {
+                    tracing::warn!(%binding, waiting = MAX_CHANNEL_CHANGES_WAITING, dropped_since_last_warning = quiet, "dropped a channel id change: the binding has as many waiting as it may");
+                });
+            }
+            Err(err) => {
+                tracing::warn!(%binding, error = %err, "couldn't record a channel id change; dropped it");
+            }
+        }
+    }
+
+    /// Calls `log` with how many went quiet when `binding`'s `note` is due,
+    /// at most once per [`WARNING_INTERVAL`] for each.
+    fn note(&self, binding: BindingId, note: &'static str, log: impl FnOnce(u64)) {
+        match self
+            .inner
+            .notes
+            .record((binding, note), std::time::Instant::now())
+        {
+            Some(quiet) => log(quiet),
+            None => tracing::debug!(%binding, note, "a Slack agent app note went quiet"),
+        }
+    }
+
+    /// Gives up the channel id changes received over
+    /// [`CHANNEL_CHANGE_TTL`] ago, and tries to settle those due. Returns
+    /// how many were settled or given up.
+    async fn settle_channel_changes(
+        &self,
+        now: &impl Fn() -> OffsetDateTime,
+    ) -> Result<usize, StoreError> {
+        let store = &self.inner.store;
+        let stale = store
+            .drop_stale_channel_id_changes(now() - CHANNEL_CHANGE_TTL)
+            .await?;
+        for change in &stale {
+            tracing::warn!(binding = %change.binding, old = %change.old, new = %change.new, "gave up a channel id change Slack couldn't be asked about for a day; the agent's rules on the old id stay there");
+        }
+        let mut settled = stale.len();
+        for change in store
+            .due_channel_id_changes(now(), CHANNEL_CHANGES_PER_PASS)
+            .await?
+        {
+            match self.settle_channel_change(&change, now).await {
+                Ok(ChannelChange::Waiting) => {}
+                Ok(_) => settled += 1,
+                Err(err) => {
+                    tracing::warn!(binding = %change.binding, error = %err, "settling a channel id change failed in the store; trying again later");
+                }
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Tries to settle `change`, if this call claims the try: asks Slack
+    /// to confirm the new id with the binding's bot token, and if it does,
+    /// moves the agent's rules on the old id to it.
+    ///
+    /// # Errors
+    ///
+    /// If the store fails; the change is then tried again later.
+    pub async fn settle_channel_change(
+        &self,
+        change: &ChannelIdChange,
+        now: &impl Fn() -> OffsetDateTime,
+    ) -> Result<ChannelChange, StoreError> {
+        let store = &self.inner.store;
+        let binding = change.binding;
+        let at = now();
+        if !store
+            .claim_channel_id_change(change, at, at + CHANNEL_CHANGE_RETRY)
+            .await?
+        {
+            return Ok(ChannelChange::Waiting);
+        }
+        let row = store.binding(binding).await?;
+        let surface = self.inner.bots.surface(binding).await?;
+        let (Some(row), Some(surface)) = (row, surface) else {
+            tracing::info!(%binding, "a channel id change for an app that isn't active; dropped it");
+            store.finish_channel_id_change(change).await?;
+            return Ok(ChannelChange::Unconfirmed);
+        };
+        let (old, new) = (&change.old, &change.new);
+        match surface.confirms_channel(new).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.note(binding, "an unconfirmed channel id change", |quiet| {
+                    tracing::warn!(%binding, %old, %new, since_last_warning = quiet, "Slack doesn't confirm a channel id change: no such channel under the new id with the agent's bot in it; moved no rules");
+                });
+                store.finish_channel_id_change(change).await?;
+                return Ok(ChannelChange::Unconfirmed);
+            }
+            Err(err) => {
+                self.note(binding, "a channel id change waiting for Slack", |quiet| {
+                    tracing::warn!(%binding, %old, %new, error = %err, since_last_warning = quiet, "couldn't ask Slack to confirm a channel id change; trying again later");
+                });
+                return Ok(ChannelChange::Waiting);
+            }
+        }
+        let room = |conversation: &core_types::ConversationId| ConvRef {
+            surface: SurfaceKind::Slack,
+            team: row.team.clone(),
+            conversation: conversation.clone(),
+        };
+        let (from, to) = (room(old), room(new));
+        let moved = store
+            .update_agent_settings(row.agent, |settings| {
+                let mut rules = Rules::read(settings).ok()?;
+                let moved = rules.move_room(&from, &to);
+                if moved {
+                    rules.write(settings);
+                }
+                Some(moved)
+            })
+            .await?;
+        surface.directory().forget_conv(old);
+        store.finish_channel_id_change(change).await?;
+        match moved {
+            Some(true) => {
+                tracing::info!(%binding, agent = %row.agent, %old, %new, "a channel changed its id; moved the agent's rules on it to the new id");
+            }
+            Some(false) => {
+                tracing::debug!(%binding, %old, %new, "a channel changed its id; the agent had no rules on it");
+            }
+            None => {
+                tracing::warn!(%binding, agent = %row.agent, %old, %new, "a channel changed its id, but the agent's rules don't read, so none moved; they refuse everyone until its owner sets them again");
+            }
+        }
+        Ok(ChannelChange::Moved {
+            rules: moved == Some(true),
+        })
     }
 
     /// Sends the reminder `due`, if its owner is reachable here; true if it

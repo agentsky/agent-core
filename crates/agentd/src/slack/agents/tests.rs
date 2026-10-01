@@ -21,6 +21,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::commands::intake::CommandIntake;
+use crate::policy::Rules;
 use crate::commands::{Commands, Replies};
 use crate::slack::manager::ManagerIdentity;
 use crate::slack::{Inbound, Messages};
@@ -333,7 +334,7 @@ async fn the_sweeper_abandons_a_creation_that_stopped_halfway() {
         pass,
         SweepPass {
             abandoned: 1,
-            reminded: 0
+            ..SweepPass::default()
         }
     );
     let row = h.store.binding(binding).await.unwrap().unwrap();
@@ -449,7 +450,7 @@ async fn an_agents_message_reaches_the_pipeline_with_its_bot_sender_looked_up() 
         Some(h.agents.inner.manager.identity().clone()),
         submitter,
     )
-    .with_agents(messages.clone());
+    .with_agents(messages.clone(), h.agents.clone());
     inbound
         .send(SlackInbound::Message(
             Box::new(bot_message(binding, TEAM)),
@@ -732,4 +733,610 @@ async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
     deleted_bindings(&h).await;
     assert_eq!(installing.await.unwrap(), StatusCode::CONFLICT);
     assert!(h.store.bot_token(binding).await.unwrap().is_none());
+}
+
+const OLD: &str = "G0PRIVAT1";
+const NEW: &str = "C0PRIVAT1";
+const WRITER_TOKEN: &str = "xoxb-writer-SECRET";
+
+fn room(id: &str) -> ConvRef {
+    ConvRef {
+        surface: SurfaceKind::Slack,
+        team: TeamId::new(TEAM),
+        conversation: id.into(),
+    }
+}
+
+fn room_rule(id: &str) -> crate::policy::Rule {
+    crate::policy::Rule::Room {
+        conv: room(id),
+        label: "#secret".to_owned(),
+    }
+}
+
+/// `conversations.info` on `token` answering for `channel` with `answer`.
+async fn channel_info(h: &Harness, token: &str, channel: &str, answer: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.info"))
+        .and(header("authorization", format!("Bearer {token}").as_str()))
+        .and(wiremock::matchers::body_string_contains(format!(
+            "channel={channel}"
+        )))
+        .respond_with(answer)
+        .mount(&h.slack)
+        .await;
+}
+
+fn member_of(channel: &str) -> ResponseTemplate {
+    ok(json!({"channel": {"id": channel, "is_channel": true, "is_private": true, "is_member": true}}))
+}
+
+/// A second agent of the owner, `name`, whose app made from the manifest
+/// of `version` is installed with `token`.
+async fn installed_as(h: &Harness, name: &str, token: &str, version: u32) -> BindingId {
+    let team = TeamId::new(TEAM);
+    let now = OffsetDateTime::now_utc();
+    let store::AgentCreation::Created(_, binding) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: h.owner,
+                name,
+                persona: "You help.",
+                visibility: Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            now,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let app = AgentApp {
+        name,
+        public_url: "https://agentd.example.com",
+        binding,
+        public_posting: false,
+    };
+    let app_id = format!("A0{}", name.to_uppercase());
+    assert!(
+        h.store
+            .set_slack_app(
+                binding,
+                &NewSlackApp {
+                    app_id: app_id.clone(),
+                    client_id: "3333.4444".to_owned(),
+                    client_secret: SecretString::from("client-SECRET"),
+                    signing_secret: SecretString::from("signing-SECRET"),
+                    scopes: app.scopes().join(","),
+                    redirect_url: app.redirect_url(),
+                    manifest_version: version,
+                },
+                name,
+                now,
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        h.store
+            .install_slack_app(
+                binding,
+                &app_id,
+                &UserId::new(format!("U0{}", name.to_uppercase())),
+                &SecretString::from(token),
+                now,
+            )
+            .await
+            .unwrap()
+    );
+    binding
+}
+
+async fn agent_of(h: &Harness, binding: BindingId) -> core_types::AgentId {
+    h.store.binding(binding).await.unwrap().unwrap().agent
+}
+
+async fn set_rules(h: &Harness, binding: BindingId, rules: &Rules) {
+    h.store
+        .update_agent_settings(agent_of(h, binding).await, |settings| {
+            rules.write(settings)
+        })
+        .await
+        .unwrap();
+}
+
+async fn rules_of(h: &Harness, binding: BindingId) -> Rules {
+    let settings = h
+        .store
+        .agent_settings(agent_of(h, binding).await)
+        .await
+        .unwrap();
+    Rules::read(&settings).unwrap()
+}
+
+fn denying(id: &str) -> Rules {
+    Rules {
+        allow: Vec::new(),
+        deny: vec![room_rule(id)],
+    }
+}
+
+fn change(binding: BindingId) -> ChannelIdChange {
+    ChannelIdChange {
+        binding,
+        old: OLD.into(),
+        new: NEW.into(),
+        received_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// Records `change` as the ingress's receiver does, without the task that
+/// settles it at once.
+async fn recorded(h: &Harness, change: &ChannelIdChange) {
+    assert_eq!(
+        h.store
+            .record_channel_id_change(change, MAX_CHANNEL_CHANGES_WAITING)
+            .await
+            .unwrap(),
+        ChannelIdChangeRecord::Recorded
+    );
+}
+
+fn the_event(binding: BindingId) -> ChannelIdChanged {
+    ChannelIdChanged {
+        binding,
+        team: TeamId::new(TEAM),
+        event_id: "Ev0CHANID1".to_owned(),
+        old: OLD.into(),
+        new: NEW.into(),
+        received_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// Waits until `binding`'s agent's rules are `rules`.
+async fn settled_to(h: &Harness, binding: BindingId, rules: &Rules) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while rules_of(h, binding).await != *rules {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rules never moved"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn only_the_receiving_agents_rules_are_rewritten() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let writer = installed_as(&h, "writer", WRITER_TOKEN, MANIFEST_VERSION).await;
+    channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
+    channel_info(&h, WRITER_TOKEN, NEW, member_of(NEW)).await;
+    for binding in [helper, writer] {
+        set_rules(&h, binding, &denying(OLD)).await;
+    }
+    h.agents.channel_id_changed(the_event(helper)).await;
+    settled_to(&h, helper, &denying(NEW)).await;
+    assert_eq!(
+        rules_of(&h, writer).await,
+        denying(OLD),
+        "the other agent's event hasn't come"
+    );
+    assert!(
+        h.store
+            .due_channel_id_changes(OffsetDateTime::now_utc() + CHANNEL_CHANGE_TTL, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "settled"
+    );
+}
+
+#[tokio::test]
+async fn an_unconfirmed_new_channel_rewrites_nothing() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    set_rules(&h, helper, &denying(OLD)).await;
+    let refusals = [
+        ok(json!({"channel": {"id": NEW, "is_channel": true, "is_member": false}})),
+        ok(json!({"channel": {"id": "C0OTHER01", "is_channel": true, "is_member": true}})),
+        ok(json!({"channel": {"id": "c0privat1", "is_channel": true, "is_member": true}})),
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"ok": false, "error": "channel_not_found"})),
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+    ];
+    for answer in refusals {
+        h.slack.reset().await;
+        channel_info(&h, AGENT_TOKEN, NEW, answer).await;
+        let changed = change(helper);
+        recorded(&h, &changed).await;
+        assert_eq!(
+            h.agents
+                .settle_channel_change(&changed, &OffsetDateTime::now_utc)
+                .await
+                .unwrap(),
+            ChannelChange::Unconfirmed
+        );
+        assert_eq!(rules_of(&h, helper).await, denying(OLD));
+        assert!(
+            !h.store.finish_channel_id_change(&changed).await.unwrap(),
+            "an unconfirmed change is settled"
+        );
+        assert_eq!(h.calls("conversations.info").await, 1, "one ask each");
+    }
+}
+
+#[tokio::test]
+async fn a_change_slack_cant_confirm_yet_is_tried_again_until_it_is_given_up() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    set_rules(&h, helper, &denying(OLD)).await;
+    channel_info(&h, AGENT_TOKEN, NEW, ResponseTemplate::new(503)).await;
+    let changed = change(helper);
+    recorded(&h, &changed).await;
+    let start = OffsetDateTime::now_utc();
+    assert_eq!(
+        h.agents
+            .settle_channel_change(&changed, &|| start)
+            .await
+            .unwrap(),
+        ChannelChange::Waiting
+    );
+    let pass = h.agents.pass_at(|| start).await.unwrap();
+    assert_eq!(pass.settled, 0);
+    assert_eq!(h.calls("conversations.info").await, 1, "not due before its retry");
+    assert_eq!(rules_of(&h, helper).await, denying(OLD));
+
+    h.slack.reset().await;
+    channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
+    let retry = start + CHANNEL_CHANGE_RETRY;
+    let pass = h.agents.pass_at(|| retry).await.unwrap();
+    assert_eq!(pass.settled, 1);
+    assert_eq!(rules_of(&h, helper).await, denying(NEW));
+
+    let stale = change(helper);
+    recorded(&h, &stale).await;
+    let late = stale.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);
+    let pass = h.agents.pass_at(|| late).await.unwrap();
+    assert_eq!(pass.settled, 1, "given up");
+    assert_eq!(h.calls("conversations.info").await, 1);
+}
+
+#[tokio::test]
+async fn a_replayed_channel_id_change_is_dropped() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    set_rules(&h, helper, &denying(OLD)).await;
+    channel_info(
+        &h,
+        AGENT_TOKEN,
+        NEW,
+        member_of(NEW).set_delay(Duration::from_millis(300)),
+    )
+    .await;
+    let changed = change(helper);
+    recorded(&h, &changed).await;
+    assert_eq!(
+        h.store
+            .record_channel_id_change(&changed, MAX_CHANNEL_CHANGES_WAITING)
+            .await
+            .unwrap(),
+        ChannelIdChangeRecord::Known,
+        "the same change waits already"
+    );
+    let now = OffsetDateTime::now_utc;
+    let (first, second) = tokio::join!(
+        h.agents.settle_channel_change(&changed, &now),
+        h.agents.settle_channel_change(&changed, &now)
+    );
+    let mut outcomes = [first.unwrap(), second.unwrap()];
+    outcomes.sort_by_key(|outcome| *outcome == ChannelChange::Waiting);
+    assert_eq!(
+        outcomes,
+        [ChannelChange::Moved { rules: true }, ChannelChange::Waiting]
+    );
+    assert_eq!(h.calls("conversations.info").await, 1);
+    assert_eq!(rules_of(&h, helper).await, denying(NEW));
+}
+
+#[tokio::test]
+async fn too_many_waiting_changes_drop_the_next_and_an_inactive_binding_settles_none() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    for n in 0..MAX_CHANNEL_CHANGES_WAITING {
+        let changed = ChannelIdChange {
+            new: format!("C0FULL{n:03}").as_str().into(),
+            ..change(helper)
+        };
+        recorded(&h, &changed).await;
+    }
+    h.agents.channel_id_changed(the_event(helper)).await;
+    let waiting = h
+        .store
+        .due_channel_id_changes(OffsetDateTime::now_utc() + CHANNEL_CHANGE_TTL, 100)
+        .await
+        .unwrap();
+    assert_eq!(waiting.len(), MAX_CHANNEL_CHANGES_WAITING as usize);
+    assert!(waiting.iter().all(|changed| changed.new.as_str() != NEW));
+
+    let bindings = deleted_bindings(&h).await;
+    assert_eq!(bindings[0].id, helper);
+    let pass = h.agents.pass().await.unwrap();
+    assert_eq!(pass.settled, waiting.len(), "an inactive binding's are dropped");
+    assert_eq!(h.calls("conversations.info").await, 0);
+}
+
+#[tokio::test]
+async fn sessions_stay_under_the_old_id() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let agent = agent_of(&h, helper).await;
+    channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
+    let now = OffsetDateTime::now_utc();
+    let thread = |id: &str| core_types::ThreadKey {
+        conv: room(id),
+        root: Some("1727698800.000100".into()),
+    };
+    let scope = |id: &str| core_types::ScopeKey::for_conversation(ConvKind::Channel, room(id));
+    let old = h
+        .store
+        .session_for_thread(agent, &thread(OLD), &scope(OLD), now)
+        .await
+        .unwrap()
+        .session;
+    let requester = core_types::Requester {
+        member: Some(h.owner),
+        key: ada(),
+        outside: None,
+    };
+    let msg = MsgRef {
+        conv: room(OLD),
+        id: "1727698800.000200".into(),
+    };
+    h.store
+        .record_message_ref(
+            &store::NewMessageRef {
+                session: old.id,
+                msg: &msg,
+                thread_root: thread(OLD).root.as_ref(),
+                agent: Some(agent),
+                turn: None,
+                requester: &requester,
+                hop: core_types::Hop(0),
+                consent: None,
+                hands_off: true,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    h.store
+        .record_turn_usage(
+            h.owner,
+            agent,
+            &thread(OLD),
+            store::TurnUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cost: Ok(0.01),
+            },
+            true,
+            now,
+        )
+        .await
+        .unwrap();
+    let window = store::LimitWindow::Hour;
+    assert!(
+        h.store
+            .claim_limit_notice(agent, &thread(OLD), "turns", window, now)
+            .await
+            .unwrap()
+    );
+
+    h.agents.channel_id_changed(the_event(helper)).await;
+    settled_to(&h, helper, &Rules::default()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while h.calls("conversations.info").await == 0
+        || !h
+            .store
+            .due_channel_id_changes(now + CHANNEL_CHANGE_TTL, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    {
+        assert!(tokio::time::Instant::now() < deadline, "never settled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let again = h
+        .store
+        .session_for_thread(agent, &thread(OLD), &scope(OLD), now)
+        .await
+        .unwrap();
+    assert_eq!((again.session.id, again.replaced), (old.id, None));
+    let moved = h
+        .store
+        .session_for_thread(agent, &thread(NEW), &scope(NEW), now)
+        .await
+        .unwrap();
+    assert_ne!(moved.session.id, old.id, "the new id starts afresh");
+    assert_eq!(
+        h.store
+            .posted_message_ref(&msg)
+            .await
+            .unwrap()
+            .map(|row| row.session),
+        Some(old.id)
+    );
+    assert_eq!(
+        h.store.thread_spend(&thread(OLD), now).await.unwrap().tokens_today,
+        15
+    );
+    assert_eq!(
+        h.store.thread_spend(&thread(NEW), now).await.unwrap().tokens_today,
+        0
+    );
+    assert!(
+        !h.store
+            .claim_limit_notice(agent, &thread(OLD), "turns", window, now)
+            .await
+            .unwrap(),
+        "the old id's notice stays claimed"
+    );
+}
+
+#[tokio::test]
+async fn older_agent_apps_get_the_event_through_a_manifest_update() {
+    let h = harness().await;
+    let current = installed(&h).await;
+    let old = installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    mount(
+        &h.slack,
+        "apps.manifest.update",
+        CONFIG_TOKEN,
+        ok(json!({"app_id": "A0WRITER", "permissions_updated": false})),
+    )
+    .await;
+    let pass = h.agents.pass().await.unwrap();
+    assert_eq!(pass.updated, 1);
+    let sent: Vec<_> = h
+        .slack
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/apps.manifest.update")
+        .collect();
+    assert_eq!(sent.len(), 1, "only the older app");
+    let form: std::collections::HashMap<String, String> =
+        serde_urlencoded::from_bytes(&sent[0].body).unwrap();
+    assert_eq!(form["app_id"], "A0WRITER");
+    let manifest: Value = serde_json::from_str(&form["manifest"]).unwrap();
+    assert_eq!(
+        manifest,
+        agent_manifest(&AgentApp {
+            name: "writer",
+            public_url: "https://agentd.example.com",
+            binding: old,
+            public_posting: false,
+        })
+    );
+    assert!(
+        manifest["settings"]["event_subscriptions"]["bot_events"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("channel_id_changed"))
+    );
+    assert!(
+        h.store
+            .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(h.agents.pass().await.unwrap().updated, 0);
+    assert_eq!(h.calls("apps.manifest.update").await, 1);
+    assert_ne!(current, old);
+}
+
+#[tokio::test]
+async fn a_manifest_update_slack_refuses_the_token_for_marks_it_broken_and_odd_apps_wait() {
+    let h = harness().await;
+    installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    mount(
+        &h.slack,
+        "apps.manifest.update",
+        CONFIG_TOKEN,
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+    )
+    .await;
+    assert_eq!(h.agents.pass().await.unwrap().updated, 0);
+    let status = h
+        .store
+        .slack_config_token_status(h.owner, &TeamId::new(TEAM))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.broken);
+    assert_eq!(
+        h.store
+            .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
+            .await
+            .unwrap(),
+        ["writer"]
+    );
+    let later = OffsetDateTime::now_utc() + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| later).await.unwrap().updated, 0);
+    assert_eq!(h.calls("apps.manifest.update").await, 1, "no usable token");
+
+    let h = harness().await;
+    let team = TeamId::new(TEAM);
+    let now = OffsetDateTime::now_utc();
+    let scopes = surface_slack::manifest::BOT_SCOPES.join(",");
+    for (name, scopes, redirect_url) in [
+        (
+            "narrow",
+            "chat:write",
+            "https://agentd.example.com/slack/oauth/callback",
+        ),
+        ("moved", scopes.as_str(), "https://agentd.example.com/elsewhere"),
+    ] {
+        let store::AgentCreation::Created(_, odd) = h
+            .store
+            .create_agent(
+                &store::NewAgent {
+                    owner: h.owner,
+                    name,
+                    persona: "You help.",
+                    visibility: Visibility::Public,
+                    surface: SurfaceKind::Slack,
+                    team: &team,
+                },
+                10,
+                now,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        let app_id = format!("A0{}", name.to_uppercase());
+        h.store
+            .set_slack_app(
+                odd,
+                &NewSlackApp {
+                    app_id: app_id.clone(),
+                    client_id: "5555.6666".to_owned(),
+                    client_secret: SecretString::from("client-SECRET"),
+                    signing_secret: SecretString::from("signing-SECRET"),
+                    scopes: scopes.to_owned(),
+                    redirect_url: redirect_url.to_owned(),
+                    manifest_version: 0,
+                },
+                name,
+                now,
+            )
+            .await
+            .unwrap();
+        h.store
+            .install_slack_app(
+                odd,
+                &app_id,
+                &UserId::new(format!("U0{}", name.to_uppercase())),
+                &SecretString::from("xoxb-odd"),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(h.agents.pass().await.unwrap().updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.update").await,
+        0,
+        "an app with other scopes, or made elsewhere, isn't updated"
+    );
 }

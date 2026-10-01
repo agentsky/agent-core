@@ -16,6 +16,12 @@
 //! it installs. A binding still waiting for its install a while after it
 //! started owes its owner one reminder, claimed with a lease like the relink
 //! notices.
+//!
+//! Each app records the version of agentd's manifest it was made from
+//! (`manifest_version`). An installed app made from an older one is
+//! [updated](Store::due_manifest_updates) with its owner's configuration
+//! token, each update claimed with a lease like a configuration token's
+//! rotation.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -54,6 +60,8 @@ pub struct NewSlackApp {
     /// The OAuth redirect URL its manifest names, which its install link
     /// and the code exchange must name too.
     pub redirect_url: String,
+    /// The version of agentd's manifest it was made from.
+    pub manifest_version: u32,
 }
 
 /// What the ingress needs to verify a Slack binding's requests, from
@@ -88,6 +96,25 @@ pub struct SlackAppBinding {
     pub scopes: Option<String>,
     /// The app's OAuth redirect URL, once created.
     pub redirect_url: Option<String>,
+}
+
+/// An installed Slack app made, or last updated, from a manifest older than
+/// the one asked for, whose owner has a configuration token to update it
+/// with, from [`Store::due_manifest_updates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestUpdate {
+    /// The binding.
+    pub binding: BindingId,
+    /// The agent's name, the app's name.
+    pub agent_name: String,
+    /// The agent's owner, whose configuration token updates the app.
+    pub owner: MemberId,
+    /// The app's id.
+    pub app_id: String,
+    /// The app's bot scopes, comma-separated, as it was made with them.
+    pub scopes: String,
+    /// The app's OAuth redirect URL, as it was made with it.
+    pub redirect_url: String,
 }
 
 /// A Slack binding whose owner is owed the reminder to install its app,
@@ -132,6 +159,15 @@ macro_rules! reminder_due {
          AND b.install_reminded_at IS NULL \
          AND (b.install_reminder_next_at IS NULL OR b.install_reminder_next_at <= ?) \
          AND b.install_reminder_attempts < ?"
+    };
+}
+
+/// The conditions under which a manifest update may be claimed, binding the
+/// version asked for, then `now`.
+macro_rules! manifest_due {
+    () => {
+        "b.surface = 'slack' AND b.state = 'active' AND b.manifest_version < ? \
+         AND (b.manifest_lease_until IS NULL OR b.manifest_lease_until <= ?)"
     };
 }
 
@@ -196,7 +232,7 @@ impl Store {
         let result = sqlx::query(
             "UPDATE agent_bindings SET app_id = ?, client_id = ?, client_secret_enc = ?, \
              signing_secret_enc = ?, app_scopes = ?, app_redirect_url = ?, bot_username = ?, \
-             state = 'pending_install', state_changed_at = ? \
+             manifest_version = ?, state = 'pending_install', state_changed_at = ? \
              WHERE id = ? AND surface = 'slack' AND state = 'creating'",
         )
         .bind(&app.app_id)
@@ -206,6 +242,7 @@ impl Store {
         .bind(&app.scopes)
         .bind(&app.redirect_url)
         .bind(bot_username)
+        .bind(i64::from(app.manifest_version))
         .bind(to_unix(now))
         .bind(&key)
         .execute(&self.pool)
@@ -423,6 +460,135 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?;
         claimed.map(attempt).transpose()
+    }
+
+    /// Up to `limit` installed Slack apps in `team` whose manifest update
+    /// may be claimed at `now`: made, or last updated, from a manifest
+    /// older than `version`, with no lease running, of an agent that isn't
+    /// deleted, whose owner has a configuration token usable at `now`.
+    /// Longest installed first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if a row doesn't parse.
+    pub async fn due_manifest_updates(
+        &self,
+        team: &TeamId,
+        version: u32,
+        now: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ManifestUpdate>> {
+        let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(concat!(
+            "SELECT b.id, a.name, a.owner_id, b.app_id, b.app_scopes, b.app_redirect_url \
+             FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
+             WHERE b.team_id = ? AND a.state <> 'deleted' AND b.app_id IS NOT NULL \
+             AND b.app_scopes IS NOT NULL AND b.app_redirect_url IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM slack_config_tokens t WHERE t.member_id = a.owner_id \
+             AND t.team_id = b.team_id AND t.broken_at IS NULL AND t.expires_at > ?) AND ",
+            manifest_due!(),
+            " ORDER BY b.state_changed_at, b.rowid LIMIT ?"
+        ))
+        .bind(team.as_str())
+        .bind(to_unix(now))
+        .bind(i64::from(version))
+        .bind(to_unix(now))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(
+                |(binding, agent_name, owner, app_id, scopes, redirect_url)| {
+                    Ok(ManifestUpdate {
+                        binding: parse_column(&binding, BINDINGS, "id")?,
+                        agent_name,
+                        owner: parse_column(&owner, "agents", "owner_id")?,
+                        app_id,
+                        scopes,
+                        redirect_url,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Claims the manifest update of `binding` at `now`, with a lease until
+    /// `lease_until`, if it is due as for
+    /// [`due_manifest_updates`](Self::due_manifest_updates) says, for
+    /// `version`. Returns true only for the one call that claims it.
+    ///
+    /// Follow a claim with
+    /// [`set_manifest_version`](Self::set_manifest_version) once the app is
+    /// updated. A claim that doesn't, because the update failed or its
+    /// caller died, lets the update be claimed again once the lease ends.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn claim_manifest_update(
+        &self,
+        binding: BindingId,
+        version: u32,
+        now: OffsetDateTime,
+        lease_until: OffsetDateTime,
+    ) -> Result<bool> {
+        let result = sqlx::query(concat!(
+            "UPDATE agent_bindings AS b SET manifest_lease_until = ? WHERE b.id = ? AND ",
+            manifest_due!()
+        ))
+        .bind(to_unix(lease_until))
+        .bind(binding.to_string())
+        .bind(i64::from(version))
+        .bind(to_unix(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Records that `binding`'s app has the manifest of `version` now, and
+    /// ends its lease. Returns false, changing nothing, if it had that
+    /// version or a later one already.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn set_manifest_version(&self, binding: BindingId, version: u32) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE agent_bindings SET manifest_version = ?, manifest_lease_until = NULL \
+             WHERE id = ? AND manifest_version < ?",
+        )
+        .bind(i64::from(version))
+        .bind(binding.to_string())
+        .bind(i64::from(version))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The names of `owner`'s agents whose installed Slack apps in `team`
+    /// were made, or last updated, from a manifest older than `version`,
+    /// by name.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn outdated_slack_apps(
+        &self,
+        owner: MemberId,
+        team: &TeamId,
+        version: u32,
+    ) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT a.name FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
+             WHERE a.owner_id = ? AND a.state <> 'deleted' AND b.team_id = ? \
+             AND b.surface = 'slack' AND b.state = 'active' AND b.manifest_version < ? \
+             ORDER BY a.name, b.rowid",
+        )
+        .bind(owner.to_string())
+        .bind(team.as_str())
+        .bind(i64::from(version))
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Records that the owner of `binding` was reminded at `now`. Returns
