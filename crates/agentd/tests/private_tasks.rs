@@ -410,6 +410,29 @@ impl Stack {
         }
     }
 
+    /// The owner alice's message `id` in her own one-to-one DM with the
+    /// agent.
+    fn in_dm(&self, id: &str) -> InboundEvent {
+        InboundEvent {
+            conv: conv("DM-ALICE"),
+            conv_kind: ConvKind::Dm,
+            message: msg("DM-ALICE", id),
+            text: "hello in my DM".to_owned(),
+            mentions: vec![],
+            ..self.mention("alice", id, None)
+        }
+    }
+
+    /// Approves `consent` as its agent's owner, alice.
+    async fn approve(&self, consent: ConsentId) {
+        self.app
+            .ctl()
+            .consents()
+            .decide(&key("alice"), consent, true)
+            .await
+            .unwrap();
+    }
+
     /// Has `sender` ask the agent, in a new thread rooted at `id`, for the
     /// private task [`script`] asks for, with the task's session doing
     /// `private`, and returns the consent the channel turn got.
@@ -578,6 +601,8 @@ async fn private_returns_at_once_and_channel_turn_ends() {
     );
     assert_eq!(row.task, TASK);
     assert_eq!(row.thread, thread("t1"));
+    assert_eq!(row.state, ConsentState::Pending, "asked in a channel");
+    stack.approve(consent).await;
 
     stack.posted(before, &heading(consent)).await;
     stack.finished(consent).await;
@@ -588,7 +613,7 @@ async fn private_returns_at_once_and_channel_turn_ends() {
 async fn owner_requester_skips_card() {
     let stack = start("").await;
     let before = stack.mock.calls().len();
-    let consent = stack.ask("alice", "t1", SEEN).await;
+    let consent = stack.ask_with(stack.in_dm("d1"), SEEN).await;
     let row = stack.store().consent(consent).await.unwrap().unwrap();
     assert_eq!(row.state, ConsentState::Approved);
     assert_eq!(row.decided_by, Some(key("alice")));
@@ -597,8 +622,11 @@ async fn owner_requester_skips_card() {
     assert_eq!(row.card, None);
     assert!(
         stack.manager.posts().is_empty(),
-        "no card for the owner's own task"
+        "no card for a task the owner asked for in their own DM"
     );
+    let private = stack.started(row.private_session.unwrap());
+    assert_eq!(private[0].shared, SharedAccess::ReadWrite);
+    assert!(private[0].memory, "the owner's own task");
     stack.stop().await;
 }
 
@@ -710,12 +738,13 @@ async fn decline_posts_outcome() {
 
 #[tokio::test]
 async fn expiry_posts_outcome() {
-    let stack = start("consent_ttl_secs = 1").await;
+    let stack = start("consent_ttl_secs = 3").await;
     let before = stack.mock.calls().len();
     let consent = stack.ask("bob", "t1", SEEN).await;
+    stack.card_to("alice").await;
     let (to, text, _) = stack.posted(before, "expired").await;
     assert_eq!(to, in_thread("t1"));
-    assert!(text.contains("within 1 second"), "{text}");
+    assert!(text.contains("within 3 seconds"), "{text}");
     let row = stack.finished(consent).await;
     assert_eq!(row.state, ConsentState::Expired);
     assert_eq!(row.private_session, None);
@@ -751,6 +780,7 @@ async fn private_session_is_fresh_and_not_dm() {
         .unwrap()
         .session;
     let consent = stack.ask("alice", "t1", SEEN).await;
+    stack.approve(consent).await;
     let row = stack.finished(consent).await;
     let private = row.private_session.expect("the task ran in a session");
     assert_ne!(private, owners_dm.id);
@@ -766,6 +796,7 @@ async fn private_session_is_fresh_and_not_dm() {
     assert_eq!(stack.started(private).len(), 1);
 
     let again = stack.ask("alice", "t2", SEEN).await;
+    stack.approve(again).await;
     let second = stack.finished(again).await.private_session.unwrap();
     assert_ne!(second, private, "each task gets a session of its own");
     stack.stop().await;
@@ -903,6 +934,7 @@ async fn ask_agent_and_private_refused_inside_private_task() {
              agentctl post --to here hi 2>> refused.txt; agentctl attach refused.txt",
         )
         .await;
+    stack.approve(consent).await;
     stack.posted(before, &heading(consent)).await;
     stack.finished(consent).await;
     let calls = stack.mock.calls().split_off(before);
@@ -996,6 +1028,7 @@ async fn result_message_ref_inherits_requester_and_hop() {
 async fn channel_volume_never_mounts_private_paths() {
     let stack = start("").await;
     let consent = stack.ask("alice", "t1", SEEN).await;
+    stack.approve(consent).await;
     let row = stack.finished(consent).await;
     let channel = stack.started(row.origin_session);
     assert!(!channel.is_empty());
@@ -1216,6 +1249,7 @@ async fn a_private_tasks_result_starts_no_hop() {
     agent_of(store, bob, "writer", "UWRITER").await;
     let before = stack.mock.calls().len();
     let consent = stack.ask("alice", "t1", SEEN).await;
+    stack.approve(consent).await;
     let (_, _, result) = stack.posted(before, &heading(consent)).await;
     stack.finished(consent).await;
     let attributed = store.posted_message_ref(&result).await.unwrap().unwrap();
@@ -1303,6 +1337,14 @@ async fn a_task_that_reached_the_model_is_never_run_again() {
         .await
         .unwrap();
     assert!(store.mark_session_turn_pending(earlier.id).await.unwrap());
+    let work = stack
+        .turns
+        .sessions()
+        .work_dir(&earlier)
+        .await
+        .unwrap()
+        .work;
+    std::fs::write(work.join("copied-from-memory.txt"), "private").unwrap();
     assert!(
         store
             .set_consent_session(consent, 0, earlier.id)
@@ -1327,27 +1369,30 @@ async fn a_task_that_reached_the_model_is_never_run_again() {
         upstream,
         "the task didn't run a second time"
     );
+    let session_dir = work.parent().unwrap().to_owned();
+    let started = Instant::now();
+    while session_dir.exists() {
+        assert!(
+            started.elapsed() < WAIT,
+            "the interrupted session's directory was kept"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     stack.stop().await;
 }
 
 #[tokio::test]
-async fn a_shutdown_releases_and_stops_the_task_it_cuts() {
+async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
     let stack = start("").await;
     let consent = stack
         .ask(
             "bob",
             "t1",
-            "sleep 30; cat in.txt > seen.txt && agentctl attach seen.txt",
+            "sleep 90; cat in.txt > seen.txt && agentctl attach seen.txt",
         )
         .await;
     stack.card_to("alice").await;
-    stack
-        .app
-        .ctl()
-        .consents()
-        .decide(&key("alice"), consent, true)
-        .await
-        .unwrap();
+    stack.approve(consent).await;
     let started = Instant::now();
     let session = loop {
         if let Some(session) = stack
@@ -1364,30 +1409,51 @@ async fn a_shutdown_releases_and_stops_the_task_it_cuts() {
         assert!(started.elapsed() < WAIT, "the task never started");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    let (store, alice) = (stack.store(), stack.alice);
+    let billed = || async move {
+        store
+            .member_usage(alice, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .today
+            .turns
+    };
+    let before = billed().await;
     stack.pipeline.cut_short().await;
     let row = stack.store().consent(consent).await.unwrap().unwrap();
     assert_eq!(row.finished_at, None);
     assert_eq!(row.work_failures, 0, "a shutdown is no failure");
-    assert_eq!(
-        stack
-            .store()
-            .consent_work_owed(OffsetDateTime::now_utc())
+    let owed = |at| async move {
+        store
+            .consent_work_owed(at)
             .await
             .unwrap()
             .iter()
             .map(|owed| owed.id)
-            .collect::<Vec<_>>(),
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        owed(OffsetDateTime::now_utc()).await.is_empty(),
+        "a claim whose turn started isn't released, so the task can't run twice"
+    );
+    assert_eq!(
+        owed(OffsetDateTime::now_utc() + agentd::pipeline::WORK_LEASE).await,
         [consent],
-        "another instance may take it up at once"
+        "it lapses with its lease"
     );
     let started = Instant::now();
-    while stack.turns.sessions().is_warm(session) {
+    while stack.turns.sessions().is_warm(session) || billed().await == before {
         assert!(
-            started.elapsed() < WAIT,
-            "the cut task's container was never stopped"
+            started.elapsed() < Duration::from_secs(10),
+            "the cut turn was never killed and metered"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert_eq!(
+        billed().await,
+        before + 1,
+        "the owner pays for the cut turn"
+    );
     stack.stop().await;
 }
 
@@ -1460,7 +1526,7 @@ async fn a_deleted_agents_consent_expires_without_a_word() {
 }
 
 #[tokio::test]
-async fn a_card_that_cant_reach_the_owner_expires_at_once() {
+async fn a_card_that_cant_reach_the_owner_expires_without_running() {
     let stack = start("").await;
     let store = stack.store();
     let carol = store
@@ -1493,7 +1559,7 @@ async fn a_card_that_cant_reach_the_owner_expires_at_once() {
                 attachments_json: "[]",
                 thread: &thread,
                 origin_session: SessionId::new_v4(),
-                expires_at: now + Duration::from_secs(3600),
+                expires_at: now + Duration::from_secs(2),
                 approved_by_owner: None,
             },
             store::OpenLimits {
@@ -1507,6 +1573,10 @@ async fn a_card_that_cant_reach_the_owner_expires_at_once() {
         .unwrap();
     stack.app.ctl().consents().wake();
     let (to, text, _) = stack.posted(before, "couldn't reach the owner").await;
+    assert!(
+        OffsetDateTime::now_utc() >= created.expires_at,
+        "a card that can't be sent is tried again until the consent expires"
+    );
     assert_eq!(to, in_thread("t9"));
     assert!(text.contains(&created.id.to_string()), "{text}");
     let row = stack.finished(created.id).await;
@@ -1574,5 +1644,33 @@ async fn a_requester_has_only_so_many_tasks_waiting() {
         3,
         "the owner gets three cards at most"
     );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn owner_request_in_a_channel_needs_a_card() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("alice", "t1", SEEN).await;
+    let row = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(row.requester.member, Some(stack.alice));
+    assert_eq!(row.hop, core_types::Hop::ZERO);
+    assert_eq!(
+        row.state,
+        ConsentState::Pending,
+        "others' messages in the thread reach the turn, so the owner decides on a card"
+    );
+    let card = stack.card_to("alice").await;
+    assert!(
+        card.contains("can read and change your agent's shared files and its memory"),
+        "{card}"
+    );
+    assert!(card.contains("outside your own DM"), "{card}");
+    stack.approve(consent).await;
+    stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+    let private = stack.started(row.private_session.unwrap());
+    assert_eq!(private[0].shared, SharedAccess::ReadWrite);
+    assert!(private[0].memory, "the owner approved their own task");
     stack.stop().await;
 }

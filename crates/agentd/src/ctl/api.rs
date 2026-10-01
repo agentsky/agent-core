@@ -622,7 +622,8 @@ async fn ask_agent(Caller(_): Caller) -> ApiError {
 /// `POST /v1/private`: records a consent for the task, with the files it
 /// names copied out of the caller's session directory, and returns its id
 /// at once. The task runs once the owner approves it, at once when the
-/// owner asked for it at hop 0. A turn may ask for [`MAX_PRIVATE_TASKS`].
+/// owner asked for it in their own DM with the agent. A turn may ask for
+/// [`MAX_PRIVATE_TASKS`].
 ///
 /// [`MAX_PRIVATE_TASKS`]: super::MAX_PRIVATE_TASKS
 async fn private(

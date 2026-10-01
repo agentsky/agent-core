@@ -3,9 +3,10 @@
 //! decided consent owes.
 //!
 //! A consent is created by `agentctl private`, `pending` unless the agent's
-//! owner asked for it at hop 0, in which case it is `approved` at once
-//! ([`Approval::Asked`]). Each agent and requester may have only so many
-//! consents unfinished ([`OpenLimits`]). Only a pending consent can be
+//! owner asked for it in their own DM with the agent, in which case it is
+//! `approved` at once ([`Approval::Asked`]). Each requester may have only so
+//! many consents of an agent unfinished, and others than the owner only so
+//! many together ([`OpenLimits`]). Only a pending consent can be
 //! [decided](Store::decide_consent) or [expired](Store::expire_consents),
 //! each in one conditional `UPDATE`, so a decision and an expiry, or two
 //! decisions, never both land.
@@ -77,7 +78,8 @@ impl ConsentState {
 /// How an approved consent was approved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Approval {
-    /// At once, because the agent's owner asked for it at hop 0.
+    /// At once, because the agent's owner asked for it in their own DM
+    /// with the agent, on the owner's side (so at hop 0).
     Asked,
     /// By the owner, on the consent card.
     Card,
@@ -107,8 +109,32 @@ impl Approval {
 pub struct OpenLimits {
     /// The most for one agent and one requester's identity.
     pub per_requester: u32,
-    /// The most for one agent.
+    /// The most for one agent asked for by anyone but its owner, so others
+    /// can never use up the owner's own.
     pub per_agent: u32,
+}
+
+/// Whether `agent` has room for another unfinished consent asked for by
+/// `requester` under `limits`, read in `conn`.
+async fn has_room(
+    conn: &mut sqlx::SqliteConnection,
+    agent: AgentId,
+    requester: &Requester,
+    limits: OpenLimits,
+) -> Result<bool> {
+    let (others, theirs, owners): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COALESCE(SUM(c.id IS NOT NULL AND c.requester_member IS NOT a.owner_id), 0), \
+         COALESCE(SUM(c.requester_key = ?), 0), COALESCE(MAX(a.owner_id = ?), 0) \
+         FROM agents a LEFT JOIN consents c ON c.agent_id = a.id AND c.finished_at IS NULL \
+         WHERE a.id = ?",
+    )
+    .bind(requester.key.to_string())
+    .bind(requester.member.map(|member| member.to_string()))
+    .bind(agent.to_string())
+    .fetch_one(conn)
+    .await?;
+    Ok(theirs < i64::from(limits.per_requester)
+        && (owners == 1 || others < i64::from(limits.per_agent)))
 }
 
 /// A consent to record, for [`Store::create_consent`].
@@ -133,8 +159,9 @@ pub struct NewConsent<'a> {
     /// When an unanswered card expires.
     pub expires_at: OffsetDateTime,
     /// `Some` with the requester's identity when the agent's owner asked
-    /// for the task at hop 0: the consent is approved at once, by them
-    /// ([`Approval::Asked`]). The store refuses it at any other hop.
+    /// for the task in their own DM with the agent: the consent is approved
+    /// at once, by them ([`Approval::Asked`]). The store refuses it at any
+    /// hop but 0, where no such turn runs.
     pub approved_by_owner: Option<&'a MemberKey>,
 }
 
@@ -346,13 +373,32 @@ macro_rules! work_claimable {
 }
 
 impl Store {
+    /// Whether `agent` has room for another unfinished consent asked for
+    /// by `requester` under `limits`, as
+    /// [`create_consent`](Self::create_consent) counts: a cheap check
+    /// before a request does any work.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn consent_room(
+        &self,
+        agent: AgentId,
+        requester: &Requester,
+        limits: OpenLimits,
+    ) -> Result<bool> {
+        let mut conn = self.pool.acquire().await?;
+        has_room(&mut conn, agent, requester, limits).await
+    }
+
     /// Records `consent` at `now`: `pending`, or `approved` by the owner
     /// ([`Approval::Asked`]) when [`NewConsent::approved_by_owner`] says
-    /// the owner asked at hop 0. Returns `None`, recording nothing, when
-    /// the agent, or the agent and the requester's identity, already have
-    /// as many unfinished consents as `limits` allow. The count and the
-    /// insert are one `BEGIN IMMEDIATE` transaction, so concurrent requests
-    /// never pass the limits together.
+    /// the owner asked in their DM. Returns `None`, recording nothing,
+    /// when there is no room for it under `limits`: the requester's
+    /// identity has as many unfinished consents of the agent as it may,
+    /// or, for anyone but the owner, others than the owner have. The count
+    /// and the insert are one `BEGIN IMMEDIATE` transaction, so concurrent
+    /// requests never pass the limits together.
     ///
     /// # Errors
     ///
@@ -375,17 +421,7 @@ impl Store {
             None => (ConsentState::Pending, None, None, None),
         };
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (per_agent, per_requester): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(requester_key = ?), 0) FROM consents \
-             WHERE agent_id = ? AND finished_at IS NULL",
-        )
-        .bind(consent.requester.key.to_string())
-        .bind(consent.agent.to_string())
-        .fetch_one(&mut *tx)
-        .await?;
-        if per_agent >= i64::from(limits.per_agent)
-            || per_requester >= i64::from(limits.per_requester)
-        {
+        if !has_room(&mut tx, consent.agent, consent.requester, limits).await? {
             return Ok(None);
         }
         let row: Row = sqlx::query_as(concat!(
@@ -650,8 +686,9 @@ impl Store {
     }
 
     /// The soonest time after `now` at which something a consent owes
-    /// falls due: a pending consent's expiry, a card's or a claim's retry
-    /// or lease. `None` when nothing is due after `now`.
+    /// falls due: the expiry of a pending consent, or of an approved one
+    /// that may wait for its paused agent, a card's or a claim's retry or
+    /// lease. `None` when nothing is due after `now`.
     ///
     /// # Errors
     ///
@@ -663,7 +700,7 @@ impl Store {
     ) -> Result<Option<OffsetDateTime>> {
         let next: Option<i64> = sqlx::query_scalar(
             "SELECT MIN(due) FROM ( \
-             SELECT expires_at AS due FROM consents WHERE state = 'pending' \
+             SELECT expires_at AS due FROM consents WHERE state IN ('pending', 'approved') \
              AND finished_at IS NULL \
              UNION ALL SELECT card_next_attempt_at FROM consents WHERE state = 'pending' \
              AND finished_at IS NULL AND card_message IS NULL \
@@ -701,31 +738,33 @@ impl Store {
 
     /// Claims consent `id`'s work at `now`, with a lease until
     /// `lease_until`, if it may be claimed as for
-    /// [`consent_work_owed`](Self::consent_work_owed). Returns which
-    /// attempt this is, from 1, only for the one call that claims it.
+    /// [`consent_work_owed`](Self::consent_work_owed). Returns the consent
+    /// as claimed, whose [`Consent::work_attempts`] is this claim's
+    /// attempt, from 1, only for the one call that claims it.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
-    /// if the count is negative.
+    /// if the row doesn't parse.
     pub async fn claim_consent_work(
         &self,
         id: ConsentId,
         now: OffsetDateTime,
         lease_until: OffsetDateTime,
-    ) -> Result<Option<u32>> {
-        let claimed: Option<i64> = sqlx::query_scalar(concat!(
+    ) -> Result<Option<Consent>> {
+        let claimed: Option<Row> = sqlx::query_as(concat!(
             "UPDATE consents SET work_attempts = work_attempts + 1, work_next_attempt_at = ? \
              WHERE id = ? AND ",
             work_claimable!(),
-            " RETURNING work_attempts"
+            " RETURNING ",
+            columns!()
         ))
         .bind(to_unix(lease_until))
         .bind(id.to_string())
         .bind(to_unix(now))
         .fetch_optional(&self.pool)
         .await?;
-        attempt_count(claimed, "work_attempts")
+        claimed.map(Row::into_consent).transpose()
     }
 
     /// Extends the lease of claim `attempt` on consent `id`'s work to
@@ -1201,14 +1240,16 @@ mod tests {
             fx.store
                 .claim_consent_work(pending.id, at(100), at(200))
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|claimed| claimed.work_attempts),
             None
         );
         assert_eq!(
             fx.store
                 .claim_consent_work(approved.id, at(100), at(200))
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|claimed| claimed.work_attempts),
             Some(1)
         );
         assert!(
@@ -1228,7 +1269,8 @@ mod tests {
             fx.store
                 .claim_consent_work(approved.id, at(250), at(400))
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|claimed| claimed.work_attempts),
             None,
             "the renewed lease holds"
         );
@@ -1236,7 +1278,8 @@ mod tests {
             fx.store
                 .claim_consent_work(approved.id, at(300), at(400))
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|claimed| claimed.work_attempts),
             Some(2),
             "an expired lease is taken over"
         );
@@ -1273,7 +1316,8 @@ mod tests {
             fx.store
                 .claim_consent_work(approved.id, at(350), at(900))
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|claimed| claimed.work_attempts),
             Some(3)
         );
         assert!(
@@ -1286,7 +1330,8 @@ mod tests {
             fx.store
                 .claim_consent_work(approved.id, at(360), at(900))
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|claimed| claimed.work_attempts),
             Some(4),
             "a released claim is taken again at once"
         );
@@ -1349,8 +1394,8 @@ mod tests {
         let approved = fx.create(true, None, 1_000).await;
         assert_eq!(
             fx.store.next_consent_deadline(at(100)).await.unwrap(),
-            Some(at(5_000)),
-            "an approved consent's expiry is no deadline"
+            Some(at(1_000)),
+            "an approved consent may wait for its paused agent until it expires"
         );
         fx.store
             .claim_consent_card(pending.id, at(100), at(700))
@@ -1359,7 +1404,8 @@ mod tests {
         fx.store
             .claim_consent_work(approved.id, at(100), at(400))
             .await
-            .unwrap();
+            .unwrap()
+            .map(|claimed| claimed.work_attempts);
         assert_eq!(
             fx.store.next_consent_deadline(at(100)).await.unwrap(),
             Some(at(400))
@@ -1487,6 +1533,7 @@ mod tests {
             .claim_consent_work(first.id, at(160), at(200))
             .await
             .unwrap()
+            .map(|claimed| claimed.work_attempts)
             .unwrap();
         fx.store
             .finish_consent(first.id, attempt, at(170))
@@ -1497,6 +1544,36 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+        assert!(
+            !fx.store
+                .consent_room(fx.agent, &carol, limits)
+                .await
+                .unwrap()
+        );
+        let owner = Requester {
+            member: fx.store.member_for_identity(&fx.owner).await.unwrap(),
+            key: fx.owner.clone(),
+        };
+        assert!(
+            fx.store
+                .consent_room(fx.agent, &owner, limits)
+                .await
+                .unwrap(),
+            "others can't use up the owner's own"
+        );
+        for _ in 0..2 {
+            fx.try_create(&owner, false, None, 1_000, limits)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fx.try_create(&owner, false, None, 1_000, limits)
+                .await
+                .unwrap(),
+            None,
+            "the owner has a limit of their own"
         );
     }
 }

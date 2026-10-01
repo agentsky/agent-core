@@ -225,7 +225,7 @@ struct Inner {
     pending: Arc<Semaphore>,
     shares: Mutex<HashMap<MemberId, Share>>,
     tasks: Mutex<JoinSet<()>>,
-    private: Mutex<HashMap<ConsentId, u32>>,
+    private: Mutex<HashMap<ConsentId, private::Claim>>,
     closed: AtomicBool,
     working: Mutex<Working>,
     floods: Throttle<(AgentId, Flood)>,

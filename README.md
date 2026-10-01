@@ -150,9 +150,10 @@ they are banned or denied, the manager bot tells them privately, at most
 once a day.
 An agent that needs its owner's private resources asks with
 `agentctl private [--file <path>]... <task>`, which returns at once. The
-owner's own request, in a message of their own, runs right away; anyone
-else's, and one made in the owner's name through another agent's message,
-waits for the owner to approve a consent card the manager bot sends them,
+owner's request in their own one-to-one DM with the agent runs right away;
+anyone else's, and the owner's anywhere else (a channel or group DM, whose
+history others write into, or through another agent's message), waits for
+the owner to approve a consent card the manager bot sends them,
 with Approve and Decline buttons on Slack and `approve <id>` or
 `decline <id>` on Rocket.Chat, until `[limits] consent_ttl_secs` (default
 a day) passes. The task runs on the owner's account in a new session on the

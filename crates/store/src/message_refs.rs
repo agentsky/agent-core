@@ -241,6 +241,23 @@ impl Store {
         row.into_ref()
     }
 
+    /// Whether agentd posted anything for consent `consent` under session
+    /// `session`: a private task's result, or its outcome.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn consent_posted(&self, consent: ConsentId, session: SessionId) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM message_refs WHERE session_id = ? AND consent_id = ? LIMIT 1",
+        )
+        .bind(session.to_string())
+        .bind(consent.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
     /// The row of `msg` if agentd posted it as an agent: the one that
     /// attributes it.
     ///

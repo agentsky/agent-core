@@ -2777,14 +2777,17 @@ Deliverables:
      the design's "files the channel turn attached explicitly". The PR adds
      `--file` to the design's `agentctl` table.
   2. Return the consent id at once.
-  3. If the owner asked for it in a turn at hop 0 (their own message started
-     the turn), set the state to `approved` and enqueue the task. Otherwise,
-     including a hop turn whose inherited requester is the owner, send the
-     consent card to the owner. The row records how it was approved
-     (`approval`: `asked` or `card`).
-  4. Refuse a request past the limits on unfinished consents per agent and per
-     (agent, requester), counted in the insert's transaction, and files over
-     one attachment's cap together.
+  3. If the owner asked for it in their own one-to-one DM with the agent (a
+     `Side::Owner` turn, so at hop 0), set the state to `approved` and enqueue
+     the task. Otherwise, including the owner asking in a channel or group DM,
+     whose history anyone can write into, and a hop turn whose inherited
+     requester is the owner, send the consent card to the owner. The row
+     records how it was approved (`approval`: `asked` or `card`).
+  4. Refuse a request past the limits on unfinished consents per agent (the
+     owner's own not counted) and per (agent, requester), counted before the
+     files are staged and again in the insert's transaction, and files over
+     one attachment's cap together. Refuse a task with control or invisible
+     characters, which the card wouldn't show.
 - Consent card:
   - Slack: Block Kit in the owner's DM from the manager bot, showing the exact
     task text, requester, channel and thread link, with Approve and Decline
@@ -2792,6 +2795,10 @@ Deliverables:
     card is updated with the outcome.
   - Rocket.Chat: a DM from the manager bot with the same text, plus the
     commands `approve <id>` and `decline <id>` (T08's `Approve` and `Decline`).
+  - The requester is named by their name on their surface, looked up when
+    the card is sent, and the thread by the card's surface.
+  - The card says the files' contents aren't shown and can direct the task
+    like its text.
   - Only the owner can decide.
 - Expiry: a sweeper marks cards `expired` after `[limits]
   consent_ttl_secs` (default 86400, 24 hours; the repository's `_secs`
@@ -2808,7 +2815,7 @@ Deliverables:
      requested gets `shared/` read-only and no `memory/`, and its consent card
      says it can read the owner's shared files. The runner picks the mounts
      from `TurnRequest.side`, so the task's turn sets it to `Side::Owner`
-     exactly when the owner asked for it at hop 0, or approved on the card a
+     exactly when the owner asked for it in their own DM, or approved on the card a
      task the owner's own identity asked for, and to `Side::Public` otherwise.
      It never follows from the requester alone, and never copies the side of
      the channel turn that asked.
@@ -2824,9 +2831,11 @@ Deliverables:
   the router never takes a mention in it as a hop, so T34's hand-off can't
   start from a private result.
 - The private session is never the owner's DM session, and its container is
-  stopped as soon as its turn ends, however the task ends. A task is run
-  again only if no turn of it reached the model, and the thread's caps (T27)
-  apply to it.
+  stopped as soon as its turn ends. A task cut short or taken over has its
+  container killed, and the crashed turn is still billed. Its session's
+  directory is deleted once the consent's work finishes, on every path. A
+  task is run again only if no turn of it reached the model, and the
+  thread's caps (T27) apply to it.
 - The private sandbox shares the `sandbox` network with channel sandboxes,
   so it relies on that network keeping sandboxes from reaching each other
   ([Network and deployment shape](#network-and-deployment-shape)). The
@@ -2848,6 +2857,9 @@ Acceptance, as tests named after the design's rules:
 - `owner_requester_at_hop_one_needs_a_card`.
 - `channel_volume_never_mounts_private_paths`.
 - `non_owner_task_gets_read_only_shared_and_no_memory`.
+- `owner_request_in_a_channel_needs_a_card`.
+- `private_refuses_a_task_with_characters_the_card_wouldnt_show`.
+- `a_shutdown_kills_and_meters_the_turn_it_cuts`.
 
 ### T34
 

@@ -119,11 +119,12 @@ agentctl private [--file <path>]... <task>
 
 Asks for a task on your owner's private resources (their `shared/`
 directory and private tools), which this conversation can't reach. It
-returns a consent id at once and does not wait for the task. Unless your
-owner asked for this turn in a message of their own (not through another
-agent's message), your owner is asked to approve the task first, and sees
-it exactly as you wrote it, so write it plainly; the task text may be at
-most 3000 characters, an emoji counting as two. When the task
+returns a consent id at once and does not wait for the task. Unless this
+turn is your owner's own direct message with you, your owner is asked to
+approve the task first, and sees it exactly as you wrote it, so write it
+plainly, without invisible or control characters other than newlines and
+tabs, which are refused; the task text may be at most 3000 characters, an
+emoji counting as two. When the task
 finishes, agentd posts its result to this thread; you won't see it in this
 turn, so tell the requester that the result will follow.
 

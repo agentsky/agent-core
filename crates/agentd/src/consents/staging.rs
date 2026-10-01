@@ -154,7 +154,7 @@ fn is_config_name(name: &str) -> bool {
 
 /// Copies the files [`stage`] put in `dir` into `work`, a new session's
 /// working directory, under their `names`, owned by `owner`, the uid and
-/// gid agents run as, so the task can change them.
+/// gid agents run as, if the sandbox sets one, so the task can change them.
 ///
 /// # Errors
 ///
@@ -164,7 +164,7 @@ pub(super) fn hand_over(
     dir: &Path,
     names: &[String],
     work: &Path,
-    owner: (u32, u32),
+    owner: Option<(u32, u32)>,
 ) -> io::Result<()> {
     for (index, name) in names.iter().enumerate() {
         let mut source = File::open(dir.join(index.to_string()))?;
@@ -173,9 +173,11 @@ pub(super) fn hand_over(
             .create_new(true)
             .mode(0o644)
             .open(work.join(name))?;
-        let meta = dest.metadata()?;
-        if (meta.uid(), meta.gid()) != owner {
-            fchown(&dest, Some(owner.0), Some(owner.1))?;
+        if let Some((uid, gid)) = owner {
+            let meta = dest.metadata()?;
+            if (meta.uid(), meta.gid()) != (uid, gid) {
+                fchown(&dest, Some(uid), Some(gid))?;
+            }
         }
         io::copy(&mut source, &mut dest)?;
     }
@@ -234,7 +236,7 @@ mod tests {
         let work = TempDir::new();
         let me = std::fs::metadata(&work.0).unwrap();
         let owner = (me.uid(), me.gid());
-        hand_over(&staged.0, &names, &work.0, owner).unwrap();
+        hand_over(&staged.0, &names, &work.0, Some(owner)).unwrap();
         let handed = std::fs::metadata(work.0.join("in.txt")).unwrap();
         assert_eq!((handed.uid(), handed.gid()), owner);
         assert_eq!(
@@ -245,7 +247,13 @@ mod tests {
             std::fs::read_to_string(work.0.join("data.csv")).unwrap(),
             "a,b"
         );
-        assert!(hand_over(&staged.0, &names, &work.0, owner).is_err());
+        assert!(hand_over(&staged.0, &names, &work.0, None).is_err());
+        let unowned = TempDir::new();
+        hand_over(&staged.0, &names, &unowned.0, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(unowned.0.join("data.csv")).unwrap(),
+            "a,b"
+        );
     }
 
     #[test]

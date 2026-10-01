@@ -299,6 +299,14 @@ impl Commands {
         self
     }
 
+    /// Has the consents look at what an agent's new state owes, as an
+    /// approved task waiting for its paused agent.
+    fn wake_consents(&self) {
+        if let Some(consents) = &self.consents {
+            consents.wake();
+        }
+    }
+
     /// These commands, creating and deleting agents on Slack through
     /// `agents`.
     #[must_use]

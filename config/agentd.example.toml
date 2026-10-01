@@ -104,9 +104,9 @@ thread_turns_per_hour = 30
 # DMs aren't capped either. 0 means no budget. Default 2000000.
 thread_tokens_per_day = 2000000
 
-# How long a private task's consent card (`agentctl private`, asked by
-# someone other than the agent's owner, or in the owner's name through
-# another agent's message) waits for the owner's Approve or Decline before
+# How long a private task's consent card (`agentctl private`, asked for
+# anywhere but the owner's own one-to-one DM with the agent) waits for the
+# owner's Approve or Decline before
 # it expires and the thread is told, in seconds. An approved task of a
 # paused agent waits as long for the agent to be resumed. From 1 to
 # 2592000 (30 days). Default 86400, a day.

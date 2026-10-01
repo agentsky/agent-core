@@ -14,9 +14,10 @@
 -- consent card, `approved`, `declined`, or `expired` once `expires_at`
 -- passed unanswered or the card couldn't reach the owner. `approval` says
 -- how an approved consent was approved: `asked` at once, because the owner
--- asked for it at hop 0 (so never at a later hop), or `card` by the owner
--- on the consent card. `decided_by` is the identity that decided, a member
--- key's string form (none for an expiry), and `decided_at` when.
+-- asked for it in their own DM with the agent (a turn at hop 0, so never at
+-- a later hop), or `card` by the owner on the consent card. `decided_by`
+-- is the identity that decided, a member key's string form (none for an
+-- expiry), and `decided_at` when.
 --
 -- The card is sent at least once, retried until the consent expires, like
 -- the relink notices: `card_attempts` counts claims and

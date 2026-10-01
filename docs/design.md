@@ -314,7 +314,7 @@ So a turn always runs on the credential of the person who caused it.
 | Who starts the turn | Where | Runs on | What the agent can touch |
 | --- | --- | --- | --- |
 | The owner, in a DM | DM | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
-| The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests runs without a consent card when the owner's own message started the turn, and needs one when another agent's message did (see below) |
+| The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests needs a consent card, as from anyone outside the owner's own DM (see below) |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
 | A private task requested during a non-owner's turn | Owner's private sandbox | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
 | Unlinked member | Channel | Community API key if configured, otherwise a "link your account" DM from the manager bot | Public side only |
@@ -350,7 +350,7 @@ and outlast Claude Code's Bash tool timeout (2 minutes by default, with a
 flowchart TD
     T["Channel turn running"] --> R["Agent runs agentctl private 'task text'"]
     R --> ID["agentctl returns a consent id at once.<br/>The turn tells the thread<br/>it asked the owner, then ends"]
-    ID --> O{"The owner's own message<br/>started the turn (hop 0)?"}
+    ID --> O{"Asked in the owner's own<br/>one-to-one DM with the agent?"}
     O -- yes --> RUN["Fresh session in the<br/>owner's private sandbox"]
     O -- no --> CN["Consent card to owner<br/>shows the exact task text"]
     CN -- approved --> RUN
@@ -358,16 +358,18 @@ flowchart TD
     RUN --> RES["agentd posts the reply and<br/>attached files to the thread<br/>as a new agent message"]
 ```
 
-- The same asynchronous path serves the owner as requester, with no consent
-  card, when the owner's own message started the turn (hop 0). A long private
-  task would otherwise hold the channel turn the same way. A hop turn inherits
-  its requester from another agent's post, which the owner may never have seen
-  and whose text another member's agent may have written, so a task asked for
-  in it waits for a consent card even when that requester is the owner. The
-  card says it was asked for at a hop, and that approving it runs the task on
-  the owner's side. The task runs on the owner's side only when the owner asked
-  at hop 0 or approved the card of a task their own identity asked for, never
-  because of who the requester is alone.
+- The same asynchronous path serves the owner, with no consent card, only for
+  a task asked for in the owner's own one-to-one DM with the agent, the one
+  turn that already runs on the owner's side. A long private task would
+  otherwise hold that turn the same way. Everywhere else a card is sent even
+  when the owner is the requester: a channel or group-DM turn reads the
+  thread's history, which any member can write into, so its text may have
+  steered the request; and a hop turn inherits its requester from another
+  agent's post, which the owner may never have seen. The owner's card says
+  that approving runs the task on the owner's side, and when it was asked for
+  at a hop. The task runs on the owner's side only when the owner asked in
+  their own DM or approved the card of a task their own identity asked for,
+  never because of who the requester is alone.
 - Each agent, and each requester with an agent, may have only a few consents
   waiting or running at once, and a task is handed at most one attachment's
   worth of files in all, so neither the files held for consents nor the cards
@@ -382,7 +384,10 @@ flowchart TD
   cannot read the owner's DM transcript and does not add to it.
 - What crosses into the private turn is only the task text shown on the consent
   card and files the channel turn attached explicitly. The channel thread's
-  transcript does not cross.
+  transcript does not cross. The card names the files but doesn't show their
+  contents, and their contents can direct the task like its text, so the card
+  says so. A task with control or invisible characters, which the card
+  wouldn't show, is refused when it is asked for.
 - What comes back is only the private turn's final reply and files it attached.
   agentd posts them to the thread as a new agent message whose `MESSAGE_REF` is
   attributed to the original requester and hop count, and names the consent.
@@ -390,10 +395,13 @@ flowchart TD
   unattributed, so private context cannot reach another agent through the
   thread either, and no hop chains on the owner's credential from it.
 - A private task is run again after a failure only if no turn of it reached
-  the model; otherwise the thread is told it was interrupted. Its container is
-  stopped as soon as its turn ends, however the task ends, and its session's
-  directory is deleted once the result is posted. The thread's caps apply to
-  it as to any turn outside a DM.
+  the model; otherwise the thread is told it was interrupted, unless its result
+  was already posted. Its container is stopped as soon as its turn ends. A
+  task cut short by a shutdown or taken over by another instance has its
+  container killed, so its turn ends as a crash, which is billed to the owner
+  like any other. Its session's directory is deleted once the consent's work
+  is finished, however it finished. The thread's caps apply to it as to any
+  turn outside a DM.
 - Inside a private task, `agentctl` offers only `attach`. `ask-agent` and
   `private` are refused, so private context cannot flow to other agents and no
   hops can chain on the owner's credential.
@@ -622,7 +630,7 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
 | `agentctl lock -- <command>` | Run a command while holding the scope's `shared/` lock, for writes to `shared/`. A second `lock`, from any session of the scope, waits |
 | `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
-| `agentctl private [--file <path>]... <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless the owner is this turn's requester. `--file` hands the task a file from the calling session's directory, copied into its working directory. agentd posts the result to the thread when the task finishes. Refused inside a private task |
+| `agentctl private [--file <path>]... <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless this turn is the owner's own DM with the agent. `--file` hands the task a file from the calling session's directory, copied into its working directory. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
 An agent's skills are directories in agentd's data directory,
 `skills/<agent>/<name>/`, which every session of the agent mounts read-only
@@ -851,7 +859,7 @@ for Rocket.Chat bindings.
 
 | Threat | Mitigation |
 | --- | --- |
-| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and for non-owners, or for the owner reached through another agent's message, only after a consent card. Persona prompt treats others' text as data. |
+| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and only after a consent card unless the owner asked for it in their own one-to-one DM with the agent: a channel or group-DM turn reads text anyone can write, even when the owner started it. Persona prompt treats others' text as data. |
 | Leaked placeholder token | One per CLI process and container, bound to the container's network identity, revoked when the container is reaped, swapped only for the configured upstream header of its own kind. |
 | One session reads another session's placeholder or `agentctl` token | One container per session, so sessions share neither a PID namespace nor process environments. Tokens are bound to their container. |
 | One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. |

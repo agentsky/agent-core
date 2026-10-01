@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 use time::macros::format_description;
 
 use crate::commands::Rich;
+use crate::commands::reply::MAX_NAME_CHARS;
 
 /// The `block_id` of a Slack consent card's buttons.
 pub const BLOCK_ID: &str = "consent";
@@ -108,19 +109,32 @@ pub struct Card<'a> {
     pub owners: bool,
     /// Whether the agent is paused, so an approved task waits for it.
     pub paused: bool,
+    /// The surface the card is shown on: the owner's identity it goes to.
+    pub surface: SurfaceKind,
+    /// The requester's name on their surface, when it could be looked up.
+    pub requester_name: Option<&'a str>,
 }
 
 impl Card<'_> {
-    /// Whether the card fits where it is shown, before it is asked for: on
-    /// Slack each block's text within [`SLACK_TEXT_MAX`] UTF-16 code units,
-    /// and on Rocket.Chat the whole card, as the surface renders it, in
-    /// one message of the server's default limit.
+    /// Whether the card fits wherever it may be shown, before it is asked
+    /// for, in its longest form (for a paused agent): on Slack each block's
+    /// text within [`SLACK_TEXT_MAX`] UTF-16 code units, and on
+    /// Rocket.Chat the whole card, as the surface renders it, in one
+    /// message of the server's default limit. The requester's name, looked
+    /// up only when the card is sent, is counted at its longest.
     ///
     /// # Errors
     ///
     /// What is too long, to tell the agent.
     pub fn check(&self) -> Result<(), String> {
-        let open = self.open();
+        let name = "\u{1D54E}".repeat(MAX_NAME_CHARS);
+        let longest = |surface| Card {
+            surface,
+            paused: true,
+            requester_name: Some(&name),
+            ..self.clone()
+        };
+        let open = longest(SurfaceKind::Slack).open();
         let texts = open
             .blocks
             .as_ref()
@@ -137,7 +151,8 @@ impl Card<'_> {
                  code units, more than a consent card holds"
             ));
         }
-        let rendered = render::rocketchat::to_markdown(&open.markdown, &NoDirectory);
+        let markdown = longest(SurfaceKind::RocketChat).open().markdown;
+        let rendered = render::rocketchat::to_markdown(&markdown, &NoDirectory);
         if utf16_len(&rendered) > render::rocketchat::DEFAULT_MESSAGE_LIMIT.max {
             return Err(
                 "the task and its files' names are too long for one consent card message; \
@@ -204,11 +219,19 @@ impl Card<'_> {
         format!("Private task request for {}", self.agent)
     }
 
+    /// Who asked: a mention on Slack for someone on Slack, which Slack
+    /// shows as their name, and otherwise their name, or else their id, as
+    /// code, with their surface when it isn't the card's.
     fn requester(&self) -> String {
         let key = &self.consent.requester.key;
-        match key.surface {
-            SurfaceKind::Slack => format!("<@{}>", key.user),
-            SurfaceKind::RocketChat => inline_code(key.user.as_str()),
+        if key.surface == self.surface && key.surface == SurfaceKind::Slack {
+            return format!("<@{}>", key.user);
+        }
+        let name = inline_code(self.requester_name.unwrap_or(key.user.as_str()));
+        if key.surface == self.surface {
+            name
+        } else {
+            format!("{name} on {}", surface_name(key.surface))
         }
     }
 
@@ -218,7 +241,7 @@ impl Card<'_> {
             "{bold}Private task request{bold} for *{}* from {}, in {}.",
             self.agent,
             self.requester(),
-            place(&self.consent.thread),
+            place(&self.consent.thread, self.surface),
         );
         let hop = self.consent.hop.0;
         if hop > 0 {
@@ -226,6 +249,11 @@ impl Card<'_> {
                 " It was asked for in a turn another agent's message started (hop {hop}), so \
                  its text may not be what the requester wrote."
             ));
+        } else if self.owners {
+            text.push_str(
+                " You asked for it outside your own DM with the agent, so others' messages in \
+                 the thread may have steered it.",
+            );
         }
         if self.paused {
             text.push_str(&format!(
@@ -307,14 +335,16 @@ impl Card<'_> {
 /// What approving a task someone other than the owner asked for means.
 const TERMS: &str = "If you approve, it runs once in a new private session on your Claude \
      account. It can read your agent's shared files but not change them, and doesn't see its \
-     memory. Only its reply and the files it attaches are posted to the thread.";
+     memory. The files handed to it aren't shown here, and their contents can direct it like \
+     its text. Only its reply and the files it attaches are posted to the thread.";
 
-/// What approving a task the owner asked for, in a turn another agent's
-/// message started, means.
+/// What approving a task the owner's identity asked for, outside the
+/// owner's own DM with the agent, means.
 const OWNER_TERMS: &str = "If you approve, it runs once in a new private session on your \
      Claude account, on your side: it can read and change your agent's shared files and its \
-     memory. Only its reply and the files it attaches are posted to the thread, where everyone \
-     in it can read them.";
+     memory. The files handed to it aren't shown here, and their contents can direct it like \
+     its text. Only its reply and the files it attaches are posted to the thread, where \
+     everyone in it can read them.";
 
 /// The text objects of a Slack block.
 fn block_texts(block: &Value) -> Vec<&str> {
@@ -364,25 +394,47 @@ fn button(text: &str, action: &str, style: &str, id: ConsentId) -> Value {
     })
 }
 
-/// How the card names the thread the task was asked for in: on Slack a
-/// link to it, elsewhere its room and thread ids.
-fn place(thread: &ThreadKey) -> String {
+/// How a card shown on `surface` names the thread the task was asked for
+/// in: a link to it on Slack, and otherwise its conversation and thread
+/// ids, naming its surface when it isn't the card's.
+fn place(thread: &ThreadKey, surface: SurfaceKind) -> String {
     let conv = &thread.conv;
-    match conv.surface {
-        SurfaceKind::Slack => match surface_slack::surface::thread_link(thread) {
-            Some(link) if thread.root.is_some() => {
-                format!("<#{}> (<{link}|the thread>)", conv.conversation)
+    let link = surface_slack::surface::thread_link(thread).filter(|_| thread.root.is_some());
+    match (conv.surface, surface) {
+        (SurfaceKind::Slack, SurfaceKind::Slack) => match link {
+            Some(link) => format!("<#{}> (<{link}|the thread>)", conv.conversation),
+            None => format!("<#{}>", conv.conversation),
+        },
+        (SurfaceKind::Slack, SurfaceKind::RocketChat) => {
+            let channel = format!("Slack channel {}", inline_code(conv.conversation.as_str()));
+            match link {
+                Some(link) => format!("{channel} ([the thread]({link}))"),
+                None => channel,
             }
-            _ => format!("<#{}>", conv.conversation),
-        },
-        SurfaceKind::RocketChat => match &thread.root {
-            Some(root) => format!(
-                "room {}, thread {}",
-                inline_code(conv.conversation.as_str()),
-                inline_code(root.as_str())
-            ),
-            None => format!("room {}", inline_code(conv.conversation.as_str())),
-        },
+        }
+        (SurfaceKind::RocketChat, _) => {
+            let label = if surface == SurfaceKind::RocketChat {
+                "room"
+            } else {
+                "Rocket.Chat room"
+            };
+            match &thread.root {
+                Some(root) => format!(
+                    "{label} {}, thread {}",
+                    inline_code(conv.conversation.as_str()),
+                    inline_code(root.as_str())
+                ),
+                None => format!("{label} {}", inline_code(conv.conversation.as_str())),
+            }
+        }
+    }
+}
+
+/// A surface's name, as people know it.
+fn surface_name(surface: SurfaceKind) -> &'static str {
+    match surface {
+        SurfaceKind::Slack => "Slack",
+        SurfaceKind::RocketChat => "Rocket.Chat",
     }
 }
 
@@ -461,6 +513,8 @@ mod tests {
             files: &files,
             owners: false,
             paused: false,
+            surface: consent.thread.conv.surface,
+            requester_name: None,
         };
         let open = card.open();
         let blocks = open.blocks.unwrap();
@@ -492,6 +546,8 @@ mod tests {
             files: &files,
             owners: false,
             paused: false,
+            surface: consent.thread.conv.surface,
+            requester_name: None,
         }
         .closed();
         let text = closed.blocks.unwrap().to_string();
@@ -536,6 +592,8 @@ mod tests {
                 files: &[],
                 owners: false,
                 paused: false,
+                surface: consent.thread.conv.surface,
+                requester_name: None,
             }
             .open();
             let block = rocketchat_code_block(&card.markdown)
@@ -561,6 +619,8 @@ mod tests {
             files: &[],
             owners: false,
             paused: false,
+            surface: consent.thread.conv.surface,
+            requester_name: None,
         }
         .open();
         assert!(card.markdown.contains("room `C0CHAN001`, thread"));
@@ -578,6 +638,8 @@ mod tests {
             files: &files,
             owners: true,
             paused: true,
+            surface: consent.thread.conv.surface,
+            requester_name: None,
         }
         .open();
         assert!(
@@ -604,6 +666,53 @@ mod tests {
     }
 
     #[test]
+    fn a_card_names_the_requester_and_thread_for_the_surface_it_is_shown_on() {
+        let slack = consent(SurfaceKind::Slack, "x");
+        let on_rocketchat = Card {
+            consent: &slack,
+            agent: "helper",
+            files: &[],
+            owners: false,
+            paused: false,
+            surface: SurfaceKind::RocketChat,
+            requester_name: Some("bob.smith"),
+        }
+        .open()
+        .markdown;
+        assert!(
+            on_rocketchat.contains("from `bob.smith` on Slack, in Slack channel `C0CHAN001` ([the thread](https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/"),
+            "{on_rocketchat}"
+        );
+        assert!(!on_rocketchat.contains("<@"), "{on_rocketchat}");
+
+        let rocketchat = consent(SurfaceKind::RocketChat, "x");
+        let card = |surface, requester_name| {
+            Card {
+                consent: &rocketchat,
+                agent: "helper",
+                files: &[],
+                owners: false,
+                paused: false,
+                surface,
+                requester_name,
+            }
+            .open()
+        };
+        let named = card(SurfaceKind::RocketChat, Some("bob")).markdown;
+        assert!(named.contains("from `bob`, in room `C0CHAN001`"), "{named}");
+        let unnamed = card(SurfaceKind::RocketChat, None).markdown;
+        assert!(unnamed.contains("from `U0BOB`, in room"), "{unnamed}");
+        let on_slack = card(SurfaceKind::Slack, Some("bob"))
+            .blocks
+            .unwrap()
+            .to_string();
+        assert!(
+            on_slack.contains("from `bob` on Rocket.Chat, in Rocket.Chat room `C0CHAN001`"),
+            "{on_slack}"
+        );
+    }
+
+    #[test]
     fn a_card_that_wouldnt_fit_one_message_is_refused() {
         let card = |task: &str, files: &[String]| {
             let consent = consent(SurfaceKind::Slack, task);
@@ -613,6 +722,8 @@ mod tests {
                 files,
                 owners: false,
                 paused: false,
+                surface: consent.thread.conv.surface,
+                requester_name: None,
             }
             .check()
         };

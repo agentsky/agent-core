@@ -42,7 +42,21 @@ pub trait OpenDm: Send + Sync {
     /// The room of the manager bot's DM with `member`, opened if there is
     /// none yet. `member` is on the manager bot's surface and team.
     async fn open_dm(&self, member: &MemberKey) -> Result<ConversationId, SurfaceError>;
+
+    /// The name `member` goes by on the manager bot's surface, which people
+    /// there know them by. `member` is on the manager bot's surface and
+    /// team.
+    ///
+    /// # Errors
+    ///
+    /// If it can't be looked up; by default it never can.
+    async fn name_of(&self, _member: &MemberKey) -> Result<String, SurfaceError> {
+        Err(SurfaceError::Unsupported("looking up a member's name"))
+    }
 }
+
+/// The longest name [`Replies::name_of`] gives, in characters.
+pub const MAX_NAME_CHARS: usize = 80;
 
 /// The manager bot on one surface and team: who posts private replies there.
 pub struct ManagerBot {
@@ -224,6 +238,28 @@ impl Replies {
             slack.client.respond_ephemeral(response_url, &chunk).await?;
         }
         Ok(())
+    }
+
+    /// The name `member` goes by on their surface, looked up by the manager
+    /// bot that serves their surface and team, without control or
+    /// invisible characters and at most [`MAX_NAME_CHARS`] long. `None` when
+    /// no manager bot serves them or the lookup fails.
+    pub async fn name_of(&self, member: &MemberKey) -> Option<String> {
+        let bot = self.bot_for(member).ok()?;
+        match bot.dms.name_of(member).await {
+            Ok(name) => {
+                let name: String = name
+                    .chars()
+                    .filter(|c| !c.is_control() && !crate::ctl::is_invisible(*c))
+                    .take(MAX_NAME_CHARS)
+                    .collect();
+                (!name.trim().is_empty()).then_some(name)
+            }
+            Err(err) => {
+                tracing::debug!(member = %member, error = %err, "couldn't look up a member's name");
+                None
+            }
+        }
     }
 
     /// Whether a manager bot can DM `member`.

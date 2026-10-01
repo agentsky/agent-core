@@ -3,20 +3,22 @@
 //!
 //! [`Consents::request`] records a consent for a channel turn's task and
 //! copies the files the turn named into `consents/<id>/` under the data
-//! directory. A task the owner asked for themselves, at hop 0, is approved
-//! at once. Any other, a task the owner's identity asked for in a turn
-//! another agent's message started included, waits for the owner, who
-//! gets a consent card from the manager bot ([`Consents::send_cards`]) and
-//! answers it with its buttons on Slack or `approve <id>` and
-//! `decline <id>` anywhere ([`Consents::decide`]). Only the owner, by any
-//! identity of theirs, can decide. A card nobody answers within
-//! `[limits] consent_ttl_secs` expires ([`Consents::expire`]), as does one
-//! that can't reach the owner, or whose agent was deleted, and a decided
-//! card is updated with the outcome ([`Consents::close_cards`]).
+//! directory. A task the owner asked for in their own DM with the agent,
+//! on the owner's side, is approved at once. Any other waits for the owner,
+//! a task the owner asked for in a channel or group DM included, since
+//! others' messages there reach the turn that asked: the owner gets a
+//! consent card from the manager bot ([`Consents::send_cards`]) and answers
+//! it with its buttons on Slack or `approve <id>` and `decline <id>`
+//! anywhere ([`Consents::decide`]). Only the owner, by any identity of
+//! theirs, can decide. A card nobody answers within `[limits]
+//! consent_ttl_secs` expires ([`Consents::expire`]), as does one too long
+//! for one message or whose agent was deleted, and a decided card is
+//! updated with the outcome ([`Consents::close_cards`]).
 //!
-//! Each agent may have [`MAX_OPEN_PER_AGENT`] consents unfinished, and each
-//! requester [`MAX_OPEN_PER_REQUESTER`] of them, so the files they hold and
-//! the cards the owner gets stay bounded.
+//! Each requester may have [`MAX_OPEN_PER_REQUESTER`] consents of an agent
+//! unfinished, and everyone but the owner [`MAX_OPEN_PER_AGENT`] together,
+//! so the files they hold and the cards the owner gets stay bounded and
+//! others can't use up the owner's own.
 //!
 //! Everything a consent owes lives in the `consents` table, so it survives
 //! restarts and each part is done by one instance at a time: the card is
@@ -35,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use core_types::{ConsentId, Hop, MemberKey, PrivateRequest};
+use core_types::{ConsentId, MemberKey, PrivateRequest, SessionId, Side, VolumeKey};
 use store::{
     AgentState, Consent, ConsentState, CtlToken, CtlTurn, NewConsent, OpenLimits, Store, StoreError,
 };
@@ -46,7 +48,7 @@ pub use card::Card;
 pub use staging::StageError;
 
 use crate::commands::{Replies, ReplyError};
-use crate::ctl::{create_private_dir, remove_dir};
+use crate::ctl::{create_private_dir, is_invisible, remove_dir};
 use crate::pipeline::Pipeline;
 
 /// The directory under the data directory where consents' files wait.
@@ -56,7 +58,8 @@ pub const CONSENTS_DIR: &str = "consents";
 pub const MAX_TASK_LEN: usize = card::SLACK_TEXT_MAX;
 /// The most files one private task may be handed.
 pub const MAX_FILES: usize = 10;
-/// The most consents one agent may have unfinished at once.
+/// The most consents one agent may have unfinished at once that anyone but
+/// its owner asked for.
 pub const MAX_OPEN_PER_AGENT: u32 = 10;
 /// The most consents one requester's identity may have unfinished at once
 /// with one agent.
@@ -208,14 +211,16 @@ impl Consents {
     /// Records a consent for `request`, asked for in `turn` by the process
     /// `token` was issued to, copying the files it names from that
     /// process's session directory. The consent is approved at once when
-    /// the agent's owner asked for it in a turn at hop 0, a message of
-    /// their own, and waits for the owner otherwise: a hop's requester is
-    /// inherited from another agent's post, which the owner may never
-    /// have seen.
+    /// the agent's owner asked for it in their own DM with the agent, the
+    /// one turn on the owner's side, whose context is the owner's own
+    /// words. It waits for the owner otherwise: in a channel or group DM
+    /// the turn reads others' messages, and a hop's requester is inherited
+    /// from another agent's post.
     ///
     /// # Errors
     ///
-    /// [`RequestError::BadRequest`] for an empty or long task, too many
+    /// [`RequestError::BadRequest`] for an empty or long task, one with
+    /// control or invisible characters the card wouldn't show, too many
     /// files or a card too long for one message, [`RequestError::Stage`]
     /// for a file that can't be handed over, [`RequestError::Inactive`]
     /// for an agent that isn't active, [`RequestError::TooMany`] past the
@@ -236,6 +241,17 @@ impl Consents {
                  as two"
             )));
         }
+        if request
+            .task
+            .chars()
+            .any(|c| (c.is_control() && c != '\n' && c != '\t') || is_invisible(c))
+        {
+            return Err(RequestError::BadRequest(
+                "the task has control or invisible characters, which the owner's card wouldn't \
+                 show"
+                    .to_owned(),
+            ));
+        }
         if request.files.len() > MAX_FILES {
             return Err(RequestError::BadRequest(format!(
                 "a private task can be handed at most {MAX_FILES} files"
@@ -247,6 +263,12 @@ impl Consents {
             .await?
             .filter(|agent| agent.state == AgentState::Active)
             .ok_or(RequestError::Inactive)?;
+        if !store
+            .consent_room(agent.id, &turn.requester, OPEN_LIMITS)
+            .await?
+        {
+            return Err(RequestError::TooMany);
+        }
         let id = ConsentId::new_v4();
         let dir = self.dir_of(id);
         let names = match self.stage(token, &request.files, &dir).await {
@@ -259,7 +281,7 @@ impl Consents {
         let attachments_json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned());
         let now = Self::now();
         let owners = turn.requester.member == Some(agent.owner);
-        let asked = owners && turn.hop == Hop::ZERO;
+        let asked = owners && turn.side == Side::Owner;
         let new = NewConsent {
             id,
             agent: agent.id,
@@ -279,6 +301,8 @@ impl Consents {
             files: &names,
             owners,
             paused: false,
+            surface: turn.thread.conv.surface,
+            requester_name: None,
         }
         .check();
         let created = match fits {
@@ -306,6 +330,16 @@ impl Consents {
         Ok(id)
     }
 
+    /// The directory of session `session` on volume `volume`.
+    pub(crate) fn session_dir(&self, volume: &VolumeKey, session: SessionId) -> PathBuf {
+        self.inner
+            .settings
+            .data_dir
+            .join(sandbox::volume_rel_path(volume))
+            .join("sessions")
+            .join(session.to_string())
+    }
+
     /// Copies `files` from `token`'s session directory into `dir`.
     async fn stage(
         &self,
@@ -313,13 +347,7 @@ impl Consents {
         files: &[String],
         dir: &Path,
     ) -> Result<Vec<String>, RequestError> {
-        let session_dir = self
-            .inner
-            .settings
-            .data_dir
-            .join(sandbox::volume_rel_path(&token.volume))
-            .join("sessions")
-            .join(token.session.to_string());
+        let session_dir = self.session_dir(&token.volume, token.session);
         let files = files.to_vec();
         let dir = dir.to_owned();
         let cap = self.inner.settings.attach_max_bytes;
@@ -394,11 +422,12 @@ impl Consents {
     /// Sends the cards owed, through `replies`, and returns how many were
     /// sent. A card goes to the owner's identity in the task's workspace,
     /// or else any a manager bot reaches, and says so when the agent is
-    /// paused. A card that fails is tried again after [`CARD_RETRY`],
-    /// doubling up to [`CARD_RETRY_MAX`], until the consent expires. A
-    /// consent whose card can't reach the owner, because no manager bot
-    /// reaches any identity of theirs or the card won't fit one message,
-    /// expires at once, and so does one whose agent was deleted.
+    /// paused. A card that fails, or that no manager bot of this instance
+    /// can send (another instance's may), is tried again after
+    /// [`CARD_RETRY`], doubling up to [`CARD_RETRY_MAX`], until the consent
+    /// expires; the thread is then told the card couldn't reach the owner.
+    /// A consent whose card won't fit one message expires at once. A
+    /// deleted agent's consents are left to [`expire`](Self::expire).
     ///
     /// # Errors
     ///
@@ -412,22 +441,6 @@ impl Consents {
                 .await?
                 .filter(|agent| agent.state != AgentState::Deleted)
             else {
-                self.unreachable(&consent, "its agent was deleted").await?;
-                continue;
-            };
-            let identities = store.member_identities(agent.owner).await?;
-            let reachable = |key: &&MemberKey| replies.can_dm(key);
-            let Some(owner) = identities
-                .iter()
-                .filter(reachable)
-                .find(|key| {
-                    key.surface == consent.thread.conv.surface
-                        && key.team == consent.thread.conv.team
-                })
-                .or_else(|| identities.iter().find(reachable))
-            else {
-                self.unreachable(&consent, "no manager bot reaches the owner")
-                    .await?;
                 continue;
             };
             let now = Self::now();
@@ -437,16 +450,21 @@ impl Consents {
             else {
                 continue;
             };
-            let files = attachments(&consent);
-            let card = Card {
-                consent: &consent,
-                agent: &agent.name,
-                files: &files,
-                owners: consent.requester.member == Some(agent.owner),
-                paused: agent.state == AgentState::Paused,
-            }
-            .open();
-            match replies.dm_rich(owner, &card).await {
+            let identities = store.member_identities(agent.owner).await?;
+            let reachable = |key: &&MemberKey| replies.can_dm(key);
+            let owner = identities
+                .iter()
+                .filter(reachable)
+                .find(|key| {
+                    key.surface == consent.thread.conv.surface
+                        && key.team == consent.thread.conv.team
+                })
+                .or_else(|| identities.iter().find(reachable));
+            let sent_to = match owner {
+                Some(owner) => self.send_card(replies, &consent, &agent, owner).await,
+                None => Err(ReplyError::NoManagerBot(consent.thread.conv.surface)),
+            };
+            match sent_to {
                 Ok(posted) => {
                     record_card(store, consent.id, &posted).await?;
                     tracing::info!(consent = %consent.id, "sent a consent card to the owner");
@@ -466,6 +484,30 @@ impl Consents {
             }
         }
         Ok(sent)
+    }
+
+    /// Sends `consent`'s card, for its agent `agent`, to `owner` through
+    /// `replies`, naming the requester as they are known on their surface.
+    async fn send_card(
+        &self,
+        replies: &Replies,
+        consent: &Consent,
+        agent: &store::Agent,
+        owner: &MemberKey,
+    ) -> Result<core_types::MsgRef, ReplyError> {
+        let name = replies.name_of(&consent.requester.key).await;
+        let files = attachments(consent);
+        let card = Card {
+            consent,
+            agent: &agent.name,
+            files: &files,
+            owners: consent.requester.member == Some(agent.owner),
+            paused: agent.state == AgentState::Paused,
+            surface: owner.surface,
+            requester_name: name.as_deref(),
+        }
+        .open();
+        replies.dm_rich(owner, &card).await
     }
 
     /// Expires `consent` at once, before its card reached the owner, for
@@ -505,6 +547,7 @@ impl Consents {
             }
             let agent = store.agent(consent.agent).await?;
             let files = attachments(&consent);
+            let name = replies.name_of(&consent.requester.key).await;
             let card = Card {
                 consent: &consent,
                 agent: agent.as_ref().map_or("this agent", |agent| &agent.name),
@@ -513,6 +556,8 @@ impl Consents {
                     .as_ref()
                     .is_some_and(|agent| consent.requester.member == Some(agent.owner)),
                 paused: false,
+                surface: posted.conv.surface,
+                requester_name: name.as_deref(),
             }
             .closed();
             match replies.update_rich(&posted, &card).await {
@@ -527,7 +572,7 @@ impl Consents {
 
     /// Copies the files consent `consent` was handed into `work`, a new
     /// session's working directory, giving them to `owner`, the uid and gid
-    /// agents run as.
+    /// agents run as, when the sandbox runs them as one.
     ///
     /// # Errors
     ///
@@ -536,7 +581,7 @@ impl Consents {
         &self,
         consent: &Consent,
         work: PathBuf,
-        owner: (u32, u32),
+        owner: Option<(u32, u32)>,
     ) -> std::io::Result<()> {
         let dir = self.dir_of(consent.id);
         let names = attachments(consent);

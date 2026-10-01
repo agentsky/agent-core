@@ -402,6 +402,7 @@ impl Commands {
             return Ok(no_such_agent(name));
         };
         let changed = self.inner.store.set_agent_paused(agent.id, paused).await?;
+        self.wake_consents();
         tracing::info!(agent = %agent.id, paused, changed, "pausing or resuming an agent");
         Ok(match (paused, changed) {
             (true, true) => format!(
@@ -427,6 +428,7 @@ impl Commands {
             return Ok(no_such_agent(name));
         }
         tracing::info!(agent = %agent.id, "deleted an agent");
+        self.wake_consents();
         if let Some(reply) = self.delete_on_slack(&agent, name, &bindings).await {
             return Ok(reply);
         }
