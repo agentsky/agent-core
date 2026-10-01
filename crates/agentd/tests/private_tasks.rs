@@ -64,12 +64,20 @@ impl SurfaceLookup for Mocks {
         _agent: AgentId,
         _conv: &ConvRef,
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
-        let failed = self
-            .failing
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                left.checked_sub(1)
-            });
-        if failed.is_ok() {
+        let mut left = self.failing.load(Ordering::SeqCst);
+        let failed = loop {
+            let Some(next) = left.checked_sub(1) else {
+                break false;
+            };
+            match self
+                .failing
+                .compare_exchange(left, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break true,
+                Err(now) => left = now,
+            }
+        };
+        if failed {
             return Err(StoreError::Corrupt {
                 table: "agent_bindings",
                 column: "state",

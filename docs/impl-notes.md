@@ -7651,6 +7651,15 @@ reason if it wants one.
   where only some instances reach the owner, one that can may wait up to
   15 minutes for its turn.
 
+### Rust 1.99 deprecates `fetch_update`
+
+- **Issue:** CI's lint jobs install the current stable, and Rust 1.99
+  renamed `AtomicUsize::fetch_update` to `try_update`. A test mock's
+  `fetch_update` then failed clippy's `-D warnings`. `try_update` is newer
+  than the 1.98.1 MSRV, so it can't be used either.
+- **Solution:** the mock decrements with a `compare_exchange` loop, which
+  both toolchains accept. Clippy on 1.99 is otherwise clean.
+
 ## T34: Agent-to-agent hand-off
 
 ### agentd delivers its agents' mentions itself
