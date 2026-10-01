@@ -713,10 +713,12 @@ pub struct AuthTest {
     /// The workspace's name.
     #[serde(default)]
     pub team: Option<String>,
-    /// The workspace. An answer whose `team_id` isn't shaped like a
-    /// workspace's id ([`is_workspace_id`]) doesn't read, so agentd never
-    /// serves a workspace whose id an unreadable team field could match.
-    #[serde(deserialize_with = "workspace_id")]
+    /// The workspace, as Slack wrote it, or an empty id when absent or
+    /// not a string. Not checked here: an organization-wide install
+    /// names its organization (`E…`), and agentd's manager refuses any
+    /// that isn't shaped like a workspace's id ([`is_workspace_id`]) with
+    /// an error that says why.
+    #[serde(default = "no_team", deserialize_with = "team_id_as_written")]
     pub team_id: TeamId,
     /// The token's user: the bot user, for a bot token.
     pub user_id: UserId,
@@ -729,14 +731,24 @@ pub struct AuthTest {
     /// organization's id, is `None`.
     #[serde(default, deserialize_with = "enterprise_id_or_nothing")]
     pub enterprise_id: Option<TeamId>,
+    /// Whether the app is installed organization-wide on Enterprise Grid.
+    /// Anything but `true` is `false`.
+    #[serde(default, deserialize_with = "true_or_false")]
+    pub is_enterprise_install: bool,
 }
 
-/// A string [`is_workspace_id`] accepts, and an error for anything else.
-fn workspace_id<'de, D: Deserializer<'de>>(value: D) -> Result<TeamId, D::Error> {
-    match Value::deserialize(value)? {
-        Value::String(id) if is_workspace_id(&id) => Ok(TeamId::from(id)),
-        _ => Err(serde::de::Error::custom("not a workspace id")),
-    }
+/// The empty id, which no team matches, for an absent `team_id`.
+fn no_team() -> TeamId {
+    TeamId::from(String::new())
+}
+
+/// A string as it is, and an empty id, which no team matches, for anything
+/// else.
+fn team_id_as_written<'de, D: Deserializer<'de>>(value: D) -> Result<TeamId, D::Error> {
+    Ok(match Value::deserialize(value)? {
+        Value::String(id) => TeamId::from(id),
+        _ => TeamId::from(String::new()),
+    })
 }
 
 /// An app configuration token and its refresh token, from

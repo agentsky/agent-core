@@ -510,21 +510,33 @@ async fn a_manager_dm_through_an_installation_elsewhere_is_dropped() {
 
 #[tokio::test]
 async fn agentd_does_not_start_when_auth_test_names_no_workspace() {
-    let slack = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/auth.test"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
+    for (answer, named) in [
+        (
+            json!({"ok": true, "team_id": "E0ORG0001", "enterprise_id": "E0ORG0001", "is_enterprise_install": true, "user_id": "U0MANAGER", "bot_id": "B0MANAGER"}),
+            "an organization-wide install (is_enterprise_install)",
+        ),
+        (
             json!({"ok": true, "team_id": "", "user_id": "U0MANAGER", "bot_id": "B0MANAGER"}),
-        ))
-        .mount(&slack)
-        .await;
-    let err = App::open(config(Some(&slack))).await.unwrap_err();
-    let text = format!("{err:#}");
-    assert!(text.contains("AGENTD_SLACK_MANAGER_BOT_TOKEN"), "{text}");
-    assert!(
-        text.contains("unexpected response from auth.test"),
-        "{text}"
-    );
+            "no workspace",
+        ),
+    ] {
+        let slack = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+            .mount(&slack)
+            .await;
+        let err = App::open(config(Some(&slack))).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("AGENTD_SLACK_MANAGER_BOT_TOKEN"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "auth.test named {named}: install the manager app in each workspace, not organization-wide"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("transport error"), "{text}");
+    }
 }
 
 #[tokio::test]
