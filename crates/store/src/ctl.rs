@@ -269,8 +269,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails.
+    /// [`StoreError::Database`] if the query fails; [`StoreError::Refused`]
+    /// for a turn whose requester is from outside the workspace, whose
+    /// `outside` no column holds yet.
     pub async fn set_ctl_turn(&self, hash: &TokenHash, turn: Option<&CtlTurn>) -> Result<bool> {
+        if let Some(turn) = turn {
+            crate::home_requester(&turn.requester)?;
+        }
         let (kind, consent) = match turn.map(|turn| turn.kind) {
             None => (None, None),
             Some(TurnKind::Normal) => (Some("normal"), None),
@@ -556,6 +561,26 @@ mod tests {
             assert_eq!(stored.turn, Some(turn));
         }
         assert!(store.set_ctl_turn(&new.hash, None).await.unwrap());
+        assert_eq!(
+            store.ctl_token(&new.hash).await.unwrap().unwrap().turn,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_for_an_outside_requester_is_refused() {
+        let store = memory_store().await;
+        let new = new_token(1, SessionId::new_v4());
+        store.put_ctl_token(&new).await.unwrap();
+        let mut outside = turn(TurnKind::Normal, Side::Public);
+        outside.requester.outside = Some(core_types::Outside {
+            team: Some(core_types::TeamId::new("T0THEIRS1")),
+        });
+        let err = store
+            .set_ctl_turn(&new.hash, Some(&outside))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Refused { .. }), "{err:?}");
         assert_eq!(
             store.ctl_token(&new.hash).await.unwrap().unwrap().turn,
             None

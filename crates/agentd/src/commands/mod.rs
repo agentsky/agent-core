@@ -47,11 +47,14 @@
 //! waiting for a used-up quota. It runs in the member's own task of the
 //! [`intake`], never in the Slack queue every app's requests pass through,
 //! so a slow lookup holds up only that member's commands. A sender who
-//! isn't home is dropped. A lookup that couldn't reach Slack, or ran out of
-//! quota, gets [`UNCONFIRMED_TEXT`] in the DM the event named, which opens
-//! nothing; any other failed lookup drops the command with a warning
-//! logged at most once per [`HOME_CHECK_WARNING_INTERVAL`]. Slash commands
-//! and clicks are checked before they get here (`slack::Inbound`).
+//! isn't home is dropped. A lookup that couldn't reach Slack, that Slack
+//! couldn't answer this time, or that ran out of quota, gets
+//! [`UNCONFIRMED_TEXT`] in the DM the event named, which opens nothing; any
+//! other failed lookup drops the command, and the directory logs it as a
+//! warning at most once per
+//! [`LOOKUP_WARNING_INTERVAL`](surface_slack::directory::LOOKUP_WARNING_INTERVAL).
+//! Slash commands and clicks are checked before they get here
+//! (`slack::Inbound`).
 
 mod admin;
 mod agents;
@@ -74,13 +77,11 @@ mod tests;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, CloudCommand, Command, ParseError};
 use core_types::{
     ConsentId, ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceError, SurfaceKind,
-    Throttle,
 };
 use secrecy::SecretString;
 use store::{ConsentState, MemberUsage, Store, StoreError, UsageTotals};
@@ -233,9 +234,6 @@ impl FollowUp {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
-/// How often a manager DM's failed home check is logged at most.
-pub const HOME_CHECK_WARNING_INTERVAL: Duration = Duration::from_secs(60);
-
 /// The reply to a banned member's commands, those that only take
 /// something away aside.
 const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
@@ -264,7 +262,6 @@ struct Inner {
     slack: Option<SlackManager>,
     skills: Skills,
     sessions: Mutex<Option<Weak<dyn SessionControl>>>,
-    home_check_warnings: Throttle,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -306,7 +303,6 @@ impl Commands {
                 slack,
                 skills,
                 sessions: Mutex::new(None),
-                home_check_warnings: Throttle::new(HOME_CHECK_WARNING_INTERVAL),
             }),
             admins: Arc::new([]),
             slack_agents: None,
@@ -438,17 +434,17 @@ impl Commands {
                 false
             }
             Err(err) => {
-                if let Some(quiet) = self.inner.home_check_warnings.record((), Instant::now()) {
-                    tracing::warn!(%member, error = %err, dropped_since_last = quiet, "couldn't check whether a DM command's sender is home; dropped it");
-                }
+                tracing::debug!(%member, error = %err, "couldn't check whether a DM command's sender is home; dropped it");
                 false
             }
         }
     }
 
     /// Runs `command` from `member`, sent with `files` attached, to the
-    /// end, and replies privately.
-    pub async fn dispatch(
+    /// end, and replies privately, skipping the parser and [who may run
+    /// them](self#who-may-run-them): for tests only.
+    #[cfg(test)]
+    pub(crate) async fn dispatch(
         &self,
         member: &MemberKey,
         command: Command,

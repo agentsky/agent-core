@@ -1587,13 +1587,31 @@ async fn a_home_organization_field_with_a_home_lookup_is_home() {
     let mut home = event.clone();
     surface.fill_sender_team(&mut home).await.unwrap();
     assert_eq!(home.outside, None);
-    let mut sibling = event;
+    let mut sibling = event.clone();
     sibling.sender.user = "U0ELSEWHR".into();
     surface.fill_sender_team(&mut sibling).await.unwrap();
     assert_eq!(
         sibling.outside,
         outside_unknown(),
         "another workspace of the organization isn't home"
+    );
+
+    mount_user(
+        &server,
+        "U0GRIDMEM",
+        ok(json!({"user": {
+            "id": "U0GRIDMEM",
+            "team_id": "T0SIBLING",
+            "enterprise_user": {"enterprise_id": HOME_ORG, "teams": ["T0SIBLING", TEAM]},
+        }})),
+    )
+    .await;
+    let mut member_of_both = event;
+    member_of_both.sender.user = "U0GRIDMEM".into();
+    surface.fill_sender_team(&mut member_of_both).await.unwrap();
+    assert_eq!(
+        member_of_both.outside, None,
+        "a Grid member whose workspaces include this one is home"
     );
 }
 
@@ -1604,7 +1622,6 @@ async fn a_home_lookup_slack_refuses_is_outside() {
         ("U0SCOPE01", "missing_scope"),
         ("U0AUTH001", "invalid_auth"),
         ("U0HIDDEN1", "user_not_visible"),
-        ("U0FATAL01", "fatal_error"),
     ] {
         mount_user(&server, user, refused(code)).await;
         let mut event = home_event_from(user);
@@ -1617,8 +1634,101 @@ async fn a_home_lookup_slack_refuses_is_outside() {
     }
     assert_eq!(
         lookups(&server, "users.info").await.len(),
-        8,
+        6,
         "a refusal is no answer and isn't kept"
+    );
+}
+
+#[tokio::test]
+async fn slacks_passing_failures_ask_to_try_again_rather_than_say_outside() {
+    let (server, surface) = setup().await;
+    for (user, code) in [
+        ("U0FATAL01", "fatal_error"),
+        ("U0INTERN1", "internal_error"),
+        ("U0UNAVAIL", "service_unavailable"),
+        ("U0TIMEOUT", "request_timeout"),
+    ] {
+        mount_user(&server, user, refused(code)).await;
+        for _ in 0..2 {
+            let mut event = home_event_from(user);
+            let err = surface.fill_sender_team(&mut event).await.unwrap_err();
+            assert_eq!(err, SurfaceError::Transport(code.to_owned()));
+            assert_eq!(event.outside, None, "{code}: no verdict");
+        }
+    }
+    assert_eq!(
+        lookups(&server, "users.info").await.len(),
+        8,
+        "nothing is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_lookup_that_wont_pass_on_its_own_is_warned_of_once_a_minute() {
+    const WARNED: &str = "T0WARNED1";
+    let logs = testkit::Logs::global();
+    let server = MockServer::start().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let surface = SlackSurface::new(
+        client.bot(SecretString::from(TOKEN)),
+        Arc::new(TeamDirectory::new(WARNED.into())),
+    );
+    let event_from = |user: &str| {
+        let mut event = home_event_from(user);
+        event.sender.team = WARNED.into();
+        event
+    };
+    for user in ["U0SCOPE01", "U0SCOPE02", "U0SCOPE03"] {
+        mount_user(&server, user, refused("missing_scope")).await;
+        let mut event = event_from(user);
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside_unknown());
+    }
+    mount_user(&server, "U0DOWN001", ResponseTemplate::new(503)).await;
+    surface
+        .fill_sender_team(&mut event_from("U0DOWN001"))
+        .await
+        .unwrap_err();
+    let warned = logs
+        .snapshot()
+        .matching("couldn't ask Slack whether a user is home")
+        .matching(WARNED);
+    let lines = warned.to_string();
+    assert_eq!(
+        lines.lines().filter(|line| line.contains("WARN")).count(),
+        1,
+        "{lines}"
+    );
+    assert!(lines.contains("missing_scope"), "{lines}");
+}
+
+#[tokio::test]
+async fn deactivated_members_are_never_home() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "users.list",
+        ok(json!({"members": [
+            {"id": USER, "team_id": TEAM, "name": "ada", "deleted": true},
+        ]})),
+    )
+    .await;
+    surface.refresh_members().await.unwrap();
+    mount_user(
+        &server,
+        USER,
+        ok(json!({"user": {"id": USER, "team_id": TEAM, "deleted": true}})),
+    )
+    .await;
+    for _ in 0..2 {
+        let mut event = home_event_from(USER);
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside_unknown());
+    }
+    assert_eq!(
+        lookups(&server, "users.info").await.len(),
+        1,
+        "the list doesn't vouch for them, and Slack's answer is kept"
     );
 }
 
@@ -1632,7 +1742,6 @@ async fn a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached() {
         ResponseTemplate::new(429).insert_header("retry-after", "30"),
     )
     .await;
-    mount_user(&server, "U0SCOPE01", refused("missing_scope")).await;
     for _ in 0..2 {
         let mut event = home_event_from("U0DOWN001");
         let err = surface.fill_sender_team(&mut event).await.unwrap_err();
@@ -1866,9 +1975,20 @@ async fn conv_info_reads_sharing_and_connected_teams() {
             external(Some(&[])),
         ),
         (
-            json!({"is_ext_shared": "yes", "is_shared": 1, "is_org_shared": null}),
+            json!({"is_ext_shared": "yes", "is_org_shared": null}),
+            ConvKind::Channel,
+            external(None),
+        ),
+        (json!({"is_shared": 1}), ConvKind::Channel, external(None)),
+        (
+            json!({"is_shared": null, "is_ext_shared": null, "is_org_shared": "yes"}),
             ConvKind::Channel,
             Sharing::None,
+        ),
+        (
+            json!({"is_shared": "yes", "is_org_shared": true}),
+            ConvKind::Channel,
+            Sharing::Org,
         ),
         (
             json!({"is_channel": false, "is_mpim": true, "is_ext_shared": true}),

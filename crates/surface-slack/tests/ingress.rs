@@ -193,7 +193,21 @@ impl Harness {
     }
 
     fn with_capacity(secrets: Secrets, dedup: MemoryDedup, capacity: usize) -> Self {
+        Self::serving(secrets, dedup, capacity, None)
+    }
+
+    /// A harness whose queue serves `workspace`, when given.
+    fn serving(
+        secrets: Secrets,
+        dedup: MemoryDedup,
+        capacity: usize,
+        workspace: Option<&str>,
+    ) -> Self {
         let (router, queue) = ingress(Arc::new(secrets), capacity);
+        let queue = match workspace {
+            Some(workspace) => queue.with_workspace(workspace.into(), None),
+            None => queue,
+        };
         let (tx, out) = mpsc::unbounded_channel();
         let dedup = Arc::new(dedup);
         let worker = tokio::spawn(queue.run(dedup.clone(), Sender::new(Collect(tx))));
@@ -2147,4 +2161,37 @@ async fn an_interactions_sender_team_is_its_users_team_id() {
         panic!("expected an interaction");
     };
     assert_eq!(interaction.sender_team, None);
+}
+
+#[tokio::test]
+async fn an_event_installed_elsewhere_takes_no_deduplication_key() {
+    let logs = Logs::global();
+    let mut harness = Harness::serving(secrets(), MemoryDedup::default(), 64, Some(TEAM));
+    let elsewhere = edited(
+        &fixtures::with_event_id(fixtures::MESSAGE_MENTION, "Ev0ELSEWHR"),
+        |body| body["authorizations"][0]["team_id"] = "T0ELSE001".into(),
+    );
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &elsewhere))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_MENTION,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let event = harness.message().await;
+    assert_eq!(
+        event.event_id, "Ev0MENTION1",
+        "the home installation's delivery of the same message is kept"
+    );
+    assert_eq!(event.sender.team.as_str(), TEAM);
+    harness.assert_nothing_delivered().await;
+    logs.snapshot()
+        .matching("installed in another workspace")
+        .matching(&format!("binding={}", agent()))
+        .assert_has("WARN");
 }

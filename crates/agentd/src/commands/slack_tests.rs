@@ -840,7 +840,7 @@ impl Running {
 
     async fn stop(self) {
         drop(self.inbound);
-        tokio::time::timeout(Duration::from_secs(10), self.intake)
+        tokio::time::timeout(Duration::from_secs(20), self.intake)
             .await
             .unwrap()
             .unwrap();
@@ -1095,10 +1095,27 @@ fn only_a_deleted_user_in_a_user_change_has_left() {
     let mut active = left.clone();
     active["user"]["deleted"] = json!(false);
     assert_eq!(member_who_left(&event("user_change", active)), None);
-    let mut nameless = left;
+    let mut nameless = left.clone();
     nameless["user"]["id"] = json!("");
     assert_eq!(member_who_left(&event("user_change", nameless)), None);
     assert_eq!(member_who_left(&event("user_change", json!({}))), None);
+    for team in [
+        json!("T0THEIRS1"),
+        json!("E0HOMEORG"),
+        json!(null),
+        json!(7),
+    ] {
+        let mut elsewhere = left.clone();
+        elsewhere["user"]["team_id"] = team.clone();
+        assert_eq!(
+            member_who_left(&event("user_change", elsewhere)),
+            None,
+            "deactivated in {team}, not here"
+        );
+    }
+    let mut teamless = left;
+    teamless["user"].as_object_mut().unwrap().remove("team_id");
+    assert_eq!(member_who_left(&event("user_change", teamless)), None);
 }
 
 #[tokio::test]
@@ -2134,7 +2151,7 @@ async fn a_teamless_manager_dm_from_outside_never_runs_a_command() {
     assert!(h.calls("conversations.open").await.is_empty());
     let failed = logs
         .snapshot()
-        .matching("couldn't check whether a DM command's sender is home");
+        .matching("couldn't ask Slack whether a user is home");
     assert_eq!(
         failed
             .to_string()
@@ -2194,7 +2211,7 @@ async fn a_manager_dm_lookup_never_holds_up_the_slack_queue() {
     mount_user_info(
         &h,
         "U0SLOW001",
-        user_in("U0SLOW001", TEAM).set_delay(Duration::from_secs(3)),
+        user_in("U0SLOW001", TEAM).set_delay(Duration::from_secs(10)),
     )
     .await;
     let running = Running::start(&h);
@@ -2206,7 +2223,7 @@ async fn a_manager_dm_lookup_never_holds_up_the_slack_queue() {
     );
     answered_marker(&h, &running).await;
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(5),
         "another member's command didn't wait for the slow lookup"
     );
     assert!(
@@ -2364,15 +2381,35 @@ async fn outside_commands_dms_and_clicks_never_run() {
             .collect::<Vec<_>>()
     );
     assert!(
-        !requests
-            .iter()
-            .any(|request| request.url.path() == click_hook || request.url.path() == slash_hook)
-    );
-    assert!(
         h.store
             .member_for_identity(&slack_key("U0OUTSID1"))
             .await
             .unwrap()
             .is_none()
+    );
+
+    let running = Running::start(&h);
+    let (url, home_hook) = h.response_url();
+    running.send(SlackInbound::Command(slash("me", url))).await;
+    running.stop().await;
+    assert!(
+        h.requests()
+            .await
+            .iter()
+            .any(|request| request.url.path() == home_hook),
+        "a slash command naming this workspace runs"
+    );
+    let requests = h.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| [click_hook.as_str(), slash_hook.as_str()].contains(&request.url.path())),
+        "nothing answered the outsider's click or command"
+    );
+    assert!(
+        h.calls("users.info").await.is_empty(),
+        "a slash command carries no sender team and costs no lookup: its guard is \
+         Slack's own rule that only the installing workspace's members run an app's \
+         commands, and its team_id must be this workspace"
     );
 }

@@ -2318,24 +2318,28 @@ impl Turned {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confirm_drops_an_event_that_claims_home_for_an_outside_copy() {
     let turned = Turned::start(&[HELPER]).await;
-    turned
-        .user_info_is(
-            fixtures::OTHER_USER,
-            ok(json!({"user": {"id": fixtures::OTHER_USER, "team_id": fixtures::OUTSIDE_TEAM}})),
-        )
-        .await;
+    for user in [fixtures::OTHER_USER, fixtures::OUTSIDE_USER] {
+        turned
+            .user_info_is(
+                user,
+                ok(json!({"user": {"id": user, "team_id": fixtures::OUTSIDE_TEAM}})),
+            )
+            .await;
+    }
     let text = format!("<@{AGENT_BOT}> what's new?");
     let fields_say = recent_ts(5, 100);
     let lookup_says = recent_ts(5, 200);
-    for (ts, event_id, copy) in [
+    for (ts, user, event_id, copy) in [
         (
             &fields_say,
+            fixtures::OUTSIDE_USER,
             "Ev0FIELDSAY",
-            json!({"ts": fields_say, "user": fixtures::OTHER_USER, "text": text,
+            json!({"ts": fields_say, "user": fixtures::OUTSIDE_USER, "text": text,
                    "team": fixtures::TEAM, "user_team": fixtures::OUTSIDE_TEAM}),
         ),
         (
             &lookup_says,
+            fixtures::OTHER_USER,
             "Ev0LOOKUPSY",
             json!({"ts": lookup_says, "user": fixtures::OTHER_USER, "text": text,
                    "team": fixtures::TEAM, "user_team": fixtures::TEAM}),
@@ -2343,7 +2347,7 @@ async fn confirm_drops_an_event_that_claims_home_for_an_outside_copy() {
     ] {
         turned.slack_has(ts, copy).await;
         let claims_home = message_event(
-            fixtures::OTHER_USER,
+            user,
             ts,
             event_id,
             &text,
@@ -2370,6 +2374,11 @@ async fn confirm_drops_an_event_that_claims_home_for_an_outside_copy() {
         looked_up.len(),
         1,
         "only the copy the fields left home is looked up"
+    );
+    assert!(
+        String::from_utf8_lossy(&looked_up[0].body)
+            .contains(&format!("user={}", fixtures::OTHER_USER)),
+        "the sender looked up is the one the fields left home"
     );
     assert!(turned.requests("users.info", AGENT_TOKEN).await.is_empty());
     turned.stop().await;

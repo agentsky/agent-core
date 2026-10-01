@@ -42,7 +42,9 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
-use crate::normalize::{SlackFile, in_files, is_team_id, team_id_or_nothing};
+use crate::normalize::{
+    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, team_id_or_nothing,
+};
 
 /// The result type of the Web API client.
 pub type Result<T, E = SurfaceError> = std::result::Result<T, E>;
@@ -142,6 +144,15 @@ const APP_GONE_CODES: &[&str] = &["app_not_found", "invalid_app_id"];
 
 /// Error codes of Slack's rate limiter.
 const RATE_LIMITED_CODES: &[&str] = &["ratelimited", "rate_limited"];
+
+/// Error codes with which Slack says it couldn't answer this time, as an
+/// HTTP 5xx would.
+const TRANSIENT_CODES: &[&str] = &[
+    "fatal_error",
+    "internal_error",
+    "request_timeout",
+    "service_unavailable",
+];
 
 /// A Web API method this client calls, with its rate-limit tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -707,9 +718,9 @@ pub struct AuthTest {
     #[serde(default)]
     pub bot_id: Option<String>,
     /// The workspace's Enterprise Grid organization (`E…`), when it is in
-    /// one. Read leniently: absent, or anything but a string shaped like a
-    /// team id, is `None`.
-    #[serde(default, deserialize_with = "team_id_or_nothing")]
+    /// one. Read leniently: absent, or anything but a string shaped like an
+    /// organization's id, is `None`.
+    #[serde(default, deserialize_with = "enterprise_id_or_nothing")]
     pub enterprise_id: Option<TeamId>,
 }
 
@@ -791,16 +802,18 @@ pub struct Conversation {
     #[serde(default)]
     pub is_member: bool,
     /// Whether it is shared with another workspace, of the organization or
-    /// not. Read leniently, as are the other sharing fields: anything but
-    /// `true` is `false`.
-    #[serde(default, deserialize_with = "true_or_false")]
+    /// not. Read leniently, failing closed: anything present but `false` or
+    /// `null` is `true`.
+    #[serde(default, deserialize_with = "true_unless_false")]
     pub is_shared: bool,
     /// Whether it is shared with other workspaces of the workspace's own
-    /// Enterprise Grid organization.
+    /// Enterprise Grid organization. Anything but `true` is `false`, which
+    /// leaves an `is_shared` conversation external.
     #[serde(default, deserialize_with = "true_or_false")]
     pub is_org_shared: bool,
     /// Whether it is shared with another organization (Slack Connect).
-    #[serde(default, deserialize_with = "true_or_false")]
+    /// Read as `is_shared` is.
+    #[serde(default, deserialize_with = "true_unless_false")]
     pub is_ext_shared: bool,
     /// The other organizations it is shared with, Slack's
     /// `connected_team_ids`. `None` when Slack gave none, gave anything but
@@ -837,6 +850,26 @@ fn true_or_false<'de, D: Deserializer<'de>>(value: D) -> Result<bool, D::Error> 
     Ok(Value::deserialize(value)?.as_bool().unwrap_or(false))
 }
 
+/// `false` for a JSON `false` or `null`, and `true` for anything else, for
+/// a flag whose unreadable value must fail closed.
+fn true_unless_false<'de, D: Deserializer<'de>>(value: D) -> Result<bool, D::Error> {
+    Ok(!matches!(
+        Value::deserialize(value)?,
+        Value::Bool(false) | Value::Null
+    ))
+}
+
+/// A string as it is, `None` for `null`, and an empty string, which no
+/// team id matches, for anything else: a team field the home rule reads,
+/// whose unreadable value must name no team of the workspace.
+fn text_or_unreadable<'de, D: Deserializer<'de>>(value: D) -> Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(value)? {
+        Value::Null => None,
+        Value::String(text) => Some(text),
+        _ => Some(String::new()),
+    })
+}
+
 /// A list of at most [`MAX_CONNECTED_TEAMS`] strings each shaped like a
 /// team id, or `None` for anything else.
 fn connected_teams<'de, D: Deserializer<'de>>(value: D) -> Result<Option<Vec<TeamId>>, D::Error> {
@@ -860,6 +893,24 @@ pub struct Profile {
     pub display_name: Option<String>,
     /// The member's full name.
     pub real_name: Option<String>,
+    /// The workspace the profile belongs to, as Slack wrote it, or an empty
+    /// string for a value that isn't a string.
+    #[serde(deserialize_with = "text_or_unreadable")]
+    pub team: Option<String>,
+}
+
+/// What Slack says about an Enterprise Grid member's organization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct EnterpriseUser {
+    /// The organization (`E…`), as Slack wrote it, or an empty string for a
+    /// value that isn't a string.
+    #[serde(deserialize_with = "text_or_unreadable")]
+    pub enterprise_id: Option<String>,
+    /// The organization's workspaces the member belongs to: at most
+    /// [`MAX_CONNECTED_TEAMS`] ids each shaped like a team id, or `None`.
+    #[serde(deserialize_with = "connected_teams")]
+    pub teams: Option<Vec<TeamId>>,
 }
 
 /// A user, from `users.info` or `users.list`.
@@ -883,9 +934,34 @@ pub struct User {
     /// Whether this is a bot user.
     #[serde(default)]
     pub is_bot: bool,
+    /// Whether Slack shows the user as a stranger: someone of another
+    /// organization in a shared channel. Anything present but `false` or
+    /// `null` is `true`.
+    #[serde(default, deserialize_with = "true_unless_false")]
+    pub is_stranger: bool,
     /// The profile.
     #[serde(default)]
     pub profile: Profile,
+    /// The member's Enterprise Grid organization and workspaces, when Slack
+    /// gives them. Anything but an object is an organization no id names.
+    #[serde(default, deserialize_with = "enterprise_user")]
+    pub enterprise_user: Option<EnterpriseUser>,
+}
+
+/// An `enterprise_user` object, `None` for `null`, and for anything else
+/// one whose organization no id names, so it fails the home rule.
+fn enterprise_user<'de, D: Deserializer<'de>>(
+    value: D,
+) -> Result<Option<EnterpriseUser>, D::Error> {
+    Ok(match Value::deserialize(value)? {
+        Value::Null => None,
+        value => Some(
+            EnterpriseUser::deserialize(value).unwrap_or_else(|_| EnterpriseUser {
+                enterprise_id: Some(String::new()),
+                teams: None,
+            }),
+        ),
+    })
 }
 
 /// A bot, from `bots.info`.
@@ -1891,6 +1967,10 @@ fn sanitize_code(code: &str) -> Option<&str> {
 ///   (`channel_not_found`, `message_not_found`, `thread_not_found`,
 ///   `user_not_found`, `bot_not_found`, …) are [`SurfaceError::NotFound`]
 ///   with the code.
+/// - Codes with which Slack says it couldn't answer this time
+///   (`fatal_error`, `internal_error`, `request_timeout`,
+///   `service_unavailable`) are [`SurfaceError::Transport`] with the code,
+///   as an HTTP 5xx is: the caller may try again.
 /// - Anything else is [`SurfaceError::Api`] with the code.
 ///
 /// ```
@@ -1907,6 +1987,10 @@ fn sanitize_code(code: &str) -> Option<&str> {
 ///     SurfaceError::NotFound("channel_not_found".into()),
 /// );
 /// assert_eq!(map_error("msg_too_long", None), SurfaceError::Api("msg_too_long".into()));
+/// assert_eq!(
+///     map_error("fatal_error", None),
+///     SurfaceError::Transport("fatal_error".into()),
+/// );
 /// ```
 pub fn map_error(code: &str, needed: Option<&str>) -> SurfaceError {
     let code = sanitize_code(code).unwrap_or("unknown_error");
@@ -1923,6 +2007,8 @@ pub fn map_error(code: &str, needed: Option<&str>) -> SurfaceError {
         SurfaceError::RateLimited {
             retry_after: DEFAULT_RETRY_WAIT,
         }
+    } else if TRANSIENT_CODES.contains(&code) {
+        SurfaceError::Transport(code.to_owned())
     } else {
         SurfaceError::Api(code.to_owned())
     }

@@ -84,10 +84,13 @@ pub fn routes(app: &App) -> (Router, Queue) {
             .map(|slack| (app.store().clone(), slack.identity().team.clone())),
     );
     let (router, queue) = ingress(Arc::new(secrets), QUEUE_CAPACITY);
-    let queue = queue.with_home_org(
-        app.slack()
-            .and_then(|slack| slack.identity().enterprise.clone()),
-    );
+    let queue = match app.slack() {
+        Some(slack) => queue.with_workspace(
+            slack.identity().team.clone(),
+            slack.identity().enterprise.clone(),
+        ),
+        None => queue,
+    };
     let router = match app.slack_agents() {
         Some(agents) => router.merge(
             Router::new()

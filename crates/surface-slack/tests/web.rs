@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::web::{PageRequest, map_error};
+use surface_slack::web::{EnterpriseUser, PageRequest, map_error};
 use surface_slack::{SlackClient, WebApi};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -139,14 +139,95 @@ async fn auth_test_and_users_info_read_their_teams_leniently() {
             "{enterprise}"
         );
     }
-    let (server, api) = server().await;
+    let (plain, api) = server().await;
     mount(
-        &server,
+        &plain,
         "auth.test",
         ok(json!({"team_id": "T0TEAM001", "user_id": "U0BOT0001"})),
     )
     .await;
     assert_eq!(api.auth_test().await.unwrap().enterprise_id, None);
+    let (teams, api) = server().await;
+    mount(
+        &teams,
+        "auth.test",
+        ok(json!({"team_id": "T0TEAM001", "user_id": "U0BOT0001", "enterprise_id": "T0TEAM001"})),
+    )
+    .await;
+    assert_eq!(
+        api.auth_test().await.unwrap().enterprise_id,
+        None,
+        "an organization's id starts with E"
+    );
+}
+
+#[tokio::test]
+async fn users_info_reads_what_the_home_rule_needs_failing_closed() {
+    let unreadable = || {
+        Some(EnterpriseUser {
+            enterprise_id: Some(String::new()),
+            teams: None,
+        })
+    };
+    for (fields, stranger, profile_team, grid) in [
+        (json!({}), false, None, None),
+        (
+            json!({"is_stranger": true, "profile": {"team": "T0THEIRS1"}}),
+            true,
+            Some("T0THEIRS1"),
+            None,
+        ),
+        (
+            json!({"is_stranger": "yes", "profile": {"team": 7}}),
+            true,
+            Some(""),
+            None,
+        ),
+        (
+            json!({"is_stranger": null, "enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": ["T0TEAM001", "T0SIBLING"]}}),
+            false,
+            None,
+            Some(EnterpriseUser {
+                enterprise_id: Some("E0HOMEORG".into()),
+                teams: Some(vec!["T0TEAM001".into(), "T0SIBLING".into()]),
+            }),
+        ),
+        (
+            json!({"enterprise_user": "E0HOMEORG"}),
+            false,
+            None,
+            unreadable(),
+        ),
+        (
+            json!({"enterprise_user": {"enterprise_id": 7, "teams": ["T0TEAM001"]}}),
+            false,
+            None,
+            Some(EnterpriseUser {
+                enterprise_id: Some(String::new()),
+                teams: Some(vec!["T0TEAM001".into()]),
+            }),
+        ),
+        (
+            json!({"enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": ["bad"]}}),
+            false,
+            None,
+            Some(EnterpriseUser {
+                enterprise_id: Some("E0HOMEORG".into()),
+                teams: None,
+            }),
+        ),
+    ] {
+        let (server, api) = server().await;
+        let mut user = json!({"id": "U0HUMAN01", "team_id": "T0TEAM001"});
+        for (key, value) in fields.as_object().unwrap() {
+            user[key] = value.clone();
+        }
+        mount(&server, "users.info", ok(json!({"user": user}))).await;
+        let user = api.user_info(&"U0HUMAN01".into()).await.unwrap();
+        assert_eq!(user.is_stranger, stranger, "{fields}");
+        assert_eq!(user.profile.team.as_deref(), profile_team, "{fields}");
+        assert_eq!(user.enterprise_user, grid, "{fields}");
+    }
 }
 
 #[tokio::test]

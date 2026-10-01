@@ -405,13 +405,15 @@ impl Store {
     ///
     /// [`StoreError::Database`] if a query fails, as for an id that is
     /// taken, an agent that doesn't exist, or an owner's approval at a hop
-    /// other than 0.
+    /// other than 0. [`StoreError::Refused`] for a requester from outside
+    /// the workspace, whose `outside` no column holds yet.
     pub async fn create_consent(
         &self,
         consent: &NewConsent<'_>,
         limits: OpenLimits,
         now: OffsetDateTime,
     ) -> Result<Option<Consent>> {
+        crate::home_requester(consent.requester)?;
         let (state, approval, decided_by, decided_at) = match consent.approved_by_owner {
             Some(owner) => (
                 ConsentState::Approved,
@@ -1452,6 +1454,38 @@ mod tests {
             )
             .await;
         assert!(matches!(err, Err(StoreError::Database(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_consent_for_an_outside_requester_is_refused() {
+        let fx = fixture().await;
+        let thread = thread(None);
+        let requester = Requester {
+            outside: Some(core_types::Outside { team: None }),
+            ..requester(None)
+        };
+        let id = ConsentId::new_v4();
+        let err = fx
+            .store
+            .create_consent(
+                &NewConsent {
+                    id,
+                    agent: fx.agent,
+                    requester: &requester,
+                    hop: Hop::ZERO,
+                    task: "x",
+                    attachments_json: "[]",
+                    thread: &thread,
+                    origin_session: SessionId::new_v4(),
+                    expires_at: at(10),
+                    approved_by_owner: None,
+                },
+                LIMITS,
+                at(1),
+            )
+            .await;
+        assert!(matches!(err, Err(StoreError::Refused { .. })), "{err:?}");
+        assert_eq!(fx.store.consent(id).await.unwrap(), None);
     }
 
     #[tokio::test]

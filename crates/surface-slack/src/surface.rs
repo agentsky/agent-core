@@ -246,36 +246,38 @@ impl SlackSurface {
     /// outside with no known organization. A failed lookup that says
     /// nothing about the user does that too ([`SurfaceError::Api`],
     /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), so
-    /// the fields alone never make a sender home.
+    /// the fields alone never make a sender home; the directory logs it
+    /// ([Who is home](crate::directory#who-is-home)). So is a sender
+    /// keyed by another surface or workspace, which this surface can't
+    /// vouch for.
     ///
     /// A bot sender is never looked up: its `outside` decides nothing,
     /// since the router takes no bot for a requester. Neither is a sender
-    /// already outside, nor one from another surface or workspace. The
-    /// only caller is [`confirm`](Surface::confirm), on Slack's copy of a
-    /// message, so a made-up user id in a forged event costs no lookup.
+    /// already outside. The only caller is [`confirm`](Surface::confirm),
+    /// on Slack's copy of a message, so a made-up user id in a forged event
+    /// costs no lookup.
     ///
     /// # Errors
     ///
-    /// [`SurfaceError::Transport`] and [`SurfaceError::RateLimited`], as
+    /// [`SurfaceError::Transport`] (Slack unreachable, or saying it
+    /// couldn't answer this time) and [`SurfaceError::RateLimited`], as
     /// they came, leaving `outside` alone: Slack may answer later, and the
     /// confirmation fails as any lookup it can't make does.
     pub async fn fill_sender_team(&self, event: &mut InboundEvent) -> Result<()> {
-        if event.outside.is_some()
-            || event.sender_is_bot
-            || event.sender_bot_user.is_some()
-            || event.sender.surface != SurfaceKind::Slack
-            || event.sender.team != *self.directory.team()
-        {
+        if event.outside.is_some() || event.sender_is_bot || event.sender_bot_user.is_some() {
             return Ok(());
         }
-        match self.home_user(&event.sender.user).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => {
-                return Err(err);
-            }
-            Err(err) => {
-                tracing::debug!(binding = %event.binding, error = %err, "Slack wouldn't say whether a sender is home; taking them as outside");
+        if event.sender.surface == SurfaceKind::Slack && event.sender.team == *self.directory.team()
+        {
+            match self.home_user(&event.sender.user).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => {
+                    return Err(err);
+                }
+                Err(err) => {
+                    tracing::debug!(binding = %event.binding, error = %err, "Slack wouldn't say whether a sender is home; taking them as outside");
+                }
             }
         }
         event.outside = Some(Outside { team: None });

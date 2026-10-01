@@ -659,7 +659,8 @@ impl Pipeline {
             .into_iter()
             .map(|(agent, owner)| (agent, owner, None))
             .collect();
-        self.queue(&Arc::new(event), caps, candidates, from_bot)
+        let quietly = from_bot || event.outside.is_some();
+        self.queue(&Arc::new(event), caps, candidates, quietly)
     }
 
     /// The turn that posted `msg` where a mention in it hands off, if it
@@ -692,15 +693,16 @@ impl Pipeline {
     /// Queues `event` for each of `candidates`, each with its owner and
     /// the `hand_offs` row it delivers, if any, which the job holds, and
     /// returns what completes when each is taken and done with. A candidate
-    /// whose places are full is told nothing when `from_bot`, and
-    /// otherwise gets a busy line; a hand-off it couldn't take keeps its
-    /// row, to be taken again.
+    /// whose places are full is told nothing when `quietly`, as for a bot's
+    /// message or one whose sender's fields say is from outside, whom
+    /// nothing is posted for, and otherwise gets a busy line; a hand-off it
+    /// couldn't take keeps its row, to be taken again.
     fn queue(
         &self,
         event: &Arc<InboundEvent>,
         caps: Caps,
         candidates: Vec<(AgentId, MemberId, Option<Holding>)>,
-        from_bot: bool,
+        quietly: bool,
     ) -> Vec<oneshot::Receiver<()>> {
         let thread = thread_of(event, caps);
         let mut waiting = Vec::new();
@@ -720,9 +722,9 @@ impl Pipeline {
             });
             if taken {
                 waiting.push(finished);
-            } else if from_bot {
+            } else if quietly {
                 if let Some(quiet) = self.flooded(agent, Flood::BotMessage) {
-                    tracing::warn!(%agent, message = %event.message.id, dropped_since_last_warning = quiet, "too many messages waiting; dropping a bot's message");
+                    tracing::warn!(%agent, message = %event.message.id, dropped_since_last_warning = quiet, "too many messages waiting; dropping a bot's or an outside sender's message");
                 }
             } else {
                 if let Some(quiet) = self.flooded(agent, Flood::Message) {

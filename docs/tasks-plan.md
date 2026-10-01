@@ -3482,13 +3482,19 @@ Deliverables:
   - `WebApi::conversation_info` reads the new fields leniently: a missing
     one is `false` or absent.
 - The home check:
-  - `TeamDirectory` keeps the ids of the `users.list` entries whose
-    `team_id` is the workspace, beside the names. `TeamDirectory::home_user`
-    answers from them, then from `users.info` (Tier 4) with the manager
-    app's token, as T31 reads the member list. It returns `Ok(true)` only
-    when the answer's `team_id` is the workspace, `Ok(false)` for another
-    `team_id`, none, or `user_not_found`, and otherwise the lookup's error as it
-    came, whatever its variant, uncached. Both answers are cached for an
+  - `TeamDirectory` keeps the ids of the `users.list` entries that are
+    home, beside the names. `TeamDirectory::home_user` answers from them
+    while the list is less than an hour old, then from `users.info` (Tier
+    4) with the manager app's token, as T31 reads the member list. Either
+    answer is home only as `directory::is_home` reads it: an active
+    account, not a stranger, whose `team_id` is the workspace or whose
+    `enterprise_user` is of the home organization and lists the workspace
+    in its `teams`, and every team it names (`team_id`, `profile.team`,
+    `enterprise_user.enterprise_id`) is the workspace, the organization or
+    one of those `teams`. It returns `Ok(false)` for any other answer or
+    `user_not_found`, and otherwise the lookup's error as it came, whatever
+    its variant, uncached; one that isn't a transport error or a rate limit
+    is logged as a warning at most once a minute. Both answers are cached for an
     hour, at most 4,096 of them, the oldest dropped first; an answer
     dropped from the cache is looked up again, never taken as home. A
     caller can ask it not to wait for a used-up quota
@@ -3499,8 +3505,11 @@ Deliverables:
     nothing. When the fields
     left `outside` `None` and `home_user` doesn't say home, it sets
     `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
-    `Unauthorized` error too. It returns `Transport` and `RateLimited` as
-    they came, leaving `outside` alone. Its one caller is
+    `Unauthorized` error too, and so it does for a sender keyed by another
+    surface or workspace. It returns `Transport` and `RateLimited` as they
+    came, leaving `outside` alone; Slack's `fatal_error`,
+    `internal_error`, `request_timeout` and `service_unavailable` are
+    `Transport` (`web::map_error`), as an HTTP 5xx is. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
     real user; those two errors fail the confirmation as T31's lookups do,
     and the thread gets the "try again" line.
@@ -3669,7 +3678,18 @@ Deliverables:
   `Outside` as text: the team id, `?` for an unknown one, `NULL` for home)
   to `message_refs` and `ctl_tokens`. The pipeline writes it with the
   requester and reads it back into attributions and `CtlTurn`, so a hop
-  and an agentctl call know their requester's organization.
+  and an agentctl call know their requester's organization. Until then,
+  T36a has `record_post` (and so `record_message_ref`), `set_ctl_turn` and
+  `create_consent` refuse a requester with `outside` set
+  (`StoreError::Refused`, through `store::home_requester`), so no row
+  reads back as home; T36b replaces that check with the columns, and
+  keeps it for `consents`, since a consent never has an outside requester.
+  Whether a listed organization can be admitted at all rests on T36e:
+  confirmation keeps the copy's own `outside`, and a copy whose fields
+  don't name the organization comes back `Outside { team: None }` from
+  the home check, which `copy_stands` tells from the event's named team,
+  so T36b admits a listed organization only if T36e finds that Slack's
+  `conversations.history`/`replies` copy names it.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,

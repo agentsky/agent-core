@@ -8488,12 +8488,14 @@ Slack's documentation, bolt-python's fixtures and the hand-written fixtures
 in `testkit::slack` (the Slack Connect ones are listed in that module's
 rustdoc). Each assumption T36e has to confirm lives in one place:
 
-- the sender's team fields and their order: `normalize::SENDER_TEAM_FIELDS`
-  and `MessageEvent::sender_teams`;
+- the sender's team fields and their order: `MessageEvent::sender_teams`;
 - that `authorizations[0].team_id` names the installation: the ingress's
   `Installation` reader;
 - that `users.list` and `users.info` give an outside member's own
-  `team_id`: `directory::home_users` and `TeamDirectory::home_user`;
+  `team_id`, and what they say of Grid members, deactivated accounts and
+  strangers: `directory::is_home`;
+- which `ok: false` codes mean Slack couldn't answer this time:
+  `web::TRANSIENT_CODES`;
 - the sharing flags and `connected_team_ids`: `web::Conversation::sharing`
   and `MAX_CONNECTED_TEAMS`;
 - an interaction's `user.team_id`: the ingress's interaction reader.
@@ -8535,9 +8537,10 @@ check runs in the member's intake task, before the text is even parsed,
 and nowhere else. It needs the Slack manager and a member of its workspace;
 without them a `SlackDm` origin is dropped (it can't arise otherwise).
 `Transport` and `RateLimited` post `pipeline::UNCONFIRMED_TEXT` into the DM
-the event named; any other error is logged at most once a minute
-(`HOME_CHECK_WARNING_INTERVAL`), and a sender who isn't home is dropped at
-debug.
+the event named; any other error drops the command, and a sender who isn't
+home is dropped at debug. The warning for a failed lookup is the
+directory's (below), not the command's. `Commands::dispatch`, which skips
+both the parser and this check, is now `#[cfg(test)]`.
 
 ### Every bot is skipped, not only one with a bot user
 
@@ -8557,8 +8560,11 @@ alone, with neither of the others, means.
 
 **Solution.** It is `External { teams: None }`, failing closed: a channel
 that is shared with nobody says it is unknown, never home-only.
-`is_org_shared` alone is `Org`; `is_ext_shared` wins over it. A flag that
-isn't a boolean is `false`. `Sharing` lives in `core-types` beside
+`is_org_shared` alone is `Org`; `is_ext_shared` wins over it. An
+`is_shared` or `is_ext_shared` that is present and neither `false` nor
+`null` counts as `true` (review round 1: reading it as `false` failed
+open); an `is_org_shared` that isn't `true` is `false`, which leaves a
+shared conversation external. `Sharing` lives in `core-types` beside
 `Outside`, since T36c reads it outside `surface-slack`.
 
 ### No installation, no event
@@ -8586,12 +8592,126 @@ outside and an interaction whose `sender_team` is absent or another team,
 the first drop per binding and interval logs at debug with the count since,
 the rest at trace. Neither touches the network.
 
-### Members' home ids include deactivated accounts
+### Deactivated accounts and an old member list vouch for no one
 
-**Issue.** The member list drops deactivated users from the names it
-resolves. Whether a deactivated user counts as home matters only for a
-message Slack confirmed from them, which can't happen while deactivated.
+**Issue.** The first version kept every `users.list` entry whose `team_id`
+was the workspace, deactivated ones too, on the grounds that a deactivated
+user can't post. Review round 1 showed why that fails on Grid: user ids
+are organization-wide, so a member deactivated here can stay active in a
+sibling workspace and post in a shared channel. And a member list whose
+refreshes keep failing was kept, and answered "home", with no age limit.
 
-**Solution.** The home ids keep every `users.list` entry whose `team_id` is
-the workspace, deactivated or not, so a reactivated member isn't sent to
-`users.info` until the next refresh.
+**Solution.** `directory::is_home` refuses a `deleted` account, from the
+list or from `users.info` (cached like any answer), and `home_user`
+answers from the list only while it is less than `HOME_ANSWER_TTL` old;
+past that, each sender costs one cached `users.info`. A reactivated member
+costs one lookup.
+
+### `users.info` is read like the message's fields
+
+**Issue.** `users.info` was trusted on `team_id` alone, the one field
+Bolt's fixtures show Slack sometimes filling with the installing team for
+an outside actor. Separately, on Grid a member of several of the
+organization's workspaces may have a `team_id` naming another one, which
+locked home members out of agents, DMs and consent clicks.
+
+**Solution.** `directory::is_home`, used for both the list and
+`users.info`: an active account, not `is_stranger`, whose `team_id` is the
+workspace or whose `enterprise_user` is of the home organization and lists
+the workspace in its `teams`; and every team the answer names
+(`team_id`, `profile.team`, `enterprise_user.enterprise_id`) is the
+workspace, the organization or one of those `teams`. A team field that
+isn't a string, or an `enterprise_user` that isn't an object, is read as
+naming no team, so it fails the rule. It is sound for outside members: a
+member of another organization has its own `enterprise_id` or `team_id`,
+and Slack lists only the workspaces a member belongs to. Two Grid cases
+still fail closed, as the design now says: a message whose own fields name
+another workspace of the organization, and a click whose `user.team_id`
+does. `auth.test`'s `enterprise_id` now counts only when it starts with
+`E`.
+
+### Slack saying it couldn't answer is a transport error
+
+**Issue.** `fatal_error`, `internal_error`, `request_timeout` and
+`service_unavailable` come as `ok: false` with HTTP 200, so they were
+`SurfaceError::Api`, and the home check took the sender as outside: the
+copy's decision differed from the event's and the message was dropped
+without the "try again" line, while an HTTP 5xx got it.
+
+**Solution.** `web::map_error` maps them (`TRANSIENT_CODES`) to
+`SurfaceError::Transport`, as an HTTP 5xx is, for every caller. The thread
+and the manager DM get the "try again" line; nothing is cached.
+
+### A failed home lookup is warned of once a minute
+
+**Issue.** A revoked manager token or a missing `users:read` makes every
+sender the member list doesn't vouch for outside, and `fill_sender_team`
+logged that only at debug, while the manager DM's check had its own
+warning.
+
+**Solution.** `TeamDirectory::home_user` logs a failure that isn't a
+transport error or a rate limit as a warning, at most once per
+`LOOKUP_WARNING_INTERVAL` (a minute) for the workspace, whoever asked; the
+commands' own throttle is gone.
+
+### Nothing is posted for a sender the fields say is outside
+
+**Issue.** `Pipeline::queue` posted the busy line for any sender who
+wasn't a bot, before routing, so a member of another organization learned
+whether the agent was busy.
+
+**Solution.** A message whose `outside` is set is queued `quietly`, as a
+bot's is: past the bounds it is dropped with the throttled warning. A
+sender the fields leave `None` still gets the line, as a forged event
+does.
+
+### The store refuses outside requesters until T36b
+
+**Issue.** `message_refs`, `consents` and `ctl_tokens` have no column for
+`outside`, so a requester written with it would read back as home: a hop's
+attribution, a consent or an `agentctl` turn could then run an outside
+requester's work on a home requester's terms. Nothing writes one today,
+since the router ignores outside requesters, but T36b has to remember all
+three.
+
+**Solution.** `record_post` (and so `record_message_ref`),
+`create_consent` and `set_ctl_turn` refuse a requester with `outside` set
+with `StoreError::Refused`, through one helper, `store::home_requester`.
+The T36b plan says so, and that admitting a listed organization rests on
+T36e: confirmation keeps the copy's own `outside`, which is `Outside { team:
+None }` when the copy's fields don't name the organization, so
+`copy_stands` drops an admitted outside message unless Slack's copy names
+it.
+
+### An event installed elsewhere is dropped before deduplication
+
+**Issue.** An agent's app made public and installed in another workspace
+gets that installation's deliveries. They were recorded under the message's
+deduplication key and only then dropped by `slack::Inbound`, so the home
+installation's delivery of the same message was taken for a retry.
+
+**Solution.** `Queue::with_workspace` (which replaces `with_home_org`)
+tells the ingress the workspace agentd serves; an event whose installation
+is another one is dropped before it is deduplicated, with a warning at most
+once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
+
+### Smaller fixes from review round 1
+
+- `fill_sender_team` sets a sender keyed by another surface or workspace
+  outside rather than leaving them home.
+- `member_who_left` needs the user's own `team_id` to be the workspace, so
+  a member of another organization, or of another workspace of the
+  organization, deactivated there deletes nothing here.
+- `normalize::SENDER_TEAM_FIELDS` is gone: it restated
+  `MessageEvent::sender_teams`, which is the one list.
+
+### Left as they are
+
+- A click passes on `user.team_id` alone, with no lookup: the payload is
+  Slack's, signed with the manager app's secret only operators hold, and
+  its only buttons are consent cards, which only the agent's owner can
+  decide; the design says so.
+- `home_user` has no single flight: concurrent confirmations of one new
+  sender each ask `users.info` until the first answer is kept. It costs
+  only the manager's Tier 4 quota for real senders, at most the places in
+  flight (64 per owner), and a used-up quota gets "try again", never home.

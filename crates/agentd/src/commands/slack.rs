@@ -116,13 +116,18 @@ pub fn consent_action(interaction: Interaction) -> Option<(MemberKey, String, Or
 }
 
 /// The member a `user_change` event says was deleted (left the workspace or
-/// was deactivated), in the workspace the event came through.
+/// was deactivated), in the workspace the event came through. The user's
+/// own `team_id` must be that workspace, so a member of another
+/// organization, or of another workspace of the organization, deactivated
+/// there takes nothing from the identity keyed by their id here.
 pub fn member_who_left(event: &SlackEvent) -> Option<MemberKey> {
     if event.event_type != "user_change" {
         return None;
     }
     let user = event.event.get("user")?;
-    if user.get("deleted").and_then(Value::as_bool) != Some(true) {
+    if user.get("deleted").and_then(Value::as_bool) != Some(true)
+        || user.get("team_id").and_then(Value::as_str) != Some(event.team.as_str())
+    {
         return None;
     }
     let id = user

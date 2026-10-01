@@ -12,12 +12,19 @@
 //! [`TeamDirectory::home_user`] is the independent source the design's
 //! home rule asks for: a Slack Connect message's own team fields can make
 //! its sender outside, never home, so a sender is home only when this
-//! agrees. It answers from the member list `users.list` gave, counting
-//! only the entries whose `team_id` is the workspace, and otherwise asks
-//! `users.info`, whose `team_id` must be the workspace too. Those answers
-//! are kept for [`HOME_ANSWER_TTL`], at most [`MAX_HOME_ANSWERS`] of them,
-//! the oldest dropped first; a lookup that fails is an error, not an
-//! answer, and isn't kept.
+//! agrees. It answers from the member list `users.list` gave, while that
+//! list is younger than [`HOME_ANSWER_TTL`], and otherwise asks
+//! `users.info`. Either way a user is home only as [`is_home`] reads
+//! Slack's answer: an active member, not a stranger, of the workspace, or
+//! of its Enterprise Grid organization with the workspace among their
+//! workspaces, and every team the answer names is one of those. The
+//! answers of `users.info` are kept for [`HOME_ANSWER_TTL`], at most
+//! [`MAX_HOME_ANSWERS`] of them, the oldest dropped first; a lookup that
+//! fails is an error, not an answer, and isn't kept. A failure that isn't
+//! Slack being briefly unable to answer (a revoked token, a missing
+//! scope, …) is also logged as a warning at most once per
+//! [`LOOKUP_WARNING_INTERVAL`], since it shuts out every sender the member
+//! list doesn't vouch for.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -26,7 +33,7 @@ use std::time::Duration;
 
 use std::collections::VecDeque;
 
-use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, UserId};
+use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Throttle, UserId};
 use render::MentionDirectory;
 use tokio::time::Instant;
 
@@ -65,6 +72,10 @@ pub const MAX_HOME_ANSWERS: usize = 4096;
 /// check takes for "not home".
 const USER_NOT_FOUND: &str = "user_not_found";
 
+/// How often a home check's failure that won't pass on its own is logged
+/// as a warning at most.
+pub const LOOKUP_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
 /// What `conversations.info` says about a conversation, as
 /// [`TeamDirectory::conv_info`] keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +99,7 @@ pub struct TeamDirectory {
     bots: Mutex<Bots>,
     conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
     home_answers: Mutex<HomeAnswers>,
+    lookup_warnings: Throttle,
 }
 
 /// The answers `users.info` gave to whether a user is home, each kept for
@@ -199,6 +211,7 @@ impl Bots {
 struct Members {
     directory: Arc<MemberDirectory>,
     home: Arc<HashSet<UserId>>,
+    home_read_at: Option<Instant>,
     loaded: bool,
     next_attempt: Option<Instant>,
     failure: Option<SurfaceError>,
@@ -225,6 +238,7 @@ impl TeamDirectory {
             bots: Mutex::default(),
             conv_infos: Mutex::new(HashMap::new()),
             home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
+            lookup_warnings: Throttle::new(LOOKUP_WARNING_INTERVAL),
         }
     }
 
@@ -303,10 +317,11 @@ impl TeamDirectory {
             return fresh;
         }
         self.write_members().outdated = false;
+        let reading = Instant::now();
         let names = api.all_users().await.map(|users| {
             (
                 Arc::new(names_from_users(&users)),
-                Arc::new(home_users(&users, &self.team)),
+                Arc::new(home_users(&users, &self.team, self.home_org.as_ref())),
             )
         });
         let now = Instant::now();
@@ -320,6 +335,7 @@ impl TeamDirectory {
                 *members = Members {
                     directory: Arc::clone(&directory),
                     home,
+                    home_read_at: Some(reading),
                     loaded: true,
                     next_attempt: (!members.outdated).then(|| now + self.ttl),
                     failure: None,
@@ -402,10 +418,10 @@ impl TeamDirectory {
     }
 
     /// Whether `user` belongs to the workspace, for the home rule (see
-    /// [Who is home](self#who-is-home)): `Ok(true)` when the member list
-    /// as last read has them with the workspace's `team_id`, or else when
-    /// `users.info` through `api` answers with it; `Ok(false)` when
-    /// `users.info` answers with another `team_id`, or none, or says
+    /// [Who is home](self#who-is-home)): `Ok(true)` when the member list,
+    /// read less than [`HOME_ANSWER_TTL`] ago, has them as [`is_home`]
+    /// reads it, or else when `users.info` through `api` answers so;
+    /// `Ok(false)` when `users.info` answers otherwise, or says
     /// `user_not_found`. `users.info`'s answers are kept for
     /// [`HOME_ANSWER_TTL`], at most [`MAX_HOME_ANSWERS`], the oldest
     /// dropped first, and one dropped is asked again, never taken as home.
@@ -418,22 +434,52 @@ impl TeamDirectory {
     /// ([`SurfaceError::Transport`], [`SurfaceError::RateLimited`],
     /// [`SurfaceError::Api`], [`SurfaceError::Unauthorized`],
     /// [`SurfaceError::Forbidden`] for a `missing_scope`, …). It is no
-    /// answer, and nothing is kept.
+    /// answer, and nothing is kept. One that isn't a transport error or a
+    /// rate limit is logged as a warning at most once per
+    /// [`LOOKUP_WARNING_INTERVAL`].
     pub async fn home_user(&self, api: &WebApi, user: &UserId) -> Result<bool> {
-        if self.read_members().home.contains(user) {
+        let now = Instant::now();
+        if self.listed_home(user, now) {
             return Ok(true);
         }
-        if let Some(home) = self.lock_home_answers().get(user, Instant::now()) {
+        if let Some(home) = self.lock_home_answers().get(user, now) {
             return Ok(home);
         }
         let home = match api.user_info(user).await {
-            Ok(info) => info.team_id.as_ref() == Some(&self.team),
+            Ok(info) => is_home(&info, &self.team, self.home_org.as_ref()),
             Err(SurfaceError::NotFound(code)) if code == USER_NOT_FOUND => false,
-            Err(err) => return Err(err),
+            Err(err) => {
+                self.lookup_failed(&err);
+                return Err(err);
+            }
         };
         self.lock_home_answers()
             .insert(user.clone(), home, Instant::now());
         Ok(home)
+    }
+
+    /// Whether the member list, read less than [`HOME_ANSWER_TTL`] before
+    /// `now`, has `user` as home.
+    fn listed_home(&self, user: &UserId, now: Instant) -> bool {
+        let members = self.read_members();
+        members
+            .home_read_at
+            .is_some_and(|read| now.saturating_duration_since(read) < HOME_ANSWER_TTL)
+            && members.home.contains(user)
+    }
+
+    /// Logs a failed `users.info` that won't pass on its own, at most once
+    /// per [`LOOKUP_WARNING_INTERVAL`].
+    fn lookup_failed(&self, err: &SurfaceError) {
+        if matches!(
+            err,
+            SurfaceError::Transport(_) | SurfaceError::RateLimited { .. }
+        ) {
+            return;
+        }
+        if let Some(quiet) = self.lookup_warnings.record((), std::time::Instant::now()) {
+            tracing::warn!(team = %self.team, error = %err, failed_since_last_warning = quiet, "couldn't ask Slack whether a user is home; taking them as outside");
+        }
     }
 
     /// What kind of conversation `channel` is, from `conversations.info`;
@@ -662,13 +708,49 @@ fn names_from_users(users: &[User]) -> HashMap<String, Vec<UserId>> {
     names
 }
 
-/// The ids of the `users.list` entries whose `team_id` is `team`.
-fn home_users(users: &[User], team: &TeamId) -> HashSet<UserId> {
+/// The ids of the `users.list` entries [`is_home`] counts as home.
+fn home_users(users: &[User], team: &TeamId, home_org: Option<&TeamId>) -> HashSet<UserId> {
     users
         .iter()
-        .filter(|user| user.team_id.as_ref() == Some(team))
+        .filter(|user| is_home(user, team, home_org))
         .map(|user| user.id.clone())
         .collect()
+}
+
+/// Whether Slack's `user` belongs to `team`, of the Enterprise Grid
+/// organization `home_org` if any: an active account (not `deleted`), not
+/// a stranger, whose `team_id` is `team` or whose `enterprise_user` is of
+/// `home_org` and lists `team` among its workspaces; and every team the
+/// answer names (`team_id`, `profile.team`, `enterprise_user`'s
+/// organization) is `team`, `home_org`, or one of those workspaces.
+pub fn is_home(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> bool {
+    if user.deleted || user.is_stranger {
+        return false;
+    }
+    let grid_teams = home_org
+        .and_then(|org| {
+            user.enterprise_user
+                .as_ref()
+                .filter(|grid| grid.enterprise_id.as_deref() == Some(org.as_str()))
+        })
+        .and_then(|grid| grid.teams.as_deref())
+        .filter(|teams| teams.contains(team));
+    let names_home = |field: &str| {
+        field == team.as_str()
+            || home_org.is_some_and(|org| field == org.as_str())
+            || grid_teams.is_some_and(|teams| teams.iter().any(|other| other.as_str() == field))
+    };
+    (user.team_id.as_ref() == Some(team) || grid_teams.is_some())
+        && user
+            .team_id
+            .as_ref()
+            .is_none_or(|team_id| names_home(team_id.as_str()))
+        && user.profile.team.as_deref().is_none_or(names_home)
+        && user
+            .enterprise_user
+            .as_ref()
+            .and_then(|grid| grid.enterprise_id.as_deref())
+            .is_none_or(names_home)
 }
 
 /// Lowercases and collapses white space.
@@ -682,7 +764,7 @@ fn fold(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::Profile;
+    use crate::web::{EnterpriseUser, Profile};
 
     fn user(id: &str, display: &str, real: &str, name: &str) -> User {
         User {
@@ -692,10 +774,13 @@ mod tests {
             real_name: Some(real.into()),
             deleted: false,
             is_bot: false,
+            is_stranger: false,
             profile: Profile {
                 display_name: Some(display.into()),
                 real_name: Some(real.into()),
+                team: None,
             },
+            enterprise_user: None,
         }
     }
 
@@ -891,10 +976,112 @@ mod tests {
         theirs.team_id = Some("T2".into());
         let mut unknown = user("U3", "Kit", "Kit Nobody", "kit");
         unknown.team_id = None;
+        let mut gone = user("U4", "Old", "Old Timer", "old");
+        gone.deleted = true;
         let home = home_users(
-            &[user("U1", "Ada", "Ada", "ada"), theirs, unknown],
+            &[user("U1", "Ada", "Ada", "ada"), theirs, unknown, gone],
             &"T1".into(),
+            None,
         );
         assert_eq!(home, HashSet::from([UserId::from("U1")]));
+    }
+
+    #[test]
+    fn a_member_list_older_than_an_hour_vouches_for_no_one() {
+        let directory = TeamDirectory::new("T1".into());
+        let read = Instant::now();
+        {
+            let mut members = directory.write_members();
+            members.home = Arc::new(HashSet::from([UserId::from("U1")]));
+            members.home_read_at = Some(read);
+        }
+        let ada = UserId::from("U1");
+        assert!(directory.listed_home(&ada, read));
+        assert!(directory.listed_home(&ada, read + HOME_ANSWER_TTL - Duration::from_secs(1)));
+        assert!(
+            !directory.listed_home(&ada, read + HOME_ANSWER_TTL),
+            "past an hour, users.info is asked again"
+        );
+        assert!(!directory.listed_home(&"U2".into(), read));
+        assert!(!TeamDirectory::new("T1".into()).listed_home(&ada, read));
+    }
+
+    fn grid(org: &str, teams: &[&str]) -> Option<EnterpriseUser> {
+        Some(EnterpriseUser {
+            enterprise_id: Some(org.into()),
+            teams: Some(teams.iter().map(|team| TeamId::from(*team)).collect()),
+        })
+    }
+
+    #[test]
+    fn home_is_an_active_member_whose_every_team_is_home() {
+        let team = TeamId::from("T1");
+        let org = TeamId::from("E1");
+        let home = |user: &User| is_home(user, &team, Some(&org));
+        let ada = user("U1", "Ada", "Ada", "ada");
+        assert!(home(&ada));
+        assert!(is_home(&ada, &team, None));
+
+        let mut gone = ada.clone();
+        gone.deleted = true;
+        assert!(!home(&gone), "a deactivated account isn't home");
+        let mut stranger = ada.clone();
+        stranger.is_stranger = true;
+        assert!(!home(&stranger));
+
+        let mut profile_elsewhere = ada.clone();
+        profile_elsewhere.profile.team = Some("T2".into());
+        assert!(!home(&profile_elsewhere), "every team named must be home");
+        let mut profile_unreadable = ada.clone();
+        profile_unreadable.profile.team = Some(String::new());
+        assert!(!home(&profile_unreadable));
+        let mut profile_org = ada.clone();
+        profile_org.profile.team = Some("E1".into());
+        assert!(home(&profile_org));
+
+        let mut other_org = ada.clone();
+        other_org.enterprise_user = grid("E2", &["T1"]);
+        assert!(!home(&other_org), "another organization's member");
+        let mut same_org = ada.clone();
+        same_org.enterprise_user = grid("E1", &["T1", "T3"]);
+        assert!(home(&same_org));
+
+        let mut sibling = ada.clone();
+        sibling.team_id = Some("T3".into());
+        sibling.profile.team = Some("T3".into());
+        assert!(!home(&sibling), "another workspace of the organization");
+        sibling.enterprise_user = grid("E1", &["T3"]);
+        assert!(
+            !home(&sibling),
+            "of the organization, but not of this workspace"
+        );
+        sibling.enterprise_user = grid("E1", &["T3", "T1"]);
+        assert!(
+            home(&sibling),
+            "a Grid member of this workspace among others"
+        );
+        assert!(
+            !is_home(&sibling, &team, None),
+            "only with the organization auth.test named"
+        );
+        sibling.enterprise_user = grid("E2", &["T3", "T1"]);
+        assert!(!home(&sibling));
+        sibling.enterprise_user = Some(EnterpriseUser {
+            enterprise_id: Some("E1".into()),
+            teams: None,
+        });
+        assert!(
+            !home(&sibling),
+            "an unreadable list of workspaces lists none"
+        );
+
+        let mut theirs = ada;
+        theirs.team_id = Some("T2".into());
+        theirs.enterprise_user = grid("E1", &["T2", "T1"]);
+        theirs.profile.team = Some("T9".into());
+        assert!(
+            !home(&theirs),
+            "a team outside the member's workspaces fails the rule"
+        );
     }
 }

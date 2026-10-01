@@ -56,9 +56,11 @@
 //!
 //! # Who is outside
 //!
-//! A message names its sender's team in up to four fields:
-//! [`SENDER_TEAM_FIELDS`], `user_team`, `source_team`, `user_profile.team`
-//! and `team`. One that is present and not shaped like a team id
+//! A message names its sender's team in up to four fields, read in this
+//! order by `MessageEvent::sender_teams`, the one place that lists them:
+//! `user_team`, `source_team`, `user_profile.team` and `team`. Bolt reads
+//! `user_team` before `team`, and in one of its fixtures an outside actor
+//! has the installing team in `team` and their own only in the others. One that is present and not shaped like a team id
 //! ([`is_team_id`]) makes the message [`Skip::Malformed`]. When a field
 //! names neither the workspace ([`Context::team`]) nor its Enterprise Grid
 //! organization ([`Context::home_org`]), the sender is outside, with the
@@ -146,12 +148,6 @@ pub const MAX_MIME_TYPE_BYTES: usize = 255;
 /// The most bytes of an ignored subtype that [`Skip::Subtype`] carries.
 const MAX_SUBTYPE_BYTES: usize = 64;
 
-/// The fields a message names its sender's team in, in the order the
-/// first that names another organization is taken as theirs. Bolt reads
-/// `user_team` before `team`, and in one of its fixtures an outside actor
-/// has the installing team in `team` and their own only in the others.
-pub const SENDER_TEAM_FIELDS: [&str; 4] = ["user_team", "source_team", "user_profile.team", "team"];
-
 /// What [`message`] needs besides the event.
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
@@ -230,8 +226,9 @@ struct UserProfile {
 }
 
 impl MessageEvent {
-    /// The sender's team fields, in [`SENDER_TEAM_FIELDS`]' order, each
-    /// that is present.
+    /// The sender's team fields, `user_team`, `source_team`,
+    /// `user_profile.team` and `team`, each that is present, in the order
+    /// the first that names another organization is taken as theirs.
     fn sender_teams(&self) -> impl Iterator<Item = &str> {
         [
             self.user_team.as_deref(),
@@ -278,6 +275,14 @@ pub(crate) fn team_id_or_nothing<'de, D: Deserializer<'de>>(
     value: D,
 ) -> Result<Option<TeamId>, D::Error> {
     Ok(shaped_or_nothing(value, is_team_id)?.map(TeamId::from))
+}
+
+/// A string [`is_enterprise_id`] accepts, or `None` for any other value,
+/// read without keeping what it skips.
+pub(crate) fn enterprise_id_or_nothing<'de, D: Deserializer<'de>>(
+    value: D,
+) -> Result<Option<TeamId>, D::Error> {
+    Ok(shaped_or_nothing(value, is_enterprise_id)?.map(TeamId::from))
 }
 
 /// A string `shape` accepts, or `None` for any other value, read without
@@ -669,6 +674,12 @@ pub fn is_file_id(id: &str) -> bool {
 /// letters or digits.
 pub fn is_team_id(id: &str) -> bool {
     is_slack_id(id, &["T", "E"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack Enterprise Grid organization's id:
+/// `E`, then 1 to [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_enterprise_id(id: &str) -> bool {
+    is_slack_id(id, &["E"], MAX_ID_TAIL)
 }
 
 /// Whether `id` is shaped like a Slack conversation id: `C`, `D` or `G`,
@@ -1514,10 +1525,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event.outside, outside("T0THIRD01"));
-        assert_eq!(
-            SENDER_TEAM_FIELDS,
-            ["user_team", "source_team", "user_profile.team", "team"]
-        );
     }
 
     #[test]

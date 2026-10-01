@@ -1541,10 +1541,15 @@ member they name. The person's own organization is a separate field,
      Slack's (`T` or `E` and up to 64 letters or digits) makes the message
      malformed, and it is dropped.
   2. An independent source says the user belongs to the home workspace: the
-     home member list agentd already reads (`users.list`, whose entries
-     carry `team_id`; only entries whose `team_id` is the home workspace
-     count), or else `users.info` on the manager app's token, whose
-     `team_id` must be the home workspace, its answers cached for an hour.
+     home member list agentd already reads (`users.list`), while it is less
+     than an hour old, or else `users.info` on the manager app's token, its
+     answers cached for an hour. Either answer counts only for an active
+     account (not `deleted`) that isn't `is_stranger`, whose `team_id` is
+     the home workspace or whose `enterprise_user` is of the home
+     organization and lists the home workspace among its `teams`, and every
+     team the answer names (`team_id`, `profile.team`, `enterprise_user`'s
+     organization) is the home workspace, the home organization or one of
+     those `teams`.
 
   The fields alone are not enough: in one of Bolt's fixtures an outside
   actor's `app_mention` has `team` set to the installing team and names the
@@ -1581,20 +1586,30 @@ member they name. The person's own organization is a separate field,
   the oldest dropped first, and an answer dropped from the cache is looked
   up again, never taken as home.
 
-  No path takes a sender as home from the fields alone, with one
-  exception: a slash command carries no sender team at all, so its guard
-  is Slack's own rule that only the installing workspace's members can run
-  an app's commands[^slack-connect-apps], plus the existing check that the
-  payload's `team_id` is the home workspace.
+  No message takes a sender as home from the fields alone. A slash command
+  carries no sender team at all, so its guard is Slack's own rule that only
+  the installing workspace's members can run an app's
+  commands[^slack-connect-apps], plus the existing check that the payload's
+  `team_id` is the home workspace. A click on the manager app's buttons
+  goes on when the payload's `user.team_id` is the home workspace, with no
+  lookup: the payload is Slack's, signed with the manager app's secret,
+  which only the operators hold, not an event an agent's owner can sign,
+  and the only buttons are consent cards, which only the agent's owner,
+  a home member, can decide.
 - **Enterprise Grid.** A member of another workspace in the home
   workspace's own organization is outside unless their workspace or
   organization is listed: their fields may name the home organization, but
-  the independent source names another workspace. That also refuses a
-  home member whose `users.info` names another workspace of the same
-  organization as their own, such as someone moved between workspaces;
-  it fails closed, and T36e checks it on a Grid workspace if one is at
-  hand. Both manifests keep `org_deploy_enabled: false`, so no
-  installation is organization-wide.
+  the independent source names another workspace. A member of several of
+  the organization's workspaces, the home one among them, is home when
+  `users.info` lists the home workspace in their `enterprise_user.teams`,
+  whichever workspace their `team_id` names. Two cases still fail closed,
+  and T36e checks them on a Grid workspace if one is at hand: such a
+  member's message whose own fields name another workspace of the
+  organization (outside by the fields, with no lookup), and their click
+  whose `user.team_id` does. The home organization is the `enterprise_id`
+  `auth.test` gives at startup, so a workspace that joins or leaves an
+  organization needs agentd restarted. Both manifests keep
+  `org_deploy_enabled: false`, so no installation is organization-wide.
 - **Requesters carry it.** A person's turn takes `outside` from their
   message. A hop's requester is the one its post's `MESSAGE_REF` records,
   with that row's `outside`, written by a turn whose requester was already

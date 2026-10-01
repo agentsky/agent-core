@@ -131,6 +131,13 @@
 //! `team_id` or `team.id`, and an interaction also names the clicker's own
 //! team ([`Interaction::sender_team`]).
 //!
+//! Once the queue knows the workspace agentd serves
+//! ([`Queue::with_workspace`]), an event installed in another one (an
+//! owner who made their agent's app public and installed it there) is
+//! dropped before it is deduplicated, with a warning at most once per
+//! binding per [`WARNING_INTERVAL`], so it can't take the key a delivery
+//! of the same message through the home installation needs.
+//!
 //! # Shapes
 //!
 //! An agent's owner can sign any body, and each event the queue keeps is a
@@ -401,6 +408,7 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
         Queue {
             receiver,
             notes,
+            workspace: None,
             home_org: None,
         },
     )
@@ -416,6 +424,7 @@ enum Note {
     Retry,
     Stale,
     Uninstalled,
+    Elsewhere,
     OwnerRate,
     Malformed,
     Reparsed,
@@ -1394,6 +1403,7 @@ fn command_form(body: &[u8]) -> Result<CommandForm, &'static str> {
 pub struct Queue {
     receiver: mpsc::UnboundedReceiver<Queued>,
     notes: Arc<Notes>,
+    workspace: Option<TeamId>,
     home_org: Option<TeamId>,
 }
 
@@ -1406,11 +1416,15 @@ impl fmt::Debug for Queue {
 }
 
 impl Queue {
-    /// Normalizes messages knowing that `home_org`, the `enterprise_id`
-    /// `auth.test` gave for the workspace agentd serves, is the workspace's
-    /// own Enterprise Grid organization ([`normalize::Context::home_org`]).
+    /// Takes events only from installations in `workspace`, the one agentd
+    /// serves ([The workspace](self#the-workspace)), and normalizes messages
+    /// knowing that `home_org`, the `enterprise_id` `auth.test` gave for it,
+    /// is its own Enterprise Grid organization
+    /// ([`normalize::Context::home_org`]). Without it, every installation's
+    /// events are taken, and the receiver of the queue tells them apart.
     #[must_use]
-    pub fn with_home_org(mut self, home_org: Option<TeamId>) -> Self {
+    pub fn with_workspace(mut self, workspace: TeamId, home_org: Option<TeamId>) -> Self {
+        self.workspace = Some(workspace);
         self.home_org = home_org;
         self
     }
@@ -1422,8 +1436,14 @@ impl Queue {
     /// closed, dropping what is left.
     pub async fn run(mut self, dedup: Arc<dyn Dedup>, out: Sender<SlackInbound>) {
         while let Some(queued) = self.receiver.recv().await {
-            let Some(inbound) =
-                process(queued, dedup.as_ref(), &self.notes, self.home_org.as_ref()).await
+            let Some(inbound) = process(
+                queued,
+                dedup.as_ref(),
+                &self.notes,
+                self.workspace.as_ref(),
+                self.home_org.as_ref(),
+            )
+            .await
             else {
                 continue;
             };
@@ -1440,6 +1460,7 @@ async fn process(
     queued: Queued,
     dedup: &dyn Dedup,
     notes: &Notes,
+    workspace: Option<&TeamId>,
     home_org: Option<&TeamId>,
 ) -> Option<SlackInbound> {
     let Queued {
@@ -1473,6 +1494,17 @@ async fn process(
                 reparsed("the event's installation");
                 return None;
             };
+            if workspace.is_some_and(|workspace| *workspace != team) {
+                match note(notes, binding, Note::Elsewhere) {
+                    Some(quiet) => {
+                        tracing::warn!(%binding, installation = %team, dropped_since_last_warning = quiet, "dropped a Slack event installed in another workspace")
+                    }
+                    None => {
+                        tracing::debug!(%binding, installation = %team, "dropped a Slack event installed in another workspace")
+                    }
+                }
+                return None;
+            }
             let context = EventContext {
                 binding,
                 bot_user: bot_user.as_ref(),

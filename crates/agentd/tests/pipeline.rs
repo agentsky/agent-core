@@ -2086,6 +2086,73 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
     stack.stop().await;
 }
 
+#[tokio::test]
+async fn past_the_queue_an_outside_sender_gets_no_busy_line() {
+    let stack = start_with(Setup {
+        pipeline: |settings| {
+            settings.queue_per_thread = 0;
+            settings.max_pending = 2;
+        },
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Done.").with_delay(Duration::from_millis(1500)));
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("the first turn runs", || {
+        stack.mock.calls().contains(&working_on("b1"))
+    })
+    .await;
+    let outside = |mut event: InboundEvent| {
+        event.outside = Some(core_types::Outside {
+            team: Some("T0THEIRS1".into()),
+        });
+        event
+    };
+    sink.send(outside(stack.event(
+        "zoe",
+        "GENERAL",
+        ConvKind::Channel,
+        "b2",
+        Some("b1"),
+        &[BOT],
+    )))
+    .await
+    .unwrap();
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b3", None, &[BOT]))
+        .await
+        .unwrap();
+    sink.send(outside(stack.event(
+        "zoe",
+        "GENERAL",
+        ConvKind::Channel,
+        "b4",
+        None,
+        &[BOT],
+    )))
+    .await
+    .unwrap();
+    wait_until("the two messages taken are answered", || {
+        stack
+            .mock
+            .posts()
+            .iter()
+            .filter(|(_, text)| text == "Done.")
+            .count()
+            == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        stack.busy_lines("helper"),
+        0,
+        "nothing is posted for a sender from outside, not even a busy line"
+    );
+    stack.stop().await;
+}
+
 impl Stack {
     async fn bob(&self) -> MemberId {
         self.store()
