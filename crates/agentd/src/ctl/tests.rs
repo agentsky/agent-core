@@ -52,8 +52,12 @@ struct Lookup(Arc<MockSurface>);
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Lookup {
-    async fn surface(&self, _agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        (conv.surface == SurfaceKind::Slack).then(|| self.0.clone() as Arc<dyn Surface>)
+    async fn surface(
+        &self,
+        _agent: AgentId,
+        conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        Ok((conv.surface == SurfaceKind::Slack).then(|| self.0.clone() as Arc<dyn Surface>))
     }
 }
 
@@ -915,7 +919,7 @@ async fn private_records_a_consent_and_stages_its_files_at_once() {
 async fn private_refuses_bad_tasks_and_files_and_records_nothing() {
     let fixture = Fixture::new().await;
     let (_, token, _) = fixture.agent_process(false).await;
-    let long = "x".repeat(crate::consents::MAX_TASK_CHARS + 1);
+    let long = "x".repeat(crate::consents::MAX_TASK_LEN + 1);
     let many: Vec<String> = (0..=crate::consents::MAX_FILES)
         .map(|i| format!("work/{i}"))
         .collect();
@@ -924,7 +928,7 @@ async fn private_refuses_bad_tasks_and_files_and_records_nothing() {
         (
             json!({"task": long, "files": []}),
             400,
-            "over 3000 characters",
+            "over 3000 UTF-16 code units",
         ),
         (json!({"task": "t", "files": many}), 400, "at most 10 files"),
         (
@@ -935,7 +939,7 @@ async fn private_refuses_bad_tasks_and_files_and_records_nothing() {
         (
             json!({"task": "t", "files": ["work/big.bin"]}),
             413,
-            "attachment limit",
+            "files together",
         ),
         (json!({"task": "t", "files": ["../x"]}), 400, "not a path"),
         (
@@ -1137,6 +1141,7 @@ async fn no_surfaces_has_no_surface() {
         NoSurfaces
             .surface(AgentId::new_v4(), &conv("C1"))
             .await
+            .unwrap()
             .is_none()
     );
 }
@@ -1182,6 +1187,7 @@ async fn short_ids_name_messages_the_session_was_shown() {
                     turn: None,
                     requester: &sender,
                     hop: Hop::ZERO,
+                    consent: None,
                 },
                 time::OffsetDateTime::now_utc(),
             )

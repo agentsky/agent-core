@@ -20,7 +20,7 @@ use core_types::{
 };
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
-use store::Store;
+use store::{Store, StoreError};
 use testkit::claude::SCRIPT_ENV;
 use testkit::{MockSurface, fake_anthropic, fake_claude_path, write_script};
 use time::OffsetDateTime;
@@ -59,8 +59,12 @@ struct Lookup(Arc<MockSurface>);
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Lookup {
-    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        Some(self.0.clone())
+    async fn surface(
+        &self,
+        _agent: AgentId,
+        _conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        Ok(Some(self.0.clone()))
     }
 }
 
@@ -346,7 +350,7 @@ async fn each_subcommand_works_against_the_server() {
     server
         .run(&token, &["private", "check", "it"])
         .await
-        .refused("the agent was deleted");
+        .refused("the agent is paused or was deleted");
 
     let outbox = server.ctl.end_turn(&token).await.unwrap().unwrap();
     assert_eq!(outbox.attachments().len(), 1);
@@ -1073,7 +1077,10 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
             true,
             "Exit code 1\nagentctl: agentctl ask-agent is not available yet",
         ),
-        (true, "Exit code 1\nagentctl: the agent was deleted"),
+        (
+            true,
+            "Exit code 1\nagentctl: the agent is paused or was deleted",
+        ),
     ];
     let results: Vec<(bool, &str)> = results.iter().map(|(e, c)| (*e, c.as_str())).collect();
     assert_eq!(results, expected);

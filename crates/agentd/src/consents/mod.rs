@@ -3,22 +3,30 @@
 //!
 //! [`Consents::request`] records a consent for a channel turn's task and
 //! copies the files the turn named into `consents/<id>/` under the data
-//! directory. A task the owner asked for is approved at once; any other
-//! waits for the owner, who gets a consent card from the manager bot
-//! ([`Consents::send_cards`]) and answers it with its buttons on Slack or
-//! `approve <id>` and `decline <id>` anywhere ([`Consents::decide`]). Only
-//! the owner, by any identity of theirs, can decide. A card nobody answers
-//! within `[limits] consent_ttl_secs` expires ([`Consents::expire`]), and
-//! a decided card is updated with the outcome ([`Consents::close_cards`]).
+//! directory. A task the owner asked for themselves, at hop 0, is approved
+//! at once. Any other, a task the owner's identity asked for in a turn
+//! another agent's message started included, waits for the owner, who
+//! gets a consent card from the manager bot ([`Consents::send_cards`]) and
+//! answers it with its buttons on Slack or `approve <id>` and
+//! `decline <id>` anywhere ([`Consents::decide`]). Only the owner, by any
+//! identity of theirs, can decide. A card nobody answers within
+//! `[limits] consent_ttl_secs` expires ([`Consents::expire`]), as does one
+//! that can't reach the owner, or whose agent was deleted, and a decided
+//! card is updated with the outcome ([`Consents::close_cards`]).
+//!
+//! Each agent may have [`MAX_OPEN_PER_AGENT`] consents unfinished, and each
+//! requester [`MAX_OPEN_PER_REQUESTER`] of them, so the files they hold and
+//! the cards the owner gets stay bounded.
 //!
 //! Everything a consent owes lives in the `consents` table, so it survives
 //! restarts and each part is done by one instance at a time: the card is
-//! sent at least once with bounded retries, and the work (running the
-//! approved task, or posting the declined or expired outcome in the
-//! thread) is leased, so a task whose instance died runs again. The
+//! sent at least once, retried until the consent expires, and the work
+//! (running the approved task, or posting the outcome in the thread) is
+//! leased, so a task whose instance died is taken up again. The
 //! [`Pipeline`] does the work ([`Pipeline::settle_consents`]).
 //! [`Consents::run`] does all of it: at startup, whenever a consent is
-//! asked for or decided, and every [`CONSENT_SWEEP_INTERVAL`].
+//! asked for or decided or something falls due, and at least every
+//! [`CONSENT_SWEEP_INTERVAL`].
 
 pub mod card;
 mod staging;
@@ -27,34 +35,48 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use core_types::{ConsentId, MemberKey, PrivateRequest};
-use store::{Consent, ConsentState, CtlToken, CtlTurn, NewConsent, Store, StoreError};
+use core_types::{ConsentId, Hop, MemberKey, PrivateRequest};
+use store::{
+    AgentState, Consent, ConsentState, CtlToken, CtlTurn, NewConsent, OpenLimits, Store, StoreError,
+};
 use time::OffsetDateTime;
 use tokio::sync::{Notify, watch};
-use tokio::time::MissedTickBehavior;
 
 pub use card::Card;
 pub use staging::StageError;
 
-use crate::commands::Replies;
+use crate::commands::{Replies, ReplyError};
 use crate::ctl::{create_private_dir, remove_dir};
 use crate::pipeline::Pipeline;
 
 /// The directory under the data directory where consents' files wait.
 pub const CONSENTS_DIR: &str = "consents";
-/// The longest task text, in characters: what a Slack plain-text section,
-/// which shows it on the card, holds.
-pub const MAX_TASK_CHARS: usize = 3000;
+/// The longest task text, in UTF-16 code units, as Slack counts it: what
+/// a Slack plain-text section, which shows it on the card, holds.
+pub const MAX_TASK_LEN: usize = card::SLACK_TEXT_MAX;
 /// The most files one private task may be handed.
 pub const MAX_FILES: usize = 10;
-/// How often consents are looked at without being woken.
+/// The most consents one agent may have unfinished at once.
+pub const MAX_OPEN_PER_AGENT: u32 = 10;
+/// The most consents one requester's identity may have unfinished at once
+/// with one agent.
+pub const MAX_OPEN_PER_REQUESTER: u32 = 3;
+/// How often consents are looked at at least, besides when woken or when
+/// something falls due.
 pub const CONSENT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// How long a claim on a card keeps other instances from sending it.
 pub const CARD_LEASE: Duration = Duration::from_secs(10 * 60);
-/// How long after a failed card another is tried.
+/// How long after a card's first failed send it is tried again. Each
+/// failure after that doubles the wait, up to [`CARD_RETRY_MAX`], until
+/// the consent expires.
 pub const CARD_RETRY: Duration = Duration::from_secs(60);
-/// How many times a card is tried before it is left to expire.
-pub const CARD_MAX_ATTEMPTS: u32 = 10;
+/// The longest wait between two tries of a card.
+pub const CARD_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+/// The limits on unfinished consents.
+const OPEN_LIMITS: OpenLimits = OpenLimits {
+    per_requester: MAX_OPEN_PER_REQUESTER,
+    per_agent: MAX_OPEN_PER_AGENT,
+};
 /// How long a staging directory no consent owns is kept, for a request
 /// still being recorded.
 const ORPHAN_AGE: Duration = Duration::from_secs(10 * 60);
@@ -70,7 +92,8 @@ pub struct ConsentSettings {
     pub dir: PathBuf,
     /// How long a card waits for the owner.
     pub ttl: Duration,
-    /// The largest file a task may be handed, as for `agentctl attach`.
+    /// The most bytes a task may be handed, all its files together: one
+    /// attachment's cap, as for `agentctl attach`.
     pub attach_max_bytes: u64,
 }
 
@@ -98,15 +121,23 @@ impl ConsentSettings {
 /// Why [`Consents::request`] refused or failed.
 #[derive(Debug, thiserror::Error)]
 pub enum RequestError {
-    /// The task text is empty or too long, or there are too many files.
+    /// The task text is empty or too long, there are too many files, or
+    /// the card wouldn't fit one message.
     #[error("{0}")]
     BadRequest(String),
     /// A file couldn't be handed to the task.
     #[error(transparent)]
     Stage(#[from] StageError),
-    /// The agent is gone.
-    #[error("the agent was deleted")]
-    NoAgent,
+    /// The agent is paused or deleted.
+    #[error("the agent is paused or was deleted")]
+    Inactive,
+    /// The agent, or the requester with it, has as many consents
+    /// unfinished as they may.
+    #[error(
+        "too many private tasks of this agent's are waiting for their owner or running; ask \
+         again once some are done"
+    )]
+    TooMany,
     /// The store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -177,14 +208,19 @@ impl Consents {
     /// Records a consent for `request`, asked for in `turn` by the process
     /// `token` was issued to, copying the files it names from that
     /// process's session directory. The consent is approved at once when
-    /// the turn's requester is the agent's owner, and waits for the owner
-    /// otherwise.
+    /// the agent's owner asked for it in a turn at hop 0, a message of
+    /// their own, and waits for the owner otherwise: a hop's requester is
+    /// inherited from another agent's post, which the owner may never
+    /// have seen.
     ///
     /// # Errors
     ///
-    /// [`RequestError::BadRequest`] for an empty or long task or too many
-    /// files, [`RequestError::Stage`] for a file that can't be handed over,
-    /// and the others if agentd failed. Nothing is recorded then.
+    /// [`RequestError::BadRequest`] for an empty or long task, too many
+    /// files or a card too long for one message, [`RequestError::Stage`]
+    /// for a file that can't be handed over, [`RequestError::Inactive`]
+    /// for an agent that isn't active, [`RequestError::TooMany`] past the
+    /// limits on unfinished consents, and the others if agentd failed.
+    /// Nothing is recorded then.
     pub async fn request(
         &self,
         token: &CtlToken,
@@ -194,9 +230,10 @@ impl Consents {
         if request.task.trim().is_empty() {
             return Err(RequestError::BadRequest("the task is empty".to_owned()));
         }
-        if request.task.chars().count() > MAX_TASK_CHARS {
+        if request.task.encode_utf16().count() > MAX_TASK_LEN {
             return Err(RequestError::BadRequest(format!(
-                "the task is over {MAX_TASK_CHARS} characters"
+                "the task is over {MAX_TASK_LEN} UTF-16 code units, in which an emoji counts \
+                 as two"
             )));
         }
         if request.files.len() > MAX_FILES {
@@ -208,7 +245,8 @@ impl Consents {
         let agent = store
             .agent(token.agent)
             .await?
-            .ok_or(RequestError::NoAgent)?;
+            .filter(|agent| agent.state == AgentState::Active)
+            .ok_or(RequestError::Inactive)?;
         let id = ConsentId::new_v4();
         let dir = self.dir_of(id);
         let names = match self.stage(token, &request.files, &dir).await {
@@ -221,33 +259,47 @@ impl Consents {
         let attachments_json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_owned());
         let now = Self::now();
         let owners = turn.requester.member == Some(agent.owner);
-        let created = store
-            .create_consent(
-                &NewConsent {
-                    id,
-                    agent: agent.id,
-                    requester: &turn.requester,
-                    hop: turn.hop,
-                    task: &request.task,
-                    attachments_json: &attachments_json,
-                    thread: &turn.thread,
-                    origin_session: token.session,
-                    expires_at: now + self.inner.settings.ttl,
-                    approved_by_owner: owners.then_some(&turn.requester.key),
-                },
-                now,
-            )
-            .await;
+        let asked = owners && turn.hop == Hop::ZERO;
+        let new = NewConsent {
+            id,
+            agent: agent.id,
+            requester: &turn.requester,
+            hop: turn.hop,
+            task: &request.task,
+            attachments_json: &attachments_json,
+            thread: &turn.thread,
+            origin_session: token.session,
+            expires_at: now + self.inner.settings.ttl,
+            approved_by_owner: asked.then_some(&turn.requester.key),
+        };
+        let draft = new.draft(now);
+        let fits = Card {
+            consent: &draft,
+            agent: &agent.name,
+            files: &names,
+            owners,
+            paused: false,
+        }
+        .check();
+        let created = match fits {
+            Err(why) if !asked => Err(RequestError::BadRequest(why)),
+            _ => store
+                .create_consent(&new, OPEN_LIMITS, now)
+                .await
+                .map_err(RequestError::from)
+                .and_then(|created| created.ok_or(RequestError::TooMany)),
+        };
         if let Err(err) = created {
             discard(dir).await;
-            return Err(err.into());
+            return Err(err);
         }
         tracing::info!(
             consent = %id,
             agent = %agent.id,
             session = %token.session,
+            hop = turn.hop.0,
             files = names.len(),
-            approved = owners,
+            approved = asked,
             "a private task was asked for"
         );
         self.wake();
@@ -296,7 +348,11 @@ impl Consents {
         let Some(consent) = store.consent(id).await? else {
             return Ok(Decided::NotYours);
         };
-        let owner = store.agent(consent.agent).await?.map(|agent| agent.owner);
+        let owner = store
+            .agent(consent.agent)
+            .await?
+            .filter(|agent| agent.state != AgentState::Deleted)
+            .map(|agent| agent.owner);
         let member = store.member_for_identity(by).await?;
         if owner.is_none() || member != owner {
             tracing::info!(consent = %id, member = %by, "refused a decision on a consent by someone other than its owner");
@@ -321,8 +377,8 @@ impl Consents {
         }))
     }
 
-    /// Marks every card that waited past its expiry expired, and returns
-    /// how many.
+    /// Marks every card that waited past its expiry, or whose agent was
+    /// deleted, expired, and returns how many.
     ///
     /// # Errors
     ///
@@ -337,9 +393,12 @@ impl Consents {
 
     /// Sends the cards owed, through `replies`, and returns how many were
     /// sent. A card goes to the owner's identity in the task's workspace,
-    /// or else any a manager bot reaches; with none, it waits unclaimed. A
-    /// card that fails is tried again after [`CARD_RETRY`], up to
-    /// [`CARD_MAX_ATTEMPTS`] times, and then left to expire.
+    /// or else any a manager bot reaches, and says so when the agent is
+    /// paused. A card that fails is tried again after [`CARD_RETRY`],
+    /// doubling up to [`CARD_RETRY_MAX`], until the consent expires. A
+    /// consent whose card can't reach the owner, because no manager bot
+    /// reaches any identity of theirs or the card won't fit one message,
+    /// expires at once, and so does one whose agent was deleted.
     ///
     /// # Errors
     ///
@@ -347,11 +406,13 @@ impl Consents {
     pub async fn send_cards(&self, replies: &Replies) -> Result<usize, StoreError> {
         let store = &self.inner.store;
         let mut sent = 0;
-        for consent in store
-            .consent_cards_owed(Self::now(), CARD_MAX_ATTEMPTS)
-            .await?
-        {
-            let Some(agent) = store.agent(consent.agent).await? else {
+        for consent in store.consent_cards_owed(Self::now()).await? {
+            let Some(agent) = store
+                .agent(consent.agent)
+                .await?
+                .filter(|agent| agent.state != AgentState::Deleted)
+            else {
+                self.unreachable(&consent, "its agent was deleted").await?;
                 continue;
             };
             let identities = store.member_identities(agent.owner).await?;
@@ -365,12 +426,13 @@ impl Consents {
                 })
                 .or_else(|| identities.iter().find(reachable))
             else {
-                tracing::debug!(consent = %consent.id, "no manager bot reaches the owner; the card waits");
+                self.unreachable(&consent, "no manager bot reaches the owner")
+                    .await?;
                 continue;
             };
             let now = Self::now();
             let Some(attempt) = store
-                .claim_consent_card(consent.id, now, now + CARD_LEASE, CARD_MAX_ATTEMPTS)
+                .claim_consent_card(consent.id, now, now + CARD_LEASE)
                 .await?
             else {
                 continue;
@@ -380,23 +442,45 @@ impl Consents {
                 consent: &consent,
                 agent: &agent.name,
                 files: &files,
+                owners: consent.requester.member == Some(agent.owner),
+                paused: agent.state == AgentState::Paused,
             }
             .open();
             match replies.dm_rich(owner, &card).await {
                 Ok(posted) => {
-                    store.record_consent_card(consent.id, &posted).await?;
+                    record_card(store, consent.id, &posted).await?;
                     tracing::info!(consent = %consent.id, "sent a consent card to the owner");
                     sent += 1;
                 }
+                Err(ReplyError::TooLong) => {
+                    self.unreachable(&consent, "the card doesn't fit one message")
+                        .await?;
+                }
                 Err(err) => {
-                    tracing::warn!(consent = %consent.id, attempt, error = %err, "couldn't send a consent card");
+                    let retry = card_retry(attempt);
+                    tracing::warn!(consent = %consent.id, attempt, error = %err, retry_secs = retry.as_secs(), "couldn't send a consent card");
                     store
-                        .defer_consent_card(consent.id, Self::now() + CARD_RETRY)
+                        .defer_consent_card(consent.id, attempt, Self::now() + retry)
                         .await?;
                 }
             }
         }
         Ok(sent)
+    }
+
+    /// Expires `consent` at once, before its card reached the owner, for
+    /// the reason `why`.
+    async fn unreachable(&self, consent: &Consent, why: &str) -> Result<(), StoreError> {
+        if self
+            .inner
+            .store
+            .expire_consent(consent.id, Self::now())
+            .await?
+        {
+            tracing::warn!(consent = %consent.id, why, "a private task's consent card can't reach the owner; it expired");
+            self.wake();
+        }
+        Ok(())
     }
 
     /// Updates each decided or expired consent's card with its outcome,
@@ -419,15 +503,16 @@ impl Consents {
             {
                 continue;
             }
-            let name = store
-                .agent(consent.agent)
-                .await?
-                .map_or_else(|| "this agent".to_owned(), |agent| agent.name);
+            let agent = store.agent(consent.agent).await?;
             let files = attachments(&consent);
             let card = Card {
                 consent: &consent,
-                agent: &name,
+                agent: agent.as_ref().map_or("this agent", |agent| &agent.name),
                 files: &files,
+                owners: agent
+                    .as_ref()
+                    .is_some_and(|agent| consent.requester.member == Some(agent.owner)),
+                paused: false,
             }
             .closed();
             match replies.update_rich(&posted, &card).await {
@@ -441,15 +526,21 @@ impl Consents {
     }
 
     /// Copies the files consent `consent` was handed into `work`, a new
-    /// session's working directory.
+    /// session's working directory, giving them to `owner`, the uid and gid
+    /// agents run as.
     ///
     /// # Errors
     ///
     /// If a file can't be copied.
-    pub(crate) async fn hand_over(&self, consent: &Consent, work: PathBuf) -> std::io::Result<()> {
+    pub(crate) async fn hand_over(
+        &self,
+        consent: &Consent,
+        work: PathBuf,
+        owner: (u32, u32),
+    ) -> std::io::Result<()> {
         let dir = self.dir_of(consent.id);
         let names = attachments(consent);
-        tokio::task::spawn_blocking(move || staging::hand_over(&dir, &names, &work))
+        tokio::task::spawn_blocking(move || staging::hand_over(&dir, &names, &work, owner))
             .await
             .map_err(std::io::Error::other)?
     }
@@ -498,28 +589,42 @@ impl Consents {
         Ok(())
     }
 
-    /// Looks at the consents now, then whenever woken and every `every`,
-    /// until `stopping` becomes true or its sender is dropped: expires
-    /// cards, sends and closes cards through `pipeline`'s manager bots,
-    /// deletes orphaned files, and has `pipeline` do the work decided
-    /// consents owe. A pass in progress finishes first.
+    /// Looks at the consents now, then whenever woken, when the next thing
+    /// a consent owes falls due ([`Store::next_consent_deadline`]), and at
+    /// least every `every`, until `stopping` becomes true or its sender is
+    /// dropped: expires cards, sends and closes cards through `pipeline`'s
+    /// manager bots, deletes orphaned files, and has `pipeline` do the work
+    /// decided consents owe. A pass in progress finishes first.
     pub async fn run(
         self,
         pipeline: Pipeline,
         every: Duration,
         mut stopping: watch::Receiver<bool>,
     ) {
-        let mut ticks = tokio::time::interval(every);
-        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
+        while !*stopping.borrow() {
+            if let Err(err) = self.pass(pipeline.replies(), &pipeline).await {
+                tracing::warn!(error = %err, "looking at private tasks' consents failed");
+            }
+            let wait = self.next_wait(every).await;
             tokio::select! {
                 biased;
                 _ = stopping.wait_for(|stop| *stop) => break,
                 () = self.inner.wake.notified() => {}
-                _ = ticks.tick() => {}
+                () = tokio::time::sleep(wait) => {}
             }
-            if let Err(err) = self.pass(pipeline.replies(), &pipeline).await {
-                tracing::warn!(error = %err, "looking at private tasks' consents failed");
+        }
+    }
+
+    /// How long until the next pass: until the next deadline, or `every`
+    /// if that is sooner or the store can't say.
+    async fn next_wait(&self, every: Duration) -> Duration {
+        let now = Self::now();
+        match self.inner.store.next_consent_deadline(now).await {
+            Ok(Some(due)) => Duration::try_from(due - now).map_or(every, |wait| wait.min(every)),
+            Ok(None) => every,
+            Err(err) => {
+                tracing::warn!(error = %err, "couldn't read when consents next fall due");
+                every
             }
         }
     }
@@ -543,6 +648,50 @@ pub(crate) fn attachments(consent: &Consent) -> Vec<String> {
 }
 
 /// Removes `dir`, in a blocking task.
-async fn discard(dir: PathBuf) {
+pub(crate) async fn discard(dir: PathBuf) {
     let _ = tokio::task::spawn_blocking(move || remove_dir(&dir)).await;
+}
+
+/// How long after failed attempt `attempt` of a card the next is tried.
+fn card_retry(attempt: u32) -> Duration {
+    CARD_RETRY
+        .saturating_mul(1 << attempt.saturating_sub(1).min(16))
+        .min(CARD_RETRY_MAX)
+}
+
+/// How many times recording a card that was posted is tried, before the
+/// card is left to be sent again once its claim's lease ends.
+const RECORD_TRIES: u32 = 3;
+
+/// Records that consent `id`'s card was posted as `posted`, trying a few
+/// times, since a card posted but not recorded is sent again.
+async fn record_card(
+    store: &Store,
+    id: ConsentId,
+    posted: &core_types::MsgRef,
+) -> Result<(), StoreError> {
+    let mut tries = 1;
+    loop {
+        match store.record_consent_card(id, posted).await {
+            Ok(_) => return Ok(()),
+            Err(err) if tries < RECORD_TRIES => {
+                tracing::warn!(consent = %id, error = %err, "couldn't record a consent card that was posted; trying again");
+                tokio::time::sleep(Duration::from_millis(200) * tries).await;
+                tries += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_card_waits_longer_each_time_up_to_a_cap() {
+        let waits: Vec<u64> = (1..=7).map(|n| card_retry(n).as_secs()).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 900, 900, 900]);
+        assert_eq!(card_retry(u32::MAX), CARD_RETRY_MAX);
+    }
 }

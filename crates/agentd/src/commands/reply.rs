@@ -30,6 +30,10 @@ pub enum ReplyError {
     /// The surface refused or failed.
     #[error(transparent)]
     Surface(#[from] SurfaceError),
+    /// A message that must be one, such as a consent card, would be split
+    /// in several.
+    #[error("the message doesn't fit in one")]
+    TooLong,
 }
 
 /// Opens the manager bot's direct message with a member.
@@ -86,29 +90,36 @@ impl ManagerBot {
     ///
     /// The first [`SurfaceError`]; chunks after it aren't posted.
     pub async fn post(&self, room: &ConversationId, text: &str) -> Result<(), SurfaceError> {
-        self.post_first(room, text).await.map(drop)
+        let to = self.target(room);
+        for chunk in self.surface.render(text) {
+            self.surface.post(&to, &chunk).await?;
+        }
+        Ok(())
     }
 
-    /// [`post`](Self::post), returning the first chunk's message, if any.
-    async fn post_first(
-        &self,
-        room: &ConversationId,
-        text: &str,
-    ) -> Result<Option<MsgRef>, SurfaceError> {
-        let to = ReplyTarget {
+    /// The top level of `room`, on the bot's surface and team.
+    fn target(&self, room: &ConversationId) -> ReplyTarget {
+        ReplyTarget {
             conv: ConvRef {
                 surface: self.identity.surface,
                 team: self.identity.team.clone(),
                 conversation: room.clone(),
             },
             thread_root: None,
-        };
-        let mut first = None;
-        for chunk in self.surface.render(text) {
-            let posted = self.surface.post(&to, &chunk).await?;
-            first.get_or_insert(posted);
         }
-        Ok(first)
+    }
+
+    /// Markdown `text` rendered for the surface as one message.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplyError::TooLong`] if it renders to more than one.
+    fn render_one(&self, text: &str) -> Result<String, ReplyError> {
+        let mut chunks = self.surface.render(text).into_iter();
+        match (chunks.next(), chunks.next()) {
+            (Some(one), None) => Ok(one),
+            _ => Err(ReplyError::TooLong),
+        }
     }
 
     /// Sends Markdown `text` to `member` in the manager bot's DM with them.
@@ -266,13 +277,15 @@ impl Replies {
         Ok(self.bot_for(member)?.dm_room(member).await?)
     }
 
-    /// Sends `message` to `member` in a DM from the manager bot: its
-    /// blocks on Slack, its Markdown elsewhere. Returns where it went, the
-    /// first chunk's message for Markdown split in several.
+    /// Sends `message` to `member` in a DM from the manager bot, as one
+    /// message: its blocks on Slack, its Markdown elsewhere. Returns where
+    /// it went.
     ///
     /// # Errors
     ///
-    /// As for [`reply_private`](Self::reply_private).
+    /// As for [`reply_private`](Self::reply_private), and
+    /// [`ReplyError::TooLong`], sending nothing, for Markdown the surface
+    /// would split.
     pub async fn dm_rich(&self, member: &MemberKey, message: &Rich) -> Result<MsgRef, ReplyError> {
         let bot = self.bot_for(member)?;
         let room = bot.dm_room(member).await?;
@@ -290,18 +303,17 @@ impl Replies {
                 .await?;
             return Ok(MsgRef { conv, id });
         }
-        bot.post_first(&room, &message.markdown)
-            .await?
-            .ok_or_else(|| ReplyError::Surface(SurfaceError::Api("nothing to post".to_owned())))
+        let text = bot.render_one(&message.markdown)?;
+        Ok(bot.surface.post(&bot.target(&room), &text).await?)
     }
 
     /// Replaces the manager bot's message `msg`, which
-    /// [`dm_rich`](Self::dm_rich) sent, with `message`: its blocks on
-    /// Slack, and elsewhere the first chunk of its Markdown.
+    /// [`dm_rich`](Self::dm_rich) sent, with `message`, whole: its blocks
+    /// on Slack, and elsewhere its Markdown.
     ///
     /// # Errors
     ///
-    /// As for [`reply_private`](Self::reply_private).
+    /// As for [`dm_rich`](Self::dm_rich).
     pub async fn update_rich(&self, msg: &MsgRef, message: &Rich) -> Result<(), ReplyError> {
         let conv = &msg.conv;
         let bot = self.bot_on(conv.surface, &conv.team)?;
@@ -314,11 +326,7 @@ impl Replies {
                 .await?;
             return Ok(());
         }
-        let text = bot
-            .render(&message.markdown)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let text = bot.render_one(&message.markdown)?;
         Ok(bot.surface.edit(msg, &text).await?)
     }
 }

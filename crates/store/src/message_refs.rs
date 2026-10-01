@@ -2,8 +2,8 @@
 //! messages shown to each session's model, with their short ids.
 
 use core_types::{
-    AgentId, ConvRef, ConversationId, Hop, MemberId, MemberKey, MessageId, MsgRef, Requester,
-    SessionId, SurfaceKind, TeamId, ThreadKey, TurnId,
+    AgentId, ConsentId, ConvRef, ConversationId, Hop, MemberId, MemberKey, MessageId, MsgRef,
+    Requester, SessionId, SurfaceKind, TeamId, ThreadKey, TurnId,
 };
 use sqlx::SqliteConnection;
 use time::OffsetDateTime;
@@ -16,7 +16,7 @@ const TABLE: &str = "message_refs";
 macro_rules! columns {
     () => {
         "session_id, short_id, surface, team_id, conversation, thread_root, platform_ref, \
-         agent_id, turn_id, requester_member, requester_key, hop, posted_at"
+         agent_id, turn_id, requester_member, requester_key, hop, posted_at, consent_id"
     };
 }
 
@@ -39,6 +39,9 @@ pub struct NewMessageRef<'a> {
     pub requester: &'a Requester,
     /// The posting turn's hop, or 0 for an inbound message.
     pub hop: Hop,
+    /// The consent whose private task's result or outcome the message
+    /// reports, if it does: a mention in it starts no agent's turn.
+    pub consent: Option<ConsentId>,
 }
 
 /// A `message_refs` row.
@@ -63,6 +66,9 @@ pub struct MessageRef {
     pub hop: Hop,
     /// When the row was recorded.
     pub posted_at: OffsetDateTime,
+    /// The consent whose private task's result or outcome the message
+    /// reports, if it does.
+    pub consent: Option<ConsentId>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -80,6 +86,7 @@ struct Row {
     requester_key: String,
     hop: i64,
     posted_at: i64,
+    consent_id: Option<String>,
 }
 
 fn corrupt(column: &'static str) -> StoreError {
@@ -121,6 +128,10 @@ impl Row {
             },
             hop: Hop(u8::try_from(self.hop).map_err(|_| corrupt("hop"))?),
             posted_at: from_unix(self.posted_at, TABLE, "posted_at")?,
+            consent: self
+                .consent_id
+                .map(|consent| parse_column(&consent, TABLE, "consent_id"))
+                .transpose()?,
         })
     }
 }
@@ -153,8 +164,8 @@ async fn in_session(
 async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Result<MessageRef> {
     let row: Row = sqlx::query_as(concat!(
         "UPDATE message_refs SET agent_id = ?, turn_id = ?, requester_member = ?, \
-         requester_key = ?, hop = ? WHERE session_id = ? AND surface = ? AND team_id = ? \
-         AND conversation = ? AND platform_ref = ? RETURNING ",
+         requester_key = ?, hop = ?, consent_id = ? WHERE session_id = ? AND surface = ? \
+         AND team_id = ? AND conversation = ? AND platform_ref = ? RETURNING ",
         columns!()
     ))
     .bind(new.agent.map(|agent| agent.to_string()))
@@ -162,6 +173,7 @@ async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Resu
     .bind(new.requester.member.map(|member| member.to_string()))
     .bind(new.requester.key.to_string())
     .bind(i64::from(new.hop.0))
+    .bind(new.consent.map(|consent| consent.to_string()))
     .bind(new.session.to_string())
     .bind(new.msg.conv.surface.as_str())
     .bind(new.msg.conv.team.as_str())
@@ -205,9 +217,9 @@ impl Store {
         let row: Row = sqlx::query_as(concat!(
             "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
              thread_root, platform_ref, agent_id, turn_id, requester_member, requester_key, hop, \
-             posted_at) \
-             SELECT ?1, COALESCE(MAX(short_id), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12 \
-             FROM message_refs WHERE session_id = ?1 RETURNING ",
+             posted_at, consent_id) \
+             SELECT ?1, COALESCE(MAX(short_id), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, \
+             ?12, ?13 FROM message_refs WHERE session_id = ?1 RETURNING ",
             columns!()
         ))
         .bind(new.session.to_string())
@@ -222,6 +234,7 @@ impl Store {
         .bind(new.requester.key.to_string())
         .bind(i64::from(new.hop.0))
         .bind(to_unix(now))
+        .bind(new.consent.map(|consent| consent.to_string()))
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -403,6 +416,7 @@ mod tests {
             turn: None,
             requester,
             hop: Hop::ZERO,
+            consent: None,
         }
     }
 
@@ -488,6 +502,7 @@ mod tests {
                     turn: Some(turn),
                     requester: &payer,
                     hop: Hop(2),
+                    consent: None,
                 },
                 at(5),
             )
@@ -523,6 +538,7 @@ mod tests {
                     turn: None,
                     requester: &payer,
                     hop: Hop::ZERO,
+                    consent: None,
                 },
                 at(7),
             )
@@ -538,6 +554,7 @@ mod tests {
                     turn: None,
                     requester: &payer,
                     hop: Hop::ZERO,
+                    consent: None,
                 },
                 at(8),
             )
@@ -620,6 +637,7 @@ mod tests {
             turn: Some(turn),
             requester: &payer,
             hop: Hop(3),
+            consent: None,
         };
         store
             .record_message_ref(&inbound(session, &msg("C1", "1.1"), None, &sender), at(1))
@@ -706,6 +724,7 @@ mod tests {
                             turn: None,
                             requester: &payer,
                             hop: Hop::ZERO,
+                            consent: None,
                         },
                         at(20),
                     )

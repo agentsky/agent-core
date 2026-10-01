@@ -494,6 +494,7 @@ async fn history(
         .surfaces()
         .surface(caller.token.agent, &thread.conv)
         .await
+        .map_err(|err| internal("looking up the agent's surface", &err))?
         .ok_or_else(|| {
             error(
                 CtlErrorCode::NotAvailable,
@@ -621,7 +622,7 @@ async fn ask_agent(Caller(_): Caller) -> ApiError {
 /// `POST /v1/private`: records a consent for the task, with the files it
 /// names copied out of the caller's session directory, and returns its id
 /// at once. The task runs once the owner approves it, at once when the
-/// requester is the owner. A turn may ask for [`MAX_PRIVATE_TASKS`].
+/// owner asked for it at hop 0. A turn may ask for [`MAX_PRIVATE_TASKS`].
 ///
 /// [`MAX_PRIVATE_TASKS`]: super::MAX_PRIVATE_TASKS
 async fn private(
@@ -648,7 +649,9 @@ async fn private(
         }
         RequestError::Stage(StageError::Io(ref io)) => internal("staging a file", io),
         RequestError::Stage(_) => error(CtlErrorCode::BadRequest, err.to_string()),
-        RequestError::NoAgent => error(CtlErrorCode::Refused, "the agent was deleted"),
+        RequestError::Inactive | RequestError::TooMany => {
+            error(CtlErrorCode::Refused, err.to_string())
+        }
         RequestError::Store(ref store) => internal("recording a consent", store),
         RequestError::Io(ref io) => internal("staging a consent's files", io),
     })?;

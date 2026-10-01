@@ -1925,9 +1925,14 @@ async fn only_owner_can_decide() {
                 expires_at: now + time::Duration::hours(1),
                 approved_by_owner: None,
             },
+            store::OpenLimits {
+                per_requester: 1,
+                per_agent: 1,
+            },
             now,
         )
         .await
+        .unwrap()
         .unwrap();
 
     assert_eq!(

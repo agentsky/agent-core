@@ -2777,8 +2777,14 @@ Deliverables:
      the design's "files the channel turn attached explicitly". The PR adds
      `--file` to the design's `agentctl` table.
   2. Return the consent id at once.
-  3. If the requester is the owner, set the state to `approved` and enqueue the
-     task. Otherwise send the consent card to the owner.
+  3. If the owner asked for it in a turn at hop 0 (their own message started
+     the turn), set the state to `approved` and enqueue the task. Otherwise,
+     including a hop turn whose inherited requester is the owner, send the
+     consent card to the owner. The row records how it was approved
+     (`approval`: `asked` or `card`).
+  4. Refuse a request past the limits on unfinished consents per agent and per
+     (agent, requester), counted in the insert's transaction, and files over
+     one attachment's cap together.
 - Consent card:
   - Slack: Block Kit in the owner's DM from the manager bot, showing the exact
     task text, requester, channel and thread link, with Approve and Decline
@@ -2802,8 +2808,10 @@ Deliverables:
      requested gets `shared/` read-only and no `memory/`, and its consent card
      says it can read the owner's shared files. The runner picks the mounts
      from `TurnRequest.side`, so the task's turn sets it to `Side::Owner`
-     exactly when the consent's requester is the owner, and to `Side::Public`
-     otherwise. It never copies the side of the channel turn that asked.
+     exactly when the owner asked for it at hop 0, or approved on the card a
+     task the owner's own identity asked for, and to `Side::Public` otherwise.
+     It never follows from the requester alone, and never copies the side of
+     the channel turn that asked.
   5. The turn recorded on the agentctl token has `TurnKind::PrivateTask`, so
      agentctl allows only `attach` (T15's rule).
 - Delivery: the final reply and attached files are posted to the recorded
@@ -2812,9 +2820,13 @@ Deliverables:
   thread's `conversation` and `thread_root`, so the channel session's next
   turn finds it (T23). Declined and expired outcomes are posted the same way;
   with no private session, their rows carry the consent's id as the session
-  id.
+  id. Every such row also names the consent (`message_refs.consent_id`), and
+  the router never takes a mention in it as a hop, so T34's hand-off can't
+  start from a private result.
 - The private session is never the owner's DM session, and its container is
-  reaped right after the task.
+  stopped as soon as its turn ends, however the task ends. A task is run
+  again only if no turn of it reached the model, and the thread's caps (T27)
+  apply to it.
 - The private sandbox shares the `sandbox` network with channel sandboxes,
   so it relies on that network keeping sandboxes from reaching each other
   ([Network and deployment shape](#network-and-deployment-shape)). The
@@ -2833,6 +2845,7 @@ Acceptance, as tests named after the design's rules:
 - `ask_agent_and_private_refused_inside_private_task`.
 - `result_message_ref_inherits_requester_and_hop`.
 - `only_owner_can_decide`.
+- `owner_requester_at_hop_one_needs_a_card`.
 - `channel_volume_never_mounts_private_paths`.
 - `non_owner_task_gets_read_only_shared_and_no_memory`.
 

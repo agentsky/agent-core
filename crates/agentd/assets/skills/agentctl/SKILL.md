@@ -120,20 +120,24 @@ agentctl private [--file <path>]... <task>
 Asks for a task on your owner's private resources (their `shared/`
 directory and private tools), which this conversation can't reach. It
 returns a consent id at once and does not wait for the task. Unless your
-owner asked for this turn, your owner is asked to approve the task first,
-and sees it exactly as you wrote it, so write it plainly. When the task
+owner asked for this turn in a message of their own (not through another
+agent's message), your owner is asked to approve the task first, and sees
+it exactly as you wrote it, so write it plainly; the task text may be at
+most 3000 characters, an emoji counting as two. When the task
 finishes, agentd posts its result to this thread; you won't see it in this
 turn, so tell the requester that the result will follow.
 
 `--file` hands a file from this session's directory (your working
 directory, or anything else under the session directory) to the task, as it
-is now; repeat it for several, up to 10, each named differently. The task
-finds them in its working directory. Nothing else of this conversation
+is now; repeat it for several, up to 10, each named differently and none a
+dotfile or `CLAUDE.md`, together no larger than one attachment may be. The
+task finds them in its working directory. Nothing else of this conversation
 reaches the task: put what it needs in the task text or a file. Its result
 comes back as a new message in this thread, headed `Private task <id>:`,
 with the files it attached; if your owner declines, or doesn't answer in
-time, that is posted instead. A turn may ask for three private tasks.
-Refused inside a private task.
+time, that is posted instead. A turn may ask for three private tasks, and
+only a few may wait for your owner or run at once; past that the request is
+refused until some are done. Refused inside a private task.
 
 ## Inside a private task
 

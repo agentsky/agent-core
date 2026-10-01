@@ -225,6 +225,7 @@ struct Inner {
     pending: Arc<Semaphore>,
     shares: Mutex<HashMap<MemberId, Share>>,
     tasks: Mutex<JoinSet<()>>,
+    private: Mutex<HashMap<ConsentId, u32>>,
     closed: AtomicBool,
     working: Mutex<Working>,
     floods: Throttle<(AgentId, Flood)>,
@@ -375,6 +376,7 @@ impl Pipeline {
                 pending,
                 shares: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
+                private: Mutex::new(HashMap::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
                 floods: Throttle::new(FLOOD_WARNING_INTERVAL),
@@ -436,10 +438,12 @@ impl Pipeline {
     /// its working emoji taken off and its thread told to ask again
     /// ([`RESTARTING_TEXT`]), within a few seconds. Messages still waiting
     /// are dropped without a word: no decision was made about them yet.
+    /// The private tasks it drops are released for another instance.
     pub async fn cut_short(&self) {
         self.close();
         let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         tasks.shutdown().await;
+        self.release_cut_tasks().await;
         lock(&self.inner.lanes).clear();
         {
             let mut working = self.working();
@@ -643,7 +647,7 @@ impl Pipeline {
 
     async fn post_notice(&self, event: &InboundEvent, agent: AgentId, caps: Caps, notice: Notice) {
         let told = async {
-            let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+            let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
                 return Ok(());
             };
             if !surface.can_post(&event.conv).await? {
@@ -783,7 +787,13 @@ impl Pipeline {
     /// word.
     async fn confirmed(&self, job: &Job, agent: AgentId) -> Option<InboundEvent> {
         let (event, caps) = (job.event.as_ref(), job.caps);
-        let surface = self.inner.surfaces.surface(agent, &event.conv).await?;
+        let surface = match self.inner.surfaces.surface(agent, &event.conv).await {
+            Ok(surface) => surface?,
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "looking up an agent's surface failed");
+                return None;
+            }
+        };
         match surface.confirm(event).await {
             Ok(Some(copy))
                 if copy.message == event.message
@@ -867,7 +877,7 @@ impl Pipeline {
         requester: &Requester,
         text: fn(&str) -> String,
     ) -> Result<(), PipelineError> {
-        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             return Ok(());
         };
         if !surface.can_post(&event.conv).await? {
@@ -904,7 +914,7 @@ impl Pipeline {
             tracing::info!(%agent, message = %event.message.id, %reason, "refused a hop for its requester; told no one");
             return Ok(());
         }
-        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             return Ok(());
         };
         if !surface.can_post(&event.conv).await? {
@@ -1067,7 +1077,7 @@ impl Pipeline {
         caps: Caps,
         turn: Run,
     ) -> Result<(), PipelineError> {
-        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             tracing::warn!(%agent, conv = %event.conv, "the agent has no surface in this conversation");
             return Ok(());
         };
@@ -1749,6 +1759,10 @@ impl Delivery<'_> {
                         turn,
                         requester: self.requester,
                         hop: self.hop,
+                        consent: match self.answering {
+                            Answering::PrivateTask(consent) => Some(consent),
+                            Answering::Message(_) => None,
+                        },
                     },
                     OffsetDateTime::now_utc(),
                 )
@@ -1780,6 +1794,8 @@ enum PipelineError {
     Surface(#[from] SurfaceError),
     #[error("handing a private task its files: {0}")]
     HandOver(std::io::Error),
+    #[error("a private task's outcome couldn't be posted")]
+    NotPosted,
 }
 
 /// The sink behind [`Pipeline::sink`].

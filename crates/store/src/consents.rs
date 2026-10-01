@@ -2,19 +2,22 @@
 //! resources, their owners' decisions, their consent cards, and the work a
 //! decided consent owes.
 //!
-//! A consent is created by `agentctl private`, `pending` unless its
-//! requester is the agent's owner, whose task is `approved` at once. Only a
-//! pending consent can be [decided](Store::decide_consent) or
-//! [expired](Store::expire_consents), each in one conditional `UPDATE`, so
-//! a decision and an expiry, or two decisions, never both land.
+//! A consent is created by `agentctl private`, `pending` unless the agent's
+//! owner asked for it at hop 0, in which case it is `approved` at once
+//! ([`Approval::Asked`]). Each agent and requester may have only so many
+//! consents unfinished ([`OpenLimits`]). Only a pending consent can be
+//! [decided](Store::decide_consent) or [expired](Store::expire_consents),
+//! each in one conditional `UPDATE`, so a decision and an expiry, or two
+//! decisions, never both land.
 //!
 //! The consent card and the work a decided consent owes are sent or done
-//! at least once, with bounded retries, the way the relink notices are: a
-//! claim is a conditional `UPDATE` that counts an attempt and sets a lease,
-//! after which the card or the work is claimable again if its claimer died.
-//! The work's claimer [renews](Store::renew_consent_work) the lease while a
-//! task runs, and only the claim of the latest attempt can
-//! [finish](Store::finish_consent) it.
+//! at least once, the way the relink notices are: a claim is a conditional
+//! `UPDATE` that counts an attempt and sets a lease, after which the card
+//! or the work is claimable again if its claimer died. The card is retried
+//! until the consent expires. The work's claimer
+//! [renews](Store::renew_consent_work) the lease while a task runs, only
+//! the claim of the latest attempt can [finish](Store::finish_consent) it,
+//! and the claims that [failed](Store::fail_consent_work) are counted.
 
 use core_types::{
     AgentId, ConsentId, ConvRef, ConversationId, Hop, MemberId, MemberKey, MessageId, MsgRef,
@@ -33,7 +36,7 @@ macro_rules! columns {
          state, reply_surface, reply_team_id, reply_conversation, reply_thread_root, \
          origin_session_id, private_session_id, created_at, expires_at, decided_by, \
          decided_at, card_conversation, card_message, card_closed_at, work_attempts, \
-         finished_at"
+         finished_at, approval, work_failures"
     };
 }
 
@@ -71,6 +74,43 @@ impl ConsentState {
     }
 }
 
+/// How an approved consent was approved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Approval {
+    /// At once, because the agent's owner asked for it at hop 0.
+    Asked,
+    /// By the owner, on the consent card.
+    Card,
+}
+
+impl Approval {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asked => "asked",
+            Self::Card => "card",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "asked" => Ok(Self::Asked),
+            "card" => Ok(Self::Card),
+            _ => Err(corrupt("approval")),
+        }
+    }
+}
+
+/// How many consents may be unfinished at once, for
+/// [`Store::create_consent`]: asked for and not yet decided, or decided and
+/// owing their work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenLimits {
+    /// The most for one agent and one requester's identity.
+    pub per_requester: u32,
+    /// The most for one agent.
+    pub per_agent: u32,
+}
+
 /// A consent to record, for [`Store::create_consent`].
 #[derive(Debug, Clone, Copy)]
 pub struct NewConsent<'a> {
@@ -92,9 +132,44 @@ pub struct NewConsent<'a> {
     pub origin_session: SessionId,
     /// When an unanswered card expires.
     pub expires_at: OffsetDateTime,
-    /// `Some` with the requester's identity when the requester is the
-    /// agent's owner: the consent is approved at once, by them.
+    /// `Some` with the requester's identity when the agent's owner asked
+    /// for the task at hop 0: the consent is approved at once, by them
+    /// ([`Approval::Asked`]). The store refuses it at any other hop.
     pub approved_by_owner: Option<&'a MemberKey>,
+}
+
+impl NewConsent<'_> {
+    /// The consent [`Store::create_consent`] would record at `now`, as a
+    /// card would show it before it is asked for.
+    pub fn draft(&self, now: OffsetDateTime) -> Consent {
+        let approved = self.approved_by_owner.is_some();
+        Consent {
+            id: self.id,
+            agent: self.agent,
+            requester: self.requester.clone(),
+            hop: self.hop,
+            task: self.task.to_owned(),
+            attachments_json: self.attachments_json.to_owned(),
+            state: if approved {
+                ConsentState::Approved
+            } else {
+                ConsentState::Pending
+            },
+            approval: approved.then_some(Approval::Asked),
+            thread: self.thread.clone(),
+            origin_session: self.origin_session,
+            private_session: None,
+            created_at: now,
+            expires_at: self.expires_at,
+            decided_by: self.approved_by_owner.cloned(),
+            decided_at: approved.then_some(now),
+            card: None,
+            card_closed_at: None,
+            work_attempts: 0,
+            work_failures: 0,
+            finished_at: None,
+        }
+    }
 }
 
 /// A `consents` row.
@@ -114,6 +189,8 @@ pub struct Consent {
     pub attachments_json: String,
     /// The owner's decision.
     pub state: ConsentState,
+    /// How it was approved, once it is.
+    pub approval: Option<Approval>,
     /// Where the result goes.
     pub thread: ThreadKey,
     /// The session of the turn that asked.
@@ -134,6 +211,8 @@ pub struct Consent {
     pub card_closed_at: Option<OffsetDateTime>,
     /// How many times its work was claimed.
     pub work_attempts: u32,
+    /// How many of those claims failed.
+    pub work_failures: u32,
     /// When its work was done.
     pub finished_at: Option<OffsetDateTime>,
 }
@@ -163,6 +242,8 @@ struct Row {
     card_closed_at: Option<i64>,
     work_attempts: i64,
     finished_at: Option<i64>,
+    approval: Option<String>,
+    work_failures: i64,
 }
 
 fn corrupt(column: &'static str) -> StoreError {
@@ -207,6 +288,7 @@ impl Row {
             task: self.task_text,
             attachments_json: self.attachments_json,
             state: ConsentState::parse(&self.state)?,
+            approval: self.approval.as_deref().map(Approval::parse).transpose()?,
             thread: ThreadKey {
                 conv,
                 root: (!self.reply_thread_root.is_empty())
@@ -228,6 +310,8 @@ impl Row {
             card_closed_at: optional_time(self.card_closed_at, "card_closed_at")?,
             work_attempts: u32::try_from(self.work_attempts)
                 .map_err(|_| corrupt("work_attempts"))?,
+            work_failures: u32::try_from(self.work_failures)
+                .map_err(|_| corrupt("work_failures"))?,
             finished_at: optional_time(self.finished_at, "finished_at")?,
         })
     }
@@ -237,20 +321,18 @@ fn consents(rows: Vec<Row>) -> Result<Vec<Consent>> {
     rows.into_iter().map(Row::into_consent).collect()
 }
 
-fn attempt(value: Option<i64>, column: &'static str) -> Result<Option<u32>> {
+fn attempt_count(value: Option<i64>, column: &'static str) -> Result<Option<u32>> {
     value
         .map(|attempt| u32::try_from(attempt).map_err(|_| corrupt(column)))
         .transpose()
 }
 
 /// The conditions under which a card is owed and may be claimed at `now`
-/// (bound first) with fewer than `max_attempts` claims so far (bound
-/// second).
+/// (bound once).
 macro_rules! card_claimable {
     () => {
-        "state = 'pending' AND card_message IS NULL \
-         AND (card_next_attempt_at IS NULL OR card_next_attempt_at <= ?) \
-         AND card_attempts < ?"
+        "state = 'pending' AND finished_at IS NULL AND card_message IS NULL \
+         AND (card_next_attempt_at IS NULL OR card_next_attempt_at <= ?)"
     };
 }
 
@@ -265,32 +347,53 @@ macro_rules! work_claimable {
 
 impl Store {
     /// Records `consent` at `now`: `pending`, or `approved` by the owner
-    /// when [`NewConsent::approved_by_owner`] says the requester is the
-    /// agent's owner.
+    /// ([`Approval::Asked`]) when [`NewConsent::approved_by_owner`] says
+    /// the owner asked at hop 0. Returns `None`, recording nothing, when
+    /// the agent, or the agent and the requester's identity, already have
+    /// as many unfinished consents as `limits` allow. The count and the
+    /// insert are one `BEGIN IMMEDIATE` transaction, so concurrent requests
+    /// never pass the limits together.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the insert fails, as for an id that is
-    /// taken or an agent that doesn't exist.
+    /// [`StoreError::Database`] if a query fails, as for an id that is
+    /// taken, an agent that doesn't exist, or an owner's approval at a hop
+    /// other than 0.
     pub async fn create_consent(
         &self,
         consent: &NewConsent<'_>,
+        limits: OpenLimits,
         now: OffsetDateTime,
-    ) -> Result<Consent> {
-        let (state, decided_by, decided_at) = match consent.approved_by_owner {
+    ) -> Result<Option<Consent>> {
+        let (state, approval, decided_by, decided_at) = match consent.approved_by_owner {
             Some(owner) => (
                 ConsentState::Approved,
+                Some(Approval::Asked.as_str()),
                 Some(owner.to_string()),
                 Some(to_unix(now)),
             ),
-            None => (ConsentState::Pending, None, None),
+            None => (ConsentState::Pending, None, None, None),
         };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (per_agent, per_requester): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(requester_key = ?), 0) FROM consents \
+             WHERE agent_id = ? AND finished_at IS NULL",
+        )
+        .bind(consent.requester.key.to_string())
+        .bind(consent.agent.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        if per_agent >= i64::from(limits.per_agent)
+            || per_requester >= i64::from(limits.per_requester)
+        {
+            return Ok(None);
+        }
         let row: Row = sqlx::query_as(concat!(
             "INSERT INTO consents (id, agent_id, requester_member, requester_key, hop, \
-             task_text, attachments_json, state, reply_surface, reply_team_id, \
+             task_text, attachments_json, state, approval, reply_surface, reply_team_id, \
              reply_conversation, reply_thread_root, origin_session_id, created_at, expires_at, \
              decided_by, decided_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING ",
             columns!()
         ))
         .bind(consent.id.to_string())
@@ -301,6 +404,7 @@ impl Store {
         .bind(consent.task)
         .bind(consent.attachments_json)
         .bind(state.as_str())
+        .bind(approval)
         .bind(consent.thread.conv.surface.as_str())
         .bind(consent.thread.conv.team.as_str())
         .bind(consent.thread.conv.conversation.as_str())
@@ -310,9 +414,10 @@ impl Store {
         .bind(to_unix(consent.expires_at))
         .bind(decided_by)
         .bind(decided_at)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        row.into_consent()
+        tx.commit().await?;
+        row.into_consent().map(Some)
     }
 
     /// The consent `id`, if there is one.
@@ -334,7 +439,7 @@ impl Store {
     }
 
     /// Records `by`'s decision on the pending consent `id` at `now`:
-    /// approved, or declined. Returns the decided consent, or `None` when
+    /// approved ([`Approval::Card`]), or declined. Returns the decided consent, or `None` when
     /// it isn't pending any more or expired before `now`: a decision never
     /// overrides another, or an expiry.
     ///
@@ -349,17 +454,18 @@ impl Store {
         by: &MemberKey,
         now: OffsetDateTime,
     ) -> Result<Option<Consent>> {
-        let state = if approve {
-            ConsentState::Approved
+        let (state, approval) = if approve {
+            (ConsentState::Approved, Some(Approval::Card.as_str()))
         } else {
-            ConsentState::Declined
+            (ConsentState::Declined, None)
         };
         let row: Option<Row> = sqlx::query_as(concat!(
-            "UPDATE consents SET state = ?, decided_by = ?, decided_at = ? \
+            "UPDATE consents SET state = ?, approval = ?, decided_by = ?, decided_at = ? \
              WHERE id = ? AND state = 'pending' AND expires_at > ? RETURNING ",
             columns!()
         ))
         .bind(state.as_str())
+        .bind(approval)
         .bind(by.to_string())
         .bind(to_unix(now))
         .bind(id.to_string())
@@ -369,8 +475,8 @@ impl Store {
         row.map(Row::into_consent).transpose()
     }
 
-    /// Marks every pending consent whose card expired by `now` `expired`,
-    /// and returns them.
+    /// Marks `expired` every pending consent whose card expired by `now`,
+    /// or whose agent was deleted, and returns them.
     ///
     /// # Errors
     ///
@@ -379,7 +485,8 @@ impl Store {
     pub async fn expire_consents(&self, now: OffsetDateTime) -> Result<Vec<Consent>> {
         let rows: Vec<Row> = sqlx::query_as(concat!(
             "UPDATE consents SET state = 'expired', decided_at = ? \
-             WHERE state = 'pending' AND expires_at <= ? RETURNING ",
+             WHERE state = 'pending' AND finished_at IS NULL AND (expires_at <= ? \
+             OR agent_id IN (SELECT id FROM agents WHERE state = 'deleted')) RETURNING ",
             columns!()
         ))
         .bind(to_unix(now))
@@ -389,19 +496,32 @@ impl Store {
         consents(rows)
     }
 
+    /// Marks the pending consent `id` expired at `now`, before its time,
+    /// as when its card can't reach the owner. False if it isn't pending.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn expire_consent(&self, id: ConsentId, now: OffsetDateTime) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE consents SET state = 'expired', decided_at = ? \
+             WHERE id = ? AND state = 'pending'",
+        )
+        .bind(to_unix(now))
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// The pending consents whose card may be claimed at `now`, oldest
-    /// first: not posted yet, no lease or backoff running past `now`, and
-    /// claimed fewer than `max_attempts` times.
+    /// first: not posted yet, and no lease or backoff running past `now`.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
     /// if a row doesn't parse.
-    pub async fn consent_cards_owed(
-        &self,
-        now: OffsetDateTime,
-        max_attempts: u32,
-    ) -> Result<Vec<Consent>> {
+    pub async fn consent_cards_owed(&self, now: OffsetDateTime) -> Result<Vec<Consent>> {
         let rows: Vec<Row> = sqlx::query_as(concat!(
             "SELECT ",
             columns!(),
@@ -410,7 +530,6 @@ impl Store {
             " ORDER BY created_at, id"
         ))
         .bind(to_unix(now))
-        .bind(i64::from(max_attempts))
         .fetch_all(&self.pool)
         .await?;
         consents(rows)
@@ -430,7 +549,6 @@ impl Store {
         id: ConsentId,
         now: OffsetDateTime,
         lease_until: OffsetDateTime,
-        max_attempts: u32,
     ) -> Result<Option<u32>> {
         let claimed: Option<i64> = sqlx::query_scalar(concat!(
             "UPDATE consents SET card_attempts = card_attempts + 1, card_next_attempt_at = ? \
@@ -441,10 +559,9 @@ impl Store {
         .bind(to_unix(lease_until))
         .bind(id.to_string())
         .bind(to_unix(now))
-        .bind(i64::from(max_attempts))
         .fetch_optional(&self.pool)
         .await?;
-        attempt(claimed, "card_attempts")
+        attempt_count(claimed, "card_attempts")
     }
 
     /// Records where consent `id`'s card was posted, which ends its claim.
@@ -466,8 +583,9 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Ends a claim on consent `id`'s card that couldn't be sent: it may be
-    /// claimed again from `retry_at`, if attempts are left.
+    /// Ends claim `attempt` on consent `id`'s card, which couldn't be sent:
+    /// it may be claimed again from `retry_at`. False if the card was
+    /// posted, or a later claim took it over.
     ///
     /// # Errors
     ///
@@ -475,14 +593,16 @@ impl Store {
     pub async fn defer_consent_card(
         &self,
         id: ConsentId,
+        attempt: u32,
         retry_at: OffsetDateTime,
     ) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE consents SET card_next_attempt_at = ? \
-             WHERE id = ? AND card_message IS NULL",
+             WHERE id = ? AND card_attempts = ? AND card_message IS NULL",
         )
         .bind(to_unix(retry_at))
         .bind(id.to_string())
+        .bind(i64::from(attempt))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -527,6 +647,34 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// The soonest time after `now` at which something a consent owes
+    /// falls due: a pending consent's expiry, a card's or a claim's retry
+    /// or lease. `None` when nothing is due after `now`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if the time doesn't parse.
+    pub async fn next_consent_deadline(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Option<OffsetDateTime>> {
+        let next: Option<i64> = sqlx::query_scalar(
+            "SELECT MIN(due) FROM ( \
+             SELECT expires_at AS due FROM consents WHERE state = 'pending' \
+             AND finished_at IS NULL \
+             UNION ALL SELECT card_next_attempt_at FROM consents WHERE state = 'pending' \
+             AND finished_at IS NULL AND card_message IS NULL \
+             UNION ALL SELECT work_next_attempt_at FROM consents WHERE state <> 'pending' \
+             AND finished_at IS NULL) WHERE due > ?",
+        )
+        .bind(to_unix(now))
+        .fetch_one(&self.pool)
+        .await?;
+        next.map(|at| from_unix(at, TABLE, "next deadline"))
+            .transpose()
     }
 
     /// The decided consents whose work may be claimed at `now`, oldest
@@ -577,7 +725,7 @@ impl Store {
         .bind(to_unix(now))
         .fetch_optional(&self.pool)
         .await?;
-        attempt(claimed, "work_attempts")
+        attempt_count(claimed, "work_attempts")
     }
 
     /// Extends the lease of claim `attempt` on consent `id`'s work to
@@ -598,6 +746,58 @@ impl Store {
              WHERE id = ? AND work_attempts = ? AND finished_at IS NULL",
         )
         .bind(to_unix(lease_until))
+        .bind(id.to_string())
+        .bind(i64::from(attempt))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Ends claim `attempt` on consent `id`'s work, which failed: it may be
+    /// claimed again from `retry_at`. Returns how many claims failed so
+    /// far, or `None` if the work finished or a later claim took it over.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if the count is negative.
+    pub async fn fail_consent_work(
+        &self,
+        id: ConsentId,
+        attempt: u32,
+        retry_at: OffsetDateTime,
+    ) -> Result<Option<u32>> {
+        let failures: Option<i64> = sqlx::query_scalar(
+            "UPDATE consents SET work_failures = work_failures + 1, work_next_attempt_at = ? \
+             WHERE id = ? AND work_attempts = ? AND finished_at IS NULL RETURNING work_failures",
+        )
+        .bind(to_unix(retry_at))
+        .bind(id.to_string())
+        .bind(i64::from(attempt))
+        .fetch_optional(&self.pool)
+        .await?;
+        attempt_count(failures, "work_failures")
+    }
+
+    /// Ends claim `attempt` on consent `id`'s work, which was cut short
+    /// without failing, as by a shutdown: it may be claimed again from
+    /// `now`, and counts as no failure. False if the work finished or a
+    /// later claim took it over.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn release_consent_work(
+        &self,
+        id: ConsentId,
+        attempt: u32,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE consents SET work_next_attempt_at = ? \
+             WHERE id = ? AND work_attempts = ? AND finished_at IS NULL",
+        )
+        .bind(to_unix(now))
         .bind(id.to_string())
         .bind(i64::from(attempt))
         .execute(&self.pool)
@@ -698,17 +898,35 @@ mod tests {
         }
     }
 
+    const LIMITS: OpenLimits = OpenLimits {
+        per_requester: 100,
+        per_agent: 100,
+    };
+
     impl Fixture {
         async fn create(&self, owner_asked: bool, root: Option<&str>, expires: i64) -> Consent {
-            let requester = requester(None);
+            self.try_create(&requester(None), owner_asked, root, expires, LIMITS)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn try_create(
+            &self,
+            requester: &Requester,
+            owner_asked: bool,
+            root: Option<&str>,
+            expires: i64,
+            limits: OpenLimits,
+        ) -> Result<Option<Consent>> {
             let thread = thread(root);
             self.store
                 .create_consent(
                     &NewConsent {
                         id: ConsentId::new_v4(),
                         agent: self.agent,
-                        requester: &requester,
-                        hop: Hop(2),
+                        requester,
+                        hop: if owner_asked { Hop::ZERO } else { Hop(2) },
                         task: "Summarize the repo.",
                         attachments_json: "[]",
                         thread: &thread,
@@ -716,10 +934,10 @@ mod tests {
                         expires_at: at(expires),
                         approved_by_owner: owner_asked.then_some(&self.owner),
                     },
+                    limits,
                     at(100),
                 )
                 .await
-                .unwrap()
         }
     }
 
@@ -734,10 +952,27 @@ mod tests {
         assert_eq!(pending.requester, requester(None));
         assert_eq!(pending.decided_at, None);
         assert_eq!(pending.card, None);
+        assert_eq!(pending.approval, None);
         assert_eq!(fx.store.consent(pending.id).await.unwrap(), Some(pending));
 
         let owners = fx.create(true, None, 1_000).await;
+        let requester = requester(None);
+        let thread = thread(None);
+        let new = NewConsent {
+            id: owners.id,
+            agent: fx.agent,
+            requester: &requester,
+            hop: Hop::ZERO,
+            task: "Summarize the repo.",
+            attachments_json: "[]",
+            thread: &thread,
+            origin_session: owners.origin_session,
+            expires_at: at(1_000),
+            approved_by_owner: Some(&fx.owner),
+        };
+        assert_eq!(new.draft(at(100)), owners, "a draft is the row to be");
         assert_eq!(owners.state, ConsentState::Approved);
+        assert_eq!(owners.approval, Some(Approval::Asked));
         assert_eq!(owners.decided_by, Some(fx.owner.clone()));
         assert_eq!(owners.decided_at, Some(at(100)));
         assert_eq!(owners.thread.root, None);
@@ -756,6 +991,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decided.state, ConsentState::Declined);
+        assert_eq!(decided.approval, None);
         assert_eq!(decided.decided_by, Some(by.clone()));
         assert_eq!(
             fx.store
@@ -780,6 +1016,15 @@ mod tests {
         assert_eq!(expired[0].state, ConsentState::Expired);
         assert_eq!(expired[0].decided_by, None);
         assert!(fx.store.expire_consents(at(400)).await.unwrap().is_empty());
+
+        let orphan = fx.create(false, None, 10_000).await;
+        assert!(fx.store.delete_agent(fx.agent, at(500)).await.unwrap());
+        let expired = fx.store.expire_consents(at(500)).await.unwrap();
+        assert_eq!(
+            expired.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [orphan.id],
+            "a deleted agent's consents expire at once"
+        );
     }
 
     #[tokio::test]
@@ -787,18 +1032,18 @@ mod tests {
         let fx = fixture().await;
         let consent = fx.create(false, None, 10_000).await;
         fx.create(true, None, 10_000).await;
-        let owed = fx.store.consent_cards_owed(at(100), 3).await.unwrap();
+        let owed = fx.store.consent_cards_owed(at(100)).await.unwrap();
         assert_eq!(owed.len(), 1, "an approved consent owes no card");
         assert_eq!(
             fx.store
-                .claim_consent_card(consent.id, at(100), at(700), 3)
+                .claim_consent_card(consent.id, at(100), at(700))
                 .await
                 .unwrap(),
             Some(1)
         );
         assert_eq!(
             fx.store
-                .claim_consent_card(consent.id, at(101), at(701), 3)
+                .claim_consent_card(consent.id, at(101), at(701))
                 .await
                 .unwrap(),
             None,
@@ -806,16 +1051,30 @@ mod tests {
         );
         assert!(
             fx.store
-                .defer_consent_card(consent.id, at(150))
+                .defer_consent_card(consent.id, 1, at(150))
                 .await
                 .unwrap()
         );
         assert_eq!(
             fx.store
-                .claim_consent_card(consent.id, at(150), at(700), 3)
+                .claim_consent_card(consent.id, at(150), at(700))
                 .await
                 .unwrap(),
             Some(2)
+        );
+        assert!(
+            !fx.store
+                .defer_consent_card(consent.id, 1, at(151))
+                .await
+                .unwrap(),
+            "a stale claim can't shorten the latest one's lease"
+        );
+        assert_eq!(
+            fx.store
+                .claim_consent_card(consent.id, at(160), at(800))
+                .await
+                .unwrap(),
+            None
         );
         let card = MsgRef {
             conv: ConvRef {
@@ -839,13 +1098,13 @@ mod tests {
         );
         assert!(
             !fx.store
-                .defer_consent_card(consent.id, at(150))
+                .defer_consent_card(consent.id, 2, at(150))
                 .await
                 .unwrap()
         );
         assert!(
             fx.store
-                .consent_cards_owed(at(9_000), 3)
+                .consent_cards_owed(at(9_000))
                 .await
                 .unwrap()
                 .is_empty()
@@ -856,22 +1115,27 @@ mod tests {
         );
 
         let other = fx.create(false, None, 10_000).await;
-        for n in 1..=3 {
+        for n in 1..=20 {
             assert_eq!(
                 fx.store
-                    .claim_consent_card(other.id, at(100 * n), at(100 * n + 1), 3)
+                    .claim_consent_card(other.id, at(100 * n), at(100 * n + 1))
                     .await
                     .unwrap(),
-                Some(u32::try_from(n).unwrap())
+                Some(u32::try_from(n).unwrap()),
+                "a card is tried until its consent expires"
             );
         }
+        assert!(fx.store.expire_consent(other.id, at(2_500)).await.unwrap());
+        assert!(!fx.store.expire_consent(other.id, at(2_501)).await.unwrap());
+        let expired = fx.store.consent(other.id).await.unwrap().unwrap();
+        assert_eq!(expired.state, ConsentState::Expired);
+        assert_eq!(expired.decided_at, Some(at(2_500)));
         assert_eq!(
             fx.store
-                .claim_consent_card(other.id, at(1_000), at(1_001), 3)
+                .claim_consent_card(other.id, at(9_000), at(9_001))
                 .await
                 .unwrap(),
-            None,
-            "the attempts ran out"
+            None
         );
     }
 
@@ -899,10 +1163,13 @@ mod tests {
                 .unwrap(),
             "a pending card stays open"
         );
-        fx.store
+        let approved = fx
+            .store
             .decide_consent(consent.id, true, &fx.owner, at(150))
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(approved.approval, Some(Approval::Card));
         assert_eq!(fx.store.consent_cards_to_close().await.unwrap().len(), 1);
         assert!(
             fx.store
@@ -973,6 +1240,56 @@ mod tests {
             Some(2),
             "an expired lease is taken over"
         );
+        assert_eq!(
+            fx.store
+                .fail_consent_work(approved.id, 1, at(350))
+                .await
+                .unwrap(),
+            None,
+            "a stale claim can't fail the work"
+        );
+        assert!(
+            !fx.store
+                .release_consent_work(approved.id, 1, at(300))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            fx.store
+                .fail_consent_work(approved.id, 2, at(350))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(
+            fx.store
+                .consent_work_owed(at(349))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a failed claim waits for its retry"
+        );
+        assert_eq!(
+            fx.store
+                .claim_consent_work(approved.id, at(350), at(900))
+                .await
+                .unwrap(),
+            Some(3)
+        );
+        assert!(
+            fx.store
+                .release_consent_work(approved.id, 3, at(360))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            fx.store
+                .claim_consent_work(approved.id, at(360), at(900))
+                .await
+                .unwrap(),
+            Some(4),
+            "a released claim is taken again at once"
+        );
         let session = SessionId::new_v4();
         assert!(
             !fx.store
@@ -994,32 +1311,63 @@ mod tests {
         );
         assert!(
             fx.store
-                .set_consent_session(approved.id, 2, session)
+                .set_consent_session(approved.id, 4, session)
                 .await
                 .unwrap()
         );
         assert!(
             fx.store
-                .finish_consent(approved.id, 2, at(320))
+                .finish_consent(approved.id, 4, at(320))
                 .await
                 .unwrap()
         );
         assert!(
             !fx.store
-                .finish_consent(approved.id, 2, at(330))
+                .finish_consent(approved.id, 4, at(330))
                 .await
                 .unwrap()
         );
         let done = fx.store.consent(approved.id).await.unwrap().unwrap();
         assert_eq!(done.private_session, Some(session));
         assert_eq!(done.finished_at, Some(at(320)));
-        assert_eq!(done.work_attempts, 2);
+        assert_eq!(done.work_attempts, 4);
+        assert_eq!(done.work_failures, 1);
         assert!(
             fx.store
                 .consent_work_owed(at(9_000))
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_next_deadline_is_the_soonest_due_after_now() {
+        let fx = fixture().await;
+        assert_eq!(fx.store.next_consent_deadline(at(100)).await.unwrap(), None);
+        let pending = fx.create(false, None, 5_000).await;
+        let approved = fx.create(true, None, 1_000).await;
+        assert_eq!(
+            fx.store.next_consent_deadline(at(100)).await.unwrap(),
+            Some(at(5_000)),
+            "an approved consent's expiry is no deadline"
+        );
+        fx.store
+            .claim_consent_card(pending.id, at(100), at(700))
+            .await
+            .unwrap();
+        fx.store
+            .claim_consent_work(approved.id, at(100), at(400))
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.store.next_consent_deadline(at(100)).await.unwrap(),
+            Some(at(400))
+        );
+        assert_eq!(
+            fx.store.next_consent_deadline(at(400)).await.unwrap(),
+            Some(at(700)),
+            "only what falls due after now"
         );
     }
 
@@ -1050,9 +1398,105 @@ mod tests {
                     expires_at: at(10),
                     approved_by_owner: None,
                 },
+                LIMITS,
                 at(1),
             )
             .await;
         assert!(matches!(err, Err(StoreError::Database(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_owners_approval_at_once_is_refused_past_hop_zero() {
+        let fx = fixture().await;
+        let thread = thread(None);
+        let requester = requester(None);
+        let err = fx
+            .store
+            .create_consent(
+                &NewConsent {
+                    id: ConsentId::new_v4(),
+                    agent: fx.agent,
+                    requester: &requester,
+                    hop: Hop(1),
+                    task: "x",
+                    attachments_json: "[]",
+                    thread: &thread,
+                    origin_session: SessionId::new_v4(),
+                    expires_at: at(10),
+                    approved_by_owner: Some(&fx.owner),
+                },
+                LIMITS,
+                at(1),
+            )
+            .await;
+        assert!(matches!(err, Err(StoreError::Database(_))), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn unfinished_consents_are_limited_per_requester_and_per_agent() {
+        let fx = fixture().await;
+        let limits = OpenLimits {
+            per_requester: 2,
+            per_agent: 3,
+        };
+        let bob = requester(None);
+        let carol = Requester {
+            member: None,
+            key: member_key("carol"),
+        };
+        let first = fx
+            .try_create(&bob, false, None, 1_000, limits)
+            .await
+            .unwrap()
+            .unwrap();
+        fx.try_create(&bob, false, None, 1_000, limits)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fx.try_create(&bob, false, None, 1_000, limits)
+                .await
+                .unwrap(),
+            None,
+            "bob has as many as he may"
+        );
+        fx.try_create(&carol, false, None, 1_000, limits)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fx.try_create(&carol, false, None, 1_000, limits)
+                .await
+                .unwrap(),
+            None,
+            "the agent has as many as it may"
+        );
+        fx.store
+            .decide_consent(first.id, false, &fx.owner, at(150))
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.try_create(&bob, false, None, 1_000, limits)
+                .await
+                .unwrap(),
+            None,
+            "a decided consent counts until its work is done"
+        );
+        let attempt = fx
+            .store
+            .claim_consent_work(first.id, at(160), at(200))
+            .await
+            .unwrap()
+            .unwrap();
+        fx.store
+            .finish_consent(first.id, attempt, at(170))
+            .await
+            .unwrap();
+        assert!(
+            fx.try_create(&bob, false, None, 1_000, limits)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

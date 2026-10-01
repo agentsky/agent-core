@@ -8,12 +8,14 @@
 //! each component of a path below it is opened relative to its parent's
 //! handle with `O_NOFOLLOW`, directories with `O_PATH`, and the file
 //! itself with `O_NONBLOCK`, so a FIFO can't hold the request up. Only a
-//! regular file is copied, and at most the attachment cap of it.
+//! regular file is copied, and at most the attachment cap of all of them
+//! together, counted in the bytes actually read. A name a Claude session
+//! would read as its configuration, a dotfile or `CLAUDE.md`, is refused.
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, fchown};
 use std::path::{Component, Path};
 
 use rustix::fs::{FileType, Mode, OFlags};
@@ -35,8 +37,8 @@ pub enum StageError {
     /// A directory, a symlink, or anything else but a regular file.
     #[error("{0} is not a regular file")]
     NotAFile(String),
-    /// The file is over the attachment cap.
-    #[error("{0} is over the {1}-byte attachment limit")]
+    /// The file takes the files over the attachment cap, which they share.
+    #[error("{0} takes the files over the {1}-byte limit for a private task's files together")]
     TooLarge(String, u64),
     /// The file's name couldn't be shown as an attachment's.
     #[error(
@@ -44,6 +46,10 @@ pub enum StageError {
          invisible formatting characters"
     )]
     BadName(String),
+    /// The file's name is one a Claude session reads as its
+    /// configuration.
+    #[error("{0} is a dotfile or CLAUDE.md, which a private task isn't handed; rename it")]
+    ConfigName(String),
     /// Two files have the same name.
     #[error("two files are named {0}")]
     Duplicate(String),
@@ -62,8 +68,8 @@ const FILE: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC);
 
 /// Copies each of `files`, a path relative to `session_dir`, into `dir`,
-/// which must exist, as `0`, `1`, and so on, and returns their names. A
-/// file over `cap` bytes is refused.
+/// which must exist, as `0`, `1`, and so on, and returns their names.
+/// Files over `cap` bytes together are refused.
 ///
 /// # Errors
 ///
@@ -75,13 +81,13 @@ pub(super) fn stage(
     cap: u64,
 ) -> Result<Vec<String>, StageError> {
     let mut names = Vec::with_capacity(files.len());
+    let mut left = cap;
     for (index, file) in files.iter().enumerate() {
         let (name, source) = open_in(session_dir, file)?;
         if names.contains(&name) {
             return Err(StageError::Duplicate(name));
         }
-        let size = source.metadata()?.len();
-        if size > cap {
+        if source.metadata()?.len() > left {
             return Err(StageError::TooLarge(file.clone(), cap));
         }
         let mut dest = OpenOptions::new()
@@ -89,10 +95,10 @@ pub(super) fn stage(
             .create_new(true)
             .mode(0o600)
             .open(dir.join(index.to_string()))?;
-        let copied = io::copy(&mut source.take(cap.saturating_add(1)), &mut dest)?;
-        if copied > cap {
-            return Err(StageError::TooLarge(file.clone(), cap));
-        }
+        let copied = io::copy(&mut source.take(left.saturating_add(1)), &mut dest)?;
+        left = left
+            .checked_sub(copied)
+            .ok_or_else(|| StageError::TooLarge(file.clone(), cap))?;
         names.push(name);
     }
     Ok(names)
@@ -117,6 +123,9 @@ fn open_in(session_dir: &Path, file: &str) -> Result<(String, File), StageError>
         .filter(|name| is_plain_file_name(name))
         .ok_or_else(|| StageError::BadName(file.to_owned()))?
         .to_owned();
+    if is_config_name(&name) {
+        return Err(StageError::ConfigName(file.to_owned()));
+    }
     let refused = |errno: Errno| match errno {
         Errno::NOENT | Errno::NOTDIR => StageError::NotFound(file.to_owned()),
         Errno::LOOP | Errno::ISDIR | Errno::NXIO => StageError::NotAFile(file.to_owned()),
@@ -134,14 +143,29 @@ fn open_in(session_dir: &Path, file: &str) -> Result<(String, File), StageError>
     Ok((name, File::from(fd)))
 }
 
+/// Whether `name` is one a Claude session reads as its configuration: a
+/// dotfile, such as `.mcp.json` or `.claude`, or `CLAUDE.md` or
+/// `CLAUDE.local.md` in any case.
+fn is_config_name(name: &str) -> bool {
+    name.starts_with('.')
+        || name.eq_ignore_ascii_case("CLAUDE.md")
+        || name.eq_ignore_ascii_case("CLAUDE.local.md")
+}
+
 /// Copies the files [`stage`] put in `dir` into `work`, a new session's
-/// working directory, under their `names`, readable by the sandbox user.
+/// working directory, under their `names`, owned by `owner`, the uid and
+/// gid agents run as, so the task can change them.
 ///
 /// # Errors
 ///
-/// If a staged file can't be read, or a copy can't be made, as when a
-/// file of that name is already in `work`.
-pub(super) fn hand_over(dir: &Path, names: &[String], work: &Path) -> io::Result<()> {
+/// If a staged file can't be read, or a copy can't be made or given to
+/// `owner`, as when a file of that name is already in `work`.
+pub(super) fn hand_over(
+    dir: &Path,
+    names: &[String],
+    work: &Path,
+    owner: (u32, u32),
+) -> io::Result<()> {
     for (index, name) in names.iter().enumerate() {
         let mut source = File::open(dir.join(index.to_string()))?;
         let mut dest = OpenOptions::new()
@@ -149,6 +173,10 @@ pub(super) fn hand_over(dir: &Path, names: &[String], work: &Path) -> io::Result
             .create_new(true)
             .mode(0o644)
             .open(work.join(name))?;
+        let meta = dest.metadata()?;
+        if (meta.uid(), meta.gid()) != owner {
+            fchown(&dest, Some(owner.0), Some(owner.1))?;
+        }
         io::copy(&mut source, &mut dest)?;
     }
     Ok(())
@@ -191,17 +219,24 @@ mod tests {
     #[test]
     fn staged_files_are_copied_out_and_handed_over_by_name() {
         let (session, staged) = session();
-        let names = stage(
-            &session.0,
-            &files(&["work/in.txt", "work/sub/data.csv"]),
-            &staged.0,
-            5,
-        )
-        .unwrap();
+        let both = files(&["work/in.txt", "work/sub/data.csv"]);
+        let err = stage(&session.0, &both, &staged.0, 7).unwrap_err();
+        assert!(
+            matches!(&err, StageError::TooLarge(file, 7) if file == "work/sub/data.csv"),
+            "the cap counts the files together: {err}"
+        );
+        for entry in std::fs::read_dir(&staged.0).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        let names = stage(&session.0, &both, &staged.0, 8).unwrap();
         assert_eq!(names, ["in.txt", "data.csv"]);
         std::fs::write(session.0.join("work/in.txt"), "changed later").unwrap();
         let work = TempDir::new();
-        hand_over(&staged.0, &names, &work.0).unwrap();
+        let me = std::fs::metadata(&work.0).unwrap();
+        let owner = (me.uid(), me.gid());
+        hand_over(&staged.0, &names, &work.0, owner).unwrap();
+        let handed = std::fs::metadata(work.0.join("in.txt")).unwrap();
+        assert_eq!((handed.uid(), handed.gid()), owner);
         assert_eq!(
             std::fs::read_to_string(work.0.join("in.txt")).unwrap(),
             "input"
@@ -210,7 +245,7 @@ mod tests {
             std::fs::read_to_string(work.0.join("data.csv")).unwrap(),
             "a,b"
         );
-        assert!(hand_over(&staged.0, &names, &work.0).is_err());
+        assert!(hand_over(&staged.0, &names, &work.0, owner).is_err());
     }
 
     #[test]
@@ -222,6 +257,8 @@ mod tests {
         symlink(&outside.0, session.0.join("work/dirlink")).unwrap();
         std::fs::write(session.0.join("work/big"), "123456").unwrap();
         std::fs::write(session.0.join("work/bad\u{202E}name"), "x").unwrap();
+        std::fs::write(session.0.join("work/.mcp.json"), "{}").unwrap();
+        std::fs::write(session.0.join("work/claude.MD"), "x").unwrap();
         let cases = [
             ("/etc/passwd", "is not a path"),
             ("../other/work/x", "is not a path"),
@@ -233,8 +270,10 @@ mod tests {
             ("work/link", "is not a regular file"),
             ("work/dirlink/secret", "doesn't exist"),
             ("work/sub", "is not a regular file"),
-            ("work/big", "attachment limit"),
+            ("work/big", "limit for a private task's files together"),
             ("work/bad\u{202E}name", "isn't plain"),
+            ("work/.mcp.json", "dotfile or CLAUDE.md"),
+            ("work/claude.MD", "dotfile or CLAUDE.md"),
         ];
         for (path, reason) in cases {
             let err = stage(&session.0, &files(&[path]), &staged.0, 5).unwrap_err();

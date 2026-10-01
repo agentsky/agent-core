@@ -72,7 +72,7 @@ pub use agents::{
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use community::CommunityKeyStatus;
-pub use consents::{Consent, ConsentState, NewConsent};
+pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use message_refs::{MessageRef, NewMessageRef};

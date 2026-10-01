@@ -89,7 +89,16 @@ pub const STAGING_DIR: &str = "ctl-outbox";
 pub trait SurfaceLookup: Send + Sync + std::fmt::Debug {
     /// The surface that acts as `agent`'s bot on `conv`'s surface and
     /// team, if the agent has an active binding there.
-    async fn surface(&self, agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>>;
+    ///
+    /// # Errors
+    ///
+    /// If the store couldn't say, which isn't the same as no surface: the
+    /// caller may try again.
+    async fn surface(
+        &self,
+        agent: AgentId,
+        conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError>;
 }
 
 /// A [`SurfaceLookup`] with no surfaces.
@@ -98,8 +107,12 @@ pub struct NoSurfaces;
 
 #[async_trait::async_trait]
 impl SurfaceLookup for NoSurfaces {
-    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        None
+    async fn surface(
+        &self,
+        _agent: AgentId,
+        _conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        Ok(None)
     }
 }
 

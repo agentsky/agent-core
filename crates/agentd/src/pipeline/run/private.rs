@@ -1,8 +1,8 @@
 //! The work a decided consent owes, which the pipeline does: an approved
 //! private task, run in a fresh session on the owner's private volume, or
-//! the declined or expired outcome, posted in the thread that asked.
+//! the outcome of one that didn't run, posted in the thread that asked.
 
-use store::{AgentState, Consent, ConsentState};
+use store::{AgentState, Approval, Consent, ConsentState};
 
 use super::*;
 use crate::consents::{self, Consents, card};
@@ -10,12 +10,20 @@ use crate::consents::{self, Consents, card};
 /// How long a claim on a consent's work lasts. A running task renews it
 /// every third of that.
 pub const WORK_LEASE: Duration = Duration::from_secs(10 * 60);
-/// How long after a task failed before reaching the model it is tried
-/// again.
+/// How long after a try of a consent's work failed it is tried again.
 pub const WORK_RETRY: Duration = Duration::from_secs(60);
-/// How many times a consent's work is tried before the thread is told it
-/// couldn't be done.
+/// How many tries of a consent's work may fail before the thread is told
+/// it couldn't be done. A try cut short by a shutdown isn't one of them.
 pub const WORK_MAX_ATTEMPTS: u32 = 3;
+
+/// What became of a claim on a private task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ran {
+    /// The work is done with: delivered, or not deliverable.
+    Done,
+    /// Another claim took it over.
+    TakenOver,
+}
 
 impl Pipeline {
     /// Does the work each decided consent in `consents` owes, oldest
@@ -25,30 +33,40 @@ impl Pipeline {
     ///   the pipeline's own, holding a place among the owner's agents'
     ///   messages ([`PipelineSettings::max_pending_per_owner`]) and the
     ///   pipeline's; while none is free it waits for the next pass. The
-    ///   task gets a new session
+    ///   thread's caps ([`Limits::thread_budget`]) are checked first, as
+    ///   for any turn outside a DM: a capped thread is told so, and the
+    ///   task doesn't run. The task gets a new session
     ///   ([`SessionManager::create_private`](runner::SessionManager::create_private))
     ///   on the owner's private volume, never the owner's DM session, with
     ///   the consent's files copied into its `work/`. Its turn message is
     ///   the task text and the files' names alone, with no thread history;
-    ///   it runs on the owner's credential, on the owner's side only when
-    ///   the owner asked for it, as a
+    ///   it runs on the owner's credential, as a
     ///   [`TurnKind::PrivateTask`](core_types::TurnKind::PrivateTask), so
-    ///   agentctl allows only `attach`. Its container is stopped right
-    ///   after, and the turn is billed to the owner. Its reply, headed
-    ///   with the consent's id, and its attached files are posted in the
-    ///   thread that asked as the agent's bot, each chunk recorded in
-    ///   `message_refs` with the consent's requester and hop and the
-    ///   private session, where that thread's session finds it on its next
-    ///   turn.
+    ///   agentctl allows only `attach`, and on the owner's side only when
+    ///   the owner asked for it at hop 0, or approved on its card a task
+    ///   their own identity asked for. Its container is stopped
+    ///   once the turn ends, however the task ends, and the turn is billed
+    ///   to the owner. Its reply, headed with the consent's id, and its
+    ///   attached files are posted in the thread that asked as the agent's
+    ///   bot, each chunk recorded in `message_refs` with the consent's
+    ///   requester and hop, the private session and the consent, where
+    ///   that thread's session finds it on its next turn. A mention in it
+    ///   starts no agent's turn. The session's directory is deleted then.
+    /// - An approved task of a paused agent waits for the agent to be
+    ///   resumed until the consent's expiry, and then the thread is told it
+    ///   didn't run.
     /// - A declined or expired consent's outcome is posted in the thread
     ///   the same way, under a session id that is the consent's own, since
-    ///   no session ran.
+    ///   no session ran. Nothing is posted for a deleted agent.
     ///
     /// The work is leased ([`WORK_LEASE`]), so an instance that dies
-    /// leaves it to the next pass anywhere. A task that fails before its
-    /// turn reached the model is tried again after [`WORK_RETRY`]; after
-    /// [`WORK_MAX_ATTEMPTS`] tries the thread is told it couldn't be run.
-    /// The consent's files are deleted once its work is done.
+    /// leaves it to the next pass anywhere, and a shutdown releases what it
+    /// cut short. A task is run again only if no turn of it reached the
+    /// model: a claim that finds an earlier claim's session had its turn
+    /// sent to the CLI tells the thread the task was interrupted instead.
+    /// A try that fails is tried again after [`WORK_RETRY`]; after
+    /// [`WORK_MAX_ATTEMPTS`] failures the thread is told it couldn't be
+    /// done. The consent's files are deleted once its work is done.
     ///
     /// # Errors
     ///
@@ -59,7 +77,10 @@ impl Pipeline {
             if self.is_closed() {
                 return Ok(());
             }
-            let agent = store.agent(consent.agent).await?;
+            let agent = store
+                .agent(consent.agent)
+                .await?
+                .filter(|agent| agent.state != AgentState::Deleted);
             match agent {
                 Some(agent)
                     if consent.state == ConsentState::Approved
@@ -67,15 +88,21 @@ impl Pipeline {
                 {
                     self.start_private_task(consents, consent, agent).await?;
                 }
+                Some(agent)
+                    if consent.state == ConsentState::Approved
+                        && Consents::now() < consent.expires_at =>
+                {
+                    tracing::debug!(consent = %consent.id, agent = %agent.id, "a private task waits for its paused agent");
+                }
                 agent => self.post_outcome(consents, &consent, agent).await?,
             }
         }
         Ok(())
     }
 
-    /// Posts the outcome of `consent`, whose agent is `agent` if it isn't
-    /// deleted: declined, expired, or, for an approved task whose agent
-    /// was paused, that it couldn't be run.
+    /// Posts the outcome of `consent`, whose agent is `agent` unless it was
+    /// deleted: declined, expired, or, for an approved task, that its
+    /// agent stayed paused.
     async fn post_outcome(
         &self,
         consents: &Consents,
@@ -90,36 +117,73 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        let text = agent
-            .filter(|agent| agent.state != AgentState::Deleted)
-            .map(|agent| match consent.state {
-                ConsentState::Declined => card::declined_text(consent.id, &agent.name),
-                ConsentState::Expired => card::expired_text(
-                    consent.id,
-                    &agent.name,
-                    consent.expires_at - consent.created_at,
-                ),
-                ConsentState::Approved | ConsentState::Pending => card::failed_text(consent.id),
-            });
-        let posted = match text {
+        let id = consent.id;
+        let text = agent.map(|agent| match consent.state {
+            ConsentState::Declined => card::declined_text(id, &agent.name),
+            ConsentState::Expired if consent.card.is_none() => {
+                card::unreachable_text(id, &agent.name)
+            }
+            ConsentState::Expired => {
+                card::expired_text(id, &agent.name, consent.expires_at - consent.created_at)
+            }
+            ConsentState::Approved => card::paused_text(id, &agent.name),
+            ConsentState::Pending => card::failed_text(id),
+        });
+        let told = match text {
             Some(text) => self.tell_thread(consent, &text).await,
-            None => true,
+            None => Ok(()),
         };
-        if posted || attempt >= WORK_MAX_ATTEMPTS {
-            self.finish_consent(consents, consent.id, attempt).await?;
+        match told {
+            Ok(()) => self.finish_consent(consents, id, attempt).await,
+            Err(err) => self.failed(consents, consent, attempt, &err, false).await,
         }
-        Ok(())
+    }
+
+    /// Records that claim `attempt` of `consent`'s work failed with `err`,
+    /// to be tried again after [`WORK_RETRY`], or, after
+    /// [`WORK_MAX_ATTEMPTS`] failures, gives up: telling the thread the
+    /// task couldn't be run when `tell` says to, and finishing the work.
+    async fn failed(
+        &self,
+        consents: &Consents,
+        consent: &Consent,
+        attempt: u32,
+        err: &PipelineError,
+        tell: bool,
+    ) -> Result<(), StoreError> {
+        let id = consent.id;
+        let retry = Consents::now() + WORK_RETRY;
+        let Some(failures) = self
+            .inner
+            .store
+            .fail_consent_work(id, attempt, retry)
+            .await?
+        else {
+            return Ok(());
+        };
+        if failures < WORK_MAX_ATTEMPTS {
+            tracing::warn!(consent = %id, failures, error = %err, "a private task's work failed; it is tried again later");
+            return Ok(());
+        }
+        tracing::warn!(consent = %id, failures, error = %err, "a private task's work failed too often; giving up");
+        if tell && let Err(err) = self.tell_thread(consent, &card::failed_text(id)).await {
+            tracing::warn!(consent = %id, error = %err, "couldn't tell the thread a private task couldn't be run");
+        }
+        self.finish_consent(consents, id, attempt).await
     }
 
     /// Takes the places `consent`'s task holds and claims its work, then
-    /// runs it in a task of the pipeline's own. Nothing when a place isn't
-    /// free, the work is claimed elsewhere, or the pipeline closed.
+    /// runs it in a task of the pipeline's own. Nothing when the pipeline
+    /// closed, a place isn't free, or the work is claimed elsewhere.
     async fn start_private_task(
         &self,
         consents: &Consents,
         consent: Consent,
         agent: Agent,
     ) -> Result<(), StoreError> {
+        if self.is_closed() {
+            return Ok(());
+        }
         let Some(places) = self.places(agent.owner) else {
             tracing::debug!(consent = %consent.id, "no place for a private task yet; it waits");
             return Ok(());
@@ -132,17 +196,19 @@ impl Pipeline {
         else {
             return Ok(());
         };
-        if attempt > WORK_MAX_ATTEMPTS {
-            tracing::warn!(consent = %consent.id, "a private task was claimed too often; giving up");
-            self.tell_thread(&consent, &card::failed_text(consent.id))
-                .await;
-            return self.finish_consent(consents, consent.id, attempt).await;
-        }
         let mut tasks = lock(&self.inner.tasks);
         if self.is_closed() {
+            drop(tasks);
+            if let Err(err) = store
+                .release_consent_work(consent.id, attempt, Consents::now())
+                .await
+            {
+                tracing::warn!(consent = %consent.id, error = %err, "couldn't release a private task the pipeline closed on");
+            }
             return Ok(());
         }
         reap(&mut tasks);
+        lock(&self.inner.private).insert(consent.id, attempt);
         tasks.spawn(
             self.clone()
                 .private_task(consents.clone(), consent, agent, attempt, places),
@@ -164,29 +230,17 @@ impl Pipeline {
         let id = consent.id;
         let ran = tokio::select! {
             ran = self.run_private_task(&consents, &consent, &agent, attempt) => ran,
-            () = self.renew_work(id, attempt) => return,
+            () = self.renew_work(id, attempt) => Ok(Ran::TakenOver),
         };
-        let store = &self.inner.store;
-        let done = match ran {
-            Ok(true) => true,
-            Ok(false) => return,
-            Err(err) if attempt >= WORK_MAX_ATTEMPTS => {
-                tracing::warn!(consent = %id, attempt, error = %err, "a private task failed before it reached the model; giving up");
-                self.tell_thread(&consent, &card::failed_text(id)).await;
-                true
-            }
-            Err(err) => {
-                tracing::warn!(consent = %id, attempt, error = %err, "a private task failed before it reached the model; it runs again later");
-                let retry = Consents::now() + WORK_RETRY;
-                if let Err(err) = store.renew_consent_work(id, attempt, retry).await {
-                    tracing::warn!(consent = %id, error = %err, "couldn't set when a private task runs again");
-                }
-                false
-            }
+        let settled = match ran {
+            Ok(Ran::Done) => self.finish_consent(&consents, id, attempt).await,
+            Ok(Ran::TakenOver) => Ok(()),
+            Err(err) => self.failed(&consents, &consent, attempt, &err, true).await,
         };
-        if done && let Err(err) = self.finish_consent(&consents, id, attempt).await {
-            tracing::warn!(consent = %id, error = %err, "couldn't record that a private task is done");
+        if let Err(err) = settled {
+            tracing::warn!(consent = %id, error = %err, "couldn't record how a private task went");
         }
+        lock(&self.inner.private).remove(&id);
     }
 
     /// Renews claim `attempt` on consent `id`'s work every third of
@@ -212,30 +266,68 @@ impl Pipeline {
         }
     }
 
+    /// Releases the claims of the private tasks a shutdown cut short, so
+    /// another instance takes them up at once, none of them counted as a
+    /// failure.
+    pub(super) async fn release_cut_tasks(&self) {
+        let cut: Vec<(ConsentId, u32)> = lock(&self.inner.private).drain().collect();
+        for (id, attempt) in cut {
+            match self
+                .inner
+                .store
+                .release_consent_work(id, attempt, Consents::now())
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(consent = %id, "released a private task a shutdown cut short");
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(consent = %id, error = %err, "couldn't release a private task a shutdown cut short");
+                }
+            }
+        }
+    }
+
     /// Runs `consent`'s task, as [`settle_consents`](Self::settle_consents)
-    /// describes. True once it is done with, delivered or not deliverable,
-    /// and false when another claim took it over.
+    /// describes.
     async fn run_private_task(
         &self,
         consents: &Consents,
         consent: &Consent,
         agent: &Agent,
         attempt: u32,
-    ) -> Result<bool, PipelineError> {
+    ) -> Result<Ran, PipelineError> {
+        let store = &self.inner.store;
+        if let Some(earlier) = consent.private_session
+            && let Some(session) = store.session(earlier).await?
+            && (session.resumes() || session.last_turn_at.is_some())
+        {
+            tracing::warn!(consent = %consent.id, session = %earlier, "a private task's earlier run reached the model before it was cut short; not running it again");
+            self.tell_thread(consent, &card::interrupted_text(consent.id))
+                .await?;
+            return Ok(Ran::Done);
+        }
         let conv = &consent.thread.conv;
-        let Some(surface) = self.inner.surfaces.surface(agent.id, conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent.id, conv).await? else {
             tracing::warn!(consent = %consent.id, "the agent has no surface in the thread that asked; the private task can't report");
-            return Ok(true);
+            return Ok(Ran::Done);
         };
         if !surface.can_post(conv).await? {
             tracing::info!(consent = %consent.id, "the agent's bot left the thread that asked; not running the private task");
-            return Ok(true);
+            return Ok(Ran::Done);
+        }
+        if let Some(reason) = self.thread_capped(consent).await? {
+            tracing::info!(consent = %consent.id, %reason, "the thread that asked is capped; not running the private task");
+            let refusal = refusal_text(&agent.name, reason);
+            self.tell_thread(consent, &card::limited_text(consent.id, &refusal))
+                .await?;
+            return Ok(Ran::Done);
         }
         let credential = CredentialRef::Member(agent.owner);
         let Some(prepared) = self.prepare(agent.id, conv, credential).await? else {
-            return Ok(true);
+            return Ok(Ran::Done);
         };
-        let store = &self.inner.store;
         let sessions = self.inner.turns.sessions();
         let session = sessions
             .create_private(agent.id, consent.id, &consent.thread)
@@ -244,18 +336,14 @@ impl Pipeline {
             .set_consent_session(consent.id, attempt, session.id)
             .await?
         {
-            return Ok(false);
+            return Ok(Ran::TakenOver);
         }
-        let work = sessions.work_dir(&session).await?;
+        let dirs = sessions.work_dir(&session).await?;
         consents
-            .hand_over(consent, work)
+            .hand_over(consent, dirs.work.clone(), dirs.owner)
             .await
             .map_err(PipelineError::HandOver)?;
-        let side = if consent.requester.member == Some(agent.owner) {
-            Side::Owner
-        } else {
-            Side::Public
-        };
+        let side = side(consent, agent.owner);
         let request = TurnRequest {
             turn: TurnId::new_v4(),
             message: task_message(&consent.task, &consents::attachments(consent)),
@@ -269,8 +357,9 @@ impl Pipeline {
         };
         let turn = request.turn;
         tracing::info!(consent = %consent.id, session = %session.id, ?side, "running a private task");
+        let stopping = StopOnDrop::new(self, session.id);
         let report = sessions.run_turn(session.id, request).await;
-        sessions.stop(session.id).await;
+        stopping.stop().await;
         let report = report?;
         self.bill(
             agent.owner,
@@ -293,25 +382,45 @@ impl Pipeline {
         }
         .report(turn, report)
         .await;
-        Ok(true)
+        consents::discard(dirs.session_dir).await;
+        Ok(Ran::Done)
+    }
+
+    /// Why the thread `consent` was asked for in takes no more turns now,
+    /// by its caps, if it doesn't. A task asked for in a DM, which the
+    /// caps don't cover, is never capped.
+    async fn thread_capped(&self, consent: &Consent) -> Result<Option<RefuseReason>, StoreError> {
+        let store = &self.inner.store;
+        let in_dm = store
+            .session(consent.origin_session)
+            .await?
+            .is_some_and(|session| matches!(session.scope, ScopeKey::Dm(_) | ScopeKey::Private));
+        if in_dm {
+            return Ok(None);
+        }
+        let settings = &self.inner.settings;
+        let spend = store
+            .thread_spend(&consent.thread, (settings.now)())
+            .await?;
+        Ok(settings.limits.thread_budget(spend).exceeded())
     }
 
     /// Posts Markdown `text` about `consent` in the thread that asked, as
-    /// its agent's bot, recorded in `message_refs` like a reply under a
-    /// session id that is the consent's own. True once posted, or when
-    /// the agent can't post there any more.
-    async fn tell_thread(&self, consent: &Consent, text: &str) -> bool {
+    /// its agent's bot, recorded in `message_refs` like a private task's
+    /// reply under a session id that is the consent's own. Done when it is
+    /// posted, or when the agent can't post there any more.
+    ///
+    /// # Errors
+    ///
+    /// When it wasn't posted but may be later.
+    async fn tell_thread(&self, consent: &Consent, text: &str) -> Result<(), PipelineError> {
         let conv = &consent.thread.conv;
-        let Some(surface) = self.inner.surfaces.surface(consent.agent, conv).await else {
-            return true;
+        let Some(surface) = self.inner.surfaces.surface(consent.agent, conv).await? else {
+            tracing::warn!(consent = %consent.id, "the agent has no surface in the thread that asked; its outcome isn't posted");
+            return Ok(());
         };
-        match surface.can_post(conv).await {
-            Ok(true) => {}
-            Ok(false) => return true,
-            Err(err) => {
-                tracing::warn!(consent = %consent.id, error = %err, "couldn't check that the agent can post a private task's outcome");
-                return false;
-            }
+        if !surface.can_post(conv).await? {
+            return Ok(());
         }
         let delivery = Delivery {
             store: &self.inner.store,
@@ -324,11 +433,11 @@ impl Pipeline {
             target: ReplyTarget::from(consent.thread.clone()),
             answering: Answering::PrivateTask(consent.id),
         };
-        let posted = delivery.post(None, text).await;
-        if posted {
-            tracing::info!(consent = %consent.id, "posted a private task's outcome");
+        if !delivery.post(None, text).await {
+            return Err(PipelineError::NotPosted);
         }
-        posted
+        tracing::info!(consent = %consent.id, "posted a private task's outcome");
+        Ok(())
     }
 
     /// Records that claim `attempt` did consent `id`'s work, and deletes
@@ -348,6 +457,64 @@ impl Pipeline {
             consents.forget_files(id).await;
         }
         Ok(())
+    }
+}
+
+/// The side an approved `consent` of an agent `owner` owns runs on: the
+/// owner's when the owner asked for it at hop 0, or approved on its card a
+/// task their own identity asked for, and the public side otherwise. It
+/// never follows from who the requester is alone.
+fn side(consent: &Consent, owner: MemberId) -> Side {
+    let owners = consent.requester.member == Some(owner);
+    match consent.approval {
+        Some(Approval::Asked) if owners && consent.hop == Hop::ZERO => Side::Owner,
+        Some(Approval::Card) if owners => Side::Owner,
+        _ => Side::Public,
+    }
+}
+
+/// Stops a private task's session's container when dropped, as when the
+/// task is cut short or taken over while its turn runs, unless
+/// [`stop`](Self::stop) did first.
+struct StopOnDrop {
+    pipeline: Pipeline,
+    session: SessionId,
+    armed: bool,
+}
+
+impl StopOnDrop {
+    fn new(pipeline: &Pipeline, session: SessionId) -> Self {
+        Self {
+            pipeline: pipeline.clone(),
+            session,
+            armed: true,
+        }
+    }
+
+    /// Stops the session's container now.
+    async fn stop(mut self) {
+        self.pipeline
+            .inner
+            .turns
+            .sessions()
+            .stop(self.session)
+            .await;
+        self.armed = false;
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pipeline = self.pipeline.clone();
+        let session = self.session;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                pipeline.inner.turns.sessions().stop(session).await;
+            });
+        }
     }
 }
 
@@ -374,5 +541,49 @@ mod tests {
             task_message("do it", &["a.txt".to_owned(), "b.csv".to_owned()]),
             "do it\n\nFiles handed to this task, in the working directory: a.txt, b.csv"
         );
+    }
+
+    #[test]
+    fn the_owners_side_follows_how_a_task_was_approved_not_who_asked() {
+        let owner = MemberId::new_v4();
+        let thread = ThreadKey {
+            conv: ConvRef {
+                surface: core_types::SurfaceKind::RocketChat,
+                team: "chat.example".into(),
+                conversation: "GENERAL".into(),
+            },
+            root: None,
+        };
+        let requester = Requester {
+            member: Some(owner),
+            key: MemberKey {
+                surface: core_types::SurfaceKind::RocketChat,
+                team: "chat.example".into(),
+                user: "alice".into(),
+            },
+        };
+        let new = store::NewConsent {
+            id: ConsentId::new_v4(),
+            agent: AgentId::new_v4(),
+            requester: &requester,
+            hop: Hop::ZERO,
+            task: "t",
+            attachments_json: "[]",
+            thread: &thread,
+            origin_session: SessionId::new_v4(),
+            expires_at: OffsetDateTime::UNIX_EPOCH,
+            approved_by_owner: Some(&requester.key),
+        };
+        let mut consent = new.draft(OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(side(&consent, owner), Side::Owner, "asked at hop 0");
+        consent.hop = Hop(1);
+        assert_eq!(side(&consent, owner), Side::Public, "never asked at a hop");
+        consent.approval = Some(Approval::Card);
+        assert_eq!(side(&consent, owner), Side::Owner, "the owner's card");
+        consent.requester.member = None;
+        assert_eq!(side(&consent, owner), Side::Public, "someone else's card");
+        consent.approval = None;
+        consent.requester.member = Some(owner);
+        assert_eq!(side(&consent, owner), Side::Public, "not approved");
     }
 }

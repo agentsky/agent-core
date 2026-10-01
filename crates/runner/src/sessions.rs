@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
-use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -51,6 +51,20 @@ pub struct SessionConfig {
     /// agentd's data directory, which holds each agent's persona directory
     /// ([`persona_dir`]) and skills directory ([`skills_dir`]).
     pub data_dir: PathBuf,
+}
+
+/// A session's directories, as agentd sees them, from
+/// [`SessionManager::work_dir`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkDir {
+    /// The session's directory.
+    pub session_dir: PathBuf,
+    /// Its `work/` directory, the CLI's working directory.
+    pub work: PathBuf,
+    /// The uid and gid of the volume's `shared/` directory, which the
+    /// sandbox gives the user agents run as: who should own a file put in
+    /// `work/`.
+    pub owner: (u32, u32),
 }
 
 /// How one turn went, as [`SessionManager::run_turn`] returns it.
@@ -401,10 +415,10 @@ impl<H: TurnHooks> SessionManager<H> {
             .await?)
     }
 
-    /// The `work/` directory of `session`, as agentd sees it, made with
-    /// the session's directory, and its volume if that is missing, so files
-    /// can be handed to a new session before its first turn, as a private
-    /// task's are. Directories already there are kept as they are.
+    /// The directories of `session`, as agentd sees them, made with its
+    /// volume if that is missing, so files can be handed to a new session
+    /// before its first turn, as a private task's are. Directories already
+    /// there are kept as they are.
     ///
     /// Call it only for a session no container has run yet: nothing in a
     /// sandbox can have touched a directory made here, and the sandbox
@@ -414,19 +428,20 @@ impl<H: TurnHooks> SessionManager<H> {
     ///
     /// [`RunnerError::Sandbox`] if the volume couldn't be made, and
     /// [`RunnerError::Io`] if a directory couldn't.
-    pub async fn work_dir(&self, session: &Session) -> Result<PathBuf> {
+    pub async fn work_dir(&self, session: &Session) -> Result<WorkDir> {
         let volume = self.inner.sandbox.ensure_volume(&session.volume()).await?;
         let session_dir = volume.session_dir(session.id);
-        let work = session_dir.join("work");
-        let made = work.clone();
-        tokio::task::spawn_blocking(move || {
-            for dir in [&session_dir, &made] {
-                match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+        let shared = volume.shared_dir();
+        let made = session_dir.clone();
+        let owner = tokio::task::spawn_blocking(move || {
+            for dir in [made.clone(), made.join("work")] {
+                match std::fs::DirBuilder::new().mode(0o755).create(&dir) {
                     Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err),
                     _ => {}
                 }
             }
-            Ok(())
+            let shared = std::fs::metadata(shared)?;
+            Ok((shared.uid(), shared.gid()))
         })
         .await
         .map_err(|_| RunnerError::TurnTask)?
@@ -434,7 +449,11 @@ impl<H: TurnHooks> SessionManager<H> {
             what: "making a session's work directory",
             source,
         })?;
-        Ok(work)
+        Ok(WorkDir {
+            work: session_dir.join("work"),
+            session_dir,
+            owner,
+        })
     }
 
     /// Resets `session`: once the turns queued before it have run, stops

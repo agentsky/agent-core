@@ -1505,6 +1505,7 @@ impl Turned {
                         key: ada(),
                     },
                     hop: Hop(0),
+                    consent: None,
                 },
                 OffsetDateTime::now_utc(),
             )

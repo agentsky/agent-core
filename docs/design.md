@@ -314,7 +314,7 @@ So a turn always runs on the credential of the person who caused it.
 | Who starts the turn | Where | Runs on | What the agent can touch |
 | --- | --- | --- | --- |
 | The owner, in a DM | DM | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
-| The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests runs without a consent card (see below) |
+| The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests runs without a consent card when the owner's own message started the turn, and needs one when another agent's message did (see below) |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
 | A private task requested during a non-owner's turn | Owner's private sandbox | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
 | Unlinked member | Channel | Community API key if configured, otherwise a "link your account" DM from the manager bot | Public side only |
@@ -350,7 +350,7 @@ and outlast Claude Code's Bash tool timeout (2 minutes by default, with a
 flowchart TD
     T["Channel turn running"] --> R["Agent runs agentctl private 'task text'"]
     R --> ID["agentctl returns a consent id at once.<br/>The turn tells the thread<br/>it asked the owner, then ends"]
-    ID --> O{"Turn requester<br/>is the owner?"}
+    ID --> O{"The owner's own message<br/>started the turn (hop 0)?"}
     O -- yes --> RUN["Fresh session in the<br/>owner's private sandbox"]
     O -- no --> CN["Consent card to owner<br/>shows the exact task text"]
     CN -- approved --> RUN
@@ -359,7 +359,21 @@ flowchart TD
 ```
 
 - The same asynchronous path serves the owner as requester, with no consent
-  card. A long private task would otherwise hold the channel turn the same way.
+  card, when the owner's own message started the turn (hop 0). A long private
+  task would otherwise hold the channel turn the same way. A hop turn inherits
+  its requester from another agent's post, which the owner may never have seen
+  and whose text another member's agent may have written, so a task asked for
+  in it waits for a consent card even when that requester is the owner. The
+  card says it was asked for at a hop, and that approving it runs the task on
+  the owner's side. The task runs on the owner's side only when the owner asked
+  at hop 0 or approved the card of a task their own identity asked for, never
+  because of who the requester is alone.
+- Each agent, and each requester with an agent, may have only a few consents
+  waiting or running at once, and a task is handed at most one attachment's
+  worth of files in all, so neither the files held for consents nor the cards
+  sent to an owner grow without bound. A consent card is one message, with its
+  decision commands, on every surface; a task too long for one is refused when
+  it is asked for.
 - `CONSENT` records the reply target: surface, conversation, thread root, the
   originating session, the requester and the hop count. Unanswered consent cards
   expire after a configurable time, 24 hours by default.
@@ -371,8 +385,15 @@ flowchart TD
   transcript does not cross.
 - What comes back is only the private turn's final reply and files it attached.
   agentd posts them to the thread as a new agent message whose `MESSAGE_REF` is
-  attributed to the original requester and hop count, so a follow-up mention
-  of that message inherits correctly.
+  attributed to the original requester and hop count, and names the consent.
+  A mention in it starts no other agent's turn: the router treats it as
+  unattributed, so private context cannot reach another agent through the
+  thread either, and no hop chains on the owner's credential from it.
+- A private task is run again after a failure only if no turn of it reached
+  the model; otherwise the thread is told it was interrupted. Its container is
+  stopped as soon as its turn ends, however the task ends, and its session's
+  directory is deleted once the result is posted. The thread's caps apply to
+  it as to any turn outside a DM.
 - Inside a private task, `agentctl` offers only `attach`. `ask-agent` and
   `private` are refused, so private context cannot flow to other agents and no
   hops can chain on the owner's credential.
@@ -750,6 +771,7 @@ erDiagram
         uuid turn_id
         uuid requester_id
         int hop
+        uuid consent_id
     }
     CONSENT {
         uuid id
@@ -757,6 +779,7 @@ erDiagram
         int hop
         text task_text
         text state
+        text approval
         text reply_surface
         text reply_conversation
         text reply_thread_root
@@ -828,7 +851,7 @@ for Rocket.Chat bindings.
 
 | Threat | Mitigation |
 | --- | --- |
-| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and for non-owners only after a consent card. Persona prompt treats others' text as data. |
+| Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and for non-owners, or for the owner reached through another agent's message, only after a consent card. Persona prompt treats others' text as data. |
 | Leaked placeholder token | One per CLI process and container, bound to the container's network identity, revoked when the container is reaped, swapped only for the configured upstream header of its own kind. |
 | One session reads another session's placeholder or `agentctl` token | One container per session, so sessions share neither a PID namespace nor process environments. Tokens are bound to their container. |
 | One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. |

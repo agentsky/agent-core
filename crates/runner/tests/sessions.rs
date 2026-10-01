@@ -1140,9 +1140,20 @@ async fn files_put_in_a_new_sessions_work_dir_are_there_for_its_first_turn() {
         .create_private(h.agent, consent, &thread("1.1"))
         .await
         .unwrap();
-    let work = h.manager.work_dir(&private).await.unwrap();
+    let dirs = h.manager.work_dir(&private).await.unwrap();
+    let work = dirs.work.clone();
     assert!(work.ends_with(format!("sessions/{}/work", private.id)));
-    assert_eq!(h.manager.work_dir(&private).await.unwrap(), work);
+    assert_eq!(dirs.session_dir, work.parent().unwrap());
+    let me = std::fs::metadata(&work).unwrap();
+    assert_eq!(
+        dirs.owner,
+        (
+            std::os::unix::fs::MetadataExt::uid(&me),
+            std::os::unix::fs::MetadataExt::gid(&me)
+        ),
+        "the process sandbox runs agents as agentd's own user"
+    );
+    assert_eq!(h.manager.work_dir(&private).await.unwrap(), dirs);
     std::fs::write(work.join("in.txt"), "handed over").unwrap();
     let mut task = request("go");
     task.kind = TurnKind::PrivateTask(consent);
