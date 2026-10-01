@@ -388,10 +388,10 @@ Every PR, in addition to its task's acceptance criteria:
 | [T35c](#t35c) | Cloud hand-off: commands | `cloud-handoff-commands` | T35a, T35b | M6 |
 | [T36](#t36) | Slack Connect (design first) | `slack-connect-design` | T34 | M7 |
 | [T36a](#t36a) | Slack Connect: who is outside | `slack-connect-identity` | T36 | M7 |
-| [T36b](#t36b) | Slack Connect: audience and paying | `slack-connect-audience` | T36a | M7 |
+| [T36b](#t36b) | Slack Connect: audience and paying | `slack-connect-audience` | T36a, T36e | M7 |
 | [T36c](#t36c) | Slack Connect: private work in shared conversations | `slack-connect-private` | T36b | M7 |
 | [T36d](#t36d) | Slack Connect: channel ids that change | `slack-channel-id-changed` | T36a | M7 |
-| [T36e](#t36e) | Verify Slack Connect payloads | `slack-connect-check` | T36 | M7 check |
+| [T36e](#t36e) | Verify Slack Connect payloads | `slack-connect-check` | T36 | M7 gate |
 
 Progress:
 
@@ -520,6 +520,7 @@ graph TD
     T36b --> T36c
     T36a --> T36d
     T36 --> T36e
+    T36e --> T36b
 ```
 
 ## Parallel lanes
@@ -538,7 +539,7 @@ is a suggestion, not an owner: pick any unblocked task.
 | Slack | T28, T29, T30, T31, T32 | `crates/surface-slack`, agentd Slack wiring |
 | Integration | T23 to T27, T33, T34 | `crates/agentd` pipeline, `crates/router` |
 | Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `config/agentd.example.toml` |
-| Slack Connect | T36a, T36d, then T36b, T36c; T36e any time | `crates/surface-slack`, `crates/router`, `crates/agentd` Slack wiring, consents and ctl |
+| Slack Connect | T36e (live, any time), T36a, T36d, then T36b, T36c | `crates/surface-slack`, `crates/router`, `crates/agentd` Slack wiring, consents and ctl |
 
 ## Phase 0: foundation
 
@@ -3343,12 +3344,13 @@ Deliverables:
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.
-  - `outside` is `None` when every one of `user_team` and `team` present is
-    the workspace, and `Some` with the first present otherwise. One that
-    isn't shaped like a team id is `Skip::Malformed`.
-  - With neither present, `message` sets `None`, for routing as the event
-    arrived; `read_back` takes the conversation's sharing from its caller:
-    `None` when it isn't shared, `Some(Outside { team: None })` when it is.
+  - `InboundEvent::sender_team` is the first of `user_team` and `team`
+    present, and `outside` is `None` when every one present is the
+    workspace, and `Some` with the first otherwise. One that isn't shaped
+    like a team id is `Skip::Malformed`.
+  - With neither present, `sender_team` is `None` and `outside` is
+    `Some(Outside { team: None })`: unknown, never home, until it is
+    looked up.
 - `surface-slack` directory (`directory.rs`):
   - `TeamDirectory::conv_info` returns `ConvInfo { kind, sharing }`, with
     `Sharing::None`, `Sharing::Org` or `Sharing::External { teams }` from
@@ -3359,17 +3361,27 @@ Deliverables:
   - `TeamDirectory::conv_info_fresh` reads past the cache and refreshes it.
   - `WebApi::conversation_info` reads the new fields leniently: a missing
     one is `false` or empty.
-- `SlackSurface::confirm`: a copy without a sender team in a conversation
-  the cache says isn't shared reads `conv_info_fresh` once before calling
-  the sender home.
+- Sender lookup, for a sender Slack named no team for:
+  - `TeamDirectory` keeps the home member ids from `users.list` (whose
+    entries carry `team_id`) beside the names, and `TeamDirectory::home_user`
+    answers from them, then from `users.info` (Tier 4) with the manager
+    app's token, as T31 reads the member list, caching each answer for an
+    hour. It says home only when the answer names the workspace; a failed
+    lookup is not cached and answers outside.
+  - `SlackSurface::fill_sender_team(&mut InboundEvent)` sets `outside` from
+    it when `sender_team` is `None`. agentd's Slack receiver calls it with
+    `fill_bot_sender`, before the first routing, and `confirm` on the copy.
 - agentd (`crates/agentd/src/slack/mod.rs`):
   - The other-workspace checks of T30 and T31 compare the workspace above.
-  - `slack::Inbound` drops, with a debug line throttled per binding as the
-    ingress throttles its warnings, a slash command, a manager DM (a
-    `message` whose `outside` is set) or an interaction whose
-    `sender_team` isn't the workspace, before `CommandIntake`. That closes
-    T33's open item about interactions with a `team` the manager doesn't
-    serve.
+  - `slack::Inbound` resolves the sender of every slash command (whose
+    payload names no sender team, so it is always looked up), manager DM
+    (`fill_sender_team`) and interaction (its `sender_team`, else looked
+    up), and passes only a sender resolved to the workspace to
+    `CommandIntake`. The rest are dropped with a debug line throttled per
+    binding as the ingress throttles its warnings; a slash command whose
+    lookup failed is answered through its `response_url` to try again.
+    That closes T33's open item about interactions with a `team` the
+    manager doesn't serve.
 - `router`: until T36b, a requester with `outside` set gets
   `Decision::Ignore(IgnoreReason::Outside)`. The router's rustdoc order says
   where it sits: after the gate, before any refusal.
@@ -3388,8 +3400,12 @@ Acceptance:
 - `a_home_member_in_a_shared_channel_is_home`.
 - `an_enterprise_id_is_outside_even_for_the_home_organization`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
-- `a_copy_without_a_team_in_a_shared_conversation_is_outside_unknown`.
-- `a_copy_without_a_team_reads_the_conversation_fresh_before_calling_it_home`.
+- `a_sender_without_a_team_is_outside_until_looked_up`.
+- `a_sender_without_a_team_is_home_only_when_the_lookup_says_so`.
+- `a_failed_sender_lookup_is_outside`.
+- `a_teamless_manager_dm_from_outside_never_reaches_the_intake`.
+- `a_slash_command_sender_is_always_looked_up`.
+- `an_interaction_without_user_team_is_looked_up`.
 - `confirm_drops_an_event_that_claims_home_for_an_outside_copy`.
 - `conv_info_reads_sharing_and_connected_teams`.
 - `conv_info_fresh_refreshes_the_cache`.
@@ -3400,7 +3416,10 @@ Acceptance:
 ### T36b
 
 **Slack Connect: audience and paying.** Branch `slack-connect-audience`.
-Depends on T36a.
+Depends on T36a and T36e. This is the first task that lets an outside
+member's message run a turn, so it waits for T36e's live check of the
+assumptions the design's identity rules rest on, and builds on what T36e
+recorded.
 
 Design: [Audience](design.md#audience),
 [Paying for outside members' turns](design.md#paying-for-outside-members-turns),
@@ -3414,7 +3433,7 @@ Deliverables:
   - `teams`: at most 100 ids shaped like Slack team ids (`T…` or `E…`),
     default empty. `App::open` refuses to start when one is the home
     workspace, which it learns from `auth.test` (T30).
-  - `hand_off` and `private_tasks`, both `false` by default.
+  - `hand_off`, `false` by default.
 - `router`:
   - `RouterView::outside_access(&Outside) -> Option<OutsideAccess { heard,
     hand_off }>`, `None` when the view can't say, which refuses with
@@ -3449,7 +3468,9 @@ Deliverables:
     one, and the thread line is still posted. The router never asks for a
     link or relink prompt for one.
 - `ctl`: `ask-agent` in a turn whose requester is outside is refused unless
-  `hand_off` is on, with a reason the model can read.
+  `hand_off` is on, and `private` always is, a hop's turn included, before
+  any file is staged, each with a reason the model can read. An approved
+  private task would run on the owner's credential.
 - `pipeline/message.rs`: the turn's message names an outside sender by user
   id and organization, and its surface hints say the requester is outside
   and has no commands.
@@ -3469,6 +3490,8 @@ Acceptance:
 - `outside_refusals_are_one_line_per_thread_per_day_and_name_no_reason`.
 - `a_hop_on_an_outside_requester_needs_hand_off`.
 - `ask_agent_is_refused_for_an_outside_requester_without_hand_off`.
+- `an_outside_requester_can_never_ask_for_a_private_task`.
+- `a_hop_on_an_outside_requester_can_never_ask_for_a_private_task`.
 - `message_refs_keep_the_requesters_organization`.
 - `the_daily_and_thread_caps_count_outside_turns`.
 - `config_refuses_the_home_workspace_in_teams`.
@@ -3487,29 +3510,23 @@ Deliverables:
   Slack's reads `conv_info_fresh` with the binding's token; Rocket.Chat's
   and `MockSurface`'s return `Sharing::None` (the mock can be told
   otherwise).
-- `store`: a migration `…_consent_sharing.sql` adds `requester_outside`,
-  `shared_with_json` (the `Sharing` the card showed) and `withheld_at` to
-  `consents`. The state stays `approved` for a withheld result; its `CHECK`
-  constraints don't change.
-- `agentctl private` (`crates/agentd/src/ctl`) in a turn whose requester is
-  outside is refused unless `[slack_connect] private_tasks` is on, before
-  any file is staged.
-- The card (`crates/agentd/src/consents/card.rs`):
-  - An outside requester is named as "from outside", with their
-    organization's id or "an organization Slack didn't name", besides
-    their handle.
-  - Every card says whether the thread's conversation is externally shared
-    and with which organizations, from `Surface::sharing` at send time; a
-    sharing read that fails defers the card like a failed send (T33's
-    backoff). The fit check counts the longest list.
+- `store`: a migration `…_consent_sharing.sql` adds `shared_with_json`
+  (the `Sharing` the card showed) and `withheld_at` to `consents`. The
+  state stays `approved` for a withheld result; its `CHECK` constraints
+  don't change. A consent never has an outside requester: T36b refuses
+  `private` for one.
+- The card (`crates/agentd/src/consents/card.rs`) says whether the thread's
+  conversation is externally shared and with which organizations, from
+  `Surface::sharing` at send time; a sharing read that fails defers the
+  card like a failed send (T33's backoff). The fit check counts the
+  longest list.
 - Delivery of a result (`consents/mod.rs`): before posting, read
   `Surface::sharing` again. If `shared_with_json` shows the conversation as
   not externally shared and it now is, or the conversation now names an
   organization the card's list didn't (a card that had no list consented
-  to any), the result is withheld: one line to the
-  thread, a DM to the owner from the manager bot, `withheld_at` set, and
-  the work finished through `Store::finish_consent`, deleted as on every
-  other path. A read
+  to any), the result is withheld: one line to the thread, a DM to the
+  owner from the manager bot, `withheld_at` set, and the work finished
+  through `Store::finish_consent`, deleted as on every other path. A read
   that fails is retried under the work's lease. Declined and expired
   outcomes are posted as before.
 - `agentctl post --to` on the owner's side (`ctl/target.rs` and its
@@ -3519,9 +3536,6 @@ Deliverables:
 
 Acceptance:
 
-- `an_outside_requester_cant_ask_for_a_private_task_by_default`.
-- `private_tasks_lets_an_outside_requester_ask`.
-- `the_card_names_an_outside_requester_and_their_organization`.
 - `the_card_says_the_thread_is_shared_and_with_whom`.
 - `a_card_for_a_shared_thread_goes_to_the_owners_home_dm`.
 - `a_result_is_withheld_when_the_thread_was_shared_after_approval`.
@@ -3534,8 +3548,9 @@ Live check (manual): on two paid Slack workspaces joined by a Slack Connect
 channel, with the home one running agentd, list the other organization, allow
 `outside` on one agent, and have an outside member mention it with and
 without a community key; mention a second agent that doesn't allow
-`outside`; have a home member ask for a private task in the shared channel
-and approve the card. Record what each saw. With T36d, that completes
+`outside`; have the admitted agent's turn for the outside member try
+`agentctl private`; have a home member ask for a private task in the shared
+channel and approve the card. Record what each saw. With T36d, that completes
 design milestone 7.
 
 ### T36d
@@ -3587,7 +3602,9 @@ reinstall, and that a `deny #room` rule still applied afterwards.
 ### T36e
 
 **Verify Slack Connect payloads.** Branch `slack-connect-check`. Depends on
-T36. Docs-only PR, like T32.
+T36. Docs-only PR, like T32, and the gate for T36b: nothing admits an
+outside member until this records its result. T36a and T36d only close
+things, so they don't wait for it.
 
 Design: [Verified and assumed](design.md#verified-and-assumed-1) under Slack
 Connect.
@@ -3598,7 +3615,7 @@ Deliverables:
   channel, with two agent apps from T31 installed in the home one. Record,
   redacted:
   1. First, for a message from an outside member and one from a home
-     member: the envelope's `team_id`, `context_team_id`,
+     member, in a channel and in a thread: the envelope's `team_id`, `context_team_id`,
      `is_ext_shared_channel` and `authorizations`, and the event's `team`,
      `user_team` and `source_team`. Above all, whether any of them names an
      outside member with the home workspace's team.
@@ -3610,6 +3627,8 @@ Deliverables:
   5. Whether an outside member can run `/agent`, DM the manager app, or DM
      an agent's bot, and what agentd logged.
   6. An outside member's `<@U…>` id as both organizations see it.
+  7. What `users.info` on the manager's token answers for an outside
+     member, and for a home member.
 - On an Enterprise Grid workspace, if one is available, the same for a
   member of another workspace of the home organization.
 - Update the design's Slack Connect "Verified and assumed" and open
