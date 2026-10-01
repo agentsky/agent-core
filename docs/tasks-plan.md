@@ -3456,8 +3456,10 @@ Deliverables:
     the design.
   - `Interaction` gains `sender_team`, the payload's `user.team_id` when it
     has one.
-- `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`, and
-  `User` keeps `team_id`, both leniently.
+- `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`
+  leniently, an `E…` id or `None`, and refuses an answer whose `team_id`
+  isn't a workspace's (`T…`), so startup fails. `User` keeps `team_id`,
+  failing closed: a value not shaped like a team id names no team.
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.

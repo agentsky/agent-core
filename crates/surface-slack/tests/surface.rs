@@ -1803,6 +1803,40 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
         look_up(user).await;
     }
     assert_eq!(warnings(), 1);
+
+    for (lone, user, team_id) in [
+        ("T0NOORG02", "U0SIBLING", "T0SIBLING"),
+        ("T0NOORG03", "U0ORGWIDE", HOME_ORG),
+    ] {
+        let surface = SlackSurface::new(
+            client.bot(SecretString::from(TOKEN)),
+            Arc::new(TeamDirectory::new(lone.into())),
+        );
+        mount_user(
+            &server,
+            user,
+            ok(json!({"user": {
+                "id": user,
+                "team_id": team_id,
+                "enterprise_user": {"enterprise_id": HOME_ORG, "teams": ["T0SIBLING", lone]},
+            }})),
+        )
+        .await;
+        let mut event = home_event_from(user);
+        event.sender.team = lone.into();
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside_unknown(), "{user}");
+        let warned = logs
+            .snapshot()
+            .matching("auth.test gave the workspace none")
+            .matching(lone)
+            .to_string();
+        assert_eq!(
+            warned.lines().filter(|line| line.contains("WARN")).count(),
+            1,
+            "a member the organization lists in {lone}, whose team_id is {team_id}: {warned}"
+        );
+    }
 }
 
 #[tokio::test]

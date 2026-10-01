@@ -529,18 +529,23 @@ impl TeamDirectory {
     }
 
     /// Warns, once, when Slack describes `user`, whose own `team_id` is the
-    /// workspace, as a member of an Enterprise Grid organization while
-    /// `auth.test` named none for the workspace: then no member's answer
-    /// names only home, and everyone is refused. A member of another
-    /// organization on Grid says nothing of the workspace, and is passed
-    /// over.
+    /// workspace or whose `enterprise_user.teams` lists it, as a member of
+    /// an Enterprise Grid organization while `auth.test` named none for the
+    /// workspace: then no member's answer names only home, and everyone is
+    /// refused. A member of another organization on Grid lists only that
+    /// organization's workspaces, and is passed over.
     fn notice_grid(&self, user: &User) {
         let grid = user
             .enterprise_user
             .as_ref()
             .and_then(|grid| grid.enterprise_id.as_deref())
             .is_some_and(is_enterprise_id);
-        let ours = user.team_id.as_ref() == Some(&self.team);
+        let ours = user.team_id.as_ref() == Some(&self.team)
+            || user
+                .enterprise_user
+                .as_ref()
+                .and_then(|grid| grid.teams.as_deref())
+                .is_some_and(|teams| teams.contains(&self.team));
         if self.home_org.is_none()
             && ours
             && grid

@@ -1615,8 +1615,9 @@ member they name. The person's own organization is a separate field,
   the independent source names another workspace. A member of several of
   the organization's workspaces, the home one among them, is home when
   the member list or `users.info` lists the home workspace in their
-  `enterprise_user.teams`, whichever workspace their `team_id` names. Two cases still fail closed,
-  and T36e checks them on a Grid workspace if one is at hand: such a
+  `enterprise_user.teams`, whichever workspace their `team_id` names. Two
+  cases still fail closed, and T36e checks them on a Grid workspace if one
+  is at hand: such a
   member's message whose own fields name another workspace of the
   organization (outside by the fields, with no lookup), and their click
   whose `user.team_id` does. The home organization is the `enterprise_id`

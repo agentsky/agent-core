@@ -8525,9 +8525,10 @@ cached "not home" for answers that say nothing about the user.
 `user_not_visible` (`directory::NOT_HOME_CODES`) are a verdict, cached like
 any answer and not warned of, since an ordinary outsider may cause either;
 any other `NotFound` is returned uncached like the rest. A `users.info`
-answer with no `team_id`, or one not shaped like a team id, is `Ok(false)`
-and cached unless its `enterprise_user` places it in the workspace
-(below): it is an answer, and it doesn't name the workspace. Since review
+answer with no `team_id` is `Ok(false)` and cached unless its
+`enterprise_user` places it in the workspace (below); one with a `team_id`
+not shaped like a team id is `Ok(false)` and cached. Either is an answer,
+and doesn't name the workspace. Since review
 round 3, a `user_not_visible` is noted at info level at most once a
 minute, so a stream of them, which would refuse everyone, leaves a
 trace.
@@ -8788,6 +8789,16 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   `bot_not_found`, not for any `NotFound`.
 - The T36e plan asks whether `users.info` echoes the id asked for exactly
   (`U…` or `W…`), and for a Grid member's deactivation `user_change`.
+
+### Smaller fixes from review round 4
+
+- `notice_grid` also counts a user whose `enterprise_user.teams` lists the
+  workspace, so a locked-out Grid member whose `team_id` names a sibling
+  workspace or the organization is warned of too; an outside
+  organization's member lists only its own workspaces and still isn't.
+- `AuthTest::team_id` must be shaped like a workspace's id (`T…`), or the
+  answer doesn't read and agentd doesn't start: an empty workspace id
+  would have matched the empty id an unreadable `team_id` reads as.
 
 ### Left as they are
 

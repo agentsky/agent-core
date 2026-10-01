@@ -713,7 +713,10 @@ pub struct AuthTest {
     /// The workspace's name.
     #[serde(default)]
     pub team: Option<String>,
-    /// The workspace.
+    /// The workspace. An answer whose `team_id` isn't shaped like a
+    /// workspace's id ([`is_workspace_id`]) doesn't read, so agentd never
+    /// serves a workspace whose id an unreadable team field could match.
+    #[serde(deserialize_with = "workspace_id")]
     pub team_id: TeamId,
     /// The token's user: the bot user, for a bot token.
     pub user_id: UserId,
@@ -726,6 +729,14 @@ pub struct AuthTest {
     /// organization's id, is `None`.
     #[serde(default, deserialize_with = "enterprise_id_or_nothing")]
     pub enterprise_id: Option<TeamId>,
+}
+
+/// A string [`is_workspace_id`] accepts, and an error for anything else.
+fn workspace_id<'de, D: Deserializer<'de>>(value: D) -> Result<TeamId, D::Error> {
+    match Value::deserialize(value)? {
+        Value::String(id) if is_workspace_id(&id) => Ok(TeamId::from(id)),
+        _ => Err(serde::de::Error::custom("not a workspace id")),
+    }
 }
 
 /// An app configuration token and its refresh token, from
