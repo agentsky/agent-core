@@ -7634,6 +7634,12 @@ reason if it wants one.
   points, the Cyrillic enclosing signs) aren't limited; counting
   General_Category Mn and Me would need a Unicode table this workspace
   doesn't carry yet.
+- A takeover's kill that outlives `KILL_TIMEOUT` (a turn that survives
+  30 seconds of Docker stops) leaves the turn holding its session's slot,
+  so a later `finish_consent` on the same instance waits in its
+  `sessions.stop` until the turn ends. Very unlikely; bounding that stop,
+  or killing instead and leaving the container to the idle reaper, would
+  fix it.
 - Whether a session still runs is known only on its own instance. If a
   claim's renewals keep failing while its turn runs, another instance can
   take the task over, report it interrupted and delete that session's
