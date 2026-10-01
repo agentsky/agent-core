@@ -447,8 +447,10 @@ impl Auth {
                 other => other,
             })?;
         if let Some(refused) = tokens.login_refusal() {
-            if matches!(refused, AuthError::ScopeUnstated) {
+            if tokens.grant == client::Grant::Unstated {
                 tracing::error!(%member, "refused a login: the token endpoint's answer names no scope, so no login can complete until it does");
+            } else if tokens.grant == client::Grant::Unreadable {
+                tracing::error!(%member, "refused a login: the token endpoint's answer gives its scope as neither a string nor an array of strings, so no login can complete until it does");
             } else {
                 tracing::warn!(%member, error = %refused, "refused a login's tokens");
             }

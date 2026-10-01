@@ -93,16 +93,17 @@ pub(crate) struct Tokens {
 pub(crate) enum Grant {
     /// Only scopes in [`ALLOWED_SCOPES`].
     Allowed,
-    /// No `scope`, or a blank one, which RFC 6749 (section 5.1) reads as
-    /// what the request asked for: what agentd asked for on a refresh, but
-    /// on a login what the authorize URL asked for, which the member could
-    /// have changed.
+    /// No `scope`, `null`, a blank string or an array of no scope, which
+    /// RFC 6749 (section 5.1) reads as what the request asked for: what
+    /// agentd asked for on a refresh, but on a login what the authorize URL
+    /// asked for, which the member could have changed.
     Unstated,
-    /// A scope outside [`ALLOWED_SCOPES`].
+    /// A scope outside [`ALLOWED_SCOPES`], in any shape.
     Wider,
-    /// A `scope` that is neither a string nor an array of strings, which
-    /// says nothing about the grant: a login counts it as unstated, and a
-    /// refresh, which sent the scopes itself, keeps the link and warns.
+    /// A `scope` that is neither a string nor an array of strings and names
+    /// no scope outside [`ALLOWED_SCOPES`]: a login counts it as unstated,
+    /// and a refresh, which sent the scopes itself, keeps the link and
+    /// warns.
     Unreadable,
 }
 
@@ -120,19 +121,46 @@ impl Tokens {
     }
 }
 
-/// What `parts`, each a scope or several separated by blanks, grant: none
-/// is unstated, as an empty `scope` says nothing.
-fn granted<'a>(parts: impl IntoIterator<Item = &'a str>) -> Grant {
-    let mut scopes = parts
+/// What a token answer's `scope` grants. Every string anywhere in it, an
+/// object's keys included, at any depth, is split on blanks into scopes, so
+/// no shape hides a wider one: any scope outside [`ALLOWED_SCOPES`] is
+/// [`Grant::Wider`]. Otherwise `null`, or a string or an array of strings,
+/// is [`Grant::Allowed`] if it names a scope and [`Grant::Unstated`] if not,
+/// and any other shape is [`Grant::Unreadable`].
+fn granted(scope: &Value) -> Grant {
+    let mut leaves = Vec::new();
+    string_leaves(scope, &mut leaves);
+    let mut scopes = leaves
         .into_iter()
         .flat_map(str::split_ascii_whitespace)
         .peekable();
-    if scopes.peek().is_none() {
-        Grant::Unstated
-    } else if scopes.all(|scope| ALLOWED_SCOPES.contains(&scope)) {
-        Grant::Allowed
-    } else {
-        Grant::Wider
+    let named = scopes.peek().is_some();
+    if !scopes.all(|granted| ALLOWED_SCOPES.contains(&granted)) {
+        return Grant::Wider;
+    }
+    let well_formed = match scope {
+        Value::Null | Value::String(_) => true,
+        Value::Array(items) => items.iter().all(Value::is_string),
+        _ => false,
+    };
+    match (well_formed, named) {
+        (true, true) => Grant::Allowed,
+        (true, false) => Grant::Unstated,
+        (false, _) => Grant::Unreadable,
+    }
+}
+
+/// Pushes every string in `value`, at any depth, onto `leaves`, an
+/// object's keys as well as its values.
+fn string_leaves<'a>(value: &'a Value, leaves: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => leaves.push(text),
+        Value::Array(items) => items.iter().for_each(|item| string_leaves(item, leaves)),
+        Value::Object(fields) => fields.iter().for_each(|(key, field)| {
+            leaves.push(key);
+            string_leaves(field, leaves);
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
@@ -143,7 +171,7 @@ struct TokenResponse {
     refresh_token: Option<SecretString>,
     expires_in: f64,
     /// The scopes granted, space-separated, or as an array of strings. Read
-    /// as any JSON value, so another shape is [`Grant::Unreadable`] rather
+    /// as any JSON value, so another shape is judged by [`granted`] rather
     /// than failing the whole response.
     #[serde(default)]
     scope: Option<Value>,
@@ -159,16 +187,7 @@ impl TokenResponse {
         if self.access_token.expose_secret().is_empty() {
             return Err(invalid("empty access_token"));
         }
-        let grant = match &self.scope {
-            None | Some(Value::Null) => Grant::Unstated,
-            Some(Value::String(scope)) => granted([scope.as_str()]),
-            Some(Value::Array(scopes)) => scopes
-                .iter()
-                .map(Value::as_str)
-                .collect::<Option<Vec<_>>>()
-                .map_or(Grant::Unreadable, granted),
-            Some(_) => Grant::Unreadable,
-        };
+        let grant = self.scope.as_ref().map_or(Grant::Unstated, granted);
         let refresh_token = self
             .refresh_token
             .filter(|token| !token.expose_secret().is_empty());
@@ -526,7 +545,16 @@ mod tests {
             unstated.login_refusal(),
             Some(AuthError::ScopeUnstated)
         ));
-        for scope in ["7", "{}", "true", r#"["user:profile", 7]"#] {
+        for scope in [
+            "7",
+            "{}",
+            "true",
+            "[7]",
+            r#"["user:profile", 7]"#,
+            r#"[["user:profile"]]"#,
+            r#"{"user:profile": true}"#,
+            r#"{"user:profile": "user:inference"}"#,
+        ] {
             assert_eq!(grant(scope), Grant::Unreadable, "{scope}");
             let unreadable = tokens(&format!(
                 r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
@@ -545,6 +573,12 @@ mod tests {
             r#""user:profile,user:inference""#,
             r#"["user:profile", "user:sessions:claude_code"]"#,
             r#"["user:inference org:create_api_key"]"#,
+            r#"["user:profile", "user:sessions:claude_code", 7]"#,
+            r#"[["user:sessions:claude_code"]]"#,
+            r#"{"granted": ["user:profile", "user:sessions:claude_code"]}"#,
+            r#"{"user:profile": "user:sessions:claude_code"}"#,
+            r#"{"user:sessions:claude_code": true}"#,
+            r#"[{"user:sessions:claude_code": null}]"#,
         ] {
             assert_eq!(grant(scope), Grant::Wider, "{scope}");
             let wide = tokens(&format!(
