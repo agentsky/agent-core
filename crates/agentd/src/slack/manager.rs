@@ -111,6 +111,7 @@ impl SlackManager {
         let identity = manager.identity();
         tracing::info!(
             team = %identity.team,
+            enterprise = identity.enterprise.as_ref().map_or("none", TeamId::as_str),
             bot_user = %identity.bot_user,
             app_id = identity.app_id,
             "Slack manager app connected"

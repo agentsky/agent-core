@@ -60,8 +60,9 @@
 //! order by `MessageEvent::sender_teams`, the one place that lists them:
 //! `user_team`, `source_team`, `user_profile.team` and `team`. Bolt reads
 //! `user_team` before `team`, and in one of its fixtures an outside actor
-//! has the installing team in `team` and their own only in the others. One that is present and not shaped like a team id
-//! ([`is_team_id`]) makes the message [`Skip::Malformed`]. When a field
+//! has the installing team in `team` and their own only in the others.
+//! One that is present and not shaped like a team id ([`is_team_id`])
+//! makes the message [`Skip::Malformed`]. When a field
 //! names neither the workspace ([`Context::team`]) nor its Enterprise Grid
 //! organization ([`Context::home_org`]), the sender is outside, with the
 //! first such field, in that order, as their organization. Otherwise
@@ -674,6 +675,12 @@ pub fn is_file_id(id: &str) -> bool {
 /// letters or digits.
 pub fn is_team_id(id: &str) -> bool {
     is_slack_id(id, &["T", "E"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack workspace's id: `T`, then 1 to
+/// [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_workspace_id(id: &str) -> bool {
+    is_slack_id(id, &["T"], MAX_ID_TAIL)
 }
 
 /// Whether `id` is shaped like a Slack Enterprise Grid organization's id:

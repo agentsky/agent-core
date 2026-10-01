@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -37,8 +38,8 @@ use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Thrott
 use render::MentionDirectory;
 use tokio::time::Instant;
 
-use crate::normalize::{is_bot_id, is_user_id};
-use crate::web::{Result, User, WebApi};
+use crate::normalize::{is_bot_id, is_enterprise_id, is_user_id};
+use crate::web::{Result, User, WebApi, is_unreadable};
 
 /// How long a member list is used before `users.list` is read again.
 pub const DEFAULT_MEMBER_TTL: Duration = Duration::from_secs(15 * 60);
@@ -68,9 +69,9 @@ pub const HOME_ANSWER_TTL: Duration = Duration::from_secs(60 * 60);
 /// once; past it, the oldest is dropped.
 pub const MAX_HOME_ANSWERS: usize = 4096;
 
-/// The `users.info` error code that answers for no user, which the home
-/// check takes for "not home".
-const USER_NOT_FOUND: &str = "user_not_found";
+/// The `users.info` error codes that answer for no user the bot may see,
+/// which the home check takes, and keeps, for "not home".
+const NOT_HOME_CODES: &[&str] = &["user_not_found", "user_not_visible"];
 
 /// How often a home check's failure that won't pass on its own is logged
 /// as a warning at most.
@@ -100,6 +101,7 @@ pub struct TeamDirectory {
     conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
     home_answers: Mutex<HomeAnswers>,
     lookup_warnings: Throttle,
+    grid_noticed: AtomicBool,
 }
 
 /// The answers `users.info` gave to whether a user is home, each kept for
@@ -239,6 +241,7 @@ impl TeamDirectory {
             conv_infos: Mutex::new(HashMap::new()),
             home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
             lookup_warnings: Throttle::new(LOOKUP_WARNING_INTERVAL),
+            grid_noticed: AtomicBool::new(false),
         }
     }
 
@@ -319,6 +322,7 @@ impl TeamDirectory {
         self.write_members().outdated = false;
         let reading = Instant::now();
         let names = api.all_users().await.map(|users| {
+            users.iter().for_each(|user| self.notice_grid(user));
             (
                 Arc::new(names_from_users(&users)),
                 Arc::new(home_users(&users, &self.team, self.home_org.as_ref())),
@@ -422,7 +426,8 @@ impl TeamDirectory {
     /// read less than [`HOME_ANSWER_TTL`] ago, has them as [`is_home`]
     /// reads it, or else when `users.info` through `api` answers so;
     /// `Ok(false)` when `users.info` answers otherwise, or says
-    /// `user_not_found`. `users.info`'s answers are kept for
+    /// `user_not_found` or `user_not_visible`. `users.info`'s answers are
+    /// kept for
     /// [`HOME_ANSWER_TTL`], at most [`MAX_HOME_ANSWERS`], the oldest
     /// dropped first, and one dropped is asked again, never taken as home.
     /// Pass a client made with [`WebApi::without_waiting`] for a caller
@@ -433,10 +438,11 @@ impl TeamDirectory {
     /// Any other `users.info` error, as it came, whatever its variant
     /// ([`SurfaceError::Transport`], [`SurfaceError::RateLimited`],
     /// [`SurfaceError::Api`], [`SurfaceError::Unauthorized`],
-    /// [`SurfaceError::Forbidden`] for a `missing_scope`, …). It is no
-    /// answer, and nothing is kept. One that isn't a transport error or a
-    /// rate limit is logged as a warning at most once per
-    /// [`LOOKUP_WARNING_INTERVAL`].
+    /// [`SurfaceError::Forbidden`] for a `missing_scope`, …), and
+    /// [`SurfaceError::Api`] for an answer about another user. It is no
+    /// answer, and nothing is kept. One that won't pass on its own, which
+    /// is any but Slack unreachable or busy and a rate limit, is logged as a
+    /// warning at most once per [`LOOKUP_WARNING_INTERVAL`].
     pub async fn home_user(&self, api: &WebApi, user: &UserId) -> Result<bool> {
         let now = Instant::now();
         if self.listed_home(user, now) {
@@ -446,8 +452,20 @@ impl TeamDirectory {
             return Ok(home);
         }
         let home = match api.user_info(user).await {
-            Ok(info) => is_home(&info, &self.team, self.home_org.as_ref()),
-            Err(SurfaceError::NotFound(code)) if code == USER_NOT_FOUND => false,
+            Ok(info) if info.id != *user => {
+                let err = SurfaceError::Api("users.info answered for another user".into());
+                self.lookup_failed(&err);
+                return Err(err);
+            }
+            Ok(info) => {
+                self.notice_grid(&info);
+                is_home(&info, &self.team, self.home_org.as_ref())
+            }
+            Err(SurfaceError::NotFound(code) | SurfaceError::Api(code))
+                if NOT_HOME_CODES.contains(&code.as_str()) =>
+            {
+                false
+            }
             Err(err) => {
                 self.lookup_failed(&err);
                 return Err(err);
@@ -468,17 +486,34 @@ impl TeamDirectory {
             && members.home.contains(user)
     }
 
-    /// Logs a failed `users.info` that won't pass on its own, at most once
-    /// per [`LOOKUP_WARNING_INTERVAL`].
+    /// Logs a failed `users.info` that won't pass on its own (a revoked
+    /// token, a missing scope, an answer that can't be read, …), at most
+    /// once per [`LOOKUP_WARNING_INTERVAL`].
     fn lookup_failed(&self, err: &SurfaceError) {
-        if matches!(
-            err,
-            SurfaceError::Transport(_) | SurfaceError::RateLimited { .. }
-        ) {
+        let passing = match err {
+            SurfaceError::RateLimited { .. } => true,
+            SurfaceError::Transport(_) => !is_unreadable(err),
+            _ => false,
+        };
+        if passing {
             return;
         }
         if let Some(quiet) = self.lookup_warnings.record((), std::time::Instant::now()) {
-            tracing::warn!(team = %self.team, error = %err, failed_since_last_warning = quiet, "couldn't ask Slack whether a user is home; taking them as outside");
+            tracing::warn!(team = %self.team, error = %err, failed_since_last_warning = quiet, "couldn't ask Slack whether a user is home; refusing whoever was asked about");
+        }
+    }
+
+    /// Warns, once, when Slack describes `user` as a member of an Enterprise
+    /// Grid organization while `auth.test` named none for the workspace:
+    /// then no member's answer names only home, and everyone is refused.
+    fn notice_grid(&self, user: &User) {
+        let grid = user
+            .enterprise_user
+            .as_ref()
+            .and_then(|grid| grid.enterprise_id.as_deref())
+            .is_some_and(is_enterprise_id);
+        if self.home_org.is_none() && grid && !self.grid_noticed.swap(true, Ordering::Relaxed) {
+            tracing::warn!(team = %self.team, "Slack names an Enterprise Grid organization for the workspace's members, but auth.test gave the workspace none; every member is refused until agentd restarts with one");
         }
     }
 
@@ -717,30 +752,49 @@ fn home_users(users: &[User], team: &TeamId, home_org: Option<&TeamId>) -> HashS
         .collect()
 }
 
+/// The workspaces of `home_org` that Slack's `user` belongs to, as their
+/// `enterprise_user` lists them, when it is of `home_org` and lists
+/// `team`.
+fn grid_teams<'a>(
+    user: &'a User,
+    team: &TeamId,
+    home_org: Option<&TeamId>,
+) -> Option<&'a [TeamId]> {
+    let org = home_org?;
+    user.enterprise_user
+        .as_ref()
+        .filter(|grid| grid.enterprise_id.as_deref() == Some(org.as_str()))
+        .and_then(|grid| grid.teams.as_deref())
+        .filter(|teams| teams.contains(team))
+}
+
+/// Whether Slack's `user` is a member of `team`, of the Enterprise Grid
+/// organization `home_org` if any: their `team_id` is `team`, or their
+/// `enterprise_user` is of `home_org` and lists `team` among its
+/// workspaces. It says nothing of whether the account is active, or of the
+/// other teams the answer names; [`is_home`] does.
+pub fn is_member(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> bool {
+    user.team_id.as_ref() == Some(team) || grid_teams(user, team, home_org).is_some()
+}
+
 /// Whether Slack's `user` belongs to `team`, of the Enterprise Grid
 /// organization `home_org` if any: an active account (not `deleted`), not
-/// a stranger, whose `team_id` is `team` or whose `enterprise_user` is of
-/// `home_org` and lists `team` among its workspaces; and every team the
-/// answer names (`team_id`, `profile.team`, `enterprise_user`'s
-/// organization) is `team`, `home_org`, or one of those workspaces.
+/// a stranger, that [`is_member`] of `team`; and every team the answer
+/// names (`team_id`, `profile.team`, `enterprise_user`'s organization) is
+/// `team`, `home_org`, or one of the workspaces `enterprise_user` lists.
+/// Guests (`is_restricted`, `is_ultra_restricted`) count as home, as they
+/// did before Slack Connect: they are the workspace's own accounts.
 pub fn is_home(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> bool {
     if user.deleted || user.is_stranger {
         return false;
     }
-    let grid_teams = home_org
-        .and_then(|org| {
-            user.enterprise_user
-                .as_ref()
-                .filter(|grid| grid.enterprise_id.as_deref() == Some(org.as_str()))
-        })
-        .and_then(|grid| grid.teams.as_deref())
-        .filter(|teams| teams.contains(team));
+    let grid_teams = grid_teams(user, team, home_org);
     let names_home = |field: &str| {
         field == team.as_str()
             || home_org.is_some_and(|org| field == org.as_str())
             || grid_teams.is_some_and(|teams| teams.iter().any(|other| other.as_str() == field))
     };
-    (user.team_id.as_ref() == Some(team) || grid_teams.is_some())
+    is_member(user, team, home_org)
         && user
             .team_id
             .as_ref()

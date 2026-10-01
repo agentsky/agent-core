@@ -87,7 +87,7 @@ async fn harness() -> Harness {
         ("users.list", json!({"members": []})),
         (
             "users.info",
-            json!({"user": {"id": "U0OWNER01", "team_id": TEAM}}),
+            json!({"user": {"id": "U0ADA0001", "team_id": TEAM}}),
         ),
     ] {
         mount(&slack, name, MANAGER_TOKEN, ok(body)).await;

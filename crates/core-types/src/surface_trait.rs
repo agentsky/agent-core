@@ -243,7 +243,9 @@ pub enum SurfaceError {
     /// The platform answered with another error.
     #[error("platform error: {0}")]
     Api(String),
-    /// The platform couldn't be reached, or its answer couldn't be read.
+    /// The platform couldn't be reached, said it couldn't answer this time,
+    /// or answered in a way that couldn't be read. The call may have partly
+    /// taken effect, so a write that failed so isn't retried blindly.
     #[error("transport error: {0}")]
     Transport(String),
 }

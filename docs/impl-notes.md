@@ -8513,7 +8513,7 @@ rustdoc). Each assumption T36e has to confirm lives in one place:
   and `MAX_CONNECTED_TEAMS`;
 - an interaction's `user.team_id`: the ingress's interaction reader.
 
-### Only Slack's own `user_not_found` means "not home"
+### Only Slack's own `user_not_found` and `user_not_visible` mean "not home"
 
 **Issue.** The plan has `home_user` answer `Ok(false)` for
 `user_not_found` and pass every other error on. `WebApi::user_info` maps
@@ -8521,8 +8521,10 @@ a whole family of codes to `SurfaceError::NotFound` (`users_not_found`,
 `channel_not_found`, `file_deleted`, …), so matching the variant would have
 cached "not home" for answers that say nothing about the user.
 
-**Solution.** Only `NotFound("user_not_found")` is a verdict; any other
-`NotFound` is returned uncached like the rest. A `users.info` answer with no
+**Solution.** Only `user_not_found` and, since review round 2,
+`user_not_visible` (`directory::NOT_HOME_CODES`) are a verdict, cached like
+any answer and not warned of, since an ordinary outsider may cause either;
+any other `NotFound` is returned uncached like the rest. A `users.info` answer with no
 `team_id`, or one not shaped like a team id, is `Ok(false)` and cached: it
 is an answer, and it doesn't name the workspace.
 
@@ -8653,7 +8655,11 @@ without the "try again" line, while an HTTP 5xx got it.
 
 **Solution.** `web::map_error` maps them (`TRANSIENT_CODES`) to
 `SurfaceError::Transport`, as an HTTP 5xx is, for every caller. The thread
-and the manager DM get the "try again" line; nothing is cached.
+and the manager DM get the "try again" line; nothing is cached. Slack's
+`request_timeout` means POST data it got missing or truncated, and after
+`fatal_error` or `internal_error` the call may have partly taken effect,
+so `SurfaceError::Transport`'s rustdoc now says a write that failed with
+one isn't retried blindly. No caller retries one today.
 
 ### A failed home lookup is warned of once a minute
 
@@ -8667,16 +8673,22 @@ transport error or a rate limit as a warning, at most once per
 `LOOKUP_WARNING_INTERVAL` (a minute) for the workspace, whoever asked; the
 commands' own throttle is gone.
 
-### Nothing is posted for a sender the fields say is outside
+### Nothing is posted for a sender the fields say is outside, but a fields-silent outsider can still get three lines
 
 **Issue.** `Pipeline::queue` posted the busy line for any sender who
 wasn't a bot, before routing, so a member of another organization learned
 whether the agent was busy.
 
 **Solution.** A message whose `outside` is set is queued `quietly`, as a
-bot's is: past the bounds it is dropped with the throttled warning. A
-sender the fields leave `None` still gets the line, as a forged event
-does.
+bot's is: past the bounds it is dropped with the throttled warning. The
+router ignores it before confirmation, so it gets no "try again" line
+either, and `slack::Inbound` drops such a manager DM. A sender the fields
+leave `None` is found outside only by the home check, after the busy line
+and during confirmation, so an outsider whose fields say nothing of it
+can still get the busy line, the thread's "try again" line, and the
+manager DM's "try again" line when Slack can't answer. That can't be
+avoided without knowing home first; the design says so, and that none of
+them says more than that the agent is busy or Slack failed.
 
 ### The store refuses outside requesters until T36b
 
@@ -8685,7 +8697,8 @@ does.
 attribution, a consent or an `agentctl` turn could then run an outside
 requester's work on a home requester's terms. Nothing writes one today,
 since the router ignores outside requesters, but T36b has to remember all
-three.
+three, and a fourth writer the guard can't see: `pipeline::message::record`
+writes `outside: None` for every thread message it shows a session.
 
 **Solution.** `record_post` (and so `record_message_ref`),
 `create_consent` and `set_ctl_turn` refuse a requester with `outside` set
@@ -8695,6 +8708,16 @@ T36e: confirmation keeps the copy's own `outside`, which is `Outside { team:
 None }` when the copy's fields don't name the organization, so
 `copy_stands` drops an admitted outside message unless Slack's copy names
 it.
+
+Review round 2 found that the earlier wording here and in the plan, "no
+row reads back as home", was wrong: `record` writes a home requester for
+each thread message, whoever sent it, and for the event's sender. It is
+left so, since `Msg` carries no team fields to fill it from, and an event
+whose `outside` is set never reaches `record`, the router ignoring it.
+Those rows have no agent, so no attribution reads them
+(`posted_message_ref` takes only rows with one) and `agentctl`'s short ids
+read only their message. The T36b plan now names `record` as a writer it
+must fill.
 
 ### An event installed elsewhere is dropped before deduplication
 
@@ -8718,6 +8741,34 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
 - `normalize::SENDER_TEAM_FIELDS` is gone: it restated
   `MessageEvent::sender_teams`, which is the one list.
 
+### Smaller fixes from review round 2
+
+- `member_who_left` reads the user with `directory::is_member`, the rule
+  `is_home` uses: a Grid member whose `team_id` names a sibling workspace
+  and whose `enterprise_user` is of the home organization and lists this
+  workspace has left too. `slack::Inbound` passes the organization from
+  the manager's identity.
+- On Grid, an `auth.test` without an `enterprise_id` would refuse every
+  member silently: `TeamDirectory` now warns once, until a restart, when a
+  `users.info` or `users.list` answer names an organization while it has
+  none, and the manager's startup line logs the workspace and the
+  organization.
+- `home_user` checks that `users.info` answered for the user asked,
+  as `conv_info` does for the channel; an answer about someone else is an
+  error, warned of and not kept. An answer that doesn't read
+  (`web::is_unreadable`, `decode`'s error) is warned of too: it won't pass
+  on its own.
+- `enterprise_user.teams` has its own limit, `MAX_GRID_TEAMS` (1024), and
+  keeps the entries shaped like a workspace's id (`T…`), skipping any
+  other, an organization's `E…` id included, rather than dropping the
+  list. An `enterprise_user` that isn't an object, or names no
+  organization, is read as one naming an organization no id has, so it
+  fails the home rule rather than being taken as absent.
+- `is_shared`, `is_ext_shared` and `is_stranger` read `null` as `true`,
+  failing closed like any other value that isn't `false`.
+- The design says guests count as home, and the T36e plan asks for each
+  field the home check reads, in both `users.info` and `users.list`.
+
 ### Left as they are
 
 - A click passes on `user.team_id` alone, with no lookup: the payload is
@@ -8726,8 +8777,16 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   decide; the design says so.
 - `home_user` has no single flight: concurrent confirmations of one new
   sender each ask `users.info` until the first answer is kept. It costs
-  only the manager's Tier 4 quota for real senders, at most the places in
-  flight (64 per owner), and a used-up quota gets "try again", never home.
+  only the manager's Tier 4 quota for real senders, at most the pipeline's
+  places (64 in all, 16 per owner), and a used-up quota gets "try again",
+  never home.
+- A member list less than an hour old that has a user as home outranks a
+  fresher `users.info` answer that doesn't (security review round 2, N4):
+  both sources are trusted for the same hour the design accepts, the
+  list is checked first because it costs nothing, and a member removed in
+  the meantime is home for at most that hour, as they are when the list is
+  all agentd asks.
+- `pipeline::message::record` keeps writing `outside: None` (above).
 
 ## T35c: Cloud hand-off: commands
 

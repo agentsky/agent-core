@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::web::{EnterpriseUser, PageRequest, map_error};
+use surface_slack::web::{EnterpriseUser, MAX_GRID_TEAMS, PageRequest, map_error};
 use surface_slack::{SlackClient, WebApi};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -184,7 +184,7 @@ async fn users_info_reads_what_the_home_rule_needs_failing_closed() {
             None,
         ),
         (
-            json!({"is_stranger": null, "enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": ["T0TEAM001", "T0SIBLING"]}}),
+            json!({"is_stranger": false, "enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": ["T0TEAM001", "T0SIBLING"]}}),
             false,
             None,
             Some(EnterpriseUser {
@@ -192,8 +192,27 @@ async fn users_info_reads_what_the_home_rule_needs_failing_closed() {
                 teams: Some(vec!["T0TEAM001".into(), "T0SIBLING".into()]),
             }),
         ),
+        (json!({"is_stranger": null}), true, None, None),
         (
             json!({"enterprise_user": "E0HOMEORG"}),
+            false,
+            None,
+            unreadable(),
+        ),
+        (
+            json!({"enterprise_user": [{"enterprise_id": "E0HOMEORG", "teams": ["T0TEAM001"]}]}),
+            false,
+            None,
+            unreadable(),
+        ),
+        (
+            json!({"enterprise_user": {"teams": ["T0TEAM001"]}}),
+            false,
+            None,
+            unreadable(),
+        ),
+        (
+            json!({"enterprise_user": {"enterprise_id": null, "teams": ["T0TEAM001"]}}),
             false,
             None,
             unreadable(),
@@ -213,6 +232,24 @@ async fn users_info_reads_what_the_home_rule_needs_failing_closed() {
             None,
             Some(EnterpriseUser {
                 enterprise_id: Some("E0HOMEORG".into()),
+                teams: Some(Vec::new()),
+            }),
+        ),
+        (
+            json!({"enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": ["T0TEAM001", "E0HOMEORG", 7, null, "bad", "T0SIBLING"]}}),
+            false,
+            None,
+            Some(EnterpriseUser {
+                enterprise_id: Some("E0HOMEORG".into()),
+                teams: Some(vec!["T0TEAM001".into(), "T0SIBLING".into()]),
+            }),
+        ),
+        (
+            json!({"enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": "T0TEAM001"}}),
+            false,
+            None,
+            Some(EnterpriseUser {
+                enterprise_id: Some("E0HOMEORG".into()),
                 teams: None,
             }),
         ),
@@ -228,6 +265,34 @@ async fn users_info_reads_what_the_home_rule_needs_failing_closed() {
         assert_eq!(user.profile.team.as_deref(), profile_team, "{fields}");
         assert_eq!(user.enterprise_user, grid, "{fields}");
     }
+}
+
+#[tokio::test]
+async fn a_grid_members_workspaces_are_kept_up_to_their_own_limit() {
+    let most: Vec<String> = (0..MAX_GRID_TEAMS)
+        .map(|n| format!("T0GRID{n:04}"))
+        .collect();
+    let teams_of = |teams: &[String]| {
+        let teams = teams.to_vec();
+        async move {
+            let (server, api) = server().await;
+            mount(
+                &server,
+                "users.info",
+                ok(json!({"user": {
+                    "id": "U0HUMAN01",
+                    "enterprise_user": {"enterprise_id": "E0HOMEORG", "teams": teams},
+                }})),
+            )
+            .await;
+            let user = api.user_info(&"U0HUMAN01".into()).await.unwrap();
+            user.enterprise_user.unwrap().teams.map(|teams| teams.len())
+        }
+    };
+    assert_eq!(teams_of(&most).await, Some(MAX_GRID_TEAMS));
+    let mut too_many = most;
+    too_many.push("T0ONEMORE".into());
+    assert_eq!(teams_of(&too_many).await, None);
 }
 
 #[tokio::test]

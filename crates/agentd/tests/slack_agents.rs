@@ -74,6 +74,17 @@ async fn mount(slack: &MockServer, name: &str, token: &str, body: Value) {
         .await;
 }
 
+/// `users.info`'s answer that whoever was asked about is a member of the
+/// workspace named Ada.
+fn home_member(request: &Request) -> ResponseTemplate {
+    let form: HashMap<String, String> =
+        serde_urlencoded::from_bytes(&request.body).unwrap_or_default();
+    let user = form.get("user").cloned().unwrap_or_default();
+    ok(
+        json!({"user": {"id": user, "team_id": fixtures::TEAM, "name": "ada", "profile": {"display_name": "Ada"}}}),
+    )
+}
+
 /// `conversations.info`'s answer for the public channel the fixtures are in.
 fn public_channel() -> Value {
     json!({"channel": {"id": fixtures::CHANNEL, "is_channel": true, "is_member": true}})
@@ -98,13 +109,18 @@ async fn fake_slack() -> MockServer {
             json!({"channel": {"id": "D0DM00001"}}),
         ),
         ("users.list", json!({"members": []})),
-        (
-            "users.info",
-            json!({"user": {"id": fixtures::USER, "team_id": fixtures::TEAM, "name": "ada", "profile": {"display_name": "Ada"}}}),
-        ),
     ] {
         mount(&slack, name, MANAGER_TOKEN, body).await;
     }
+    Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .and(header(
+            "authorization",
+            format!("Bearer {MANAGER_TOKEN}").as_str(),
+        ))
+        .respond_with(home_member)
+        .mount(&slack)
+        .await;
     for (name, body) in [
         ("chat.postMessage", json!({"ts": "1727700001.000200"})),
         ("reactions.add", json!({})),
