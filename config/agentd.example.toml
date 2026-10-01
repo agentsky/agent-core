@@ -329,9 +329,9 @@ base_url = "https://api.anthropic.com"
 beta = "experimental-cc-routine-2026-04-01"
 
 # How long one request may take, in seconds (5 to 120), and how long
-# connecting may take (1 to timeout_secs). agentd never retries a request: a
-# hand-off still sending after twice timeout_secs, because agentd stopped
-# during it, is reported to the member as possibly started.
+# connecting may take (1 to less than timeout_secs). agentd never retries a
+# request: a hand-off still sending after twice timeout_secs, because agentd
+# stopped during it, is reported to the member as possibly started.
 timeout_secs = 30
 connect_timeout_secs = 10
 

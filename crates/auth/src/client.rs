@@ -9,6 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ALLOWED_SCOPES, Urls};
 use crate::plan::{PlanInfo, ProfileResponse};
 use crate::{AuthError, Endpoint};
 
@@ -28,16 +29,34 @@ const MAX_ERROR_CODE: usize = 64;
 /// Builds the HTTP client. It never follows redirects: a 307 or 308 from the
 /// token endpoint would otherwise resend a body holding a code or refresh
 /// token to wherever it points.
-pub(crate) fn build_client() -> Result<Client, AuthError> {
-    Client::builder()
+///
+/// It honors the system proxy settings, unless an endpoint agentd calls is
+/// on a loopback IP address, which only tests' fakes are: a proxy would
+/// read a plain `http` request, codes and tokens included, and reach the
+/// address on its own host. One client serves every endpoint, so then none
+/// of them uses a proxy. `proxy` is a proxy tests add as if the system had
+/// it.
+pub(crate) fn build_client(
+    urls: &Urls,
+    proxy: Option<reqwest::Proxy>,
+) -> Result<Client, AuthError> {
+    let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
-        .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|source| AuthError::Http {
-            endpoint: Endpoint::Client,
-            source: Arc::new(source.without_url()),
-        })
+        .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    let loopback = [&urls.token, &urls.revoke, &urls.profile]
+        .into_iter()
+        .any(|url| url.host_str().is_some_and(core_types::is_loopback_ip_host));
+    if loopback {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(|source| AuthError::Http {
+        endpoint: Endpoint::Client,
+        source: Arc::new(source.without_url()),
+    })
 }
 
 /// Tokens from the token endpoint.
@@ -55,13 +74,29 @@ struct TokenResponse {
     #[serde(default)]
     refresh_token: Option<SecretString>,
     expires_in: f64,
+    /// The scopes granted, space-separated. Left out, they are the ones
+    /// asked for (RFC 6749, section 5.1).
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 impl TokenResponse {
+    /// The tokens, checked.
+    ///
+    /// A grant wider than [`ALLOWED_SCOPES`] is [`AuthError::ScopeRefused`]:
+    /// the member can add scopes to the authorize URL, and the server may
+    /// grant its own, so what was asked for doesn't bound what came back.
     fn into_tokens(self, endpoint: Endpoint) -> Result<Tokens, AuthError> {
         let invalid = |reason| AuthError::InvalidResponse { endpoint, reason };
         if self.access_token.expose_secret().is_empty() {
             return Err(invalid("empty access_token"));
+        }
+        if self.scope.as_deref().is_some_and(|scope| {
+            scope
+                .split_ascii_whitespace()
+                .any(|granted| !ALLOWED_SCOPES.contains(&granted))
+        }) {
+            return Err(AuthError::ScopeRefused);
         }
         let refresh_token = self
             .refresh_token
@@ -176,8 +211,9 @@ fn token_is_dead(status: StatusCode, body: &[u8]) -> bool {
 /// A failed refresh.
 pub(crate) struct RefreshFailure {
     pub(crate) error: AuthError,
-    /// Whether the token endpoint said the refresh token is dead
-    /// ([`token_is_dead`]), so the link has to be marked broken.
+    /// Whether the refresh token can't be used again, so the link has to be
+    /// marked broken: the token endpoint said it is dead
+    /// ([`token_is_dead`]), or it grants more than [`ALLOWED_SCOPES`].
     pub(crate) dead: bool,
 }
 
@@ -286,7 +322,12 @@ pub(crate) async fn refresh(
             dead: token_is_dead(response.status, &response.body),
         });
     }
-    Ok(parse::<TokenResponse>(&response.body, Endpoint::Token)?.into_tokens(Endpoint::Token)?)
+    parse::<TokenResponse>(&response.body, Endpoint::Token)?
+        .into_tokens(Endpoint::Token)
+        .map_err(|error| RefreshFailure {
+            dead: matches!(error, AuthError::ScopeRefused),
+            error,
+        })
 }
 
 /// GETs the profile with the access token and reads the plan from it.
@@ -335,6 +376,25 @@ pub(crate) async fn revoke(
 mod tests {
     use super::*;
 
+    fn urls(base: &str) -> Urls {
+        let at = |path| Url::parse(base).unwrap().join(path).unwrap();
+        Urls {
+            authorize: at("/oauth/authorize"),
+            token: at("/v1/oauth/token"),
+            revoke: at("/v1/oauth/revoke"),
+            redirect: at("/oauth/code/callback"),
+            profile: at("/api/oauth/profile"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_endpoints_are_called_without_a_proxy() {
+        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
+            build_client(&urls(base), Some(proxy)).unwrap()
+        })
+        .await;
+    }
+
     fn tokens(json: &str) -> Result<Tokens, AuthError> {
         serde_json::from_str::<TokenResponse>(json)
             .unwrap()
@@ -348,7 +408,8 @@ mod tests {
         assert_eq!(ok.refresh_token.unwrap().expose_secret(), "r");
         assert_eq!(ok.expires_in, Duration::from_secs(28_800));
 
-        let no_refresh = tokens(r#"{"access_token":"a","expires_in":60.5,"scope":"x"}"#).unwrap();
+        let no_refresh =
+            tokens(r#"{"access_token":"a","expires_in":60.5,"scope":"user:profile"}"#).unwrap();
         assert!(no_refresh.refresh_token.is_none());
         assert_eq!(no_refresh.expires_in, Duration::from_millis(60_500));
 
@@ -368,6 +429,36 @@ mod tests {
                 matches!(tokens(json), Err(AuthError::InvalidResponse { .. })),
                 "{json}"
             );
+        }
+    }
+
+    #[test]
+    fn a_grant_wider_than_the_allowed_scopes_is_refused() {
+        for scope in [
+            r#""user:profile user:inference""#,
+            r#""user:inference""#,
+            r#"" user:profile  user:inference ""#,
+            r#""""#,
+            "null",
+        ] {
+            let json = format!(r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#);
+            assert!(tokens(&json).is_ok(), "{scope}");
+        }
+        assert!(tokens(r#"{"access_token":"a","expires_in":60}"#).is_ok());
+        for scope in [
+            "user:profile user:inference user:sessions:claude_code",
+            "user:sessions:claude_code",
+            "user:inference org:create_api_key",
+            "User:Profile",
+            "user:profile,user:inference",
+        ] {
+            let json = format!(r#"{{"access_token":"a","expires_in":60,"scope":"{scope}"}}"#);
+            let err = tokens(&json).err().unwrap();
+            assert!(matches!(err, AuthError::ScopeRefused), "{scope}: {err:?}");
+            for allowed in ALLOWED_SCOPES {
+                assert!(err.to_string().contains(allowed), "{err}");
+            }
+            assert!(!err.to_string().contains("sessions"), "{err}");
         }
     }
 

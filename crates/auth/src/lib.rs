@@ -107,8 +107,9 @@ pub enum AuthError {
     /// The member has no Claude link.
     #[error("no Claude account is linked")]
     NotLinked,
-    /// The token endpoint said the member's refresh token is dead, so the
-    /// link is marked broken and the member must log in again. The member is
+    /// The token endpoint said the member's refresh token is dead, or
+    /// granted more than [`ALLOWED_SCOPES`] on a refresh, so the link is
+    /// marked broken and the member must log in again. The member is
     /// announced once per failure on [`Auth::take_relink_notices`], not
     /// through this error.
     #[error("the Claude link has stopped working; log in again")]
@@ -158,6 +159,14 @@ pub enum AuthError {
         /// What is wrong with it.
         reason: &'static str,
     },
+    /// The token endpoint granted a scope outside [`ALLOWED_SCOPES`]. A
+    /// login is refused and stores nothing; a refresh marks the link broken,
+    /// as for a dead refresh token, so the member logs in again.
+    #[error(
+        "Anthropic granted more than {}; log in again without changing the login link",
+        ALLOWED_SCOPES.join(" and ")
+    )]
+    ScopeRefused,
     /// The operating system's random number generator failed.
     #[error("the system random number generator failed")]
     Random,
@@ -296,13 +305,14 @@ impl Auth {
     pub fn new(config: OAuthConfig, store: Store) -> Result<Self, AuthError> {
         config.validate()?;
         let urls = config.urls()?;
+        let http = client::build_client(&urls, None)?;
         let (relink, relink_notices) = mpsc::unbounded_channel();
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 urls,
                 store,
-                http: client::build_client()?,
+                http,
                 locks: KeyedLocks::default(),
                 flights: Mutex::default(),
                 failures: Mutex::default(),
@@ -376,6 +386,7 @@ impl Auth {
     /// [`AuthError::UnknownLogin`] if no pending login of this member has
     /// that `state`, [`AuthError::LoginExpired`] if it expired,
     /// [`AuthError::CodeRejected`] if the token endpoint refuses the code,
+    /// [`AuthError::ScopeRefused`] if it grants more than [`ALLOWED_SCOPES`],
     /// and [`AuthError::Http`], [`AuthError::Status`] or
     /// [`AuthError::InvalidResponse`] if the exchange fails otherwise.
     pub async fn complete_login(
@@ -662,7 +673,7 @@ impl Inner {
         let tokens = match refreshed {
             Ok(tokens) => tokens,
             Err(failure) if failure.dead => {
-                tracing::warn!(%member, error = %failure.error, "the token endpoint says the refresh token is dead; the link is broken");
+                tracing::warn!(%member, error = %failure.error, "the refresh token can't be used again; the link is broken");
                 return (self.mark_broken(member, &link).await, Afterwards::Nothing);
             }
             Err(failure) => {
@@ -704,8 +715,8 @@ impl Inner {
         }
     }
 
-    /// Marks `link` broken after the token endpoint said its refresh token
-    /// is dead, and announces the member if this call broke it.
+    /// Marks `link` broken after its refresh token turned out unusable, and
+    /// announces the member if this call broke it.
     async fn mark_broken(&self, member: MemberId, link: &ClaudeLink) -> Outcome {
         let newly_broken = self
             .store

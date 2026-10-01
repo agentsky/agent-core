@@ -595,6 +595,61 @@ async fn a_token_response_without_a_refresh_token_is_refused() {
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
 }
 
+fn widened(access: &str, refresh: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "token_type": "Bearer",
+        "access_token": access,
+        "refresh_token": refresh,
+        "expires_in": 28800,
+        "scope": "user:profile user:inference user:sessions:claude_code",
+    }))
+}
+
+#[tokio::test]
+async fn a_login_granted_a_wider_scope_is_refused_and_stores_nothing() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(widened("access-wide", "refresh-wide"))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    let start = h.auth.start_login(h.member).await.unwrap();
+    let state = query(&Url::parse(&start.url).unwrap(), "state");
+    let err = h
+        .auth
+        .complete_login(h.member, &paste("code", &state))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthError::ScopeRefused), "{err:?}");
+    assert!(!format!("{err} {err:?}").contains("-wide"));
+    assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
+    assert!(requests_to(&h.server, PROFILE_PATH).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_refresh_granted_a_wider_scope_breaks_the_link() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(widened("access-wide", "refresh-wide"))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+    let mut notices = h.auth.take_relink_notices().unwrap();
+
+    let err = h.auth.access_token(h.member).await.unwrap_err();
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
+    let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+    assert!(stored.broken_at.is_some());
+    assert_eq!(stored.access_token.expose_secret(), "access-1");
+    assert_eq!(stored.refresh_token.expose_secret(), "refresh-1");
+    assert_eq!(notices.try_recv().unwrap(), h.member);
+    let err = h.auth.access_token(h.member).await.unwrap_err();
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
+}
+
 #[tokio::test]
 async fn the_link_is_stored_even_if_the_profile_fails() {
     let h = harness().await;

@@ -359,11 +359,7 @@ impl SlackClient {
             let path = format!("{}/", base.path());
             base.set_path(&path);
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(redirect::Policy::none())
-            .build()
-            .map_err(transport)?;
+        let http = http_client(&base, None)?;
         Ok(Self {
             http,
             base,
@@ -1866,6 +1862,24 @@ pub fn map_error(code: &str, needed: Option<&str>) -> SurfaceError {
 
 /// A transport error with its causes, but without the URL, which may be a
 /// presigned upload URL or a `response_url`.
+/// Builds the client that calls `base`. It honors the system proxy
+/// settings unless `base` is on a loopback IP address, as only tests' fakes
+/// are: a proxy would read a plain `http` request, the bot token included,
+/// and reach the address on its own host. `proxy` is a proxy tests add as
+/// if the system had it.
+fn http_client(base: &Url, proxy: Option<reqwest::Proxy>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(redirect::Policy::none());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    if base.host_str().is_some_and(core_types::is_loopback_ip_host) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(transport)
+}
+
 fn transport(err: reqwest::Error) -> SurfaceError {
     let err = err.without_url();
     let mut text = err.to_string();
@@ -1881,6 +1895,14 @@ fn transport(err: reqwest::Error) -> SurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_loopback_api_is_called_without_a_proxy() {
+        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
+            http_client(&Url::parse(base).unwrap(), Some(proxy)).unwrap()
+        })
+        .await;
+    }
 
     #[test]
     fn every_method_has_a_tier() {

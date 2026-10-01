@@ -590,7 +590,9 @@ pub struct CloudConfig {
     /// after twice this is reported as unknown.
     pub timeout_secs: u64,
     /// `connect_timeout_secs`: how long connecting may take, from 1 to
-    /// `timeout_secs`, default [`DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS`].
+    /// less than `timeout_secs`, default
+    /// [`DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS`]. Below the timeout, a
+    /// connection that never opened always counts as not sent.
     pub connect_timeout_secs: u64,
     /// `retention_days`: how long hand-offs are kept after they were asked
     /// for, from 1 to 365, default [`DEFAULT_CLOUD_RETENTION_DAYS`].
@@ -634,7 +636,7 @@ impl CloudConfig {
 
     /// [`retention_days`](Self::retention_days) as a [`Duration`].
     pub fn retention(&self) -> Duration {
-        Duration::from_secs(self.retention_days * 24 * 60 * 60)
+        Duration::from_secs(self.retention_days.saturating_mul(24 * 60 * 60))
     }
 
     /// Checks every value, as loading the file does.
@@ -655,10 +657,10 @@ impl CloudConfig {
         if !(5..=120).contains(&self.timeout_secs) {
             return Err(invalid("cloud.timeout_secs", "must be from 5 to 120"));
         }
-        if !(1..=self.timeout_secs).contains(&self.connect_timeout_secs) {
+        if !(1..self.timeout_secs).contains(&self.connect_timeout_secs) {
             return Err(invalid(
                 "cloud.connect_timeout_secs",
-                "must be from 1 to cloud.timeout_secs",
+                "must be from 1 to less than cloud.timeout_secs",
             ));
         }
         if !(1..=365).contains(&self.retention_days) {
@@ -669,18 +671,14 @@ impl CloudConfig {
 }
 
 /// `text` as an origin: `https`, or `http` to a loopback IP address
-/// (IPv4-mapped included; `localhost` is a name that could resolve
-/// anywhere), with a host, and no credentials, path, query or fragment.
+/// ([`core_types::is_loopback_ip_host`]), with a host, and no credentials,
+/// path, query or fragment.
 fn cloud_origin(text: &str) -> Result<Url, &'static str> {
     const REASON: &str = "must be an https:// origin, or http:// to a loopback IP address, with \
                           no user info, path, query or fragment";
     let url = Url::parse(text).map_err(|_| REASON)?;
     let host = url.host_str().ok_or(REASON)?;
-    let loopback = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    let loopback = core_types::is_loopback_ip_host(host);
     let scheme_ok = match url.scheme() {
         "https" => true,
         "http" => loopback,
@@ -1717,6 +1715,11 @@ data_dir = "/nonexistent/agentd"
                 "timeout_secs = 5\nconnect_timeout_secs = 6",
                 "cloud.connect_timeout_secs",
             ),
+            (
+                "timeout_secs = 5\nconnect_timeout_secs = 5",
+                "cloud.connect_timeout_secs",
+            ),
+            ("connect_timeout_secs = 30", "cloud.connect_timeout_secs"),
             ("retention_days = 0", "cloud.retention_days"),
             ("retention_days = 366", "cloud.retention_days"),
         ] {
@@ -1728,14 +1731,19 @@ data_dir = "/nonexistent/agentd"
 
         let cloud = cloud_with(
             "beta = \"experimental-cc-routine-2027-01-01,other.beta_2\"\ntimeout_secs = 5\n\
-             connect_timeout_secs = 5\nretention_days = 365",
+             connect_timeout_secs = 4\nretention_days = 365",
         )
         .unwrap()
         .cloud
         .unwrap();
         assert_eq!(cloud.timeout(), Duration::from_secs(5));
-        assert_eq!(cloud.connect_timeout(), Duration::from_secs(5));
+        assert_eq!(cloud.connect_timeout(), Duration::from_secs(4));
         assert_eq!(cloud.retention(), Duration::from_secs(365 * 24 * 60 * 60));
+        let unchecked = CloudConfig {
+            retention_days: u64::MAX,
+            ..CloudConfig::default()
+        };
+        assert_eq!(unchecked.retention(), Duration::from_secs(u64::MAX));
         let cloud = cloud_with("timeout_secs = 120\nconnect_timeout_secs = 1")
             .unwrap()
             .cloud

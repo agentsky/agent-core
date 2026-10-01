@@ -1,5 +1,7 @@
 //! [`Cidr`]: IP subnets, for the listeners' network checks and the
-//! egress proxy's address rules.
+//! egress proxy's address rules; and [`is_loopback_ip_host`], the one rule
+//! for which configured hosts may be reached over plain HTTP and without a
+//! proxy.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -131,11 +133,64 @@ impl TryFrom<String> for Cidr {
     }
 }
 
+/// Whether `host`, as a URL's host is written (an IPv6 address in
+/// brackets), is a loopback IP address: anything in `127.0.0.0/8`, `::1`,
+/// or the IPv4-mapped form of those. A name such as `localhost` is not,
+/// since it could resolve anywhere.
+///
+/// It decides where a configured `http://` URL is allowed, since a request
+/// to a loopback address never crosses a network, and that an HTTP client
+/// calling such a URL uses no proxy: a proxy would read a plain request,
+/// credentials included, and resolve the address on its own host.
+///
+/// ```
+/// use core_types::is_loopback_ip_host;
+///
+/// assert!(is_loopback_ip_host("127.9.9.9"));
+/// assert!(is_loopback_ip_host("[::ffff:127.0.0.1]"));
+/// assert!(!is_loopback_ip_host("localhost"));
+/// ```
+pub fn is_loopback_ip_host(host: &str) -> bool {
+    host.strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[test]
+    fn loopback_hosts_are_loopback_ip_addresses_only() {
+        for host in [
+            "127.0.0.1",
+            "127.255.0.9",
+            "[::1]",
+            "::1",
+            "[::ffff:127.0.0.1]",
+            "[0:0:0:0:0:0:0:1]",
+        ] {
+            assert!(is_loopback_ip_host(host), "{host}");
+        }
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1.nip.io",
+            "10.0.0.1",
+            "0.0.0.0",
+            "[::]",
+            "[fe80::1]",
+            "[::ffff:10.0.0.1]",
+            "",
+            "[",
+        ] {
+            assert!(!is_loopback_ip_host(host), "{host}");
+        }
+    }
 
     fn cidr(s: &str) -> Cidr {
         s.parse().unwrap()

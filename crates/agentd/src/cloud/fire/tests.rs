@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use serde_json::json;
+use store::CloudHandoffState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use wiremock::matchers::{method, path};
@@ -28,8 +29,25 @@ fn client(base: &str) -> FireClient {
         &config(base),
         Duration::from_secs(10),
         Duration::from_secs(5),
+        None,
     )
     .unwrap()
+}
+
+/// A client whose request times out in two seconds, for a fake that holds
+/// its answer back for ten.
+fn quick(base: &str) -> FireClient {
+    FireClient::build(
+        &config(base),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        None,
+    )
+    .unwrap()
+}
+
+fn state(outcome: &FireOutcome) -> CloudHandoffState {
+    CloudOutcome::from(outcome).state()
 }
 
 fn routine() -> RoutineId {
@@ -41,7 +59,7 @@ fn token() -> SecretString {
 }
 
 async fn fire(base: &str) -> FireOutcome {
-    client(base).fire(&routine(), &token(), TASK).await.unwrap()
+    client(base).fire(&routine(), &token(), TASK).await
 }
 
 /// Fires once at a fresh fake that answers with `template`, and checks it
@@ -74,11 +92,19 @@ fn session_body(id: &str, url: Option<&str>) -> serde_json::Value {
     body
 }
 
-fn rejected(status: u16, error_type: Option<&str>, retry_after: Option<u32>) -> FireOutcome {
+fn rejected(status: u16, error_type: Option<&str>, retry_after_secs: Option<u32>) -> FireOutcome {
     FireOutcome::Rejected {
         status: Some(status),
         error_type: error_type.map(str::to_owned),
-        retry_after,
+        retry_after_secs,
+    }
+}
+
+fn not_sent() -> FireOutcome {
+    FireOutcome::Rejected {
+        status: None,
+        error_type: None,
+        retry_after_secs: None,
     }
 }
 
@@ -105,7 +131,7 @@ async fn fire_sends_the_documented_request() {
         .await;
 
     let outcome = fire(&server.uri()).await;
-    assert_eq!(outcome.kind(), "fired");
+    assert_eq!(state(&outcome), CloudHandoffState::Fired);
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -127,6 +153,7 @@ async fn fire_sends_the_documented_request() {
     );
     assert_eq!(DEFAULT_CLOUD_BETA, "experimental-cc-routine-2026-04-01");
     assert_eq!(header("content-type").as_deref(), Some("application/json"));
+    assert_eq!(header("accept-encoding"), None);
     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body, json!({"text": TASK}));
 
@@ -162,9 +189,8 @@ async fn a_custom_beta_header_is_sent() {
     let outcome = FireClient::new(&config)
         .unwrap()
         .fire(&routine(), &token(), TASK)
-        .await
-        .unwrap();
-    assert_eq!(outcome.kind(), "fired");
+        .await;
+    assert_eq!(state(&outcome), CloudHandoffState::Fired);
     server.verify().await;
 }
 
@@ -180,7 +206,6 @@ async fn fire_reads_the_session_id_and_url() {
             session_url: Some(format!("https://claude.ai/code/{SESSION}")),
         }
     );
-    assert_eq!(outcome.status(), Some(200));
 
     let longest = format!("session_{}", "a".repeat(128));
     let outcome = classify(answer(
@@ -248,8 +273,7 @@ async fn each_documented_4xx_is_rejected_with_its_type() {
     ] {
         let outcome = answered(ResponseTemplate::new(status).set_body_json(envelope(kind))).await;
         assert_eq!(outcome, rejected(status, Some(kind), None), "{status}");
-        assert_eq!(outcome.kind(), "rejected");
-        assert_eq!(outcome.status(), Some(status));
+        assert_eq!(state(&outcome), CloudHandoffState::Rejected);
     }
 
     let lenient = [
@@ -307,9 +331,11 @@ async fn retry_after_is_kept_in_seconds_and_a_date_is_ignored() {
         ("0", Some(0)),
         ("3600", Some(3600)),
         (" 30 ", Some(30)),
-        ("4294967295", Some(u32::MAX)),
-        ("4294967296", None),
-        ("99999999999999999999999", None),
+        ("86400", Some(86_400)),
+        ("86401", Some(MAX_RETRY_AFTER_SECS)),
+        ("4294967295", Some(MAX_RETRY_AFTER_SECS)),
+        ("4294967296", Some(MAX_RETRY_AFTER_SECS)),
+        ("99999999999999999999999", Some(MAX_RETRY_AFTER_SECS)),
         ("+5", None),
         ("-1", None),
         ("1.5", None),
@@ -320,6 +346,7 @@ async fn retry_after_is_kept_in_seconds_and_a_date_is_ignored() {
         let outcome = classify(answer(429, Some(value), Ok(Vec::new())));
         assert_eq!(outcome, rejected(429, None, seconds), "{value:?}");
     }
+    assert_eq!(MAX_RETRY_AFTER_SECS, 24 * 60 * 60);
     let outcome = classify(answer(503, Some("10"), Ok(Vec::new())));
     assert_eq!(outcome, unknown_with(Some(503), UnknownReason::ServerError));
 }
@@ -334,8 +361,7 @@ async fn server_errors_and_other_statuses_are_unknown() {
             unknown_with(Some(status), UnknownReason::ServerError),
             "{status}"
         );
-        assert_eq!(outcome.kind(), "unknown");
-        assert_eq!(outcome.status(), Some(status));
+        assert_eq!(state(&outcome), CloudHandoffState::Unknown);
     }
     for status in [201, 202, 204, 402, 405, 409, 413, 418, 422, 451] {
         let outcome =
@@ -364,16 +390,12 @@ async fn a_timeout_after_sending_is_unknown() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(session_body(SESSION, None))
-                .set_delay(Duration::from_secs(5)),
+                .set_delay(Duration::from_secs(10)),
         )
         .mount(&server)
         .await;
-    let outcome = quick(&server.uri())
-        .fire(&routine(), &token(), TASK)
-        .await
-        .unwrap();
+    let outcome = quick(&server.uri()).fire(&routine(), &token(), TASK).await;
     assert_eq!(outcome, unknown_with(None, UnknownReason::Timeout));
-    assert_eq!(outcome.status(), None);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 
     assert_eq!(
@@ -392,7 +414,11 @@ async fn a_timeout_after_sending_is_unknown() {
 enum Then {
     HangUp,
     Answer(Vec<u8>),
+    /// Answers, then holds the connection open for ten seconds or until
+    /// the client hangs up.
     AnswerAndStall(Vec<u8>),
+    /// Answers every request the connection carries.
+    KeepAlive(Vec<u8>),
 }
 
 /// A server on a local port that does `then` with every request, until a
@@ -415,7 +441,15 @@ async fn hand_written(then: Then) -> (String, tokio::task::JoinHandle<usize>) {
                 }
                 Then::AnswerAndStall(bytes) => {
                     stream.write_all(bytes).await.unwrap();
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let mut rest = [0; 1];
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(10), stream.read(&mut rest)).await;
+                }
+                Then::KeepAlive(bytes) => {
+                    stream.write_all(bytes).await.unwrap();
+                    while read_request(&mut stream).await {
+                        stream.write_all(bytes).await.unwrap();
+                    }
                 }
             }
         }
@@ -424,12 +458,13 @@ async fn hand_written(then: Then) -> (String, tokio::task::JoinHandle<usize>) {
     (base, task)
 }
 
-async fn read_request(stream: &mut TcpStream) {
+/// Reads one request, and says whether it came whole.
+async fn read_request(stream: &mut TcpStream) -> bool {
     let mut request = Vec::new();
     let mut chunk = [0; 4096];
     loop {
         match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return false,
             Ok(n) => request.extend_from_slice(&chunk[..n]),
         }
         let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
@@ -442,18 +477,9 @@ async fn read_request(stream: &mut TcpStream) {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .unwrap_or(0);
         if request.len() >= end + 4 + length {
-            return;
+            return true;
         }
     }
-}
-
-fn quick(base: &str) -> FireClient {
-    FireClient::build(
-        &config(base),
-        Duration::from_millis(300),
-        Duration::from_millis(300),
-    )
-    .unwrap()
 }
 
 #[tokio::test]
@@ -482,7 +508,7 @@ async fn a_connection_lost_after_sending_is_unknown() {
 async fn a_success_whose_body_stalls_or_runs_past_the_limit_is_unknown() {
     let head = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"claude_code".to_vec();
     let (base, server) = hand_written(Then::AnswerAndStall(head)).await;
-    let outcome = quick(&base).fire(&routine(), &token(), TASK).await.unwrap();
+    let outcome = quick(&base).fire(&routine(), &token(), TASK).await;
     assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Timeout));
     assert_eq!(server.await.unwrap(), 1);
 
@@ -517,16 +543,8 @@ async fn a_refused_connection_is_rejected() {
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let base = format!("http://{}", socket.local_addr().unwrap());
     let outcome = fire(&base).await;
-    assert_eq!(
-        outcome,
-        FireOutcome::Rejected {
-            status: None,
-            error_type: None,
-            retry_after: None,
-        }
-    );
-    assert_eq!(outcome.kind(), "rejected");
-    assert_eq!(outcome.status(), None);
+    assert_eq!(outcome, not_sent());
+    assert_eq!(state(&outcome), CloudHandoffState::Rejected);
     drop(socket);
 }
 
@@ -608,7 +626,7 @@ async fn an_unreadable_success_is_unknown() {
     };
     let outcome =
         answered(ResponseTemplate::new(200).set_body_string(padded(MAX_BODY_BYTES))).await;
-    assert_eq!(outcome.kind(), "fired");
+    assert_eq!(state(&outcome), CloudHandoffState::Fired);
     let outcome =
         answered(ResponseTemplate::new(200).set_body_string(padded(MAX_BODY_BYTES + 1))).await;
     assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Unreadable));
@@ -618,7 +636,7 @@ async fn an_unreadable_success_is_unknown() {
 async fn fire_never_retries() {
     for status in [500, 503] {
         let outcome = answered(ResponseTemplate::new(status)).await;
-        assert_eq!(outcome.kind(), "unknown");
+        assert_eq!(state(&outcome), CloudHandoffState::Unknown);
     }
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -635,6 +653,38 @@ async fn fire_never_retries() {
 }
 
 #[tokio::test]
+async fn each_fire_opens_a_connection_of_its_own() {
+    let mut answer = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+        session_body(SESSION, None).to_string().len()
+    )
+    .into_bytes();
+    answer.extend_from_slice(session_body(SESSION, None).to_string().as_bytes());
+    let (base, server) = hand_written(Then::KeepAlive(answer)).await;
+    let reused = client(&base);
+    for _ in 0..2 {
+        let outcome = reused.fire(&routine(), &token(), TASK).await;
+        assert_eq!(state(&outcome), CloudHandoffState::Fired);
+    }
+    assert_eq!(server.await.unwrap(), 2, "a connection was reused");
+}
+
+#[tokio::test]
+async fn a_loopback_base_url_is_called_without_a_proxy() {
+    testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
+        FireClient::build(
+            &config(base),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            Some(proxy),
+        )
+        .unwrap()
+        .http
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn nothing_is_sent_for_a_bad_token_or_task() {
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
@@ -643,6 +693,7 @@ async fn nothing_is_sent_for_a_bad_token_or_task() {
         .mount(&server)
         .await;
     let refusing = client(&server.uri());
+    let logs = global_logs().tag();
     for bad in [
         "",
         "sk-ant oat01",
@@ -650,20 +701,24 @@ async fn nothing_is_sent_for_a_bad_token_or_task() {
         "sk-ant-\u{e9}",
         "tab\there",
     ] {
-        let err = refusing
+        let outcome = refusing
             .fire(&routine(), &SecretString::from(bad), TASK)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, FireError::Token), "{bad:?}: {err}");
-        assert!(bad.is_empty() || !err.to_string().contains(bad));
-        assert!(bad.is_empty() || !format!("{err:?}").contains(bad));
+            .await;
+        assert_eq!(outcome, not_sent(), "{bad:?}");
     }
     let too_long = "x".repeat(MAX_TASK_BYTES + 1);
     for task in ["", too_long.as_str()] {
-        let err = refusing.fire(&routine(), &token(), task).await.unwrap_err();
-        assert!(matches!(err, FireError::Task), "{}", task.len());
+        assert_eq!(check_task(task), Err(TaskError), "{}", task.len());
+        let outcome = refusing.fire(&routine(), &token(), task).await;
+        assert_eq!(outcome, not_sent(), "{}", task.len());
     }
     server.verify().await;
+    logs.snapshot()
+        .assert_has("wasn't sent")
+        .assert_has("header can't carry")
+        .assert_has("the task is empty or longer than 65536 bytes")
+        .assert_lacks("sk-ant oat01")
+        .assert_lacks("tab\there");
 
     let longest_id: RoutineId = format!("trig_{}", "Z9".repeat(32)).parse().unwrap();
     let server = MockServer::start().await;
@@ -674,11 +729,11 @@ async fn nothing_is_sent_for_a_bad_token_or_task() {
         .mount(&server)
         .await;
     let longest_task = "é".repeat(MAX_TASK_BYTES / 2);
+    assert_eq!(check_task(&longest_task), Ok(()));
     let outcome = client(&server.uri())
         .fire(&longest_id, &token(), &longest_task)
-        .await
-        .unwrap();
-    assert_eq!(outcome.kind(), "fired");
+        .await;
+    assert_eq!(state(&outcome), CloudHandoffState::Fired);
     server.verify().await;
 }
 
@@ -712,16 +767,29 @@ fn a_client_is_built_only_from_a_valid_config() {
         ),
     ] {
         match FireClient::new(&config).unwrap_err() {
-            FireError::Config(err) => assert_eq!(err.key(), Some(key)),
+            FireClientError::Config(err) => assert_eq!(err.key(), Some(key)),
             other => panic!("{key}: {other}"),
         }
     }
 }
 
 #[test]
-fn outcome_names_are_the_handoff_states() {
-    assert_eq!(classify(Exchange::NotSent).kind(), "rejected");
-    assert_eq!(classify(Exchange::Lost).kind(), "unknown");
+fn an_answer_shows_its_body_only_by_length() {
+    let shown = format!(
+        "{:?}",
+        answer(401, Some("5"), Ok(b"BODY-MARKER-echoed".to_vec()))
+    );
+    assert!(!shown.contains("BODY-MARKER"), "{shown}");
+    assert!(shown.contains("401") && shown.contains("Ok(18)"), "{shown}");
+}
+
+#[test]
+fn outcomes_map_to_what_the_store_records() {
+    assert_eq!(
+        state(&classify(Exchange::NotSent)),
+        CloudHandoffState::Rejected
+    );
+    assert_eq!(state(&classify(Exchange::Lost)), CloudHandoffState::Unknown);
     for (reason, name) in [
         (UnknownReason::ServerError, "server_error"),
         (UnknownReason::Redirect, "redirect"),
@@ -755,14 +823,23 @@ async fn token_and_task_never_reach_the_log() {
     let socket = TcpSocket::new_v4().unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     outcomes.push(fire(&format!("http://{}", socket.local_addr().unwrap())).await);
-    let kinds: Vec<_> = outcomes.iter().map(FireOutcome::kind).collect();
+    let states: Vec<_> = outcomes.iter().map(state).collect();
     assert_eq!(
-        kinds,
-        ["fired", "rejected", "unknown", "unknown", "rejected"]
+        states,
+        [
+            CloudHandoffState::Fired,
+            CloudHandoffState::Rejected,
+            CloudHandoffState::Unknown,
+            CloudHandoffState::Unknown,
+            CloudHandoffState::Rejected,
+        ]
     );
 
     let mine = logs.snapshot();
     mine.assert_has("fired a cloud routine")
+        .assert_has(r#""outcome":"fired""#)
+        .assert_has("wasn't sent")
+        .assert_has("tcp connect error")
         .assert_has(ROUTINE)
         .assert_has(SESSION)
         .assert_has("authentication_error")

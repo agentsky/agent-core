@@ -4,14 +4,15 @@
 //! [`FireClient`] sends the one request a hand-off makes: `POST
 //! {base_url}/v1/claude_code/routines/<routine id>/fire` with the routine's
 //! own token. It never retries, since the endpoint has no idempotency key
-//! and every success starts a session. [`classify`] turns what came back
-//! into a [`FireOutcome`]: the session was started, the endpoint refused
-//! the request, or nobody can tell. agentd doesn't follow the session
-//! afterwards; the member does, at the link.
+//! and every success starts a session. What came back becomes a
+//! [`FireOutcome`]: the session was started, the endpoint refused the
+//! request, or nobody can tell, and that is what the hand-off records
+//! ([`store::CloudOutcome`]). agentd doesn't follow the session afterwards;
+//! the member does, at the link.
 
 mod fire;
 
 pub use fire::{
-    ANTHROPIC_VERSION, Answer, BodyError, Exchange, FireClient, FireError, FireOutcome,
-    MAX_BODY_BYTES, MAX_TASK_BYTES, SESSION_URL_PREFIX, UnknownReason, classify,
+    ANTHROPIC_VERSION, FireClient, FireClientError, FireOutcome, MAX_BODY_BYTES,
+    MAX_RETRY_AFTER_SECS, MAX_TASK_BYTES, SESSION_URL_PREFIX, TaskError, UnknownReason, check_task,
 };

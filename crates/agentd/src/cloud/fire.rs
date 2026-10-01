@@ -1,5 +1,5 @@
-//! [`FireClient`] and [`classify`]: one request to a routine's fire
-//! endpoint, and what its answer means.
+//! [`FireClient`]: one request to a routine's fire endpoint, and what its
+//! answer means.
 
 use std::fmt;
 use std::time::Duration;
@@ -10,6 +10,7 @@ use reqwest::{Client, Response, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
+use store::CloudOutcome;
 
 use crate::config::{CloudConfig, ConfigError};
 
@@ -28,6 +29,9 @@ pub const SESSION_URL_PREFIX: &str = "https://claude.ai/code/";
 const MAX_SESSION_ID_TAIL: usize = 128;
 /// The longest `error.type` kept from an error body.
 const MAX_ERROR_TYPE: usize = 64;
+/// The longest `Retry-After` kept, a day: the endpoint's documented limits
+/// are hourly, and a longer one is read as this.
+pub const MAX_RETRY_AFTER_SECS: u32 = 24 * 60 * 60;
 
 /// Fires Claude Code routines: one `POST` per hand-off, never retried.
 ///
@@ -36,7 +40,9 @@ const MAX_ERROR_TYPE: usize = 64;
 /// nothing; retries nothing, not even what reqwest would retry on its own;
 /// keeps no idle connection, so a fire never meets a connection the server
 /// closed meanwhile and is never left unsure for that; and honors the
-/// system proxy settings as `auth`'s client does. The token, the task and
+/// system proxy settings as `auth`'s client does, except for a `base_url`
+/// on a loopback IP address, which no proxy could reach and which would
+/// read the plain request, token included. The token, the task and
 /// response bodies appear in no log line or error.
 #[derive(Clone)]
 pub struct FireClient {
@@ -54,23 +60,34 @@ impl fmt::Debug for FireClient {
     }
 }
 
-/// Why a [`FireClient`] couldn't be built, or why [`FireClient::fire`] sent
-/// nothing. None of them repeats a token or a task.
+/// Why a [`FireClient`] couldn't be built.
 #[derive(Debug, thiserror::Error)]
-pub enum FireError {
+pub enum FireClientError {
     /// `[cloud]` has a bad value.
     #[error(transparent)]
     Config(#[from] ConfigError),
     /// The HTTP client couldn't be built.
     #[error("couldn't build the cloud hand-off's HTTP client: {0}")]
     Client(#[source] reqwest::Error),
-    /// The routine token is empty or holds a character a header can't
-    /// carry, such as a space or a line break.
-    #[error("the routine token is empty or holds characters a header can't carry")]
-    Token,
-    /// The task is empty or longer than [`MAX_TASK_BYTES`].
-    #[error("the task is empty or longer than 65536 bytes")]
-    Task,
+}
+
+/// Why a task can't be fired: it is empty or longer than
+/// [`MAX_TASK_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the task is empty or longer than {} bytes", MAX_TASK_BYTES)]
+pub struct TaskError;
+
+/// Checks that `task` can be fired, before a hand-off is written: one that
+/// can't would reach [`FireClient::fire`] only to be refused unsent.
+///
+/// # Errors
+///
+/// [`TaskError`] if it is empty or longer than [`MAX_TASK_BYTES`].
+pub fn check_task(task: &str) -> Result<(), TaskError> {
+    if task.is_empty() || task.len() > MAX_TASK_BYTES {
+        return Err(TaskError);
+    }
+    Ok(())
 }
 
 /// What a fire request led to.
@@ -86,16 +103,18 @@ pub enum FireOutcome {
         session_url: Option<String>,
     },
     /// The endpoint refused the request with a documented status (400,
-    /// 401, 403, 404 or 429), or the connection failed before the request
-    /// was sent. Assumed to have started no session.
+    /// 401, 403, 404 or 429), or the request wasn't sent: the connection
+    /// failed first, or the token or task couldn't be. Assumed to have
+    /// started no session.
     Rejected {
         /// The status, or `None` when nothing was sent.
         status: Option<u16>,
         /// `error.type` from the error body, when it is 1 to 64 lowercase
         /// ASCII letters, digits and `_`.
         error_type: Option<String>,
-        /// `Retry-After` in whole seconds. An HTTP date is ignored.
-        retry_after: Option<u32>,
+        /// `Retry-After` in whole seconds, at most
+        /// [`MAX_RETRY_AFTER_SECS`]. An HTTP date is ignored.
+        retry_after_secs: Option<u32>,
     },
     /// Anything else: the session may or may not have started.
     Unknown {
@@ -106,22 +125,27 @@ pub enum FireOutcome {
     },
 }
 
-impl FireOutcome {
-    /// `fired`, `rejected` or `unknown`: the hand-off's state, for logs and
-    /// the store.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Fired { .. } => "fired",
-            Self::Rejected { .. } => "rejected",
-            Self::Unknown { .. } => "unknown",
-        }
-    }
-
-    /// The HTTP status that came back, if any.
-    pub fn status(&self) -> Option<u16> {
-        match self {
-            Self::Fired { .. } => Some(200),
-            Self::Rejected { status, .. } | Self::Unknown { status, .. } => *status,
+/// The outcome to record for the hand-off.
+impl From<&FireOutcome> for CloudOutcome {
+    fn from(outcome: &FireOutcome) -> Self {
+        match outcome.clone() {
+            FireOutcome::Fired {
+                session_id,
+                session_url,
+            } => Self::Fired {
+                session_id,
+                session_url,
+            },
+            FireOutcome::Rejected {
+                status,
+                error_type,
+                retry_after_secs,
+            } => Self::Rejected {
+                status,
+                error_type,
+                retry_after_secs,
+            },
+            FireOutcome::Unknown { status, reason: _ } => Self::Unknown { status },
         }
     }
 }
@@ -160,12 +184,12 @@ impl UnknownReason {
 }
 
 /// What came back from one fire request, for [`classify`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Exchange {
+#[derive(Debug)]
+enum Exchange {
     /// The server answered with a status.
     Answered(Answer),
-    /// Connecting failed before the request was sent: DNS, a refused
-    /// connection, TLS, or the connect timeout.
+    /// Nothing was sent: the token or task couldn't be, or connecting
+    /// failed (DNS, a refused connection, TLS, or the connect timeout).
     NotSent,
     /// The request timed out after it may have been sent.
     TimedOut,
@@ -173,20 +197,30 @@ pub enum Exchange {
     Lost,
 }
 
-/// An answer's status, `Retry-After` and body.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Answer {
+/// An answer's status, `Retry-After` and body. `Debug` shows the body's
+/// length only, since a body may echo what was sent.
+struct Answer {
     /// The HTTP status.
-    pub status: u16,
+    status: u16,
     /// The `Retry-After` header, if it is visible ASCII.
-    pub retry_after: Option<String>,
+    retry_after: Option<String>,
     /// The body, up to [`MAX_BODY_BYTES`].
-    pub body: Result<Vec<u8>, BodyError>,
+    body: Result<Vec<u8>, BodyError>,
+}
+
+impl fmt::Debug for Answer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Answer")
+            .field("status", &self.status)
+            .field("retry_after", &self.retry_after)
+            .field("body_len", &self.body.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 /// Why an answer's body couldn't be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyError {
+enum BodyError {
     /// It is longer than [`MAX_BODY_BYTES`].
     TooLarge,
     /// Reading it timed out.
@@ -205,26 +239,28 @@ impl FireClient {
     ///
     /// # Errors
     ///
-    /// [`FireError::Config`] for a value `[cloud]` refuses, and
-    /// [`FireError::Client`] if the HTTP client can't be built.
-    pub fn new(config: &CloudConfig) -> Result<Self, FireError> {
+    /// [`FireClientError::Config`] for a value `[cloud]` refuses, and
+    /// [`FireClientError::Client`] if the HTTP client can't be built.
+    pub fn new(config: &CloudConfig) -> Result<Self, FireClientError> {
         config.validate()?;
-        Self::build(config, config.timeout(), config.connect_timeout())
+        Self::build(config, config.timeout(), config.connect_timeout(), None)
     }
 
     /// [`new`](Self::new) with the timeouts given, which tests shorten
-    /// below what `[cloud]` accepts.
+    /// below what `[cloud]` accepts, and `proxy`, a proxy tests add as if
+    /// the system had it.
     fn build(
         config: &CloudConfig,
         timeout: Duration,
         connect_timeout: Duration,
-    ) -> Result<Self, FireError> {
+        proxy: Option<reqwest::Proxy>,
+    ) -> Result<Self, FireClientError> {
         let base = config.base_url()?;
         let beta = HeaderValue::from_str(&config.beta).map_err(|_| ConfigError::Invalid {
             key: "cloud.beta".to_owned(),
             message: "must be a header value".to_owned(),
         })?;
-        let http = Client::builder()
+        let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .timeout(timeout)
@@ -234,9 +270,16 @@ impl FireClient {
             .no_brotli()
             .no_deflate()
             .no_zstd()
-            .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy);
+        }
+        if base.host_str().is_some_and(core_types::is_loopback_ip_host) {
+            builder = builder.no_proxy();
+        }
+        let http = builder
             .build()
-            .map_err(|err| FireError::Client(err.without_url()))?;
+            .map_err(|err| FireClientError::Client(err.without_url()))?;
         Ok(Self { http, base, beta })
     }
 
@@ -245,34 +288,34 @@ impl FireClient {
     /// {base_url}/v1/claude_code/routines/{routine}/fire`, never retried,
     /// whatever comes back. A [`RoutineId`] is only letters and digits
     /// after `trig_`, so it can't change the path. Logs the routine id, the
-    /// status and the outcome's kind, never the token, the task or the
-    /// body.
+    /// status and the outcome's state, and why nothing was sent when it
+    /// wasn't, never the token, the task or the body.
     ///
-    /// # Errors
-    ///
-    /// [`FireError::Token`] or [`FireError::Task`] for an argument that
-    /// can't be sent, in which case nothing is.
-    pub async fn fire(
-        &self,
-        routine: &RoutineId,
-        token: &SecretString,
-        task: &str,
-    ) -> Result<FireOutcome, FireError> {
+    /// A token a header can't carry, or a task [`check_task`] refuses, is
+    /// not sent, and the outcome is [`FireOutcome::Rejected`] with no
+    /// status, as for a connection that failed first: the caller checks
+    /// the task before it writes the hand-off, and records whatever comes
+    /// back.
+    pub async fn fire(&self, routine: &RoutineId, token: &SecretString, task: &str) -> FireOutcome {
         let token = token.expose_secret();
-        if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(FireError::Token);
-        }
-        if task.is_empty() || task.len() > MAX_TASK_BYTES {
-            return Err(FireError::Task);
-        }
-        let mut url = self.base.clone();
-        url.set_path(&format!("/v1/claude_code/routines/{routine}/fire"));
-        let outcome = classify(self.exchange(url, token, task).await);
+        let exchange = if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            not_sent(
+                routine,
+                "the routine token holds characters a header can't carry",
+            )
+        } else if let Err(err) = check_task(task) {
+            not_sent(routine, &err.to_string())
+        } else {
+            self.exchange(routine, token, task).await
+        };
+        let outcome = classify(exchange);
         log_outcome(routine.as_str(), &outcome);
-        Ok(outcome)
+        outcome
     }
 
-    async fn exchange(&self, url: Url, token: &str, task: &str) -> Exchange {
+    async fn exchange(&self, routine: &RoutineId, token: &str, task: &str) -> Exchange {
+        let mut url = self.base.clone();
+        url.set_path(&format!("/v1/claude_code/routines/{routine}/fire"));
         let sent = self
             .http
             .post(url)
@@ -284,7 +327,9 @@ impl FireClient {
             .await;
         let mut response = match sent {
             Ok(response) => response,
-            Err(err) if err.is_builder() || err.is_connect() => return Exchange::NotSent,
+            Err(err) if err.is_builder() || err.is_connect() => {
+                return not_sent(routine, &causes(err));
+            }
             Err(err) if err.is_timeout() => return Exchange::TimedOut,
             Err(_) => return Exchange::Lost,
         };
@@ -326,8 +371,32 @@ async fn read_body(response: &mut Response) -> Result<Vec<u8>, BodyError> {
     }
 }
 
+/// Logs why a request wasn't sent, and says so.
+fn not_sent(routine: &RoutineId, cause: &str) -> Exchange {
+    tracing::warn!(
+        routine = routine.as_str(),
+        cause,
+        "a cloud routine's fire request wasn't sent"
+    );
+    Exchange::NotSent
+}
+
+/// A request error and its causes, without the URL. They name what failed,
+/// such as DNS, TLS or a refused connection, and never a header.
+fn causes(err: reqwest::Error) -> String {
+    let err = err.without_url();
+    let mut text = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
 fn log_outcome(routine: &str, outcome: &FireOutcome) {
-    let kind = outcome.kind();
+    let kind = CloudOutcome::from(outcome).state().as_str();
     match outcome {
         FireOutcome::Fired { session_id, .. } => tracing::info!(
             routine,
@@ -339,13 +408,13 @@ fn log_outcome(routine: &str, outcome: &FireOutcome) {
         FireOutcome::Rejected {
             status,
             error_type,
-            retry_after,
+            retry_after_secs,
         } => tracing::warn!(
             routine,
             status = *status,
             outcome = kind,
             error_type = error_type.as_deref(),
-            retry_after_secs = *retry_after,
+            retry_after_secs = *retry_after_secs,
             "fired a cloud routine"
         ),
         FireOutcome::Unknown { status, reason } => tracing::warn!(
@@ -362,19 +431,19 @@ fn log_outcome(routine: &str, outcome: &FireOutcome) {
 ///
 /// - a 200 whose body names a session id of the expected shape is
 ///   [`FireOutcome::Fired`];
-/// - 400, 401, 403, 404 and 429, whatever their body, and a connection that
-///   failed before the request was sent, are [`FireOutcome::Rejected`];
+/// - 400, 401, 403, 404 and 429, whatever their body, and a request that
+///   wasn't sent, are [`FireOutcome::Rejected`];
 /// - everything else is [`FireOutcome::Unknown`]: a 5xx, a redirect,
 ///   another status, a timeout or a connection lost after sending, and a
 ///   200 that can't be read.
-pub fn classify(exchange: Exchange) -> FireOutcome {
+fn classify(exchange: Exchange) -> FireOutcome {
     let answer = match exchange {
         Exchange::Answered(answer) => answer,
         Exchange::NotSent => {
             return FireOutcome::Rejected {
                 status: None,
                 error_type: None,
-                retry_after: None,
+                retry_after_secs: None,
             };
         }
         Exchange::TimedOut => return unknown(None, UnknownReason::Timeout),
@@ -397,7 +466,7 @@ pub fn classify(exchange: Exchange) -> FireOutcome {
         400 | 401 | 403 | 404 | 429 => FireOutcome::Rejected {
             status,
             error_type: answer.body.ok().and_then(|body| error_type(&body)),
-            retry_after: answer.retry_after.as_deref().and_then(retry_after_secs),
+            retry_after_secs: answer.retry_after.as_deref().and_then(retry_after_secs),
         },
         300..=399 => unknown(status, UnknownReason::Redirect),
         500..=599 => unknown(status, UnknownReason::ServerError),
@@ -438,14 +507,18 @@ fn error_type(body: &[u8]) -> Option<String> {
     code.then(|| kind.to_owned())
 }
 
-/// `Retry-After` as whole seconds. An HTTP date, or anything but digits,
-/// gives `None`.
+/// `Retry-After` as whole seconds, at most [`MAX_RETRY_AFTER_SECS`]. An
+/// HTTP date, or anything but digits, gives `None`.
 fn retry_after_secs(value: &str) -> Option<u32> {
     let value = value.trim();
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    value.parse().ok()
+    Some(
+        value
+            .parse::<u32>()
+            .map_or(MAX_RETRY_AFTER_SECS, |secs| secs.min(MAX_RETRY_AFTER_SECS)),
+    )
 }
 
 fn is_session_id(id: &str) -> bool {

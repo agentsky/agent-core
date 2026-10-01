@@ -142,15 +142,7 @@ impl CredProxy {
         community: Arc<dyn CommunityKey>,
     ) -> Result<Self, ProxyError> {
         let upstream = Upstream::parse(upstream)?;
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .build()
-            .map_err(|err| ProxyError::Client(err.without_url()))?;
+        let http = http_client(&upstream, None)?;
         Ok(Self {
             upstream,
             http,
@@ -361,7 +353,7 @@ impl Upstream {
         if base.host().is_none() {
             return Err(ProxyError::Upstream("there is no host"));
         }
-        if base.scheme() == "http" && !is_loopback_ip(&base) {
+        if base.scheme() == "http" && !is_loopback(&base) {
             return Err(ProxyError::Upstream(
                 "plain http is allowed only to a loopback IP address",
             ));
@@ -378,7 +370,6 @@ impl Upstream {
     fn prefix(&self) -> &str {
         self.base.path().trim_end_matches('/')
     }
-
     /// The upstream URL for a request's origin-form `path_and_query`, or
     /// `None` if the result would leave the upstream's origin or base path.
     fn url(&self, path_and_query: &str) -> Option<Url> {
@@ -402,11 +393,35 @@ impl Upstream {
 }
 
 /// Whether `url`'s host is a loopback IP address, IPv4-mapped included.
-fn is_loopback_ip(url: &Url) -> bool {
-    url.host_str()
-        .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
-        .and_then(|host| host.parse::<IpAddr>().ok())
-        .is_some_and(|ip| ip.to_canonical().is_loopback())
+fn is_loopback(url: &Url) -> bool {
+    url.host_str().is_some_and(core_types::is_loopback_ip_host)
+}
+
+/// Builds the client that forwards to `upstream`. It honors the system
+/// proxy settings unless the upstream is on a loopback IP address: a proxy
+/// would read a plain `http` request, members' tokens included, and reach
+/// the address on its own host. `proxy` is a proxy tests add as if the
+/// system had it.
+fn http_client(
+    upstream: &Upstream,
+    proxy: Option<reqwest::Proxy>,
+) -> Result<reqwest::Client, ProxyError> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd();
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    if is_loopback(&upstream.base) {
+        builder = builder.no_proxy();
+    }
+    builder
+        .build()
+        .map_err(|err| ProxyError::Client(err.without_url()))
 }
 
 /// The header a credential of `kind` travels in.
@@ -656,6 +671,14 @@ impl IntoResponse for Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_loopback_upstream_is_reached_without_a_proxy() {
+        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
+            http_client(&Upstream::parse(base).unwrap(), Some(proxy)).unwrap()
+        })
+        .await;
+    }
 
     #[test]
     fn upstream_urls_keep_the_origin_and_base_path() {

@@ -569,11 +569,7 @@ impl RestClient {
                 "invalid Rocket.Chat URL: user info, query and fragment are not allowed".into(),
             ));
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .redirect(same_origin_redirects())
-            .build()
-            .map_err(transport)?;
+        let http = http_client(&base, None)?;
         let foreign = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(Policy::none())
@@ -1156,6 +1152,24 @@ impl RestClient {
     }
 }
 
+/// Builds the client that calls the server at `base`. It honors the system
+/// proxy settings unless `base` is on a loopback IP address, as only tests'
+/// fakes are: a proxy would read a plain `http` request, the auth token
+/// included, and reach the address on its own host. `proxy` is a proxy
+/// tests add as if the system had it.
+fn http_client(base: &Url, proxy: Option<reqwest::Proxy>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(same_origin_redirects());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    if base.host_str().is_some_and(core_types::is_loopback_ip_host) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(transport)
+}
+
 /// Follows up to [`MAX_REDIRECTS`] redirects within the origin a request
 /// was sent to, and stops at one to another origin, so the Rocket.Chat
 /// headers never leave the server.
@@ -1498,6 +1512,14 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_loopback_server_is_called_without_a_proxy() {
+        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
+            http_client(&Url::parse(base).unwrap(), Some(proxy)).unwrap()
+        })
+        .await;
+    }
 
     fn at_ms(ms: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(ms)
