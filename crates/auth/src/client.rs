@@ -98,12 +98,16 @@ pub(crate) enum Grant {
     /// agentd asked for on a refresh, but on a login what the authorize URL
     /// asked for, which the member could have changed.
     Unstated,
-    /// A scope outside [`ALLOWED_SCOPES`], in any shape.
+    /// A scope outside [`ALLOWED_SCOPES`], in any shape. An object's keys
+    /// count as scopes, since a label can't be told from a scope name, so
+    /// an object with any key that isn't an allowed scope, such as
+    /// `{"granted": "user:profile"}`, is wider too.
     Wider,
-    /// A `scope` that is neither a string nor an array of strings and names
-    /// no scope outside [`ALLOWED_SCOPES`]: a login counts it as unstated,
-    /// and a refresh, which sent the scopes itself, keeps the link and
-    /// warns.
+    /// Any other shape that names no scope outside [`ALLOWED_SCOPES`], in
+    /// its strings or its keys, such as a number, `true`, `[7]`, a nested
+    /// array of allowed scopes, `{}` or `{"user:profile": true}`. A login
+    /// counts it as unstated, and a refresh, which sent the scopes itself,
+    /// keeps the link and warns.
     Unreadable,
 }
 
@@ -124,8 +128,9 @@ impl Tokens {
 /// What a token answer's `scope` grants. Every string anywhere in it, an
 /// object's keys included, at any depth, is split on blanks into scopes, so
 /// no shape hides a wider one: any scope outside [`ALLOWED_SCOPES`] is
-/// [`Grant::Wider`]. Otherwise `null`, or a string or an array of strings,
-/// is [`Grant::Allowed`] if it names a scope and [`Grant::Unstated`] if not,
+/// [`Grant::Wider`], an object with any key that isn't an allowed scope
+/// included. Otherwise a string or an array of strings is
+/// [`Grant::Allowed`] if it names a scope and [`Grant::Unstated`] if not,
 /// and any other shape is [`Grant::Unreadable`].
 fn granted(scope: &Value) -> Grant {
     let mut leaves = Vec::new();
@@ -139,7 +144,7 @@ fn granted(scope: &Value) -> Grant {
         return Grant::Wider;
     }
     let well_formed = match scope {
-        Value::Null | Value::String(_) => true,
+        Value::String(_) => true,
         Value::Array(items) => items.iter().all(Value::is_string),
         _ => false,
     };
@@ -579,6 +584,8 @@ mod tests {
             r#"{"user:profile": "user:sessions:claude_code"}"#,
             r#"{"user:sessions:claude_code": true}"#,
             r#"[{"user:sessions:claude_code": null}]"#,
+            r#"{"granted": "user:profile user:inference"}"#,
+            r#"{"scopes": ["user:profile"]}"#,
         ] {
             assert_eq!(grant(scope), Grant::Wider, "{scope}");
             let wide = tokens(&format!(
