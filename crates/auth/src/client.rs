@@ -100,24 +100,39 @@ pub(crate) enum Grant {
     Unstated,
     /// A scope outside [`ALLOWED_SCOPES`].
     Wider,
-    /// A `scope` that isn't a string, which can't be shown to be narrower:
-    /// a login counts it as wider, and a refresh, which sent the scopes
-    /// itself, as unstated, so a change of format doesn't break every link.
+    /// A `scope` that is neither a string nor an array of strings, which
+    /// says nothing about the grant: a login counts it as unstated, and a
+    /// refresh, which sent the scopes itself, keeps the link and warns.
     Unreadable,
 }
 
 impl Tokens {
     /// Why a login can't keep these tokens: a grant wider than
-    /// [`ALLOWED_SCOPES`] or unreadable ([`AuthError::ScopeRefused`]), or
-    /// one that doesn't say ([`AuthError::ScopeUnstated`]), since the member
-    /// can add scopes to the authorize URL and the code exchange doesn't
-    /// send them again.
+    /// [`ALLOWED_SCOPES`] ([`AuthError::ScopeRefused`]), or one that doesn't
+    /// say ([`AuthError::ScopeUnstated`]), since the member can add scopes
+    /// to the authorize URL and the code exchange doesn't send them again.
     pub(crate) fn login_refusal(&self) -> Option<AuthError> {
         match self.grant {
             Grant::Allowed => None,
-            Grant::Unstated => Some(AuthError::ScopeUnstated),
-            Grant::Wider | Grant::Unreadable => Some(AuthError::ScopeRefused),
+            Grant::Unstated | Grant::Unreadable => Some(AuthError::ScopeUnstated),
+            Grant::Wider => Some(AuthError::ScopeRefused),
         }
+    }
+}
+
+/// What `parts`, each a scope or several separated by blanks, grant: none
+/// is unstated, as an empty `scope` says nothing.
+fn granted<'a>(parts: impl IntoIterator<Item = &'a str>) -> Grant {
+    let mut scopes = parts
+        .into_iter()
+        .flat_map(str::split_ascii_whitespace)
+        .peekable();
+    if scopes.peek().is_none() {
+        Grant::Unstated
+    } else if scopes.all(|scope| ALLOWED_SCOPES.contains(&scope)) {
+        Grant::Allowed
+    } else {
+        Grant::Wider
     }
 }
 
@@ -127,9 +142,9 @@ struct TokenResponse {
     #[serde(default)]
     refresh_token: Option<SecretString>,
     expires_in: f64,
-    /// The scopes granted, space-separated. Read as any JSON value, so one
-    /// of another type is [`Grant::Unreadable`] rather than failing the
-    /// whole response.
+    /// The scopes granted, space-separated, or as an array of strings. Read
+    /// as any JSON value, so another shape is [`Grant::Unreadable`] rather
+    /// than failing the whole response.
     #[serde(default)]
     scope: Option<Value>,
 }
@@ -146,15 +161,12 @@ impl TokenResponse {
         }
         let grant = match &self.scope {
             None | Some(Value::Null) => Grant::Unstated,
-            Some(Value::String(scope)) if scope.trim_ascii().is_empty() => Grant::Unstated,
-            Some(Value::String(scope))
-                if scope
-                    .split_ascii_whitespace()
-                    .all(|granted| ALLOWED_SCOPES.contains(&granted)) =>
-            {
-                Grant::Allowed
-            }
-            Some(Value::String(_)) => Grant::Wider,
+            Some(Value::String(scope)) => granted([scope.as_str()]),
+            Some(Value::Array(scopes)) => scopes
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+                .map_or(Grant::Unreadable, granted),
             Some(_) => Grant::Unreadable,
         };
         let refresh_token = self
@@ -496,10 +508,16 @@ mod tests {
             r#""user:profile user:inference""#,
             r#""user:inference""#,
             r#"" user:profile  user:inference ""#,
+            r#"["user:profile", "user:inference"]"#,
+            r#"["user:profile user:inference"]"#,
         ] {
             assert_eq!(grant(scope), Grant::Allowed, "{scope}");
+            let allowed = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ));
+            assert!(allowed.unwrap().login_refusal().is_none(), "{scope}");
         }
-        for scope in ["null", r#""""#, r#""  ""#] {
+        for scope in ["null", r#""""#, r#""  ""#, "[]", r#"["", " "]"#] {
             assert_eq!(grant(scope), Grant::Unstated, "{scope}");
         }
         let unstated = tokens(r#"{"access_token":"a","expires_in":60}"#).unwrap();
@@ -508,8 +526,16 @@ mod tests {
             unstated.login_refusal(),
             Some(AuthError::ScopeUnstated)
         ));
-        for scope in [r#"["user:profile"]"#, "7", "{}"] {
+        for scope in ["7", "{}", "true", r#"["user:profile", 7]"#] {
             assert_eq!(grant(scope), Grant::Unreadable, "{scope}");
+            let unreadable = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ))
+            .unwrap();
+            assert!(
+                matches!(unreadable.login_refusal(), Some(AuthError::ScopeUnstated)),
+                "{scope}"
+            );
         }
         for scope in [
             r#""user:profile user:inference user:sessions:claude_code""#,
@@ -517,10 +543,10 @@ mod tests {
             r#""user:inference org:create_api_key""#,
             r#""User:Profile""#,
             r#""user:profile,user:inference""#,
-            r#"["user:profile"]"#,
-            "7",
-            "{}",
+            r#"["user:profile", "user:sessions:claude_code"]"#,
+            r#"["user:inference org:create_api_key"]"#,
         ] {
+            assert_eq!(grant(scope), Grant::Wider, "{scope}");
             let wide = tokens(&format!(
                 r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
             ))
@@ -532,8 +558,6 @@ mod tests {
             }
             assert!(!err.to_string().contains("sessions"), "{err}");
         }
-        let allowed = tokens(r#"{"access_token":"a","expires_in":60,"scope":"user:profile"}"#);
-        assert!(allowed.unwrap().login_refusal().is_none());
     }
 
     #[test]

@@ -8331,9 +8331,12 @@ fakes use one) takes those off the proxy too; the example configuration
 says so, rather than a second client for a case no deployment has.
 Rocket.Chat's cross-origin redirects already use their own proxied client.
 The example configuration and the Compose README tell operators the rule:
-`https://` URLs honor `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`, and a
-plain `http://` URL or a loopback IP address is always called directly,
-which `NO_PROXY` can't change.
+`https://` URLs honor `HTTPS_PROXY` (or `ALL_PROXY`, its fallback in
+hyper-util's environment matcher) and `NO_PROXY`; `HTTP_PROXY` never
+applies, since no plain `http://` URL is proxied. A plain `http://` URL or a
+loopback IP address is always called directly, which `NO_PROXY` can't
+change. Rocket.Chat's realtime connection (`tokio-tungstenite`) never used
+a proxy, so a Rocket.Chat server has to be reachable directly anyway.
 Where `http` is allowed is a separate rule, `core_types::is_loopback_ip_host`,
 which `[cloud]`, `[proxy] upstream` and `[claude_oauth]` share;
 `[claude_oauth]` now refuses `http://localhost` as the other two do. Each
@@ -8424,23 +8427,28 @@ were wider still hold such tokens. RFC 6749 lets the answer leave `scope`
 out when it is what the request asked for, which for a login is the URL
 the member may have changed.
 
-**Solution.** `auth` reads a token response's `scope` as any JSON value
-and sorts it into a `Grant`: only `ALLOWED_SCOPES`; unstated (absent,
-`null` or blank, since an empty string is no grant and a server using it
-for "as requested" would reopen the hole); wider; or unreadable, a value
-that isn't a string.
+**Solution.** `auth` reads a token response's `scope` as any JSON value:
+a space-separated string, as RFC 6749 has it, or an array of strings read
+the same way, so an array naming a wider scope can't slip through as a
+format nobody expected. It sorts what that grants into a `Grant`: only
+`ALLOWED_SCOPES`; unstated (absent, `null`, blank or an empty array, since
+no scope is no grant and a server using it for "as requested" would reopen
+the hole); wider; or unreadable, any other shape, which says nothing about
+the grant.
 
-- A login keeps only an allowed grant. A wider or unreadable one is
+- A login keeps only an allowed grant. A wider one is
   `AuthError::ScopeRefused`, whose reply tells the member to open the
-  login link unchanged. An unstated one is `AuthError::ScopeUnstated`,
-  logged once at error for the operator, since every login then fails
-  until the endpoint changes, and the reply says so and to tell an admin
-  rather than inviting retries.
+  login link unchanged. An unstated or unreadable one is
+  `AuthError::ScopeUnstated`, since every login then fails until the
+  endpoint changes: its error line for the operator is logged once per
+  login attempt, not again by the command handler, and the reply says so
+  and to tell an admin rather than inviting retries.
 - A refresh sent the scopes itself, so an unstated or unreadable grant
   keeps the link: a change of format at Anthropic doesn't break every
-  member's link and revoke every token. A wider one marks the link broken,
-  as a dead refresh token does, so the member gets the relink notice and
-  the token isn't served again.
+  member's link and revoke every token. An unreadable one is logged at
+  warn, once per process. A wider one, string or array, marks the link
+  broken, as a dead refresh token does, so the member gets the relink
+  notice and the token isn't served again.
 - A refused grant's refresh token is revoked, as `logout` revokes one,
   best effort: before the login's reply, and after a refresh releases the
   member's lock, the new refresh token if the answer had one and the

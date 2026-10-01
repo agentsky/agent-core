@@ -30,6 +30,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -159,8 +160,8 @@ pub enum AuthError {
         reason: &'static str,
     },
     /// A login's token response granted a scope outside
-    /// [`ALLOWED_SCOPES`], or named its scope in a form that isn't a
-    /// string: nothing was stored, and its refresh token, if it had one,
+    /// [`ALLOWED_SCOPES`], as a string or an array of strings: nothing was
+    /// stored, and its refresh token, if it had one,
     /// was revoked as far as revocation works. A refresh granted more breaks
     /// the link instead ([`AuthError::RelinkRequired`]).
     #[error(
@@ -168,8 +169,9 @@ pub enum AuthError {
         ALLOWED_SCOPES.join(" and ")
     )]
     ScopeRefused,
-    /// A login's token response didn't name the scope it granted, so
-    /// nothing shows the member didn't widen the authorize URL: nothing was
+    /// A login's token response didn't name the scope it granted, or named
+    /// it as neither a string nor an array of strings, so nothing shows the
+    /// member didn't widen the authorize URL: nothing was
     /// stored, and its refresh token, if it had one, was revoked as far as
     /// revocation works. Every login fails this way until the token
     /// endpoint names `scope`, which retrying doesn't change.
@@ -268,6 +270,8 @@ struct Inner {
     failures: Mutex<HashMap<MemberId, Instant>>,
     relink: mpsc::UnboundedSender<MemberId>,
     relink_notices: Mutex<Option<mpsc::UnboundedReceiver<MemberId>>>,
+    /// Whether a refresh answer's unreadable `scope` was logged already.
+    unreadable_scope_logged: AtomicBool,
 }
 
 /// Work a refresh does after it released the member's lock.
@@ -326,6 +330,7 @@ impl Auth {
                 failures: Mutex::default(),
                 relink,
                 relink_notices: Mutex::new(Some(relink_notices)),
+                unreadable_scope_logged: AtomicBool::new(false),
             }),
         })
     }
@@ -712,6 +717,11 @@ impl Inner {
             }
         };
         locked(&self.failures).remove(&member);
+        if tokens.grant == client::Grant::Unreadable
+            && !self.unreadable_scope_logged.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(%member, "a refresh answer's scope is neither a string nor an array of strings; keeping the link, and not saying so again");
+        }
         if tokens.grant == client::Grant::Wider {
             tracing::warn!(%member, "a refresh granted more than the allowed scopes; the link is broken and the grant revoked");
             let wide = tokens.refresh_token.unwrap_or(link.refresh_token.clone());

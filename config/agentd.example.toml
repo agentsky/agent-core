@@ -266,10 +266,12 @@ profile_url = "https://api.anthropic.com/api/oauth/profile"
 # messages, and as messages starting with `!agent` in rooms it is in, and
 # answers every command in a direct message.
 [rocketchat]
-# The server's base URL. agentd honors HTTPS_PROXY, HTTP_PROXY and NO_PROXY
-# for https:// URLs, but always calls a plain http:// URL or a loopback IP
-# address directly, so a proxy never sees a request carrying a token in
-# clear. Use https:// for a server reachable only through a proxy.
+# The server's base URL. Its REST calls to an https:// URL honor HTTPS_PROXY
+# (or ALL_PROXY) and NO_PROXY. A plain http:// URL is always called
+# directly, so a proxy never sees a request carrying a token in clear, and
+# so is a loopback IP address, which a proxy would resolve on its own host.
+# The realtime connection never uses a proxy, so the server must be
+# reachable directly.
 base_url = "https://chat.example.com"
 
 # The realtime (DDP) endpoint. Optional: by default <base_url>/websocket,
@@ -293,11 +295,12 @@ manager_user_id = "aBcD1234eFgH5678"
 # set; README.md says how to create the app from
 # deploy/slack/manager-manifest.yaml. The section is optional.
 [slack]
-# The Web API's base URL. Change it only to point tests at a fake. As for
-# [rocketchat] base_url, an https:// URL honors HTTPS_PROXY and NO_PROXY,
-# and a plain http:// URL or a loopback IP address is called directly; one
-# client serves every Slack request, so with such a URL file transfers and
-# response URLs skip the proxy too.
+# The Web API's base URL. Change it only to point tests at a fake. An
+# https:// URL honors HTTPS_PROXY (or ALL_PROXY) and NO_PROXY. A plain
+# http:// URL is always called directly, so no proxy reads the bot token in
+# clear, and so is a loopback IP address, which a proxy would resolve on its
+# own host. One client serves every Slack request, so with such a URL, file
+# transfers and response URLs skip the proxy too.
 api_url = "https://slack.com/api/"
 
 # agentd's public HTTPS URL, as Slack reaches the public listener through the

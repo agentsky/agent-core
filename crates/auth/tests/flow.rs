@@ -667,7 +667,9 @@ async fn a_refresh_whose_grant_is_unstated_or_unreadable_keeps_the_link() {
     for scope in [
         None,
         Some(json!("")),
-        Some(json!(["user:sessions:claude_code"])),
+        Some(json!([])),
+        Some(json!(7)),
+        Some(json!({"user": "profile"})),
     ] {
         let h = harness().await;
         let mut body = json!({"access_token": "access-2", "expires_in": 28800});
@@ -693,6 +695,83 @@ async fn a_refresh_whose_grant_is_unstated_or_unreadable_keeps_the_link() {
         assert!(stored.broken_at.is_none(), "{scope:?}");
         h.server.verify().await;
     }
+}
+
+#[tokio::test]
+async fn an_array_naming_a_wider_scope_refuses_a_login_and_breaks_a_refresh() {
+    let wide = || {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-wide",
+            "refresh_token": "refresh-wide",
+            "expires_in": 28800,
+            "scope": ["user:profile", "user:inference", "user:sessions:claude_code"],
+        }))
+    };
+    let h = harness().await;
+    mount_revoke(&h.server, "refresh-wide").await;
+    let err = login_answered(&h, wide()).await;
+    assert!(matches!(err, AuthError::ScopeRefused), "{err:?}");
+    assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
+    h.server.verify().await;
+
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(wide())
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    mount_revoke(&h.server, "refresh-wide").await;
+    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+    let err = h.auth.access_token(h.member).await.unwrap_err();
+    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
+    let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+    assert!(stored.broken_at.is_some());
+    eventually("the wide grant is revoked", || async {
+        !requests_to(&h.server, REVOKE_PATH).await.is_empty()
+    })
+    .await;
+    h.server.verify().await;
+}
+
+#[tokio::test]
+async fn an_array_naming_only_allowed_scopes_links() {
+    let h = harness().await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "expires_in": 28800,
+            "scope": ["user:profile", "user:inference"],
+        })))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    mount_profile(&h.server, "access-1", "claude_max").await;
+    let start = h.auth.start_login(h.member).await.unwrap();
+    let state = query(&Url::parse(&start.url).unwrap(), "state");
+    h.auth
+        .complete_login(h.member, &paste("code", &state))
+        .await
+        .unwrap();
+    assert!(h.store.get_claude_link(h.member).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn a_login_whose_scope_is_unreadable_is_refused_as_unstated() {
+    let h = harness().await;
+    mount_revoke(&h.server, "refresh-odd").await;
+    let answer = ResponseTemplate::new(200).set_body_json(json!({
+        "access_token": "access-odd",
+        "refresh_token": "refresh-odd",
+        "expires_in": 28800,
+        "scope": {"user": "profile"},
+    }));
+    let err = login_answered(&h, answer).await;
+    assert!(matches!(err, AuthError::ScopeUnstated), "{err:?}");
+    assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
+    h.server.verify().await;
 }
 
 #[tokio::test]
