@@ -12,8 +12,8 @@
 //! an identity of theirs they never linked, which is another member to
 //! agentd: agents refuse their requests, their own and the hops they
 //! started, and the only commands they may run are those that take
-//! something away from them: `me`, `logout`, and `pause` and `delete` of
-//! their own agents. Their agents still answer others, on each requester's
+//! something away from them: `me`, `logout`, `cloud rm`, and `pause` and
+//! `delete` of their own agents. Their agents still answer others, on each requester's
 //! own credential, as their owner left them. An admin can't be banned, and
 //! a ban left on an admin's member (one made before they became an admin)
 //! doesn't hold them back, so a ban can't lock the community out of
@@ -149,7 +149,8 @@ impl Commands {
             tracing::info!(%admin, %member, "banned a member");
             Ok(format!(
                 "Banned {label}. Agents refuse their requests, and they can only run `me`, \
-                 `logout`, and `pause` or `delete` their agents. Undo it with `admin unban`."
+                 `logout`, `cloud rm`, and `pause` or `delete` their agents. Undo it with \
+                 `admin unban`."
             ))
         } else {
             Ok(format!("{label} is banned already."))

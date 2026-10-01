@@ -3386,6 +3386,20 @@ master key, never with a SQL `UPDATE`). Update the design's
 [Verified and assumed](design.md#verified-and-assumed) and failure table
 with the result and date. That completes design milestone 6.
 
+Decided in T35c ([impl-notes](impl-notes.md#t35c-cloud-hand-off-commands)):
+Slack command text reaches `Commands::answer_text` as Slack delivered it,
+which decodes the entities before parsing, so `cloud run` reads Slack's
+tokens in the delivered text and a `<` the member typed stays text; a
+mention without its name, as a manager DM's `message` event carries it, is
+refused like a broadcast. `FireClient::fires_for` is the one origin rule:
+it parses the stored `url_origin`, as T35a decided, and `fire`'s backstop
+uses it too instead of comparing strings. `consents::unshowable` is
+`pub(crate)` with reasons that read for a card and a cloud task alike.
+`cloud list` shows a task's first line as a code span, its backticks left
+out, and never the endpoint's `error_type`. `cloud rm` is named wherever a
+ban's replies list what a banned member may still run. The pass is
+`commands::cloud::CloudNotifier`, run every minute from `Server::run`.
+
 ## Phase 7: Slack Connect (design milestone 7)
 
 ### T36

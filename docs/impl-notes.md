@@ -8728,3 +8728,107 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   sender each ask `users.info` until the first answer is kept. It costs
   only the manager's Tier 4 quota for real senders, at most the places in
   flight (64 per owner), and a used-up quota gets "try again", never home.
+
+## T35c: Cloud hand-off: commands
+
+No request reached claude.ai from the environment this was built in: the
+commands were tested against `wiremock` routine endpoints, a `MockSurface`
+manager bot and a `wiremock` Slack. The plan's live check, and the design's
+[Verified and assumed](design.md#verified-and-assumed) list, are still to be
+done.
+
+### Slack's tokens have to be read before its entities are decoded
+
+**Issue.** Slack delivers command text with `&`, `<` and `>` as entities and
+mentions, channels and links as `<…>` tokens, and `slash_command` and
+`dm_command` decoded the entities before anything else read the text. After
+that a `<div>` or `<T>` the member typed, which Slack sent as `&lt;div&gt;`,
+can't be told from a token Slack made: rewriting tokens then would refuse
+every task that mentions HTML or generics, and would read a typed
+`<https://a|b>` as a link.
+
+**Solution.** The Slack side hands on the text as Slack delivered it, and
+`Commands::answer_text`, the one place every command passes through, decodes
+it for Slack origins (`Origin::decoded`) before parsing, so every other
+command reads as before. A `cloud run` from Slack parses the delivered text
+again for its task: the command words and the label can't hold an entity or
+a token, so it is the same command. Its tokens are rewritten there
+(`slack_task`): `<@U…|name>` to `@name`, `<#C…|name>` to `#name`, `<url>`
+and a `<url|label>` labelled with its URL to the URL, any other
+`<url|label>` to `label (url)`, and the entities in the rest and inside the
+tokens decoded. A link is a scheme, `:` and something without blanks, as
+`https:`, `mailto:` and `tel:` links are. Anything else in brackets is
+refused with one fixed line: broadcasts, user groups, dates, an unclosed
+`<`, and a mention or channel without its name. Slack's `message` events,
+which a DM with the manager app is, carry mentions as `<@U…>` without the
+name, so a task with a mention is refused there and the member types the
+name as plain text, or uses the slash command, whose tokens carry it.
+
+### A routine's origin is compared parsed, in the fire client too
+
+**Issue.** T35a decided that a routine's stored `url_origin` is parsed and
+compared as an origin with `base_url`'s, so a change in how the `url` crate
+writes an origin can't lock members out. T35b's backstop in
+`FireClient::fire` compared the strings, and its test refused
+`http://127.0.0.1:<port>/`, the same origin with a slash. With both rules
+in place, a routine T35c's check let through would be written `sending`
+and then refused unsent by the client.
+
+**Solution.** One rule: `FireClient::fires_for(url_origin)` parses the
+stored origin and compares it with `base_url`'s. `fire`, `cloud add`, `cloud
+run` and `cloud list` (which marks a routine registered for another
+endpoint) all use it. T35b's test now checks that a written-otherwise origin
+is the same one and that other hosts, ports, schemes and unparsable text are
+not.
+
+### The checks on a task read for a card and for a cloud task
+
+**Issue.** `consents::unshowable` gave its reasons in terms of "the owner's
+card", which a `cloud run` member would have read in their refusal.
+
+**Solution.** It is `pub(crate)`, and its reasons say what the characters do
+wherever the task is shown ("which don't show where it is read", "which can
+push the rest of a line out of view"). The agentctl error and the card's
+tests match on the parts that stayed. `cloud run` drops joiners and
+presentation selectors first, as `agentctl private` does, so an emoji such
+as 👨‍💻 reaches the session as its parts.
+
+### What `cloud list` shows of a task
+
+**Issue.** The plan asks for each task's first line, cut to 60 characters,
+as literal text, escaped on Slack. Command replies are Markdown rendered for
+each surface, and Slack's renderer already escapes `&`, `<` and `>`
+everywhere, so escaping the line again would show `&amp;lt;`, while plain
+text would let the task's own Markdown, links and mentions format the reply.
+
+**Solution.** The line is a code span, as agent listings show members'
+names: nothing in it formats, links, mentions or broadcasts on either
+surface, and the renderer escapes it on Slack. Slack can't show a backtick
+in inline code, so backticks are left out; a line with nothing else shows
+as "(nothing to show)". The cut is by characters and ends in `…`.
+
+### Smaller choices
+
+- `cloud rm` joins the commands a ban leaves, so the ban replies (`me`,
+  the refusal and `admin ban`'s) now name it.
+- A routine whose stored token no longer opens or parses
+  (`StoreError::Seal` or `Corrupt` on `cloud_routines`) is answered by
+  asking the member to `cloud add` it again, which replaces the row without
+  reading the old token; other store failures are the usual "something went
+  wrong".
+- The reply never shows `error_type`, which the endpoint chooses: each
+  status gets the failure table's fixed line, worded tentatively for 403
+  and 404 as T35b's review asked. A 429 says when the limit resets, in
+  whole minutes rounded up, from `Retry-After`.
+- `cloud add` replies with the routine id, also when it replaces a label,
+  and says which label already holds a routine registered twice.
+- `logout` says to revoke the tokens only when it deleted routines; a
+  member with only hand-offs left loses them without a word about tokens.
+- The notifier sends a hand-off's notice to each of the member's identities
+  a manager bot reaches, as the relink notice does, and leaves a member
+  none reaches owed without a claim, so another instance or a later
+  configuration can send it. It logs each row it marks `unknown` as a
+  warning, with the hand-off, member and routine ids.
+- `a_replayed_slack_command_fires_once` sends the same signed request
+  twice, timestamp included, which is what a replay is; the ingress drops
+  the second by its signature before the intake sees it.

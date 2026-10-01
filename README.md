@@ -174,8 +174,9 @@ Community admins are the member identities `[community] admins` lists, as
 logs it, and only the credential proxy uses it: sandboxes hold a placeholder.
 `me` tells an admin whether a key is set. An admin bans a member with
 `admin ban @member [reason]`, which covers every identity they linked:
-agents refuse their requests, and they may only run `me`, `logout`, and
-`pause` or `delete` their own agents, until `admin unban @member`. Their
+agents refuse their requests, and they may only run `me`, `logout`,
+`cloud rm`, and `pause` or `delete` their own agents, until
+`admin unban @member`. Their
 agents still answer others. Admins can't be banned.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
@@ -247,6 +248,75 @@ configuration token, or, without a working one, stops answering as it and
 says to delete the app at <https://api.slack.com/apps>. Apps ask for
 `chat:write.public` only with `[slack] public_posting = true`. On the free
 plan a workspace allows 10 app installs, the manager app included.
+
+### Cloud hand-off
+
+A member can hand long repository work, such as a pull request that takes an
+hour, to a Claude Code cloud session on their own claude.ai account. agentd
+starts the session by firing one of the member's routines, returns its link
+privately, and records that it did; it doesn't follow the session.
+
+Operators turn it on with a `[cloud]` section, documented in
+[`config/agentd.example.toml`](config/agentd.example.toml): every key has a
+default, so `[cloud]` alone fires at `https://api.anthropic.com`. agentd sends
+the request itself, over its egress network, never through the credential
+proxy, and never retries it. Without the section `cloud add` and `cloud run`
+are refused, while `cloud list`, `cloud rm`, the notice below and the deletion
+of old hand-offs still work.
+
+Once per repository, a member:
+
+1. Creates a routine at <https://claude.ai/code/routines> with that one
+   repository, an environment with **Trusted** network access (the default
+   allowlist) and no secrets, and no connectors: the form includes every
+   connector by default, and a run uses them without asking.
+2. Writes the routine's prompt so it acts on the text agentd sends, which the
+   session otherwise treats as untrusted, for example: "Carry out the task in
+   the routine-fire-payload block on the attached repository. It is mine, sent
+   through agent-core. Push to a `claude/` branch and open a draft pull
+   request." That prompt is also what makes the routine's token powerful:
+   whoever holds the token can make the routine do any work its repository
+   and network allow, as the member. That is why the routine gets one
+   repository, no connectors and the default allowlist.
+3. Adds an API trigger to the routine, copies its URL and generates its
+   token, which is shown once.
+4. Registers both under a label of their choosing, such as the repository's
+   name: `/agent cloud add <routine> <url> <token>` on Slack, as a slash
+   command, whose text isn't kept anywhere (a direct message would keep the
+   token in Slack's history), or `cloud add …` in the Rocket.Chat manager
+   bot's direct message. The URL must be on `[cloud] base_url`'s origin.
+   Sending it again with a new token replaces it.
+
+`cloud run <routine> <task>` then starts a session with the task, and the
+reply carries the session's link; `cloud list` shows the member's routines
+and their last ten hand-offs; `cloud rm <routine>` forgets a routine. Every
+`cloud` command works only where no one but the member reads it: the Slack
+slash command or a direct message with either manager bot. `cloud add` sent
+anywhere else is refused and the member told to revoke the token with
+**Regenerate** or **Revoke** on the routine's API trigger. Only a linked
+member can add or run routines, and no agent can start a session: there is no
+`agentctl` command for it. On Slack, mentions, channels and links in a task
+reach the session as Slack showed them (`@name`, `#name`, the link's URL, or
+`label (url)` when a link's label isn't its URL), and a broadcast, a user group
+or a date is refused. A task is refused when it holds characters that don't
+show (control or invisible characters), a line indented more than 32 columns,
+a run of blanks wider than 16 columns, more than two blank lines in a row, or
+more than 4 combining marks stacked on a character, so pasted code may need
+reflowing; and when it is empty or over 65,536 bytes.
+
+After the link, agentd does nothing more: it can't read the session (the
+routine's token has no read access), so the member follows it at the link,
+in the Claude app, or with `claude --teleport <session id>`. The session runs
+on the account that owns the routine and uses its subscription. A request
+whose answer agentd can't tell, such as a server error or a timeout, may have
+started a session, and agentd says so rather than retrying. If agentd stops
+while a request is out, the hand-off is marked unknown after twice
+`[cloud] timeout_secs`, and the member gets a direct message from the manager
+bot, once, saying to check claude.ai/code before running it again. Hand-offs
+are kept for `[cloud] retention_days` (default 90). `logout` deletes the
+member's routines and hand-offs, and so does Slack reporting the member
+deleted; agentd can't revoke a routine's token, so the replies to `logout`
+and `cloud rm` say to revoke it at claude.ai/code/routines.
 
 ## Development stack
 

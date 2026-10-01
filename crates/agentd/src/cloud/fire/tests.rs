@@ -739,9 +739,10 @@ async fn nothing_is_sent_for_another_origin_or_a_bad_task() {
         format!("http://127.0.0.1:{}", port + 1),
         format!("https://127.0.0.1:{port}"),
         format!("http://127.0.0.2:{port}"),
-        format!("http://127.0.0.1:{port}/"),
         String::new(),
+        "not a url".to_owned(),
     ] {
+        assert!(!refusing.fires_for(&elsewhere), "{elsewhere}");
         let routine = CloudRoutineToken {
             url_origin: elsewhere.clone(),
             ..routine(&server.uri())
@@ -754,6 +755,15 @@ async fn nothing_is_sent_for_another_origin_or_a_bad_task() {
         assert_eq!(check_task(task), Err(TaskError), "{}", task.len());
         let outcome = refusing.fire(&routine(&server.uri()), task).await;
         assert_eq!(outcome, not_sent(), "{}", task.len());
+    }
+    for written_otherwise in [
+        format!("http://127.0.0.1:{port}/"),
+        format!("HTTP://127.0.0.1:{port}"),
+    ] {
+        assert!(
+            refusing.fires_for(&written_otherwise),
+            "{written_otherwise}"
+        );
     }
     server.verify().await;
     logs.snapshot()

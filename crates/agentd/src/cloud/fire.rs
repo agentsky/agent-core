@@ -220,10 +220,18 @@ impl FireClient {
 
     /// The origin `[cloud] base_url` names, as
     /// `url::Origin::ascii_serialization` writes it: the form the store
-    /// keeps a routine's with ([`CloudRoutineToken::url_origin`]), and
-    /// which [`fire`](Self::fire) requires.
+    /// keeps a routine's with ([`CloudRoutineToken::url_origin`]).
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// Whether a routine registered with the fire URL origin `url_origin`,
+    /// as the store keeps it, is for this client's endpoint, so that
+    /// [`fire`](Self::fire) may send its token: the stored origin parses to
+    /// [`origin`](Self::origin)'s. Parsing rather than comparing strings
+    /// keeps a change in how an origin is written from locking members out.
+    pub fn fires_for(&self, url_origin: &str) -> bool {
+        Url::parse(url_origin).is_ok_and(|stored| stored.origin() == self.base.origin())
     }
 
     /// Fires `routine` with `task` as its text, authenticated by the
@@ -234,15 +242,16 @@ impl FireClient {
     /// id, the status and the outcome's state, and why nothing was sent
     /// when it wasn't, never the token, the task or the body.
     ///
-    /// A routine registered for another origin than [`origin`](Self::origin),
-    /// whose token is then not for this endpoint, and a task [`check_task`]
+    /// A routine registered for another origin than [`origin`](Self::origin)
+    /// ([`fires_for`](Self::fires_for)), whose token is then not for this
+    /// endpoint, and a task [`check_task`]
     /// refuses are not sent, and the outcome is [`CloudOutcome::Rejected`]
     /// with no status, as for a connection that failed first. The caller
     /// checks both before it writes the hand-off, to say what is wrong, and
     /// records whatever comes back.
     pub async fn fire(&self, routine: &CloudRoutineToken, task: &str) -> FireOutcome {
         let id = &routine.routine_id;
-        let exchange = if routine.url_origin != self.origin {
+        let exchange = if !self.fires_for(&routine.url_origin) {
             not_sent(
                 id,
                 "the routine was registered for another origin than [cloud] base_url's",

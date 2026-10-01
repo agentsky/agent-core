@@ -843,14 +843,18 @@ example `/agent cloud <name> <repo> <task>` had.
 
 Slack delivers slash command text with `&`, `<` and `>` as entities and
 with mentions, channels and links as `<@U…|name>`, `<#C…|name>` and
-`<url|label>` tokens (`should_escape` is on for `/agent`). The Slack surface
-decodes the entities before parsing, as for every command (T08, T30). The
+`<url|label>` tokens (`should_escape` is on for `/agent`). agentd decodes the
+entities before parsing, as for every command (T08, T30), but reads a task's
+tokens in the text as Slack delivered it, where every `<` the member typed is
+still an entity, so only Slack's own tokens are read as tokens. The
 `<url>` around a pasted fire URL is taken off. In a task, each token becomes
 what Slack showed the member, so the session reads what they saw:
 `<@U…|name>` becomes `@name`, `<#C…|name>` becomes `#name`, `<url>` and a
 `<url|label>` whose label is its URL become the URL, and a `<url|label>`
 with another label becomes `label (url)`, so a label can't hide where a
-link goes. Any other `<…>` token, such as a broadcast, is refused. The task
+link goes. Any other `<…>` token, such as a broadcast, is refused, and so is
+a mention without its name, which is how a DM's `message` event carries
+one. The task
 then reaches the session as Slack delivered it, with those tokens
 rewritten. Rocket.Chat delivers what was typed, unchanged.
 

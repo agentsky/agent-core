@@ -12,7 +12,7 @@
 //!   and consent cards' buttons go to the
 //!   [`CommandIntake`](crate::commands::intake::CommandIntake),
 //!   and a `user_change` saying a member left deletes their configuration
-//!   token. Messages to agents' apps go to [`Messages`], which looks their
+//!   token, cloud routines and hand-offs. Messages to agents' apps go to [`Messages`], which looks their
 //!   bot senders up and hands them to the turn pipeline outside the Slack
 //!   queue, in a lane for each binding. The rest is logged by kind and
 //!   dropped.
@@ -399,7 +399,9 @@ impl Dedup for StoreDedup {
 /// - To the manager app: an `/agent` slash command, a DM to the app, or a
 ///   click on a consent card's button goes to the command intake, and a
 ///   `user_change` whose user is `deleted` deletes that member's
-///   configuration token for the workspace. Only home members' commands
+///   configuration token for the workspace, and every cloud routine and
+///   hand-off of the member, whichever surface registered them, telling
+///   no one. Only home members' commands
 ///   go on (see the design's Slack Connect "Commands"):
 ///   - A DM whose sender's own team fields make them outside is dropped
 ///     here, without touching the network; the rest are checked against
@@ -467,22 +469,37 @@ impl Inbound {
         let Some(key) = member_who_left(event) else {
             return;
         };
-        let deleted = match self.store.member_for_identity(&key).await {
-            Ok(Some(member)) => {
-                self.store
-                    .delete_slack_config_token(member, &key.team)
-                    .await
+        let member = match self.store.member_for_identity(&key).await {
+            Ok(Some(member)) => member,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(member = %key, error = %err, "couldn't look up a member who left");
+                return;
             }
-            Ok(None) => Ok(false),
-            Err(err) => Err(err),
         };
-        match deleted {
+        match self
+            .store
+            .delete_slack_config_token(member, &key.team)
+            .await
+        {
             Ok(true) => {
                 tracing::info!(member = %key, "a member left the workspace; deleted their configuration token")
             }
             Ok(false) => {}
             Err(err) => {
                 tracing::warn!(member = %key, error = %err, "couldn't delete the configuration token of a member who left")
+            }
+        }
+        match self.store.delete_cloud_routines_of(member).await {
+            Ok(deleted) if deleted.routines > 0 || deleted.handoffs > 0 => tracing::info!(
+                member = %key,
+                routines = deleted.routines,
+                handoffs = deleted.handoffs,
+                "a member left the workspace; deleted their cloud routines and hand-offs"
+            ),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(member = %key, error = %err, "couldn't delete the cloud routines of a member who left")
             }
         }
     }
