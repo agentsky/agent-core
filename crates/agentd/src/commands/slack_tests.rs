@@ -2562,6 +2562,7 @@ async fn a_relink_notice_the_store_fails_on_leaves_the_others() {
     assert_eq!(notifier.send_pending().await.unwrap(), 1);
     assert_eq!(h.posts().await.len(), 2, "alice was told after");
     let _ = std::fs::remove_dir_all(dir);
+}
 
 impl SlackHarness {
     fn slack_agents(&self) -> crate::slack::agents::SlackAgents {
@@ -2615,7 +2616,7 @@ impl SlackHarness {
             .set_slack_app(
                 binding,
                 &store::NewSlackApp {
-                    app_id: "A0SCRIBE1".to_owned(),
+                    app_id: format!("A0{}", name.to_uppercase()),
                     client_id: "3333.4444".to_owned(),
                     client_secret: SecretString::from("client-SECRET"),
                     signing_secret: SecretString::from("signing-SECRET"),
@@ -2631,9 +2632,9 @@ impl SlackHarness {
         self.store
             .install_slack_app(
                 binding,
-                "A0SCRIBE1",
-                &UserId::new("U0SCRIBE1"),
-                &SecretString::from("xoxb-scribe-SECRET"),
+                &format!("A0{}", name.to_uppercase()),
+                &UserId::new(format!("U0{}", name.to_uppercase())),
+                &SecretString::from(format!("xoxb-{name}-SECRET")),
                 now,
             )
             .await
@@ -2649,7 +2650,7 @@ async fn a_failed_manifest_update_is_retried_and_me_says_so() {
         .await;
     let agents = h.slack_agents();
     let start = OffsetDateTime::now_utc();
-    assert_eq!(agents.pass_at(|| start).await.unwrap().updated, 0);
+    assert_eq!(agents.pass_at(|| start).await.updated, 0);
     assert!(
         h.calls("apps.manifest.update").await.is_empty(),
         "nothing is updated without a configuration token"
@@ -2675,6 +2676,13 @@ async fn a_failed_manifest_update_is_retried_and_me_says_so() {
         .await
         .unwrap();
     Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .respond_with(ok(
+            json!({"manifest": {"settings": {"event_subscriptions": {"bot_events": ["message.im"]}}}}),
+        ))
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
         .and(path("/api/apps.manifest.update"))
         .respond_with(ResponseTemplate::new(500))
         .up_to_n_times(1)
@@ -2688,22 +2696,51 @@ async fn a_failed_manifest_update_is_retried_and_me_says_so() {
         ))
         .mount(&h.slack)
         .await;
-    assert_eq!(agents.pass_at(|| start).await.unwrap().updated, 0);
+    assert_eq!(agents.pass_at(|| start).await.updated, 0);
     assert_eq!(h.calls("apps.manifest.update").await.len(), 1);
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(reply.contains("haven't updated yet: `scribe`"), "{reply}");
     assert!(reply.contains("try again every hour"), "{reply}");
 
     let soon = start + Duration::from_secs(60);
-    assert_eq!(agents.pass_at(|| soon).await.unwrap().updated, 0);
+    assert_eq!(agents.pass_at(|| soon).await.updated, 0);
     assert_eq!(
         h.calls("apps.manifest.update").await.len(),
         1,
         "not again within the lease"
     );
     let later = start + crate::slack::agents::MANIFEST_UPDATE_LEASE;
-    assert_eq!(agents.pass_at(|| later).await.unwrap().updated, 1);
+    assert_eq!(agents.pass_at(|| later).await.updated, 1);
     assert_eq!(h.calls("apps.manifest.update").await.len(), 2);
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(!reply.contains("haven't updated yet"), "{reply}");
+    assert!(!reply.contains("can't update"), "{reply}");
+
+    h.installed_before_the_manifest_version(alice, "ghost")
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .and(body_string_contains("app_id=A0GHOST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "app_not_found"})),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    assert_eq!(agents.pass_at(|| later).await.updated, 0);
+    let reply = h.slash("U0HUMAN01", "me").await.remove(0);
+    assert!(reply.contains("can't update: `ghost`"), "{reply}");
+    assert!(
+        reply.contains("delete the agent and create it again"),
+        "{reply}"
+    );
+    assert!(!reply.contains("haven't updated yet"), "{reply}");
+    let much_later = later + crate::slack::agents::MANIFEST_UPDATE_LEASE;
+    assert_eq!(agents.pass_at(|| much_later).await.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.export").await.len(),
+        3,
+        "an app Slack says is gone isn't tried again"
+    );
 }

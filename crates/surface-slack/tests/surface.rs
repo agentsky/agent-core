@@ -2315,36 +2315,64 @@ async fn conv_info_fresh_refreshes_the_cache() {
 }
 
 #[tokio::test]
-async fn a_channel_is_confirmed_under_its_exact_id_with_the_bot_in_it() {
+async fn where_a_channel_is_now_is_only_an_answer_with_the_bot_in_it() {
     let refused = |error: &str| {
         ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": error}))
     };
     let answers = [
         (
             ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": true}})),
-            Some(true),
-        ),
-        (
-            ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": false}})),
-            Some(false),
+            Ok(Some(CHANNEL)),
         ),
         (
             ok(json!({"channel": {"id": "C0ELSE001", "is_channel": true, "is_member": true}})),
-            Some(false),
+            Ok(Some("C0ELSE001")),
         ),
-        (refused("channel_not_found"), Some(false)),
-        (refused("invalid_auth"), Some(false)),
-        (refused("internal_error"), None),
-        (ResponseTemplate::new(503), None),
+        (
+            ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": false}})),
+            Ok(None),
+        ),
+        (
+            ok(json!({"channel": {"id": "c0else001", "is_channel": true, "is_member": true}})),
+            Ok(None),
+        ),
+        (refused("channel_not_found"), Err("not found")),
+        (refused("team_access_not_granted"), Err("forbidden")),
+        (refused("missing_scope"), Err("forbidden")),
+        (refused("invalid_auth"), Err("unauthorized")),
+        (refused("internal_error"), Err("transport")),
+        (refused("ratelimited"), Err("rate limited")),
+        (
+            ResponseTemplate::new(429).insert_header("retry-after", "30"),
+            Err("rate limited"),
+        ),
+        (ResponseTemplate::new(503), Err("transport")),
     ];
-    for (answer, confirmed) in answers {
+    for (answer, expected) in answers {
         let (server, surface) = setup().await;
         mount(&server, "conversations.info", answer).await;
+        let found = surface.channel_now(&CHANNEL.into()).await;
+        match (found, expected) {
+            (Ok(id), Ok(expected)) => {
+                assert_eq!(id.as_ref().map(|id| id.as_str()), expected);
+            }
+            (Err(err), Err(kind)) => {
+                let matches = match kind {
+                    "not found" => matches!(err, SurfaceError::NotFound(_)),
+                    "forbidden" => matches!(err, SurfaceError::Forbidden(_)),
+                    "unauthorized" => matches!(err, SurfaceError::Unauthorized),
+                    "rate limited" => matches!(err, SurfaceError::RateLimited { .. }),
+                    _ => matches!(err, SurfaceError::Transport(_)),
+                };
+                assert!(matches, "{kind}: {err:?}");
+            }
+            (found, expected) => panic!("{found:?} for {expected:?}"),
+        }
         assert_eq!(
-            surface.confirms_channel(&CHANNEL.into()).await.ok(),
-            confirmed
+            lookups(&server, "conversations.info").await.len(),
+            1,
+            "asked once, without waiting"
         );
-        assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
     }
 }
 
@@ -2357,7 +2385,10 @@ async fn a_forgotten_channel_is_asked_about_again_and_confirming_skips_the_cache
         directory.conv_info(surface.api(), &channel).await.unwrap();
     }
     assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
-    assert_eq!(surface.confirms_channel(&channel).await, Ok(true));
+    assert_eq!(
+        surface.channel_now(&channel).await,
+        Ok(Some(channel.clone()))
+    );
     assert_eq!(lookups(&server, "conversations.info").await.len(), 2);
     directory.forget_conv(&channel);
     directory.conv_info(surface.api(), &channel).await.unwrap();

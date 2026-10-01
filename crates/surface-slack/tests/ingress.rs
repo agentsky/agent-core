@@ -1925,7 +1925,7 @@ async fn messages_one_owner_keeps_past_their_rate_are_acked_and_dropped_without_
         "another owner's messages are all kept"
     );
     logs.snapshot()
-        .matching("keeping events faster than their rate")
+        .matching("keeping messages faster than their rate")
         .assert_has("WARN");
 }
 
@@ -2238,10 +2238,11 @@ async fn an_agents_channel_id_change_is_queued_once_by_event_id() {
 }
 
 #[tokio::test]
-async fn a_channel_id_change_without_two_channel_ids_is_refused_and_writes_nothing() {
+async fn a_channel_id_change_without_two_different_channel_ids_is_refused_and_writes_nothing() {
     let mut harness = Harness::start();
-    let bad: [fn(&mut serde_json::Value); 7] = [
+    let bad: [fn(&mut serde_json::Value); 8] = [
         |body| body["event"]["old_channel_id"] = "U0HUMAN01".into(),
+        |body| body["event"]["new_channel_id"] = body["event"]["old_channel_id"].clone(),
         |body| body["event"]["new_channel_id"] = "c0lower01".into(),
         |body| body["event"]["new_channel_id"] = format!("C{}", "A".repeat(MAX_ID_TAIL + 1)).into(),
         |body| {

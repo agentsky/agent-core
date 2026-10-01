@@ -12,11 +12,16 @@
 //! a private channel it is in got a new id when it was shared with another
 //! organization.
 //!
-//! An app keeps the manifest it was made from until agentd updates it with
+//! An app keeps the manifest it was made from until agentd updates it: it
+//! reads the app's manifest with `apps.manifest.export`
+//! ([`SlackClient::export_app`](crate::SlackClient::export_app)), adds the
+//! [`BOT_EVENTS`] it lacks ([`add_bot_events`]) and writes it back with
 //! `apps.manifest.update`
-//! ([`SlackClient::update_app`](crate::SlackClient::update_app)). Each
-//! change to [`agent_manifest`] that an existing app should get raises
-//! [`MANIFEST_VERSION`], and agentd records the version each app has.
+//! ([`SlackClient::update_app`](crate::SlackClient::update_app)), so
+//! nothing else in it changes. Each new bot event an existing app should
+//! get raises [`MANIFEST_VERSION`], and agentd records the version each app
+//! has. A change of scopes would take a new install, which an update can't
+//! do, so a version never adds one.
 //!
 //! A member installs the app from [`install_url`]: Slack's OAuth consent
 //! page, which redirects to agentd's [`OAUTH_CALLBACK_PATH`] with a code
@@ -49,6 +54,28 @@ pub const BOT_EVENTS: [&str; 5] = [
 /// `channel_id_changed`, 1 since. An app made, or updated, from an older
 /// version doesn't have what it added.
 pub const MANIFEST_VERSION: u32 = 1;
+
+/// Adds to `manifest`, an app's manifest as `apps.manifest.export` gives
+/// it, the [`BOT_EVENTS`] its `settings.event_subscriptions.bot_events`
+/// lacks, after the ones it has, and says whether it added any. `None`,
+/// changing nothing, when the manifest has no such list of strings: an app
+/// that subscribes to no events isn't one agentd should change.
+pub fn add_bot_events(manifest: &mut Value) -> Option<bool> {
+    let events = manifest
+        .get_mut("settings")?
+        .get_mut("event_subscriptions")?
+        .get_mut("bot_events")?
+        .as_array_mut()?;
+    if !events.iter().all(Value::is_string) {
+        return None;
+    }
+    let missing: Vec<&str> = BOT_EVENTS
+        .into_iter()
+        .filter(|event| !events.iter().any(|known| known == event))
+        .collect();
+    events.extend(missing.iter().map(|event| json!(event)));
+    Some(!missing.is_empty())
+}
 
 /// The bot scopes every agent app asks for. `chat:write.public` is added
 /// only when [`AgentApp::public_posting`] is on. The `*:read` scopes let
@@ -104,15 +131,6 @@ impl AgentApp<'_> {
     /// [`OAUTH_CALLBACK_PATH`].
     pub fn redirect_url(&self) -> String {
         format!("{}{OAUTH_CALLBACK_PATH}", self.public_url)
-    }
-
-    /// The public URL an app whose manifest names `redirect_url` was made
-    /// with: `redirect_url` less [`OAUTH_CALLBACK_PATH`], if it ends with
-    /// it and what is left is a [`public_url`].
-    pub fn public_url_of(redirect_url: &str) -> Option<&str> {
-        redirect_url
-            .strip_suffix(OAUTH_CALLBACK_PATH)
-            .filter(|base| public_url(base).as_deref() == Some(*base))
     }
 
     fn request_url(&self, kind: &str) -> String {
@@ -302,23 +320,39 @@ mod tests {
     }
 
     #[test]
-    fn an_apps_public_url_comes_back_from_its_redirect_url() {
-        let made = app(false);
-        assert_eq!(
-            AgentApp::public_url_of(&made.redirect_url()),
-            Some(made.public_url)
-        );
-        assert_eq!(
-            AgentApp::public_url_of("https://example.com/agentd/slack/oauth/callback"),
-            Some("https://example.com/agentd")
-        );
-        for bad in [
-            "https://agentd.example.com/slack/oauth/other",
-            "http://agentd.example.com/slack/oauth/callback",
-            "https://agentd.example.com//slack/oauth/callback",
-            "/slack/oauth/callback",
+    fn the_bot_events_an_app_lacks_are_added_and_nothing_else_changes() {
+        let mut current = agent_manifest(&app(false));
+        let unchanged = current.clone();
+        assert_eq!(add_bot_events(&mut current), Some(false));
+        assert_eq!(current, unchanged);
+
+        let mut older = unchanged.clone();
+        older["settings"]["event_subscriptions"]["bot_events"] =
+            json!(["message.im", "app_mention", "message.channels"]);
+        older["display_information"]["description"] = json!("Edited by its owner.");
+        let mut expected = older.clone();
+        expected["settings"]["event_subscriptions"]["bot_events"] = json!([
+            "message.im",
+            "app_mention",
+            "message.channels",
+            "message.groups",
+            "message.mpim",
+            "channel_id_changed",
+        ]);
+        assert_eq!(add_bot_events(&mut older), Some(true));
+        assert_eq!(older, expected);
+
+        for mut odd in [
+            json!({}),
+            json!({"settings": {}}),
+            json!({"settings": {"event_subscriptions": {"request_url": "x"}}}),
+            json!({"settings": {"event_subscriptions": {"bot_events": "message.im"}}}),
+            json!({"settings": {"event_subscriptions": {"bot_events": [7]}}}),
+            json!([]),
         ] {
-            assert_eq!(AgentApp::public_url_of(bad), None, "{bad}");
+            let before = odd.clone();
+            assert_eq!(add_bot_events(&mut odd), None, "{before}");
+            assert_eq!(odd, before);
         }
     }
 

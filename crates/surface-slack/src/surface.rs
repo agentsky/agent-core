@@ -14,7 +14,7 @@ use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
 use crate::directory::{MemberDirectory, TeamDirectory};
-use crate::normalize::{self, Context, KEPT_SUBTYPES};
+use crate::normalize::{self, Context, KEPT_SUBTYPES, is_channel_id};
 use crate::web::{Message, PageRequest, Result, WebApi};
 
 /// The page size history reads ask for.
@@ -154,26 +154,28 @@ impl SlackSurface {
         &self.directory
     }
 
-    /// Whether Slack says `channel` exists under that id exactly and the
-    /// bot is a member, asked now with `conversations.info`, past every
-    /// cache and [without waiting](WebApi::without_waiting) for the
-    /// token's quota. Slack not finding the conversation for the bot,
-    /// refusing the bot, or no longer accepting its token is a no.
+    /// Where Slack says `channel` is now, asked now with
+    /// `conversations.info`, past every cache and
+    /// [without waiting](WebApi::without_waiting) for the token's quota:
+    /// `Some` of the id Slack answers with, which is `channel` itself unless
+    /// Slack follows it to the id it has since, when the bot is a member
+    /// and that id is shaped like a channel's; `None` when the bot isn't a
+    /// member.
     ///
     /// # Errors
     ///
-    /// A failure that says nothing about the channel and may pass: a rate
-    /// limit, Slack unreachable or unable to answer
-    /// ([`SurfaceError::Transport`]), or an answer Slack gives for no other
-    /// reason ([`SurfaceError::Api`]).
-    pub async fn confirms_channel(&self, channel: &ConversationId) -> Result<bool> {
-        match self.api.without_waiting().conversation_info(channel).await {
-            Ok(info) => Ok(info.id == *channel && info.is_member),
-            Err(
-                SurfaceError::NotFound(_) | SurfaceError::Forbidden(_) | SurfaceError::Unauthorized,
-            ) => Ok(false),
-            Err(err) => Err(err),
-        }
+    /// Any `conversations.info` error, a channel Slack can't find for the
+    /// bot ([`SurfaceError::NotFound`]) or won't show it
+    /// ([`SurfaceError::Forbidden`]) included: Slack may not have caught up
+    /// with a change it just announced, so none of them is taken as an
+    /// answer.
+    pub async fn channel_now(&self, channel: &ConversationId) -> Result<Option<ConversationId>> {
+        let info = self
+            .api
+            .without_waiting()
+            .conversation_info(channel)
+            .await?;
+        Ok((info.is_member && is_channel_id(info.id.as_str())).then_some(info.id))
     }
 
     /// Reads the workspace's members again when the cache is older than its

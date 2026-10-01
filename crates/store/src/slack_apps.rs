@@ -21,7 +21,8 @@
 //! (`manifest_version`). An installed app made from an older one is
 //! [updated](Store::due_manifest_updates) with its owner's configuration
 //! token, each update claimed with a lease like a configuration token's
-//! rotation.
+//! rotation, unless agentd found it can't update the app to that version
+//! ([`block_manifest_update`](Store::block_manifest_update)).
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -105,16 +106,21 @@ pub struct SlackAppBinding {
 pub struct ManifestUpdate {
     /// The binding.
     pub binding: BindingId,
-    /// The agent's name, the app's name.
-    pub agent_name: String,
     /// The agent's owner, whose configuration token updates the app.
     pub owner: MemberId,
     /// The app's id.
     pub app_id: String,
-    /// The app's bot scopes, comma-separated, as it was made with them.
-    pub scopes: String,
-    /// The app's OAuth redirect URL, as it was made with it.
-    pub redirect_url: String,
+}
+
+/// An agent whose installed Slack app is on a manifest older than the one
+/// asked for, from [`Store::outdated_slack_apps`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutdatedSlackApp {
+    /// The agent's name.
+    pub agent_name: String,
+    /// Whether agentd found it can't update the app to the version asked
+    /// for.
+    pub blocked: bool,
 }
 
 /// A Slack binding whose owner is owed the reminder to install its app,
@@ -163,10 +169,11 @@ macro_rules! reminder_due {
 }
 
 /// The conditions under which a manifest update may be claimed, binding the
-/// version asked for, then `now`.
+/// version asked for, twice, then `now`.
 macro_rules! manifest_due {
     () => {
         "b.surface = 'slack' AND b.state = 'active' AND b.manifest_version < ? \
+         AND (b.manifest_blocked_version IS NULL OR b.manifest_blocked_version < ?) \
          AND (b.manifest_lease_until IS NULL OR b.manifest_lease_until <= ?)"
     };
 }
@@ -464,9 +471,9 @@ impl Store {
 
     /// Up to `limit` installed Slack apps in `team` whose manifest update
     /// may be claimed at `now`: made, or last updated, from a manifest
-    /// older than `version`, with no lease running, of an agent that isn't
-    /// deleted, whose owner has a configuration token usable at `now`.
-    /// Longest installed first.
+    /// older than `version`, not blocked at `version`, with no lease
+    /// running, of an agent that isn't deleted, whose owner has a
+    /// configuration token usable at `now`. Longest installed first.
     ///
     /// # Errors
     ///
@@ -479,11 +486,10 @@ impl Store {
         now: OffsetDateTime,
         limit: u32,
     ) -> Result<Vec<ManifestUpdate>> {
-        let rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(concat!(
-            "SELECT b.id, a.name, a.owner_id, b.app_id, b.app_scopes, b.app_redirect_url \
+        let rows: Vec<(String, String, String)> = sqlx::query_as(concat!(
+            "SELECT b.id, a.owner_id, b.app_id \
              FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
              WHERE b.team_id = ? AND a.state <> 'deleted' AND b.app_id IS NOT NULL \
-             AND b.app_scopes IS NOT NULL AND b.app_redirect_url IS NOT NULL \
              AND EXISTS (SELECT 1 FROM slack_config_tokens t WHERE t.member_id = a.owner_id \
              AND t.team_id = b.team_id AND t.broken_at IS NULL AND t.expires_at > ?) AND ",
             manifest_due!(),
@@ -492,23 +498,19 @@ impl Store {
         .bind(team.as_str())
         .bind(to_unix(now))
         .bind(i64::from(version))
+        .bind(i64::from(version))
         .bind(to_unix(now))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(
-                |(binding, agent_name, owner, app_id, scopes, redirect_url)| {
-                    Ok(ManifestUpdate {
-                        binding: parse_column(&binding, BINDINGS, "id")?,
-                        agent_name,
-                        owner: parse_column(&owner, "agents", "owner_id")?,
-                        app_id,
-                        scopes,
-                        redirect_url,
-                    })
-                },
-            )
+            .map(|(binding, owner, app_id)| {
+                Ok(ManifestUpdate {
+                    binding: parse_column(&binding, BINDINGS, "id")?,
+                    owner: parse_column(&owner, "agents", "owner_id")?,
+                    app_id,
+                })
+            })
             .collect()
     }
 
@@ -539,7 +541,29 @@ impl Store {
         .bind(to_unix(lease_until))
         .bind(binding.to_string())
         .bind(i64::from(version))
+        .bind(i64::from(version))
         .bind(to_unix(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Records that agentd can't update `binding`'s app to the manifest of
+    /// `version`, and ends its lease: no update to `version` is claimed
+    /// again. Returns false, changing nothing, if the app has that version
+    /// already.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn block_manifest_update(&self, binding: BindingId, version: u32) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE agent_bindings SET manifest_blocked_version = ?, manifest_lease_until = NULL \
+             WHERE id = ? AND manifest_version < ?",
+        )
+        .bind(i64::from(version))
+        .bind(binding.to_string())
+        .bind(i64::from(version))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -565,9 +589,9 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    /// The names of `owner`'s agents whose installed Slack apps in `team`
-    /// were made, or last updated, from a manifest older than `version`,
-    /// by name.
+    /// `owner`'s agents whose installed Slack apps in `team` were made, or
+    /// last updated, from a manifest older than `version`, by name, each
+    /// saying whether it is blocked at `version`.
     ///
     /// # Errors
     ///
@@ -577,18 +601,27 @@ impl Store {
         owner: MemberId,
         team: &TeamId,
         version: u32,
-    ) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar(
-            "SELECT a.name FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
+    ) -> Result<Vec<OutdatedSlackApp>> {
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT a.name, COALESCE(b.manifest_blocked_version >= ?, 0) \
+             FROM agent_bindings b JOIN agents a ON a.id = b.agent_id \
              WHERE a.owner_id = ? AND a.state <> 'deleted' AND b.team_id = ? \
              AND b.surface = 'slack' AND b.state = 'active' AND b.manifest_version < ? \
              ORDER BY a.name, b.rowid",
         )
+        .bind(i64::from(version))
         .bind(owner.to_string())
         .bind(team.as_str())
         .bind(i64::from(version))
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(agent_name, blocked)| OutdatedSlackApp {
+                agent_name,
+                blocked,
+            })
+            .collect())
     }
 
     /// Records that the owner of `binding` was reminded at `now`. Returns

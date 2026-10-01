@@ -329,7 +329,7 @@ async fn the_sweeper_abandons_a_creation_that_stopped_halfway() {
     else {
         panic!("created");
     };
-    let pass = h.agents.pass().await.unwrap();
+    let pass = h.agents.pass().await;
     assert_eq!(
         pass,
         SweepPass {
@@ -737,6 +737,7 @@ async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
 
 const OLD: &str = "G0PRIVAT1";
 const NEW: &str = "C0PRIVAT1";
+const NEWER: &str = "C0PRIVAT2";
 const WRITER_TOKEN: &str = "xoxb-writer-SECRET";
 
 fn room(id: &str) -> ConvRef {
@@ -773,8 +774,10 @@ fn member_of(channel: &str) -> ResponseTemplate {
     )
 }
 
-/// A second agent of the owner, `name`, whose app made from the manifest
-/// of `version` is installed with `token`.
+fn refused(error: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": error}))
+}
+
 async fn installed_as(h: &Harness, name: &str, token: &str, version: u32) -> BindingId {
     let team = TeamId::new(TEAM);
     let now = OffsetDateTime::now_utc();
@@ -858,20 +861,24 @@ async fn rules_of(h: &Harness, binding: BindingId) -> Rules {
     Rules::read(&settings).unwrap()
 }
 
-fn denying(id: &str) -> Rules {
+fn denying(ids: &[&str]) -> Rules {
     Rules {
         allow: Vec::new(),
-        deny: vec![room_rule(id)],
+        deny: ids.iter().map(|id| room_rule(id)).collect(),
+    }
+}
+
+fn change_of(binding: BindingId, old: &str, new: &str) -> ChannelIdChange {
+    ChannelIdChange {
+        binding,
+        old: old.into(),
+        new: new.into(),
+        received_at: OffsetDateTime::now_utc(),
     }
 }
 
 fn change(binding: BindingId) -> ChannelIdChange {
-    ChannelIdChange {
-        binding,
-        old: OLD.into(),
-        new: NEW.into(),
-        received_at: OffsetDateTime::now_utc(),
-    }
+    change_of(binding, OLD, NEW)
 }
 
 /// Records `change` as the ingress's receiver does, without the task that
@@ -879,11 +886,29 @@ fn change(binding: BindingId) -> ChannelIdChange {
 async fn recorded(h: &Harness, change: &ChannelIdChange) {
     assert_eq!(
         h.store
-            .record_channel_id_change(change, MAX_CHANNEL_CHANGES_WAITING)
+            .record_channel_id_change(change, MAX_CHANNEL_CHANGES)
             .await
             .unwrap(),
         ChannelIdChangeRecord::Recorded
     );
+}
+
+/// `binding`'s recorded changes, each with whether it still waits.
+async fn changes_of(h: &Harness, binding: BindingId) -> Vec<(String, String, bool)> {
+    h.store
+        .channel_id_changes_of_agent(agent_of(h, binding).await)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|known| known.change.binding == binding)
+        .map(|known| {
+            (
+                known.change.old.as_str().to_owned(),
+                known.change.new.as_str().to_owned(),
+                known.waiting,
+            )
+        })
+        .collect()
 }
 
 fn the_event(binding: BindingId) -> ChannelIdChanged {
@@ -897,16 +922,39 @@ fn the_event(binding: BindingId) -> ChannelIdChanged {
     }
 }
 
-/// Waits until `binding`'s agent's rules are `rules`.
-async fn settled_to(h: &Harness, binding: BindingId, rules: &Rules) {
+/// Waits until `binding`'s change from [`OLD`] to [`NEW`] is settled.
+async fn settled(h: &Harness, binding: BindingId) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while rules_of(h, binding).await != *rules {
+    while changes_of(h, binding).await != [(OLD.to_owned(), NEW.to_owned(), false)] {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the rules never moved"
+            "the change never settled"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Whether the router lets a member who isn't the owner use `binding`'s
+/// agent in `channel`, by the agent's rules and its waiting changes, as
+/// the router's view reads them.
+async fn permits(h: &Harness, binding: BindingId, channel: &str) -> bool {
+    let agent = agent_of(h, binding).await;
+    let settings = h.store.agent_settings(agent).await.unwrap();
+    let changes = h.store.channel_id_changes_of_agent(agent).await.unwrap();
+    let pending = crate::policy::pending_denials(&changes);
+    crate::policy::agent_policy(&settings, &crate::policy::Limits::default(), 0, &pending)
+        .unwrap()
+        .permits(
+            &core_types::Requester {
+                member: None,
+                key: MemberKey {
+                    user: UserId::new("U0BOB0001"),
+                    ..ada()
+                },
+                outside: None,
+            },
+            &room(channel),
+        )
 }
 
 #[tokio::test]
@@ -917,104 +965,174 @@ async fn only_the_receiving_agents_rules_are_rewritten() {
     channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
     channel_info(&h, WRITER_TOKEN, NEW, member_of(NEW)).await;
     for binding in [helper, writer] {
-        set_rules(&h, binding, &denying(OLD)).await;
+        set_rules(&h, binding, &denying(&[OLD])).await;
     }
     h.agents.channel_id_changed(the_event(helper)).await;
-    settled_to(&h, helper, &denying(NEW)).await;
+    settled(&h, helper).await;
+    assert_eq!(rules_of(&h, helper).await, denying(&[NEW]));
     assert_eq!(
         rules_of(&h, writer).await,
-        denying(OLD),
+        denying(&[OLD]),
         "the other agent's event hasn't come"
     );
-    assert!(
-        h.store
-            .due_channel_id_changes(OffsetDateTime::now_utc() + CHANNEL_CHANGE_TTL, 10)
-            .await
-            .unwrap()
-            .is_empty(),
-        "settled"
-    );
+    assert!(changes_of(&h, writer).await.is_empty());
 }
 
 #[tokio::test]
 async fn an_unconfirmed_new_channel_rewrites_nothing() {
     let h = harness().await;
     let helper = installed(&h).await;
-    set_rules(&h, helper, &denying(OLD)).await;
-    let refusals = [
+    set_rules(&h, helper, &denying(&[OLD])).await;
+    let answers = [
         ok(json!({"channel": {"id": NEW, "is_channel": true, "is_member": false}})),
-        ok(json!({"channel": {"id": "C0OTHER01", "is_channel": true, "is_member": true}})),
         ok(json!({"channel": {"id": "c0privat1", "is_channel": true, "is_member": true}})),
-        ResponseTemplate::new(200)
-            .set_body_json(json!({"ok": false, "error": "channel_not_found"})),
-        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+        refused("channel_not_found"),
+        refused("team_access_not_granted"),
+        refused("missing_scope"),
+        refused("invalid_auth"),
+        ResponseTemplate::new(503),
+        refused("ratelimited"),
     ];
-    for answer in refusals {
+    let changed = change(helper);
+    recorded(&h, &changed).await;
+    let mut at = OffsetDateTime::now_utc();
+    for answer in answers {
         h.slack.reset().await;
         channel_info(&h, AGENT_TOKEN, NEW, answer).await;
-        let changed = change(helper);
-        recorded(&h, &changed).await;
         assert_eq!(
             h.agents
-                .settle_channel_change(&changed, &OffsetDateTime::now_utc)
+                .settle_channel_change(&changed, &|| at)
                 .await
                 .unwrap(),
-            ChannelChange::Unconfirmed
-        );
-        assert_eq!(rules_of(&h, helper).await, denying(OLD));
-        assert!(
-            !h.store.finish_channel_id_change(&changed).await.unwrap(),
-            "an unconfirmed change is settled"
+            ChannelChange::Waiting
         );
         assert_eq!(h.calls("conversations.info").await, 1, "one ask each");
+        assert_eq!(rules_of(&h, helper).await, denying(&[OLD]));
+        assert_eq!(
+            changes_of(&h, helper).await,
+            [(OLD.to_owned(), NEW.to_owned(), true)],
+            "it waits for its next try"
+        );
+        assert!(
+            !permits(&h, helper, NEW).await,
+            "the deny applies meanwhile"
+        );
+        at += CHANNEL_CHANGE_RETRY;
     }
 }
 
 #[tokio::test]
-async fn a_change_slack_cant_confirm_yet_is_tried_again_until_it_is_given_up() {
+async fn a_channel_slack_hasnt_caught_up_with_settles_once_it_has() {
     let h = harness().await;
     let helper = installed(&h).await;
-    set_rules(&h, helper, &denying(OLD)).await;
-    channel_info(&h, AGENT_TOKEN, NEW, ResponseTemplate::new(503)).await;
-    let changed = change(helper);
-    recorded(&h, &changed).await;
+    set_rules(&h, helper, &denying(&[OLD])).await;
+    channel_info(&h, AGENT_TOKEN, NEW, refused("channel_not_found")).await;
+    h.agents.channel_id_changed(the_event(helper)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while h.calls("conversations.info").await == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "never asked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let start = OffsetDateTime::now_utc();
-    assert_eq!(
-        h.agents
-            .settle_channel_change(&changed, &|| start)
-            .await
-            .unwrap(),
-        ChannelChange::Waiting
-    );
-    let pass = h.agents.pass_at(|| start).await.unwrap();
-    assert_eq!(pass.settled, 0);
-    assert_eq!(
-        h.calls("conversations.info").await,
-        1,
-        "not due before its retry"
-    );
-    assert_eq!(rules_of(&h, helper).await, denying(OLD));
+    assert_eq!(h.agents.pass_at(|| start).await.settled, 0, "not due yet");
+    assert_eq!(rules_of(&h, helper).await, denying(&[OLD]));
 
     h.slack.reset().await;
     channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
     let retry = start + CHANNEL_CHANGE_RETRY;
-    let pass = h.agents.pass_at(|| retry).await.unwrap();
-    assert_eq!(pass.settled, 1);
-    assert_eq!(rules_of(&h, helper).await, denying(NEW));
+    assert_eq!(h.agents.pass_at(|| retry).await.settled, 1);
+    assert_eq!(rules_of(&h, helper).await, denying(&[NEW]));
+    assert!(!permits(&h, helper, NEW).await);
+    assert!(permits(&h, helper, OLD).await, "the old id's deny moved");
+}
 
-    let stale = change(helper);
-    recorded(&h, &stale).await;
-    let late = stale.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);
-    let pass = h.agents.pass_at(|| late).await.unwrap();
-    assert_eq!(pass.settled, 1, "given up");
+#[tokio::test]
+async fn a_chain_of_changes_lands_on_the_last_id_in_either_order() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    channel_info(&h, AGENT_TOKEN, NEWER, member_of(NEWER)).await;
+    channel_info(&h, AGENT_TOKEN, NEW, refused("channel_not_found")).await;
+    let first = change_of(helper, OLD, NEW);
+    let second = change_of(helper, NEW, NEWER);
+    let now = OffsetDateTime::now_utc;
+    for order in [[&first, &second], [&second, &first]] {
+        set_rules(&h, helper, &denying(&[OLD])).await;
+        for changed in [&first, &second] {
+            h.store.delete_channel_id_change(changed).await.unwrap();
+            recorded(&h, changed).await;
+        }
+        for changed in order {
+            assert!(matches!(
+                h.agents.settle_channel_change(changed, &now).await.unwrap(),
+                ChannelChange::Moved { to, .. } if to.as_str() == NEWER
+            ));
+        }
+        assert_eq!(rules_of(&h, helper).await, denying(&[NEWER]));
+    }
+
+    let redirected = installed_as(&h, "writer", WRITER_TOKEN, MANIFEST_VERSION).await;
+    set_rules(&h, redirected, &denying(&[OLD])).await;
+    channel_info(&h, WRITER_TOKEN, NEW, member_of(NEWER)).await;
+    let changed = change_of(redirected, OLD, NEW);
+    recorded(&h, &changed).await;
+    assert_eq!(
+        h.agents
+            .settle_channel_change(&changed, &now)
+            .await
+            .unwrap(),
+        ChannelChange::Moved {
+            rules: true,
+            to: NEWER.into()
+        },
+        "Slack names the id the channel has since"
+    );
+    assert_eq!(rules_of(&h, redirected).await, denying(&[NEWER]));
+}
+
+#[tokio::test]
+async fn a_change_slack_never_confirms_is_given_up_with_its_denies_copied() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let rules = Rules {
+        allow: vec![room_rule(OLD)],
+        deny: vec![room_rule(OLD)],
+    };
+    set_rules(&h, helper, &rules).await;
+    channel_info(&h, AGENT_TOKEN, NEW, ResponseTemplate::new(503)).await;
+    let changed = change(helper);
+    recorded(&h, &changed).await;
+    let late = changed.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| changed.received_at).await.settled, 0);
+    let pass = h.agents.pass_at(|| late).await;
+    assert_eq!((pass.given_up, pass.settled), (1, 0));
+    assert_eq!(
+        rules_of(&h, helper).await,
+        Rules {
+            allow: vec![room_rule(OLD)],
+            deny: vec![room_rule(OLD), room_rule(NEW)],
+        },
+        "the deny applies to the new id for good, and the allow didn't move"
+    );
+    assert!(changes_of(&h, helper).await.is_empty());
+    assert!(!permits(&h, helper, NEW).await);
     assert_eq!(h.calls("conversations.info").await, 1);
+
+    let settled_long_ago = change_of(helper, "G0PRIVAT3", "C0PRIVAT3");
+    recorded(&h, &settled_long_ago).await;
+    h.store
+        .settle_channel_id_change(&settled_long_ago, settled_long_ago.received_at)
+        .await
+        .unwrap();
+    let later = settled_long_ago.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| later).await.given_up, 0);
+    assert!(changes_of(&h, helper).await.is_empty(), "purged");
 }
 
 #[tokio::test]
 async fn a_replayed_channel_id_change_is_dropped() {
     let h = harness().await;
     let helper = installed(&h).await;
-    set_rules(&h, helper, &denying(OLD)).await;
+    set_rules(&h, helper, &denying(&[OLD])).await;
     channel_info(
         &h,
         AGENT_TOKEN,
@@ -1024,14 +1142,6 @@ async fn a_replayed_channel_id_change_is_dropped() {
     .await;
     let changed = change(helper);
     recorded(&h, &changed).await;
-    assert_eq!(
-        h.store
-            .record_channel_id_change(&changed, MAX_CHANNEL_CHANGES_WAITING)
-            .await
-            .unwrap(),
-        ChannelIdChangeRecord::Known,
-        "the same change waits already"
-    );
     let now = OffsetDateTime::now_utc;
     let (first, second) = tokio::join!(
         h.agents.settle_channel_change(&changed, &now),
@@ -1041,38 +1151,46 @@ async fn a_replayed_channel_id_change_is_dropped() {
     outcomes.sort_by_key(|outcome| *outcome == ChannelChange::Waiting);
     assert_eq!(
         outcomes,
-        [ChannelChange::Moved { rules: true }, ChannelChange::Waiting]
+        [
+            ChannelChange::Moved {
+                rules: true,
+                to: NEW.into()
+            },
+            ChannelChange::Waiting
+        ]
     );
+    assert_eq!(
+        h.store
+            .record_channel_id_change(&changed, MAX_CHANNEL_CHANGES)
+            .await
+            .unwrap(),
+        ChannelIdChangeRecord::Known,
+        "a settled change is known"
+    );
+    h.agents.channel_id_changed(the_event(helper)).await;
+    assert_eq!(h.agents.pass().await.settled, 0);
     assert_eq!(h.calls("conversations.info").await, 1);
-    assert_eq!(rules_of(&h, helper).await, denying(NEW));
+    assert_eq!(rules_of(&h, helper).await, denying(&[NEW]));
 }
 
 #[tokio::test]
-async fn too_many_waiting_changes_drop_the_next_and_an_inactive_binding_settles_none() {
+async fn too_many_changes_drop_the_next_and_an_inactive_binding_settles_none() {
     let h = harness().await;
     let helper = installed(&h).await;
-    for n in 0..MAX_CHANNEL_CHANGES_WAITING {
-        let changed = ChannelIdChange {
-            new: format!("C0FULL{n:03}").as_str().into(),
-            ..change(helper)
-        };
-        recorded(&h, &changed).await;
+    for n in 0..MAX_CHANNEL_CHANGES {
+        recorded(&h, &change_of(helper, OLD, &format!("C0FULL{n:03}"))).await;
     }
     h.agents.channel_id_changed(the_event(helper)).await;
-    let waiting = h
-        .store
-        .due_channel_id_changes(OffsetDateTime::now_utc() + CHANNEL_CHANGE_TTL, 100)
-        .await
-        .unwrap();
-    assert_eq!(waiting.len(), MAX_CHANNEL_CHANGES_WAITING as usize);
-    assert!(waiting.iter().all(|changed| changed.new.as_str() != NEW));
+    let recorded = changes_of(&h, helper).await;
+    assert_eq!(recorded.len(), MAX_CHANNEL_CHANGES as usize);
+    assert!(recorded.iter().all(|(_, new, _)| new != NEW));
 
     let bindings = deleted_bindings(&h).await;
     assert_eq!(bindings[0].id, helper);
-    let pass = h.agents.pass().await.unwrap();
+    let pass = h.agents.pass().await;
     assert_eq!(
         pass.settled,
-        waiting.len(),
+        recorded.len(),
         "an inactive binding's are dropped"
     );
     assert_eq!(h.calls("conversations.info").await, 0);
@@ -1083,6 +1201,7 @@ async fn sessions_stay_under_the_old_id() {
     let h = harness().await;
     let helper = installed(&h).await;
     let agent = agent_of(&h, helper).await;
+    set_rules(&h, helper, &denying(&[OLD])).await;
     channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
     let now = OffsetDateTime::now_utc();
     let thread = |id: &str| core_types::ThreadKey {
@@ -1146,19 +1265,8 @@ async fn sessions_stay_under_the_old_id() {
     );
 
     h.agents.channel_id_changed(the_event(helper)).await;
-    settled_to(&h, helper, &Rules::default()).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while h.calls("conversations.info").await == 0
-        || !h
-            .store
-            .due_channel_id_changes(now + CHANNEL_CHANGE_TTL, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    {
-        assert!(tokio::time::Instant::now() < deadline, "never settled");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    settled(&h, helper).await;
+    assert_eq!(rules_of(&h, helper).await, denying(&[NEW]));
 
     let again = h
         .store
@@ -1205,11 +1313,57 @@ async fn sessions_stay_under_the_old_id() {
     );
 }
 
+/// An agent app's manifest as `apps.manifest.export` gives it: `binding`'s
+/// app, with the bot events of an app made before `channel_id_changed`, as
+/// its owner edited its description.
+fn exported(binding: BindingId) -> Value {
+    let mut manifest = agent_manifest(&AgentApp {
+        name: "writer",
+        public_url: "https://agentd.example.com",
+        binding,
+        public_posting: false,
+    });
+    manifest["settings"]["event_subscriptions"]["bot_events"] = json!([
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim"
+    ]);
+    manifest["display_information"]["description"] = json!("The owner's words.");
+    manifest
+}
+
+async fn sent_manifests(h: &Harness) -> Vec<(String, Value)> {
+    h.slack
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/apps.manifest.update")
+        .map(|request| {
+            let form: std::collections::HashMap<String, String> =
+                serde_urlencoded::from_bytes(&request.body).unwrap();
+            (
+                form["app_id"].clone(),
+                serde_json::from_str(&form["manifest"]).unwrap(),
+            )
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn older_agent_apps_get_the_event_through_a_manifest_update() {
     let h = harness().await;
     let current = installed(&h).await;
     let old = installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    let manifest = exported(old);
+    mount(
+        &h.slack,
+        "apps.manifest.export",
+        CONFIG_TOKEN,
+        ok(json!({"manifest": manifest})),
+    )
+    .await;
     mount(
         &h.slack,
         "apps.manifest.update",
@@ -1217,35 +1371,16 @@ async fn older_agent_apps_get_the_event_through_a_manifest_update() {
         ok(json!({"app_id": "A0WRITER", "permissions_updated": false})),
     )
     .await;
-    let pass = h.agents.pass().await.unwrap();
-    assert_eq!(pass.updated, 1);
-    let sent: Vec<_> = h
-        .slack
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|request| request.url.path() == "/api/apps.manifest.update")
-        .collect();
-    assert_eq!(sent.len(), 1, "only the older app");
-    let form: std::collections::HashMap<String, String> =
-        serde_urlencoded::from_bytes(&sent[0].body).unwrap();
-    assert_eq!(form["app_id"], "A0WRITER");
-    let manifest: Value = serde_json::from_str(&form["manifest"]).unwrap();
+    assert_eq!(h.agents.pass().await.updated, 1);
+    let mut expected = manifest;
+    expected["settings"]["event_subscriptions"]["bot_events"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("channel_id_changed"));
     assert_eq!(
-        manifest,
-        agent_manifest(&AgentApp {
-            name: "writer",
-            public_url: "https://agentd.example.com",
-            binding: old,
-            public_posting: false,
-        })
-    );
-    assert!(
-        manifest["settings"]["event_subscriptions"]["bot_events"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("channel_id_changed"))
+        sent_manifests(&h).await,
+        [("A0WRITER".to_owned(), expected)],
+        "only the older app, with only the event added"
     );
     assert!(
         h.store
@@ -1254,109 +1389,162 @@ async fn older_agent_apps_get_the_event_through_a_manifest_update() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(h.agents.pass().await.unwrap().updated, 0);
-    assert_eq!(h.calls("apps.manifest.update").await, 1);
+    assert_eq!(h.agents.pass().await.updated, 0);
+    assert_eq!(h.calls("apps.manifest.export").await, 1);
     assert_ne!(current, old);
+
+    let h = harness().await;
+    let has_it = installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    let manifest = agent_manifest(&AgentApp {
+        name: "writer",
+        public_url: "https://agentd.example.com",
+        binding: has_it,
+        public_posting: false,
+    });
+    mount(
+        &h.slack,
+        "apps.manifest.export",
+        CONFIG_TOKEN,
+        ok(json!({"manifest": manifest})),
+    )
+    .await;
+    assert_eq!(h.agents.pass().await.updated, 1);
+    assert_eq!(
+        h.calls("apps.manifest.update").await,
+        0,
+        "an app with every event already is only recorded"
+    );
 }
 
 #[tokio::test]
-async fn a_manifest_update_slack_refuses_the_token_for_marks_it_broken_and_odd_apps_wait() {
+async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() {
     let h = harness().await;
-    installed_as(&h, "writer", WRITER_TOKEN, 0).await;
-    mount(
-        &h.slack,
-        "apps.manifest.update",
-        CONFIG_TOKEN,
-        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
-    )
-    .await;
-    assert_eq!(h.agents.pass().await.unwrap().updated, 0);
+    let gone = installed_as(&h, "gone", WRITER_TOKEN, 0).await;
+    let eventless = installed_as(&h, "eventless", "xoxb-eventless", 0).await;
+    let refusing = installed_as(&h, "refusing", "xoxb-refusing", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .and(wiremock::matchers::body_string_contains("app_id=A0GONE"))
+        .respond_with(refused("app_not_found"))
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .and(wiremock::matchers::body_string_contains(
+            "app_id=A0EVENTLESS",
+        ))
+        .respond_with(ok(json!({"manifest": {"settings": {}}})))
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .and(wiremock::matchers::body_string_contains(
+            "app_id=A0REFUSING",
+        ))
+        .respond_with(refused("invalid_auth"))
+        .mount(&h.slack)
+        .await;
+    let start = OffsetDateTime::now_utc();
+    assert_eq!(h.agents.pass_at(|| start).await.updated, 0);
+    assert_eq!(h.calls("apps.manifest.export").await, 3);
     let status = h
         .store
         .slack_config_token_status(h.owner, &TeamId::new(TEAM))
         .await
         .unwrap()
         .unwrap();
-    assert!(status.broken);
+    assert!(status.broken, "Slack refused the token");
+    let outdated = h
+        .store
+        .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
+        .await
+        .unwrap();
+    let blocked: Vec<_> = outdated
+        .iter()
+        .map(|app| (app.agent_name.as_str(), app.blocked))
+        .collect();
     assert_eq!(
-        h.store
-            .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
-            .await
-            .unwrap(),
-        ["writer"]
+        blocked,
+        [("eventless", true), ("gone", true), ("refusing", false)]
     );
-    let later = OffsetDateTime::now_utc() + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
-    assert_eq!(h.agents.pass_at(|| later).await.unwrap().updated, 0);
-    assert_eq!(h.calls("apps.manifest.update").await, 1, "no usable token");
 
+    register_token(&h, start).await;
+    let later = start + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.export").await,
+        4,
+        "only the app whose token was refused is tried again"
+    );
+    assert_eq!(h.calls("apps.manifest.update").await, 0);
+    let _ = (gone, eventless, refusing);
+}
+
+#[tokio::test]
+async fn a_token_that_expires_before_a_call_could_end_is_not_used() {
     let h = harness().await;
-    let team = TeamId::new(TEAM);
-    let now = OffsetDateTime::now_utc();
-    let scopes = surface_slack::manifest::BOT_SCOPES.join(",");
-    for (name, scopes, redirect_url) in [
-        (
-            "narrow",
-            "chat:write",
-            "https://agentd.example.com/slack/oauth/callback",
-        ),
-        (
-            "moved",
-            scopes.as_str(),
-            "https://agentd.example.com/elsewhere",
-        ),
-    ] {
-        let store::AgentCreation::Created(_, odd) = h
-            .store
-            .create_agent(
-                &store::NewAgent {
-                    owner: h.owner,
-                    name,
-                    persona: "You help.",
-                    visibility: Visibility::Public,
-                    surface: SurfaceKind::Slack,
-                    team: &team,
-                },
-                10,
-                now,
-            )
+    installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    let start = OffsetDateTime::now_utc();
+    let expiry = h
+        .store
+        .slack_config_token_status(h.owner, &TeamId::new(TEAM))
+        .await
+        .unwrap()
+        .unwrap()
+        .expires_at;
+    let close = expiry - APP_CALL_TIMEOUT + Duration::from_secs(1);
+    assert!(close > start);
+    assert_eq!(h.agents.pass_at(|| close).await.updated, 0);
+    assert_eq!(h.calls("apps.manifest.export").await, 0);
+    assert!(
+        !h.store
+            .slack_config_token_status(h.owner, &TeamId::new(TEAM))
             .await
             .unwrap()
-        else {
-            panic!("created");
-        };
-        let app_id = format!("A0{}", name.to_uppercase());
-        h.store
-            .set_slack_app(
-                odd,
-                &NewSlackApp {
-                    app_id: app_id.clone(),
-                    client_id: "5555.6666".to_owned(),
-                    client_secret: SecretString::from("client-SECRET"),
-                    signing_secret: SecretString::from("signing-SECRET"),
-                    scopes: scopes.to_owned(),
-                    redirect_url: redirect_url.to_owned(),
-                    manifest_version: 0,
-                },
-                name,
-                now,
-            )
-            .await
-            .unwrap();
-        h.store
-            .install_slack_app(
-                odd,
-                &app_id,
-                &UserId::new(format!("U0{}", name.to_uppercase())),
-                &SecretString::from("xoxb-odd"),
-                now,
-            )
-            .await
-            .unwrap();
-    }
-    assert_eq!(h.agents.pass().await.unwrap().updated, 0);
-    assert_eq!(
-        h.calls("apps.manifest.update").await,
-        0,
-        "an app with other scopes, or made elsewhere, isn't updated"
+            .unwrap()
+            .broken
     );
+}
+
+#[tokio::test]
+async fn a_pass_slack_holds_up_starts_no_call_past_its_budget() {
+    let h = harness().await;
+    for name in ["first", "second"] {
+        installed_as(&h, name, &format!("xoxb-{name}"), 0).await;
+    }
+    mount(
+        &h.slack,
+        "apps.manifest.export",
+        CONFIG_TOKEN,
+        refused("internal_error").set_delay(Duration::from_millis(400)),
+    )
+    .await;
+    let pass = h
+        .agents
+        .pass_within(OffsetDateTime::now_utc, Duration::from_millis(100))
+        .await;
+    assert_eq!(pass.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.export").await,
+        1,
+        "the second update waits for the next pass"
+    );
+}
+
+/// Registers a new configuration token for the owner at `at`, good for
+/// three hours.
+async fn register_token(h: &Harness, at: OffsetDateTime) {
+    h.store
+        .put_slack_config_token(
+            h.owner,
+            &TeamId::new(TEAM),
+            &NewSlackConfigToken {
+                token: SecretString::from(CONFIG_TOKEN),
+                refresh_token: SecretString::from("refresh-SECRET"),
+                expires_at: at + Duration::from_secs(3 * 3600),
+            },
+            at,
+        )
+        .await
+        .unwrap();
 }

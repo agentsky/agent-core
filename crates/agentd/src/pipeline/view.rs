@@ -14,7 +14,7 @@ use store::{MessageRef, Store, StoreError};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
-use crate::policy::{Limits, agent_policy};
+use crate::policy::{Limits, agent_policy, pending_denials};
 
 /// The first pause between two reads of an attribution; each next one is
 /// twice as long.
@@ -329,21 +329,26 @@ impl RouterView for StoreView {
 }
 
 /// `agent`'s policy under `context`'s limits, with the turns it took
-/// today, or `None` if the store couldn't say or its rules don't read.
+/// today and its denies on the old ids of channel id changes still waiting
+/// applying to their new ids ([`pending_denials`]), or `None` if the store
+/// couldn't say or its rules don't read.
 async fn policy(store: &Store, agent: AgentId, context: ViewContext<'_>) -> Option<AgentPolicy> {
     let loaded = async {
         let settings = store.agent_settings(agent).await?;
         let turns = store.capped_turns_on(agent, context.now).await?;
-        Ok::<_, StoreError>((settings, turns))
+        let changes = store.channel_id_changes_of_agent(agent).await?;
+        Ok::<_, StoreError>((settings, turns, pending_denials(&changes)))
     };
     match loaded.await {
-        Ok((settings, turns)) => match agent_policy(&settings, context.limits, turns) {
-            Ok(policy) => Some(policy),
-            Err(err) => {
-                tracing::warn!(%agent, kind = ?err.classify(), column = err.column(), "an agent's allow and deny rules don't read");
-                None
+        Ok((settings, turns, pending)) => {
+            match agent_policy(&settings, context.limits, turns, &pending) {
+                Ok(policy) => Some(policy),
+                Err(err) => {
+                    tracing::warn!(%agent, kind = ?err.classify(), column = err.column(), "an agent's allow and deny rules don't read");
+                    None
+                }
             }
-        },
+        }
         Err(err) => {
             tracing::warn!(%agent, error = %err, "couldn't read an agent's policy");
             None

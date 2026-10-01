@@ -670,10 +670,10 @@ async fn an_owner_is_reminded_once_when_the_app_waits_for_its_install() {
     let agents = harness.app.slack_agents().unwrap().clone();
     let now = OffsetDateTime::now_utc();
 
-    assert_eq!(agents.pass_at(|| now).await.unwrap().reminded, 0);
+    assert_eq!(agents.pass_at(|| now).await.reminded, 0);
     let later = now + Duration::from_secs(120);
-    assert_eq!(agents.pass_at(|| later).await.unwrap().reminded, 1);
-    assert_eq!(agents.pass_at(|| later).await.unwrap().reminded, 0, "once");
+    assert_eq!(agents.pass_at(|| later).await.reminded, 1);
+    assert_eq!(agents.pass_at(|| later).await.reminded, 0, "once");
     let reminder = harness
         .manager_posts()
         .await
@@ -2494,6 +2494,65 @@ fn denying_room(channel: &str) -> agentd::policy::Rules {
     rules
 }
 
+/// Waits until `done`, failing with `what` after 20 seconds.
+async fn until<F, Fut>(what: &str, done: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !done().await {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Posts bob's mention of the helper in `channel`, and waits until the
+/// manager app tells him the helper's owner hasn't allowed him there.
+async fn bob_is_refused_in(turned: &Turned, channel: &str, event_id: &str) {
+    let ts = recent_ts(5, 100);
+    let text = format!("<@{AGENT_BOT}> what's the plan?");
+    let message = message_event(
+        fixtures::OTHER_USER,
+        &ts,
+        event_id,
+        &text,
+        json!({"channel": channel, "channel_type": "group"}),
+    );
+    turned
+        .slack_has(
+            &ts,
+            json!({"ts": ts, "user": fixtures::OTHER_USER, "text": text}),
+        )
+        .await;
+    assert_eq!(turned.post(0, SIGNING_SECRET, message).await, 200);
+    until("bob was never told no", || async {
+        turned.posts(MANAGER_TOKEN).await.iter().any(|post| {
+            post["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("hasn't allowed you"))
+        })
+    })
+    .await;
+    turned.nothing_billed_to_bob().await;
+    assert!(
+        turned.posts(AGENT_TOKEN).await.is_empty(),
+        "the deny on the old id holds on the new one"
+    );
+}
+
+/// The `conversations.info` lookups of `channel` with the helper's token.
+async fn lookups_of(turned: &Turned, channel: &str) -> usize {
+    turned
+        .requests("conversations.info", AGENT_TOKEN)
+        .await
+        .iter()
+        .filter(|request| {
+            String::from_utf8_lossy(&request.body).contains(&format!("channel={channel}"))
+        })
+        .count()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shared_private_channel_keeps_the_agents_rules() {
     let turned = Turned::start(&[HELPER]).await;
@@ -2514,46 +2573,60 @@ async fn a_shared_private_channel_keeps_the_agents_rules() {
     let changed = fixtures::CHANNEL_ID_CHANGED.to_owned();
     assert_eq!(turned.post(0, SIGNING_SECRET, changed.clone()).await, 200);
     let moved = denying_room(fixtures::PRIVATE_CHANNEL_SHARED);
-    settle("the agent's rules never moved", || async {
+    until("the agent's rules never moved", || async {
         rules_of(&turned.store, binding).await == moved
     })
     .await;
     assert_eq!(turned.post(0, SIGNING_SECRET, changed).await, 200);
-
-    let ts = recent_ts(5, 100);
-    let text = format!("<@{AGENT_BOT}> what's the plan?");
-    let message = message_event(
-        fixtures::OTHER_USER,
-        &ts,
-        "Ev0SHARED1",
-        &text,
-        json!({"channel": fixtures::PRIVATE_CHANNEL_SHARED, "channel_type": "group"}),
+    bob_is_refused_in(&turned, fixtures::PRIVATE_CHANNEL_SHARED, "Ev0SHARED1").await;
+    assert!(
+        lookups_of(&turned, fixtures::PRIVATE_CHANNEL_SHARED).await > 0,
+        "the new id is confirmed with the agent's token"
     );
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_slack_hasnt_confirmed_already_denies_the_new_id() {
+    let turned = Turned::start(&[HELPER]).await;
+    let binding = turned.bindings[0];
+    let agent = turned.store.binding(binding).await.unwrap().unwrap().agent;
+    let rules = denying_room(fixtures::PRIVATE_CHANNEL);
     turned
-        .slack_has(
-            &ts,
-            json!({"ts": ts, "user": fixtures::OTHER_USER, "text": text}),
+        .store
+        .update_agent_settings(agent, |settings| rules.write(settings))
+        .await
+        .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.info"))
+        .and(body_string_contains(
+            format!("channel={}", fixtures::PRIVATE_CHANNEL_SHARED).as_str(),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "channel_not_found"})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&turned.slack)
+        .await;
+    turned
+        .conversation_is(
+            fixtures::PRIVATE_CHANNEL_SHARED,
+            json!({"is_channel": true, "is_private": true, "is_ext_shared": true, "is_member": true}),
         )
         .await;
-    assert_eq!(turned.post(0, SIGNING_SECRET, message).await, 200);
-    turned.wait_for_confirmation(AGENT_TOKEN).await;
-    turned.nothing_billed_to_bob().await;
-    assert!(
-        turned.posts(AGENT_TOKEN).await.is_empty(),
-        "the deny on the old id holds on the new one"
-    );
-    let asked: Vec<_> = turned
-        .requests("conversations.info", AGENT_TOKEN)
-        .await
-        .into_iter()
-        .filter(|request| {
-            String::from_utf8_lossy(&request.body)
-                .contains(&format!("channel={}", fixtures::PRIVATE_CHANNEL_SHARED))
-        })
-        .collect();
-    assert!(
-        !asked.is_empty(),
-        "the new id is confirmed with the agent's token"
+    let changed = fixtures::CHANNEL_ID_CHANGED.to_owned();
+    assert_eq!(turned.post(0, SIGNING_SECRET, changed).await, 200);
+    until("Slack was never asked", || async {
+        lookups_of(&turned, fixtures::PRIVATE_CHANNEL_SHARED).await == 1
+    })
+    .await;
+    bob_is_refused_in(&turned, fixtures::PRIVATE_CHANNEL_SHARED, "Ev0SHARED2").await;
+    assert_eq!(
+        rules_of(&turned.store, binding).await,
+        rules,
+        "nothing moved yet"
     );
     turned.stop().await;
 }

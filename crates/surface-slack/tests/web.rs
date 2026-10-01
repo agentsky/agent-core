@@ -1591,6 +1591,62 @@ mod apps {
     }
 
     #[tokio::test]
+    async fn export_app_reads_the_apps_manifest_as_the_member() {
+        let server = MockServer::start().await;
+        let manifest = manifest();
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.export"))
+            .and(header(
+                "authorization",
+                format!("Bearer {CONFIG_TOKEN}").as_str(),
+            ))
+            .respond_with(ok(json!({"manifest": manifest})))
+            .mount(&server)
+            .await;
+        let token = SecretString::from(CONFIG_TOKEN);
+        assert_eq!(
+            client(&server)
+                .await
+                .export_app(&token, "A0AGENT01")
+                .await
+                .unwrap(),
+            manifest
+        );
+        let sent = requests(&server).await;
+        assert_eq!(form(&sent[0])["app_id"], "A0AGENT01");
+        assert!(!String::from_utf8_lossy(&sent[0].body).contains(CONFIG_TOKEN));
+
+        for (answer, expected) in [
+            (
+                failed("app_not_found"),
+                Some(SurfaceError::NotFound("app_not_found".into())),
+            ),
+            (
+                failed("invalid_app_id"),
+                Some(SurfaceError::NotFound("invalid_app_id".into())),
+            ),
+            (failed("invalid_auth"), Some(SurfaceError::Unauthorized)),
+            (ok(json!({"manifest": "not an object"})), None),
+            (ok(json!({})), None),
+        ] {
+            let refused = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(answer)
+                .mount(&refused)
+                .await;
+            let err = client(&refused)
+                .await
+                .export_app(&token, "A0AGENT01")
+                .await
+                .unwrap_err();
+            match expected {
+                Some(expected) => assert_eq!(err, expected),
+                None => assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn an_app_that_is_gone_already_is_not_found() {
         for code in ["app_not_found", "invalid_app_id"] {
             let server = MockServer::start().await;

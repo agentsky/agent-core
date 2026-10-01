@@ -98,9 +98,11 @@
 //!   never reach the queue (see [Agents' apps](#agents-apps)); the manager
 //!   app's, which only its operators can sign, are handed on as they came.
 //! - Other events by `event_id`, under the source `slack:<binding>`, which
-//!   drops Slack's retries. Before that write, an event to an agent's app
-//!   takes a token from its owner's bucket, as a kept message does, and is
-//!   dropped, after its 200, when there is none.
+//!   drops Slack's retries. A `channel_id_changed` to an agent's app takes
+//!   no token from its owner's bucket, which other members' messages drain:
+//!   Slack sends it once, and dropping it would leave the agent's rules on
+//!   an id the channel no longer has. The app's own rate and in-flight
+//!   places, taken before its 200, bound it.
 //! - Slash commands and interactivity by their signature, under
 //!   `slack:<binding>:request`. Slack doesn't retry them, so a second copy is
 //!   a replay inside the five-minute window.
@@ -157,7 +159,7 @@
 //!   letters or digits; its `ts` and `thread_ts`: 10 to 20 digits, the
 //!   first not a zero, a dot and 6 digits.
 //! - A `channel_id_changed` event's `old_channel_id` and `new_channel_id`,
-//!   both required, shaped like a message's `channel`.
+//!   both required, shaped like a message's `channel`, and not the same.
 //!
 //! A message's sender is no key, so it is not checked here: [`normalize`]
 //! drops a message whose `user` or `bot_id` isn't shaped like Slack's,
@@ -1254,13 +1256,12 @@ struct ChannelChangeIds {
 }
 
 impl ChannelChangeIds {
-    /// Both ids, when both are there and shaped like a channel's.
+    /// Both ids, when both are there, shaped like a channel's, and not
+    /// the same.
     fn ids(self) -> Option<(ConversationId, ConversationId)> {
         let shaped = |id: Option<String>| id.filter(|id| is_channel_id(id));
-        Some((
-            shaped(self.old_channel_id)?.into(),
-            shaped(self.new_channel_id)?.into(),
-        ))
+        let (old, new) = (shaped(self.old_channel_id)?, shaped(self.new_channel_id)?);
+        (old != new).then(|| (old.into(), new.into()))
     }
 }
 
@@ -1410,8 +1411,9 @@ fn check_callback(head: &EnvelopeHead, body: &[u8]) -> Result<Callback, &'static
         Some("channel_id_changed") => {
             let ChannelChangeHead { event: ids } = serde_json::from_slice(body)
                 .map_err(|_| "a channel_id_changed event whose channel ids aren't strings")?;
-            ids.ids()
-                .ok_or("a channel_id_changed event without both channel ids shaped like Slack's")?;
+            ids.ids().ok_or(
+                "a channel_id_changed event without two different channel ids shaped like Slack's",
+            )?;
             return Ok(Callback::ChannelIdChanged);
         }
         _ => return Ok(Callback::Other),
@@ -1692,9 +1694,6 @@ async fn process_event(
         } else {
             None
         };
-        if !kept(notes, binding, &event_id, &place) {
-            return None;
-        }
         if !first_time(dedup, &format!("slack:{binding}"), &event_id, binding).await {
             tracing::debug!(%binding, event_id, "dropped a Slack event already handled");
             return None;
@@ -1749,7 +1748,20 @@ async fn process_event(
             return None;
         }
     };
-    if !kept(notes, binding, &event_id, &place) {
+    if !place.keep(Instant::now()) {
+        match note(notes, binding, Note::OwnerRate) {
+            Some(quiet) => tracing::warn!(
+                %binding,
+                event_id,
+                dropped_since_last_warning = quiet,
+                "dropped a Slack message: its owner's agents' apps are keeping messages faster than their rate"
+            ),
+            None => tracing::debug!(
+                %binding,
+                event_id,
+                "dropped a Slack message: its owner's agents' apps are keeping messages faster than their rate"
+            ),
+        }
         return None;
     }
     let key = format!("{}:{}", message.conv.conversation, message.message.id);
@@ -1758,29 +1770,6 @@ async fn process_event(
         return None;
     }
     Some(SlackInbound::Message(Box::new(message), place))
-}
-
-/// Whether a request on `place` may be kept now, taking a token from its
-/// owner's bucket ([`InFlight::keep`]); one that may not is logged at most
-/// once per binding per [`WARNING_INTERVAL`] as a warning.
-fn kept(notes: &Notes, binding: BindingRef, event_id: &str, place: &InFlight) -> bool {
-    if place.keep(Instant::now()) {
-        return true;
-    }
-    match note(notes, binding, Note::OwnerRate) {
-        Some(quiet) => tracing::warn!(
-            %binding,
-            event_id,
-            dropped_since_last_warning = quiet,
-            "dropped a Slack event: its owner's agents' apps are keeping events faster than their rate"
-        ),
-        None => tracing::debug!(
-            %binding,
-            event_id,
-            "dropped a Slack event: its owner's agents' apps are keeping events faster than their rate"
-        ),
-    }
-    false
 }
 
 /// Logs a queued body whose `what` no longer parses, which only a signed,
@@ -2020,7 +2009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_channel_id_change_past_its_owners_rate_is_dropped_without_a_row() {
+    async fn a_channel_id_change_is_kept_when_its_owners_bucket_is_empty() {
         let places = places(64);
         let (binding, owner) = (BindingId::new_v4(), MemberId::new_v4());
         let notes = Throttle::new(WARNING_INTERVAL);
@@ -2046,19 +2035,21 @@ mod tests {
         };
         let dedup = Seen::default();
         let place = places.take(seat(binding, owner), Instant::now()).unwrap();
+        while place.keep(Instant::now()) {}
         let kept = process_event(&context, callback("Ev0KEPT1"), &dedup, &notes, place).await;
         assert!(
             matches!(kept, Some(SlackInbound::ChannelIdChanged(ref changed)) if changed.old.as_str() == "G0PRIVAT1" && changed.new.as_str() == "C0PRIVAT1"),
             "{kept:?}"
         );
         let place = places.take(seat(binding, owner), Instant::now()).unwrap();
-        while place.keep(Instant::now()) {}
-        let dropped = process_event(&context, callback("Ev0DROP1"), &dedup, &notes, place).await;
-        assert!(dropped.is_none(), "{dropped:?}");
+        let again = process_event(&context, callback("Ev0KEPT1"), &dedup, &notes, place).await;
+        assert!(again.is_none(), "{again:?}");
         assert_eq!(
             dedup.0.lock().unwrap().clone(),
-            [(format!("slack:{binding}"), "Ev0KEPT1".to_owned())],
-            "the dropped change wrote no row"
+            [
+                (format!("slack:{binding}"), "Ev0KEPT1".to_owned()),
+                (format!("slack:{binding}"), "Ev0KEPT1".to_owned())
+            ],
         );
     }
 

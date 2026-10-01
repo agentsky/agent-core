@@ -1,14 +1,16 @@
 //! `channel_id_changes`: the `channel_id_changed` events agents' Slack
-//! apps received and agentd hasn't settled yet.
+//! apps received.
 //!
-//! Each row says a channel the binding's bot is in changed its id. It waits
-//! until the change is settled: confirmed with Slack, and the rules of the
-//! binding's agent moved to the new id, or found unconfirmed. A try is
-//! claimed by moving `next_attempt_at` past it, so one that fails, or whose
-//! process dies, is made again once that has passed, by this instance or
-//! another.
+//! Each row says a channel the binding's bot is in changed its id. It
+//! waits until it is settled: Slack confirmed where the channel is now, and
+//! the rules of the binding's agent moved there. A try is claimed by moving
+//! `next_attempt_at` past it, so one that fails, or whose process dies, is
+//! made again once that has passed, by this instance or another. A settled
+//! row is kept a while, so a later change in a chain finds where the
+//! channel went and a replay is known; one still waiting a while after it
+//! arrived is given up.
 
-use core_types::{BindingId, ConversationId};
+use core_types::{AgentId, BindingId, ConversationId, TeamId};
 use time::OffsetDateTime;
 
 use crate::{Result, Store, from_unix, parse_column, to_unix};
@@ -20,22 +22,35 @@ const TABLE: &str = "channel_id_changes";
 pub struct ChannelIdChange {
     /// The binding whose app was told.
     pub binding: BindingId,
-    /// The channel's id until now.
+    /// The channel's id until then.
     pub old: ConversationId,
-    /// The id the event says it has now.
+    /// The id the event says it has since.
     pub new: ConversationId,
     /// When agentd received the event.
     pub received_at: OffsetDateTime,
 }
 
+/// A recorded channel id change of one of an agent's bindings, from
+/// [`Store::channel_id_changes_of_agent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownChannelIdChange {
+    /// The change.
+    pub change: ChannelIdChange,
+    /// The binding's workspace.
+    pub team: TeamId,
+    /// Whether it still waits to be settled.
+    pub waiting: bool,
+}
+
 /// What [`Store::record_channel_id_change`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelIdChangeRecord {
-    /// The change is recorded, due at once.
+    /// The change is recorded, waiting, due at once.
     Recorded,
-    /// The same change of the same binding waits already.
+    /// The same change of the same binding is recorded already, waiting or
+    /// settled.
     Known,
-    /// The binding has as many changes waiting as it may; nothing was
+    /// The binding has as many changes recorded as it may; nothing was
     /// recorded.
     Full,
 }
@@ -52,22 +67,23 @@ fn change_of((binding, old, new, received_at): Row) -> Result<ChannelIdChange> {
 }
 
 impl Store {
-    /// Records `change`, due at once, unless the same change of the same
-    /// binding waits already, or the binding has `max_waiting` changes
-    /// waiting.
+    /// Records `change`, waiting and due at once, unless the same change of
+    /// the same binding is recorded already, or the binding has `max`
+    /// changes recorded, waiting or settled.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if a query
-    /// fails, as when there is no such binding.
+    /// fails, as when there is no such binding or an id isn't shaped like a
+    /// channel's.
     pub async fn record_channel_id_change(
         &self,
         change: &ChannelIdChange,
-        max_waiting: u32,
+        max: u32,
     ) -> Result<ChannelIdChangeRecord> {
         let binding = change.binding.to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (waiting, known): (i64, i64) = sqlx::query_as(
+        let (recorded, known): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COUNT(CASE WHEN old_channel = ? AND new_channel = ? THEN 1 END) \
              FROM channel_id_changes WHERE binding_id = ?",
         )
@@ -79,7 +95,7 @@ impl Store {
         if known > 0 {
             return Ok(ChannelIdChangeRecord::Known);
         }
-        if waiting >= i64::from(max_waiting) {
+        if recorded >= i64::from(max) {
             return Ok(ChannelIdChangeRecord::Full);
         }
         let at = to_unix(change.received_at);
@@ -99,8 +115,8 @@ impl Store {
         Ok(ChannelIdChangeRecord::Recorded)
     }
 
-    /// Up to `limit` changes that may be claimed at `now`, the earliest
-    /// received first.
+    /// Up to `limit` waiting changes that may be claimed at `now`, the
+    /// earliest received first.
     ///
     /// # Errors
     ///
@@ -114,7 +130,8 @@ impl Store {
     ) -> Result<Vec<ChannelIdChange>> {
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT binding_id, old_channel, new_channel, received_at FROM channel_id_changes \
-             WHERE next_attempt_at <= ? ORDER BY received_at, rowid LIMIT ?",
+             WHERE settled_at IS NULL AND next_attempt_at <= ? \
+             ORDER BY received_at, rowid LIMIT ?",
         )
         .bind(to_unix(now))
         .bind(i64::from(limit))
@@ -123,9 +140,32 @@ impl Store {
         rows.into_iter().map(change_of).collect()
     }
 
-    /// Claims a try at `change` at `now`, until `next_attempt_at`, when the
-    /// next may be made. Returns true only for the one call that claims it:
-    /// false when it is gone, or a claim runs past `now`.
+    /// Up to `limit` changes still waiting that were received before
+    /// `received_before`, the earliest first, to be given up.
+    ///
+    /// # Errors
+    ///
+    /// As for [`due_channel_id_changes`](Self::due_channel_id_changes).
+    pub async fn expired_channel_id_changes(
+        &self,
+        received_before: OffsetDateTime,
+        limit: u32,
+    ) -> Result<Vec<ChannelIdChange>> {
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT binding_id, old_channel, new_channel, received_at FROM channel_id_changes \
+             WHERE settled_at IS NULL AND received_at < ? ORDER BY received_at, rowid LIMIT ?",
+        )
+        .bind(to_unix(received_before))
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(change_of).collect()
+    }
+
+    /// Claims a try at the waiting `change` at `now`, until
+    /// `next_attempt_at`, when the next may be made. Returns true only for
+    /// the one call that claims it: false when it is gone or settled, or a
+    /// claim runs past `now`.
     ///
     /// # Errors
     ///
@@ -140,7 +180,7 @@ impl Store {
         let result = sqlx::query(
             "UPDATE channel_id_changes SET next_attempt_at = ? \
              WHERE binding_id = ? AND old_channel = ? AND new_channel = ? \
-             AND next_attempt_at <= ?",
+             AND settled_at IS NULL AND next_attempt_at <= ?",
         )
         .bind(to_unix(next_attempt_at))
         .bind(change.binding.to_string())
@@ -152,13 +192,39 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Deletes `change`, once it is settled. Returns whether it was there.
+    /// Marks the waiting `change` settled at `at`. Returns whether it was
+    /// waiting.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if the query
     /// fails.
-    pub async fn finish_channel_id_change(&self, change: &ChannelIdChange) -> Result<bool> {
+    pub async fn settle_channel_id_change(
+        &self,
+        change: &ChannelIdChange,
+        at: OffsetDateTime,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE channel_id_changes SET settled_at = ? \
+             WHERE binding_id = ? AND old_channel = ? AND new_channel = ? \
+             AND settled_at IS NULL",
+        )
+        .bind(to_unix(at))
+        .bind(change.binding.to_string())
+        .bind(change.old.as_str())
+        .bind(change.new.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Deletes `change`, waiting or settled. Returns whether it was there.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails.
+    pub async fn delete_channel_id_change(&self, change: &ChannelIdChange) -> Result<bool> {
         let result = sqlx::query(
             "DELETE FROM channel_id_changes \
              WHERE binding_id = ? AND old_channel = ? AND new_channel = ?",
@@ -171,26 +237,54 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Deletes the changes received before `received_before`, which are
-    /// given up, and returns them.
+    /// Deletes the settled changes received before `received_before`, and
+    /// says how many there were.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if the query
-    /// fails, [`StoreError::Corrupt`](crate::StoreError::Corrupt) if a row
-    /// doesn't parse.
-    pub async fn drop_stale_channel_id_changes(
+    /// fails.
+    pub async fn purge_settled_channel_id_changes(
         &self,
         received_before: OffsetDateTime,
-    ) -> Result<Vec<ChannelIdChange>> {
-        let rows: Vec<Row> = sqlx::query_as(
-            "DELETE FROM channel_id_changes WHERE received_at < ? \
-             RETURNING binding_id, old_channel, new_channel, received_at",
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM channel_id_changes WHERE settled_at IS NOT NULL AND received_at < ?",
         )
         .bind(to_unix(received_before))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// The changes recorded for `agent`'s bindings, waiting or settled,
+    /// the earliest received first.
+    ///
+    /// # Errors
+    ///
+    /// As for [`due_channel_id_changes`](Self::due_channel_id_changes).
+    pub async fn channel_id_changes_of_agent(
+        &self,
+        agent: AgentId,
+    ) -> Result<Vec<KnownChannelIdChange>> {
+        let rows: Vec<(String, String, String, i64, String, bool)> = sqlx::query_as(
+            "SELECT c.binding_id, c.old_channel, c.new_channel, c.received_at, b.team_id, \
+             c.settled_at IS NULL FROM channel_id_changes c \
+             JOIN agent_bindings b ON b.id = c.binding_id WHERE b.agent_id = ? \
+             ORDER BY c.received_at, c.rowid",
+        )
+        .bind(agent.to_string())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(change_of).collect()
+        rows.into_iter()
+            .map(|(binding, old, new, received_at, team, waiting)| {
+                Ok(KnownChannelIdChange {
+                    change: change_of((binding, old, new, received_at))?,
+                    team: team.into(),
+                    waiting,
+                })
+            })
+            .collect()
     }
 }
 

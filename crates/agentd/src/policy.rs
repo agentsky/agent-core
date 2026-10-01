@@ -20,10 +20,12 @@
 //! - `allow everyone` empties the allow list and takes `everyone` off the
 //!   deny list, so everyone not denied by name may use the agent again.
 
-use core_types::{ConvRef, Hop, MemberId, MemberKey};
+use core_types::{
+    BindingId, ConvRef, ConversationId, Hop, MemberId, MemberKey, SurfaceKind, TeamId,
+};
 use router::{AgentPolicy, PolicyTarget, ThreadBudget};
 use serde::{Deserialize, Serialize};
-use store::{AgentSettings, ThreadSpend};
+use store::{AgentSettings, KnownChannelIdChange, ThreadSpend};
 
 use crate::config::LimitsConfig;
 
@@ -215,6 +217,33 @@ impl Rules {
         allow || deny
     }
 
+    /// Puts a deny on `to` beside each deny on `from`, keeping its label,
+    /// unless the deny list names `to` already, and says whether it added
+    /// one: so a deny on a channel's old id applies under its new one too.
+    /// It never lets anyone in, so it may take the list past
+    /// [`MAX_RULES`].
+    pub fn copy_denies(&mut self, from: &ConvRef, to: &ConvRef) -> bool {
+        let copies: Vec<Rule> = self
+            .deny
+            .iter()
+            .filter_map(|rule| match rule {
+                Rule::Room { conv, label } if conv == from => Some(Rule::Room {
+                    conv: to.clone(),
+                    label: label.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let mut copied = false;
+        for copy in copies {
+            if !self.deny.iter().any(|known| known.same_target(&copy)) {
+                self.deny.push(copy);
+                copied = true;
+            }
+        }
+        copied
+    }
+
     /// Whether `everyone` is denied, which leaves the agent to its owner
     /// whatever the allow list says.
     pub fn denies_everyone(&self) -> bool {
@@ -298,8 +327,55 @@ fn add(rules: &mut Vec<Rule>, rule: Rule) -> Change {
     }
 }
 
+/// The ids a channel that was `start` had since, as `binding`'s recorded
+/// channel id changes in `changes` say, waiting or settled: those it was
+/// changed to, then those they were changed to, and so on, each once, the
+/// last the latest a chain reaches.
+pub fn later_ids(
+    changes: &[KnownChannelIdChange],
+    binding: BindingId,
+    start: &ConversationId,
+) -> Vec<ConversationId> {
+    let mut seen = vec![start.clone()];
+    let mut next = 0;
+    while next < seen.len() {
+        let id = seen[next].clone();
+        next += 1;
+        for known in changes {
+            let change = &known.change;
+            if change.binding == binding && change.old == id && !seen.contains(&change.new) {
+                seen.push(change.new.clone());
+            }
+        }
+    }
+    seen.remove(0);
+    seen
+}
+
+/// The conversations whose denies apply to others too while `changes`, an
+/// agent's recorded channel id changes, wait: for each waiting change,
+/// its old id and each id the channel had since ([`later_ids`]).
+pub fn pending_denials(changes: &[KnownChannelIdChange]) -> Vec<(ConvRef, ConvRef)> {
+    let room = |team: &TeamId, conversation: &ConversationId| ConvRef {
+        surface: SurfaceKind::Slack,
+        team: team.clone(),
+        conversation: conversation.clone(),
+    };
+    changes
+        .iter()
+        .filter(|known| known.waiting)
+        .flat_map(|known| {
+            let change = &known.change;
+            later_ids(changes, change.binding, &change.old)
+                .into_iter()
+                .map(|to| (room(&known.team, &change.old), room(&known.team, &to)))
+        })
+        .collect()
+}
+
 /// The router's policy for an agent with `settings`, under `limits`, that
-/// took `turns_today` turns today.
+/// took `turns_today` turns today, each deny on the first conversation of
+/// a pair in `pending` applying to the second too ([`pending_denials`]).
 ///
 /// # Errors
 ///
@@ -308,8 +384,12 @@ pub fn agent_policy(
     settings: &AgentSettings,
     limits: &Limits,
     turns_today: u32,
+    pending: &[(ConvRef, ConvRef)],
 ) -> Result<AgentPolicy, serde_json::Error> {
-    let rules = Rules::read(settings)?;
+    let mut rules = Rules::read(settings)?;
+    for (from, to) in pending {
+        rules.copy_denies(from, to);
+    }
     Ok(AgentPolicy {
         allow: rules.allow.iter().map(Rule::target).collect(),
         deny: rules.deny.iter().map(Rule::target).collect(),
@@ -359,7 +439,7 @@ mod tests {
     fn permits(rules: &Rules, user: &str, room: &str) -> bool {
         let mut settings = AgentSettings::default();
         rules.write(&mut settings);
-        let policy = agent_policy(&settings, &Limits::default(), 0).unwrap();
+        let policy = agent_policy(&settings, &Limits::default(), 0, &[]).unwrap();
         policy.permits(
             &Requester {
                 member: None,
@@ -525,7 +605,7 @@ mod tests {
             ..AgentSettings::default()
         };
         assert!(Rules::read(&bad).is_err());
-        assert!(agent_policy(&bad, &Limits::default(), 0).is_err());
+        assert!(agent_policy(&bad, &Limits::default(), 0, &[]).is_err());
     }
 
     #[test]
@@ -542,7 +622,7 @@ mod tests {
             max_hops: Some(0),
             ..AgentSettings::default()
         };
-        let policy = agent_policy(&settings, &limits, 5).unwrap();
+        let policy = agent_policy(&settings, &limits, 5, &[]).unwrap();
         assert_eq!(
             (policy.max_hops, policy.turns_per_day, policy.turns_today),
             (Hop(0), Some(7), 5)
@@ -643,5 +723,97 @@ mod tests {
             "another workspace's channel and a member are no room on the old id"
         );
         assert_eq!(elsewhere, unchanged);
+    }
+
+    fn known(binding: BindingId, old: &str, new: &str, waiting: bool) -> KnownChannelIdChange {
+        KnownChannelIdChange {
+            change: store::ChannelIdChange {
+                binding,
+                old: old.into(),
+                new: new.into(),
+                received_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+            team: "T1".into(),
+            waiting,
+        }
+    }
+
+    #[test]
+    fn a_channel_is_followed_through_its_bindings_changes_only() {
+        let (ours, theirs) = (BindingId::new_v4(), BindingId::new_v4());
+        let changes = [
+            known(ours, "C2", "C3", false),
+            known(ours, "G1", "C2", true),
+            known(theirs, "C3", "C9", true),
+            known(ours, "C3", "G1", true),
+        ];
+        let ids = |start: &str| -> Vec<String> {
+            later_ids(&changes, ours, &start.into())
+                .into_iter()
+                .map(|id| id.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids("G1"), ["C2", "C3"], "in any order, and a cycle ends");
+        assert_eq!(ids("C3"), ["G1", "C2"]);
+        assert!(ids("C9").is_empty());
+    }
+
+    #[test]
+    fn a_waiting_change_applies_the_old_ids_denies_and_never_its_allows() {
+        let binding = BindingId::new_v4();
+        let rules = Rules {
+            allow: vec![room("G1"), member("bob")],
+            deny: vec![room("G1"), room("C7")],
+        };
+        let mut settings = AgentSettings::default();
+        rules.write(&mut settings);
+        let changes = [
+            known(binding, "G1", "C2", true),
+            known(binding, "C2", "C3", false),
+            known(binding, "C7", "C8", false),
+        ];
+        let pending = pending_denials(&changes);
+        assert_eq!(
+            pending,
+            [(conv("G1"), conv("C2")), (conv("G1"), conv("C3"))],
+            "only a waiting change counts, along the chain it starts"
+        );
+        let policy = agent_policy(&settings, &Limits::default(), 0, &pending).unwrap();
+        let alice = Requester {
+            member: None,
+            key: key("alice"),
+            outside: None,
+        };
+        let bob = Requester {
+            member: None,
+            key: key("bob"),
+            outside: None,
+        };
+        for channel in ["G1", "C2", "C3"] {
+            assert!(!policy.permits(&bob, &conv(channel)), "{channel}");
+        }
+        assert!(
+            policy.permits(&bob, &conv("C8")),
+            "a settled change applies nothing"
+        );
+        assert!(
+            !policy.permits(&alice, &conv("C2")),
+            "the allow on the old id doesn't move early"
+        );
+    }
+
+    #[test]
+    fn copied_denies_may_go_past_the_most_rules() {
+        let mut rules = Rules {
+            allow: Vec::new(),
+            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
+        };
+        assert!(rules.copy_denies(&conv("C0"), &conv("G9")));
+        assert_eq!(rules.deny.len(), MAX_RULES + 1);
+        assert!(!rules.copy_denies(&conv("C0"), &conv("G9")), "once");
+        assert!(
+            !rules.copy_denies(&conv("C99999"), &conv("G8")),
+            "no deny there"
+        );
     }
 }

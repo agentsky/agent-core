@@ -398,6 +398,13 @@ async fn reminder_attempts_are_capped() {
 
 const CURRENT: u32 = 2;
 
+fn outdated(name: &str, blocked: bool) -> crate::OutdatedSlackApp {
+    crate::OutdatedSlackApp {
+        agent_name: name.to_owned(),
+        blocked,
+    }
+}
+
 /// A Slack agent of `owner` whose app, made from the manifest of
 /// `version`, is installed.
 async fn installed(store: &Store, owner: MemberId, name: &str, version: u32) -> BindingId {
@@ -467,11 +474,8 @@ async fn older_installed_apps_are_due_while_their_owner_has_a_usable_token() {
         due,
         [ManifestUpdate {
             binding: old,
-            agent_name: "old".to_owned(),
             owner: ada,
             app_id: "Aold".to_owned(),
-            scopes: "chat:write,im:history".to_owned(),
-            redirect_url: "https://agentd.example.com/slack/oauth/callback".to_owned(),
         }]
     );
     assert!(
@@ -490,7 +494,7 @@ async fn older_installed_apps_are_due_while_their_owner_has_a_usable_token() {
             .outdated_slack_apps(ada, &team(), CURRENT)
             .await
             .unwrap(),
-        ["old"]
+        [outdated("old", false)]
     );
 }
 
@@ -543,6 +547,105 @@ async fn registering_a_token_ends_the_owners_manifest_leases_in_that_workspace()
     }
     register_token(&store, ada, 100_000).await;
     assert_eq!(due_bindings(&store, 5_001).await, [adas]);
+}
+
+#[tokio::test]
+async fn a_failure_ending_the_leases_still_stores_the_token() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    register_token(&store, ada, 100_000).await;
+    let binding = installed(&store, ada, "helper", 0).await;
+    assert!(
+        store
+            .claim_manifest_update(binding, CURRENT, at(5_000), at(8_600))
+            .await
+            .unwrap()
+    );
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_lease_clear BEFORE UPDATE OF manifest_lease_until ON agent_bindings \
+         WHEN NEW.manifest_lease_until IS NULL BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let stored = store
+        .put_slack_config_token(
+            ada,
+            &team(),
+            &crate::NewSlackConfigToken {
+                token: SecretString::from("config-token-2"),
+                refresh_token: SecretString::from("refresh-token-2"),
+                expires_at: at(100_000),
+            },
+            at(5_001),
+        )
+        .await
+        .expect("the token is stored although the leases stay");
+    let token = store
+        .usable_slack_config_token(ada, &team(), at(5_001))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(token.row, stored);
+    assert!(due_bindings(&store, 5_002).await.is_empty(), "still leased");
+    assert_eq!(due_bindings(&store, 8_600).await, [binding]);
+}
+
+#[tokio::test]
+async fn a_blocked_update_is_never_claimed_again_for_its_version_and_says_so() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    register_token(&store, ada, 100_000).await;
+    let binding = installed(&store, ada, "helper", 0).await;
+    let other = installed(&store, ada, "writer", 0).await;
+    assert!(
+        store
+            .claim_manifest_update(binding, CURRENT, at(5_000), at(8_600))
+            .await
+            .unwrap()
+    );
+    assert!(store.block_manifest_update(binding, CURRENT).await.unwrap());
+    assert_eq!(
+        due_bindings(&store, 5_001).await,
+        [other],
+        "the lease ended too"
+    );
+    assert!(
+        !store
+            .claim_manifest_update(binding, CURRENT, at(99_000), at(99_100))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .outdated_slack_apps(ada, &team(), CURRENT)
+            .await
+            .unwrap(),
+        [outdated("helper", true), outdated("writer", false)]
+    );
+    assert_eq!(
+        store
+            .due_manifest_updates(&team(), CURRENT + 1, at(5_001), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|due| due.binding)
+            .collect::<Vec<_>>(),
+        [binding, other],
+        "a later version is tried again"
+    );
+    assert_eq!(
+        store
+            .outdated_slack_apps(ada, &team(), CURRENT + 1)
+            .await
+            .unwrap(),
+        [outdated("helper", false), outdated("writer", false)]
+    );
+    assert!(store.set_manifest_version(other, CURRENT).await.unwrap());
+    assert!(
+        !store.block_manifest_update(other, CURRENT).await.unwrap(),
+        "an updated app isn't blocked"
+    );
 }
 
 #[tokio::test]
@@ -644,6 +747,6 @@ async fn existing_bindings_start_at_manifest_version_zero() {
     );
     assert_eq!(
         store.outdated_slack_apps(ada, &team(), 1).await.unwrap(),
-        ["helper"]
+        [outdated("helper", false)]
     );
 }
