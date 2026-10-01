@@ -40,9 +40,10 @@ pub const MAX_RETRY_AFTER_SECS: u32 = 24 * 60 * 60;
 /// nothing; retries nothing, not even what reqwest would retry on its own;
 /// keeps no idle connection, so a fire never meets a connection the server
 /// closed meanwhile and is never left unsure for that; and honors the
-/// system proxy settings as `auth`'s client does, except for a `base_url`
-/// on a loopback IP address, which no proxy could reach and which would
-/// read the plain request, token included. The token, the task and
+/// system proxy settings as `auth`'s client does, except where
+/// [`core_types::skips_proxy`] says a `base_url` goes direct: plain `http`,
+/// which a proxy would read token and all, and a loopback IP address,
+/// which a proxy would reach on its own host. The token, the task and
 /// response bodies appear in no log line or error.
 #[derive(Clone)]
 pub struct FireClient {
@@ -202,7 +203,7 @@ impl FireClient {
         if let Some(proxy) = proxy {
             builder = builder.proxy(proxy);
         }
-        if base.host_str().is_some_and(core_types::is_loopback_ip_host) {
+        if core_types::skips_proxy(base.scheme(), base.host_str().unwrap_or_default()) {
             builder = builder.no_proxy();
         }
         let http = builder
@@ -271,7 +272,7 @@ impl FireClient {
         let mut response = match sent {
             Ok(response) => response,
             Err(err) if err.is_builder() || err.is_connect() => {
-                return not_sent(routine, &causes(err));
+                return not_sent(routine, &core_types::error_chain(&err.without_url()));
             }
             Err(err) if err.is_timeout() => return Exchange::TimedOut,
             Err(_) => return Exchange::Lost,
@@ -322,20 +323,6 @@ fn not_sent(routine: &RoutineId, cause: &str) -> Exchange {
         "a cloud routine's fire request wasn't sent"
     );
     Exchange::NotSent
-}
-
-/// A request error and its causes, without the URL. They name what failed,
-/// such as DNS, TLS or a refused connection, and never a header.
-fn causes(err: reqwest::Error) -> String {
-    let err = err.without_url();
-    let mut text = err.to_string();
-    let mut source = std::error::Error::source(&err);
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
 
 fn log_outcome(routine: &str, outcome: &FireOutcome) {

@@ -248,7 +248,7 @@ admins = []
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every
 # key is optional; these are the defaults (Claude Code 2.1.285). URLs must be
-# https://, except http:// on a loopback host for local fakes. `scopes` may
+# https://, except http:// to a loopback IP address for local fakes. `scopes` may
 # name only user:profile and user:inference: the credential proxy forwards any
 # path, so a wider scope, such as one that controls a member's cloud sessions,
 # would be usable from every turn on their account.

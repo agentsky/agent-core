@@ -8298,7 +8298,7 @@ drops packets: a 100 ms connect timeout under a 600 ms total gave
 most equal as the plan says, so a connection that never opened is always
 `rejected`.
 
-### No proxy reads a request to a loopback address
+### No proxy reads a plain request or one to a loopback address
 
 **Issue.** The client honors the system proxy settings, as the plan asks,
 and reqwest's environment proxy has no exception of its own for loopback
@@ -8308,17 +8308,28 @@ proxy reached `127.0.0.1` on its own host. A `NO_PROXY` listing
 `127.0.0.1` doesn't cover all of `127.0.0.0/8` or `::ffff:127.0.0.1`,
 which the configuration accepts. The credential proxy's upstream, the
 OAuth client and the Slack and Rocket.Chat clients had the same gap with
-members' and bots' tokens.
+members' and bots' tokens, and the Slack and Rocket.Chat clients accept
+plain `http` to any host: Compose's `http://rocketchat:3000` sent the bot's
+`X-Auth-Token` to the proxy in clear, and the proxy couldn't resolve
+`rocketchat` either.
 
-**Solution.** Each of those clients skips proxies when its configured
-base is a loopback IP address, by one rule,
-`core_types::is_loopback_ip_host`, which the `http` checks of `[cloud]`,
-`[proxy] upstream` and `[claude_oauth]` share; `[claude_oauth]` now
-refuses `http://localhost` as the other two do. Any other base still
-honors the system settings. Each client's builder takes a proxy that tests
-add as if the system had it, and `testkit::proxy::assert_loopback_skips_proxy`
-checks with a fake proxy that the loopback request goes around it while a
-request from a client built for another base goes through it, without
+**Solution.** One rule, `core_types::skips_proxy`, decides it for all five
+clients: a plain `http` base, or a loopback IP address over either
+scheme, is called without a proxy; any other `https` base honors the
+system settings. Skipping the proxy for every plain `http` base, rather
+than only for loopback addresses with `NO_PROXY` advice for the rest, was
+chosen because a proxy should never read a request that carries
+credentials in clear, and an operator who needs one for such a host uses
+`https`; it also needs no deployment to set anything. `auth` decides per
+endpoint, with a proxied and a direct client, so a loopback token-endpoint
+fake no longer takes the proxy away from an `https` profile endpoint.
+Where `http` is allowed is a separate rule, `core_types::is_loopback_ip_host`,
+which `[cloud]`, `[proxy] upstream` and `[claude_oauth]` share;
+`[claude_oauth]` now refuses `http://localhost` as the other two do. Each
+client's builder takes a proxy that tests add as if the system had it,
+and `testkit::proxy::assert_proxied_only_elsewhere` checks with a fake
+proxy that the fake server's loopback address and each other direct base
+go around it while `https://api.example.com` goes through it, without
 setting any environment variable.
 
 ### `base_url` is checked as the `url` crate reads it
@@ -8375,7 +8386,9 @@ the edges to the implementation.
   `Retry-After` or the reason for `unknown`: at info for `fired` and at
   warn otherwise. A request that wasn't sent adds a warning saying why:
   the origin, the task, or the connect error and its causes without the
-  URL (DNS, TLS, a refused connection), which never hold a header.
+  URL (DNS, TLS, a refused connection), which never hold a header. The
+  causes are joined by `core_types::error_chain`, which the Slack and
+  Rocket.Chat clients' transport errors now use too.
 - The answer's `Debug` shows a body's length only, since a body may echo
   what was sent; the classifier and its types are private to the module.
 
@@ -8396,15 +8409,24 @@ and the code exchange doesn't send them again, so a member who added
 with it, which the credential proxy would forward on every turn. A token
 endpoint that grants its own defaults, or doesn't narrow a refresh, would
 do the same silently, and members who linked while the configured scopes
-were wider still hold such tokens.
+were wider still hold such tokens. RFC 6749 lets the answer leave `scope`
+out when it is what the request asked for, which for a login is the URL
+the member may have changed.
 
-**Solution.** `auth` reads a token response's `scope` and refuses one
-naming anything outside `ALLOWED_SCOPES` (`AuthError::ScopeRefused`): a
-login stores nothing and the member is told to log in again without
-changing the link; a refresh marks the link broken, as a dead refresh
-token does, so the member gets the relink notice and the token isn't
-served again. The refused tokens are dropped, not revoked: the login's
-were never stored, and the broken link keeps its old refresh token until
-the next login replaces it or `logout` revokes it. A response without `scope` keeps the link: RFC
-6749 says the grant is then what was asked for, and neither the plan nor
-the design says otherwise.
+**Solution.** `auth` reads a token response's `scope` as any JSON value
+and sorts it into a `Grant`: only `ALLOWED_SCOPES`, unstated (absent or
+`null`), or wider, which a scope of another type counts as, since it
+can't be shown to be narrower; failing the whole response for it would
+hide why. A login keeps only an allowed grant: a wider one is
+`AuthError::ScopeRefused`, whose reply tells the member to open the login
+link unchanged, and an unstated one is `InvalidResponse` (`no scope`),
+since nothing then shows the URL wasn't widened. This depends on the
+token endpoint naming `scope` in its answer, as Claude Code expects; the
+design's Verified and assumed list and T35c's live check carry it. A
+refresh sent the scopes itself, so an unstated grant keeps the link, and
+a wider one marks the link broken, as a dead refresh token does, so the
+member gets the relink notice and the token isn't served again. A refused
+grant's refresh token is revoked, as `logout` revokes one: before the
+login's reply, and after a refresh releases the member's lock, the new
+refresh token if the answer had one and the link's old one otherwise.
+Revocation is best effort, so a failure is only logged.

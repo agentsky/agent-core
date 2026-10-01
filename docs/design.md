@@ -1126,6 +1126,11 @@ Assumed, until the live check in the plan's implementation tasks:
   reference says only the routine's token matches; neither was tried.
 - That the endpoint stays as documented. It is experimental, and routines
   are a research preview[^cc-routines][^cc-routines-fire].
+- That the OAuth token endpoint names the granted scopes in `scope` when it
+  answers a login's code exchange. agentd refuses a login whose answer
+  doesn't, since only `scope` shows the member didn't widen the authorize
+  URL; Claude Code reads the field, but the response's shape is not
+  documented. A refresh without `scope` keeps the link.
 
 ## Data model
 

@@ -3238,11 +3238,13 @@ over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
 `FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
 not at most equal, so a connection that never opened is always
 `rejected`. `Retry-After` is capped at a day. Each fire is one request on
-a connection of its own, with reqwest's own retries off, and no proxy is
-used for a loopback `base_url`, nor by the other clients for a loopback
-base. `auth` refuses a token response granting a scope outside
-`auth::ALLOWED_SCOPES`: a login stores nothing, and a refresh breaks the
-link.
+a connection of its own, with reqwest's own retries off. This client and
+the credential proxy's, `auth`'s, Slack's and Rocket.Chat's use no proxy
+for a plain `http` base or a loopback IP address
+(`core_types::skips_proxy`), `auth` deciding per endpoint. `auth`
+refuses a token response granting a scope outside `auth::ALLOWED_SCOPES`,
+and a login's that doesn't name its scope: a login stores nothing, a
+refresh breaks the link, and the refused grant is revoked.
 
 ### T35c
 
@@ -3334,6 +3336,9 @@ Acceptance, as pipeline and command tests named after the rules:
 - `a_link_label_other_than_its_url_is_shown_with_the_url`.
 - `cloud_notifier_uses_the_defaults_without_cloud_config`.
 - `a_routine_url_on_another_origin_is_refused`.
+- `a_routine_registered_for_another_origin_is_refused_before_it_is_written`
+  (`run`, after `[cloud] base_url` changed: the actionable reply, no
+  hand-off row, nothing sent).
 - `the_link_is_never_posted_outside_the_private_reply`.
 
 Notes from T35b and its review:
@@ -3363,7 +3368,9 @@ get from the endpoint; what it answers with the account out of usage, its
 GitHub connection removed and, if one is at hand, its subscription paused;
 and whether any of those started a session; whether tokens are still
 `sk-ant-oat01-…`, as the reference says, since `RoutineToken` requires the
-`sk-ant-` family; and whether routine ids are case-insensitive (if so,
+`sk-ant-` family; whether the OAuth token endpoint's answer to a login's
+code exchange names `scope`, since agentd refuses a login without it; and
+whether routine ids are case-insensitive (if so,
 normalize them, since `trig_AB` and `trig_ab` would register one routine
 under two labels; a token's associated data holds the stored routine id, so
 normalize when parsing new ones, and re-seal stored rows in Rust with the

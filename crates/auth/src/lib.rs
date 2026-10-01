@@ -35,7 +35,6 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use core_types::MemberId;
-use reqwest::Client;
 use secrecy::SecretString;
 use store::{ClaudeLink, ClaudeTokens, NewClaudeLink, Store, StoreError};
 use time::OffsetDateTime;
@@ -159,9 +158,10 @@ pub enum AuthError {
         /// What is wrong with it.
         reason: &'static str,
     },
-    /// The token endpoint granted a scope outside [`ALLOWED_SCOPES`]. A
-    /// login is refused and stores nothing; a refresh marks the link broken,
-    /// as for a dead refresh token, so the member logs in again.
+    /// A login's token response granted a scope outside
+    /// [`ALLOWED_SCOPES`]: nothing was stored, and the grant was revoked.
+    /// A refresh that does so breaks the link instead
+    /// ([`AuthError::RelinkRequired`]).
     #[error(
         "Anthropic granted more than {}; log in again without changing the login link",
         ALLOWED_SCOPES.join(" and ")
@@ -254,7 +254,7 @@ struct Inner {
     config: OAuthConfig,
     urls: Urls,
     store: Store,
-    http: Client,
+    http: client::Http,
     locks: KeyedLocks<MemberId>,
     flights: Mutex<HashMap<MemberId, Flight>>,
     failures: Mutex<HashMap<MemberId, Instant>>,
@@ -305,7 +305,7 @@ impl Auth {
     pub fn new(config: OAuthConfig, store: Store) -> Result<Self, AuthError> {
         config.validate()?;
         let urls = config.urls()?;
-        let http = client::build_client(&urls, None)?;
+        let http = client::build_client(None)?;
         let (relink, relink_notices) = mpsc::unbounded_channel();
         Ok(Self {
             inner: Arc::new(Inner {
@@ -388,7 +388,9 @@ impl Auth {
     /// [`AuthError::CodeRejected`] if the token endpoint refuses the code,
     /// [`AuthError::ScopeRefused`] if it grants more than [`ALLOWED_SCOPES`],
     /// and [`AuthError::Http`], [`AuthError::Status`] or
-    /// [`AuthError::InvalidResponse`] if the exchange fails otherwise.
+    /// [`AuthError::InvalidResponse`] if the exchange fails otherwise,
+    /// including a response that doesn't say what it granted. A refused
+    /// grant's refresh token is revoked, as far as revocation works.
     pub async fn complete_login(
         &self,
         member: MemberId,
@@ -430,6 +432,13 @@ impl Auth {
                 } => AuthError::CodeRejected { status, error },
                 other => other,
             })?;
+        if let Some(refused) = tokens.login_refusal() {
+            tracing::warn!(%member, error = %refused, "refused a login's tokens; revoking them");
+            if let Some(refresh_token) = &tokens.refresh_token {
+                inner.revoke(member, refresh_token).await;
+            }
+            return Err(refused);
+        }
         let plan = match inner.fetch_plan(&tokens.access_token).await {
             Ok(plan) => Some(plan),
             Err(err) => {
@@ -673,7 +682,7 @@ impl Inner {
         let tokens = match refreshed {
             Ok(tokens) => tokens,
             Err(failure) if failure.dead => {
-                tracing::warn!(%member, error = %failure.error, "the refresh token can't be used again; the link is broken");
+                tracing::warn!(%member, error = %failure.error, "the token endpoint says the refresh token is dead; the link is broken");
                 return (self.mark_broken(member, &link).await, Afterwards::Nothing);
             }
             Err(failure) => {
@@ -687,6 +696,14 @@ impl Inner {
             }
         };
         locked(&self.failures).remove(&member);
+        if tokens.grant == client::Grant::Wider {
+            tracing::warn!(%member, "a refresh granted more than the allowed scopes; the link is broken and the grant revoked");
+            let wide = tokens.refresh_token.unwrap_or(link.refresh_token.clone());
+            return (
+                self.mark_broken(member, &link).await,
+                Afterwards::Revoke(wide),
+            );
+        }
         let updated = ClaudeTokens {
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token.unwrap_or(link.refresh_token),

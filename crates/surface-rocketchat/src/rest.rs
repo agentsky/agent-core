@@ -1153,9 +1153,10 @@ impl RestClient {
 }
 
 /// Builds the client that calls the server at `base`. It honors the system
-/// proxy settings unless `base` is on a loopback IP address, as only tests'
-/// fakes are: a proxy would read a plain `http` request, the auth token
-/// included, and reach the address on its own host. `proxy` is a proxy
+/// proxy settings unless [`core_types::skips_proxy`] says `base` goes
+/// direct: a plain `http` base such as Compose's `http://rocketchat:3000`,
+/// whose requests a proxy would read auth token and all, or a loopback IP
+/// address, which a proxy would reach on its own host. `proxy` is a proxy
 /// tests add as if the system had it.
 fn http_client(base: &Url, proxy: Option<reqwest::Proxy>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
@@ -1164,7 +1165,7 @@ fn http_client(base: &Url, proxy: Option<reqwest::Proxy>) -> Result<reqwest::Cli
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy);
     }
-    if base.host_str().is_some_and(core_types::is_loopback_ip_host) {
+    if core_types::skips_proxy(base.scheme(), base.host_str().unwrap_or_default()) {
         builder = builder.no_proxy();
     }
     builder.build().map_err(transport)
@@ -1425,15 +1426,7 @@ fn truncate(text: &str) -> String {
 
 /// A transport error with its causes, but without the URL.
 fn transport(err: reqwest::Error) -> SurfaceError {
-    let err = err.without_url();
-    let mut text = err.to_string();
-    let mut source = std::error::Error::source(&err);
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    SurfaceError::Transport(text)
+    SurfaceError::Transport(core_types::error_chain(&err.without_url()))
 }
 
 #[derive(Deserialize)]
@@ -1514,10 +1507,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn a_loopback_server_is_called_without_a_proxy() {
-        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
-            http_client(&Url::parse(base).unwrap(), Some(proxy)).unwrap()
-        })
+    async fn a_plain_http_or_loopback_server_is_called_without_a_proxy() {
+        testkit::proxy::assert_proxied_only_elsewhere(
+            |base, proxy| http_client(&Url::parse(base).unwrap(), Some(proxy)).unwrap(),
+            &["http://rocketchat:3000", "https://127.0.0.1:9"],
+        )
         .await;
     }
 

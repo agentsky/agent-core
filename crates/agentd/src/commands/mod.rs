@@ -639,6 +639,10 @@ impl Commands {
             Err(AuthError::CodeRejected { .. }) => {
                 format!("Anthropic didn't accept that code. {again}")
             }
+            Err(AuthError::ScopeRefused) => format!(
+                "Anthropic granted this login more access than agentd uses, so nothing was \
+                 linked. Open the login link exactly as it is sent, without changing it. {again}"
+            ),
             Err(err) => {
                 tracing::warn!(%member, error = %err, "couldn't complete a login");
                 format!("I couldn't finish linking your account. {again}")

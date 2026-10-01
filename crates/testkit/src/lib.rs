@@ -12,7 +12,7 @@
 //! - [`Logs`]: a test binary's log lines, captured by one global
 //!   subscriber.
 //! - [`FakeProxy`]: a proxy that records what reached it, and
-//!   [`proxy::assert_loopback_skips_proxy`].
+//!   [`proxy::assert_proxied_only_elsewhere`].
 //! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 //! - [`slack`]: Slack request signing and payload fixtures.
 

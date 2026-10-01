@@ -370,6 +370,7 @@ impl Upstream {
     fn prefix(&self) -> &str {
         self.base.path().trim_end_matches('/')
     }
+
     /// The upstream URL for a request's origin-form `path_and_query`, or
     /// `None` if the result would leave the upstream's origin or base path.
     fn url(&self, path_and_query: &str) -> Option<Url> {
@@ -398,10 +399,11 @@ fn is_loopback(url: &Url) -> bool {
 }
 
 /// Builds the client that forwards to `upstream`. It honors the system
-/// proxy settings unless the upstream is on a loopback IP address: a proxy
-/// would read a plain `http` request, members' tokens included, and reach
-/// the address on its own host. `proxy` is a proxy tests add as if the
-/// system had it.
+/// proxy settings unless [`core_types::skips_proxy`] says the upstream
+/// goes direct: plain `http`, whose requests a proxy would read members'
+/// tokens and all, which `upstream` allows only to a loopback IP address,
+/// or a loopback IP address, which a proxy would reach on its own host.
+/// `proxy` is a proxy tests add as if the system had it.
 fn http_client(
     upstream: &Upstream,
     proxy: Option<reqwest::Proxy>,
@@ -416,7 +418,8 @@ fn http_client(
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy);
     }
-    if is_loopback(&upstream.base) {
+    let base = &upstream.base;
+    if core_types::skips_proxy(base.scheme(), base.host_str().unwrap_or_default()) {
         builder = builder.no_proxy();
     }
     builder
@@ -674,9 +677,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_loopback_upstream_is_reached_without_a_proxy() {
-        testkit::proxy::assert_loopback_skips_proxy(|base, proxy| {
-            http_client(&Upstream::parse(base).unwrap(), Some(proxy)).unwrap()
-        })
+        testkit::proxy::assert_proxied_only_elsewhere(
+            |base, proxy| http_client(&Upstream::parse(base).unwrap(), Some(proxy)).unwrap(),
+            &["https://127.0.0.1:9", "https://[::1]:9/anthropic/"],
+        )
         .await;
     }
 
