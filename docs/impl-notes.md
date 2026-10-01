@@ -7651,6 +7651,15 @@ reason if it wants one.
   where only some instances reach the owner, one that can may wait up to
   15 minutes for its turn.
 
+### Rust 1.99 deprecates `fetch_update`
+
+- **Issue:** CI's lint jobs install the current stable, and Rust 1.99
+  renamed `AtomicUsize::fetch_update` to `try_update`. A test mock's
+  `fetch_update` then failed clippy's `-D warnings`. `try_update` is newer
+  than the 1.98.1 MSRV, so it can't be used either.
+- **Solution:** the mock decrements with a `compare_exchange` loop, which
+  both toolchains accept. Clippy on 1.99 is otherwise clean.
+
 ## T34: Agent-to-agent hand-off
 
 ### agentd delivers its agents' mentions itself
@@ -7660,54 +7669,207 @@ Slack delivers one app's bot post to another app, and T32 is blocked on a
 live workspace. Rocket.Chat delivers such posts, but only through the
 mentioned bot's own connection, after agentd's post returns.
 
-**Solution.** The fallback T32 describes, on every surface. Once a turn's
-posts are out, `Pipeline::hand_off` queues each one for the other managed
-agents it mentions, as the posting bot's message, and it then goes through
-routing, confirmation and the turn like any message. Only posts the turn
-recorded with its attribution qualify (its reply's chunks and its queued
-posts), so the requester and hop the router reads come from the post's own
-`message_refs` row, never from the agent, and T27's caps and the agents'
-rules apply as to any hop. A private task's delivery records its consent
-and collects nothing to hand off. A post in another conversation (an
-owner-side `post --to`) or in a one-to-one DM is left to the platform:
-agentd doesn't know the other conversation's kind, and no other agent
-answers in a one-to-one DM. A mention hands off only to an agent whose bot
-is active on the conversation's own surface and team (`agent_for_bot`),
-never to the poster, and the router then requires that agent's mention,
-the poster's attribution and the agent's rules for the requester and
-conversation, and the turn requires its bot to be able to post there.
+**Solution.** The fallback T32 describes, on every surface. As a turn's
+posts are recorded, each one hands off to the other managed agents it
+mentions, and once the delivery is done `Pipeline::hand_off` queues each
+hand-off as the posting bot's message, which then goes through routing
+and the turn like any message. A mention hands off only to an agent whose
+bot is active on the conversation's own surface and team
+(`agent_for_bot`), never to the poster, and the router then requires that
+agent's mention, the poster's attribution and the agent's rules for the
+requester and conversation. A one-to-one DM hands off nothing: no other
+agent answers there.
+
+### Only a turn's posts in its own thread hand off
+
+**Issue.** A turn can post elsewhere (`post --to` another channel), and
+the platform delivers that post too. Attributing it would let one thread's
+requester start a hop, with their hop count, in a conversation they never
+wrote in; and agentd's copy needs the other conversation's kind, which it
+doesn't know.
+
+**Solution.** `message_refs` gains `hands_off` (migration
+`20260930260000_hand_offs`): true only for a turn's post in the thread it
+answers, when the turn's delivery may hand off (`Delivery::hand_offs`: not
+a private task, not a one-to-one DM, and the posting bot's binding found
+as the agent's). `StoreView` gives a post's attribution only when
+`hands_off` is set, which replaces the private-task consent check there,
+so a post anywhere else reaches other agents, by either delivery, as an
+unattributed bot message, which the router ignores.
 
 ### Which users a post mentions
 
 **Issue.** agentd needs the mentions of what it posted, as the platform
-reads them, so that its own copy routes like the platform's.
+reads them, so that its own copy routes like the platform's. A review
+found one place they differed: Markdown leaves backticks of unequal runs
+as text (`` `a @writer`` ``), but Slack pairs any two backticks, so Slack
+showed the mention as code while agentd counted it, and a hand-off ran
+that the thread couldn't see. Two rounds of renderer fixes (zero-width
+spaces around literal backticks, then around backticks inside inline code)
+were each bypassed by another input: the splitter cutting a long code
+span, and a cut placed by a backtick run the splitter paired differently
+from Slack.
 
 **Solution.** `Surface::post` returns `Posted { msg, mentions }`.
 Rocket.Chat's `chat.postMessage` response carries the server's `mentions[]`,
 read with the same helper the inbound path uses (no broadcasts, each once,
 at most `MAX_MENTIONS`). Slack's response has no parsed mentions, so the
-surface reads the `<@U…>` tokens of the text it sent, as `normalize`
+surface reads the `<@U…>` tokens of each chunk it sent, as `normalize`
 reads an event's text; the renderer turns an `@<bot user id>` into one for
-managed bots. `MockSurface` reads `@name` words, with `name_user` for
-usernames, and `FakeRest` computes `mentions` for known usernames.
+managed bots. The surface reads them only outside what Slack shows as code
+(`render::slack::without_code`): a fence runs to the next fence, any two
+other backticks pair whatever lies between them, and a backtick left
+alone is text. That is the check every post passes, in the layer that
+decides what hands off, so whatever the renderer or the splitter leaves
+around a mention, agentd counts it only where Slack shows it. A mention
+Slack would show after all (if it doesn't pair backticks inside words,
+say) hands off to no one, which is the safe way to be wrong. The renderer
+changes went back out: the scan makes them unneeded, and they made code
+holding a backtick paste with invisible characters. A backtick in a link's
+URL is percent-encoded (`%60`), so a URL never holds one; such a URL
+copies as `%60`, the same address. `MockSurface` renders a post with
+Slack's renderer (`render::slack::to_mrkdwn`, with the `name_user` names
+as its directory) and reads its tokens the same way, so a test sees the
+mentions Slack would: none in code, none for `@here`, and none for a
+handle a word character follows.
 
-### A hop runs once, whichever copy arrives first
+### One hop for each posting turn and agent
 
 **Issue.** When the platform delivers the post too, the mentioned agent
-gets it twice, in either order, and could run the hop twice.
+gets it twice, in either order; and a turn whose reply and queued posts
+(or two chunks) mention the same agent would start it once per post.
 
-**Solution.** `Pipeline::first_hop` claims the hop in `processed_events`
-(source `hop`, keyed by the agent and the post's conversation and id, kept
-for `PROCESSED_EVENT_RETENTION`) after the decision is confirmed and just
-before acting on it, for any decision on a hop: a requester other than the
-sender, which only an attributed agent's post gives. The second copy finds
-the claim and is dropped without a word. Claiming only there keeps an
-ignored copy (one whose attribution didn't come within the two-second
-wait) from blocking the other, and keeps a copy the platform doesn't
-confirm from claiming anything; refusals and prompts are claimed too, so a
-hop-cap notice is posted once. A claim the store fails to record drops the
-hop rather than risk running it twice. No migration: `processed_events`
-already keys by source and id, and its sweep expires the claims.
+**Solution.** A turn's delivery hands off to each agent once, from the
+first of its posts that mentions it (`Delivery::mentioned` skips the
+agents already handed to), so a turn writes one `hand_offs` row and queues
+one job for each agent. `Pipeline::candidate` claims the hop in
+`processed_events` (source `hop`, kept for `PROCESSED_EVENT_RETENTION`),
+keyed by the mentioned agent and the posting turn read from the post's
+`message_refs` row, after the decision is confirmed and just before
+acting on it, for any decision on a hop: a requester other than the
+sender, which only an attributed post gives. Every later copy, of that
+post or of another post of the same turn, finds the claim and is dropped
+without a word. Claiming only there keeps an ignored copy (one whose
+attribution didn't come within `attribution_wait`) from blocking the
+other. Refusals are claimed too, so one turn's posts give one refusal; a
+refusal because the rules couldn't be read is not claimed, so another copy
+may get past it. When the posting turn can't be read, or the claim can't
+be recorded, the hop is left undone rather than risk running it twice,
+and a hand-off keeps its row to be tried again; there is no fallback key.
+The claim is checked read-only as well (`Store::event_processed`): in
+`dispatch` for a bot's message, before it takes a place in a queue, in
+`candidate` before the read-back, and before a hand-off is queued, so a
+second copy costs neither.
+
+### A hand-off skips the read-back
+
+**Issue.** Each hand-off was read back like a platform event
+(`conversations.replies` on Slack), though agentd made it from its own
+post, and a duplicate the platform delivered paid one more read-back
+before the claim dropped it. The read-back was also what told that the
+mentioned agent's bot could see the conversation.
+
+**Solution.** A job `hand_off` built holds its `hand_offs` row
+(`Job::hand_off`) and skips `confirmed`: there is nothing to confirm in a
+copy agentd made itself. Instead, before claiming the hop, it asks the
+platform whether the bot may post there (`Surface::can_post_now`): a no
+settles the hand-off without a word, and an error, or an agent with no
+active binding there (no surface), leaves its row to be tried again, as
+the replay does. The turn then doesn't ask again. Slack's `can_post` asks
+`conversations.info` (the conversation asked about, not archived, and a
+member, or a DM or group DM) and keeps a yes for `MEMBERSHIP_TTL` (five
+minutes, at most `MAX_MEMBERSHIPS` conversations) for the messages it
+read back; `can_post_now` always asks, and a no drops a kept yes, so a bot
+removed from a channel takes no hop there. A `channel_not_found`, an auth
+error (`invalid_auth`, `missing_scope`, ...) or a forbidden answer is a
+no too, logged as a warning with Slack's error since a revoked token or a
+missing scope looks like it, and drops the kept yes; a rate limit, a
+transport failure or an error on Slack's side stays an error. Where a
+message was read back with the bot's own access, a `can_post` that fails
+that way is taken as a yes, so a rate-limited membership check doesn't
+drop a person's message without a word; a refusal answers nothing. A
+message the platform doesn't confirm from another bot gets no notice.
+
+### Hand-offs are kept until settled
+
+**Issue.** A hand-off was only a job in memory: a shutdown, a crash or a
+full queue lost it. The first durable version then replayed every live
+hand-off each five-minute lease, though a job can wait in a lane and run
+for half an hour, so dead copies took queue places and people got busy
+lines; it deleted rows whatever the outcome, so a store error lost the
+hand-off; it wrote the rows only after the whole delivery; and a
+shutdown left its rows due five minutes later. A later review found that
+a drain longer than the lease stopped leasing the rows its jobs held, so
+another instance ran them too; that a row was not held between its write
+and its job, so a turn cut mid-delivery left it for a lease; that SQLite
+could give a deleted row's id to a new row while a job still held the
+old one; and that a post's ref and its hand-offs were two writes.
+
+**Solution.** `Delivery::post_to` records a post's `message_refs` row and
+a `hand_offs` row for each agent it hands off to (the event as JSON and
+the agent), due after `HAND_OFF_LEASE` (five minutes), in one
+transaction (`Store::record_post`), and holds each row at once
+(`Holding`, from the pipeline's `Holder`: an in-memory set, a cache in
+front of the rows, which refuses an id it holds already). The hold passes
+to the job, which keeps it while it waits and runs. `hand_offs.id` is
+`AUTOINCREMENT`, so an id is never given again. `candidate` says whether
+it settled the hand-off: claimed and acted on, found claimed, ignored,
+refused for a reason other than unreadable rules, or found unable to
+post; and the lane deletes the row only then. The "hand-off worker" calls
+`Pipeline::replay_hand_offs` every `HAND_OFF_SWEEP_INTERVAL` (30 s): it
+leases this instance's held rows again, so neither it nor another
+instance takes them, then leases up to 64 due rows, drops rows recorded
+over an hour ago that are due (logging how many; a held row is never due,
+whichever instance holds it), and
+queues each again, unless its hop's claim is taken, when the row is done
+with. A row that doesn't parse, whose agent is gone or has no active
+binding there, or whose posting turn can't be read is left for later or
+to age out, and each row is handled on its own. Once the pipeline is
+closed, the worker, which now stops with the proxy and ctl listeners
+after the drain or cut, only leases the held rows again, so a drain
+longer than the lease keeps them. A hold let go while the pipeline is
+closed, by a job that never settled its row or a delivery cut short, is
+set aside, and the end of `drain` or `cut_short` makes those rows due at
+once, so the next instance takes them on its first look; the worker does
+it once more as it stops, since its last pass can let go of a row, or
+lease one again, after them, and a release that failed or was cancelled
+is made again then, as the rows stay set aside. The sweep interval is
+`PipelineSettings::hand_off_sweep` (30 s), so a test drives the server's
+worker through a drain. A hand-off past
+a full queue keeps its row and is taken again after the lease rather than
+answered with a busy line, which no one would read. The record and the
+replay read `PipelineSettings::now`.
+
+Delivery is at least once until the hop is claimed, and at most once
+after: a crash between the claim and the turn loses that hop, and a cut
+there before the working emoji is on posts no `RESTARTING_TEXT`. An
+instance that stops leasing a row it holds, as a stuck one, lets another
+take it; the claim then still runs the hop once, perhaps out of its lane's
+order. A hand-off retried after a lease can run in the next hour's
+`thread_turns_per_hour` budget, as any message waiting that long would.
+
+### The hop-cap line once an hour
+
+**Issue.** The hop-cap refusal was posted for every hop that hit it, and
+said "1 hops" for a cap of one, and impl-notes claimed the claim made it
+once, though each posting turn claims its own hop.
+
+**Solution.** `HopCap` uses the limit notices' window
+(`limit_window` gives `hop_cap`, one hour), so each agent says it once an
+hour in a thread; a second chain stopped at the cap within the hour stops
+without a word, which the skill tells agents to expect. It now reads
+"{name} won't answer: it takes part in chains of at most {max} hand-offs",
+with "1 hand-off" for a cap of one, since "this chain has reached its
+limit" read as if the requester had done something. On a hop, the line for
+rules that can't be read is throttled the same way (`policy_unavailable`,
+one hour), since every post and copy of a chain meets it again and its
+hand-off is retried; when that claim can't be recorded, the line isn't
+posted, since a store failing is what it reports and each retry would
+say it again. A link prompt on a hop is throttled per requester with
+`claim_failure_notice` (`link_prompt/hop`, `FAILURE_DM_INTERVAL`) and
+released when it can't be sent. The personal refusals (rules, ban, not in
+the channel) stay silent on a hop, as T27 and T33 decided for any bot's
+message.
 
 ### The ref is still recorded after the post
 
@@ -7717,48 +7879,68 @@ copy finds its attribution at once.
 
 **Solution.** Not done. agentd's own copy is made after the ref is
 recorded, so it never races it; only a platform copy can arrive first, and
-it still waits up to `ATTRIBUTION_WAIT` for the row. If it gives up, it is
-ignored, and agentd's copy runs the hop. A client id would change both
-surfaces' post calls for no hop that isn't already delivered. The race test
-holds the post at a gate, sends the platform's copy before the ref exists,
-and checks the hop runs once, from that copy; the other order is checked
-with the platform's copy after the hop ran.
+it still waits up to `PipelineSettings::attribution_wait` (two seconds by
+default) for the row. If it gives up, it is ignored, and agentd's copy
+runs the hop. A client id would change both surfaces' post calls for no
+hop that isn't already delivered. The race test holds the post at a gate,
+sends the platform's copy before the ref exists, and checks the hop runs
+once, from that copy, while the turn's later post is still held; it waits
+30 seconds for the attribution, so a slow machine can't fail it, and it
+fails when the copy doesn't wait.
 
 ### `ask-agent` posts after the turn
 
 **Issue.** The plan says to post the task, record it with the turn's
-requester and hop, and return at once.
+requester and hop, and return at once. A review found that matching
+handles before names let an agent on Rocket.Chat, where a bot's handle is
+its username and the first agent of a name takes it, take the tasks meant
+for another owner's agent of that name.
 
 **Solution.** The handler queues a post to `here` in the turn's outbox,
-`@<handle> <task>`, so it goes out after the turn with the other queued
-posts, recorded with the turn's requester and hop, and hands off like any
-other post; the command returns at once and its output says so. The
-handle is the bot's user id on Slack and its username on Rocket.Chat
-(`DirectoryEntry::handle`, which `list` uses too). The agent is named by
-its name or handle, with or without `@` or Slack's `<@…|…>`, among the
+the handle and a colon alone on its first paragraph, then the task, so it
+goes out after the turn with the other queued posts, recorded with the
+turn's requester and hop, and hands off like any other post; the command
+returns at once and its output says the other agent may answer. Nothing
+of the task can run into the mention or turn it into code (a table row
+would). The handle is the bot's user id on Slack and its username on
+Rocket.Chat (`DirectoryEntry::handle`, which `list` uses too). Among the
 agents with a bot on the conversation's surface and team that the turn's
-requester may see (public ones and their own); a name two agents share is
-refused with their handles. It is refused outside a channel or group DM,
-for the calling agent itself, and past the turn's ten queued posts, and,
-as before, inside a private task.
+requester may see (public ones and their own), a mention (`@x`, or
+Slack's `<@…|…>`) names a handle only, and a bare word names a name or a
+handle; a bare word that fits two agents, as one's name and another's
+handle can, is refused with each one's handle, name, and whether it is
+the requester's own or public, so the agent can tell which it meant. It
+is refused outside a channel or group DM, for the calling agent itself,
+for an agent the turn asked already (it would take one turn anyway; the
+check and the queueing are one critical section on the outbox, so two
+asks at once can't both pass), past the turn's ten queued posts, and, as
+before, inside a private task. It doesn't check what the
+router will decide (the other agent's rules, the hop cap, its limits):
+those depend on the requester and the thread, and the router says them
+when the hand-off runs, so the skill tells the agent not to promise an
+answer.
 
 ### Smaller choices
 
-- A hand-off is a bot's message, so past an agent's queue bounds it is
-  dropped with a warning and no busy line, as the platform's copy would
-  be.
-- The hand-off happens once the whole delivery is done, after any failure
-  notice, and before the working emoji comes off.
-- Each chunk of a long reply is its own message, so two chunks that both
-  mention an agent hand off twice, as the platform would deliver them.
+- The hand-offs are queued once the whole delivery is done, after any
+  failure notice, and before the working emoji comes off.
+- The skill asks for `ask-agent` or a mention, not both. The first post
+  that mentions an agent is the one it gets, which with both is the
+  reply, posted before the queued task, so the task isn't in that
+  agent's turn.
+- A hand-off isn't read back, so a post a moderator deletes after it was
+  made still hands off, and one retried after a shutdown can run up to an
+  hour later.
+- A background process left from an earlier turn (see "What remains" in
+  the T18 notes) can also run `ask-agent` or post mentions in the next
+  turn, starting hops attributed to that turn's requester. Killing the
+  processes a turn leaves, the deferred fix there, removes this too.
 
 ### Open items
 
 - Rocket.Chat's `mentions` in the `chat.postMessage` response is read as
   the realtime stream gives it; the response shape is not verified on a
   live server.
-- On Slack, if Slack does deliver bot posts to other apps, each duplicate
-  costs the mentioned agent one `conversations.replies` read-back before
-  it is dropped.
-- A hand-off due after shutdown began is dropped and logged; a hop the
-  platform doesn't deliver is then lost.
+- Slack not resolving a mention inside code, and pairing any two
+  backticks (the model `without_code` reads by), are not verified on a
+  live workspace.

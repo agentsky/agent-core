@@ -304,7 +304,9 @@ impl Server {
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
     /// with a pipeline the consents' worker
     /// ([`Consents::run`](crate::consents::Consents::run)), whose private
-    /// tasks the pipeline drains like its turns,
+    /// tasks the pipeline drains like its turns, and the hand-off worker
+    /// ([`Pipeline::run_hand_offs`]), which runs until the pipeline is
+    /// drained or cut short, so the rows its jobs hold stay leased,
     /// with the Slack manager app the configuration token rotator and the
     /// sweeper of agents' apps (install reminders, stale creations), and with
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
@@ -354,7 +356,7 @@ impl Server {
             "ctl listener",
             ctl,
             routers.ctl,
-            internal_stopping,
+            internal_stopping.clone(),
         ));
         for worker in routers.workers {
             tasks.spawn(async move {
@@ -385,6 +387,14 @@ impl Server {
                     .run(pipeline, CONSENT_SWEEP_INTERVAL, settling)
                     .await;
                 "consent worker"
+            });
+        }
+        if let Some(pipeline) = &pipeline {
+            let pipeline = pipeline.clone();
+            let replaying = internal_stopping.clone();
+            tasks.spawn(async move {
+                pipeline.run_hand_offs(replaying).await;
+                "hand-off worker"
             });
         }
         let intake = routers.intake;

@@ -4,16 +4,22 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use agentd::pipeline::{Pipeline, TurnSettings, Turns};
 use agentd::server::{Routers, Server};
 use agentd::{App, Config};
 use core_types::{ConvKind, ConvRef, MemberId, MemberKey, ScopeKey, SurfaceKind, ThreadKey};
+use runner::{PoolConfig, ProcessConfig};
+use sandbox::ProcessSandbox;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentState, BindingState, NewClaudeLink};
 use testkit::rocketchat::{FakeDdp, FakeRest, realtime_message, subscription_doc};
+use testkit::{FakeAnthropic, Turn, agentctl_path, fake_anthropic, fake_claude_path};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -63,22 +69,29 @@ impl Chat {
 
     /// The configuration, with the sections `extra` added.
     fn config_with(&self, db_url: &str, extra: &str) -> Config {
-        let text = format!(
+        Config::parse(&self.config_text(db_url, extra), self.env()).unwrap()
+    }
+
+    /// The configuration's text, with the sections `extra` added.
+    fn config_text(&self, db_url: &str, extra: &str) -> String {
+        format!(
             "{}{extra}\n[rocketchat]\nbase_url = \"{}\"\nwebsocket_url = \"{}\"\nteam = \"{TEAM}\"\n\
              manager_user_id = \"{}\"\n",
             CONFIG.replace("sqlite::memory:", db_url),
             self.fake.uri(),
             self.ddp.url(),
             FakeRest::MANAGER_ID,
-        );
-        let env = vec![
+        )
+    }
+
+    fn env(&self) -> Vec<(String, String)> {
+        vec![
             ("AGENTD_MASTER_KEY".to_owned(), self.master_key.clone()),
             (
                 "AGENTD_RC_MANAGER_TOKEN".to_owned(),
                 FakeRest::MANAGER_TOKEN.to_owned(),
             ),
-        ];
-        Config::parse(&text, env).unwrap()
+        ]
     }
 
     fn user(&self, name: &str) -> &str {
@@ -227,6 +240,62 @@ impl Running {
         let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
             .await
             .unwrap();
+        Self::serve(chat, app, server).await
+    }
+
+    /// agentd running turns in `fake-claude` over a process sandbox in
+    /// `dir`, every turn playing `turn`, upstream of `fake`.
+    async fn start_turning(chat: &Chat, dir: &TempDir, fake: &FakeAnthropic, turn: Turn) -> Self {
+        let text = chat
+            .config_text(
+                &dir.db_url(),
+                &format!("\n[proxy]\nupstream = \"{}\"\n", fake.uri()),
+            )
+            .replace("/nonexistent/agentd", &dir.0.display().to_string());
+        let app = App::open(Config::parse(&text, chat.env()).unwrap())
+            .await
+            .unwrap();
+        let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+            .await
+            .unwrap();
+        let addrs = server.addrs();
+        let script = dir.0.join("script.json");
+        testkit::write_script(&script, &vec![turn; 8]).unwrap();
+        let agentctl = agentctl_path();
+        let vars = BTreeMap::from([
+            (
+                testkit::claude::SCRIPT_ENV.to_owned(),
+                script.display().to_string(),
+            ),
+            (
+                "PATH".to_owned(),
+                format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display()),
+            ),
+            ("NO_PROXY".to_owned(), addrs.proxy.ip().to_string()),
+            ("no_proxy".to_owned(), addrs.proxy.ip().to_string()),
+        ]);
+        let settings = TurnSettings {
+            process: ProcessConfig {
+                claude_bin: fake_claude_path().display().to_string(),
+                anthropic_base_url: format!("http://{}", addrs.proxy),
+                turn_timeout_secs: 60,
+            },
+            pool: PoolConfig {
+                global_container_cap: 1,
+                ..PoolConfig::default()
+            },
+            image: "unused".to_owned(),
+            data_dir: dir.0.clone(),
+            agentctl_url: format!("http://{}", addrs.ctl),
+            env: vars,
+        };
+        let sandbox = ProcessSandbox::new(app.store().clone(), &dir.0).unwrap();
+        let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
+        let server = server.with_pipeline(Pipeline::for_app(&app, turns));
+        Self::serve(chat, app, server).await
+    }
+
+    async fn serve(chat: &Chat, app: App, server: Server) -> Self {
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.run(
             async {
@@ -1054,4 +1123,78 @@ async fn an_unmanaged_bots_mention_starts_no_turn() {
         "the bot's message, answered first in the same thread, started no turn"
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn a_hop_runs_once_when_rocketchat_delivers_the_post_too() {
+    let chat = Chat::start().await;
+    let dir = TempDir::new();
+    let fake = fake_anthropic().await;
+    let running =
+        Running::start_turning(&chat, &dir, &fake, Turn::reply("@writer over to you.")).await;
+    running.link(&chat.alice).await;
+    running.link(&chat.bob).await;
+    let helper = chat.create(&running, "alice", "helper").await;
+    let writer = chat.create(&running, "alice", "writer").await;
+
+    let asked = chat.say("bob", "GENERAL", "@helper look", mention(&[&helper]));
+    let helpers = wait_for_message(&chat, &helper).await;
+    assert_eq!(helpers.tmid.as_deref(), Some(asked.as_str()));
+    let mut copy = realtime_message(&helpers.id, "GENERAL", (&helper, "helper"), &helpers.text);
+    copy["tmid"] = json!(asked);
+    copy["mentions"] = json!([{ "_id": writer, "username": "writer" }]);
+    chat.ddp.send_message(&copy);
+    let writers = wait_for_message(&chat, &writer).await;
+    assert_eq!(writers.tmid.as_deref(), Some(asked.as_str()));
+    let store = running.app.store().clone();
+    let posted = core_types::MsgRef {
+        conv: ConvRef {
+            surface: SurfaceKind::RocketChat,
+            team: TEAM.into(),
+            conversation: "GENERAL".into(),
+        },
+        id: writers.id.as_str().into(),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let attributed = loop {
+        if let Some(attributed) = store.posted_message_ref(&posted).await.unwrap() {
+            break attributed;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "writer's post was never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(attributed.requester.key, key(&chat.bob), "the hop is bob's");
+    assert_eq!(attributed.hop.0, 1);
+    running.stop().await;
+    let by_writer = chat
+        .fake
+        .messages()
+        .into_iter()
+        .filter(|message| message.user_id == writer)
+        .count();
+    assert_eq!(by_writer, 1, "agentd's copy and the server's ran one hop");
+    assert_eq!(fake.message_requests().await.len(), 2);
+}
+
+/// The first message `user` posted, once there is one.
+async fn wait_for_message(chat: &Chat, user: &str) -> testkit::rocketchat::FakeMessage {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(found) = chat
+            .fake
+            .messages()
+            .into_iter()
+            .find(|message| message.user_id == user)
+        {
+            return found;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{user} never posted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

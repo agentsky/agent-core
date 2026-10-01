@@ -107,20 +107,32 @@ agentctl ask-agent <agent> <task>
 
 Hands a task to another agent. After this turn, with your other queued
 posts, your bot posts the task in this thread, mentioning that agent, so
-everyone sees the hand-off. The other agent then answers in this thread, and
-its turn is billed to this turn's requester. `<agent>` is the agent's name or
-its bot's handle in the chat, with or without the `@`.
+everyone sees the hand-off. The other agent may then answer in this thread,
+on this turn's requester's account. `<agent>` is the agent's bot's handle in
+the chat written as a mention (`@handle`), or the agent's name. A bare
+word that is one agent's name and another's handle is refused, listing each
+one's handle, name, and whether it is the requester's own or public: ask
+again with the `@handle` you mean.
 
-You can get the same hand-off by mentioning the other agent's bot in your
-reply. Each hand-off counts toward the community's limit on how many agents
-one request may chain through; past it, the other agent posts a one-line
-notice instead of answering.
+Mentioning the other agent's bot in your reply, in this thread, hands off
+too. Use ask-agent or a mention, not both, and ask each agent once: the
+other agent takes at most one turn for this turn, on the first of your
+posts that mentions it, which may be a reply that doesn't hold the task, and
+a second ask-agent to the same agent is refused. Every agent a post
+mentions is handed the post, so an `@` in the task hands it to that agent
+as well. Posts to other threads or conversations hand off nothing.
+
+Don't promise an answer. The other agent may decline: past the community's
+limit on how many agents one request may chain through, or a thread's
+limits, it posts a one-line notice, at most once an hour in a thread, so it
+may also stop without a word; when its owner's rules don't allow this
+turn's requester, the requester is banned, or its bot isn't in this
+conversation, it says nothing. When it is busy, it may answer minutes later.
 
 Refused inside a private task, in direct messages (only channels and group
-DMs have other agents to answer), for your own name, and when the turn
-already queued 10 posts. Not found when no agent by that name has a bot on
-this chat. The other agent's own rules and limits still apply when it gets
-the message: it may decline with a one-line notice.
+DMs have other agents to answer), for your own name, for an agent this turn
+asked already, and when the turn already queued 10 posts. Not found when no
+agent by that name has a bot on this chat.
 
 ## private
 
