@@ -162,7 +162,9 @@ description, and must pass T02's policy.
   and the request shapes, against the 2.1.285 binary
   ([impl-notes](impl-notes.md#t09-auth)). Claude Code's own claude.ai login
   asks for more scopes; `user:profile user:inference` is the least agentd
-  needs. A live login is still to be done.
+  needs. A live login is still to be done. `scopes` may hold only a subset
+  of `user:profile user:inference`: configuration refuses any other scope
+  (T35b), so no linked token can control a member's cloud sessions.
 
 ### Network and deployment shape
 
@@ -3040,11 +3042,12 @@ Deliverables:
     `cloud_handoffs/task_enc/<id>`, inserts the row as `sending` and
     returns its id.
   - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
-    `unknown` from `sending`, and also `fired` from `unknown`, for an answer
-    whose record was held up past the pass. Recording any outcome from
-    `sending` sets `notified_at`, since the command's reply tells the
-    member; recording `fired` from `unknown` sets it too unless a notice
-    claim's lease is live.
+    `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
+    for an answer whose record was held up past the pass. Recording any
+    outcome from `sending` sets `notified_at`, since the command's reply
+    tells the member; recording `fired` or `rejected` from `unknown` sets it
+    too unless a notice claim's lease is live. Nothing retries a record
+    that failed.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3097,7 +3100,8 @@ Acceptance, as tests named after the rules:
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
-- `a_handoff_finishes_from_sending_and_late_from_unknown`.
+- `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
+  `rejected`).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3215,8 +3219,14 @@ Deliverables:
     names), and one line saying agentd doesn't follow sessions.
   - `rm` deletes the routine and says to revoke the token at claude.ai.
 - `logout` and a member Slack reports deleted delete the member's routines
-  and hand-offs; `logout`'s reply says to revoke the tokens, and a deleted
-  member is sent nothing.
+  and hand-offs, by `MemberId`, so those registered from any surface go;
+  `logout`'s reply says to revoke the tokens, and a deleted member is sent
+  nothing.
+- A Slack task's tokens are rewritten to what Slack showed, as the design's
+  [Command surface](design.md#command-surface) says: `<@U…|name>` to
+  `@name`, `<#C…|name>` to `#name`, `<url>` and a `<url|label>` labelled
+  with its URL to the URL, any other `<url|label>` to `label (url)`; any
+  other `<…>` token is refused. Rocket.Chat tasks are left as typed.
 - A `CloudNotifier` built like `RelinkNotifier`
   (`crates/agentd/src/commands/relink.rs`), holding the store and the
   manager bots' `Replies`, run from `Server::run` every minute: it marks
@@ -3225,14 +3235,18 @@ Deliverables:
   identities (the hand-off may have started; check claude.ai/code before
   running it again), defers a failed send, and purges hand-offs older than
   `[cloud] retention_days`. It runs whether or not `[cloud]` is present,
-  so a notice and the purge don't wait on the configuration.
+  so a notice and the purge don't wait on the configuration; without the
+  section it uses the defaults, `timeout_secs` 30 and `retention_days` 90.
 - No `agentctl` subcommand, no ctl API route, and no mention of `cloud` in
   the bundled `agentctl` skill.
 - `README.md`: the member's setup (a routine per repository with no
   connectors and the default allowlist, the prompt from the design and
   what it means for the token, the API trigger, `cloud add` as a slash
-  command on Slack), what agentd does and doesn't do after the link, and
-  `[cloud]` for operators.
+  command on Slack), that a task with characters that don't show, a line
+  indented past 32 columns, a run of blanks wider than 16 columns or more
+  than two blank lines in a row is refused, so pasted code may need
+  reflowing, what agentd does and doesn't do after the link, and `[cloud]`
+  for operators.
 
 Acceptance, as pipeline and command tests named after the rules:
 
@@ -3251,6 +3265,10 @@ Acceptance, as pipeline and command tests named after the rules:
 - `a_late_answer_after_the_pass_is_recorded_as_fired`.
 - `a_replayed_slack_command_fires_once`.
 - `logout_drops_routines_and_handoffs`.
+- `a_member_slack_reports_deleted_loses_routines_from_every_surface`.
+- `slack_tokens_in_a_task_become_what_slack_showed`.
+- `a_link_label_other_than_its_url_is_shown_with_the_url`.
+- `cloud_notifier_uses_the_defaults_without_cloud_config`.
 - `a_routine_url_on_another_origin_is_refused`.
 - `the_link_is_never_posted_outside_the_private_reply`.
 

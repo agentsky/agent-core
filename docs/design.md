@@ -304,7 +304,9 @@ Rules:
 - Tokens are encrypted at rest (ChaCha20-Poly1305, key from the environment or a
   KMS). Refresh is single-flight per member. A failed refresh DMs the member.
 - Endpoint URLs, client id and scopes come from configuration. They are Claude
-  Code's OAuth parameters, not a published API contract, and can change.
+  Code's OAuth parameters, not a published API contract, and can change. The
+  scopes may be only `user:profile`, `user:inference` or both: configuration
+  refuses any other (see [Cloud hand-off](#cloud-hand-off)).
 
 ## Turn routing and billing
 
@@ -727,7 +729,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits; `off` removes one |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
 | `/agent sessions <name>`, `/agent reset <name> [here]` | Owner | Inspect or reset sessions |
-| `/agent cloud add\|run\|list\|rm …` | Linked member, privately | Register routines and hand work to a cloud session on one's own account (see [Cloud hand-off](#cloud-hand-off)) |
+| `/agent cloud add\|run\|list\|rm …` | Privately: `add` and `run` by a linked member, `list` and `rm` by any member | Register routines and hand work to a cloud session on one's own account (see [Cloud hand-off](#cloud-hand-off)) |
 | `/agent list [@user]` | Anyone | Agent directory |
 | `/agent admin ...` | Community admin | Community API key, bans, Slack configuration |
 
@@ -839,9 +841,14 @@ Slack delivers slash command text with `&`, `<` and `>` as entities and
 with mentions, channels and links as `<@U…|name>`, `<#C…|name>` and
 `<url|label>` tokens (`should_escape` is on for `/agent`). The Slack surface
 decodes the entities before parsing, as for every command (T08, T30). The
-`<url>` around a pasted fire URL is taken off. A task keeps its tokens as
-Slack wrote them, which the session reads well enough, so it reaches the
-session as the member typed it, entities aside.
+`<url>` around a pasted fire URL is taken off. In a task, each token becomes
+what Slack showed the member, so the session reads what they saw:
+`<@U…|name>` becomes `@name`, `<#C…|name>` becomes `#name`, `<url>` and a
+`<url|label>` whose label is its URL become the URL, and a `<url|label>`
+with another label becomes `label (url)`, so a label can't hide where a
+link goes. Any other `<…>` token, such as a broadcast, is refused. The task
+then reaches the session as Slack delivered it, with those tokens
+rewritten. Rocket.Chat delivers what was typed, unchanged.
 
 ### Who can start one, and where
 
@@ -879,8 +886,8 @@ private tasks on purpose:
   words; the bundled `agentctl` skill doesn't describe `cloud run`, so no
   agent is taught to write one out.
 
-A member can still paste text from elsewhere, an agent's reply included. So a `cloud run` task gets the checks a consent card's task gets
-(T33): the presentation selectors and joiners that only change how a
+A member can still paste text from elsewhere, an agent's reply included.
+So a `cloud run` task gets the checks a consent card's task gets (T33): the presentation selectors and joiners that only change how a
 character is drawn are dropped, and a task with control or invisible
 characters, deep indentation, wide runs of blanks, many blank lines in a row
 or stacked combining marks is refused, so what the member sees in their own
@@ -1005,7 +1012,9 @@ Two tables, both in the store:
   One label and one routine id per member. A row is deleted by `cloud rm`,
   by the member's `logout`, and when Slack reports the member deleted, as
   configuration tokens are; that last one sends no reply, since there is no
-  one to reply to. agentd can't revoke a token at Anthropic, which has no
+  one to reply to. A deletion acts on the member, not the identity, so a
+  member Slack reports deleted loses every routine and hand-off they have,
+  those registered from Rocket.Chat included. agentd can't revoke a token at Anthropic, which has no
   public API for it[^cc-routines-fire], so the other replies tell the member
   to revoke it at claude.ai/code/routines.
 - `cloud_handoffs`: an id, the member, the routine's label and id (copied, so
@@ -1039,10 +1048,15 @@ The member hears each outcome once:
   again. The notice is claimed and sent as the relink notice is (T13): a
   claim counts an attempt and takes a 10-minute lease, a failed send
   backs off from a minute, doubling up to an hour, and the notice is given
-  up 24 hours after the row became `unknown`.
+  up 24 hours after the row became `unknown`. The pass and the purge run
+  even when `[cloud]` is absent, so a notice owed from before the section
+  was removed still goes out; they then use the defaults, 30 seconds for
+  `timeout_secs` and 90 days for `retention_days`.
 - An answer that arrives for a row already marked `unknown`, when recording
   it was held up, is still recorded: `unknown` becomes `fired` with the
-  session's id and link, and a notice not yet claimed is marked done.
+  session's id and link, or `rejected` with its status, and a notice not
+  yet claimed is marked done. Nothing retries a record that failed: such a
+  row stays `unknown`, and the reply already said what happened.
 
 Logs carry the command's name, the member, routine and hand-off ids, the
 state, the status and the session id. Never the token, the task text, or
@@ -1063,7 +1077,7 @@ the pasted URL as typed.
 | 429: an hourly fire limit | `rejected` | When it resets, from `Retry-After` in seconds (an HTTP date is ignored). agentd doesn't retry |
 | 500 or 503, a timeout after sending, a reset connection, a redirect, or a 200 agentd can't read | `unknown` | It may have started; check claude.ai/code before running it again |
 | agentd stops during the request | `unknown`, by the pass | The same, once, in the manager bot's DM |
-| The store fails after a 200 | stays `sending`, then `unknown`, then `fired` if the late record lands | The link at once, from memory |
+| The store fails after a 200 | stays `sending`, then `unknown` | The link at once, from memory; the reply already carried it |
 | The reply can't be delivered | as recorded | Nothing at once; `cloud list` shows the outcome and link |
 | The account is out of usage, its GitHub connection is gone, its subscription is paused, or the task fails in the cloud | Not documented: `fired`, or a `rejected` the endpoint may give | What the endpoint answers; otherwise the session shows it |
 
@@ -1780,8 +1794,9 @@ Direct calls would also need our own agent loop.
   read of one session would allow a `cloud status`. Self-hosted environments
   document a Stop-hook read-back that a Team or Enterprise deployment could
   use later.
-- Each repository needs its own routine, made by hand at claude.ai. If a documented API ever creates routines or sessions with a
-  narrow token, the setup could shrink to one command.
+- Each repository needs its own routine, made by hand at claude.ai. If a
+  documented API ever creates routines or sessions with a narrow token, the
+  setup could shrink to one command.
 - Terms interpretation for requester-pays in shared channels is a design
   judgment, not legal advice. Larger communities should confirm with Anthropic.
 - Slack Connect payloads. Which team an outside member's message names, in
