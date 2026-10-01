@@ -103,7 +103,7 @@ async fn a_try_is_claimed_once_until_its_retry_is_due_and_finished_once() {
     );
     assert_eq!(
         store.due_channel_id_changes(at(1_300), 10).await.unwrap(),
-        [changed.clone()]
+        std::slice::from_ref(&changed)
     );
     assert!(claim(1_300).await.unwrap());
     assert!(store.finish_channel_id_change(&changed).await.unwrap());
@@ -126,7 +126,10 @@ async fn changes_received_long_ago_are_given_up() {
         store.record_channel_id_change(changed, 16).await.unwrap();
     }
     assert_eq!(
-        store.drop_stale_channel_id_changes(at(5_000)).await.unwrap(),
+        store
+            .drop_stale_channel_id_changes(at(5_000))
+            .await
+            .unwrap(),
         [old]
     );
     assert_eq!(

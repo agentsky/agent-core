@@ -95,9 +95,7 @@ pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use sessions::{RESETS_AT_ONCE, Session, SessionKind, ThreadSession};
 pub use skills::{AgentSkill, NewSkill, SkillState};
-pub use slack_apps::{
-    InstallReminder, ManifestUpdate, NewSlackApp, SlackAppBinding, SlackAppKeys,
-};
+pub use slack_apps::{InstallReminder, ManifestUpdate, NewSlackApp, SlackAppBinding, SlackAppKeys};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };

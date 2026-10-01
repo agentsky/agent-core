@@ -1514,13 +1514,17 @@ mod apps {
                 "authorization",
                 format!("Bearer {CONFIG_TOKEN}").as_str(),
             ))
-            .respond_with(ok(json!({"app_id": "A0AGENT01", "permissions_updated": false})))
+            .respond_with(ok(
+                json!({"app_id": "A0AGENT01", "permissions_updated": false}),
+            ))
             .up_to_n_times(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/api/apps.manifest.update"))
-            .respond_with(ok(json!({"app_id": "A0AGENT01", "permissions_updated": true})))
+            .respond_with(ok(
+                json!({"app_id": "A0AGENT01", "permissions_updated": true}),
+            ))
             .mount(&server)
             .await;
         let manifest = manifest();
@@ -1547,10 +1551,19 @@ mod apps {
         assert!(!String::from_utf8_lossy(&sent[0].body).contains(CONFIG_TOKEN));
 
         for (code, expected) in [
-            ("app_not_found", SurfaceError::NotFound("app_not_found".into())),
-            ("invalid_app_id", SurfaceError::NotFound("invalid_app_id".into())),
+            (
+                "app_not_found",
+                SurfaceError::NotFound("app_not_found".into()),
+            ),
+            (
+                "invalid_app_id",
+                SurfaceError::NotFound("invalid_app_id".into()),
+            ),
             ("token_expired", SurfaceError::Unauthorized),
-            ("internal_error", SurfaceError::Transport("internal_error".into())),
+            (
+                "internal_error",
+                SurfaceError::Transport("internal_error".into()),
+            ),
         ] {
             let refused = MockServer::start().await;
             Mock::given(method("POST"))

@@ -2598,7 +2598,8 @@ impl SlackHarness {
 async fn a_failed_manifest_update_is_retried_and_me_says_so() {
     let h = slack_harness().await;
     let alice = h.linked("U0HUMAN01").await;
-    h.installed_before_the_manifest_version(alice, "scribe").await;
+    h.installed_before_the_manifest_version(alice, "scribe")
+        .await;
     let agents = h.slack_agents();
     let start = OffsetDateTime::now_utc();
     assert_eq!(agents.pass_at(|| start).await.unwrap().updated, 0);
@@ -2635,7 +2636,9 @@ async fn a_failed_manifest_update_is_retried_and_me_says_so() {
         .await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.update"))
-        .respond_with(ok(json!({"app_id": "A0SCRIBE1", "permissions_updated": false})))
+        .respond_with(ok(
+            json!({"app_id": "A0SCRIBE1", "permissions_updated": false}),
+        ))
         .mount(&h.slack)
         .await;
     assert_eq!(agents.pass_at(|| start).await.unwrap().updated, 0);

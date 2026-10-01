@@ -9068,7 +9068,9 @@ minute) once `CHANNEL_CHANGE_RETRY` (five minutes) has passed, at most
 a throttled warning. The same change recorded again, under another
 `event_id` or after the ingress's dedup window, finds its row and is left
 to the try already under way. A binding that isn't active, or whose bot
-token is gone, settles its changes as unconfirmed.
+token is gone, settles its changes as unconfirmed. Only a store that
+refuses the one write that records the change still loses it, with a
+warning.
 
 ### What confirms a new id
 
@@ -9141,9 +9143,12 @@ leased, whose owner has a usable configuration token in the workspace.
 Each is claimed for `MANIFEST_UPDATE_LEASE` (an hour) with a conditional
 `UPDATE`, so a failure is tried again an hour later, and a success raises
 the version, which only ever goes up, and clears the lease. Registering a
-configuration token (`put_slack_config_token`, now one transaction) clears
-the leases of that member's bindings in that workspace, so their apps are
-updated within a minute. A token Slack refuses is marked broken as at
+configuration token (`put_slack_config_token`) then clears the leases of
+that member's bindings in that workspace, so their apps are updated within
+a minute. That is a second statement after the token's write, not one
+transaction with it: a failed write rolls back nothing T30's retries of
+the write rely on (its tests fail writes with a trigger that counts them),
+and a lease left behind only delays an update by its hour. A token Slack refuses is marked broken as at
 creation, and no update is tried until a new one is registered. An app
 Slack says is gone is tried again hourly like any failure; deleting the
 agent is its owner's call.

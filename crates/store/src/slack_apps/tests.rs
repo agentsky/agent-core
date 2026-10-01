@@ -509,7 +509,10 @@ async fn a_manifest_update_is_claimed_once_until_its_lease_ends() {
 
     assert!(store.set_manifest_version(binding, CURRENT).await.unwrap());
     assert!(!store.set_manifest_version(binding, CURRENT).await.unwrap());
-    assert!(!store.set_manifest_version(binding, 1).await.unwrap(), "never back");
+    assert!(
+        !store.set_manifest_version(binding, 1).await.unwrap(),
+        "never back"
+    );
     assert!(due_bindings(&store, 100_000 - 1).await.is_empty());
     assert!(!claim(100_000 - 1).await.unwrap());
     assert!(

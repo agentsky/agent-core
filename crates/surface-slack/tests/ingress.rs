@@ -2245,10 +2245,16 @@ async fn a_channel_id_change_without_two_channel_ids_is_refused_and_writes_nothi
         |body| body["event"]["new_channel_id"] = "c0lower01".into(),
         |body| body["event"]["new_channel_id"] = format!("C{}", "A".repeat(MAX_ID_TAIL + 1)).into(),
         |body| {
-            body["event"].as_object_mut().unwrap().remove("old_channel_id");
+            body["event"]
+                .as_object_mut()
+                .unwrap()
+                .remove("old_channel_id");
         },
         |body| {
-            body["event"].as_object_mut().unwrap().remove("new_channel_id");
+            body["event"]
+                .as_object_mut()
+                .unwrap()
+                .remove("new_channel_id");
         },
         |body| body["event"]["new_channel_id"] = serde_json::Value::Null,
         |body| body["event"]["old_channel_id"] = 7.into(),
@@ -2263,4 +2269,3 @@ async fn a_channel_id_change_without_two_channel_ids_is_refused_and_writes_nothi
     harness.assert_nothing_delivered().await;
     assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
 }
-

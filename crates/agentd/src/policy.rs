@@ -583,7 +583,10 @@ mod tests {
             allow: vec![room("C0PRIVAT1"), member("bob"), room("C0OTHER01")],
             deny: vec![room("G0PRIVAT1"), member("carol")],
         };
-        assert!(permits(&rules, "dave", "C0PRIVAT1"), "allowed on the new id");
+        assert!(
+            permits(&rules, "dave", "C0PRIVAT1"),
+            "allowed on the new id"
+        );
         assert!(rules.move_room(&old, &new));
         assert_eq!(
             rules.deny,

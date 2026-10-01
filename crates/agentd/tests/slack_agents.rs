@@ -2551,6 +2551,9 @@ async fn a_shared_private_channel_keeps_the_agents_rules() {
                 .contains(&format!("channel={}", fixtures::PRIVATE_CHANNEL_SHARED))
         })
         .collect();
-    assert!(!asked.is_empty(), "the new id is confirmed with the agent's token");
+    assert!(
+        !asked.is_empty(),
+        "the new id is confirmed with the agent's token"
+    );
     turned.stop().await;
 }

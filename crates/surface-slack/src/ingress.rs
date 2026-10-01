@@ -195,8 +195,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use core_types::{
-    BindingId, ConvRef, ConversationId, MemberId, MemberKey, Sender, SurfaceKind, TeamId,
-    Throttle, UserId,
+    BindingId, ConvRef, ConversationId, MemberId, MemberKey, Sender, SurfaceKind, TeamId, Throttle,
+    UserId,
 };
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use secrecy::SecretString;
@@ -1410,9 +1410,8 @@ fn check_callback(head: &EnvelopeHead, body: &[u8]) -> Result<Callback, &'static
         Some("channel_id_changed") => {
             let ChannelChangeHead { event: ids } = serde_json::from_slice(body)
                 .map_err(|_| "a channel_id_changed event whose channel ids aren't strings")?;
-            ids.ids().ok_or(
-                "a channel_id_changed event without both channel ids shaped like Slack's",
-            )?;
+            ids.ids()
+                .ok_or("a channel_id_changed event without both channel ids shaped like Slack's")?;
             return Ok(Callback::ChannelIdChanged);
         }
         _ => return Ok(Callback::Other),

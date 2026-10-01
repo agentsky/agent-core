@@ -21,8 +21,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::commands::intake::CommandIntake;
-use crate::policy::Rules;
 use crate::commands::{Commands, Replies};
+use crate::policy::Rules;
 use crate::slack::manager::ManagerIdentity;
 use crate::slack::{Inbound, Messages};
 use crate::telemetry::tests::global_logs;
@@ -768,7 +768,9 @@ async fn channel_info(h: &Harness, token: &str, channel: &str, answer: ResponseT
 }
 
 fn member_of(channel: &str) -> ResponseTemplate {
-    ok(json!({"channel": {"id": channel, "is_channel": true, "is_private": true, "is_member": true}}))
+    ok(
+        json!({"channel": {"id": channel, "is_channel": true, "is_private": true, "is_member": true}}),
+    )
 }
 
 /// A second agent of the owner, `name`, whose app made from the manifest
@@ -842,9 +844,7 @@ async fn agent_of(h: &Harness, binding: BindingId) -> core_types::AgentId {
 
 async fn set_rules(h: &Harness, binding: BindingId, rules: &Rules) {
     h.store
-        .update_agent_settings(agent_of(h, binding).await, |settings| {
-            rules.write(settings)
-        })
+        .update_agent_settings(agent_of(h, binding).await, |settings| rules.write(settings))
         .await
         .unwrap();
 }
@@ -988,7 +988,11 @@ async fn a_change_slack_cant_confirm_yet_is_tried_again_until_it_is_given_up() {
     );
     let pass = h.agents.pass_at(|| start).await.unwrap();
     assert_eq!(pass.settled, 0);
-    assert_eq!(h.calls("conversations.info").await, 1, "not due before its retry");
+    assert_eq!(
+        h.calls("conversations.info").await,
+        1,
+        "not due before its retry"
+    );
     assert_eq!(rules_of(&h, helper).await, denying(OLD));
 
     h.slack.reset().await;
@@ -1066,7 +1070,11 @@ async fn too_many_waiting_changes_drop_the_next_and_an_inactive_binding_settles_
     let bindings = deleted_bindings(&h).await;
     assert_eq!(bindings[0].id, helper);
     let pass = h.agents.pass().await.unwrap();
-    assert_eq!(pass.settled, waiting.len(), "an inactive binding's are dropped");
+    assert_eq!(
+        pass.settled,
+        waiting.len(),
+        "an inactive binding's are dropped"
+    );
     assert_eq!(h.calls("conversations.info").await, 0);
 }
 
@@ -1173,11 +1181,19 @@ async fn sessions_stay_under_the_old_id() {
         Some(old.id)
     );
     assert_eq!(
-        h.store.thread_spend(&thread(OLD), now).await.unwrap().tokens_today,
+        h.store
+            .thread_spend(&thread(OLD), now)
+            .await
+            .unwrap()
+            .tokens_today,
         15
     );
     assert_eq!(
-        h.store.thread_spend(&thread(NEW), now).await.unwrap().tokens_today,
+        h.store
+            .thread_spend(&thread(NEW), now)
+            .await
+            .unwrap()
+            .tokens_today,
         0
     );
     assert!(
@@ -1283,7 +1299,11 @@ async fn a_manifest_update_slack_refuses_the_token_for_marks_it_broken_and_odd_a
             "chat:write",
             "https://agentd.example.com/slack/oauth/callback",
         ),
-        ("moved", scopes.as_str(), "https://agentd.example.com/elsewhere"),
+        (
+            "moved",
+            scopes.as_str(),
+            "https://agentd.example.com/elsewhere",
+        ),
     ] {
         let store::AgentCreation::Created(_, odd) = h
             .store

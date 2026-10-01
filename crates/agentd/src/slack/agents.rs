@@ -864,7 +864,12 @@ impl SlackAgents {
             }
         }
         for due in store
-            .due_manifest_updates(self.team(), MANIFEST_VERSION, now(), MANIFEST_UPDATES_PER_PASS)
+            .due_manifest_updates(
+                self.team(),
+                MANIFEST_VERSION,
+                now(),
+                MANIFEST_UPDATES_PER_PASS,
+            )
             .await?
         {
             match self.update_manifest(&due, &now).await {
@@ -902,7 +907,10 @@ impl SlackAgents {
             name: &due.agent_name,
             public_url,
             binding,
-            public_posting: due.scopes.split(',').any(|scope| scope == PUBLIC_POSTING_SCOPE),
+            public_posting: due
+                .scopes
+                .split(',')
+                .any(|scope| scope == PUBLIC_POSTING_SCOPE),
         };
         if app.scopes().join(",") != due.scopes {
             tracing::warn!(%binding, "an app asks for other scopes than this agentd would; not updating its manifest, which would take a new install");
@@ -916,10 +924,11 @@ impl SlackAgents {
         };
         let updated = tokio::time::timeout(
             APP_CALL_TIMEOUT,
-            self.inner
-                .manager
-                .client()
-                .update_app(&token.token, &due.app_id, &agent_manifest(&app)),
+            self.inner.manager.client().update_app(
+                &token.token,
+                &due.app_id,
+                &agent_manifest(&app),
+            ),
         )
         .await
         .unwrap_or_else(|_| {
@@ -933,7 +942,9 @@ impl SlackAgents {
                 if permissions_updated {
                     tracing::warn!(%binding, app_id, "Slack says updating an app's manifest changed its permissions, which take a new install");
                 }
-                store.set_manifest_version(binding, MANIFEST_VERSION).await?;
+                store
+                    .set_manifest_version(binding, MANIFEST_VERSION)
+                    .await?;
                 tracing::info!(%binding, app_id, version = MANIFEST_VERSION, "updated an agent's Slack app to the current manifest");
                 Ok(true)
             }
