@@ -18,6 +18,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use core_types::{ConversationId, MemberKey, SurfaceError, SurfaceKind, TeamId, UserId};
 use secrecy::SecretString;
+use surface_slack::normalize::is_workspace_id;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory, WebApi};
 
 use crate::commands::{ManagerBot, OpenDm};
@@ -48,10 +49,21 @@ impl ManagerIdentity {
     /// # Errors
     ///
     /// The [`SurfaceError`] of `auth.test` or `bots.info`, or
-    /// [`SurfaceError::Api`] if the token isn't a bot token or its bot
-    /// belongs to no app.
+    /// [`SurfaceError::Api`] if `auth.test` names no workspace (`T…`), as
+    /// for an organization-wide install, if the token isn't a bot token,
+    /// or if its bot belongs to no app.
     pub async fn look_up(api: &WebApi) -> Result<Self, SurfaceError> {
         let auth = api.auth_test().await?;
+        if !is_workspace_id(auth.team_id.as_str()) {
+            let named = if auth.is_enterprise_install {
+                "an organization-wide install (is_enterprise_install)"
+            } else {
+                "no workspace"
+            };
+            return Err(SurfaceError::Api(format!(
+                "auth.test named {named}: install the manager app in each workspace, not organization-wide"
+            )));
+        }
         let bot_id = auth.bot_id.filter(|id| !id.is_empty()).ok_or_else(|| {
             SurfaceError::Api("the token is not a bot token (auth.test named no bot)".into())
         })?;

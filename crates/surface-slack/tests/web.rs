@@ -163,26 +163,32 @@ async fn auth_test_reads_its_organization_leniently_and_users_info_its_team_fail
 }
 
 #[tokio::test]
-async fn an_auth_test_naming_no_workspace_doesnt_read() {
-    for team in [
-        json!(""),
-        json!("E0HOMEORG"),
-        json!("t0team001"),
-        json!(7),
-        json!(null),
+async fn auth_test_reads_its_team_and_install_as_slack_wrote_them() {
+    for (fields, team, org_wide) in [
+        (
+            json!({"team_id": "E0HOMEORG", "is_enterprise_install": true}),
+            "E0HOMEORG",
+            true,
+        ),
+        (
+            json!({"team_id": "t0team001", "is_enterprise_install": "yes"}),
+            "t0team001",
+            false,
+        ),
+        (json!({"team_id": ""}), "", false),
+        (json!({"team_id": 7}), "", false),
+        (json!({"team_id": null}), "", false),
+        (json!({}), "", false),
     ] {
         let (server, api) = server().await;
-        mount(
-            &server,
-            "auth.test",
-            ok(json!({"team_id": team, "user_id": "U0BOT0001"})),
-        )
-        .await;
-        let err = api.auth_test().await.unwrap_err();
-        assert!(
-            matches!(&err, SurfaceError::Transport(detail) if detail.starts_with("unexpected response from auth.test")),
-            "{team}: {err:?}"
-        );
+        let mut answer = json!({"user_id": "U0BOT0001"});
+        for (key, value) in fields.as_object().unwrap() {
+            answer[key] = value.clone();
+        }
+        mount(&server, "auth.test", ok(answer)).await;
+        let auth = api.auth_test().await.unwrap();
+        assert_eq!(auth.team_id.as_str(), team, "{fields}");
+        assert_eq!(auth.is_enterprise_install, org_wide, "{fields}");
     }
 }
 

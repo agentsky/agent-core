@@ -8796,9 +8796,17 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   workspace, so a locked-out Grid member whose `team_id` names a sibling
   workspace or the organization is warned of too; an outside
   organization's member lists only its own workspaces and still isn't.
-- `AuthTest::team_id` must be shaped like a workspace's id (`T…`), or the
-  answer doesn't read and agentd doesn't start: an empty workspace id
-  would have matched the empty id an unreadable `team_id` reads as.
+- agentd doesn't start unless `auth.test`'s `team_id` is shaped like a
+  workspace's id (`T…`): an empty workspace id would have matched the
+  empty id an unreadable `team_id` reads as. `AuthTest` reads `team_id` as
+  Slack wrote it, with `is_enterprise_install`, and
+  `ManagerIdentity::look_up` refuses with a `SurfaceError::Api` saying the
+  manager app must be installed in each workspace, not organization-wide,
+  naming `is_enterprise_install` when Slack set it (review round 5: a
+  refusal while reading the answer read as a transport error, pointing
+  the operator at the network). An organization-wide install never
+  worked: every request names a member's workspace, never the
+  organization.
 
 ### Left as they are
 

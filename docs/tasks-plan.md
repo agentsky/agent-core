@@ -3481,9 +3481,11 @@ Deliverables:
   - `Interaction` gains `sender_team`, the payload's `user.team_id` when it
     has one.
 - `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`
-  leniently, an `E…` id or `None`, and refuses an answer whose `team_id`
-  isn't a workspace's (`T…`), so startup fails. `User` keeps `team_id`,
-  failing closed: a value not shaped like a team id names no team.
+  leniently, an `E…` id or `None`, and `is_enterprise_install`; agentd's
+  manager refuses to start when its `team_id` isn't a workspace's (`T…`),
+  saying the app must be installed in each workspace. `User` keeps
+  `team_id`, failing closed: a value not shaped like a team id names no
+  team.
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.
@@ -3955,11 +3957,12 @@ Deliverables:
   with the fields of item 7 in both `users.info` and `users.list`. Above
   all, whether `enterprise_user.teams` lists every workspace of the
   organization the member belongs to, the home one included, and whether
-  `auth.test` gives the organization's `enterprise_id`. Deactivate such a
-  member whose `team_id` names another workspace, and record the
-  `user_change` the manager app gets: whether its `enterprise_user.teams`
-  still lists the home workspace, which `member_who_left` needs to delete
-  their configuration token.
+  `auth.test` gives the organization's `enterprise_id`, and what it gives
+  as `team_id` and `is_enterprise_install` for the manager app installed
+  in the workspace. Deactivate such a member whose `team_id` names another
+  workspace, and record the `user_change` the manager app gets: whether
+  its `enterprise_user.teams` still lists the home workspace, which
+  `member_who_left` needs to delete their configuration token.
 - The redacted payloads as fixture files under
   `crates/testkit/fixtures/slack/connect/`, for `testkit::slack` to load in
   place of T36a's made-up ones. Whichever of T36a and T36e lands second
