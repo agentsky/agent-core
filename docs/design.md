@@ -42,8 +42,9 @@ so that one small Rust process serves many agents.
   or where explicitly permitted[^terms].
 - Calling the Messages API directly with subscription OAuth tokens. Subscription
   tokens are only used by the Claude Code CLI.
-- Slack Connect in the first releases. The design keeps it possible (see
-  [Slack Connect](#slack-connect)).
+- Slack Connect before milestone 7. [Slack Connect](#slack-connect) designs
+  it, with members of other organizations kept out unless the community and
+  each agent's owner let them in.
 - Microsoft Teams, Discord, email.
 
 ## Terminology
@@ -51,6 +52,7 @@ so that one small Rust process serves many agents.
 | Term | Meaning |
 | --- | --- |
 | Member | A person in a chat workspace. Identified by `(surface, team, user)`. |
+| Outside member | A Slack member from another organization, seen in a Slack Connect conversation. Keyed by the workspace agentd serves, with their own organization alongside (see [Slack Connect](#slack-connect)). |
 | Linked member | A member who completed the Claude PKCE login. |
 | Agent | A persona (prompt, skills, sandbox image) owned by one member, with one chat identity per surface binding. |
 | Surface | A chat platform adapter: Slack or Rocket.Chat. |
@@ -469,7 +471,10 @@ notice, and they come before the credential, so nobody is offered a link
 prompt or a community-key turn they would then be refused. A refusal of the
 requester themselves (a ban, or the agent's deny rules) is told to them
 privately by the manager bot, at most once a day per agent, and never in the
-thread; the others are one line in the thread. If the router
+thread; the others are one line in the thread. A member of another
+organization in a Slack Connect channel is ignored unless the community
+lists their organization, and is told any refusal in the thread instead
+(see [Audience](#audience)). If the router
 can't tell whether the requester is banned, or what the agent's rules are, it
 refuses rather than assume the requester is allowed. The router's rustdoc
 gives the full order.
@@ -500,7 +505,8 @@ gives the full order.
   Skills are mounted read-only.
 - The surface and team are part of every lookup key, so the same agent on two
   platforms, or in a Slack Connect channel seen from two workspaces, keeps
-  separate sessions.
+  separate sessions. On Slack the team is the workspace agentd serves, in a
+  shared channel too, whoever posted (see [Slack Connect](#slack-connect)).
 
 ### Lifecycle
 
@@ -717,7 +723,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent create <name> [persona]` | Linked member | Create the identity and a default persona |
 | `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
 | `/agent skill add <name> [source]`, `/agent skill confirm <name> <skill>`, `/agent skill rm <name> <skill>` | Owner | Manage skills; confirm the hosts a skill asks for |
-| `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where |
+| `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where. `outside` stands for members of other organizations the community lists (see [Audience](#audience)) |
 | `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits; `off` removes one |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
 | `/agent sessions <name>`, `/agent reset <name> [here]` | Owner | Inspect or reset sessions |
@@ -1095,12 +1101,14 @@ erDiagram
         text platform_ref
         uuid turn_id
         uuid requester_id
+        text requester_outside
         int hop
         uuid consent_id
     }
     CONSENT {
         uuid id
         uuid requester_id
+        text requester_outside
         int hop
         text task_text
         text state
@@ -1110,6 +1118,7 @@ erDiagram
         text reply_thread_root
         uuid origin_session_id
         uuid private_session_id
+        text shared_with
         timestamp expires_at
     }
     CLOUD_ROUTINE {
@@ -1194,7 +1203,10 @@ Identities are `(surface, team_id, user_id)`, never a bare user id. One member
 can link several surface identities to one Claude login. `MESSAGE_REF` records
 the turn and requester of every message agentd posts, which is what
 agent-to-agent attribution reads. The Slack columns of `AGENT_BINDING` are empty
-for Rocket.Chat bindings.
+for Rocket.Chat bindings. On Slack, `team_id` is the workspace agentd serves,
+for members of other organizations too, whose own organization is kept as
+`requester_outside` wherever a requester is (see
+[Who is outside](#who-is-outside)).
 
 ## Security
 
@@ -1226,6 +1238,12 @@ for Rocket.Chat bindings.
 | agentd's Claude links gain control of members' cloud sessions | Links keep `user:profile user:inference`, and configuration refuses a `user:sessions:` scope, so no turn can reach a member's cloud sessions through the credential proxy. |
 | An owner's pasted URL steers agentd's request and token to another host | Only the routine id is kept; the URL is rebuilt from `[cloud] base_url`, and redirects aren't followed. |
 | A retried fire starts two sessions | A fire is recorded before it is sent and never retried. An outcome agentd can't know is reported as such, and the owner decides. |
+| Members of another organization in a Slack Connect channel use agents, spend the community key or bill a member | Closed by default. agentd hears them only when `[slack_connect] teams` lists their organization, and an agent answers them only when its owner allows `outside`; `everyone` and room allows don't. Their turns run on the community key or not at all, never on a link or the owner's credential, and bans, deny rules and every cap apply. Hops and private tasks on their behalf need their own switches. |
+| A message's organization is forged or misread, so an outside member passes as a home one | The event decides nothing: the sender's organization comes from Slack's copy, read back with the agent's token, from `user_team` then `team`, and is home only when each names the home workspace. A copy naming neither is outside unless the conversation, read again, isn't shared. The workspace an event came through is its installation's, `authorizations[0].team_id`, never the envelope's `team_id`, and an installation elsewhere is dropped. Envelope fields an owner could sign (`is_ext_shared_channel`, `context_team_id`) are never read. |
+| An outside member runs commands, decides a consent card, links an account, or is DMed | Slack routes `/agent` only for home members, and agentd also drops any command, manager DM or interaction whose sender is outside before the intake. agentd never DMs an outside member; refusals reach them as one generic line in the thread, at most once a day, which names no ban. |
+| The owner's private work reaches another organization | Cards go to the owner's home DM, never the thread. A card says whether the thread is shared with other organizations, and which, read fresh; a result is withheld if the thread was shared with another organization after approval. A private task asked for by an outside member needs `[slack_connect] private_tasks`, and the card says so. An owner-side `agentctl post` into another externally shared conversation is refused. |
+| Other organizations read what agents say in a shared channel, and their members' messages steer turns | Accepted, as for any channel member: a home member who asks in a shared channel chooses that audience, and outside text reaches only public-side turns, whose sandboxes hold no owner secrets. |
+| A private channel shared with another organization gets a new id, so the rules naming it stop applying | Agent apps subscribe to `channel_id_changed`. The new id is confirmed with `conversations.info`, and the receiving agent's room rules move to it; nothing else moves, so no other channel's sessions can be joined to this one. |
 
 ## Crate layout
 
@@ -1292,16 +1310,343 @@ shared code. A `MockSurface` drives the shared core in tests.
    agentd drops.
 6. Owner-initiated cloud hand-off for long PR work, through a routine's API
    trigger rather than `claude --cloud` (see [Cloud hand-off](#cloud-hand-off)).
-7. Slack Connect.
+7. Slack Connect, with members of other organizations kept out by default
+   (see [Slack Connect](#slack-connect)).
 
 ## Slack Connect
 
-Every organization in a Slack Connect channel must be on a paid plan[^slack-connect].
-Bot users work there, but a custom app's slash commands only work for its own
-organization. The design keeps this possible by keying identities and sessions by
-team, deduplicating events that arrive once per workspace, and routing consent
-cards to the owner's own workspace. The audience policy is configurable rather
-than refusing external members as qm-core does by default.
+In a Slack Connect conversation, members of other organizations post next to
+the community's own. Every organization in one must be on a paid
+plan[^slack-connect]. agentd serves one Slack workspace, the one its manager
+app is installed in (T30), and installs every agent's app there and only
+there (T31). So Slack Connect changes no app, binding, session key or
+deduplication key. It changes who agentd may be talking to, and where the
+owner's work may be read.
+
+The design keeps members of other organizations out by default, and lets them
+in on terms the community and each agent's owner set:
+
+- The community lists the organizations whose members agentd hears at all.
+  Anyone else is ignored, as an unaddressed message is.
+- Each agent's owner opts the agent in. `/agent allow <name> outside` admits
+  members of listed organizations; `everyone` and `#room` don't.
+- Their turns run on the community API key or not at all. They can't link a
+  Claude account, and never use the owner's credential or anyone else's.
+- They have no commands, agentd never DMs them, and they never see or decide a
+  consent card. Hand-offs and private tasks on their behalf are off unless the
+  community turns them on.
+- A private task's result, or a post from the owner's side, reaches another
+  organization only when the owner could see it would.
+
+qm-core refuses external members by default. agentd does too, but lets the
+community and owners open the door.
+
+### Terms
+
+- **Home workspace**: the workspace agentd serves, the manager app's.
+- **Outside member**: a Slack member whose own workspace or organization
+  isn't the home workspace, seen in a shared channel, a shared group DM or a
+  DM with an agent's bot. Their organization is the team id Slack names for
+  them (`T…`, or `E…` for an Enterprise Grid organization), or unknown.
+- **Shared conversation**: one whose `conversations.info` has `is_shared`.
+  It is **externally shared** when it also has `is_ext_shared`, which is when
+  another organization is in it; `is_org_shared` alone means only other
+  workspaces of the home workspace's own Enterprise Grid organization
+  are[^slack-conversation].
+
+### What Slack documents
+
+| Question | What Slack documents | Used |
+| --- | --- | --- |
+| How many times is an event delivered when an app is installed on several sides of a shared channel? | Once. "If you're using the Events API, you don't have to worry about duplicate messages from shared channels"[^slack-connect-apps]. In an Enterprise organization, "only one event will be sent regardless of how many workspaces" the app is installed on[^slack-enterprise] | Yes |
+| Whose installation does an event name? | `authorizations` is one installation of the app that can see the event (`enterprise_id`, `team_id`, `user_id`, `is_bot`, `is_enterprise_install`). It is truncated to one; the full list comes from `apps.event.authorizations.list` with the event's `event_context`. `authed_users` and `authed_teams` were deprecated for it in 2021[^slack-events][^slack-authed][^slack-event-authorizations] | `authorizations[0].team_id` |
+| Does `event_id` differ per workspace? | `event_id` is "a unique identifier for this specific event, globally unique across all workspaces"[^slack-events][^slack-api-specs]. Whether two apps that both receive one message see the same `event_id` isn't said | No change needed (below) |
+| What is the envelope's `team_id`? | "The unique identifier of the workspace where the event occurred"[^slack-api-specs]. `context_team_id` is "the perspective through which the viewing user is accessing the channel", and `is_ext_shared_channel` says the event happened in an externally shared channel[^slack-events] | Not read |
+| Which team sent a message? | A message's `team` is the team it originated from. When it differs from the installation's, the sender is external[^slack-connect-apps]. Bolt reads a sender's team from `event.user_team`, then `event.team`, and notes `user_team` can be an `E…` organization id[^bolt-actor] | Yes |
+| Are user ids unique across organizations? | User ids are globally unique: the same person in two unrelated workspaces has two ids, and an Enterprise organization gives each person one id, `U…` or `W…`[^slack-users-identity][^slack-enterprise]. The user object's `team_id` names the person's own workspace, and `is_stranger` marks an external member the app shares no channel with[^slack-user-object] | Yes |
+| What does `conversations.info` say about sharing? | `is_shared`, `is_ext_shared`, `is_org_shared`, `connected_team_ids` ("connected external team IDs"), `shared_team_ids` and `context_team_id`[^slack-conversation] | `is_shared`, `is_ext_shared`, `connected_team_ids` |
+| Can external members use an app's slash commands? | No. Slash commands and message shortcuts work only for members of the team that installed the app; external members see what the app posts in the channel[^slack-connect-apps] | Yes |
+| Can a bot DM an external member? | Only one it shares a channel with[^slack-connect-apps] | Not used |
+| Does a channel's id change when it is shared? | A private channel's id changes from `G…` to `C…` the moment a share is initiated, even if it never completes; apps that can see the channel get `channel_id_changed` with `old_channel_id` and `new_channel_id`[^slack-channel-id] | Yes |
+| Can an agent's app be installed in another organization? | A new app installs only in its own workspace until public distribution is turned on in its settings[^slack-distribution] | Yes |
+
+Slack's developer site wasn't reachable from where this was written, as for
+T28 to T31. The rows above were read on 2026-10-01 from search excerpts of
+those pages, the `event_id` and `team_id` wording also from Slack's own event
+wrapper schema, and the field names from Slack's SDKs: the Java SDK's
+`EventsApiPayload`, `Authorization`, `MessageEvent`, `Conversation` and
+`BlockActionPayload`, and the Node SDK's event types, which give `user_team`
+and `source_team` "when the user who mentioned this bot is in a different
+workspace/org". See [Verified and assumed](#verified-and-assumed-1).
+
+### Who is outside
+
+agentd keys every Slack identity by the home workspace and the user id,
+`(slack, home team, user)`, an outside member's too. User ids are globally
+unique, so that names one person, and the keys members already type stay
+right: `/agent admin ban @user` and `/agent deny <name> @user` parse
+`<@U…>` with the command's workspace, the home one, and match the outside
+member they name. The person's own organization is a separate field,
+`outside`, on the event and on the turn's requester.
+
+- **The workspace an event came through** is its installation's,
+  `authorizations[0].team_id`, or the envelope's `team_id` when an event has
+  no `authorizations`. Not the envelope's `team_id` alone: in an externally
+  shared channel Slack's SDK fixtures show it holding the team of whoever
+  acted[^bolt-actor]. Until T36a, the ingress takes the team from the
+  envelope (T28) and agentd drops requests from another workspace (T30,
+  T31), so it drops most outside members' messages by accident. T36a makes
+  that a rule.
+- **A conversation's team** is that workspace, so sessions, volumes, thread
+  caps and message references in a shared channel are keyed as in any other
+  of the home workspace's channels.
+- **The sender's organization** comes from Slack's copy of the message
+  ([below](#confirmation)): its `user_team`, else its `team`. The sender
+  is home only when every one of them present is the home workspace;
+  otherwise `outside` holds the first present. A message whose copy names
+  neither is home only when `conversations.info`, read again for it, says
+  the conversation isn't shared at all; otherwise it is outside with no
+  known organization, which no list admits. A team that isn't shaped like
+  Slack's (`T` or `E` and up to 64 letters or digits) makes the message
+  malformed, and it is dropped.
+- **Enterprise Grid.** Equality is exact. A member of another workspace in
+  the home workspace's own organization is outside unless their workspace
+  or organization is listed, and so is anyone Slack names only by an `E…`
+  id, the home organization's included. Both manifests keep
+  `org_deploy_enabled: false`, so no installation is organization-wide.
+- **Requesters carry it.** A turn's `Requester` has `outside`, and so does
+  every record that keeps a requester: `MESSAGE_REF` (so a hop inherits
+  it), `CONSENT` and the `agentctl` token's turn.
+- **Names.** Outside members aren't in the home workspace's `users.list`, so
+  `@Name` for one stays text when rendered, as an ambiguous name does
+  (T29). The turn's message names an outside sender by user id and
+  organization, and its surface hints say the requester is outside and has
+  no commands, so the agent doesn't tell them to run one.
+
+### Delivery and deduplication
+
+Slack delivers an event once to each app that may see it, however many
+workspaces the app is installed in[^slack-connect-apps][^slack-enterprise].
+Each agent's app is installed only in the home workspace: an app is
+installable only in its own workspace until its owner turns public
+distribution on[^slack-distribution], and T31's callback stores no install
+anywhere else. So each binding gets one delivery of a message in a shared
+channel, and Slack's retries of it, with the same `event_id`.
+
+T28's deduplication needs no change. It is per binding: a kept message by
+`(channel, ts)` under `slack:<binding>:message`, other events by `event_id`
+under `slack:<binding>`. Neither key depends on how many workspaces the
+channel spans, nor on whether two apps see one message under the same
+`event_id`, which Slack doesn't say. N agents in a shared channel get N
+copies, one per binding, as in any channel, and each agent routes its own.
+A hop runs once whichever copy of an agent's post arrives first, by T34's
+claim on the agent and the post.
+
+An owner who turns public distribution on and installs their agent's app in
+another workspace too gets events whose `authorizations[0]` may name that
+installation. agentd drops those, so the agent may miss messages in channels
+both installations see. That only fails closed, and only for that owner's
+agent. `apps.event.authorizations.list` would show every installation, but it
+takes an app-level token[^slack-event-authorizations], which no API creates,
+as for Socket Mode[^slack-socket], so agentd doesn't call it.
+
+### Confirmation
+
+Nothing an event says decides anything (T31): the owner of an agent's app
+holds its signing secret and can sign any body, an envelope's
+`is_ext_shared_channel`, `context_team_id` and `user_team` included. agentd
+never reads the first two, and decides on the sender's team only as Slack's
+copy gives it:
+
+- `Surface::confirm` reads the message back with the binding's bot token, as
+  today, and normalizes the copy with the ingress's rules, now including
+  `user_team` and `team`.
+- `conversations.info`, already cached per channel for an hour for the
+  conversation's kind, also gives its sharing: not shared, shared only within
+  the organization, or externally shared with `connected_team_ids`. The places
+  where sharing guards the owner's work read it again instead of using the
+  cache: a consent card, a private result's delivery and an owner-side post.
+- An event whose `outside` differs from the copy's routes differently, so it
+  is dropped without a word, like any other mismatch.
+
+### Audience
+
+Two layers decide whether an outside member's message runs a turn, and both
+are closed by default:
+
+1. **The community.** `[slack_connect] teams` lists the organizations whose
+   members agentd hears, by the id Slack names them with (`T…` or `E…`),
+   which agentd logs when it ignores one. A message from anyone else outside
+   is ignored without a word, as an unaddressed message is. An empty list,
+   the default, hears no one from outside.
+2. **The agent's owner.** `/agent allow <name> outside` admits members of
+   listed organizations to that agent. `everyone` means everyone in the
+   community and a `#room` allow means its home members, so neither admits
+   an outside member; a member rule naming one (`@user`) does. Deny wins as
+   before: `deny <name> outside`, or a deny of the room, of `everyone` or of
+   the member, refuses them.
+
+Past those, every T27 rule applies as to anyone: a ban by a community admin
+(`/agent admin ban @user`), a paused agent, the agent's daily cap (outside
+members' turns count toward it), the per-thread caps and the hop cap.
+
+| What an outside member's message can do | When |
+| --- | --- |
+| Run a turn: a mention, a reply to the agent, a group DM or a DM with the agent's bot | Their organization is listed, the agent allows `outside`, and a community key is set |
+| Be the requester of a hop: an agent's post that mentions another agent, or `agentctl ask-agent` | All of the above for each agent, and `[slack_connect] hand_off = true` |
+| Ask for a private task, through a turn they requested | All of the above, and `[slack_connect] private_tasks = true`; the owner's card says who asked |
+| Run `/agent`, DM the manager bot, decide a card | Never |
+| Link a Claude account, own an agent, administer the community | Never |
+
+A refusal is told as one line where the message was posted, at most once per
+thread per agent per day, claimed in `limit_notices` like a capped agent's
+notice. It reads the same whatever the reason (a ban, the agent's rules, no
+community key, a hop or task the community doesn't allow), since agentd can't
+tell an outside member privately, and a ban shouldn't be announced where
+others read it. An ignored message, from an organization not listed, gets
+nothing.
+
+### Paying for outside members' turns
+
+A turn runs on the credential of whoever caused it. An outside member can't
+link one:
+
+- Linking takes a place only the member and the manager bot read
+  ([Account linking](#account-linking)). Outside members have none: Slack
+  routes the manager app's `/agent` only for home members, and the manager
+  bot joins no channels, so it shares none with them and can't DM
+  them[^slack-connect-apps].
+- Linking an outside identity to a home member would need a command from
+  that outside identity, which agentd can't receive.
+
+So an outside member's turn runs on the community API key when one is set,
+and is refused otherwise. It never runs on the agent owner's credential, nor
+on any linked member's, whoever else is in the thread. A subscription can't
+be made available to others[^terms]; the community key is an API key, and
+listing an organization in `[slack_connect] teams` is the community's choice
+to spend it on that organization's members. The meter records their usage
+against their identity, as for an unlinked member (T27).
+
+Refusing them outright is the default: an empty list. A community that
+wants outside members to pay for themselves can't have it from this design;
+see [Deferred work](tasks-plan.md#deferred-work).
+
+### Commands
+
+- Slack routes an app's slash commands only for the team that installed
+  it[^slack-connect-apps], so outside members can't run `/agent`. agentd
+  doesn't rely on that alone: before the command intake, it drops a slash
+  command, a DM to the manager app or an interaction whose sender is
+  outside. An interaction's sender is outside when its `user.team_id` isn't
+  the home workspace, and a DM's by the sender's team as above.
+- Home members' `/agent` in a shared channel works as anywhere: its text
+  isn't posted, and its reply is ephemeral, for them alone. `allow` and
+  `deny` may name a shared channel as a `#room`.
+- agentd never DMs an outside member, from the manager bot or an agent's:
+  no link prompt, relink notice, usage-limit notice (T26) or personal
+  refusal. What they would have been told privately, they are told in the
+  thread as above, or not at all.
+
+### Consent cards and private tasks
+
+- A card goes where T33 sends it: to the owner's identity on the thread's
+  surface and team, through the manager bot's DM. The thread's team is
+  always the home workspace, and an owner is always a home member (agents
+  are made with `/agent create`), so a card goes to the owner's own home
+  workspace and never into the thread or through an agent's app. A click on
+  one from an outside member is dropped before the intake.
+- `agentctl private` in a turn whose requester is outside is refused unless
+  `[slack_connect] private_tasks` is on. Then the card says the request is
+  from outside and names their organization, as well as the requester's
+  handle.
+- Whatever the requester, the card says whether the thread's conversation is
+  externally shared and with which organizations, read fresh with the agent's
+  bot token, since the result will be posted there. The consent records what
+  the card showed.
+- Before a result is posted, agentd reads the conversation's sharing again.
+  If the card showed it as not externally shared and it now is, or it now
+  names an organization the card's list didn't, the result is withheld. A
+  card that could name no organizations, because Slack gave no list, said
+  so, and the owner consented to that. When a result is withheld, the
+  thread is told in one line that it wasn't posted because the
+  conversation's sharing changed, the owner is told in the manager bot's
+  DM, and the task's work is deleted as on every other path. Declined and
+  expired outcomes are posted as before; they say nothing private.
+- `agentctl post --to` from the owner's own DM with the agent, the one turn
+  on the owner's side that can post (a private task can only `attach`),
+  into another conversation that is externally shared is refused, so a turn
+  holding the owner's memory and `shared/` doesn't post into another
+  organization's view unasked. The owner can post there themselves.
+
+### Hand-offs
+
+agentd delivers its agents' mentions itself (T34), in shared channels too. A
+hop inherits its requester's `outside`, so the mentioned agent must admit the
+requester as above, and `[slack_connect] hand_off` must be on. `ask-agent` in
+a turn whose requester is outside is refused unless it is on. Other
+organizations' bots are bots agentd doesn't manage, and are ignored.
+
+### Shared channels that change id
+
+Sharing a private channel gives it a new id[^slack-channel-id]. Everything
+agentd keys by conversation would stop matching, and a rule that names the
+channel would stop applying: a `deny <name> #room` would stop denying at the
+moment the channel gains outside members. So agent apps subscribe to
+`channel_id_changed`, and when one arrives agentd:
+
+1. Confirms the new id with `conversations.info` on that binding's token: the
+   channel exists, its id is exactly the new one, and the bot is a member.
+2. Rewrites that agent's own `#room` rules from the old id to the new, in one
+   transaction.
+
+Only the receiving agent's rules move: each agent whose bot is in the channel
+gets its own event, and an owner who forges one can change only rules they
+could set anyway. Nothing else moves. Sessions, volumes, thread counts and
+message references stay under the old id, unused, and threads in the
+channel start new sessions: agentd can't confirm that the old id and the new
+are one channel, and moving another channel's sessions into this one would
+show its threads to this channel's turns. An agent whose bot isn't in the
+channel gets no event and keeps a rule naming the old id. It can't hear the
+channel until it is invited, and its owner must then set the rule again.
+
+Existing agents' apps get the subscription through `apps.manifest.update`
+with their owner's configuration token (T30) when it works, and keep missing
+it until then; `/agent me` says so.
+
+### Verified and assumed
+
+Verified, from Slack's documentation on 2026-10-01 as described under
+[What Slack documents](#what-slack-documents): the rows of that table.
+Verified from Slack's SDK sources: the field names agentd reads, and that
+Bolt takes an event's installation from `authorizations[0]` and the actor's
+team from `user_team`, then `team`.
+
+Assumed, until T36e's live check:
+
+- That an outside member's message names their own team in `team` or
+  `user_team`, both in the event and in the copy `conversations.history` and
+  `conversations.replies` return. If the copy names neither, agentd treats
+  them as outside with no known organization, so Slack Connect is closed
+  rather than open. If it named the home workspace instead, an outside
+  member would pass as a home one, with a home member's reach; that is the
+  first thing T36e checks.
+- That every event to an agent's app has the home workspace in
+  `authorizations[0].team_id`.
+- That a home member's message in a shared channel names the home workspace,
+  not an `E…` organization id. If not, home members are refused there.
+- That an outside member's user id is the same in both organizations, in
+  `<@U…>` mentions too.
+- That `conversations.info` gives a bot token `is_ext_shared` and
+  `connected_team_ids`. Without `connected_team_ids`, a card says the thread
+  is shared with other organizations without naming them, and a result is
+  withheld only when the thread wasn't externally shared at approval and is
+  now.
+- That outside members can't DM the manager app, and whether they can DM an
+  agent's bot. agentd drops the first and admits the second only as above.
+- That `channel_id_changed` reaches an agent's app subscribed to it, and that
+  `apps.manifest.update` adds the subscription without a reinstall.
+- That files outside members attach download with the home bot token. One
+  that doesn't fails as any other download does.
 
 ## Alternatives considered
 
@@ -1370,6 +1715,21 @@ Direct calls would also need our own agent loop.
   narrow token, the setup could shrink to one command.
 - Terms interpretation for requester-pays in shared channels is a design
   judgment, not legal advice. Larger communities should confirm with Anthropic.
+- Slack Connect payloads. Which team an outside member's message names, in
+  the event and in the copy agentd reads back, and what `authorizations` and
+  `conversations.info` hold for a bot token, are read from documentation
+  excerpts and SDK fixtures, not seen. Most wrong guesses keep outside
+  members out, or refuse home members in shared channels. The one that
+  would let someone in is Slack naming an outside sender with the home
+  workspace's team, which T36e checks first (see
+  [Verified and assumed](#verified-and-assumed-1)).
+- An Enterprise Grid home workspace. Members of its own organization's other
+  workspaces are outside unless listed, and Slack may name a sender only by
+  the organization's `E…` id. Whether that reads right in practice needs a
+  Grid workspace to try.
+- Outside members paying for themselves. They can't link, since agentd has no
+  private place to talk to them. A manager app installed in their own
+  workspace, or a link through a Slack Connect DM, could change that.
 
 ## References
 
@@ -1397,6 +1757,18 @@ Direct calls would also need our own agent loop.
 [^slack-manifest]: [Configuring apps with app manifests](https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/).
 [^slack-socket]: [Using Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/). App-level tokens are generated in the app settings UI.
 [^slack-connect]: [Slack Connect guide](https://slack.com/help/articles/115004151203-Slack-Connect-guide--Work-with-external-organizations).
+[^slack-connect-apps]: [Understanding Slack Connect](https://docs.slack.dev/apis/slack-connect/): no duplicate events from shared channels with the Events API, a message's `team` against the installation's `team_id`, slash commands and message shortcuts only for the installing team, and bots DMing external members only with a shared channel in common. Read through search excerpts on 2026-10-01; the site wasn't reachable.
+[^slack-events]: [The Events API](https://docs.slack.dev/apis/events-api/): the event wrapper's `event_id` ("globally unique across all workspaces"), `event_context`, `authorizations`, `is_ext_shared_channel` and `context_team_id`. Read through search excerpts on 2026-10-01.
+[^slack-api-specs]: Slack's event wrapper schema, [`slackapi/slack-api-specs` `events-api/slack_common_event_wrapper_schema.json`](https://github.com/slackapi/slack-api-specs/blob/master/events-api/slack_common_event_wrapper_schema.json): `team_id` is "the unique identifier of the workspace where the event occurred", `event_id` "globally unique across all workspaces". Read on 2026-10-01. The schema predates `authorizations`.
+[^slack-authed]: [Events API truncate authed users](https://docs.slack.dev/changelog/2020-09-15-events-api-truncate-authed-users/): `authed_users` and `authed_teams` deprecated for one `authorizations` entry, from 2021-02-24. Read through search excerpts on 2026-10-01.
+[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with an app-level token holding `authorizations:read`. Read through search excerpts on 2026-10-01.
+[^slack-enterprise]: [Developing apps for Enterprise orgs](https://docs.slack.dev/enterprise/developing-for-enterprise-orgs/): one event per shared-channel event whatever the number of installations, `is_enterprise_install`, one global `U…` or `W…` user id per person. Read through search excerpts on 2026-10-01.
+[^slack-conversation]: [Conversation object](https://docs.slack.dev/reference/objects/conversation-object/) and [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/): `is_shared`, `is_ext_shared`, `is_org_shared`, `connected_team_ids`, `shared_team_ids` and `context_team_id`. Read through search excerpts on 2026-10-01; the field names match the Java SDK's `Conversation`.
+[^slack-users-identity]: [`users.identity`](https://docs.slack.dev/reference/methods/users.identity/): user ids are globally unique, and the same user on two unrelated workspaces has two. Read through search excerpts on 2026-10-01.
+[^slack-user-object]: [User object](https://docs.slack.dev/reference/objects/user-object/): `team_id`, `is_stranger` and `enterprise_user`. Read through search excerpts on 2026-10-01.
+[^slack-channel-id]: [`channel_id_changed` event](https://docs.slack.dev/reference/events/channel_id_changed/): a private channel's `G…` id becomes a `C…` id when a share is initiated, sent only to apps that can see the channel. Read through search excerpts on 2026-10-01.
+[^slack-distribution]: [App lifecycle and distribution](https://docs.slack.dev/app-management/distribution/): a new app installs only in its own workspace until public distribution is activated. Read through search excerpts on 2026-10-01.
+[^bolt-actor]: `slackapi/bolt-python` [`slack_bolt/request/internals.py`](https://github.com/slackapi/bolt-python/blob/main/slack_bolt/request/internals.py) (`extract_team_id`, `extract_actor_team_id`) and its `tests/slack_bolt/request/test_internals.py` fixtures, read on 2026-10-01: events in shared channels take the installation from `authorizations[0]`, the actor's team from `event.user_team` then `event.team`, which "can be an enterprise_id", and the fixtures put the actor's team in the envelope's `team_id`.
 [^rc-stream]: [stream-room-messages](https://developer.rocket.chat/api/realtime-api/subscriptions/stream-room-messages).
 [^rc-create]: [Rocket.Chat Create User](https://developer.rocket.chat/reference/api/rest-api/endpoints/user-management/users-endpoints/create-user).
 [^rc-perms]: [Rocket.Chat permissions](https://docs.rocket.chat/docs/permissions): `api-bypass-rate-limit` defaults to the admin, bot and app roles.
