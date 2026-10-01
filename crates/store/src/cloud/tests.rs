@@ -589,6 +589,36 @@ async fn a_member_past_the_hourly_handoff_cap_records_nothing() {
 }
 
 #[tokio::test]
+async fn concurrent_handoffs_never_pass_the_hourly_cap_together() {
+    let dir = TempDir::new();
+    let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "r", "trig_1", "sk", 10).await;
+    let per_hour = 5;
+    for n in 0..per_hour - 1 {
+        assert!(matches!(
+            begin_capped(&store, ada, "r", "trig_1", per_hour, 100 + i64::from(n)).await,
+            CloudBegun::Begun(_)
+        ));
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        tasks.spawn(async move { begin_capped(&store, ada, "r", "trig_1", per_hour, 200).await });
+    }
+    let mut begun = 0;
+    while let Some(outcome) = tasks.join_next().await {
+        match outcome.unwrap() {
+            CloudBegun::Begun(_) => begun += 1,
+            CloudBegun::TooMany => {}
+            CloudBegun::RoutineGone => panic!("the routine is there"),
+        }
+    }
+    assert_eq!(begun, 1, "one place was left");
+    assert_eq!(handoffs_held(&store).await, i64::from(per_hour));
+}
+
+#[tokio::test]
 async fn a_handoff_whose_routine_is_gone_records_nothing() {
     let store = memory_store().await;
     let ada = member(&store, "ada").await;

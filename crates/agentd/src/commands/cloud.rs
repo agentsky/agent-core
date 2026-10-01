@@ -290,7 +290,7 @@ impl Commands {
                 ));
             }
             Ok(CloudBegun::TooMany) => {
-                tracing::info!(%member, routine = routine.routine_id.as_str(), "refused a cloud hand-off past the hourly cap");
+                tracing::debug!(%member, routine = routine.routine_id.as_str(), "refused a cloud hand-off past the hourly cap");
                 return Ok(format!(
                     "Nothing was started: you've asked for {} in the last hour, the most I start \
                      for one member. Try again later.",
@@ -667,11 +667,12 @@ fn outcome_reply(label: &RoutineLabel, outcome: &CloudOutcome, origin: &Origin) 
     }
 }
 
-/// `secs` in whole minutes, at least one, or in whole hours past an hour.
+/// `secs` in whole minutes, at least one, up to two hours, and in hours,
+/// to the nearest, past that.
 fn wait_in_words(secs: u32) -> String {
     match secs.div_ceil(60) {
         0 | 1 => "a minute".to_owned(),
-        n @ 2..=60 => format!("{n} minutes"),
-        n => format!("{} hours", n.div_ceil(60)),
+        n @ 2..=120 => format!("{n} minutes"),
+        _ => format!("{} hours", secs.saturating_add(1800) / 3600),
     }
 }

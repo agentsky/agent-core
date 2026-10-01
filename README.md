@@ -301,13 +301,13 @@ reach the session as Slack showed them (`@name`, `#name`, the link's URL, or
 `label (url)` when a link's label isn't its URL), and a broadcast, a user group
 or a date is refused. In a direct message to the manager app Slack sends a
 mention without its name, so a mention is refused there too: write the name as
-plain text, or use the slash command. A task is refused when it holds characters that don't
-show (control or invisible characters), a line indented more than 32 columns,
-a run of blanks wider than 16 columns, more than two blank lines in a row, or
-more than 4 combining marks stacked on a character, so pasted code may need
-reflowing; and when it is empty or over 65,536 bytes. A member may ask for
-`[cloud] handoffs_per_hour` hand-offs an hour (default 10), whatever came of
-them; one more is refused before anything is recorded or sent.
+plain text, or use the slash command. A task is refused when it holds
+characters that don't show (control or invisible characters), a line indented
+more than 32 columns, a run of blanks wider than 16 columns, more than two
+blank lines in a row, or more than 4 combining marks stacked on a character, so
+pasted code may need reflowing; and when it is empty or over 65,536 bytes. A
+member may ask for `[cloud] handoffs_per_hour` hand-offs an hour (default 10),
+whatever came of them; one more is refused before anything is recorded or sent.
 
 After the link, agentd does nothing more: it can't read the session (the
 routine's token has no read access), so the member follows it at the link,

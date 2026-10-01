@@ -22,6 +22,7 @@ use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::intake::CommandIntake;
+use super::relink::RelinkNotifier;
 use super::slack::{consent_action, dm_command, member_who_left, slash_command};
 use super::slack_tokens::{
     ConfigTokenRotator, NOTICE_LEASE, NOTICE_MAX_ATTEMPTS, ROTATION_LEASE, RotationPass,
@@ -1327,6 +1328,17 @@ pub(super) async fn file_store() -> (Store, String, std::path::PathBuf) {
     (store, url, dir)
 }
 
+/// Runs `statements` on the database at `url`, beside the store.
+pub(super) async fn sql(url: &str, statements: &str) {
+    use sqlx::Connection as _;
+    let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(statements.to_owned()))
+        .execute(&mut db)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+}
+
 const FAIL_TOKEN_WRITES: &str = "\
     CREATE TABLE token_write_failures (remaining INTEGER NOT NULL); \
     INSERT INTO token_write_failures VALUES (0); \
@@ -2514,4 +2526,40 @@ async fn slack_command_text_is_decoded_once_before_it_is_parsed() {
         .unwrap();
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
     assert_eq!(row.persona, "x <y> &amp; z");
+}
+
+#[tokio::test]
+async fn a_relink_notice_the_store_fails_on_leaves_the_others() {
+    let (store, url, dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    let grace = h.linked("U0HUMAN02").await;
+    for member in [alice, grace] {
+        let generation = h
+            .store
+            .get_claude_link(member)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation;
+        h.store
+            .mark_claude_link_broken(member, generation, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+    }
+    sql(
+        &url,
+        &format!(
+            "CREATE TRIGGER no_claim BEFORE UPDATE OF relink_attempts ON claude_links \
+             WHEN OLD.member_id = '{alice}' BEGIN SELECT RAISE(FAIL, 'injected'); END;"
+        ),
+    )
+    .await;
+    let notifier = RelinkNotifier::new(h.store.clone(), h.commands.replies().clone());
+    assert!(notifier.send_pending().await.is_err());
+    assert_eq!(h.posts().await.len(), 1, "grace was told");
+    sql(&url, "DROP TRIGGER no_claim;").await;
+    assert_eq!(notifier.send_pending().await.unwrap(), 1);
+    assert_eq!(h.posts().await.len(), 2, "alice was told after");
+    let _ = std::fs::remove_dir_all(dir);
 }

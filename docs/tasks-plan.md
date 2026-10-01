@@ -3408,7 +3408,7 @@ the row, and `finish_cloud_handoff` says when the row is gone. On Slack,
 replies name `/agent cloud add` even in a DM. `logout` unlinks before it
 deletes routines, so a failed `logout` sent again still says to revoke
 tokens. One row's store failure no longer ends a notifier pass or skips its
-purge.
+purge; review round 2 gave the relink notifier the same shape.
 
 ## Phase 7: Slack Connect (design milestone 7)
 
