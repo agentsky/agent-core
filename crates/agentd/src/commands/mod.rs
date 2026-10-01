@@ -765,6 +765,7 @@ impl Commands {
         let (unlinked, tokens, cloud) = match self.member(key).await? {
             Some(member) => {
                 self.inner.store.invalidate_pending_logins(member).await?;
+                let unlinked = self.inner.auth.logout(member).await?;
                 let tokens = self.inner.store.delete_slack_config_tokens(member).await?;
                 if tokens > 0 {
                     tracing::info!(%member, tokens, "deleted Slack configuration tokens at logout");
@@ -778,7 +779,7 @@ impl Commands {
                         "deleted cloud routines and hand-offs at logout"
                     );
                 }
-                (self.inner.auth.logout(member).await?, tokens, cloud)
+                (unlinked, tokens, cloud)
             }
             None => (false, 0, CloudDeleted::default()),
         };
@@ -796,14 +797,21 @@ impl Commands {
                  change apps as you.",
             );
         }
+        let forgot: Vec<String> = [
+            (cloud.routines > 0).then(|| cloud::routines_counted(cloud.routines)),
+            (cloud.handoffs > 0).then(|| cloud::handoffs_counted(cloud.handoffs)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !forgot.is_empty() {
+            reply.push_str(&format!(" I also forgot your {}.", forgot.join(" and ")));
+        }
         if cloud.routines > 0 {
-            reply.push_str(&format!(
-                " I also forgot your {} and {} hand-offs. I can't revoke a routine's token: \
-                 revoke each with **Revoke** on the routine's API trigger at \
-                 claude.ai/code/routines.",
-                cloud::routines_counted(cloud.routines),
-                if cloud.routines == 1 { "its" } else { "their" },
-            ));
+            reply.push_str(
+                " I can't revoke a routine's token: revoke each with **Revoke** on the \
+                 routine's API trigger at claude.ai/code/routines.",
+            );
         }
         Ok(reply)
     }

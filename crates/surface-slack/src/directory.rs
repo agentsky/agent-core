@@ -100,7 +100,7 @@ pub struct TeamDirectory {
     bots: Mutex<Bots>,
     conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
     home_answers: Mutex<HomeAnswers>,
-    lookup_warnings: Throttle,
+    lookup_notes: Throttle<&'static str>,
     grid_noticed: AtomicBool,
 }
 
@@ -240,7 +240,7 @@ impl TeamDirectory {
             bots: Mutex::default(),
             conv_infos: Mutex::new(HashMap::new()),
             home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
-            lookup_warnings: Throttle::new(LOOKUP_WARNING_INTERVAL),
+            lookup_notes: Throttle::new(LOOKUP_WARNING_INTERVAL),
             grid_noticed: AtomicBool::new(false),
         }
     }
@@ -404,7 +404,8 @@ impl TeamDirectory {
     ///
     /// # Errors
     ///
-    /// Any other `bots.info` error. Nothing is cached then.
+    /// Any other `bots.info` error, and [`SurfaceError::Api`] for an answer
+    /// about another bot. Nothing is cached then.
     pub async fn bot_user(&self, api: &WebApi, bot_id: &str) -> Result<Option<UserId>> {
         if !is_bot_id(bot_id) {
             return Ok(None);
@@ -413,8 +414,13 @@ impl TeamDirectory {
             return Ok(known);
         }
         let user = match api.bot_info(bot_id).await {
+            Ok(bot) if bot.id != bot_id => {
+                return Err(SurfaceError::Api(
+                    "bots.info answered for another bot".into(),
+                ));
+            }
             Ok(bot) => bot.user_id.filter(|user| is_user_id(user.as_str())),
-            Err(SurfaceError::NotFound(_)) => None,
+            Err(SurfaceError::NotFound(code)) if code == "bot_not_found" => None,
             Err(err) => return Err(err),
         };
         self.lock_bots().insert(bot_id, user.clone());
@@ -426,10 +432,11 @@ impl TeamDirectory {
     /// read less than [`HOME_ANSWER_TTL`] ago, has them as [`is_home`]
     /// reads it, or else when `users.info` through `api` answers so;
     /// `Ok(false)` when `users.info` answers otherwise, or says
-    /// `user_not_found` or `user_not_visible`. `users.info`'s answers are
-    /// kept for
-    /// [`HOME_ANSWER_TTL`], at most [`MAX_HOME_ANSWERS`], the oldest
-    /// dropped first, and one dropped is asked again, never taken as home.
+    /// `user_not_found` or `user_not_visible`, the latter noted at info
+    /// level at most once per [`LOOKUP_WARNING_INTERVAL`]. `users.info`'s
+    /// answers are kept for [`HOME_ANSWER_TTL`], at most
+    /// [`MAX_HOME_ANSWERS`], the oldest dropped first, and one dropped is
+    /// asked again, never taken as home.
     /// Pass a client made with [`WebApi::without_waiting`] for a caller
     /// that mustn't wait for a used-up quota.
     ///
@@ -464,6 +471,9 @@ impl TeamDirectory {
             Err(SurfaceError::NotFound(code) | SurfaceError::Api(code))
                 if NOT_HOME_CODES.contains(&code.as_str()) =>
             {
+                if code == "user_not_visible" {
+                    self.not_visible();
+                }
                 false
             }
             Err(err) => {
@@ -498,21 +508,49 @@ impl TeamDirectory {
         if passing {
             return;
         }
-        if let Some(quiet) = self.lookup_warnings.record((), std::time::Instant::now()) {
+        if let Some(quiet) = self
+            .lookup_notes
+            .record("failed", std::time::Instant::now())
+        {
             tracing::warn!(team = %self.team, error = %err, failed_since_last_warning = quiet, "couldn't ask Slack whether a user is home; refusing whoever was asked about");
         }
     }
 
-    /// Warns, once, when Slack describes `user` as a member of an Enterprise
-    /// Grid organization while `auth.test` named none for the workspace:
-    /// then no member's answer names only home, and everyone is refused.
+    /// Notes a `users.info` that said `user_not_visible`, at most once per
+    /// [`LOOKUP_WARNING_INTERVAL`]: an ordinary answer for an outsider, but
+    /// one that, given for everyone, would refuse every member unlogged.
+    fn not_visible(&self) {
+        if let Some(quiet) = self
+            .lookup_notes
+            .record("user_not_visible", std::time::Instant::now())
+        {
+            tracing::info!(team = %self.team, not_visible_since_last_note = quiet, "Slack won't show a user to the manager app (user_not_visible); refusing them");
+        }
+    }
+
+    /// Warns, once, when Slack describes `user`, whose own `team_id` is the
+    /// workspace or whose `enterprise_user.teams` lists it, as a member of
+    /// an Enterprise Grid organization while `auth.test` named none for the
+    /// workspace: then no member's answer names only home, and everyone is
+    /// refused. A member of another organization on Grid lists only that
+    /// organization's workspaces, and is passed over.
     fn notice_grid(&self, user: &User) {
         let grid = user
             .enterprise_user
             .as_ref()
             .and_then(|grid| grid.enterprise_id.as_deref())
             .is_some_and(is_enterprise_id);
-        if self.home_org.is_none() && grid && !self.grid_noticed.swap(true, Ordering::Relaxed) {
+        let ours = user.team_id.as_ref() == Some(&self.team)
+            || user
+                .enterprise_user
+                .as_ref()
+                .and_then(|grid| grid.teams.as_deref())
+                .is_some_and(|teams| teams.contains(&self.team));
+        if self.home_org.is_none()
+            && ours
+            && grid
+            && !self.grid_noticed.swap(true, Ordering::Relaxed)
+        {
             tracing::warn!(team = %self.team, "Slack names an Enterprise Grid organization for the workspace's members, but auth.test gave the workspace none; every member is refused until agentd restarts with one");
         }
     }
@@ -1134,6 +1172,17 @@ mod tests {
         assert!(
             !home(&sibling),
             "an unreadable list of workspaces lists none"
+        );
+
+        let misshapen: User = serde_json::from_value(serde_json::json!({
+            "id": "U1",
+            "team_id": "t3",
+            "enterprise_user": {"enterprise_id": "E1", "teams": ["T1", "t3"]},
+        }))
+        .unwrap();
+        assert!(
+            !home(&misshapen),
+            "a team_id that doesn't read names no team, so fails the rule"
         );
 
         let mut theirs = ada;

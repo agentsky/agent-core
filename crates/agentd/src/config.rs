@@ -124,6 +124,8 @@ pub const DEFAULT_CLOUD_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// The default for `cloud.retention_days`.
 pub const DEFAULT_CLOUD_RETENTION_DAYS: u64 = 90;
+/// The default for `cloud.handoffs_per_hour`.
+pub const DEFAULT_CLOUD_HANDOFFS_PER_HOUR: u32 = 10;
 
 /// agentd's configuration, validated.
 #[derive(Debug)]
@@ -597,6 +599,12 @@ pub struct CloudConfig {
     /// `retention_days`: how long hand-offs are kept after they were asked
     /// for, from 1 to 365, default [`DEFAULT_CLOUD_RETENTION_DAYS`].
     pub retention_days: u64,
+    /// `handoffs_per_hour`: how many `cloud run`s one member may ask for
+    /// in an hour, from 1 to 100, default
+    /// [`DEFAULT_CLOUD_HANDOFFS_PER_HOUR`]. Every one counts, whatever its
+    /// outcome, and one past the cap is refused before anything is written
+    /// or sent.
+    pub handoffs_per_hour: u32,
 }
 
 impl Default for CloudConfig {
@@ -607,6 +615,7 @@ impl Default for CloudConfig {
             timeout_secs: DEFAULT_CLOUD_TIMEOUT_SECS,
             connect_timeout_secs: DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS,
             retention_days: DEFAULT_CLOUD_RETENTION_DAYS,
+            handoffs_per_hour: DEFAULT_CLOUD_HANDOFFS_PER_HOUR,
         }
     }
 }
@@ -665,6 +674,9 @@ impl CloudConfig {
         }
         if !(1..=365).contains(&self.retention_days) {
             return Err(invalid("cloud.retention_days", "must be from 1 to 365"));
+        }
+        if !(1..=100).contains(&self.handoffs_per_hour) {
+            return Err(invalid("cloud.handoffs_per_hour", "must be from 1 to 100"));
         }
         Ok(())
     }
@@ -1722,6 +1734,8 @@ data_dir = "/nonexistent/agentd"
             ("connect_timeout_secs = 30", "cloud.connect_timeout_secs"),
             ("retention_days = 0", "cloud.retention_days"),
             ("retention_days = 366", "cloud.retention_days"),
+            ("handoffs_per_hour = 0", "cloud.handoffs_per_hour"),
+            ("handoffs_per_hour = 101", "cloud.handoffs_per_hour"),
         ] {
             let err = cloud_with(lines).unwrap_err();
             assert_eq!(err.key(), Some(key), "{lines}: {err}");
@@ -1731,7 +1745,7 @@ data_dir = "/nonexistent/agentd"
 
         let cloud = cloud_with(
             "beta = \"experimental-cc-routine-2027-01-01,other.beta_2\"\ntimeout_secs = 5\n\
-             connect_timeout_secs = 4\nretention_days = 365",
+             connect_timeout_secs = 4\nretention_days = 365\nhandoffs_per_hour = 100",
         )
         .unwrap()
         .cloud
@@ -1739,6 +1753,7 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(cloud.timeout(), Duration::from_secs(5));
         assert_eq!(cloud.connect_timeout(), Duration::from_secs(4));
         assert_eq!(cloud.retention(), Duration::from_secs(365 * 24 * 60 * 60));
+        assert_eq!(cloud.handoffs_per_hour, 100);
         let unchecked = CloudConfig {
             retention_days: u64::MAX,
             ..CloudConfig::default()

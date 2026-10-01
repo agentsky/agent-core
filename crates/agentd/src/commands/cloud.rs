@@ -26,8 +26,10 @@
 //! [`MAX_TASK_BYTES`] is refused. A routine
 //! registered for another origin than `[cloud] base_url`'s is refused
 //! before anything is written, and so its token goes nowhere else. The
-//! hand-off is then written `sending`, the routine fired once and the
-//! outcome recorded, and the reply says what came of it: the session's
+//! hand-off is then written `sending`, unless the member asked for
+//! `[cloud] handoffs_per_hour` within the last hour or the routine was
+//! removed or replaced meanwhile, the routine fired once and the outcome
+//! recorded, and the reply says what came of it: the session's
 //! link, or the failure table's line. A link the store failed to record is
 //! still in the reply.
 //!
@@ -43,8 +45,8 @@ use commands::{CloudCommand, Command, RoutineLabel, RoutineUrl};
 use core_types::{MemberId, MemberKey, RoutineToken};
 use secrecy::ExposeSecret as _;
 use store::{
-    CloudHandoff, CloudHandoffState, CloudOrigin, CloudOutcome, CloudRoutinePut, NewCloudHandoff,
-    NewCloudRoutine, StoreError,
+    CloudBegun, CloudFinished, CloudHandoff, CloudHandoffState, CloudOrigin, CloudOutcome,
+    CloudRoutinePut, NewCloudHandoff, NewCloudRoutine, StoreError,
 };
 use surface_slack::normalize::unescape;
 
@@ -177,7 +179,7 @@ impl Commands {
             CloudRoutinePut::RoutineTaken { label: taken } => format!(
                 "You registered that routine as `{taken}` already, so I didn't store it again. \
                  To give it a new token, send {}.",
-                origin.command(&format!("cloud add {taken} <url> <token>"))
+                add_command(origin, &format!("{taken} <url> <token>"))
             ),
             CloudRoutinePut::Full => format!(
                 "You have {}, the most one member may hold, so I didn't store this one. Remove \
@@ -246,7 +248,7 @@ impl Commands {
                 return Ok(format!(
                     "Routine `{label}`'s stored token can't be used any more, so I didn't start \
                      anything. Register it again with {}.",
-                    origin.command(&format!("cloud add {label} <url> <token>"))
+                    add_command(origin, &format!("{label} <url> <token>"))
                 ));
             }
             Err(err) => return Err(err.into()),
@@ -258,7 +260,7 @@ impl Commands {
                  this agentd fires now (`[cloud] base_url` changed), so I sent its token nowhere \
                  and started nothing. Register it again with {}, with the URL and a token from \
                  its API trigger.",
-                origin.command(&format!("cloud add {label} <url> <token>"))
+                add_command(origin, &format!("{label} <url> <token>"))
             ));
         }
         let begun = self
@@ -273,11 +275,28 @@ impl Commands {
                     origin: place,
                     task: &task,
                 },
+                fire.handoffs_per_hour(),
                 now(),
             )
             .await;
         let id = match begun {
-            Ok(id) => id,
+            Ok(CloudBegun::Begun(id)) => id,
+            Ok(CloudBegun::RoutineGone) => {
+                tracing::info!(%member, routine = routine.routine_id.as_str(), "a cloud routine was removed or replaced before its hand-off; fired nothing");
+                return Ok(format!(
+                    "Routine `{label}` was removed or replaced while I was starting it, so \
+                     nothing was started. {} shows your routines.",
+                    origin.command("cloud list")
+                ));
+            }
+            Ok(CloudBegun::TooMany) => {
+                tracing::info!(%member, routine = routine.routine_id.as_str(), "refused a cloud hand-off past the hourly cap");
+                return Ok(format!(
+                    "Nothing was started: you've asked for {} in the last hour, the most I start \
+                     for one member. Try again later.",
+                    handoffs_counted(u64::from(fire.handoffs_per_hour()))
+                ));
+            }
             Err(err) => {
                 tracing::warn!(%member, routine = routine.routine_id.as_str(), error = %err, "couldn't record a cloud hand-off; fired nothing");
                 return Ok(
@@ -294,11 +313,14 @@ impl Commands {
             .finish_cloud_handoff(id, &outcome, now())
             .await
         {
-            Ok(true) => {
+            Ok(CloudFinished::Recorded) => {
                 tracing::info!(%member, handoff = %id, routine = routine.routine_id.as_str(), state, "recorded a cloud hand-off")
             }
-            Ok(false) => {
+            Ok(CloudFinished::Kept) => {
                 tracing::warn!(%member, handoff = %id, routine = routine.routine_id.as_str(), state, "a cloud hand-off had its outcome already; kept that one")
+            }
+            Ok(CloudFinished::Gone) => {
+                tracing::warn!(%member, handoff = %id, routine = routine.routine_id.as_str(), state, "a cloud hand-off was deleted with the member's routines while its request was out; recorded nothing")
             }
             Err(err) => {
                 tracing::warn!(%member, handoff = %id, routine = routine.routine_id.as_str(), state, error = %err, "couldn't record a cloud hand-off's outcome")
@@ -316,7 +338,7 @@ impl Commands {
         let mut text = if routines.is_empty() {
             format!(
                 "You have no routines. Register one with {}.",
-                origin.command("cloud add <routine> <url> <token>")
+                add_command(origin, "<routine> <url> <token>")
             )
         } else {
             let mut text = "Your routines:".to_owned();
@@ -333,7 +355,7 @@ impl Commands {
                     text.push_str(&format!(
                         ", registered for another routine endpoint than this agentd fires: \
                          register it again with {}",
-                        origin.command(&format!("cloud add {} <url> <token>", routine.label))
+                        add_command(origin, &format!("{} <url> <token>", routine.label))
                     ));
                 }
             }
@@ -426,8 +448,28 @@ fn no_routine(label: &RoutineLabel, origin: &Origin) -> String {
     format!(
         "You have no routine `{label}`. {} shows yours, and {} registers one.",
         origin.command("cloud list"),
-        origin.command("cloud add <routine> <url> <token>")
+        add_command(origin, "<routine> <url> <token>")
     )
+}
+
+/// `n` hand-offs, in words.
+pub(super) fn handoffs_counted(n: u64) -> String {
+    if n == 1 {
+        "1 hand-off".to_owned()
+    } else {
+        format!("{n} hand-offs")
+    }
+}
+
+/// How the member registers a routine, with `args` after `cloud add`: on
+/// Slack always the slash command, whose text Slack keeps nowhere, since a
+/// direct message would keep the token in Slack's history.
+fn add_command(origin: &Origin, args: &str) -> String {
+    if origin.is_slack() {
+        format!("`/agent cloud add {args}`")
+    } else {
+        origin.command(&format!("cloud add {args}"))
+    }
 }
 
 /// `n` routines, in words.
@@ -558,7 +600,7 @@ fn is_link(url: &str) -> bool {
 
 /// The reply to a `cloud run` of routine `label` that led to `outcome`.
 fn outcome_reply(label: &RoutineLabel, outcome: &CloudOutcome, origin: &Origin) -> String {
-    let again = origin.command(&format!("cloud add {label} <url> <token>"));
+    let again = add_command(origin, &format!("{label} <url> <token>"));
     match outcome {
         CloudOutcome::Fired {
             session_id,
@@ -605,7 +647,7 @@ fn outcome_reply(label: &RoutineLabel, outcome: &CloudOutcome, origin: &Origin) 
             Some(429) => {
                 let wait = retry_after_secs.map_or_else(
                     || "Try again later".to_owned(),
-                    |secs| format!("It resets in about {}", minutes(secs)),
+                    |secs| format!("It resets in about {}", wait_in_words(secs)),
                 );
                 format!(
                     "Nothing was started: the routine or the account fired as often as an hour \
@@ -625,10 +667,11 @@ fn outcome_reply(label: &RoutineLabel, outcome: &CloudOutcome, origin: &Origin) 
     }
 }
 
-/// `secs` in whole minutes, at least one.
-fn minutes(secs: u32) -> String {
+/// `secs` in whole minutes, at least one, or in whole hours past an hour.
+fn wait_in_words(secs: u32) -> String {
     match secs.div_ceil(60) {
         0 | 1 => "a minute".to_owned(),
-        n => format!("{n} minutes"),
+        n @ 2..=60 => format!("{n} minutes"),
+        n => format!("{} hours", n.div_ceil(60)),
     }
 }

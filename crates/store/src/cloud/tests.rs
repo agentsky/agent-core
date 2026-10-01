@@ -68,21 +68,39 @@ async fn opened(store: &Store, member: MemberId, label: &str) -> Option<(Routine
 
 async fn begin(store: &Store, member: MemberId, task: &str, now: i64) -> CloudHandoffId {
     let routine_id = routine("trig_1");
+    let held = store
+        .cloud_routines(member)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|held| held.routine_id == routine_id);
+    let label = match held {
+        Some(held) => held.label,
+        None => {
+            put(store, member, "agent-core", "trig_1", "sk", now).await;
+            "agent-core".to_owned()
+        }
+    };
     let requested_by = member_key("ada");
-    store
+    let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member,
-                routine_label: "agent-core",
+                routine_label: &label,
                 routine_id: &routine_id,
                 requested_by: &requested_by,
                 origin: CloudOrigin::RocketChatDm,
                 task,
             },
+            u32::MAX,
             at(now),
         )
         .await
-        .unwrap()
+        .unwrap();
+    let CloudBegun::Begun(id) = begun else {
+        panic!("{begun:?}");
+    };
+    id
 }
 
 async fn handoff(store: &Store, member: MemberId, id: CloudHandoffId) -> CloudHandoff {
@@ -116,6 +134,7 @@ async fn finish(store: &Store, id: CloudHandoffId, outcome: &CloudOutcome, now: 
         .finish_cloud_handoff(id, outcome, at(now))
         .await
         .unwrap()
+        == CloudFinished::Recorded
 }
 
 async fn due(store: &Store, now: i64) -> Vec<CloudHandoffId> {
@@ -448,7 +467,8 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
     let ada = member(&store, "ada").await;
     let routine_id = routine("trig_7");
     let requested_by = slack_key("U7");
-    let id = store
+    put(&store, ada, "docs", "trig_7", "sk", 10).await;
+    let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member: ada,
@@ -458,10 +478,14 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
                 origin: CloudOrigin::SlackSlash,
                 task: "t",
             },
+            1,
             at(500),
         )
         .await
         .unwrap();
+    let CloudBegun::Begun(id) = begun else {
+        panic!("{begun:?}");
+    };
     assert_eq!(
         handoff(&store, ada, id).await,
         CloudHandoff {
@@ -483,6 +507,119 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
             notified_at: None,
             unknown_reason: None,
         }
+    );
+}
+
+async fn begin_capped(
+    store: &Store,
+    member: MemberId,
+    label: &str,
+    id: &str,
+    per_hour: u32,
+    now: i64,
+) -> CloudBegun {
+    store
+        .begin_cloud_handoff(
+            &NewCloudHandoff {
+                member,
+                routine_label: label,
+                routine_id: &routine(id),
+                requested_by: &member_key("ada"),
+                origin: CloudOrigin::RocketChatDm,
+                task: "t",
+            },
+            per_hour,
+            at(now),
+        )
+        .await
+        .unwrap()
+}
+
+async fn handoffs_held(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM cloud_handoffs")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_member_past_the_hourly_handoff_cap_records_nothing() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let bob = member(&store, "bob").await;
+    put(&store, ada, "r", "trig_1", "sk", 10).await;
+    put(&store, ada, "s", "trig_2", "sk", 10).await;
+    put(&store, bob, "r", "trig_1", "sk", 10).await;
+    let window = i64::try_from(CLOUD_HANDOFF_WINDOW.as_secs()).unwrap();
+    assert_eq!(window, 3_600);
+
+    assert!(matches!(
+        begin_capped(&store, ada, "r", "trig_1", 2, 1_000).await,
+        CloudBegun::Begun(_)
+    ));
+    assert!(matches!(
+        begin_capped(&store, ada, "s", "trig_2", 2, 1_001).await,
+        CloudBegun::Begun(_)
+    ));
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 2, 1_002).await,
+        CloudBegun::TooMany,
+        "the cap is the member's, over every routine"
+    );
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 2, 1_000 + window - 1).await,
+        CloudBegun::TooMany
+    );
+    assert_eq!(handoffs_held(&store).await, 2);
+    assert!(matches!(
+        begin_capped(&store, bob, "r", "trig_1", 2, 1_002).await,
+        CloudBegun::Begun(_)
+    ));
+    assert!(
+        matches!(
+            begin_capped(&store, ada, "r", "trig_1", 2, 1_000 + window).await,
+            CloudBegun::Begun(_)
+        ),
+        "a hand-off an hour old leaves the count"
+    );
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 0, 1_000).await,
+        CloudBegun::TooMany
+    );
+}
+
+#[tokio::test]
+async fn a_handoff_whose_routine_is_gone_records_nothing() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 10, 100).await,
+        CloudBegun::RoutineGone
+    );
+    put(&store, ada, "r", "trig_1", "sk", 10).await;
+    put(&store, ada, "r", "trig_2", "sk", 11).await;
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 10, 100).await,
+        CloudBegun::RoutineGone,
+        "replaced under its label"
+    );
+    let CloudBegun::Begun(id) = begin_capped(&store, ada, "r", "trig_2", 10, 100).await else {
+        panic!("not begun");
+    };
+    store.delete_cloud_routines_of(ada).await.unwrap();
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_2", 10, 101).await,
+        CloudBegun::RoutineGone,
+        "logged out"
+    );
+    assert_eq!(handoffs_held(&store).await, 0);
+    assert_eq!(
+        store
+            .finish_cloud_handoff(id, &fired("session_1"), at(102))
+            .await
+            .unwrap(),
+        CloudFinished::Gone,
+        "deleted while its request was out"
     );
 }
 
@@ -530,7 +667,7 @@ async fn routines_of_a_member_are_deleted_by_member_id() {
         )
         .await
         .unwrap();
-    put(&store, bob, "bobs", "trig_3", "c", 10).await;
+    put(&store, bob, "bobs", "trig_1", "c", 10).await;
     begin(&store, ada, "one", 100).await;
     begin(&store, ada, "two", 101).await;
     let bobs = begin(&store, bob, "three", 102).await;
@@ -694,7 +831,20 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
     assert_eq!(row.notified_at, Some(at(301)), "the notice's time is kept");
     assert!(!finish(&store, told, &fired("session_again"), 320).await);
 
-    assert!(!finish(&store, CloudHandoffId::new_v4(), &fired("session_9"), 1).await);
+    assert_eq!(
+        store
+            .finish_cloud_handoff(told, &fired("session_again"), at(330))
+            .await
+            .unwrap(),
+        CloudFinished::Kept
+    );
+    assert_eq!(
+        store
+            .finish_cloud_handoff(CloudHandoffId::new_v4(), &fired("session_9"), at(1))
+            .await
+            .unwrap(),
+        CloudFinished::Gone
+    );
 }
 
 #[tokio::test]

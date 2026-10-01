@@ -102,14 +102,15 @@ async fn auth_test_reads_the_bot_identity() {
 }
 
 #[tokio::test]
-async fn auth_test_and_users_info_read_their_teams_leniently() {
-    for (enterprise, read) in [
-        (json!("E0HOMEORG"), Some("E0HOMEORG")),
-        (json!(null), None),
-        (json!(""), None),
-        (json!("not an org"), None),
-        (json!(42), None),
-        (json!({"id": "E0HOMEORG"}), None),
+async fn auth_test_reads_its_organization_leniently_and_users_info_its_team_failing_closed() {
+    for (enterprise, read, user_team) in [
+        (json!("E0HOMEORG"), Some("E0HOMEORG"), Some("E0HOMEORG")),
+        (json!(null), None, None),
+        (json!(""), None, Some("")),
+        (json!("not an org"), None, Some("")),
+        (json!("t0team001"), None, Some("")),
+        (json!(42), None, Some("")),
+        (json!({"id": "E0HOMEORG"}), None, Some("")),
     ] {
         let (server, api) = server().await;
         mount(
@@ -135,8 +136,8 @@ async fn auth_test_and_users_info_read_their_teams_leniently() {
         let user = api.user_info(&"U0HUMAN01".into()).await.unwrap();
         assert_eq!(
             user.team_id.as_ref().map(|id| id.as_str()),
-            read,
-            "{enterprise}"
+            user_team,
+            "a user's team that doesn't read names no team: {enterprise}"
         );
     }
     let (plain, api) = server().await;
@@ -159,6 +160,36 @@ async fn auth_test_and_users_info_read_their_teams_leniently() {
         None,
         "an organization's id starts with E"
     );
+}
+
+#[tokio::test]
+async fn auth_test_reads_its_team_and_install_as_slack_wrote_them() {
+    for (fields, team, org_wide) in [
+        (
+            json!({"team_id": "E0HOMEORG", "is_enterprise_install": true}),
+            "E0HOMEORG",
+            true,
+        ),
+        (
+            json!({"team_id": "t0team001", "is_enterprise_install": "yes"}),
+            "t0team001",
+            false,
+        ),
+        (json!({"team_id": ""}), "", false),
+        (json!({"team_id": 7}), "", false),
+        (json!({"team_id": null}), "", false),
+        (json!({}), "", false),
+    ] {
+        let (server, api) = server().await;
+        let mut answer = json!({"user_id": "U0BOT0001"});
+        for (key, value) in fields.as_object().unwrap() {
+            answer[key] = value.clone();
+        }
+        mount(&server, "auth.test", ok(answer)).await;
+        let auth = api.auth_test().await.unwrap();
+        assert_eq!(auth.team_id.as_str(), team, "{fields}");
+        assert_eq!(auth.is_enterprise_install, org_wide, "{fields}");
+    }
 }
 
 #[tokio::test]

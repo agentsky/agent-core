@@ -39,8 +39,13 @@ fn session_url() -> String {
 }
 
 fn fire_client(endpoint: &MockServer) -> FireClient {
+    fire_client_capped(endpoint, CloudConfig::default().handoffs_per_hour)
+}
+
+fn fire_client_capped(endpoint: &MockServer, handoffs_per_hour: u32) -> FireClient {
     FireClient::new(&CloudConfig {
         base_url: endpoint.uri(),
+        handoffs_per_hour,
         ..CloudConfig::default()
     })
     .unwrap()
@@ -151,9 +156,17 @@ async fn put_routine(store: &Store, member: MemberId, url_origin: &str, added_by
         .unwrap();
 }
 
-async fn begin(store: &Store, member: MemberId, by: &MemberKey, at: OffsetDateTime) {
+async fn begin(
+    store: &Store,
+    member: MemberId,
+    by: &MemberKey,
+    at: OffsetDateTime,
+) -> core_types::CloudHandoffId {
+    if store.cloud_routine(member, LABEL).await.unwrap().is_none() {
+        put_routine(store, member, "https://api.anthropic.com", by).await;
+    }
     let routine_id: RoutineId = ROUTINE.parse().unwrap();
-    store
+    let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member,
@@ -163,10 +176,15 @@ async fn begin(store: &Store, member: MemberId, by: &MemberKey, at: OffsetDateTi
                 origin: CloudOrigin::RocketChatDm,
                 task: "Fix the flaky test",
             },
+            u32::MAX,
             at,
         )
         .await
         .unwrap();
+    let CloudBegun::Begun(id) = begun else {
+        panic!("{begun:?}");
+    };
+    id
 }
 
 #[tokio::test]
@@ -486,6 +504,47 @@ async fn a_bot_message_never_runs_a_cloud_command() {
 }
 
 #[tokio::test]
+async fn a_member_past_the_hourly_cap_starts_nothing() {
+    let c = cloud().await;
+    let alice = c.linked("alice").await;
+    let bob = c.linked("bob").await;
+    c.add("alice").await;
+    c.add("bob").await;
+    let per_hour = crate::config::DEFAULT_CLOUD_HANDOFFS_PER_HOUR;
+    assert_eq!(per_hour, 10);
+    mount_fire(
+        &c.endpoint,
+        ResponseTemplate::new(401),
+        u64::from(per_hour) + 1,
+    )
+    .await;
+    for n in 0..per_hour {
+        let reply = c.run("alice", &format!("Task {n}")).await;
+        assert!(reply.contains("refused routine"), "{reply}");
+    }
+    let logs = global_logs().tag();
+    let reply = c.run("alice", "One more").await;
+    assert_eq!(
+        reply,
+        "Nothing was started: you've asked for 10 hand-offs in the last hour, the most I \
+         start for one member. Try again later."
+    );
+    assert_eq!(
+        fires(&c.endpoint).await.len(),
+        usize::try_from(per_hour).unwrap()
+    );
+    assert_eq!(handoffs(&c.h.store, alice).await.len(), 10);
+    logs.snapshot()
+        .assert_has("refused a cloud hand-off past the hourly cap");
+    let reply = c.run("bob", "Mine").await;
+    assert!(
+        reply.contains("refused routine"),
+        "the cap is each member's: {reply}"
+    );
+    assert_eq!(handoffs(&c.h.store, bob).await.len(), 1);
+}
+
+#[tokio::test]
 async fn an_unknown_outcome_is_never_retried() {
     let c = cloud().await;
     let alice = c.linked("alice").await;
@@ -497,8 +556,6 @@ async fn an_unknown_outcome_is_never_retried() {
         "{reply}"
     );
     assert!(reply.contains("Check claude.ai/code before running it again"));
-    let later = second() + time::Duration::hours(1);
-    c.notifier().pass_at(clock(later)).await.unwrap();
     assert_eq!(fires(&c.endpoint).await.len(), 1);
     let recorded = handoffs(&c.h.store, alice).await;
     assert_eq!(recorded.len(), 1);
@@ -701,7 +758,7 @@ async fn logout_drops_routines_and_handoffs() {
     c.h.dm("alice", "logout").await;
     let reply = c.h.last_reply("alice");
     assert!(
-        reply.contains("I also forgot your 1 routine and its hand-offs."),
+        reply.contains("I also forgot your 1 routine and 1 hand-off."),
         "{reply}"
     );
     assert!(
@@ -715,6 +772,51 @@ async fn logout_drops_routines_and_handoffs() {
     assert!(handoffs(&c.h.store, alice).await.is_empty());
     c.h.dm("alice", "logout").await;
     assert!(!c.h.last_reply("alice").contains("routine"));
+
+    let bob = c.linked("bob").await;
+    c.add("bob").await;
+    c.h.dm("bob", "logout").await;
+    let reply = c.h.last_reply("bob");
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(!reply.contains("hand-off"), "{reply}");
+    assert!(c.h.store.cloud_routines(bob).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_logout_that_failed_still_says_to_revoke_when_sent_again() {
+    let endpoint = MockServer::start().await;
+    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let alice = h
+        .store
+        .member_for_identity(&slack_key("U0HUMAN01"))
+        .await
+        .unwrap()
+        .unwrap();
+    sql(
+        &url,
+        "CREATE TRIGGER no_unlink BEFORE DELETE ON claude_links \
+         BEGIN SELECT RAISE(FAIL, 'injected'); END;",
+    )
+    .await;
+    assert_eq!(h.slash("U0HUMAN01", "logout").await, [FAILED.to_owned()]);
+    assert_eq!(
+        h.store.cloud_routines(alice).await.unwrap().len(),
+        1,
+        "nothing is forgotten while the link stays"
+    );
+    sql(&url, "DROP TRIGGER no_unlink;").await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(
+        reply.starts_with("Your Claude account is unlinked."),
+        "{reply}"
+    );
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(
+        reply.contains("I can't revoke a routine's token: revoke each"),
+        "{reply}"
+    );
+    assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -938,8 +1040,8 @@ async fn a_routine_url_on_another_origin_is_refused() {
         );
     }
     assert!(c.h.store.cloud_routines(alice).await.unwrap().is_empty());
-    let default_port = c.endpoint.uri();
-    assert!(default_port.starts_with("http://127.0.0.1:"));
+    let added = c.add("alice").await;
+    assert!(added.starts_with("Registered routine"), "{added}");
 }
 
 #[tokio::test]
@@ -1165,7 +1267,11 @@ async fn a_new_token_replaces_the_routine_and_a_routine_is_registered_once() {
 
 #[tokio::test]
 async fn cloud_list_shows_routines_and_the_last_ten_handoffs() {
-    let c = cloud().await;
+    let mut c = cloud().await;
+    c.h.commands =
+        c.h.commands
+            .clone()
+            .with_cloud(fire_client_capped(&c.endpoint, 100));
     let alice = c.linked("alice").await;
     c.h.dm("alice", "cloud list").await;
     let empty = c.h.last_reply("alice");
@@ -1231,11 +1337,15 @@ fn a_tasks_first_line_is_cut_and_shown_as_code() {
 }
 
 #[test]
-fn a_retry_after_reads_in_whole_minutes() {
-    assert_eq!(minutes(0), "a minute");
-    assert_eq!(minutes(59), "a minute");
-    assert_eq!(minutes(61), "2 minutes");
-    assert_eq!(minutes(3600), "60 minutes");
+fn a_retry_after_reads_in_whole_minutes_or_hours() {
+    assert_eq!(wait_in_words(0), "a minute");
+    assert_eq!(wait_in_words(59), "a minute");
+    assert_eq!(wait_in_words(61), "2 minutes");
+    assert_eq!(wait_in_words(3600), "60 minutes");
+    assert_eq!(wait_in_words(3601), "2 hours");
+    assert_eq!(wait_in_words(7200), "2 hours");
+    assert_eq!(wait_in_words(7201), "3 hours");
+    assert_eq!(wait_in_words(86_400), "24 hours");
 }
 
 #[test]
@@ -1386,4 +1496,134 @@ async fn a_store_failing_around_the_request_never_hides_the_link() {
     let posts = h.posts().await;
     assert!(posts[0].1.contains("`/agent cloud list`"), "{posts:?}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_notice_the_store_fails_on_leaves_the_others_and_the_purge() {
+    let endpoint = MockServer::start().await;
+    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let alice = h
+        .store
+        .member_for_identity(&slack_key("U0HUMAN01"))
+        .await
+        .unwrap()
+        .unwrap();
+    let grace = h.linked("U0HUMAN02").await;
+    let t0 = second();
+    begin(&h.store, alice, &slack_key("U0HUMAN01"), t0).await;
+    begin(&h.store, grace, &slack_key("U0HUMAN02"), t0).await;
+    let long_ago = t0 - time::Duration::days(91);
+    let old = begin(&h.store, grace, &slack_key("U0HUMAN02"), long_ago).await;
+    h.store
+        .finish_cloud_handoff(
+            old,
+            &CloudOutcome::Rejected {
+                status: Some(404),
+                error_type: None,
+                retry_after_secs: None,
+            },
+            long_ago,
+        )
+        .await
+        .unwrap();
+    sql(
+        &url,
+        &format!(
+            "CREATE TRIGGER no_claim BEFORE UPDATE OF notice_attempts ON cloud_handoffs \
+             WHEN OLD.member_id = '{alice}' BEGIN SELECT RAISE(FAIL, 'injected'); END;"
+        ),
+    )
+    .await;
+    let notifier = CloudNotifier::new(h.store.clone(), h.commands.replies().clone(), None);
+    let failed = notifier
+        .pass_at(clock(t0 + time::Duration::seconds(61)))
+        .await;
+    assert!(failed.is_err(), "{failed:?}");
+    let posts = h.posts().await;
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert!(posts[0].1.starts_with("Your cloud hand-off"), "{posts:?}");
+    let left: Vec<_> = handoffs(&h.store, grace)
+        .await
+        .into_iter()
+        .map(|recent| recent.handoff.id)
+        .collect();
+    assert!(!left.contains(&old), "the purge ran");
+    assert!(
+        handoffs(&h.store, alice).await[0]
+            .handoff
+            .notified_at
+            .is_none()
+    );
+
+    sql(&url, "DROP TRIGGER no_claim;").await;
+    let pass = notifier
+        .pass_at(clock(t0 + time::Duration::seconds(62)))
+        .await
+        .unwrap();
+    assert_eq!((pass.marked, pass.told), (0, 1));
+    assert!(
+        handoffs(&h.store, alice).await[0]
+            .handoff
+            .notified_at
+            .is_some()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_task_line_in_cloud_list_on_slack_formats_and_pings_nothing() {
+    let (h, endpoint, _) = slack_cloud().await;
+    mount_fire(&endpoint, started(), 1).await;
+    h.slash(
+        "U0HUMAN01",
+        "cloud run agent-core &lt;!here&gt; *loud* _x_ @grace &lt;https://evil.example|docs&gt; `y`",
+    )
+    .await;
+    assert_eq!(
+        fired_text(&endpoint).await,
+        "<!here> *loud* _x_ @grace <https://evil.example|docs> `y`"
+    );
+    let listed = h.slash("U0HUMAN01", "cloud list").await.remove(0);
+    let line = listed
+        .lines()
+        .find(|line| line.contains("Task: "))
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert!(
+        line.ends_with(
+            "Task: `&lt;!here&gt; *loud* _x_ @grace &lt;https://evil.example|docs&gt; y`"
+        ),
+        "{line}"
+    );
+    assert!(!listed.contains("<!here>"), "{listed}");
+    assert!(!listed.contains("<https://evil"), "{listed}");
+}
+
+#[tokio::test]
+async fn a_slack_dm_points_to_the_slash_command_to_add_a_routine() {
+    let endpoint = MockServer::start().await;
+    let mut h = slack_harness().await;
+    h.commands = h.commands.clone().with_cloud(fire_client(&endpoint));
+    h.linked("U0HUMAN01").await;
+    let running = Running::start(&h);
+    for text in ["cloud list", "cloud run agent-core Fix it"] {
+        running
+            .send(SlackInbound::Message(
+                Box::new(dm_event("U0HUMAN01", text)),
+                InFlight::untracked(),
+            ))
+            .await;
+    }
+    running.stop().await;
+    let posts = h.posts().await;
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert!(
+        posts[1]
+            .1
+            .starts_with("You have no routine `agent-core`. `cloud list` shows yours"),
+        "{posts:?}"
+    );
+    for (_, text) in &posts {
+        assert!(text.contains("`/agent cloud add "), "{text}");
+        assert!(!text.contains("`cloud add"), "{text}");
+    }
 }

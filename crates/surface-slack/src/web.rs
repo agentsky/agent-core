@@ -43,7 +43,7 @@ use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
 use crate::normalize::{
-    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, is_workspace_id, team_id_or_nothing,
+    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, is_workspace_id,
 };
 
 /// The result type of the Web API client.
@@ -755,7 +755,12 @@ pub struct AuthTest {
     /// The workspace's name.
     #[serde(default)]
     pub team: Option<String>,
-    /// The workspace.
+    /// The workspace, as Slack wrote it, or an empty id when absent or
+    /// not a string. Not checked here: an organization-wide install
+    /// names its organization (`E…`), and agentd's manager refuses any
+    /// that isn't shaped like a workspace's id ([`is_workspace_id`]) with
+    /// an error that says why.
+    #[serde(default = "no_team", deserialize_with = "team_id_as_written")]
     pub team_id: TeamId,
     /// The token's user: the bot user, for a bot token.
     pub user_id: UserId,
@@ -768,6 +773,24 @@ pub struct AuthTest {
     /// organization's id, is `None`.
     #[serde(default, deserialize_with = "enterprise_id_or_nothing")]
     pub enterprise_id: Option<TeamId>,
+    /// Whether the app is installed organization-wide on Enterprise Grid.
+    /// Anything but `true` is `false`.
+    #[serde(default, deserialize_with = "true_or_false")]
+    pub is_enterprise_install: bool,
+}
+
+/// The empty id, which no team matches, for an absent `team_id`.
+fn no_team() -> TeamId {
+    TeamId::from(String::new())
+}
+
+/// A string as it is, and an empty id, which no team matches, for anything
+/// else.
+fn team_id_as_written<'de, D: Deserializer<'de>>(value: D) -> Result<TeamId, D::Error> {
+    Ok(match Value::deserialize(value)? {
+        Value::String(id) => TeamId::from(id),
+        _ => TeamId::from(String::new()),
+    })
 }
 
 /// An app configuration token and its refresh token, from
@@ -985,9 +1008,10 @@ fn grid_teams<'de, D: Deserializer<'de>>(value: D) -> Result<Option<Vec<TeamId>>
 pub struct User {
     /// The user's id.
     pub id: UserId,
-    /// The workspace the user belongs to. Read leniently: absent, or
-    /// anything but a string shaped like a team id, is `None`.
-    #[serde(default, deserialize_with = "team_id_or_nothing")]
+    /// The workspace the user belongs to: `None` when absent or `null`,
+    /// and an empty id, which no team matches, for anything but a string
+    /// shaped like a team id, so it fails the home rule.
+    #[serde(default, deserialize_with = "team_id_or_unreadable")]
     pub team_id: Option<TeamId>,
     /// The username (a legacy handle).
     #[serde(default)]
@@ -1013,6 +1037,16 @@ pub struct User {
     /// gives them. Anything but an object is an organization no id names.
     #[serde(default, deserialize_with = "enterprise_user")]
     pub enterprise_user: Option<EnterpriseUser>,
+}
+
+/// A string shaped like a team id ([`is_team_id`]), `None` for `null`, and
+/// an empty id, which no team matches, for anything else.
+fn team_id_or_unreadable<'de, D: Deserializer<'de>>(value: D) -> Result<Option<TeamId>, D::Error> {
+    Ok(match Value::deserialize(value)? {
+        Value::Null => None,
+        Value::String(id) if is_team_id(&id) => Some(TeamId::from(id)),
+        _ => Some(TeamId::from(String::new())),
+    })
 }
 
 /// An `enterprise_user` object, `None` for `null`, and for anything else,

@@ -8524,9 +8524,14 @@ cached "not home" for answers that say nothing about the user.
 **Solution.** Only `user_not_found` and, since review round 2,
 `user_not_visible` (`directory::NOT_HOME_CODES`) are a verdict, cached like
 any answer and not warned of, since an ordinary outsider may cause either;
-any other `NotFound` is returned uncached like the rest. A `users.info` answer with no
-`team_id`, or one not shaped like a team id, is `Ok(false)` and cached: it
-is an answer, and it doesn't name the workspace.
+any other `NotFound` is returned uncached like the rest. A `users.info`
+answer with no `team_id` is `Ok(false)` and cached unless its
+`enterprise_user` places it in the workspace (below); one with a `team_id`
+not shaped like a team id is `Ok(false)` and cached. Either is an answer,
+and doesn't name the workspace. Since review
+round 3, a `user_not_visible` is noted at info level at most once a
+minute, so a stream of them, which would refuse everyone, leaves a
+trace.
 
 ### The answer cache numbers its entries
 
@@ -8636,8 +8641,9 @@ workspace or whose `enterprise_user` is of the home organization and lists
 the workspace in its `teams`; and every team the answer names
 (`team_id`, `profile.team`, `enterprise_user.enterprise_id`) is the
 workspace, the organization or one of those `teams`. A team field that
-isn't a string, or an `enterprise_user` that isn't an object, is read as
-naming no team, so it fails the rule. It is sound for outside members: a
+isn't a string, a `team_id` not shaped like a team id (since review round
+3), or an `enterprise_user` that isn't an object, is read as naming no
+team, so it fails the rule. It is sound for outside members: a
 member of another organization has its own `enterprise_id` or `team_id`,
 and Slack lists only the workspaces a member belongs to. Two Grid cases
 still fail closed, as the design now says: a message whose own fields name
@@ -8769,6 +8775,39 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
 - The design says guests count as home, and the T36e plan asks for each
   field the home check reads, in both `users.info` and `users.list`.
 
+### Smaller fixes from review round 3
+
+- `notice_grid` warns only for a user whose own `team_id` is the
+  workspace: on a workspace not on Grid, an outside member of a Grid
+  organization looked up in a shared channel named an organization and
+  set off a false "every member is refused".
+- `User::team_id` reads a present value not shaped like a team id as an
+  empty id, which no team matches, rather than as absent, so it fails the
+  home rule like `profile.team` and `enterprise_user`.
+- `bot_user` refuses a `bots.info` answer about another bot, as
+  `home_user` and `conv_info` do, and caches "no user" only for
+  `bot_not_found`, not for any `NotFound`.
+- The T36e plan asks whether `users.info` echoes the id asked for exactly
+  (`U…` or `W…`), and for a Grid member's deactivation `user_change`.
+
+### Smaller fixes from review round 4
+
+- `notice_grid` also counts a user whose `enterprise_user.teams` lists the
+  workspace, so a locked-out Grid member whose `team_id` names a sibling
+  workspace or the organization is warned of too; an outside
+  organization's member lists only its own workspaces and still isn't.
+- agentd doesn't start unless `auth.test`'s `team_id` is shaped like a
+  workspace's id (`T…`): an empty workspace id would have matched the
+  empty id an unreadable `team_id` reads as. `AuthTest` reads `team_id` as
+  Slack wrote it, with `is_enterprise_install`, and
+  `ManagerIdentity::look_up` refuses with a `SurfaceError::Api` saying the
+  manager app must be installed in each workspace, not organization-wide,
+  naming `is_enterprise_install` when Slack set it (review round 5: a
+  refusal while reading the answer read as a transport error, pointing
+  the operator at the network). An organization-wide install never
+  worked: every request names a member's workspace, never the
+  organization.
+
 ### Left as they are
 
 - A click passes on `user.team_id` alone, with no lookup: the payload is
@@ -8787,6 +8826,10 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   the meantime is home for at most that hour, as they are when the list is
   all agentd asks.
 - `pipeline::message::record` keeps writing `outside: None` (above).
+- `web::is_unreadable` tells `decode`'s error by its message's prefix, a
+  shared constant, rather than by type: a typed marker would mean a new
+  `SurfaceError` variant that every caller matching `Transport` must
+  handle, and the prefix is pinned by a test that asserts the warning.
 
 ## T35c: Cloud hand-off: commands
 
@@ -8877,12 +8920,14 @@ as "(nothing to show)". The cut is by characters and ends in `…`.
   wrong".
 - The reply never shows `error_type`, which the endpoint chooses: each
   status gets the failure table's fixed line, worded tentatively for 403
-  and 404 as T35b's review asked. A 429 says when the limit resets, in
-  whole minutes rounded up, from `Retry-After`.
+  and 404 as T35b's review asked. A 429 says when the limit resets, from
+  `Retry-After`, in whole minutes rounded up, or in whole hours past an
+  hour.
 - `cloud add` replies with the routine id, also when it replaces a label,
   and says which label already holds a routine registered twice.
-- `logout` says to revoke the tokens only when it deleted routines; a
-  member with only hand-offs left loses them without a word about tokens.
+- `logout` names what it forgot, routines and hand-offs each only when
+  there were some, and says to revoke the tokens only when it deleted
+  routines.
 - The notifier sends a hand-off's notice to each of the member's identities
   a manager bot reaches, as the relink notice does, and leaves a member
   none reaches owed without a claim, so another instance or a later
@@ -8891,3 +8936,100 @@ as "(nothing to show)". The cut is by characters and ends in `…`.
 - `a_replayed_slack_command_fires_once` sends the same signed request
   twice, timestamp included, which is what a replay is; the ingress drops
   the second by its signature before the intake sees it.
+
+### Review round 1: a per-member cap on hand-offs
+
+**Issue.** Nothing bounded how many hand-offs a linked member could ask
+for. Each writes a row holding up to 64 KiB of sealed task, kept 90 days
+whatever its outcome, and sends a request from agentd's address; the
+endpoint's own caps don't stop either. A member looping `cloud run`
+against a routine with a made-up token could grow the store by gigabytes a
+day and send a flood of bad tokens to api.anthropic.com, risking a block
+that would break every member's hand-offs.
+
+**Solution.** `Store::begin_cloud_handoff` takes a cap and counts the
+member's hand-offs asked within `CLOUD_HANDOFF_WINDOW` (an hour), every
+state, in the `BEGIN IMMEDIATE` transaction that writes the row, so two
+instances can't both pass it; one past the cap is `CloudBegun::TooMany`
+and nothing is written or sent. The cap is `[cloud] handoffs_per_hour`,
+default 10, from 1 to 100 (the endpoint's per-account cap), carried by
+`FireClient`. The count uses the existing `(member_id, created_at)` index.
+`logout` deletes the rows the cap counts, but a member must link again
+through OAuth to run again, which costs more than waiting the hour.
+
+### Review round 1: `cloud run` racing `logout` or a member's deletion
+
+**Issue.** Commands are ordered per identity, not per member, and Slack's
+deletion of a member doesn't go through the intake, so a `cloud run` from
+one surface could read its routine, then lose the race to a `logout` on
+another, then write a hand-off row after the member was told everything
+was forgotten. The row could also be deleted while the request was out,
+and recording the answer then logged "had its outcome already", which
+wasn't so.
+
+**Solution.** The same transaction checks the member still holds a
+routine under the label with that routine id (`CloudBegun::RoutineGone`
+otherwise, answered "was removed or replaced while I was starting it").
+A deletion either comes first, and nothing is written or sent, or comes
+after and deletes the row with the rest; the request already out still
+runs, as the member asked for it. `finish_cloud_handoff` returns
+`CloudFinished::{Recorded, Kept, Gone}`, and `Gone` logs that the row was
+deleted with the member's routines while its request was out.
+
+### Review round 1: smaller fixes
+
+- On Slack every reply that names `cloud add` names the slash command,
+  even in a DM, since the design keeps the token out of DM history; the
+  README says a mention in a Slack DM task is refused, since `message`
+  events carry mentions without names.
+- `logout` unlinks before it deletes configuration tokens and routines, so
+  a `logout` that fails before deleting anything still says to revoke the
+  tokens when sent again; one that fails after unlinking is sent again as
+  "No Claude account is linked" and deletes them then, with the advice.
+- One row's store failure no longer ends a notifier pass: each step and
+  each notice runs whatever another met, the failure is logged with the
+  hand-off, and the purge still runs. The pass returns the first failure
+  after doing the rest. The relink notifier keeps its shape; it has no
+  purge for a failure to starve.
+- A test now runs `persona` with entities through a slash command and a
+  manager DM, so removing the decoding in `answer_text` fails it, and one
+  renders a hostile task line in Slack's `cloud list`.
+- Not fixed: the Slack `user_change` deletion is lost if the store fails
+  then. The ingress acknowledges and deduplicates an event before agentd
+  handles it, so nothing would deliver it again; retrying it needs a
+  durable inbound queue, which no Slack event has yet. Configuration
+  tokens have the same gap.
+- Noted (security N3): a token posted with `cloud add` in a Rocket.Chat
+  room is refused and the member told to revoke it, but the message stays
+  in the room, and a later turn's history read gives it to the model, as
+  with `login` codes and other secrets posted in rooms.
+- Noted (spend NIT5): instances whose clocks differ by more than twice
+  `timeout_secs`, or whose `timeout_secs` differ during a blue-green
+  deploy, can mark another's in-flight row `unknown`; the member then gets
+  a "may have started" notice as well as the link, and nothing fires
+  twice.
+
+### Review round 1: the pipeline test that raced
+
+**Issue.** `a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_ref`
+predates T35c and failed under load (correctness review S1): it reset the
+first session on seeing the hourglass and the second a fixed time after the
+first history read, so under contention a reset could land before the
+attempt it was aimed at looked its session up, and the turn ran.
+
+**Solution.** The test file's `Holds` gained a queue of gates for history
+reads. The test waits until each attempt is held reading the thread,
+which is after it looked its session up and before it runs, resets that
+session, then opens the gate; the sleeps are gone. The same gates replace
+the 1 s history delay in
+`messages_in_a_thread_are_answered_once_each_in_arrival_order`, a gate on
+the post replaces the 20 s post delay and 500 ms sleep in
+`a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its_thread_told`,
+and the two hand-off drain tests wait for the pipeline to close rather than
+sleeping 500 ms. The remaining fixed sleeps in agentd's tests wait for
+nothing to happen, poll, simulate slow work, or stand in for "a moment
+later" well inside an attribution window (300 ms of 2 s, and 200 ms of
+30 s in two tests whose assertions hold in either order), which no hook
+marks; `tests/slack.rs`'s
+half-sent-request shutdown test sleeps for the server to read the request,
+which nothing the test can see marks.
