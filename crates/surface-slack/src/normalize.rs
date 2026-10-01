@@ -36,7 +36,15 @@
 //! - Mentions are the `<@U…>` tokens in `text`, then the `user` elements of
 //!   `rich_text` blocks and the tokens in `mrkdwn` text objects, each user
 //!   once, in order of first appearance. Text typed inside a `rich_text`
-//!   block is not scanned: a literal `<@U…>` there is not a mention.
+//!   block is not scanned: a literal `<@U…>` there is not a mention. A
+//!   token with a backtick somewhere before it and another after it in the
+//!   same text is not one either, since Slack might show it as code
+//!   ([`mentions`]); a person's mention there is still read from the
+//!   `user` element their client sends. A bot's mentions are read from
+//!   `text` alone, as agentd reads what it posted, so the copy of an
+//!   agent's post Slack delivers, with whatever blocks Slack makes of its
+//!   text, hands off to the agents agentd's own delivery did: agentd's
+//!   agents post text, and the router ignores every other bot.
 //! - The team is the envelope's `team_id`, for the sender and the
 //!   conversation alike.
 //! - A bot's message that was `edited` is dropped: agentd never edits its
@@ -321,7 +329,7 @@ fn normalized(
     };
     let mut text = event.text.unwrap_or_default();
     text.truncate(truncated(&text, MAX_TEXT_BYTES).len());
-    let mentions = mentions(&text, event.blocks.as_ref());
+    let mentions = mentions(&text, event.blocks.as_ref().filter(|_| !is_bot));
     let thread_root = event.thread_ts.filter(|root| *root != ts);
     let mentioned = context.bot_user.is_some_and(|bot| mentions.contains(bot));
     let own = context.bot_user.is_some_and(|bot| *bot == sender);
@@ -686,6 +694,31 @@ mod tests {
     }
 
     #[test]
+    fn a_persons_mention_between_backticks_is_read_from_the_block_their_client_sends() {
+        let text = "`foo` <@U0BOT> `bar`";
+        let typed = channel_message(json!({
+            "text": text,
+            "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "foo", "style": {"code": true}},
+                    {"type": "text", "text": " "},
+                    {"type": "user", "user_id": "U0BOT"},
+                    {"type": "text", "text": " "},
+                    {"type": "text", "text": "bar", "style": {"code": true}},
+                ]},
+            ]}],
+        }));
+        let event = normalize(typed).unwrap();
+        assert_eq!(event.mentions, [UserId::from("U0BOT")]);
+        let bare = channel_message(json!({"text": text}));
+        assert_eq!(
+            normalize(bare),
+            Err(Skip::NotAddressed),
+            "without the block, a token between backticks addresses no one"
+        );
+    }
+
+    #[test]
     fn many_mentions_are_deduplicated_in_linear_time_and_capped() {
         let text: String = (0..40_000).map(|n| format!("<@U{n}><@U{n}>")).collect();
         let found = mentions(&text, None);
@@ -927,6 +960,26 @@ mod tests {
                 with(
                     json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER", "text": format!("`<@{BOT}>` over to you")}),
                 ),
+                with(json!({
+                    "user": "U0OTHERBOT",
+                    "bot_id": "B0OTHER",
+                    "text": format!("`a` <@{BOT}> `b`"),
+                    "blocks": [{"type": "rich_text", "elements": [
+                        {"type": "rich_text_section", "elements": [
+                            {"type": "text", "text": "a", "style": {"code": true}},
+                            {"type": "user", "user_id": BOT},
+                            {"type": "text", "text": "b", "style": {"code": true}},
+                        ]},
+                    ]}],
+                })),
+                with(json!({
+                    "user": "U0OTHERBOT",
+                    "bot_id": "B0OTHER",
+                    "text": "have a look",
+                    "blocks": [{"type": "rich_text", "elements": [
+                        {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]},
+                    ]}],
+                })),
             ];
             quiet_bots[2].as_object_mut().unwrap().remove("user");
             for quiet in quiet_bots {
@@ -936,17 +989,6 @@ mod tests {
             let calling = with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER"}));
             assert!(normalize(calling.clone()).is_ok(), "{channel_type}");
             assert!(read(kind, calling).is_ok(), "{channel_type}");
-            let calling_in_blocks = with(json!({
-                "user": "U0OTHERBOT",
-                "bot_id": "B0OTHER",
-                "text": "have a look",
-                "blocks": [{"type": "rich_text", "elements": [
-                    {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]},
-                ]}],
-            }));
-            let kept = normalize(calling_in_blocks.clone()).unwrap();
-            assert_eq!(kept.mentions, [UserId::from(BOT)], "{channel_type}");
-            assert!(read(kind, calling_in_blocks).is_ok(), "{channel_type}");
             let person = with(json!({"text": "hi"}));
             assert!(normalize(person).is_ok(), "{channel_type}");
         }

@@ -7730,8 +7730,15 @@ mention shown as code, and that the platform's copy, read by the inbound
 path, skipped the check. The cost, chosen to fail closed: a mention
 between two backticks that Slack shows as text, as in `` `a` @writer
 `b` ``, or between two code blocks, hands off to no one, which SKILL.md
-tells agents. Rich-text `user` elements, which Slack itself marks as
-mentions, are read as before. The renderer
+tells agents. A bot's mentions are read from its `text` alone, as
+agentd reads what it posted: Slack may attach `rich_text` blocks it makes
+from an app's text-only post, whose `user` elements (or a code-styled one)
+would otherwise count a mention agentd's own read dropped, running a hop
+with no `hand_offs` row behind it. Agentd's agents post text, and the
+router ignores every other bot, so nothing that routes is lost. A
+person's mentions are still read from the blocks too, so a person who
+writes `` `foo` @agent `bar` `` is addressed through the `user` element
+their client sends; only a person's message without blocks loses it. The renderer
 changes went back out: the scan makes them unneeded, and they made code
 holding a backtick paste with invisible characters. A backtick in a link's
 URL is percent-encoded (`%60`), so a URL never holds one; such a URL
@@ -7844,7 +7851,13 @@ does it once more after its hand-off worker is joined or aborted
 go of a row after them. A row stays set aside until a release of it
 succeeds, so one that failed or was cancelled is made again by the next,
 and is then forgotten, so a later release can't take it from an instance
-that holds it by then. A pass whose re-lease of a row commits after the
+that holds it by then. A drain cut by its timeout while its release is in
+flight may have committed it without forgetting the rows, and
+`cut_short` then releases them again a few milliseconds later; a row
+another instance took in between has its lease reset, which the claim
+keeps from running twice. A forced shutdown skips the server's last
+release, and a second signal cuts it short, leaving those rows to their
+lease. A pass whose re-lease of a row commits after the
 cut released it leaves that row to its lease, five minutes at most. The
 sweep interval is `PipelineSettings::hand_off_sweep` (30 s), so a test
 drives the server's worker through a drain. A hand-off past

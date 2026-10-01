@@ -297,8 +297,8 @@ impl Server {
     ///    dropped.
     /// 4. The hand-offs let go since the drain began, by the hand-off
     ///    worker's last pass included, are made due at once
-    ///    ([`Pipeline::release_cut_hand_offs`]), the pipeline is dropped,
-    ///    and the store is closed.
+    ///    ([`Pipeline::release_cut_hand_offs`]) unless the shutdown was
+    ///    forced, the pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -524,15 +524,25 @@ impl Server {
                 drained = tokio::time::timeout_at(deadline, drain) => {
                     drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
                 }
-                () = abort.as_mut() => Some("shutdown forced; dropping in-flight work"),
+                () = abort.as_mut() => {
+                    forced = true;
+                    Some("shutdown forced; dropping in-flight work")
+                }
             }
         };
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
-        if let Some(pipeline) = &pipeline {
-            pipeline.release_cut_hand_offs().await;
+        if let Some(pipeline) = &pipeline
+            && !forced
+        {
+            tokio::select! {
+                () = pipeline.release_cut_hand_offs() => {}
+                () = abort.as_mut() => {
+                    tracing::warn!("shutdown forced; the hand-offs let go last are taken after their lease");
+                }
+            }
         }
         drop(pipeline);
         app.store().close().await;

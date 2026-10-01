@@ -60,6 +60,10 @@ impl SurfaceLookup for Mocks {
         agent: AgentId,
         _conv: &ConvRef,
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        let gate = self.holds.lookups.lock().unwrap().get(&agent).cloned();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         if self.holds.unbound.lock().unwrap().contains(&agent) {
             return Ok(None);
         }
@@ -112,6 +116,7 @@ struct Holds {
     can_posts: Mutex<HashMap<AgentId, Gate>>,
     posts: Mutex<HashMap<String, Gate>>,
     unbound: Mutex<HashSet<AgentId>>,
+    lookups: Mutex<HashMap<AgentId, Gate>>,
 }
 
 impl Holds {
@@ -134,6 +139,11 @@ impl Holds {
             .entry(agent)
             .or_default()
             .push_back(error);
+    }
+
+    /// Holds every look-up of `agent`'s surface at `gate`.
+    fn lookups_of(&self, agent: AgentId, gate: &Gate) {
+        self.lookups.lock().unwrap().insert(agent, gate.clone());
     }
 
     /// Holds `agent`'s checks of whether its bot may post at `gate`.
@@ -2728,6 +2738,16 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
     stack.stop().await;
 }
 
+/// Every managed bot in these tests, for Slack's renderer: a handle names
+/// the bot user of the same id.
+struct Bots;
+
+impl render::MentionDirectory for Bots {
+    fn resolve(&self, name: &str) -> Option<String> {
+        name.starts_with('U').then(|| name.to_owned())
+    }
+}
+
 #[tokio::test]
 async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
     let stack = start().await;
@@ -2741,10 +2761,39 @@ async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
         stack.kept_hand_offs().await.is_empty(),
         "agentd's own delivery hands nothing off"
     );
-    let shown = "``a <@UWRITER>` b";
+    let shown = render::slack::to_mrkdwn(&sent[0].1, &Bots);
+    assert!(shown.contains("<@UWRITER>"), "{shown}");
+    let writers_bot = UserId::new("UWRITER");
+    let team = core_types::TeamId::from("T1");
+    let read_by_writers_app = surface_slack::normalize::message(
+        &surface_slack::normalize::Context {
+            binding: BindingId::new_v4(),
+            bot_user: Some(&writers_bot),
+            team: &team,
+            event_id: "Ev1",
+            received_at: pinned_now(),
+        },
+        &serde_json::json!({
+            "type": "message",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": BOT,
+            "bot_id": "B0HELPER",
+            "text": shown,
+            "ts": "1727697600.000100",
+            "thread_ts": "1727697500.000050",
+            "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "`a ", "style": {"code": true}},
+                    {"type": "user", "user_id": "UWRITER"},
+                    {"type": "text", "text": "` b"},
+                ]},
+            ]}],
+        }),
+    );
     let mut copy = stack.agents_post(BOT, sent[0].2.id.as_str(), "c1", &[]);
-    copy.text = shown.to_owned();
-    copy.mentions = surface_slack::normalize::mentions(shown, None);
+    copy.text = shown.clone();
+    copy.mentions = read_by_writers_app.map_or_else(|_| Vec::new(), |event| event.mentions);
     stack.handle(copy).await;
     stack.pipeline.close();
     stack.pipeline.drain().await;
@@ -3106,6 +3155,54 @@ async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
     busy.open();
     stack.wait_for_posts(3).await;
     stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stops() {
+    let mut stack = start_with(Setup {
+        drain_timeout_secs: 30,
+        pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+    })
+    .await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let looking = Gate::closed();
+    stack.holds.lookups_of(writer, &looking);
+    let event = stack.agents_post(BOT, "m9", "c1", &["UWRITER"]);
+    stack
+        .store()
+        .add_hand_off(
+            writer,
+            &serde_json::to_string(&event).unwrap(),
+            pinned_now(),
+            pinned_now(),
+        )
+        .await
+        .unwrap();
+    wait_until("the worker took the hand-off and holds it", || {
+        looking.waiting() == 1
+    })
+    .await;
+    let (still, _still_open) = oneshot::channel();
+    std::mem::replace(&mut stack.stop, still).send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    looking.open();
+    let Stack { task, dir, .. } = stack;
+    task.await.unwrap().unwrap();
+    let db = dir.path().join("agentd.db");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
+        .await
+        .unwrap();
+    let due: Vec<(i64,)> = sqlx::query_as("SELECT due_at FROM hand_offs")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(
+        due,
+        [(pinned_now().unix_timestamp(),)],
+        "the pass queued it on a closed pipeline after the drain's release, \
+         and the server's last release made it due at once"
+    );
 }
 
 #[tokio::test]
