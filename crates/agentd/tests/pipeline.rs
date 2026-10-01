@@ -231,7 +231,7 @@ struct Stack {
     stop: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
     fake: FakeAnthropic,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 fn key(user: &str) -> MemberKey {
@@ -434,13 +434,31 @@ async fn start_with(setup: Setup) -> Stack {
         stop,
         task,
         fake,
-        _dir: dir,
+        dir,
     }
 }
 
 impl Stack {
     fn store(&self) -> &Store {
         self.app.store()
+    }
+
+    /// The turns billed no cost, by the reason the `usage` table records,
+    /// as an operator counts them.
+    async fn unbilled_turns(&self) -> Vec<(String, i64)> {
+        let db = self.dir.path().join("agentd.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
+            .await
+            .unwrap();
+        let rows = sqlx::query_as(
+            "SELECT cost_unknown, SUM(turns) FROM usage WHERE cost_unknown != '' \
+             GROUP BY cost_unknown ORDER BY cost_unknown",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        rows
     }
 
     /// Every text the manager bot sent `user` in their DM.
@@ -1025,15 +1043,11 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         .await;
     let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
     assert_eq!(
-        (
-            billed.turns,
-            billed.used.input_tokens,
-            billed.used.output_tokens
-        ),
+        (billed.turns, billed.input_tokens, billed.output_tokens),
         (1, 10, 1),
         "fake-claude's usage for one reply"
     );
-    assert_eq!(billed.used.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
     assert_eq!(
         store
             .member_usage(stack.alice, pinned_now())
@@ -1079,13 +1093,15 @@ async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
         .await;
     let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
     assert_eq!(
-        (
-            billed.turns,
-            billed.used.input_tokens,
-            billed.used.output_tokens
-        ),
+        (billed.turns, billed.input_tokens, billed.output_tokens),
         (2, 20, 2),
         "a turn whose CLI the agent killed is billed what its messages used"
+    );
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(
+        stack.unbilled_turns().await,
+        [("no_result".to_owned(), 1)],
+        "and recorded as a turn of unknown cost"
     );
     let spend = store
         .thread_spend(&thread("GENERAL", "k1"), pinned_now())
@@ -1507,7 +1523,7 @@ async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
         agent,
         stop,
         task,
-        _dir: dir,
+        dir,
         ..
     } = stack;
     drop(pipeline);

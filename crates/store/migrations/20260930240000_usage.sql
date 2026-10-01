@@ -8,7 +8,11 @@
 -- requester: turns, tokens and the CLI's cost. input_tokens holds the
 -- input the model read fresh (uncached input and cache writes);
 -- cache reads, which every call of a turn repeats for the whole
--- conversation, aren't counted.
+-- conversation, aren't counted. A turn whose cost isn't known is billed
+-- no cost, in a row of its own whose cost_unknown says why (the store's
+-- CostUnknown names the reasons); a turn with a known cost has
+-- cost_unknown ''. What went unbilled is then the turns and tokens of the
+-- rows with a reason.
 --
 -- agent_policies holds an owner's settings for one agent: turns_per_day
 -- (NULL for no cap), max_hops (NULL to leave the global cap), and the allow
@@ -35,7 +39,10 @@ CREATE TABLE usage (
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     cost_usd REAL NOT NULL,
-    PRIMARY KEY (member_id, day)
+    cost_unknown TEXT NOT NULL DEFAULT '' CHECK (cost_unknown IN ('', 'no_result', 'no_total',
+        'total_out_of_range', 'reused_container', 'transcript_too_large',
+        'transcript_unreadable', 'transcript_unrecognized')),
+    PRIMARY KEY (member_id, day, cost_unknown)
 ) STRICT;
 
 CREATE TABLE agent_policies (

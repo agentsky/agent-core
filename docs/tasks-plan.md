@@ -2336,7 +2336,7 @@ Deliverables:
 
 - A migration `…_usage.sql` with five tables:
   - `usage` (`member_id`, `day`, `turns`, `input_tokens`, `output_tokens`,
-    `cost_usd`), keyed `(member_id, day)`.
+    `cost_usd`, `cost_unknown`), keyed `(member_id, day, cost_unknown)`.
   - `agent_policies` (`agent_id`, `turns_per_day`, `max_hops`, `allow_json`,
     `deny_json`).
   - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
@@ -2955,7 +2955,9 @@ Not scheduled. Each needs a decision before it becomes a task.
   forged `result` line, which ends its turn early with its own reply; the
   CLI's real result is then read as the next turn's, so the next
   requester gets this turn's reply and pays its cost. Reading turns from a
-  channel the agent can't write would close that as well.
+  channel the agent can't write would close that as well. It would also
+  bill the turns T27 records with an unknown cost, such as every resumed
+  process's first turn once a long thread's transcript passes 5 MiB.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private

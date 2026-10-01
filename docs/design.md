@@ -780,6 +780,7 @@ erDiagram
         int input_tokens
         int output_tokens
         real cost_usd
+        text cost_unknown
     }
     AGENT_POLICY {
         int turns_per_day

@@ -16,7 +16,7 @@ use core_types::{
 };
 use futures::{FutureExt, StreamExt};
 use sandbox::{Container, ContainerEvent, ContainerId, Sandbox, SessionSpec, SharedAccess};
-use store::{Session, SessionKind, Store};
+use store::{CostUnknown, Session, SessionKind, Store};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
@@ -813,8 +813,9 @@ impl<H: TurnHooks> Inner<H> {
                 Some(restored_cost(&held.session_dir, session.id).await)
             }
             SessionStart::Resume => {
-                tracing::warn!(session = %session.id, "resuming in a container an earlier process ran in, where a process it left could change the transcript; the first turn has no cost");
-                Some(None)
+                let reason = CostUnknown::ReusedContainer;
+                tracing::warn!(session = %session.id, %reason, "resuming in a container an earlier process ran in, where a process it left could change the transcript; the first turn has no cost");
+                Some(Err(reason))
             }
             SessionStart::New => None,
         };

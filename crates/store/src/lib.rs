@@ -87,7 +87,8 @@ pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
 pub use usage::{
-    LimitWindow, MemberUsage, THREAD_USAGE_RETENTION, ThreadSpend, TurnUsage, UsageTotals,
+    CostUnknown, LimitWindow, MemberUsage, THREAD_USAGE_RETENTION, ThreadSpend, TurnUsage,
+    UsageTotals,
 };
 pub use volumes::Volume;
 

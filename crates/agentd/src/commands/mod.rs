@@ -735,7 +735,7 @@ impl Commands {
                 "{} {}, {} tokens",
                 usage.turns,
                 if usage.turns == 1 { "turn" } else { "turns" },
-                usage.used.tokens()
+                usage.tokens()
             )
         };
         Ok(format!(

@@ -5477,14 +5477,18 @@ keep that cost known at a container start's price, and would also end
 the agent's leftover processes (Deferred work's "Killing leftover
 processes at turn end").
 
-A turn's cost is unknown (`None`, and billed as 0) when its result or the
-process's previous one has no plausible total (so a result without one
-leaves the next turn unknown too, and the one after is known again), when
-the total falls, or when it rises by more than `MAX_TURN_COST_USD`
-($1,000). An unknown restored total makes only the first turn's cost
-unknown. Even so, the agent can write the transcript and the CLI's stdout
+A turn's cost is unknown (an `Err` with a `CostUnknown` reason, and
+billed as 0) when its result or the process's previous one has no
+plausible total (so a result without one leaves the next turn unknown
+too, and the one after is known again), when the total falls, or when it
+rises by more than `MAX_TURN_COST_USD` ($1,000). An unknown restored total
+makes only the first turn's cost unknown. When that first result has no
+total either, `no_total` wins and the restored total's reason isn't
+counted. Even so, the agent can write the transcript and the CLI's stdout
 (it runs as the same user), so `cost_usd` is a record, never something a
-limit is enforced with: no cap reads it.
+limit is enforced with: no cap reads it. The same holds for the reasons:
+an agent can move a turn from one to another, so their counts are a
+lower-trust figure than the turns and tokens.
 
 `fake-claude` now appends a `cost-state` line shaped as 2.1.285 writes
 it, starting with the same bytes, when its input ends, and none when it
@@ -5492,6 +5496,31 @@ crashes, and restores the session's last one on `--resume`;
 a runner test checks the resumed turn's cost after a clean stop and after
 a crash, and the Docker test now checks the corrected cost against the real
 CLI in CI.
+
+### Turns of unknown cost are recorded by reason
+
+**Issue.** A review measured about 146 KB of transcript per CLI process
+start with 2.1.285: an ~82 KB `prompt_snapshot` line and a ~12 KB
+`skill_listing` line are written on every start, whatever the turn. So a
+long-lived thread's transcript passes `CLI_INDEX_BYTES` (5 MiB) after
+about 36 process starts at that rate, and after at most about 56 from
+those two lines alone. From then on every resumed process's first turn
+has an unknown cost and is billed nothing. That fails safe, but only a
+warning log said so, and nothing counted what went unbilled.
+
+**Solution.** A turn's unknown cost carries its reason, a `CostUnknown`:
+`no_result` (crashed or timed out), `no_total`, `total_out_of_range`,
+`reused_container`, `transcript_too_large`, `transcript_unreadable` or
+`transcript_unrecognized`. The `usage` table has a `cost_unknown` column
+in its key, `''` for turns of known cost, so each member's day has a row
+per reason with its turns and tokens and no cost. What went unbilled is
+`SELECT cost_unknown, SUM(turns), SUM(input_tokens + output_tokens) FROM
+usage WHERE cost_unknown != '' GROUP BY cost_unknown`, and `me` still
+shows the member's day and month over every row. The warning logs name
+the reason too. A store test and a pipeline test (a turn whose CLI the
+agent killed is recorded as `no_result`) check it. Metering at the
+credential proxy (Deferred work) would bill these turns; until then an
+operator can price them from their tokens.
 
 ### Cache reads aren't tokens the meter counts
 
@@ -5778,8 +5807,9 @@ bot on the platform.
 
 ### The usage migration was edited in place
 
-**Issue.** `thread_usage.others_turns` was added to
-`20260930240000_usage.sql` after the branch's first push, by editing the
+**Issue.** `thread_usage.others_turns` and then `usage.cost_unknown`
+were added to `20260930240000_usage.sql` after the branch's first push,
+by editing the
 migration rather than adding another, since T27 hadn't merged. sqlx keeps
 each applied migration's checksum and refuses to start on a database whose
 applied migration has since changed.

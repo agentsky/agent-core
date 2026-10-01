@@ -21,7 +21,7 @@ use futures::FutureExt as _;
 use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
-use store::{Agent, LimitWindow, NewMessageRef, Store, StoreError, TurnUsage};
+use store::{Agent, CostUnknown, LimitWindow, NewMessageRef, Store, StoreError, TurnUsage};
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -1447,19 +1447,20 @@ fn limit_window(reason: RefuseReason) -> Option<(&'static str, LimitWindow)> {
 /// model read fresh (uncached input and cache writes), the output and the
 /// cost, from [`TurnOutcome::usage`], so a turn that crashed or timed out
 /// is billed what its messages used. Cache reads, which every call of a
-/// turn repeats, aren't billed.
+/// turn repeats, aren't billed. A turn whose cost isn't known, one that
+/// crashed or timed out among them, is billed none and recorded with why.
 fn turn_usage(outcome: &TurnOutcome) -> TurnUsage {
     let usage = outcome.usage();
-    let cost_usd = match outcome {
-        TurnOutcome::Finished(result) => result.cost_usd.unwrap_or(0.0),
-        TurnOutcome::Crashed { .. } | TurnOutcome::TimedOut { .. } => 0.0,
+    let cost = match outcome {
+        TurnOutcome::Finished(result) => result.cost_usd,
+        TurnOutcome::Crashed { .. } | TurnOutcome::TimedOut { .. } => Err(CostUnknown::NoResult),
     };
     TurnUsage {
         input_tokens: usage
             .input_tokens
             .saturating_add(usage.cache_creation_input_tokens),
         output_tokens: usage.output_tokens,
-        cost_usd,
+        cost,
     }
 }
 
