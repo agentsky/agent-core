@@ -7375,17 +7375,23 @@ private task still waits for it; a crash is billed as a turn of unknown
 cost (T27's `CostUnknown`). Dropped before the turn ended, `TurnTask`
 spawns a loop that kills the session's containers every 200 ms until the
 turn's task has finished, for at most 30 seconds in all, its kills' own
-waits included, covering a turn still starting its container. The session
-is then stopped, once its turn ended either way, and a claim whose turn is
-known to have ended is released, so another instance takes the task up at
-once and finds the session marked if the turn reached the model. The loops
-run in a `JoinSet` the pipeline holds: `Pipeline::cut_short` waits for
-them, 35 seconds at most, before it returns, and `Server::run` closes the
-store only after it, so a turn cut by a shutdown is billed while the store
-is open. In the Docker sandbox the kill is the sandbox's stop, which gives
-the process the daemon's grace period (10 seconds) before it is killed.
-The test runs `sleep 90` and asserts that once `cut_short` returns, within
-ten seconds, the session is cold, the owner billed and the claim free.
+waits included, covering a turn still starting its container. Once the
+turn has ended the session is stopped and the claim released, so another
+instance takes the task up at once and finds the session marked if the
+turn reached the model; a turn that outlives the kills keeps its claim
+until the lease lapses, and its container is left to the runner's idle
+reaping rather than waited for. The loops run in a `JoinSet` the pipeline
+holds, which `Pipeline::wait_for_kills` waits for, 35 seconds at most.
+`Pipeline::cut_short` releases the other claims and tells the cut threads
+to ask again first, so those notices aren't held up; `Server::run` then
+waits for the kills, unless a second signal forces the shutdown, which
+drops them at once as before, and closes the store only after, so a turn
+cut by a shutdown is billed while the store is open. `Pipeline::drain`
+waits for kills of taken-over tasks too. In the Docker sandbox the kill is
+the sandbox's stop, which gives the process the daemon's grace period (10
+seconds) before it is killed. The test runs `sleep 90` and asserts that
+once `cut_short` and `wait_for_kills` return, within ten seconds, the
+session is cold, the owner billed and the claim free.
 
 ### Every path ends in `finish_consent`
 
@@ -7396,7 +7402,11 @@ interrupted task left theirs on the owner's private volume, with whatever
 an owner-side task copied out of `memory/`.
 
 **Solution.** `Pipeline::finish_consent`, which every outcome reaches once
-the consent's work is done, stops each of the consent's private sessions
+the consent's work is done, first renews its claim: a claim another one
+took over touches nothing, since the newer claim's session may be running
+(a test steals the claim mid-turn and checks the newer session's directory
+survives the stale claim's delivery), and the renewal keeps any other claim
+from taking over meanwhile. It then stops each of the consent's private sessions
 (`Store::private_sessions_of`), which waits for a turn still running in it
 here, and deletes its directory, then records the work finished and
 deletes the staged files. The directories go before the record, so a crash
@@ -7461,9 +7471,11 @@ app.
   that stays the same: their Slack mention with their user id, or their
   name on their surface (`OpenDm::name_of`: the Slack user's name, the
   Rocket.Chat username), looked up when the card is sent, with their id.
-  In the name each control or invisible character shows as U+FFFD, so it
-  can't make an exact copy of another name, and it is at most 80
-  characters. When the card goes to another surface than the thread's,
+  The name drops the presentation and joining characters a task drops
+  (below), each other control or invisible character shows as U+FFFD, so
+  it can't make an exact copy of another name, and it is at most 80
+  characters; agent listings show owners' names the same way
+  (`commands::reply::shown_name`). When the card goes to another surface than the thread's,
   the requester and the thread are named for that surface: a Slack mention
   or channel link means nothing on Rocket.Chat. Text from elsewhere on a
   Slack card (names, ids) has `&`, `<` and `>` escaped
@@ -7517,12 +7529,27 @@ push it below Slack's fold, and stacked combining marks draw over the
 card's own text: the text the owner approved could hide instructions the
 model reads.
 
-**Solution.** `agentctl private` refuses, before anything is staged, a task
-with a control character other than a newline or tab, a character
-`ctl::is_invisible` matches, a run of more than 4 blanks within a line,
-more than 2 blank lines in a row, or more than 2 combining diacritical
-marks in a row (the blocks of marks any letter takes, so scripts whose
-letters carry their own marks aren't refused). `ctl::is_invisible` is
+**Solution.** `agentctl private` first drops from the task the characters
+that only choose how their neighbours are drawn (`ctl::without_joiners`):
+the emoji and text presentation selectors U+FE0E and U+FE0F, which ⚠️
+carries, and the zero-width non-joiner and joiner, which Persian and other
+joining scripts, and emoji such as 👨‍💻, use. The text reads the same
+without them, so the card and the model see the same stored text, and the
+other variation selectors, the 256-value channel emoji smuggling uses,
+stay refused. It then refuses, before anything is staged, a task with a
+control character other than a newline or tab, a character
+`ctl::is_invisible` matches, a line indented more than 32 columns (a tab
+counting as 8), a run of more than 16 blanks after a line's first visible
+character (enough for a table's alignment), more than 2 blank lines in a
+row, or more than 4 combining diacritical marks in a row (the blocks of
+marks any letter takes, so scripts whose letters carry their own marks
+aren't refused). Blank means whitespace or U+2800, the Braille blank,
+which isn't whitespace but draws as nothing. Indented code, YAML and
+nested lists pass. File names are still refused, not changed, for any
+invisible character: a name must match the file on disk and what the card
+lists. Whether Rocket.Chat wraps a code block's long lines hasn't been
+checked live; the limits hold either way, but a long line without blanks
+could still run off the view if it doesn't. `ctl::is_invisible` is
 Unicode's whole `Default_Ignorable_Code_Point` set
 (`render::is_default_ignorable`, which the Slack renderer's link check
 already used), and the line and paragraph separators and interlinear

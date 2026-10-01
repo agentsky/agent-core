@@ -254,6 +254,8 @@ fn zip_entries_that_leave_the_directory_or_hide_are_refused() {
         "./a",
         "a\\..\\b",
         "a\u{202e}txt.exe",
+        "a\u{fe0f}b",
+        "a\u{3164}b",
         "a\nb",
     ] {
         let dir = TempDir::new();
@@ -402,6 +404,13 @@ fn a_tree_with_a_symlink_special_file_or_hidden_name_is_refused() {
     fs::create_dir_all(&tree).unwrap();
     fs::write(tree.join("a\u{200b}b"), "x").unwrap();
     assert_eq!(problem(check_tree(&tree)), Problem::BadName);
+
+    for (index, name) in ["a\u{fe0f}b", "a\u{3164}b"].into_iter().enumerate() {
+        let tree = dir.join(&format!("ignorable-{index}"));
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join(name), "x").unwrap();
+        assert_eq!(problem(check_tree(&tree)), Problem::BadName, "{name:?}");
+    }
 }
 
 #[test]

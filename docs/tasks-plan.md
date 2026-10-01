@@ -2788,8 +2788,10 @@ Deliverables:
      files are staged and again in the insert's transaction, and files over
      one attachment's cap together. Refuse a task the card couldn't show as
      the model reads it: control or invisible (default-ignorable)
-     characters, runs of more than 4 blanks, more than 2 blank lines in a
-     row, or more than 2 stacked combining marks.
+     characters (after dropping presentation selectors and zero-width
+     joiners), indentation past 32 columns, runs of more than 16 blanks
+     after a line's first visible character, more than 2 blank lines in a
+     row, or more than 4 stacked combining marks.
 - Consent card:
   - Slack: Block Kit in the owner's DM from the manager bot, showing the exact
     task text, requester, channel and thread link, with Approve and Decline

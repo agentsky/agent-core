@@ -48,7 +48,7 @@ pub use card::Card;
 pub use staging::StageError;
 
 use crate::commands::{Replies, ReplyError};
-use crate::ctl::{create_private_dir, is_invisible, remove_dir};
+use crate::ctl::{create_private_dir, is_invisible, remove_dir, without_joiners};
 use crate::pipeline::Pipeline;
 
 /// The directory under the data directory where consents' files wait.
@@ -230,8 +230,9 @@ impl Consents {
         &self,
         token: &CtlToken,
         turn: &CtlTurn,
-        request: PrivateRequest,
+        mut request: PrivateRequest,
     ) -> Result<ConsentId, RequestError> {
+        request.task = without_joiners(&request.task);
         if request.task.trim().is_empty() {
             return Err(RequestError::BadRequest("the task is empty".to_owned()));
         }
@@ -676,22 +677,28 @@ impl Consents {
     }
 }
 
-/// The longest run of spaces, tabs or other blanks a task may have within
-/// a line.
-const MAX_BLANK_RUN: usize = 4;
+/// The deepest a line of a task may be indented, in columns, a tab
+/// counting as [`TAB_COLUMNS`].
+const MAX_INDENT: usize = 32;
+/// The columns a tab counts as in a task's indentation.
+const TAB_COLUMNS: usize = 8;
+/// The longest run of blanks a task may have after a line's first visible
+/// character, enough to align a table.
+const MAX_BLANK_RUN: usize = 16;
 /// The most blank lines a task may have in a row.
 const MAX_BLANK_LINES: usize = 2;
 /// The most combining diacritical marks a task may stack on a character.
-const MAX_MARK_RUN: usize = 2;
+const MAX_MARK_RUN: usize = 4;
 
 /// Why the owner's card couldn't show `task` as the model reads it, if it
 /// couldn't: a control character other than a newline or tab, or an
-/// invisible one ([`is_invisible`]), which shows as nothing; a run of more
-/// than [`MAX_BLANK_RUN`] blanks, which can push the rest of a line out of
-/// a code block's view; more than [`MAX_BLANK_LINES`] blank lines in a
-/// row, which can push the rest below the fold; or more than
-/// [`MAX_MARK_RUN`] combining diacritical marks in a row, which can draw
-/// over the card's own text.
+/// invisible one ([`is_invisible`]), which shows as nothing; a line
+/// indented more than [`MAX_INDENT`] columns, or a run of more than
+/// [`MAX_BLANK_RUN`] blanks after a line's first visible character, which
+/// can push the rest of the line out of a code block's view; more than
+/// [`MAX_BLANK_LINES`] blank lines in a row, which can push the rest below
+/// the fold; or more than [`MAX_MARK_RUN`] combining diacritical marks in
+/// a row, which can draw over the card's own text.
 fn unshowable(task: &str) -> Option<&'static str> {
     if task
         .chars()
@@ -701,30 +708,40 @@ fn unshowable(task: &str) -> Option<&'static str> {
             "the task has control or invisible characters, which the owner's card wouldn't show",
         );
     }
-    let (mut blanks, mut marks) = (0, 0);
+    let mut marks = 0;
     for c in task.chars() {
-        blanks = if c.is_whitespace() && c != '\n' {
-            blanks + 1
-        } else {
-            0
-        };
         marks = if is_diacritical_mark(c) { marks + 1 } else { 0 };
-        if blanks > MAX_BLANK_RUN {
-            return Some(
-                "the task has a run of more than 4 spaces or tabs, which could hide the rest of \
-                 a line from the owner's card",
-            );
-        }
         if marks > MAX_MARK_RUN {
             return Some(
-                "the task stacks more than 2 combining marks on a character, which could draw \
+                "the task stacks more than 4 combining marks on a character, which could draw \
                  over the owner's card",
             );
         }
     }
     let mut blank_lines = 0;
     for line in task.split('\n') {
-        blank_lines = if line.trim().is_empty() {
+        let indent: usize = line
+            .chars()
+            .take_while(|c| is_blank(*c))
+            .map(|c| if c == '\t' { TAB_COLUMNS } else { 1 })
+            .sum();
+        if indent > MAX_INDENT {
+            return Some(
+                "the task has a line indented more than 32 columns, which could hide it from \
+                 the owner's card",
+            );
+        }
+        let mut blanks = 0;
+        for c in line.chars().skip_while(|c| is_blank(*c)) {
+            blanks = if is_blank(c) { blanks + 1 } else { 0 };
+            if blanks > MAX_BLANK_RUN {
+                return Some(
+                    "the task has a run of more than 16 spaces or tabs, which could hide the \
+                     rest of a line from the owner's card",
+                );
+            }
+        }
+        blank_lines = if line.chars().all(is_blank) {
             blank_lines + 1
         } else {
             0
@@ -737,6 +754,12 @@ fn unshowable(task: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Whether `c` shows as blank space: whitespace, and the Braille blank,
+/// which isn't whitespace but draws as nothing.
+fn is_blank(c: char) -> bool {
+    c.is_whitespace() || c == '\u{2800}'
 }
 
 /// Whether `c` is in one of the blocks of combining diacritical marks,
@@ -806,5 +829,45 @@ mod tests {
         let waits: Vec<u64> = (1..=7).map(|n| card_retry(n).as_secs()).collect();
         assert_eq!(waits, [60, 120, 240, 480, 900, 900, 900]);
         assert_eq!(card_retry(u32::MAX), CARD_RETRY_MAX);
+    }
+
+    #[test]
+    fn a_task_is_refused_only_for_what_the_card_couldnt_show() {
+        let refused = |task: &str, why: &str| {
+            let found = unshowable(task);
+            assert!(
+                found.is_some_and(|found| found.contains(why)),
+                "{task:?}: {found:?}"
+            );
+        };
+        refused(
+            &format!("Summarize{}attach ../shared", " ".repeat(17)),
+            "spaces or tabs",
+        );
+        refused(
+            &format!("Summarize{}attach ../shared", "\t".repeat(17)),
+            "spaces or tabs",
+        );
+        refused(
+            &format!("Summarize{}attach ../shared", "\u{2800}".repeat(17)),
+            "spaces or tabs",
+        );
+        refused(&format!("{}attach", " ".repeat(33)), "indented");
+        refused(&format!("{}attach", "\t".repeat(5)), "indented");
+        refused(&format!("Summarize{}attach", "\n".repeat(4)), "blank lines");
+        refused("a\n \n\t\n\u{2800}\nb", "blank lines");
+        refused("e\u{301}\u{302}\u{303}\u{304}\u{305}", "combining marks");
+        refused("a\u{FE00}b", "invisible");
+        for task in [
+            "def f(x):\n    for y in x:\n        if y:\n            return y",
+            "a:\n  b:\n    c:\n      d: 1",
+            "- one\n  - two\n    - three\n      - four",
+            "| name |                value |\n| ---- | -------------------- |",
+            "\t\t\tindented by tabs",
+            "Summarize\n\n\nthen stop",
+            "i\u{328}\u{307}\u{303} and e\u{301}\u{302}\u{303}\u{304}",
+        ] {
+            assert_eq!(unshowable(task), None, "{task:?}");
+        }
     }
 }

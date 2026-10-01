@@ -66,7 +66,7 @@ pub use store::CtlTurn as Turn;
 pub use token::ProcessToken;
 
 use api::{ApiError, Authorized, no_turn};
-pub(crate) use api::{is_invisible, is_plain_file_name};
+pub(crate) use api::{is_invisible, is_plain_file_name, without_joiners};
 pub(crate) use outbox::{create_private_dir, remove_dir};
 
 /// The longest message `agentctl post` accepts, in bytes.

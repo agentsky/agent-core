@@ -123,8 +123,9 @@ returns a consent id at once and does not wait for the task. Unless this
 turn is your owner's own direct message with you, your owner is asked to
 approve the task first, and sees it exactly as you wrote it, so write it
 plainly: invisible or control characters other than newlines and tabs,
-runs of more than 4 spaces or tabs, more than 2 blank lines in a row and
-stacked accents are refused; the task text may be at most 3000 characters, an
+indentation past 32 columns, runs of more than 16 spaces or tabs inside a
+line, more than 2 blank lines in a row and heavily stacked accents are
+refused; the task text may be at most 3000 characters, an
 emoji counting as two. When the task
 finishes, agentd posts its result to this thread; you won't see it in this
 turn, so tell the requester that the result will follow.

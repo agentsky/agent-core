@@ -180,7 +180,9 @@ agents still answer others. Admins can't be banned.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask
-again. A second signal drops them at once. Logs go to standard error,
+again. A private task's turn dropped that way is killed and billed first,
+which can take up to about half a minute. A second signal drops them at
+once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
 
 ### Slack

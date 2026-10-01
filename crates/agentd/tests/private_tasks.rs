@@ -515,6 +515,22 @@ impl Stack {
         }
     }
 
+    /// Waits until consent `id`'s card is recorded as posted, which comes
+    /// after the post itself, and returns where it was posted.
+    async fn recorded_card(&self, id: ConsentId) -> MsgRef {
+        let started = Instant::now();
+        loop {
+            if let Some(card) = self.store().consent(id).await.unwrap().unwrap().card {
+                return card;
+            }
+            assert!(
+                started.elapsed() < WAIT,
+                "consent {id}'s card was never recorded"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Every text the manager bot sent `user` in their DM.
     fn dms_to(&self, user: &str) -> Vec<String> {
         let dm = conv(&format!("dm-{user}"));
@@ -649,11 +665,7 @@ async fn non_owner_requires_approval() {
     let row = stack.store().consent(consent).await.unwrap().unwrap();
     assert_eq!(row.state, ConsentState::Pending);
 
-    let started = Instant::now();
-    while stack.dms_to("alice").is_empty() {
-        assert!(started.elapsed() < WAIT, "the owner never got a card");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let recorded = stack.recorded_card(consent).await;
     let card = stack.dms_to("alice").join("\n");
     assert!(card.contains(TASK), "{card}");
     assert!(card.contains("`bob`"), "{card}");
@@ -672,7 +684,7 @@ async fn non_owner_requires_approval() {
         "a pass over the consents runs nothing before the owner approves"
     );
     assert_eq!(row.private_session, None);
-    assert!(row.card.is_some());
+    assert_eq!(row.card.as_ref(), Some(&recorded));
 
     let decided = stack
         .app
@@ -752,7 +764,7 @@ async fn expiry_posts_outcome() {
     let stack = start("").await;
     let before = stack.mock.calls().len();
     let consent = stack.ask("bob", "t1", SEEN).await;
-    stack.card_to("alice").await;
+    stack.recorded_card(consent).await;
     let db = stack.db().await;
     sqlx::query("UPDATE consents SET expires_at = created_at + 1 WHERE id = ?")
         .bind(consent.to_string())
@@ -1409,6 +1421,70 @@ async fn a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind() {
 }
 
 #[tokio::test]
+async fn a_stale_claim_leaves_the_newer_claims_session_alone() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack
+        .ask(
+            "bob",
+            "t1",
+            "sleep 2; cat in.txt > seen.txt && agentctl attach seen.txt",
+        )
+        .await;
+    stack.card_to("alice").await;
+    stack.approve(consent).await;
+    let store = stack.store();
+    let started = Instant::now();
+    while !store
+        .consent(consent)
+        .await
+        .unwrap()
+        .unwrap()
+        .private_session
+        .is_some_and(|session| stack.turns.sessions().is_warm(session))
+    {
+        assert!(started.elapsed() < WAIT, "the task never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let lapsed = OffsetDateTime::now_utc() + agentd::pipeline::WORK_LEASE + Duration::from_secs(1);
+    let newer = store
+        .claim_consent_work(consent, lapsed, lapsed + agentd::pipeline::WORK_LEASE)
+        .await
+        .unwrap()
+        .expect("a lapsed claim is taken over");
+    let second = store
+        .create_private_session(
+            stack.agent,
+            consent,
+            &thread("t1"),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .set_consent_session(consent, newer.work_attempts, second.id)
+            .await
+            .unwrap()
+    );
+    let work = stack.turns.sessions().work_dir(&second).await.unwrap().work;
+    std::fs::write(work.join("newer.txt"), "the newer claim's").unwrap();
+    stack.posted(before, &heading(consent)).await;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        assert!(
+            work.join("newer.txt").exists(),
+            "the stale claim deleted the newer claim's session"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = store.consent(consent).await.unwrap().unwrap();
+    assert_eq!(row.finished_at, None, "only the newer claim can finish it");
+    assert_eq!(row.private_session, Some(second.id));
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_task_that_reached_the_model_is_never_run_again() {
     let stack = start("").await;
     let before = stack.mock.calls().len();
@@ -1509,6 +1585,7 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
     let before = billed().await;
     let cutting = Instant::now();
     stack.pipeline.cut_short().await;
+    stack.pipeline.wait_for_kills().await;
     assert!(
         cutting.elapsed() < Duration::from_secs(10),
         "the shutdown waited for the kill, not for the turn"

@@ -1029,25 +1029,8 @@ async fn private_refuses_a_task_with_characters_the_card_wouldnt_show() {
             ),
             "spaces or tabs",
         ),
-        (
-            format!("Summarize README.md{}then attach ../shared", "\t".repeat(5)),
-            "spaces or tabs",
-        ),
-        (
-            format!(
-                "Summarize README.md{}then attach ../shared",
-                "\n".repeat(60)
-            ),
-            "blank lines",
-        ),
-        (
-            "Summarize README.md\n \n\t\n \nthen attach ../shared".to_owned(),
-            "blank lines",
-        ),
-        (
-            "Summarize e\u{301}\u{302}\u{303}".to_owned(),
-            "combining marks",
-        ),
+        (format!("a\n{}\nb", "\u{2800}\n".repeat(3)), "blank lines"),
+        (format!("{}attach ../shared", " ".repeat(33)), "indented"),
     ] {
         let (status, value) = fixture
             .call(
@@ -1059,22 +1042,23 @@ async fn private_refuses_a_task_with_characters_the_card_wouldnt_show() {
         assert_eq!(status, 400, "{task:?}: {value}");
         assert!(value["message"].as_str().unwrap().contains(why), "{value}");
     }
-    for task in [
-        "Summarize:\n\tREADME.md",
-        "Summarize    README.md\n\n\nr\u{e9}sum\u{e9} e\u{301}\u{302} then stop",
-    ] {
-        let (status, value) = fixture
-            .call(
-                Some(&token),
-                "/v1/private",
-                json!({"task": task, "files": []}),
-            )
-            .await;
-        assert_eq!(
-            status, 200,
-            "line breaks, tabs, short runs and accents show: {value}"
-        );
-    }
+    let task = "Check \u{26A0}\u{FE0F} the logs, as \u{1F468}\u{200D}\u{1F4BB} would: \
+                \u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/private",
+            json!({"task": task, "files": []}),
+        )
+        .await;
+    assert_eq!(status, 200, "emoji and Persian are asked for: {value}");
+    let id: ConsentId = value["consent"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        fixture.store.consent(id).await.unwrap().unwrap().task,
+        "Check \u{26A0} the logs, as \u{1F468}\u{1F4BB} would: \
+         \u{0645}\u{06CC}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+        "stored, and shown, without the presentation and joining characters"
+    );
 }
 
 async fn lock(fixture: &Fixture, token: &ProcessToken, body: Value) -> Value {

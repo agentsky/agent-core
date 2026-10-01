@@ -374,6 +374,20 @@ pub(crate) fn is_invisible(c: char) -> bool {
         || matches!(c, '\u{2028}' | '\u{2029}' | '\u{FFF9}'..='\u{FFFB}')
 }
 
+/// `text` without the characters that only choose how what is around them
+/// is drawn: the text and emoji presentation selectors (U+FE0E, U+FE0F),
+/// which emoji such as ⚠️ carry, and the zero-width non-joiner and joiner
+/// (U+200C, U+200D), which Persian and other joining scripts, and emoji
+/// sequences such as 👨‍💻, use. Without them the text reads the same, its
+/// emoji in their default form or as their parts, so a card can show
+/// exactly what the model reads while [`is_invisible`] refuses every other
+/// invisible character.
+pub(crate) fn without_joiners(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}' | '\u{200C}' | '\u{200D}'))
+        .collect()
+}
+
 /// `POST /v1/post`: queues a message after checking its target.
 async fn post_message(
     State(ctl): State<Ctl>,

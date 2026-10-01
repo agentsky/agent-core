@@ -496,12 +496,15 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Deletes the directories of consent `id`'s private sessions, each
-    /// once its container is stopped, which waits for a turn running in
-    /// it here, then records that claim `attempt` did the consent's work
+    /// Once claim `attempt` on consent `id`'s work is known to be the
+    /// current one, which renews it so no other claim can take the work
+    /// over meanwhile, deletes the directories of the consent's private
+    /// sessions, each once its container is stopped, which waits for a
+    /// turn running in it here, then records that the claim did the work
     /// and deletes its files: every path a consent's work takes ends here.
     /// The directories go first, so nothing is left if the record is the
-    /// last thing that happens; a later claim finds them gone.
+    /// last thing that happens; a later claim finds them gone. A stale
+    /// claim touches nothing.
     async fn finish_consent(
         &self,
         consents: &Consents,
@@ -509,6 +512,13 @@ impl Pipeline {
         attempt: u32,
     ) -> Result<(), StoreError> {
         let store = &self.inner.store;
+        if !store
+            .renew_consent_work(id, attempt, Consents::now() + WORK_LEASE)
+            .await?
+        {
+            tracing::warn!(consent = %id, attempt, "a claim that lost a private task's work didn't finish it");
+            return Ok(());
+        }
         let sessions = self.inner.turns.sessions();
         for session in store.private_sessions_of(id).await? {
             sessions.stop(session.id).await;
@@ -522,10 +532,11 @@ impl Pipeline {
 
     /// Kills the containers of `session`, whose private task for claim
     /// `attempt` on consent `id` was cut short while `turn` ran in it,
-    /// until the turn ends, for at most [`KILL_TIMEOUT`], and stops the
-    /// session once it has. A turn known to have ended releases the claim,
-    /// so the next claim can take the task up at once; it finds the session
-    /// marked if the turn reached the model.
+    /// until the turn ends, for at most [`KILL_TIMEOUT`], and then stops the
+    /// session and releases the claim, so the next claim can take the task
+    /// up at once; it finds the session marked if the turn reached the
+    /// model. A turn that outlives the kills keeps its claim until the lease
+    /// lapses, and its container is left to the runner's idle reaping.
     async fn kill_turn(
         self,
         id: ConsentId,
@@ -543,8 +554,7 @@ impl Pipeline {
         .await
         .is_ok();
         if !killed {
-            tracing::warn!(%session, "a private task's turn outlived its kills; it is stopped once it ends");
-            sessions.stop(session).await;
+            tracing::warn!(%session, "a private task's turn outlived its kills");
             return;
         }
         tracing::info!(%session, "killed the turn of a private task cut short");
@@ -565,19 +575,26 @@ impl Pipeline {
         }
     }
 
-    /// Waits for the kills of the turns a shutdown cut short, for at most
-    /// [`KILL_TIMEOUT`] and a little more, so those turns are billed while
-    /// the store is open. A kill still waiting is left to finish alone.
-    pub(super) async fn wait_for_kills(&self) {
-        let mut kills = std::mem::take(&mut *lock(&self.inner.kills));
+    /// Waits for the kills of the private tasks' turns that were cut short
+    /// or taken over, for at most about 35 seconds, so those turns are
+    /// billed and their claims released while the store is open. Cancelled,
+    /// it leaves the kills running.
+    pub async fn wait_for_kills(&self) {
         let waited = tokio::time::timeout(KILL_TIMEOUT + KILL_GRACE, async {
-            while kills.join_next().await.is_some() {}
+            while let Some(joined) =
+                std::future::poll_fn(|cx| lock(&self.inner.kills).poll_join_next(cx)).await
+            {
+                if let Err(err) = joined {
+                    tracing::error!(error = %err, "killing a private task's turn failed");
+                }
+            }
         })
         .await;
         if waited.is_err() {
+            let mut kills = lock(&self.inner.kills);
             tracing::warn!(
                 left = kills.len(),
-                "turns a shutdown cut short are still being killed"
+                "private tasks' turns cut short are still being killed"
             );
             kills.detach_all();
         }

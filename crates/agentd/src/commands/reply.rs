@@ -55,11 +55,13 @@ pub trait OpenDm: Send + Sync {
     }
 }
 
-/// `name` as a card may show it: at most [`MAX_NAME_CHARS`] long, each
-/// control or invisible character replaced by U+FFFD. `None` for a blank
-/// name.
-fn shown_name(name: &str) -> Option<String> {
-    let name: String = name
+/// A member's `name` as agentd shows it: without the presentation and
+/// joining characters [`without_joiners`](crate::ctl::without_joiners)
+/// drops, each other control or invisible character replaced by U+FFFD so
+/// the name can't pass for another, and at most [`MAX_NAME_CHARS`] long.
+/// `None` for a name with nothing to show but blanks and backticks.
+pub(crate) fn shown_name(name: &str) -> Option<String> {
+    let name: String = crate::ctl::without_joiners(name)
         .chars()
         .map(|c| {
             if c.is_control() || crate::ctl::is_invisible(c) {
@@ -70,7 +72,9 @@ fn shown_name(name: &str) -> Option<String> {
         })
         .take(MAX_NAME_CHARS)
         .collect();
-    (!name.trim().is_empty()).then_some(name)
+    name.chars()
+        .any(|c| c != '`' && !c.is_whitespace())
+        .then_some(name)
 }
 
 /// The longest name [`Replies::name_of`] gives, in characters.
@@ -396,6 +400,13 @@ mod tests {
             Some("a\u{FFFD}\u{FFFD}b")
         );
         assert_eq!(shown_name("   "), None);
+        assert_eq!(shown_name(" `` "), None, "nothing left to show as code");
+        assert_eq!(
+            shown_name("\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}")
+                .as_deref(),
+            Some("\u{0645}\u{06CC}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}"),
+            "joiners are dropped, not marked"
+        );
         assert_eq!(
             shown_name(&"x".repeat(200)).map(|name| name.chars().count()),
             Some(MAX_NAME_CHARS)

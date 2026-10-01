@@ -419,7 +419,9 @@ impl Pipeline {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
-    /// Waits until every message taken is answered. Call it after
+    /// Waits until every message taken is answered, and the kills of
+    /// private tasks' turns cut short meanwhile have ended
+    /// ([`wait_for_kills`](Self::wait_for_kills)). Call it after
     /// [`close`](Self::close), or it may never end.
     ///
     /// Cancelling it leaves what is still running for
@@ -432,6 +434,7 @@ impl Pipeline {
                 tracing::error!(error = %err, "a pipeline task failed");
             }
         }
+        self.wait_for_kills().await;
         self.tell_cut().await;
     }
 
@@ -440,14 +443,14 @@ impl Pipeline {
     /// its working emoji taken off and its thread told to ask again
     /// ([`RESTARTING_TEXT`]), within a few seconds. Messages still waiting
     /// are dropped without a word: no decision was made about them yet.
-    /// The private tasks it drops have their turns killed, and are
-    /// billed and released for another instance, within about
-    /// half a minute.
+    /// The private tasks it drops are released for another instance, but
+    /// those whose turn had started are left to their kills, which
+    /// [`wait_for_kills`](Self::wait_for_kills) waits for: they release
+    /// the claim once the turn is billed.
     pub async fn cut_short(&self) {
         self.close();
         let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         tasks.shutdown().await;
-        self.wait_for_kills().await;
         self.release_cut_tasks().await;
         lock(&self.inner.lanes).clear();
         {
