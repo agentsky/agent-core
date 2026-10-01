@@ -495,7 +495,7 @@ mod tests {
         );
         assert_eq!(
             code_span("a\u{200B}d\u{200D}a\u{FEFF}\u{200F}\u{2060}"),
-            "`a\u{FFFD}da\u{FFFD}\u{FFFD}\u{FFFD}`",
+            "`a\u{FFFD}d\u{FFFD}a\u{FFFD}\u{FFFD}\u{FFFD}`",
             "a name can't pass for `ada` by hiding characters"
         );
         assert_eq!(code_span("\u{200B}\u{202E}"), "`\u{FFFD}\u{FFFD}`");

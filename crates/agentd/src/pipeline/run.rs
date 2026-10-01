@@ -447,8 +447,8 @@ impl Pipeline {
                 tracing::error!(error = %err, "a pipeline task failed");
             }
         }
-        self.wait_for_kills().await;
         self.tell_cut().await;
+        self.wait_for_kills().await;
     }
 
     /// Closes the pipeline and drops every message still waiting or being

@@ -7471,10 +7471,11 @@ app.
   that stays the same: their Slack mention with their user id, or their
   name on their surface (`OpenDm::name_of`: the Slack user's name, the
   Rocket.Chat username), looked up when the card is sent, with their id.
-  The name drops the presentation and joining characters a task drops
-  (below), each other control or invisible character shows as U+FFFD, so
-  it can't make an exact copy of another name, and it is at most 80
-  characters; agent listings show owners' names the same way
+  In the name each control or invisible character, joiners included,
+  shows as U+FFFD, so it can't make an exact copy of another name, and it
+  is at most 80 characters (a task's joiners are dropped instead, below,
+  only so the card and the model read the same text; a name needs no
+  such match); agent listings show owners' names the same way
   (`commands::reply::shown_name`). When the card goes to another surface than the thread's,
   the requester and the thread are named for that surface: a Slack mention
   or channel link means nothing on Rocket.Chat. Text from elsewhere on a
@@ -7538,13 +7539,16 @@ without them, so the card and the model see the same stored text, and the
 other variation selectors, the 256-value channel emoji smuggling uses,
 stay refused. It then refuses, before anything is staged, a task with a
 control character other than a newline or tab, a character
-`ctl::is_invisible` matches, a line indented more than 32 columns (a tab
-counting as 8), a run of more than 16 blanks after a line's first visible
-character (enough for a table's alignment), more than 2 blank lines in a
-row, or more than 4 combining diacritical marks in a row (the blocks of
-marks any letter takes, so scripts whose letters carry their own marks
-aren't refused). Blank means whitespace or U+2800, the Braille blank,
-which isn't whitespace but draws as nothing. Indented code, YAML and
+`ctl::is_invisible` matches, a line indented more than 32 columns, a run
+of blanks wider than 16 columns after a line's first visible character
+(enough for a table's alignment), more than 2 blank lines in a row, or
+more than 4 combining diacritical marks in a row (the blocks of marks any
+letter takes, so scripts whose letters carry their own marks aren't
+refused). Columns count a tab as 8 and the ideographic space as 2, in an
+indent and inside a line alike. Blank means whitespace, or U+2800 (the
+Braille blank) or U+1D159 (the musical null notehead), which aren't
+whitespace but draw as nothing. A line of nothing but blanks counts only
+as a blank line, however wide. Indented code, YAML and
 nested lists pass. File names are still refused, not changed, for any
 invisible character: a name must match the file on disk and what the card
 lists. Whether Rocket.Chat wraps a code block's long lines hasn't been
@@ -7625,6 +7629,17 @@ reason if it wants one.
   instance died counts nothing, so a task that kills agentd before
   reaching the model would be claimed again and again; a panic in the
   task's own task doesn't bring agentd down, so this is unlikely.
+- Combining marks are counted only in the generic diacritical blocks, so
+  stacked marks of a script's own (Thai tone marks, Hebrew and Arabic
+  points, the Cyrillic enclosing signs) aren't limited; counting
+  General_Category Mn and Me would need a Unicode table this workspace
+  doesn't carry yet.
+- A takeover's kill that outlives `KILL_TIMEOUT` (a turn that survives
+  30 seconds of Docker stops) leaves the turn holding its session's slot,
+  so a later `finish_consent` on the same instance waits in its
+  `sessions.stop` until the turn ends. Very unlikely; bounding that stop,
+  or killing instead and leaving the container to the idle reaper, would
+  fix it.
 - Whether a session still runs is known only on its own instance. If a
   claim's renewals keep failing while its turn runs, another instance can
   take the task over, report it interrupted and delete that session's

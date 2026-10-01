@@ -134,7 +134,7 @@ returns a consent id at once and does not wait for the task. Unless this
 turn is your owner's own direct message with you, your owner is asked to
 approve the task first, and sees it exactly as you wrote it, so write it
 plainly: invisible or control characters other than newlines and tabs,
-indentation past 32 columns, runs of more than 16 spaces or tabs inside a
+indentation past 32 columns, blank runs wider than 16 columns (a tab is 8) inside a
 line, more than 2 blank lines in a row and heavily stacked accents are
 refused; the task text may be at most 3000 characters, an
 emoji counting as two. When the task
