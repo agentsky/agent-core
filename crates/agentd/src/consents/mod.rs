@@ -241,16 +241,8 @@ impl Consents {
                  as two"
             )));
         }
-        if request
-            .task
-            .chars()
-            .any(|c| (c.is_control() && c != '\n' && c != '\t') || is_invisible(c))
-        {
-            return Err(RequestError::BadRequest(
-                "the task has control or invisible characters, which the owner's card wouldn't \
-                 show"
-                    .to_owned(),
-            ));
+        if let Some(why) = unshowable(&request.task) {
+            return Err(RequestError::BadRequest(why.to_owned()));
         }
         if request.files.len() > MAX_FILES {
             return Err(RequestError::BadRequest(format!(
@@ -682,6 +674,82 @@ impl Consents {
         pipeline.settle_consents(self).await?;
         self.sweep_files().await
     }
+}
+
+/// The longest run of spaces, tabs or other blanks a task may have within
+/// a line.
+const MAX_BLANK_RUN: usize = 4;
+/// The most blank lines a task may have in a row.
+const MAX_BLANK_LINES: usize = 2;
+/// The most combining diacritical marks a task may stack on a character.
+const MAX_MARK_RUN: usize = 2;
+
+/// Why the owner's card couldn't show `task` as the model reads it, if it
+/// couldn't: a control character other than a newline or tab, or an
+/// invisible one ([`is_invisible`]), which shows as nothing; a run of more
+/// than [`MAX_BLANK_RUN`] blanks, which can push the rest of a line out of
+/// a code block's view; more than [`MAX_BLANK_LINES`] blank lines in a
+/// row, which can push the rest below the fold; or more than
+/// [`MAX_MARK_RUN`] combining diacritical marks in a row, which can draw
+/// over the card's own text.
+fn unshowable(task: &str) -> Option<&'static str> {
+    if task
+        .chars()
+        .any(|c| (c.is_control() && c != '\n' && c != '\t') || is_invisible(c))
+    {
+        return Some(
+            "the task has control or invisible characters, which the owner's card wouldn't show",
+        );
+    }
+    let (mut blanks, mut marks) = (0, 0);
+    for c in task.chars() {
+        blanks = if c.is_whitespace() && c != '\n' {
+            blanks + 1
+        } else {
+            0
+        };
+        marks = if is_diacritical_mark(c) { marks + 1 } else { 0 };
+        if blanks > MAX_BLANK_RUN {
+            return Some(
+                "the task has a run of more than 4 spaces or tabs, which could hide the rest of \
+                 a line from the owner's card",
+            );
+        }
+        if marks > MAX_MARK_RUN {
+            return Some(
+                "the task stacks more than 2 combining marks on a character, which could draw \
+                 over the owner's card",
+            );
+        }
+    }
+    let mut blank_lines = 0;
+    for line in task.split('\n') {
+        blank_lines = if line.trim().is_empty() {
+            blank_lines + 1
+        } else {
+            0
+        };
+        if blank_lines > MAX_BLANK_LINES {
+            return Some(
+                "the task has more than 2 blank lines in a row, which could hide what follows \
+                 from the owner's card",
+            );
+        }
+    }
+    None
+}
+
+/// Whether `c` is in one of the blocks of combining diacritical marks,
+/// which any script's letters take and which stack without limit.
+fn is_diacritical_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
 }
 
 /// The names of the files `consent` was handed, in their staged order.

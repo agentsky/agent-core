@@ -226,6 +226,7 @@ struct Inner {
     shares: Mutex<HashMap<MemberId, Share>>,
     tasks: Mutex<JoinSet<()>>,
     private: Mutex<HashMap<ConsentId, private::Claim>>,
+    kills: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
     floods: Throttle<(AgentId, Flood)>,
@@ -377,6 +378,7 @@ impl Pipeline {
                 shares: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
                 private: Mutex::new(HashMap::new()),
+                kills: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
                 floods: Throttle::new(FLOOD_WARNING_INTERVAL),
@@ -438,11 +440,14 @@ impl Pipeline {
     /// its working emoji taken off and its thread told to ask again
     /// ([`RESTARTING_TEXT`]), within a few seconds. Messages still waiting
     /// are dropped without a word: no decision was made about them yet.
-    /// The private tasks it drops are released for another instance.
+    /// The private tasks it drops have their turns killed, and are
+    /// billed and released for another instance, within about
+    /// half a minute.
     pub async fn cut_short(&self) {
         self.close();
         let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         tasks.shutdown().await;
+        self.wait_for_kills().await;
         self.release_cut_tasks().await;
         lock(&self.inner.lanes).clear();
         {

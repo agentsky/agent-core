@@ -360,12 +360,14 @@ flowchart TD
 
 - The same asynchronous path serves the owner, with no consent card, only for
   a task asked for in the owner's own one-to-one DM with the agent, the one
-  turn that already runs on the owner's side. A long private task would
-  otherwise hold that turn the same way. Everywhere else a card is sent even
-  when the owner is the requester: a channel or group-DM turn reads the
-  thread's history, which any member can write into, so its text may have
-  steered the request; and a hop turn inherits its requester from another
-  agent's post, which the owner may never have seen. The owner's card says
+  turn that already runs on the owner's side, with memory, read-write
+  `shared/` and posts anywhere: skipping the card there grants nothing the
+  turn doesn't already have. A long private task would otherwise hold that
+  turn the same way. Everywhere else a card is sent even when the owner is
+  the requester: a channel or group-DM turn runs on the public side and
+  reads the thread's history, which any member can write into, so its text
+  may have steered the request; and a hop turn inherits its requester from
+  another agent's post, which the owner may never have seen. The owner's card says
   that approving runs the task on the owner's side, and when it was asked for
   at a hop. The task runs on the owner's side only when the owner asked in
   their own DM or approved the card of a task their own identity asked for,
@@ -386,8 +388,11 @@ flowchart TD
   card and files the channel turn attached explicitly. The channel thread's
   transcript does not cross. The card names the files but doesn't show their
   contents, and their contents can direct the task like its text, so the card
-  says so. A task with control or invisible characters, which the card
-  wouldn't show, is refused when it is asked for.
+  says so. A task the card couldn't show as the model reads it is refused when
+  it is asked for: control or invisible characters, long runs of blanks, many
+  blank lines in a row, or stacked combining marks. The card says whether the
+  owner asked or someone else did, naming them by a handle that stays the
+  same, and shows the task in a box of its own as literal text.
 - What comes back is only the private turn's final reply and files it attached.
   agentd posts them to the thread as a new agent message whose `MESSAGE_REF` is
   attributed to the original requester and hop count, and names the consent.

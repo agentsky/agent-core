@@ -423,6 +423,17 @@ impl Stack {
         }
     }
 
+    /// A connection of its own to the stack's database, to change what
+    /// the store's API can't.
+    async fn db(&self) -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            self.data.join("agentd.db").display()
+        ))
+        .await
+        .unwrap()
+    }
+
     /// Approves `consent` as its agent's owner, alice.
     async fn approve(&self, consent: ConsentId) {
         self.app
@@ -738,13 +749,21 @@ async fn decline_posts_outcome() {
 
 #[tokio::test]
 async fn expiry_posts_outcome() {
-    let stack = start("consent_ttl_secs = 3").await;
+    let stack = start("").await;
     let before = stack.mock.calls().len();
     let consent = stack.ask("bob", "t1", SEEN).await;
     stack.card_to("alice").await;
+    let db = stack.db().await;
+    sqlx::query("UPDATE consents SET expires_at = created_at + 1 WHERE id = ?")
+        .bind(consent.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    stack.app.ctl().consents().wake();
     let (to, text, _) = stack.posted(before, "expired").await;
     assert_eq!(to, in_thread("t1"));
-    assert!(text.contains("within 3 seconds"), "{text}");
+    assert!(text.contains("within 1 second"), "{text}");
     let row = stack.finished(consent).await;
     assert_eq!(row.state, ConsentState::Expired);
     assert_eq!(row.private_session, None);
@@ -1321,6 +1340,75 @@ async fn a_store_failure_before_the_task_runs_is_retried() {
 }
 
 #[tokio::test]
+async fn a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack.card_to("alice").await;
+    let db = stack.db().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_private_sends BEFORE UPDATE OF maybe_started ON sessions \
+         WHEN NEW.kind = 'private' BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    stack.approve(consent).await;
+    let started = Instant::now();
+    let failed = loop {
+        let row = stack.store().consent(consent).await.unwrap().unwrap();
+        if row.work_failures > 0 {
+            break row;
+        }
+        assert!(started.elapsed() < WAIT, "the failure was never recorded");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let earlier = failed.private_session.expect("the task had a session");
+    assert!(
+        !stack.turns.sessions().is_warm(earlier),
+        "a turn that failed still has its container stopped"
+    );
+    let session_dir = stack.started(earlier)[0]
+        .volume_dir
+        .join("sessions")
+        .join(earlier.to_string());
+    assert!(session_dir.join("work/in.txt").exists());
+    sqlx::query("DROP TRIGGER fail_private_sends")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    assert!(
+        stack
+            .store()
+            .mark_session_turn_pending(earlier)
+            .await
+            .unwrap(),
+        "as if the send failed after it may have reached the model"
+    );
+    assert!(
+        stack
+            .store()
+            .release_consent_work(consent, failed.work_attempts, OffsetDateTime::now_utc())
+            .await
+            .unwrap(),
+        "skip the wait for the retry"
+    );
+    stack.app.ctl().consents().wake();
+    stack.posted(before, "interrupted").await;
+    stack.finished(consent).await;
+    let started = Instant::now();
+    while session_dir.exists() {
+        assert!(
+            started.elapsed() < WAIT,
+            "the failed session's directory was kept"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_task_that_reached_the_model_is_never_run_again() {
     let stack = start("").await;
     let before = stack.mock.calls().len();
@@ -1419,40 +1507,34 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
             .turns
     };
     let before = billed().await;
+    let cutting = Instant::now();
     stack.pipeline.cut_short().await;
+    assert!(
+        cutting.elapsed() < Duration::from_secs(10),
+        "the shutdown waited for the kill, not for the turn"
+    );
+    assert!(
+        !stack.turns.sessions().is_warm(session),
+        "the cut turn was killed before the shutdown went on"
+    );
+    assert_eq!(
+        billed().await,
+        before + 1,
+        "the owner pays for the cut turn, metered before the store closes"
+    );
     let row = stack.store().consent(consent).await.unwrap().unwrap();
     assert_eq!(row.finished_at, None);
     assert_eq!(row.work_failures, 0, "a shutdown is no failure");
-    let owed = |at| async move {
+    assert_eq!(
         store
-            .consent_work_owed(at)
+            .consent_work_owed(OffsetDateTime::now_utc())
             .await
             .unwrap()
             .iter()
             .map(|owed| owed.id)
-            .collect::<Vec<_>>()
-    };
-    assert!(
-        owed(OffsetDateTime::now_utc()).await.is_empty(),
-        "a claim whose turn started isn't released, so the task can't run twice"
-    );
-    assert_eq!(
-        owed(OffsetDateTime::now_utc() + agentd::pipeline::WORK_LEASE).await,
+            .collect::<Vec<_>>(),
         [consent],
-        "it lapses with its lease"
-    );
-    let started = Instant::now();
-    while stack.turns.sessions().is_warm(session) || billed().await == before {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the cut turn was never killed and metered"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(
-        billed().await,
-        before + 1,
-        "the owner pays for the cut turn"
+        "once its turn is known to have ended, another instance may take it up at once"
     );
     stack.stop().await;
 }

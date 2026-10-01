@@ -34,7 +34,10 @@
 --
 -- `message_refs.consent_id` names the consent a private task's result or
 -- outcome reports, so a mention in that post never starts another agent's
--- turn.
+-- turn, and so a later claim sees that the consent's final word was
+-- posted. A consent's private sessions are looked up by
+-- `sessions.consent_id` when its work finishes, to delete their
+-- directories.
 
 CREATE TABLE consents (
     id TEXT PRIMARY KEY NOT NULL,
@@ -81,3 +84,9 @@ CREATE INDEX consents_cards_to_close ON consents (decided_at)
     WHERE card_message IS NOT NULL AND card_closed_at IS NULL;
 
 ALTER TABLE message_refs ADD COLUMN consent_id TEXT;
+
+CREATE INDEX message_refs_by_consent ON message_refs (consent_id)
+    WHERE consent_id IS NOT NULL;
+
+CREATE INDEX sessions_by_consent ON sessions (consent_id)
+    WHERE consent_id IS NOT NULL;

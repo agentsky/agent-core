@@ -363,23 +363,15 @@ fn attachment_name(name: &str) -> Result<String, ApiError> {
     }
 }
 
-/// Whether `c` changes how a name displays without showing itself:
-/// bidirectional controls, which can make `exe.txt` read as `txt.exe`,
-/// zero-width and other invisible format characters, tag characters, and the
-/// line and paragraph separators.
+/// Whether `c` changes how text displays without showing itself:
+/// Unicode's default-ignorable code points
+/// ([`render::is_default_ignorable`]), among them bidirectional controls,
+/// which can make `exe.txt` read as `txt.exe`, zero-width characters,
+/// variation selectors and tag characters, and also the line and paragraph
+/// separators and the interlinear annotation characters.
 pub(crate) fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
+    render::is_default_ignorable(c)
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// `POST /v1/post`: queues a message after checking its target.

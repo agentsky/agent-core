@@ -36,6 +36,8 @@ use commands::SkillName;
 use cred_proxy::HostRule;
 use serde::Deserialize;
 
+use crate::ctl::is_invisible;
+
 /// The most bytes of files a skill may hold, unpacked.
 pub const MAX_SKILL_BYTES: u64 = 10 * 1024 * 1024;
 /// The most files and directories a skill may hold.
@@ -277,21 +279,6 @@ fn plain_component(name: &str) -> bool {
         && !name
             .chars()
             .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c))
-}
-
-/// Invisible formatting characters that could make a name read as another:
-/// bidirectional controls, zero-width characters and marks, tag
-/// characters, and line or paragraph separators.
-fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00ad}'
-        | '\u{061c}'
-        | '\u{180e}'
-        | '\u{200b}'..='\u{200f}'
-        | '\u{2028}'..='\u{202e}'
-        | '\u{2060}'..='\u{206f}'
-        | '\u{feff}'
-        | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Running totals, checked against the limits.

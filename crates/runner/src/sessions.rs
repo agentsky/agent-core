@@ -499,6 +499,9 @@ impl<H: TurnHooks> SessionManager<H> {
     /// a turn running in one ends as its process does, with its outcome
     /// reported as for any crash, and the session handles the death as it
     /// would any other. Nothing for a session that holds no container yet.
+    /// It stops them as [`Sandbox::stop`](sandbox::Sandbox::stop) does:
+    /// in the Docker sandbox that is a stop with the daemon's grace period
+    /// before the process is killed, so the turn may run that much longer.
     pub async fn kill(&self, session: SessionId) {
         let containers: Vec<ContainerId> = lock(&self.inner.containers)
             .values()

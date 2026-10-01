@@ -7307,17 +7307,20 @@ failures the thread is told it couldn't be run. A claim cut short isn't a
 failure: the pipeline checks it is open before claiming, and a shutdown
 releases the claims it cut before their turn started
 (`release_consent_work`), so another instance takes them up at once. A
-claim whose turn started is left to lapse with its lease instead: the
-killed turn may still be on its way to the CLI, and a release would let
-another instance run the task beside it. `claim_consent_work` returns the
+claim whose turn started is released only once its killed turn is known to
+have ended (see "A task cut short is killed and billed"), and otherwise left
+to lapse with its lease: until then the turn may still be on its way to
+the CLI, and a release would let another instance run the task beside it. `claim_consent_work` returns the
 row as claimed, so the claim reads the session an earlier claim recorded
 then, not from the listing before it. The plan runs a task again "only if
 it failed before reaching the model": a claim that finds the earlier
 claim's session had a turn sent to the CLI (`started`, `maybe_started` or
 a finished turn) tells the thread the task was interrupted and finishes,
-so a task never runs twice. If that session's result was already posted
-(a `message_refs` row with the consent and the session), as when finishing
-failed after the delivery, it just finishes. The `private` map of claims a
+so a task never runs twice. A claim that finds anything already posted
+for the consent (a `message_refs` row naming it: its result, or any
+outcome, each its last word) just finishes, as after a delivery whose
+finish failed, so nothing is posted twice; posting an outcome checks the
+same. The `private` map of claims a
 shutdown releases drops an entry only for its own attempt, so an old
 attempt can't drop a newer one's. A store error on the way, such as looking up the agent's
 surface (`SurfaceLookup::surface` now returns the error rather than
@@ -7371,9 +7374,18 @@ its own (`TurnTask`), so it is billed when it ends whether or not the
 private task still waits for it; a crash is billed as a turn of unknown
 cost (T27's `CostUnknown`). Dropped before the turn ended, `TurnTask`
 spawns a loop that kills the session's containers every 200 ms until the
-turn's task has finished, for at most 30 seconds, covering a turn still
-starting its container. The test runs `sleep 90` and asserts the session is
-cold, and the owner billed, within ten seconds of a shutdown.
+turn's task has finished, for at most 30 seconds in all, its kills' own
+waits included, covering a turn still starting its container. The session
+is then stopped, once its turn ended either way, and a claim whose turn is
+known to have ended is released, so another instance takes the task up at
+once and finds the session marked if the turn reached the model. The loops
+run in a `JoinSet` the pipeline holds: `Pipeline::cut_short` waits for
+them, 35 seconds at most, before it returns, and `Server::run` closes the
+store only after it, so a turn cut by a shutdown is billed while the store
+is open. In the Docker sandbox the kill is the sandbox's stop, which gives
+the process the daemon's grace period (10 seconds) before it is killed.
+The test runs `sleep 90` and asserts that once `cut_short` returns, within
+ten seconds, the session is cold, the owner billed and the claim free.
 
 ### Every path ends in `finish_consent`
 
@@ -7384,10 +7396,16 @@ interrupted task left theirs on the owner's private volume, with whatever
 an owner-side task copied out of `memory/`.
 
 **Solution.** `Pipeline::finish_consent`, which every outcome reaches once
-the consent's work is done, deletes the directories of all the consent's
-private sessions (`Store::private_sessions_of`) with its staged files, and
-only then: no later claim can start a turn in them. A session still warm
-here, whose turn hasn't ended, keeps its directory.
+the consent's work is done, stops each of the consent's private sessions
+(`Store::private_sessions_of`), which waits for a turn still running in it
+here, and deletes its directory, then records the work finished and
+deletes the staged files. The directories go before the record, so a crash
+between the two leaves nothing: the next claim finishes again and finds
+them gone. A private task's own turn also has its session stopped as soon
+as `run_turn` returns, an error included, so a turn whose send failed
+doesn't leave an owner-side container warm. The test fails the send with a
+store trigger, and checks the container is stopped at once and the
+directory gone once the next claim reports the task interrupted.
 
 ### Outcomes without a session
 
@@ -7416,8 +7434,10 @@ trusted: which message was clicked doesn't matter. Once decided or expired,
 the card is updated once (`chat.update` with the outcome in place of the
 buttons); on Rocket.Chat its one message is edited to the outcome.
 
-The Slack card shows the task in a `plain_text` section, so mrkdwn and
-`<!channel>` in it show as typed. Both cards say what approving means: for
+The Slack card shows the task under the label "The task, exactly as
+written:", in a `rich_text` block's `rich_text_preformatted` element: a
+visible box of literal text, so mrkdwn and `<!channel>` in it show as typed
+and nothing in it can pass for the card's own words. Both cards say what approving means: for
 someone else's task, that it can read the owner's shared files but not
 change them; for a task the owner's identity asked for outside their own
 DM, that it runs on the owner's side, with `shared/` and memory. `WebApi` gains `post_blocks` and `update_blocks`, and `Replies`
@@ -7435,14 +7455,21 @@ app.
 - The card goes to the owner's identity on the task's surface and team, or
   else any a manager bot reaches; with none, it is retried until it
   expires.
-- The card names the requester by their name on their surface
-  (`OpenDm::name_of`: the Slack user's name, the Rocket.Chat username),
-  looked up when the card is sent, without control or invisible characters
-  and at most 80 characters, and by their id if the lookup fails. When the
-  card goes to another surface than the thread's, the requester and the
-  thread are named for that surface: a Slack mention or channel link means
-  nothing on Rocket.Chat. The fit check counts the longest name and the
-  paused line.
+- The card says whether the task is the owner's ("from you, as …") or
+  "from someone other than you", since a Slack display name is the user's
+  to choose and need not be unique, and names the requester by a handle
+  that stays the same: their Slack mention with their user id, or their
+  name on their surface (`OpenDm::name_of`: the Slack user's name, the
+  Rocket.Chat username), looked up when the card is sent, with their id.
+  In the name each control or invisible character shows as U+FFFD, so it
+  can't make an exact copy of another name, and it is at most 80
+  characters. When the card goes to another surface than the thread's,
+  the requester and the thread are named for that surface: a Slack mention
+  or channel link means nothing on Rocket.Chat. Text from elsewhere on a
+  Slack card (names, ids) has `&`, `<` and `>` escaped
+  (`render::slack::escape`), since Slack parses links and broadcasts even
+  in inline code. The fit check counts the longest name and the paused
+  line.
 - The thread's caps (T27) are checked when a task starts, as the router
   checks them for any turn outside a DM: in a capped thread the thread is
   told why the task didn't run, and its work is done. Deferring it to the
@@ -7464,9 +7491,12 @@ the owner's side.
 
 **Solution.** A consent is approved at once only when the turn that asked is
 on the owner's side (`CtlTurn::side`), which only the owner's own
-one-to-one DM with the agent is; that is the one turn that reads nothing
-but the owner's own messages, and it already runs with `memory/` and
-read-write `shared/`. The row records `approval = 'asked'`, and the
+one-to-one DM with the agent is. Skipping the card there grants nothing
+that turn doesn't already have: it runs with `memory/` and read-write
+`shared/`, and can post to any conversation. Whatever could steer it
+(files, web results, the model's own output) could already use those
+directly, so a card would only ask the owner about their own turn's
+powers. The row records `approval = 'asked'`, and the
 `CHECK` keeping it at hop 0 stays as a necessary condition the store can
 see. Every other request waits for a card, the owner's in a channel
 included. The owner's card says approving runs the task on the owner's
@@ -7480,15 +7510,25 @@ the owner asked in their DM, or when the owner approved on its card
 ### Characters the card wouldn't show
 
 **Issue.** The card shows the task text, but Unicode tag characters,
-bidirectional overrides and zero-width characters render as nothing or
-reorder what is shown, so the text the owner approved could hide
-instructions the model reads.
+bidirectional overrides, zero-width characters and variation selectors
+render as nothing or reorder what is shown, long runs of blanks push the
+rest of a line out of a Rocket.Chat code block's view, many blank lines
+push it below Slack's fold, and stacked combining marks draw over the
+card's own text: the text the owner approved could hide instructions the
+model reads.
 
-**Solution.** `agentctl private` refuses a task with a control character
-other than a newline or tab, or any character `ctl::is_invisible` matches
-(the check `agentctl post` uses), before anything is staged. The card also
-says the files' contents aren't shown and can direct the task like its
-text.
+**Solution.** `agentctl private` refuses, before anything is staged, a task
+with a control character other than a newline or tab, a character
+`ctl::is_invisible` matches, a run of more than 4 blanks within a line,
+more than 2 blank lines in a row, or more than 2 combining diacritical
+marks in a row (the blocks of marks any letter takes, so scripts whose
+letters carry their own marks aren't refused). `ctl::is_invisible` is
+Unicode's whole `Default_Ignorable_Code_Point` set
+(`render::is_default_ignorable`, which the Slack renderer's link check
+already used), and the line and paragraph separators and interlinear
+annotation characters; skill file names used a copy of an older list and
+now use it too. The card also says the files' contents aren't shown and
+can direct the task like its text.
 
 ### The Rocket.Chat card fence
 
@@ -7558,5 +7598,13 @@ reason if it wants one.
   instance died counts nothing, so a task that kills agentd before
   reaching the model would be claimed again and again; a panic in the
   task's own task doesn't bring agentd down, so this is unlikely.
-- A session still warm when its consent's work finishes, which a turn
-  outliving its kills would be, keeps its directory.
+- Whether a session still runs is known only on its own instance. If a
+  claim's renewals keep failing while its turn runs, another instance can
+  take the task over, report it interrupted and delete that session's
+  directory under the running turn. The damage stays in that private
+  session's own directory.
+- With no manager bot anywhere reaching the owner, the thread hears that
+  the card couldn't reach them only when the consent expires, a day by
+  default. Each try counts toward the card's backoff, so in a deployment
+  where only some instances reach the owner, one that can may wait up to
+  15 minutes for its turn.

@@ -55,6 +55,24 @@ pub trait OpenDm: Send + Sync {
     }
 }
 
+/// `name` as a card may show it: at most [`MAX_NAME_CHARS`] long, each
+/// control or invisible character replaced by U+FFFD. `None` for a blank
+/// name.
+fn shown_name(name: &str) -> Option<String> {
+    let name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || crate::ctl::is_invisible(c) {
+                char::REPLACEMENT_CHARACTER
+            } else {
+                c
+            }
+        })
+        .take(MAX_NAME_CHARS)
+        .collect();
+    (!name.trim().is_empty()).then_some(name)
+}
+
 /// The longest name [`Replies::name_of`] gives, in characters.
 pub const MAX_NAME_CHARS: usize = 80;
 
@@ -241,20 +259,14 @@ impl Replies {
     }
 
     /// The name `member` goes by on their surface, looked up by the manager
-    /// bot that serves their surface and team, without control or
-    /// invisible characters and at most [`MAX_NAME_CHARS`] long. `None` when
-    /// no manager bot serves them or the lookup fails.
+    /// bot that serves their surface and team, at most [`MAX_NAME_CHARS`]
+    /// long, with each control or invisible character replaced by U+FFFD,
+    /// so the name can't pass for another by hiding a character. `None`
+    /// when no manager bot serves them or the lookup fails.
     pub async fn name_of(&self, member: &MemberKey) -> Option<String> {
         let bot = self.bot_for(member).ok()?;
         match bot.dms.name_of(member).await {
-            Ok(name) => {
-                let name: String = name
-                    .chars()
-                    .filter(|c| !c.is_control() && !crate::ctl::is_invisible(*c))
-                    .take(MAX_NAME_CHARS)
-                    .collect();
-                (!name.trim().is_empty()).then_some(name)
-            }
+            Ok(name) => shown_name(&name),
             Err(err) => {
                 tracing::debug!(member = %member, error = %err, "couldn't look up a member's name");
                 None
@@ -364,5 +376,29 @@ impl Replies {
         }
         let text = bot.render_one(&message.markdown)?;
         Ok(bot.surface.edit(msg, &text).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shown_name_marks_what_it_hides_and_is_capped() {
+        assert_eq!(shown_name("bob.smith").as_deref(), Some("bob.smith"));
+        assert_eq!(
+            shown_name("alice\u{200B}").as_deref(),
+            Some("alice\u{FFFD}"),
+            "can't pass for alice"
+        );
+        assert_eq!(
+            shown_name("a\u{7}\u{202E}b").as_deref(),
+            Some("a\u{FFFD}\u{FFFD}b")
+        );
+        assert_eq!(shown_name("   "), None);
+        assert_eq!(
+            shown_name(&"x".repeat(200)).map(|name| name.chars().count()),
+            Some(MAX_NAME_CHARS)
+        );
     }
 }

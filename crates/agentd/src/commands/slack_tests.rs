@@ -1951,8 +1951,8 @@ async fn only_owner_can_decide() {
         "the owner's DM with the manager app"
     );
     assert_eq!(
-        card["blocks"][1]["text"],
-        json!({"type": "plain_text", "text": "Read my *notes* <!channel>", "emoji": false})
+        card["blocks"][2]["elements"][0]["elements"][0],
+        json!({"type": "text", "text": "Read my *notes* <!channel>"})
     );
     assert!(
         card["blocks"][0]["text"]["text"]

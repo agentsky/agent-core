@@ -2786,8 +2786,10 @@ Deliverables:
   4. Refuse a request past the limits on unfinished consents per agent (the
      owner's own not counted) and per (agent, requester), counted before the
      files are staged and again in the insert's transaction, and files over
-     one attachment's cap together. Refuse a task with control or invisible
-     characters, which the card wouldn't show.
+     one attachment's cap together. Refuse a task the card couldn't show as
+     the model reads it: control or invisible (default-ignorable)
+     characters, runs of more than 4 blanks, more than 2 blank lines in a
+     row, or more than 2 stacked combining marks.
 - Consent card:
   - Slack: Block Kit in the owner's DM from the manager bot, showing the exact
     task text, requester, channel and thread link, with Approve and Decline
@@ -2795,8 +2797,11 @@ Deliverables:
     card is updated with the outcome.
   - Rocket.Chat: a DM from the manager bot with the same text, plus the
     commands `approve <id>` and `decline <id>` (T08's `Approve` and `Decline`).
-  - The requester is named by their name on their surface, looked up when
-    the card is sent, and the thread by the card's surface.
+  - The card says whether the owner asked or "someone other than you", and
+    names the requester by a stable handle (Slack mention with user id, or
+    name and id), their name looked up when the card is sent, and the
+    thread by the card's surface. On Slack the task sits under the label
+    "The task, exactly as written:" in a preformatted rich-text box.
   - The card says the files' contents aren't shown and can direct the task
     like its text.
   - Only the owner can decide.
@@ -2860,6 +2865,7 @@ Acceptance, as tests named after the design's rules:
 - `owner_request_in_a_channel_needs_a_card`.
 - `private_refuses_a_task_with_characters_the_card_wouldnt_show`.
 - `a_shutdown_kills_and_meters_the_turn_it_cuts`.
+- `a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind`.
 
 ### T34
 

@@ -851,7 +851,7 @@ fn host(rest: &str) -> String {
     .unwrap_or_default();
     let host: String = host
         .chars()
-        .filter(|&c| !is_default_ignorable(c))
+        .filter(|&c| !crate::is_default_ignorable(c))
         .map(|c| match c {
             '\u{2024}' | '\u{3002}' | '\u{FE52}' | '\u{FF0E}' | '\u{FF61}' => '.',
             _ => c,
@@ -860,32 +860,6 @@ fn host(rest: &str) -> String {
     let host = host.to_lowercase();
     let host = host.trim_end_matches('.');
     host.strip_prefix("www.").unwrap_or(host).to_string()
-}
-
-/// Unicode's default-ignorable code points: characters that render as
-/// nothing, such as zero-width spaces and bidirectional controls, which IDNA
-/// drops from hostnames and which could hide a dot from the domain check.
-fn is_default_ignorable(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'..='\u{1160}'
-            | '\u{17B4}'..='\u{17B5}'
-            | '\u{180B}'..='\u{180F}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{3164}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{FEFF}'
-            | '\u{FFA0}'
-            | '\u{FFF0}'..='\u{FFF8}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E0FFF}'
-    )
 }
 
 /// Two or more dot-separated labels of letters, digits and `-`, ending in an
@@ -971,7 +945,10 @@ fn push_literal(text: &str, at: usize, c: char, out: &mut String) {
     }
 }
 
-fn escape(text: &str) -> String {
+/// `text` with `&`, `<` and `>` escaped, as Slack's mrkdwn wants text it
+/// should show as written rather than parse as links, mentions or
+/// broadcasts.
+pub fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         push_escaped(c, &mut out);

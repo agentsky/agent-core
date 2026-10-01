@@ -219,28 +219,43 @@ impl Card<'_> {
         format!("Private task request for {}", self.agent)
     }
 
-    /// Who asked: a mention on Slack for someone on Slack, which Slack
-    /// shows as their name, and otherwise their name, or else their id, as
-    /// code, with their surface when it isn't the card's.
+    /// Who asked, by a handle that stays the same: a mention on Slack for
+    /// someone on Slack, which Slack shows as their display name, with
+    /// their user id; and otherwise their name, if it isn't their id, and
+    /// their id, as code, with their surface when it isn't the card's.
     fn requester(&self) -> String {
         let key = &self.consent.requester.key;
-        if key.surface == self.surface && key.surface == SurfaceKind::Slack {
-            return format!("<@{}>", key.user);
+        let id = key.user.as_str();
+        if key.surface == SurfaceKind::Slack && self.surface == SurfaceKind::Slack {
+            return format!("<@{id}> ({})", self.code(id));
         }
-        let name = inline_code(self.requester_name.unwrap_or(key.user.as_str()));
+        let who = match self.requester_name.filter(|name| *name != id) {
+            Some(name) => format!("{} ({})", self.code(name), self.code(id)),
+            None => self.code(id),
+        };
         if key.surface == self.surface {
-            name
+            who
         } else {
-            format!("{name} on {}", surface_name(key.surface))
+            format!("{who} on {}", surface_name(key.surface))
         }
+    }
+
+    /// `text` as inline code on the card's surface, escaped for Slack's
+    /// mrkdwn there.
+    fn code(&self, text: &str) -> String {
+        slack_safe(self.surface, &inline_code(text))
     }
 
     /// Who asked where, and what the owner should know of how.
     fn heading(&self, bold: &str) -> String {
+        let who = if self.owners {
+            format!("you, as {}", self.requester())
+        } else {
+            format!("someone other than you: {}", self.requester())
+        };
         let mut text = format!(
-            "{bold}Private task request{bold} for *{}* from {}, in {}.",
-            self.agent,
-            self.requester(),
+            "{bold}Private task request{bold} for *{}* from {who}, in {}.",
+            slack_safe(self.surface, self.agent),
             place(&self.consent.thread, self.surface),
         );
         let hop = self.consent.hop.0;
@@ -259,7 +274,7 @@ impl Card<'_> {
             text.push_str(&format!(
                 " {} is paused: if you approve, the task runs once it is resumed, if that is \
                  before it expires.",
-                self.agent
+                slack_safe(self.surface, self.agent)
             ));
         }
         text
@@ -302,7 +317,8 @@ impl Card<'_> {
     }
 
     /// The Block Kit both states of a Slack card share: who asked where,
-    /// the task as plain text, the files and what approving means.
+    /// the task under a label, boxed as preformatted literal text, the
+    /// files and what approving means.
     fn blocks(&self) -> Vec<Value> {
         let mut blocks = vec![
             json!({
@@ -310,8 +326,19 @@ impl Card<'_> {
                 "text": {"type": "mrkdwn", "text": self.heading("*")},
             }),
             json!({
-                "type": "section",
-                "text": {"type": "plain_text", "text": self.consent.task, "emoji": false},
+                "type": "context",
+                "elements": [{
+                    "type": "plain_text",
+                    "text": "The task, exactly as written:",
+                    "emoji": false,
+                }],
+            }),
+            json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_preformatted",
+                    "elements": [{"type": "text", "text": self.consent.task}],
+                }],
             }),
         ];
         if !self.files.is_empty() {
@@ -346,21 +373,34 @@ const OWNER_TERMS: &str = "If you approve, it runs once in a new private session
      its text. Only its reply and the files it attaches are posted to the thread, where \
      everyone in it can read them.";
 
-/// The text objects of a Slack block.
+/// The text objects of a Slack block, rich text's nested elements
+/// included.
 fn block_texts(block: &Value) -> Vec<&str> {
     let mut texts: Vec<&str> = block
         .pointer("/text/text")
         .and_then(Value::as_str)
         .into_iter()
         .collect();
-    if let Some(elements) = block.get("elements").and_then(Value::as_array) {
-        texts.extend(
-            elements
-                .iter()
-                .filter_map(|element| element.get("text").and_then(Value::as_str)),
-        );
+    for element in block
+        .get("elements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        texts.extend(element.get("text").and_then(Value::as_str));
+        texts.extend(block_texts(element));
     }
     texts
+}
+
+/// `text` escaped for Slack's mrkdwn when it is shown on Slack, so `&`,
+/// `<` and `>` in it can't form a link, a mention or a broadcast.
+fn slack_safe(surface: SurfaceKind, text: &str) -> String {
+    if surface == SurfaceKind::Slack {
+        render::slack::escape(text)
+    } else {
+        text.to_owned()
+    }
 }
 
 /// The length of `text` in UTF-16 code units, as Slack and Rocket.Chat
@@ -418,13 +458,14 @@ fn place(thread: &ThreadKey, surface: SurfaceKind) -> String {
             } else {
                 "Rocket.Chat room"
             };
+            let code = |text: &str| slack_safe(surface, &inline_code(text));
             match &thread.root {
                 Some(root) => format!(
                     "{label} {}, thread {}",
-                    inline_code(conv.conversation.as_str()),
-                    inline_code(root.as_str())
+                    code(conv.conversation.as_str()),
+                    code(root.as_str())
                 ),
-                None => format!("{label} {}", inline_code(conv.conversation.as_str())),
+                None => format!("{label} {}", code(conv.conversation.as_str())),
             }
         }
     }
@@ -504,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slack_card_shows_the_exact_task_as_plain_text_with_buttons() {
+    fn a_slack_card_boxes_the_exact_task_as_literal_text_with_buttons() {
         let mut consent = consent(SurfaceKind::Slack, "Summarize *my* <!channel> notes");
         let files = ["a.csv".to_owned()];
         let card = Card {
@@ -520,10 +561,20 @@ mod tests {
         let blocks = open.blocks.unwrap();
         let text = blocks.to_string();
         assert_eq!(
-            blocks[1]["text"],
-            json!({"type": "plain_text", "text": "Summarize *my* <!channel> notes", "emoji": false})
+            blocks[1]["elements"][0]["text"],
+            "The task, exactly as written:"
         );
-        assert!(text.contains("<@U0BOB>"), "{text}");
+        assert_eq!(
+            blocks[2],
+            json!({"type": "rich_text", "elements": [{
+                "type": "rich_text_preformatted",
+                "elements": [{"type": "text", "text": "Summarize *my* <!channel> notes"}],
+            }]})
+        );
+        assert!(
+            text.contains("from someone other than you: <@U0BOB> (`U0BOB`)"),
+            "{text}"
+        );
         assert!(
             text.contains("https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/"),
             "{text}"
@@ -680,7 +731,7 @@ mod tests {
         .open()
         .markdown;
         assert!(
-            on_rocketchat.contains("from `bob.smith` on Slack, in Slack channel `C0CHAN001` ([the thread](https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/"),
+            on_rocketchat.contains("from someone other than you: `bob.smith` (`U0BOB`) on Slack, in Slack channel `C0CHAN001` ([the thread](https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/"),
             "{on_rocketchat}"
         );
         assert!(!on_rocketchat.contains("<@"), "{on_rocketchat}");
@@ -699,16 +750,40 @@ mod tests {
             .open()
         };
         let named = card(SurfaceKind::RocketChat, Some("bob")).markdown;
-        assert!(named.contains("from `bob`, in room `C0CHAN001`"), "{named}");
+        assert!(
+            named.contains("from someone other than you: `bob` (`U0BOB`), in room `C0CHAN001`"),
+            "{named}"
+        );
         let unnamed = card(SurfaceKind::RocketChat, None).markdown;
-        assert!(unnamed.contains("from `U0BOB`, in room"), "{unnamed}");
-        let on_slack = card(SurfaceKind::Slack, Some("bob"))
+        assert!(
+            unnamed.contains("from someone other than you: `U0BOB`, in room"),
+            "{unnamed}"
+        );
+        let on_slack = card(SurfaceKind::Slack, Some("<!here|a&b>"))
             .blocks
             .unwrap()
             .to_string();
         assert!(
-            on_slack.contains("from `bob` on Rocket.Chat, in Rocket.Chat room `C0CHAN001`"),
-            "{on_slack}"
+            on_slack.contains(
+                "from someone other than you: `&lt;!here|a&amp;b&gt;` (`U0BOB`) on Rocket.Chat, \
+                 in Rocket.Chat room `C0CHAN001`"
+            ),
+            "Slack-bound names are escaped: {on_slack}"
+        );
+        let owners = Card {
+            consent: &rocketchat,
+            agent: "helper",
+            files: &[],
+            owners: true,
+            paused: false,
+            surface: SurfaceKind::RocketChat,
+            requester_name: Some("alice"),
+        }
+        .open()
+        .markdown;
+        assert!(
+            owners.contains("from you, as `alice` (`U0BOB`)"),
+            "{owners}"
         );
     }
 

@@ -22,6 +22,9 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a private task cut short has its session's containers killed
 /// until its turn ends.
 const KILL_EVERY: Duration = Duration::from_millis(200);
+/// How long past [`KILL_TIMEOUT`] a shutdown waits for a killed turn's
+/// session to be stopped and its claim released.
+const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// A claim this instance holds on a private task's work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,11 +83,11 @@ impl Pipeline {
     ///
     /// The work is leased ([`WORK_LEASE`]), so an instance that dies
     /// leaves it to the next pass anywhere, and a shutdown releases what it
-    /// cut short before its turn started. A task is run again only if no
-    /// turn of it reached the model: a claim that finds an earlier claim's
-    /// session had its turn sent to the CLI tells the thread the task was
-    /// interrupted instead, or just finishes if that session's result was
-    /// posted. A try that fails is tried again after [`WORK_RETRY`]; after
+    /// cut short once no turn of it can still be running. A task is run
+    /// again only if no turn of it reached the model: a claim that finds an
+    /// earlier claim's session had its turn sent to the CLI tells the
+    /// thread the task was interrupted instead. A claim that finds anything
+    /// already posted for the consent just finishes. A try that fails is tried again after [`WORK_RETRY`]; after
     /// [`WORK_MAX_ATTEMPTS`] failures the thread is told it couldn't be
     /// done. The consent's files, and its private sessions' directories,
     /// are deleted once its work is done, however it ends.
@@ -140,6 +143,10 @@ impl Pipeline {
         };
         let attempt = claimed.work_attempts;
         let id = consent.id;
+        if store.consent_posted(id).await? {
+            tracing::info!(consent = %id, "a consent's outcome was already posted; finishing its work");
+            return self.finish_consent(consents, id, attempt).await;
+        }
         let text = agent.map(|agent| match consent.state {
             ConsentState::Declined => card::declined_text(id, &agent.name),
             ConsentState::Expired if consent.card.is_none() => {
@@ -313,8 +320,10 @@ impl Pipeline {
     /// Releases the claims of the private tasks a shutdown cut short
     /// before their turn started, so another instance takes them up at
     /// once, none of them counted as a failure. A claim whose turn started
-    /// is left to lapse with its lease ([`WORK_LEASE`]), so the task can't
-    /// run again while its killed turn may still be starting.
+    /// is released by its kill once the turn ended
+    /// ([`kill_turn`](Self::kill_turn)), and otherwise left to lapse with
+    /// its lease ([`WORK_LEASE`]), so the task can't run again beside a
+    /// turn that may still be starting.
     pub(super) async fn release_cut_tasks(&self) {
         let cut: Vec<(ConsentId, Claim)> = lock(&self.inner.private).drain().collect();
         for (id, Claim { attempt, turned }) in cut {
@@ -349,10 +358,8 @@ impl Pipeline {
         attempt: u32,
     ) -> Result<Ran, PipelineError> {
         let store = &self.inner.store;
-        if let Some(earlier) = consent.private_session
-            && store.consent_posted(consent.id, earlier).await?
-        {
-            tracing::info!(consent = %consent.id, session = %earlier, "a private task's result was already posted; finishing its work");
+        if store.consent_posted(consent.id).await? {
+            tracing::info!(consent = %consent.id, "a private task's result or outcome was already posted; finishing its work");
             return Ok(Ran::Done);
         }
         if let Some(earlier) = consent.private_session
@@ -414,10 +421,11 @@ impl Pipeline {
         let turn = request.turn;
         tracing::info!(consent = %consent.id, session = %session.id, ?side, "running a private task");
         self.mark_turned(consent.id, attempt);
-        let report = TurnTask::start(self, agent, consent, session.id, request)
+        let report = TurnTask::start(self, agent, consent, attempt, session.id, request)
             .join()
-            .await?;
+            .await;
         sessions.stop(session.id).await;
+        let report = report?;
         Delivery {
             store,
             surface: surface.as_ref(),
@@ -488,10 +496,12 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Records that claim `attempt` did consent `id`'s work, and deletes
-    /// its files and the directories of its private sessions: every path
-    /// a consent's work takes ends here. A session whose turn is still
-    /// running here keeps its directory.
+    /// Deletes the directories of consent `id`'s private sessions, each
+    /// once its container is stopped, which waits for a turn running in
+    /// it here, then records that claim `attempt` did the consent's work
+    /// and deletes its files: every path a consent's work takes ends here.
+    /// The directories go first, so nothing is left if the record is the
+    /// last thing that happens; a later claim finds them gone.
     async fn finish_consent(
         &self,
         consents: &Consents,
@@ -499,19 +509,78 @@ impl Pipeline {
         attempt: u32,
     ) -> Result<(), StoreError> {
         let store = &self.inner.store;
-        if !store.finish_consent(id, attempt, Consents::now()).await? {
-            return Ok(());
-        }
-        consents.forget_files(id).await;
         let sessions = self.inner.turns.sessions();
         for session in store.private_sessions_of(id).await? {
-            if sessions.is_warm(session.id) {
-                tracing::warn!(consent = %id, session = %session.id, "a finished private task's session still runs; its directory is kept");
-                continue;
-            }
+            sessions.stop(session.id).await;
             consents::discard(consents.session_dir(&session.volume(), session.id)).await;
         }
+        if store.finish_consent(id, attempt, Consents::now()).await? {
+            consents.forget_files(id).await;
+        }
         Ok(())
+    }
+
+    /// Kills the containers of `session`, whose private task for claim
+    /// `attempt` on consent `id` was cut short while `turn` ran in it,
+    /// until the turn ends, for at most [`KILL_TIMEOUT`], and stops the
+    /// session once it has. A turn known to have ended releases the claim,
+    /// so the next claim can take the task up at once; it finds the session
+    /// marked if the turn reached the model.
+    async fn kill_turn(
+        self,
+        id: ConsentId,
+        attempt: u32,
+        session: SessionId,
+        turn: JoinHandle<Result<TurnReport<Option<Outbox>>, RunnerError>>,
+    ) {
+        let sessions = self.inner.turns.sessions();
+        let killed = tokio::time::timeout(KILL_TIMEOUT, async {
+            while !turn.is_finished() {
+                sessions.kill(session).await;
+                tokio::time::sleep(KILL_EVERY).await;
+            }
+        })
+        .await
+        .is_ok();
+        if !killed {
+            tracing::warn!(%session, "a private task's turn outlived its kills; it is stopped once it ends");
+            sessions.stop(session).await;
+            return;
+        }
+        tracing::info!(%session, "killed the turn of a private task cut short");
+        sessions.stop(session).await;
+        match self
+            .inner
+            .store
+            .release_consent_work(id, attempt, Consents::now())
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(consent = %id, "released a private task whose turn was killed")
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(consent = %id, error = %err, "couldn't release a private task whose turn was killed");
+            }
+        }
+    }
+
+    /// Waits for the kills of the turns a shutdown cut short, for at most
+    /// [`KILL_TIMEOUT`] and a little more, so those turns are billed while
+    /// the store is open. A kill still waiting is left to finish alone.
+    pub(super) async fn wait_for_kills(&self) {
+        let mut kills = std::mem::take(&mut *lock(&self.inner.kills));
+        let waited = tokio::time::timeout(KILL_TIMEOUT + KILL_GRACE, async {
+            while kills.join_next().await.is_some() {}
+        })
+        .await;
+        if waited.is_err() {
+            tracing::warn!(
+                left = kills.len(),
+                "turns a shutdown cut short are still being killed"
+            );
+            kills.detach_all();
+        }
     }
 }
 
@@ -530,22 +599,26 @@ fn side(consent: &Consent, owner: MemberId) -> Side {
 
 /// A private task's turn, run in a task of its own that bills it to the
 /// owner when it ends, however the private task ends. Dropped before it
-/// ends, as when the private task is cut short or taken over, it kills
-/// the session's containers until the turn ends, so the turn ends as a
-/// crash, billed as one.
+/// ends, as when the private task is cut short or taken over, it has the
+/// pipeline kill the session's containers until the turn ends
+/// ([`Pipeline::kill_turn`]), so the turn ends as a crash, billed as one;
+/// a shutdown waits for that ([`Pipeline::wait_for_kills`]).
 struct TurnTask {
     pipeline: Pipeline,
+    consent: ConsentId,
+    attempt: u32,
     session: SessionId,
     turn: Option<JoinHandle<Result<TurnReport<Option<Outbox>>, RunnerError>>>,
 }
 
 impl TurnTask {
-    /// Starts `request` on `consent`'s session `session`, billed to the
-    /// owner of `agent`.
+    /// Starts `request` on `consent`'s session `session`, for claim
+    /// `attempt`, billed to the owner of `agent`.
     fn start(
         pipeline: &Pipeline,
         agent: &Agent,
         consent: &Consent,
+        attempt: u32,
         session: SessionId,
         request: TurnRequest,
     ) -> Self {
@@ -565,6 +638,8 @@ impl TurnTask {
         });
         Self {
             pipeline: pipeline.clone(),
+            consent: consent.id,
+            attempt,
             session,
             turn: Some(turn),
         }
@@ -588,23 +663,16 @@ impl Drop for TurnTask {
         let Some(turn) = self.turn.take() else {
             return;
         };
-        let pipeline = self.pipeline.clone();
-        let session = self.session;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let sessions = pipeline.inner.turns.sessions();
-                let started = Instant::now();
-                while !turn.is_finished() {
-                    if started.elapsed() > KILL_TIMEOUT {
-                        tracing::warn!(%session, "a private task's turn outlived its kills");
-                        return;
-                    }
-                    sessions.kill(session).await;
-                    tokio::time::sleep(KILL_EVERY).await;
-                }
-                tracing::info!(%session, "killed the turn of a private task cut short");
-            });
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
         }
+        let killing =
+            self.pipeline
+                .clone()
+                .kill_turn(self.consent, self.attempt, self.session, turn);
+        let mut kills = lock(&self.pipeline.inner.kills);
+        reap(&mut kills);
+        kills.spawn(killing);
     }
 }
 
