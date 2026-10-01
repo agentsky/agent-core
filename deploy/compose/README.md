@@ -159,7 +159,8 @@ name, and the manager's user id as `manager_user_id`. agentd calls a plain
 say, so a proxy never reads its token in clear, and calls a loopback IP
 address directly too, since a proxy would resolve it on its own host.
 `https://` URLs elsewhere honor `HTTPS_PROXY` (or `ALL_PROXY`) and
-`NO_PROXY`. Rocket.Chat's realtime connection never uses a proxy, so the
+`NO_PROXY`, or their lowercase forms `https_proxy`, `all_proxy` and
+`no_proxy`. Rocket.Chat's realtime connection never uses a proxy, so the
 server must be reachable directly. agentd refuses to
 start with the section and no `AGENTD_RC_MANAGER_TOKEN`. agentd runs turns
 with the example's `[sandbox]` section; add `host_data_dir` to it:

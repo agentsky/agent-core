@@ -8332,7 +8332,7 @@ says so, rather than a second client for a case no deployment has.
 Rocket.Chat's cross-origin redirects already use their own proxied client.
 The example configuration and the Compose README tell operators the rule:
 `https://` URLs honor `HTTPS_PROXY` (or `ALL_PROXY`, its fallback in
-hyper-util's environment matcher) and `NO_PROXY`; `HTTP_PROXY` never
+hyper-util's environment matcher) and `NO_PROXY`, each also in lowercase; `HTTP_PROXY` never
 applies, since no plain `http://` URL is proxied. A plain `http://` URL or a
 loopback IP address is always called directly, which `NO_PROXY` can't
 change. Rocket.Chat's realtime connection (`tokio-tungstenite`) never used
@@ -8427,14 +8427,15 @@ were wider still hold such tokens. RFC 6749 lets the answer leave `scope`
 out when it is what the request asked for, which for a login is the URL
 the member may have changed.
 
-**Solution.** `auth` reads a token response's `scope` as any JSON value:
-a space-separated string, as RFC 6749 has it, or an array of strings read
-the same way, so an array naming a wider scope can't slip through as a
-format nobody expected. It sorts what that grants into a `Grant`: only
-`ALLOWED_SCOPES`; unstated (absent, `null`, blank or an empty array, since
-no scope is no grant and a server using it for "as requested" would reopen
-the hole); wider; or unreadable, any other shape, which says nothing about
-the grant.
+**Solution.** `auth` reads a token response's `scope` as any JSON value
+and splits every string in it, at any depth of arrays and objects, on
+blanks into scopes, so no shape hides a wider one. It sorts the result
+into a `Grant`: wider if any scope is outside `ALLOWED_SCOPES`, whatever
+the shape; unstated if there is none (absent, `null`, blank, an empty
+array, or a shape holding no string, since no scope is no grant and a
+server using it for "as requested" would reopen the hole); and otherwise
+allowed for a space-separated string, as RFC 6749 has it, or an array of
+strings, and unreadable for any other shape.
 
 - A login keeps only an allowed grant. A wider one is
   `AuthError::ScopeRefused`, whose reply tells the member to open the

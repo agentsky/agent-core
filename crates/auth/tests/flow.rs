@@ -669,7 +669,8 @@ async fn a_refresh_whose_grant_is_unstated_or_unreadable_keeps_the_link() {
         Some(json!("")),
         Some(json!([])),
         Some(json!(7)),
-        Some(json!({"user": "profile"})),
+        Some(json!({"granted": ["user:profile"]})),
+        Some(json!(["user:inference", null])),
     ] {
         let h = harness().await;
         let mut body = json!({"access_token": "access-2", "expires_in": 28800});
@@ -698,40 +699,51 @@ async fn a_refresh_whose_grant_is_unstated_or_unreadable_keeps_the_link() {
 }
 
 #[tokio::test]
-async fn an_array_naming_a_wider_scope_refuses_a_login_and_breaks_a_refresh() {
-    let wide = || {
-        ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "access-wide",
-            "refresh_token": "refresh-wide",
-            "expires_in": 28800,
-            "scope": ["user:profile", "user:inference", "user:sessions:claude_code"],
-        }))
-    };
-    let h = harness().await;
-    mount_revoke(&h.server, "refresh-wide").await;
-    let err = login_answered(&h, wide()).await;
-    assert!(matches!(err, AuthError::ScopeRefused), "{err:?}");
-    assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
-    h.server.verify().await;
+async fn a_wider_scope_in_any_shape_refuses_a_login_and_breaks_a_refresh() {
+    for scope in [
+        json!([
+            "user:profile",
+            "user:inference",
+            "user:sessions:claude_code"
+        ]),
+        json!(["user:profile", "user:sessions:claude_code", 7]),
+        json!([["user:sessions:claude_code"]]),
+        json!({"granted": ["user:profile", "user:sessions:claude_code"]}),
+    ] {
+        let wide = || {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-wide",
+                "refresh_token": "refresh-wide",
+                "expires_in": 28800,
+                "scope": scope,
+            }))
+        };
+        let h = harness().await;
+        mount_revoke(&h.server, "refresh-wide").await;
+        let err = login_answered(&h, wide()).await;
+        assert!(matches!(err, AuthError::ScopeRefused), "{scope}: {err:?}");
+        assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
+        h.server.verify().await;
 
-    let h = harness().await;
-    Mock::given(method("POST"))
-        .and(path(TOKEN_PATH))
-        .respond_with(wide())
-        .expect(1)
-        .mount(&h.server)
+        let h = harness().await;
+        Mock::given(method("POST"))
+            .and(path(TOKEN_PATH))
+            .respond_with(wide())
+            .expect(1)
+            .mount(&h.server)
+            .await;
+        mount_revoke(&h.server, "refresh-wide").await;
+        link(&h.store, h.member, "access-1", "refresh-1", 60).await;
+        let err = h.auth.access_token(h.member).await.unwrap_err();
+        assert!(matches!(err, AuthError::RelinkRequired), "{scope}: {err:?}");
+        let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
+        assert!(stored.broken_at.is_some(), "{scope}");
+        eventually("the wide grant is revoked", || async {
+            !requests_to(&h.server, REVOKE_PATH).await.is_empty()
+        })
         .await;
-    mount_revoke(&h.server, "refresh-wide").await;
-    link(&h.store, h.member, "access-1", "refresh-1", 60).await;
-    let err = h.auth.access_token(h.member).await.unwrap_err();
-    assert!(matches!(err, AuthError::RelinkRequired), "{err:?}");
-    let stored = h.store.get_claude_link(h.member).await.unwrap().unwrap();
-    assert!(stored.broken_at.is_some());
-    eventually("the wide grant is revoked", || async {
-        !requests_to(&h.server, REVOKE_PATH).await.is_empty()
-    })
-    .await;
-    h.server.verify().await;
+        h.server.verify().await;
+    }
 }
 
 #[tokio::test]
@@ -766,7 +778,7 @@ async fn a_login_whose_scope_is_unreadable_is_refused_as_unstated() {
         "access_token": "access-odd",
         "refresh_token": "refresh-odd",
         "expires_in": 28800,
-        "scope": {"user": "profile"},
+        "scope": {"granted": "user:profile user:inference"},
     }));
     let err = login_answered(&h, answer).await;
     assert!(matches!(err, AuthError::ScopeUnstated), "{err:?}");
