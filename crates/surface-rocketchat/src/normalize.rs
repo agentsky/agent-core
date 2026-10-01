@@ -172,6 +172,7 @@ pub(crate) fn to_event(message: &Message, ctx: &Context<'_>) -> InboundEvent {
             .map(|file| in_file(file, ctx.file_url))
             .collect(),
         received_at: ctx.received_at,
+        outside: None,
     }
 }
 

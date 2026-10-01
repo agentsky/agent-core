@@ -116,8 +116,7 @@ pub fn consent_action(interaction: Interaction) -> Option<(MemberKey, String, Or
 }
 
 /// The member a `user_change` event says was deleted (left the workspace or
-/// was deactivated), in the workspace of the event's envelope; `None` when
-/// the envelope names none.
+/// was deactivated), in the workspace the event came through.
 pub fn member_who_left(event: &SlackEvent) -> Option<MemberKey> {
     if event.event_type != "user_change" {
         return None;
@@ -132,7 +131,7 @@ pub fn member_who_left(event: &SlackEvent) -> Option<MemberKey> {
         .filter(|id| !id.is_empty())?;
     Some(MemberKey {
         surface: SurfaceKind::Slack,
-        team: event.team.clone()?,
+        team: event.team.clone(),
         user: UserId::new(id),
     })
 }

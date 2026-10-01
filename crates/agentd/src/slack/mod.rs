@@ -84,6 +84,10 @@ pub fn routes(app: &App) -> (Router, Queue) {
             .map(|slack| (app.store().clone(), slack.identity().team.clone())),
     );
     let (router, queue) = ingress(Arc::new(secrets), QUEUE_CAPACITY);
+    let queue = queue.with_home_org(
+        app.slack()
+            .and_then(|slack| slack.identity().enterprise.clone()),
+    );
     let router = match app.slack_agents() {
         Some(agents) => router.merge(
             Router::new()
@@ -385,12 +389,29 @@ impl Dedup for StoreDedup {
 /// Where the Slack queue hands verified requests.
 ///
 /// Requests from any workspace but the one agentd serves, or naming none,
-/// are dropped. Then:
+/// are dropped: a message's or an event's workspace is its installation's,
+/// a slash command's its `team_id` and an interaction's its `team.id`.
+/// Then:
 ///
 /// - To the manager app: an `/agent` slash command, a DM to the app, or a
 ///   click on a consent card's button goes to the command intake, and a
 ///   `user_change` whose user is `deleted` deletes that member's
-///   configuration token for the workspace.
+///   configuration token for the workspace. Only home members' commands
+///   go on (see the design's Slack Connect "Commands"):
+///   - A DM whose sender's own team fields make them outside is dropped
+///     here, without touching the network; the rest are checked against
+///     the member list or `users.info` in the member's own intake task
+///     ([Who may run them](crate::commands#who-may-run-them)), never in
+///     the queue every app's requests pass through.
+///   - A click goes on only when the clicker's own team, the payload's
+///     `user.team_id`, is present and is the workspace.
+///   - A slash command carries no sender team: Slack routes an app's
+///     commands only for the workspace that installed it, and its
+///     `team_id` must be this workspace.
+///
+///   What is dropped for this is logged at debug level at most once per
+///   binding per [`WARNING_INTERVAL`], the next line saying how many went
+///   quiet.
 /// - To an agent's app: a message goes to [`Messages`], without waiting.
 ///
 /// Everything else is logged by binding and kind and dropped.
@@ -399,6 +420,7 @@ pub struct Inbound {
     store: Store,
     manager: Option<(ManagerIdentity, CommandSubmitter)>,
     agents: Option<Messages>,
+    outsiders: Arc<Throttle<BindingId>>,
 }
 
 impl Inbound {
@@ -410,6 +432,25 @@ impl Inbound {
             store,
             manager: manager.map(|identity| (identity, commands)),
             agents: None,
+            outsiders: Arc::new(Throttle::new(WARNING_INTERVAL)),
+        }
+    }
+
+    /// Logs a request to the manager app dropped because whoever sent it
+    /// isn't, or can't be shown to be, a member of the workspace.
+    fn dropped_outsider(&self, binding: BindingId, kind: &'static str) {
+        match self.outsiders.record(binding, Instant::now()) {
+            Some(quiet) => tracing::debug!(
+                %binding,
+                kind,
+                dropped_since_last = quiet,
+                "dropped a request to the Slack manager app from outside the workspace"
+            ),
+            None => tracing::trace!(
+                %binding,
+                kind,
+                "dropped a request to the Slack manager app from outside the workspace"
+            ),
         }
     }
 
@@ -481,10 +522,20 @@ impl Sink<SlackInbound> for Inbound {
         let command = match item {
             SlackInbound::Command(command) => slash_command(command)
                 .map(|(member, text, origin)| (member, text, origin, Vec::new())),
+            SlackInbound::Message(event, _) if event.outside.is_some() => {
+                self.dropped_outsider(binding, kind);
+                return Ok(());
+            }
             SlackInbound::Message(event, _) => dm_command(&event, identity),
             SlackInbound::Event(event) => {
                 self.member_left(&event).await;
                 None
+            }
+            SlackInbound::Interaction(interaction)
+                if interaction.sender_team.as_ref() != Some(&identity.team) =>
+            {
+                self.dropped_outsider(binding, kind);
+                return Ok(());
             }
             SlackInbound::Interaction(interaction) => consent_action(interaction)
                 .map(|(member, text, origin)| (member, text, origin, Vec::new())),

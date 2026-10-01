@@ -408,6 +408,7 @@ mod tests {
             reply_to: None,
             files: vec![],
             received_at: datetime!(2026-09-30 00:00 UTC),
+            outside: None,
         }
     }
 

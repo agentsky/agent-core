@@ -6,16 +6,18 @@ use std::time::Duration;
 
 use core_types::{
     Binding, BindingId, ConvKind, ConvRef, Cursor, InboundEvent, LengthUnit, MemberKey, MsgRef,
-    OutFile, ReplyTarget, SendError, Sender, Sink, Surface, SurfaceError, SurfaceKind, ThreadKey,
-    UserId,
+    OutFile, Outside, ReplyTarget, SendError, Sender, Sharing, Sink, Surface, SurfaceError,
+    SurfaceKind, TeamId, ThreadKey, UserId,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use surface_slack::directory::ConvInfo;
 use surface_slack::normalize::{self, Context, MAX_ID_TAIL};
 use surface_slack::surface::CAPS;
+use surface_slack::web::MAX_CONNECTED_TEAMS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 use testkit::Held;
-use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
+use testkit::slack::{BOT_USER, CHANNEL, HOME_ORG, OUTSIDE_TEAM, SHARED_CHANNEL, TEAM, USER};
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -935,6 +937,7 @@ fn bot_event() -> InboundEvent {
         binding: BindingId::new_v4(),
         bot_user: Some(&bot),
         team: &team,
+        home_org: None,
         event_id: "Ev0BOTNOUSR",
         received_at: time::OffsetDateTime::now_utc(),
     };
@@ -1062,6 +1065,7 @@ fn event_from(fixture: &str) -> InboundEvent {
         binding: BindingId::new_v4(),
         bot_user: Some(&bot),
         team: &team,
+        home_org: None,
         event_id: "Ev0CONFIRM",
         received_at: time::OffsetDateTime::now_utc(),
     };
@@ -1440,4 +1444,547 @@ async fn a_bot_id_not_shaped_like_slacks_is_never_looked_up() {
         assert_eq!(event, before);
     }
     assert!(lookups(&server, "bots.info").await.is_empty());
+}
+
+async fn mount_user(server: &MockServer, user: &str, response: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .and(body_string_contains(format!("user={user}").as_str()))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+fn user_in(user: &str, team: Option<&str>) -> ResponseTemplate {
+    let mut answer = json!({"id": user, "name": user.to_lowercase()});
+    if let Some(team) = team {
+        answer["team_id"] = json!(team);
+    }
+    ok(json!({"user": answer}))
+}
+
+fn refused(code: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": code}))
+}
+
+/// A surface whose member list has `listed` with their teams.
+async fn listing(listed: &[(&str, &str)]) -> (MockServer, SlackSurface) {
+    let (server, surface) = setup().await;
+    let members: Vec<Value> = listed
+        .iter()
+        .map(|(user, team)| json!({"id": user, "team_id": team, "name": user.to_lowercase()}))
+        .collect();
+    mount(&server, "users.list", ok(json!({"members": members}))).await;
+    surface.refresh_members().await.unwrap();
+    (server, surface)
+}
+
+fn home_event_from(user: &str) -> InboundEvent {
+    let mut event = event_from(testkit::slack::MESSAGE_CONNECT_HOME);
+    event.sender.user = user.into();
+    event
+}
+
+fn outside_unknown() -> Option<Outside> {
+    Some(Outside { team: None })
+}
+
+#[tokio::test]
+async fn a_sender_is_home_only_when_the_home_check_agrees() {
+    let (server, surface) = listing(&[(USER, TEAM), ("U0HUMAN02", OUTSIDE_TEAM)]).await;
+    mount_user(
+        &server,
+        "U0HUMAN02",
+        user_in("U0HUMAN02", Some(OUTSIDE_TEAM)),
+    )
+    .await;
+    mount_user(&server, "U0LOOKUP1", user_in("U0LOOKUP1", Some(TEAM))).await;
+    mount_user(&server, "U0NOTEAM1", user_in("U0NOTEAM1", None)).await;
+    mount_user(
+        &server,
+        "U0THEIRS1",
+        user_in("U0THEIRS1", Some(OUTSIDE_TEAM)),
+    )
+    .await;
+    mount_user(&server, "U0ORGWIDE", user_in("U0ORGWIDE", Some(HOME_ORG))).await;
+    mount_user(&server, "U0GONE001", refused("user_not_found")).await;
+    for (user, outside) in [
+        (USER, None),
+        ("U0HUMAN02", outside_unknown()),
+        ("U0LOOKUP1", None),
+        ("U0NOTEAM1", outside_unknown()),
+        ("U0THEIRS1", outside_unknown()),
+        ("U0ORGWIDE", outside_unknown()),
+        ("U0GONE001", outside_unknown()),
+    ] {
+        let mut event = home_event_from(user);
+        assert_eq!(event.outside, None, "the fields all name home");
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside, "{user}");
+    }
+    let looked_up = lookups(&server, "users.info").await;
+    assert_eq!(looked_up.len(), 6, "the listed home member costs no lookup");
+
+    for user in ["U0HUMAN02", "U0LOOKUP1", "U0GONE001"] {
+        let mut event = home_event_from(user);
+        surface.fill_sender_team(&mut event).await.unwrap();
+    }
+    assert_eq!(
+        lookups(&server, "users.info").await.len(),
+        6,
+        "both answers are kept"
+    );
+
+    let mut theirs = home_event_from("U0LOOKUP1");
+    theirs.outside = Some(Outside {
+        team: Some(OUTSIDE_TEAM.into()),
+    });
+    let before = theirs.clone();
+    surface.fill_sender_team(&mut theirs).await.unwrap();
+    assert_eq!(
+        theirs, before,
+        "fields that say outside are kept as they are"
+    );
+}
+
+#[tokio::test]
+async fn a_home_member_in_a_shared_channel_is_home() {
+    let (server, surface) = listing(&[(USER, TEAM)]).await;
+    let mut event = event_from(testkit::slack::MESSAGE_CONNECT_HOME);
+    assert_eq!(event.conv.conversation.as_str(), SHARED_CHANNEL);
+    surface.fill_sender_team(&mut event).await.unwrap();
+    assert_eq!(event.outside, None);
+    assert!(lookups(&server, "users.info").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_home_organization_field_with_a_home_lookup_is_home() {
+    let server = MockServer::start().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let directory = Arc::new(TeamDirectory::new(TEAM.into()).with_home_org(Some(HOME_ORG.into())));
+    let surface = SlackSurface::new(client.bot(SecretString::from(TOKEN)), directory);
+    mount_user(&server, USER, user_in(USER, Some(TEAM))).await;
+    mount_user(
+        &server,
+        "U0ELSEWHR",
+        user_in("U0ELSEWHR", Some("T0SIBLING")),
+    )
+    .await;
+    let envelope: Value = serde_json::from_str(testkit::slack::MESSAGE_HOME_ORG).unwrap();
+    let bot = UserId::from(BOT_USER);
+    let team = TEAM.into();
+    let org = HOME_ORG.into();
+    let context = Context {
+        binding: BindingId::new_v4(),
+        bot_user: Some(&bot),
+        team: &team,
+        home_org: Some(&org),
+        event_id: "Ev0HOMEORG",
+        received_at: time::OffsetDateTime::now_utc(),
+    };
+    let event = normalize::message(&context, &envelope["event"]).unwrap();
+    assert_eq!(event.outside, None);
+    let mut home = event.clone();
+    surface.fill_sender_team(&mut home).await.unwrap();
+    assert_eq!(home.outside, None);
+    let mut sibling = event;
+    sibling.sender.user = "U0ELSEWHR".into();
+    surface.fill_sender_team(&mut sibling).await.unwrap();
+    assert_eq!(
+        sibling.outside,
+        outside_unknown(),
+        "another workspace of the organization isn't home"
+    );
+}
+
+#[tokio::test]
+async fn a_home_lookup_slack_refuses_is_outside() {
+    let (server, surface) = setup().await;
+    for (user, code) in [
+        ("U0SCOPE01", "missing_scope"),
+        ("U0AUTH001", "invalid_auth"),
+        ("U0HIDDEN1", "user_not_visible"),
+        ("U0FATAL01", "fatal_error"),
+    ] {
+        mount_user(&server, user, refused(code)).await;
+        let mut event = home_event_from(user);
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside_unknown(), "{code}");
+        surface
+            .fill_sender_team(&mut home_event_from(user))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        lookups(&server, "users.info").await.len(),
+        8,
+        "a refusal is no answer and isn't kept"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached() {
+    let (server, surface) = setup().await;
+    mount_user(&server, "U0DOWN001", ResponseTemplate::new(503)).await;
+    mount_user(
+        &server,
+        "U0BUSY001",
+        ResponseTemplate::new(429).insert_header("retry-after", "30"),
+    )
+    .await;
+    mount_user(&server, "U0SCOPE01", refused("missing_scope")).await;
+    for _ in 0..2 {
+        let mut event = home_event_from("U0DOWN001");
+        let err = surface.fill_sender_team(&mut event).await.unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+        assert_eq!(event.outside, None, "left alone");
+    }
+    assert_eq!(lookups(&server, "users.info").await.len(), 2);
+
+    let started = std::time::Instant::now();
+    let mut event = home_event_from("U0BUSY001");
+    let err = surface.fill_sender_team(&mut event).await.unwrap_err();
+    assert!(matches!(err, SurfaceError::RateLimited { .. }), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "never waits");
+    assert_eq!(event.outside, None);
+
+    let (server, surface) = setup().await;
+    mount_user(&server, "U0SCOPE01", refused("missing_scope")).await;
+    let directory = surface.directory();
+    for _ in 0..2 {
+        let err = directory
+            .home_user(surface.api(), &"U0SCOPE01".into())
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, SurfaceError::NotFound(_)), "{err:?}");
+    }
+    assert_eq!(lookups(&server, "users.info").await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_bots_post_is_never_looked_up() {
+    let (server, surface) = setup().await;
+    let mut bot = bot_event();
+    bot.sender_bot_user = Some("U0OTHERBT".into());
+    let mut classic = bot_event();
+    classic.sender_bot_user = None;
+    for mut event in [bot, classic] {
+        let before = event.clone();
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event, before);
+    }
+
+    let (server2, surface) = confirming_setup(public_channel()).await;
+    let event = event_from(testkit::slack::MESSAGE_BOT);
+    let ts = event.message.id.as_str();
+    mount(
+        &server2,
+        "conversations.history",
+        ok(json!({"messages": [{
+            "ts": ts,
+            "user": "U0OTHERBT",
+            "bot_id": "B0OTHER01",
+            "bot_profile": {"id": "B0OTHER01"},
+            "text": format!("<@{BOT_USER}> hello"),
+            "user_team": OUTSIDE_TEAM,
+        }]})),
+    )
+    .await;
+    mount(
+        &server2,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0OTHER01", "user_id": "U0OTHERBT"}})),
+    )
+    .await;
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert!(copy.sender_is_bot);
+    assert!(lookups(&server, "users.info").await.is_empty());
+    assert!(lookups(&server2, "users.info").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_made_up_sender_costs_no_home_lookup() {
+    let mut forged = event_from(testkit::slack::MESSAGE_MENTION);
+    forged.sender.user = "U0MADEUP1".into();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": []})),
+    )
+    .await;
+    assert_eq!(surface.confirm(&forged).await.unwrap(), None);
+    assert!(lookups(&server, "users.info").await.is_empty());
+
+    let (server, surface) = confirming_setup(public_channel()).await;
+    let ts = forged.message.id.as_str();
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": forged.text}]})),
+    )
+    .await;
+    mount_user(&server, USER, user_in(USER, Some(TEAM))).await;
+    let copy = surface.confirm(&forged).await.unwrap().unwrap();
+    assert_eq!(copy.sender.user.as_str(), USER);
+    assert_eq!(copy.outside, None);
+    let looked_up = lookups(&server, "users.info").await;
+    assert_eq!(looked_up.len(), 1);
+    assert_eq!(
+        form(&looked_up[0])["user"],
+        USER,
+        "Slack's sender, not the event's"
+    );
+}
+
+#[tokio::test]
+async fn confirm_reads_who_is_outside_from_slacks_copy() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str().to_owned();
+    for (copy, info, outside) in [
+        (
+            json!({"ts": ts, "user": USER, "text": event.text, "user_team": OUTSIDE_TEAM}),
+            None,
+            Some(Outside {
+                team: Some(OUTSIDE_TEAM.into()),
+            }),
+        ),
+        (
+            json!({"ts": ts, "user": USER, "text": event.text, "team": TEAM}),
+            Some(user_in(USER, Some(OUTSIDE_TEAM))),
+            outside_unknown(),
+        ),
+        (
+            json!({"ts": ts, "user": USER, "text": event.text, "team": TEAM}),
+            Some(user_in(USER, Some(TEAM))),
+            None,
+        ),
+    ] {
+        let (server, surface) = confirming_setup(public_channel()).await;
+        mount(
+            &server,
+            "conversations.history",
+            ok(json!({"messages": [copy]})),
+        )
+        .await;
+        let asks = info.is_some();
+        if let Some(info) = info {
+            mount_user(&server, USER, info).await;
+        }
+        let confirmed = surface.confirm(&event).await.unwrap().unwrap();
+        assert_eq!(confirmed.outside, outside);
+        assert_eq!(confirmed.sender.team.as_str(), TEAM);
+        assert_eq!(lookups(&server, "users.info").await.is_empty(), !asks);
+    }
+}
+
+#[tokio::test]
+async fn a_rate_limited_home_lookup_fails_the_confirmation_at_once() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": event.text}]})),
+    )
+    .await;
+    mount_user(
+        &server,
+        USER,
+        ResponseTemplate::new(429).insert_header("retry-after", "30"),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let err = surface.confirm(&event).await.unwrap_err();
+    assert!(matches!(err, SurfaceError::RateLimited { .. }), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+fn conversation(extra: Value) -> ResponseTemplate {
+    let mut channel = json!({"id": SHARED_CHANNEL, "is_channel": true, "is_member": true});
+    for (key, value) in extra.as_object().unwrap() {
+        channel[key] = value.clone();
+    }
+    ok(json!({"channel": channel}))
+}
+
+async fn info_of(extra: Value) -> ConvInfo {
+    let (server, surface) = setup().await;
+    mount(&server, "conversations.info", conversation(extra)).await;
+    surface
+        .directory()
+        .conv_info(surface.api(), &SHARED_CHANNEL.into())
+        .await
+        .unwrap()
+}
+
+fn external(teams: Option<&[&str]>) -> Sharing {
+    Sharing::External {
+        teams: teams.map(|teams| teams.iter().map(|team| TeamId::from(*team)).collect()),
+    }
+}
+
+#[tokio::test]
+async fn conv_info_reads_sharing_and_connected_teams() {
+    let both = [TEAM, OUTSIDE_TEAM];
+    for (extra, kind, sharing) in [
+        (json!({}), ConvKind::Channel, Sharing::None),
+        (
+            json!({"is_shared": false, "is_org_shared": false, "is_ext_shared": false}),
+            ConvKind::Channel,
+            Sharing::None,
+        ),
+        (
+            json!({"is_shared": true, "is_org_shared": true}),
+            ConvKind::Channel,
+            Sharing::Org,
+        ),
+        (
+            json!({"is_org_shared": true}),
+            ConvKind::Channel,
+            Sharing::Org,
+        ),
+        (
+            json!({"is_shared": true, "is_ext_shared": true, "connected_team_ids": both}),
+            ConvKind::Channel,
+            external(Some(&both)),
+        ),
+        (
+            json!({"is_ext_shared": true, "is_org_shared": true, "connected_team_ids": [HOME_ORG]}),
+            ConvKind::Channel,
+            external(Some(&[HOME_ORG])),
+        ),
+        (
+            json!({"is_shared": true}),
+            ConvKind::Channel,
+            external(None),
+        ),
+        (
+            json!({"is_ext_shared": true, "connected_team_ids": []}),
+            ConvKind::Channel,
+            external(Some(&[])),
+        ),
+        (
+            json!({"is_ext_shared": "yes", "is_shared": 1, "is_org_shared": null}),
+            ConvKind::Channel,
+            Sharing::None,
+        ),
+        (
+            json!({"is_channel": false, "is_mpim": true, "is_ext_shared": true}),
+            ConvKind::GroupDm,
+            external(None),
+        ),
+        (
+            json!({"is_channel": false, "is_im": true}),
+            ConvKind::Dm,
+            Sharing::None,
+        ),
+    ] {
+        let info = info_of(extra.clone()).await;
+        assert_eq!(info, ConvInfo { kind, sharing }, "{extra}");
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_or_overflowing_team_list_is_unknown() {
+    let most: Vec<String> = (0..MAX_CONNECTED_TEAMS)
+        .map(|n| format!("T0MANY{n:03}"))
+        .collect();
+    let mut too_many = most.clone();
+    too_many.push("T0ONEMORE".to_owned());
+    for teams in [
+        json!([TEAM, "not a team"]),
+        json!([TEAM, 7]),
+        json!([TEAM, null]),
+        json!([[TEAM]]),
+        json!(TEAM),
+        json!({"id": TEAM}),
+        json!(null),
+        json!(too_many),
+    ] {
+        let info = info_of(json!({"is_ext_shared": true, "connected_team_ids": teams})).await;
+        assert_eq!(info.sharing, external(None), "{teams}");
+        assert_eq!(info.kind, ConvKind::Channel);
+    }
+    let info = info_of(json!({"is_ext_shared": true, "connected_team_ids": most})).await;
+    let Sharing::External { teams: Some(teams) } = info.sharing else {
+        panic!("{:?}", info.sharing);
+    };
+    assert_eq!(teams.len(), MAX_CONNECTED_TEAMS);
+}
+
+#[tokio::test]
+async fn conv_info_fresh_refreshes_the_cache() {
+    let (server, surface) = setup().await;
+    let directory = surface.directory();
+    let channel = SHARED_CHANNEL.into();
+    mount(&server, "conversations.info", conversation(json!({}))).await;
+    let first = directory.conv_info(surface.api(), &channel).await.unwrap();
+    assert_eq!(first.sharing, Sharing::None);
+
+    server.reset().await;
+    mount(
+        &server,
+        "conversations.info",
+        conversation(json!({"is_ext_shared": true, "connected_team_ids": [TEAM, OUTSIDE_TEAM]})),
+    )
+    .await;
+    assert_eq!(
+        directory.conv_info(surface.api(), &channel).await.unwrap(),
+        first,
+        "kept until it is read fresh"
+    );
+    assert_eq!(
+        directory.conv_kind(surface.api(), &channel).await.unwrap(),
+        ConvKind::Channel
+    );
+    assert!(requests(&server).await.is_empty());
+    let shared = external(Some(&[TEAM, OUTSIDE_TEAM]));
+    let fresh = directory
+        .conv_info_fresh(surface.api(), &channel)
+        .await
+        .unwrap();
+    assert_eq!(fresh.sharing, shared);
+    assert_eq!(
+        directory
+            .conv_info(surface.api(), &channel)
+            .await
+            .unwrap()
+            .sharing,
+        shared,
+        "the fresh answer replaced the cached one"
+    );
+    assert_eq!(requests(&server).await.len(), 1);
+
+    server.reset().await;
+    mount(&server, "conversations.info", ResponseTemplate::new(503)).await;
+    assert!(
+        directory
+            .conv_info_fresh(surface.api(), &channel)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        directory
+            .conv_info(surface.api(), &channel)
+            .await
+            .unwrap()
+            .sharing,
+        shared,
+        "a failed fresh read leaves what was kept"
+    );
+
+    server.reset().await;
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": {"id": SHARED_CHANNEL.to_lowercase(), "is_channel": true}})),
+    )
+    .await;
+    let err = directory
+        .conv_info_fresh(surface.api(), &channel)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SurfaceError::NotFound(_)), "{err:?}");
 }

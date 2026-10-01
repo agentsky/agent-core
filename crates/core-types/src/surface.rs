@@ -130,13 +130,18 @@ string_id!(
 
 /// A member's identity on one surface: `(surface, team, user)`.
 ///
+/// On Slack, `team` is the workspace agentd serves, for a member of
+/// another organization seen in a Slack Connect conversation too: user ids
+/// are globally unique, so the key names one person, and their own
+/// organization is [`Outside`], apart from the key.
+///
 /// Its string form is `<surface>:<team>:<user>` (see the [module
 /// docs](self) for escaping). Its serde form is a struct.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MemberKey {
     /// The platform.
     pub surface: SurfaceKind,
-    /// The workspace.
+    /// The workspace: on Slack always the one agentd serves.
     pub team: TeamId,
     /// The user within the workspace.
     pub user: UserId,
@@ -159,6 +164,38 @@ impl FromStr for MemberKey {
             user: UserId(user),
         })
     }
+}
+
+/// A sender from outside the workspace agentd serves: a member of another
+/// Slack organization, seen in a Slack Connect conversation.
+///
+/// Their [`MemberKey`] still names the served workspace; this says that
+/// they aren't one of its members, and which organization they are from.
+/// Rocket.Chat has no such members, so it is never set there.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Outside {
+    /// The sender's own organization, a Slack team (`T…`) or Enterprise
+    /// Grid organization (`E…`), or `None` when Slack named none.
+    pub team: Option<TeamId>,
+}
+
+/// Whether a conversation is shared beyond the workspace agentd serves, as
+/// the platform says.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sharing {
+    /// Not shared: only the workspace's own members are in it.
+    None,
+    /// Shared only with other workspaces of the workspace's own Enterprise
+    /// Grid organization.
+    Org,
+    /// Shared with at least one other organization (Slack Connect).
+    External {
+        /// The organizations it is shared with, or `None` when the platform
+        /// gave no list agentd keeps: none at all, an id not shaped like a
+        /// team's, or more than agentd keeps.
+        teams: Option<Vec<TeamId>>,
+    },
 }
 
 /// A conversation on one surface: `(surface, team, conversation)`.
@@ -467,6 +504,33 @@ mod tests {
             json_round_trip(&Cursor::new("1.2")),
             serde_json::json!("1.2")
         );
+    }
+
+    #[test]
+    fn outside_serde_round_trips() {
+        assert_eq!(
+            json_round_trip(&Outside {
+                team: Some("E0ORG".into())
+            }),
+            serde_json::json!({"team": "E0ORG"})
+        );
+        assert_eq!(
+            json_round_trip(&Outside { team: None }),
+            serde_json::json!({"team": null})
+        );
+    }
+
+    #[test]
+    fn sharing_serde_round_trips() {
+        assert_eq!(json_round_trip(&Sharing::None), serde_json::json!("none"));
+        assert_eq!(json_round_trip(&Sharing::Org), serde_json::json!("org"));
+        assert_eq!(
+            json_round_trip(&Sharing::External {
+                teams: Some(vec!["T2".into()])
+            }),
+            serde_json::json!({"external": {"teams": ["T2"]}})
+        );
+        json_round_trip(&Sharing::External { teams: None });
     }
 
     #[test]

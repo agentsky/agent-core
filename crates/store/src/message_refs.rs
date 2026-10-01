@@ -132,6 +132,7 @@ impl Row {
                     .map(|member| parse_column::<MemberId>(&member, TABLE, "requester_member"))
                     .transpose()?,
                 key: parse_column::<MemberKey>(&self.requester_key, TABLE, "requester_key")?,
+                outside: None,
             },
             hop: Hop(u8::try_from(self.hop).map_err(|_| corrupt("hop"))?),
             posted_at: from_unix(self.posted_at, TABLE, "posted_at")?,
@@ -458,6 +459,7 @@ mod tests {
                 team: TeamId::new("T1"),
                 user: UserId::new(user),
             },
+            outside: None,
         }
     }
 

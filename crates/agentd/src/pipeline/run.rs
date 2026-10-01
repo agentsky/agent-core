@@ -937,7 +937,10 @@ impl Pipeline {
 
     /// Routes `job`'s message for `agent`, and unless the decision is to
     /// ignore it, routes the platform's copy again and acts on the copy
-    /// if its decision may stand ([`copy_stands`]). A hand-off agentd built
+    /// if its decision may stand ([`copy_stands`]). A copy the platform
+    /// gave without [`outside`](InboundEvent::outside) takes the event's,
+    /// so an event saying its sender is from outside is never made home by
+    /// its copy. A hand-off agentd built
     /// itself is acted on as it is, once the agent's bot is found, asking
     /// the platform now, to be able to post in the conversation.
     ///
@@ -1003,7 +1006,7 @@ impl Pipeline {
             let Some(copy) = self.confirmed(job, agent).await else {
                 return true;
             };
-            Some(copy).filter(|copy| copy != event)
+            Some(outside_kept(copy, event)).filter(|copy| copy != event)
         };
         let (event, decision) = if let Some(copy) = &copy {
             let Some(confirmed) = self.decide(copy, agent, caps).await else {
@@ -1979,16 +1982,33 @@ fn limited(decision: &Decision) -> bool {
     )
 }
 
+/// The platform's `copy` of `event`, taking the event's
+/// [`outside`](InboundEvent::outside) when the copy has none: an event that
+/// says its sender is from outside is never made home by its copy.
+fn outside_kept(mut copy: InboundEvent, event: &InboundEvent) -> InboundEvent {
+    if copy.outside.is_none() {
+        copy.outside.clone_from(&event.outside);
+    }
+    copy
+}
+
 /// Whether the decision on the platform's copy of a message, `confirmed`,
 /// may be acted on when the event's was `decision`: when they are the
-/// same, or, for the same requester's identity, when either is a limit's
+/// same, or, for the same requester's identity and the same
+/// [`outside`](core_types::Requester::outside), when either is a limit's
 /// refusal ([`limited`]). The counts a limit reads can change between the
 /// two, as a turn ends or an hour or a day turns, and so can the member an
-/// identity belongs to, as one is made for it; who asked can't.
+/// identity belongs to, as one is made for it (T27), so the requester's
+/// `member` isn't compared; who asked, and whether they are from outside,
+/// can't change.
 fn copy_stands(decision: &Decision, confirmed: &Decision) -> bool {
-    let key = |decision: &Decision| decision.requester().map(|requester| requester.key.clone());
+    let asker = |decision: &Decision| {
+        decision
+            .requester()
+            .map(|requester| (requester.key.clone(), requester.outside.clone()))
+    };
     confirmed == decision
-        || ((limited(decision) || limited(confirmed)) && key(decision) == key(confirmed))
+        || ((limited(decision) || limited(confirmed)) && asker(decision) == asker(confirmed))
 }
 
 /// For a refusal a limit over a day or an hour gives, the kind of notice
@@ -2257,6 +2277,7 @@ impl HandOffs {
             mentions: posted.mentions.clone(),
             files: Vec::new(),
             received_at: self.now,
+            outside: None,
         }
     }
 }
@@ -2679,6 +2700,7 @@ mod tests {
                 user: "U1".into(),
                 ..bot.clone()
             },
+            outside: None,
         };
         let answered = MsgRef {
             conv: conv.clone(),
@@ -2816,6 +2838,136 @@ mod tests {
         }
     }
 
+    fn asker(user: &str, outside: Option<&str>) -> Requester {
+        Requester {
+            member: None,
+            key: MemberKey {
+                surface: core_types::SurfaceKind::Slack,
+                team: "T1".into(),
+                user: user.into(),
+            },
+            outside: outside.map(|team| core_types::Outside {
+                team: (!team.is_empty()).then(|| team.into()),
+            }),
+        }
+    }
+
+    fn capped_for(requester: Requester) -> Decision {
+        Decision::Refuse {
+            reason: RefuseReason::DailyCap { max: 1 },
+            requester,
+        }
+    }
+
+    fn run_for(requester: Requester) -> Decision {
+        Decision::Run {
+            requester,
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            scope: ScopeKind::Channel,
+            side: Side::Public,
+        }
+    }
+
+    #[test]
+    fn copy_stands_compares_key_and_outside() {
+        let home = asker("U1", None);
+        let theirs = asker("U1", Some("T0THEIRS1"));
+        let unknown = asker("U1", Some(""));
+        assert!(copy_stands(
+            &capped_for(home.clone()),
+            &run_for(home.clone())
+        ));
+        assert!(copy_stands(
+            &capped_for(theirs.clone()),
+            &capped_for(theirs.clone())
+        ));
+        for (event, copy) in [
+            (&home, &theirs),
+            (&theirs, &home),
+            (&home, &unknown),
+            (&theirs, &unknown),
+        ] {
+            assert!(
+                !copy_stands(&capped_for(event.clone()), &run_for(copy.clone())),
+                "{event:?} then {copy:?}"
+            );
+            assert!(!copy_stands(
+                &run_for(event.clone()),
+                &capped_for(copy.clone())
+            ));
+        }
+        assert!(!copy_stands(
+            &capped_for(home),
+            &Decision::Ignore(router::IgnoreReason::Outside)
+        ));
+    }
+
+    #[test]
+    fn copy_stands_still_lets_a_member_be_made_between_routings() {
+        let before = asker("U1", None);
+        let after = Requester {
+            member: Some(MemberId::new_v4()),
+            ..before.clone()
+        };
+        assert!(copy_stands(
+            &capped_for(before.clone()),
+            &run_for(after.clone())
+        ));
+        assert!(copy_stands(&run_for(before), &capped_for(after)));
+        let theirs = asker("U1", Some("T0THEIRS1"));
+        let theirs_with_member = Requester {
+            member: Some(MemberId::new_v4()),
+            ..theirs.clone()
+        };
+        assert!(copy_stands(
+            &capped_for(theirs),
+            &capped_for(theirs_with_member)
+        ));
+    }
+
+    #[test]
+    fn an_event_saying_outside_keeps_the_copy_outside() {
+        let conv = core_types::ConvRef {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            conversation: "C1".into(),
+        };
+        let binding = core_types::BindingId::new_v4();
+        let event = |outside: Option<&str>| InboundEvent {
+            event_id: "Ev1".into(),
+            binding,
+            sender: asker("U1", None).key,
+            sender_is_bot: false,
+            sender_bot_user: None,
+            conv: conv.clone(),
+            conv_kind: ConvKind::Channel,
+            thread_root: None,
+            message: MsgRef {
+                conv: conv.clone(),
+                id: "1.0".into(),
+            },
+            text: String::new(),
+            mentions: Vec::new(),
+            reply_to: None,
+            files: Vec::new(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            outside: asker("U1", outside).outside,
+        };
+        let theirs = event(Some("T0THEIRS1"));
+        let home = event(None);
+        let unknown = event(Some(""));
+        assert_eq!(outside_kept(home.clone(), &theirs), theirs);
+        assert_eq!(
+            outside_kept(unknown.clone(), &theirs),
+            unknown,
+            "the copy's own outside stands"
+        );
+        assert_eq!(outside_kept(theirs.clone(), &home), theirs);
+        assert_eq!(outside_kept(unknown.clone(), &home), unknown);
+        assert_eq!(outside_kept(home.clone(), &home), home);
+    }
+
     #[test]
     fn only_a_limits_refusal_may_differ_between_an_event_and_its_copy() {
         let requester = Requester {
@@ -2825,6 +2977,7 @@ mod tests {
                 team: "T1".into(),
                 user: "U1".into(),
             },
+            outside: None,
         };
         let refuse = |reason| Decision::Refuse {
             reason,
@@ -2884,6 +3037,7 @@ mod tests {
                 user: "U2".into(),
                 ..requester.key.clone()
             },
+            outside: None,
         };
         let run_for_other = Decision::Run {
             requester: other.clone(),
@@ -2956,6 +3110,7 @@ mod tests {
                                         requester: Requester {
                                             member: requester,
                                             key: requester_key.clone(),
+                                            outside: None,
                                         },
                                         hop: Hop::ZERO,
                                         credential,
@@ -2980,6 +3135,7 @@ mod tests {
                                         reply_to: None,
                                         files: Vec::new(),
                                         received_at: OffsetDateTime::UNIX_EPOCH,
+                                        outside: None,
                                     };
                                     let resolved = turn_scope(&turn, owner, &event);
                                     let owners_own = requester == Some(owner)

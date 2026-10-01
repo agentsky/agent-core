@@ -38,6 +38,20 @@
 //! token has to be revoked. Text that fails to parse but looks
 //! secret-bearing gets the same treatment. Commands are logged by name only,
 //! never with their text or arguments.
+//!
+//! # Who may run them
+//!
+//! A DM to the Slack manager app runs only when its sender is home: before
+//! the text is even parsed, [`Commands::answer_text`] asks the manager
+//! surface's [`home_user`](surface_slack::SlackSurface::home_user), without
+//! waiting for a used-up quota. It runs in the member's own task of the
+//! [`intake`], never in the Slack queue every app's requests pass through,
+//! so a slow lookup holds up only that member's commands. A sender who
+//! isn't home is dropped. A lookup that couldn't reach Slack, or ran out of
+//! quota, gets [`UNCONFIRMED_TEXT`] in the DM the event named, which opens
+//! nothing; any other failed lookup drops the command with a warning
+//! logged at most once per [`HOME_CHECK_WARNING_INTERVAL`]. Slash commands
+//! and clicks are checked before they get here (`slack::Inbound`).
 
 mod admin;
 mod agents;
@@ -60,16 +74,21 @@ mod tests;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, CloudCommand, Command, ParseError};
-use core_types::{ConsentId, ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
+use core_types::{
+    ConsentId, ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceError, SurfaceKind,
+    Throttle,
+};
 use secrecy::SecretString;
 use store::{ConsentState, MemberUsage, Store, StoreError, UsageTotals};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
 use crate::consents::{Consents, Decided};
+use crate::pipeline::UNCONFIRMED_TEXT;
 use crate::policy::Limits;
 use crate::skills::Skills;
 use crate::slack::agents::SlackAgents;
@@ -214,6 +233,9 @@ impl FollowUp {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
+/// How often a manager DM's failed home check is logged at most.
+pub const HOME_CHECK_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The reply to a banned member's commands, those that only take
 /// something away aside.
 const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
@@ -242,6 +264,7 @@ struct Inner {
     slack: Option<SlackManager>,
     skills: Skills,
     sessions: Mutex<Option<Weak<dyn SessionControl>>>,
+    home_check_warnings: Throttle,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -283,6 +306,7 @@ impl Commands {
                 slack,
                 skills,
                 sessions: Mutex::new(None),
+                home_check_warnings: Throttle::new(HOME_CHECK_WARNING_INTERVAL),
             }),
             admins: Arc::new([]),
             slack_agents: None,
@@ -359,7 +383,9 @@ impl Commands {
     }
 
     /// As [`handle_text`](Self::handle_text), but returns once the reply
-    /// is sent, with what the command still has to do.
+    /// is sent, with what the command still has to do. A manager DM from a
+    /// sender who isn't home runs nothing ([Who may run
+    /// them](self#who-may-run-them)).
     pub async fn answer_text(
         &self,
         member: &MemberKey,
@@ -367,6 +393,9 @@ impl Commands {
         origin: &Origin,
         files: &[InFile],
     ) -> FollowUp {
+        if !self.admits(member, origin).await {
+            return FollowUp::default();
+        }
         match commands::parse(text) {
             Ok(command) => self.answer(member, command, origin, files).await,
             Err(err) => {
@@ -380,6 +409,39 @@ impl Commands {
                 let reply = self.unparsed(member, &err, origin).await;
                 self.reply(member, origin, &reply).await;
                 FollowUp::default()
+            }
+        }
+    }
+
+    /// Whether a command `member` sent from `origin` may run: always, but
+    /// for a DM to the Slack manager app, which runs only when the manager
+    /// surface says its sender is home ([Who may run
+    /// them](self#who-may-run-them)).
+    async fn admits(&self, member: &MemberKey, origin: &Origin) -> bool {
+        if !matches!(origin, Origin::SlackDm { .. }) {
+            return true;
+        }
+        let Some(slack) = self.inner.slack.as_ref().filter(|slack| {
+            member.surface == SurfaceKind::Slack && member.team == slack.identity().team
+        }) else {
+            tracing::debug!(%member, "dropped a Slack DM command no manager app serves");
+            return false;
+        };
+        match slack.surface().home_user(&member.user).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::debug!(%member, "dropped a DM command from outside the workspace");
+                false
+            }
+            Err(SurfaceError::Transport(_) | SurfaceError::RateLimited { .. }) => {
+                self.reply(member, origin, UNCONFIRMED_TEXT).await;
+                false
+            }
+            Err(err) => {
+                if let Some(quiet) = self.inner.home_check_warnings.record((), Instant::now()) {
+                    tracing::warn!(%member, error = %err, dropped_since_last = quiet, "couldn't check whether a DM command's sender is home; dropped it");
+                }
+                false
             }
         }
     }

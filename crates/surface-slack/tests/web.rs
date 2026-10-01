@@ -102,6 +102,54 @@ async fn auth_test_reads_the_bot_identity() {
 }
 
 #[tokio::test]
+async fn auth_test_and_users_info_read_their_teams_leniently() {
+    for (enterprise, read) in [
+        (json!("E0HOMEORG"), Some("E0HOMEORG")),
+        (json!(null), None),
+        (json!(""), None),
+        (json!("not an org"), None),
+        (json!(42), None),
+        (json!({"id": "E0HOMEORG"}), None),
+    ] {
+        let (server, api) = server().await;
+        mount(
+            &server,
+            "auth.test",
+            ok(json!({"team_id": "T0TEAM001", "user_id": "U0BOT0001", "enterprise_id": enterprise})),
+        )
+        .await;
+        let auth = api.auth_test().await.unwrap();
+        assert_eq!(
+            auth.enterprise_id.as_ref().map(|id| id.as_str()),
+            read,
+            "{enterprise}"
+        );
+        assert_eq!(auth.team_id.as_str(), "T0TEAM001");
+
+        mount(
+            &server,
+            "users.info",
+            ok(json!({"user": {"id": "U0HUMAN01", "team_id": enterprise}})),
+        )
+        .await;
+        let user = api.user_info(&"U0HUMAN01".into()).await.unwrap();
+        assert_eq!(
+            user.team_id.as_ref().map(|id| id.as_str()),
+            read,
+            "{enterprise}"
+        );
+    }
+    let (server, api) = server().await;
+    mount(
+        &server,
+        "auth.test",
+        ok(json!({"team_id": "T0TEAM001", "user_id": "U0BOT0001"})),
+    )
+    .await;
+    assert_eq!(api.auth_test().await.unwrap().enterprise_id, None);
+}
+
+#[tokio::test]
 async fn post_message_threads_without_unfurls_link_names_or_parse() {
     let (server, api) = server().await;
     mount(

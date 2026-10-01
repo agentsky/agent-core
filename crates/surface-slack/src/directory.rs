@@ -1,18 +1,32 @@
-//! What agentd caches about a Slack workspace: its members, for mentions,
-//! which bot user each bot id belongs to, and what kind of conversation
-//! each channel is.
+//! What agentd caches about a Slack workspace: its members, for mentions
+//! and for who is home, which bot user each bot id belongs to, and what
+//! kind of conversation each channel is and how it is shared.
 //!
 //! Every binding in a workspace shares one [`TeamDirectory`], so a team's
 //! members are listed once however many agents are installed there. The
 //! caches are rebuilt from Slack after a restart; nothing here needs to be
-//! durable.
+//! durable: each answer is Slack's, read again when it is missing.
+//!
+//! # Who is home
+//!
+//! [`TeamDirectory::home_user`] is the independent source the design's
+//! home rule asks for: a Slack Connect message's own team fields can make
+//! its sender outside, never home, so a sender is home only when this
+//! agrees. It answers from the member list `users.list` gave, counting
+//! only the entries whose `team_id` is the workspace, and otherwise asks
+//! `users.info`, whose `team_id` must be the workspace too. Those answers
+//! are kept for [`HOME_ANSWER_TTL`], at most [`MAX_HOME_ANSWERS`] of them,
+//! the oldest dropped first; a lookup that fails is an error, not an
+//! answer, and isn't kept.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use core_types::{ConvKind, ConversationId, SurfaceError, TeamId, UserId};
+use std::collections::VecDeque;
+
+use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, UserId};
 use render::MentionDirectory;
 use tokio::time::Instant;
 
@@ -33,23 +47,110 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 /// like a bot id, so the cache holds at most a few hundred kilobytes.
 const MAX_BOTS: usize = 10_000;
 
-/// How long a conversation's kind is remembered. A group DM can be
-/// converted to a private channel.
+/// How long a conversation's kind and sharing are remembered. A group DM
+/// can be converted to a private channel, and a channel shared or unshared.
 pub const CONV_KIND_TTL: Duration = Duration::from_secs(60 * 60);
 
-/// The most conversation kinds remembered before the cache starts over.
+/// The most conversations remembered before the cache starts over.
 const MAX_CONV_KINDS: usize = 10_000;
+
+/// How long an answer of `users.info` to whether a user is home is kept.
+pub const HOME_ANSWER_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// The most answers of `users.info` to whether a user is home kept at
+/// once; past it, the oldest is dropped.
+pub const MAX_HOME_ANSWERS: usize = 4096;
+
+/// The `users.info` error code that answers for no user, which the home
+/// check takes for "not home".
+const USER_NOT_FOUND: &str = "user_not_found";
+
+/// What `conversations.info` says about a conversation, as
+/// [`TeamDirectory::conv_info`] keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvInfo {
+    /// What kind of conversation it is: `is_im`, then `is_mpim`, else a
+    /// channel.
+    pub kind: ConvKind,
+    /// Whether, and with whom, it is shared ([`Conversation::sharing`](crate::web::Conversation::sharing)).
+    pub sharing: Sharing,
+}
 
 /// A workspace's caches, shared by every binding in it.
 ///
 /// `Debug` shows the team and how much is cached, never names.
 pub struct TeamDirectory {
     team: TeamId,
+    home_org: Option<TeamId>,
     ttl: Duration,
     members: RwLock<Members>,
     refreshing: tokio::sync::Mutex<()>,
     bots: Mutex<Bots>,
-    conv_kinds: Mutex<HashMap<ConversationId, (ConvKind, Instant)>>,
+    conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
+    home_answers: Mutex<HomeAnswers>,
+}
+
+/// The answers `users.info` gave to whether a user is home, each kept for
+/// [`HOME_ANSWER_TTL`] from when it was given, at most `capacity` of them,
+/// the oldest dropped first. Each answer is numbered as it is kept, so
+/// `order` tells an answer from an older one for the same user.
+struct HomeAnswers {
+    capacity: usize,
+    answers: HashMap<UserId, (bool, Instant, u64)>,
+    order: VecDeque<(UserId, u64)>,
+    next: u64,
+}
+
+impl HomeAnswers {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            answers: HashMap::new(),
+            order: VecDeque::new(),
+            next: 0,
+        }
+    }
+
+    /// The answer for `user` still kept at `now`.
+    fn get(&mut self, user: &UserId, now: Instant) -> Option<bool> {
+        let (home, given, _) = *self.answers.get(user)?;
+        if now.saturating_duration_since(given) < HOME_ANSWER_TTL {
+            return Some(home);
+        }
+        self.answers.remove(user);
+        None
+    }
+
+    /// Keeps `home` for `user`, given at `now`, dropping the oldest answers
+    /// past the capacity.
+    fn insert(&mut self, user: UserId, home: bool, now: Instant) {
+        let number = self.next;
+        self.next += 1;
+        self.answers.insert(user.clone(), (home, now, number));
+        self.order.push_back((user, number));
+        while self.answers.len() > self.capacity {
+            let Some((oldest, number)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .answers
+                .get(&oldest)
+                .is_some_and(|(_, _, kept)| *kept == number)
+            {
+                self.answers.remove(&oldest);
+            }
+        }
+        if self.order.len() > 2 * self.capacity.max(1) {
+            let answers = &self.answers;
+            self.order.retain(|(user, number)| {
+                answers.get(user).is_some_and(|(_, _, kept)| kept == number)
+            });
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.answers.len()
+    }
 }
 
 /// Bot ids by what `bots.info` answered: those with a bot user, and apart
@@ -97,6 +198,7 @@ impl Bots {
 #[derive(Default)]
 struct Members {
     directory: Arc<MemberDirectory>,
+    home: Arc<HashSet<UserId>>,
     loaded: bool,
     next_attempt: Option<Instant>,
     failure: Option<SurfaceError>,
@@ -116,12 +218,24 @@ impl TeamDirectory {
     pub fn new(team: TeamId) -> Self {
         Self {
             team,
+            home_org: None,
             ttl: DEFAULT_MEMBER_TTL,
             members: RwLock::new(Members::default()),
             refreshing: tokio::sync::Mutex::new(()),
             bots: Mutex::default(),
-            conv_kinds: Mutex::new(HashMap::new()),
+            conv_infos: Mutex::new(HashMap::new()),
+            home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
         }
+    }
+
+    /// Sets the workspace's Enterprise Grid organization, the
+    /// `enterprise_id` `auth.test` gave, which a message's sender team
+    /// fields may name for a home member
+    /// ([`Context::home_org`](crate::normalize::Context::home_org)).
+    #[must_use]
+    pub fn with_home_org(mut self, home_org: Option<TeamId>) -> Self {
+        self.home_org = home_org;
+        self
     }
 
     /// Sets how long a member list is used before it is read again, at most
@@ -134,6 +248,11 @@ impl TeamDirectory {
     /// The workspace.
     pub fn team(&self) -> &TeamId {
         &self.team
+    }
+
+    /// The workspace's Enterprise Grid organization, if it has one.
+    pub fn home_org(&self) -> Option<&TeamId> {
+        self.home_org.as_ref()
     }
 
     /// Sets the bot users of the agents agentd manages in this workspace,
@@ -184,20 +303,23 @@ impl TeamDirectory {
             return fresh;
         }
         self.write_members().outdated = false;
-        let names = api
-            .all_users()
-            .await
-            .map(|users| Arc::new(names_from_users(&users)));
+        let names = api.all_users().await.map(|users| {
+            (
+                Arc::new(names_from_users(&users)),
+                Arc::new(home_users(&users, &self.team)),
+            )
+        });
         let now = Instant::now();
         let mut members = self.write_members();
         match names {
-            Ok(names) => {
+            Ok((names, home)) => {
                 let directory = Arc::new(MemberDirectory {
                     names,
                     managed: Arc::clone(&members.directory.managed),
                 });
                 *members = Members {
                     directory: Arc::clone(&directory),
+                    home,
                     loaded: true,
                     next_attempt: (!members.outdated).then(|| now + self.ttl),
                     failure: None,
@@ -279,48 +401,121 @@ impl TeamDirectory {
         Ok(user)
     }
 
-    /// What kind of conversation `channel` is, from `conversations.info`
-    /// (`is_im`, then `is_mpim`, else a channel), remembered for
-    /// [`CONV_KIND_TTL`]. A channel id's prefix can't tell a group DM or a
-    /// private channel from a public one.
+    /// Whether `user` belongs to the workspace, for the home rule (see
+    /// [Who is home](self#who-is-home)): `Ok(true)` when the member list
+    /// as last read has them with the workspace's `team_id`, or else when
+    /// `users.info` through `api` answers with it; `Ok(false)` when
+    /// `users.info` answers with another `team_id`, or none, or says
+    /// `user_not_found`. `users.info`'s answers are kept for
+    /// [`HOME_ANSWER_TTL`], at most [`MAX_HOME_ANSWERS`], the oldest
+    /// dropped first, and one dropped is asked again, never taken as home.
+    /// Pass a client made with [`WebApi::without_waiting`] for a caller
+    /// that mustn't wait for a used-up quota.
+    ///
+    /// # Errors
+    ///
+    /// Any other `users.info` error, as it came, whatever its variant
+    /// ([`SurfaceError::Transport`], [`SurfaceError::RateLimited`],
+    /// [`SurfaceError::Api`], [`SurfaceError::Unauthorized`],
+    /// [`SurfaceError::Forbidden`] for a `missing_scope`, …). It is no
+    /// answer, and nothing is kept.
+    pub async fn home_user(&self, api: &WebApi, user: &UserId) -> Result<bool> {
+        if self.read_members().home.contains(user) {
+            return Ok(true);
+        }
+        if let Some(home) = self.lock_home_answers().get(user, Instant::now()) {
+            return Ok(home);
+        }
+        let home = match api.user_info(user).await {
+            Ok(info) => info.team_id.as_ref() == Some(&self.team),
+            Err(SurfaceError::NotFound(code)) if code == USER_NOT_FOUND => false,
+            Err(err) => return Err(err),
+        };
+        self.lock_home_answers()
+            .insert(user.clone(), home, Instant::now());
+        Ok(home)
+    }
+
+    /// What kind of conversation `channel` is, from `conversations.info`;
+    /// a wrapper over [`conv_info`](Self::conv_info). A channel id's prefix
+    /// can't tell a group DM or a private channel from a public one.
+    ///
+    /// # Errors
+    ///
+    /// As for [`conv_info`](Self::conv_info).
+    pub async fn conv_kind(&self, api: &WebApi, channel: &ConversationId) -> Result<ConvKind> {
+        Ok(self.conv_info(api, channel).await?.kind)
+    }
+
+    /// What `conversations.info` through `api` says about `channel`: its
+    /// kind (`is_im`, then `is_mpim`, else a channel) and its sharing,
+    /// remembered for [`CONV_KIND_TTL`].
     ///
     /// # Errors
     ///
     /// The `conversations.info` error, or [`SurfaceError::NotFound`] when
     /// the id Slack answers with isn't `channel` exactly, as for an id in
     /// another case. Nothing is cached then.
-    pub async fn conv_kind(&self, api: &WebApi, channel: &ConversationId) -> Result<ConvKind> {
-        let now = Instant::now();
-        if let Some((kind, until)) = self.lock_conv_kinds().get(channel)
-            && *until > now
+    pub async fn conv_info(&self, api: &WebApi, channel: &ConversationId) -> Result<ConvInfo> {
+        if let Some((info, until)) = self.lock_conv_infos().get(channel)
+            && *until > Instant::now()
         {
-            return Ok(*kind);
+            return Ok(info.clone());
         }
-        let info = api.conversation_info(channel).await?;
-        if info.id != *channel {
+        self.conv_info_fresh(api, channel).await
+    }
+
+    /// As [`conv_info`](Self::conv_info), but always asking Slack, for
+    /// where the sharing guards the owner's work; the answer replaces the
+    /// one remembered.
+    ///
+    /// # Errors
+    ///
+    /// As for [`conv_info`](Self::conv_info). A failed read leaves what was
+    /// remembered as it was.
+    pub async fn conv_info_fresh(
+        &self,
+        api: &WebApi,
+        channel: &ConversationId,
+    ) -> Result<ConvInfo> {
+        let conversation = api.conversation_info(channel).await?;
+        if conversation.id != *channel {
             return Err(SurfaceError::NotFound(
                 "the channel id isn't Slack's own spelling".into(),
             ));
         }
-        let kind = if info.is_im {
+        let kind = if conversation.is_im {
             ConvKind::Dm
-        } else if info.is_mpim {
+        } else if conversation.is_mpim {
             ConvKind::GroupDm
         } else {
             ConvKind::Channel
         };
-        let mut kinds = self.lock_conv_kinds();
-        if kinds.len() >= MAX_CONV_KINDS {
-            kinds.clear();
+        let info = ConvInfo {
+            kind,
+            sharing: conversation.sharing(),
+        };
+        let mut infos = self.lock_conv_infos();
+        if infos.len() >= MAX_CONV_KINDS {
+            infos.clear();
         }
-        kinds.insert(channel.clone(), (kind, now + CONV_KIND_TTL));
-        Ok(kind)
+        infos.insert(
+            channel.clone(),
+            (info.clone(), Instant::now() + CONV_KIND_TTL),
+        );
+        Ok(info)
     }
 
-    fn lock_conv_kinds(
+    fn lock_conv_infos(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ConversationId, (ConvKind, Instant)>> {
-        self.conv_kinds
+    ) -> std::sync::MutexGuard<'_, HashMap<ConversationId, (ConvInfo, Instant)>> {
+        self.conv_infos
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_home_answers(&self) -> std::sync::MutexGuard<'_, HomeAnswers> {
+        self.home_answers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -344,7 +539,9 @@ impl fmt::Debug for TeamDirectory {
             .field("managed_bots", &directory.managed.len())
             .field("bots", &users)
             .field("userless_bots", &userless)
-            .field("conv_kinds", &self.lock_conv_kinds().len())
+            .field("home_members", &self.read_members().home.len())
+            .field("home_answers", &self.lock_home_answers().len())
+            .field("conv_infos", &self.lock_conv_infos().len())
             .finish_non_exhaustive()
     }
 }
@@ -463,6 +660,15 @@ fn names_from_users(users: &[User]) -> HashMap<String, Vec<UserId>> {
         ids.dedup();
     }
     names
+}
+
+/// The ids of the `users.list` entries whose `team_id` is `team`.
+fn home_users(users: &[User], team: &TeamId) -> HashSet<UserId> {
+    users
+        .iter()
+        .filter(|user| user.team_id.as_ref() == Some(team))
+        .map(|user| user.id.clone())
+        .collect()
 }
 
 /// Lowercases and collapses white space.
@@ -630,5 +836,65 @@ mod tests {
         assert_eq!(bots.get(&format!("B{MAX_BOTS}")), Some(None));
         assert_eq!(bots.get("B0"), None, "the userless cache started over");
         assert_eq!(bots.get("B0UNSEEN"), None);
+    }
+
+    #[test]
+    fn the_home_answer_cache_is_bounded_and_looks_up_an_evicted_no_again() {
+        let start = Instant::now();
+        let mut answers = HomeAnswers::new(2);
+        answers.insert("U0NO".into(), false, start);
+        answers.insert("U0YES".into(), true, start);
+        assert_eq!(answers.get(&"U0NO".into(), start), Some(false));
+        answers.insert("U0LATER".into(), true, start);
+        assert_eq!(answers.len(), 2);
+        assert_eq!(
+            answers.get(&"U0NO".into(), start),
+            None,
+            "the oldest answer, a no, was dropped and is asked again"
+        );
+        assert_eq!(answers.get(&"U0YES".into(), start), Some(true));
+        assert_eq!(answers.get(&"U0LATER".into(), start), Some(true));
+
+        let later = start + HOME_ANSWER_TTL;
+        assert_eq!(answers.get(&"U0YES".into(), later), None, "kept an hour");
+        assert_eq!(answers.len(), 1);
+        answers.insert("U0YES".into(), false, later);
+        answers.insert("U0LAST".into(), false, later);
+        assert_eq!(
+            answers.get(&"U0LATER".into(), later),
+            None,
+            "an answer given again is as new as its last"
+        );
+        assert_eq!(answers.get(&"U0YES".into(), later), Some(false));
+        assert_eq!(answers.get(&"U0LAST".into(), later), Some(false));
+
+        let mut many = HomeAnswers::new(MAX_HOME_ANSWERS);
+        for n in 0..=MAX_HOME_ANSWERS {
+            many.insert(format!("U{n}").into(), n % 2 == 0, start);
+        }
+        assert_eq!(many.len(), MAX_HOME_ANSWERS);
+        assert_eq!(many.get(&"U0".into(), start), None);
+        assert_eq!(many.get(&"U1".into(), start), Some(false));
+        for _ in 0..3 * MAX_HOME_ANSWERS {
+            many.insert("U1".into(), false, start);
+        }
+        assert!(many.order.len() <= 2 * MAX_HOME_ANSWERS);
+        assert_eq!(
+            TeamDirectory::new("T1".into()).lock_home_answers().capacity,
+            MAX_HOME_ANSWERS
+        );
+    }
+
+    #[test]
+    fn only_members_listed_with_the_workspaces_team_are_home() {
+        let mut theirs = user("U2", "Zoe", "Zoe Outside", "zoe");
+        theirs.team_id = Some("T2".into());
+        let mut unknown = user("U3", "Kit", "Kit Nobody", "kit");
+        unknown.team_id = None;
+        let home = home_users(
+            &[user("U1", "Ada", "Ada", "ada"), theirs, unknown],
+            &"T1".into(),
+        );
+        assert_eq!(home, HashSet::from([UserId::from("U1")]));
     }
 }

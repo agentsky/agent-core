@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, MemberKey, Msg, MsgRef, OutFile,
-    Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
+    Outside, Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
 };
 use render::MentionDirectory;
 use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
@@ -85,6 +85,9 @@ pub const CLIENT_URL: &str = "https://app.slack.com/client/";
 /// - [`post`](Surface::post) sends one chunk with `chat.postMessage`.
 /// - A bot message without a `user` names its sender by bot id until
 ///   [`fill_bot_sender`](Self::fill_bot_sender) looks the bot up.
+/// - [`confirm`](Surface::confirm) decides whether Slack's copy of a
+///   message is from outside the workspace with
+///   [`fill_sender_team`](Self::fill_sender_team).
 ///
 /// Every conversation it is given must be a Slack conversation in its
 /// workspace; any other is refused with [`SurfaceError::Api`] before
@@ -219,6 +222,63 @@ impl SlackSurface {
             event.sender.user = user.clone();
             event.sender_bot_user = Some(user);
         }
+        Ok(())
+    }
+
+    /// Whether `user` belongs to the workspace, as
+    /// [`TeamDirectory::home_user`] says, asking `users.info` with the
+    /// [members API](Self::with_members_api), the manager app's token in
+    /// agentd, and never waiting for its used-up quota.
+    ///
+    /// # Errors
+    ///
+    /// As for [`TeamDirectory::home_user`]; past the quota,
+    /// [`SurfaceError::RateLimited`].
+    pub async fn home_user(&self, user: &UserId) -> Result<bool> {
+        self.directory
+            .home_user(&self.members_api.without_waiting(), user)
+            .await
+    }
+
+    /// Decides whether `event`'s sender is from outside the workspace when
+    /// its team fields left [`outside`](InboundEvent::outside) `None`: a
+    /// sender [`home_user`](Self::home_user) doesn't say is home is set
+    /// outside with no known organization. A failed lookup that says
+    /// nothing about the user does that too ([`SurfaceError::Api`],
+    /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), so
+    /// the fields alone never make a sender home.
+    ///
+    /// A bot sender is never looked up: its `outside` decides nothing,
+    /// since the router takes no bot for a requester. Neither is a sender
+    /// already outside, nor one from another surface or workspace. The
+    /// only caller is [`confirm`](Surface::confirm), on Slack's copy of a
+    /// message, so a made-up user id in a forged event costs no lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Transport`] and [`SurfaceError::RateLimited`], as
+    /// they came, leaving `outside` alone: Slack may answer later, and the
+    /// confirmation fails as any lookup it can't make does.
+    pub async fn fill_sender_team(&self, event: &mut InboundEvent) -> Result<()> {
+        if event.outside.is_some()
+            || event.sender_is_bot
+            || event.sender_bot_user.is_some()
+            || event.sender.surface != SurfaceKind::Slack
+            || event.sender.team != *self.directory.team()
+        {
+            return Ok(());
+        }
+        match self.home_user(&event.sender.user).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => {
+                return Err(err);
+            }
+            Err(err) => {
+                tracing::debug!(binding = %event.binding, error = %err, "Slack wouldn't say whether a sender is home; taking them as outside");
+            }
+        }
+        event.outside = Some(Outside { team: None });
         Ok(())
     }
 
@@ -535,8 +595,12 @@ impl Surface for SlackSurface {
     ///    a one-to-one DM, a mention of the bot or a thread reply under its
     ///    root. A bot known only by its bot id is named by its user, as
     ///    [`fill_bot_sender`](Self::fill_bot_sender) names it.
+    /// 4. Whether the sender is from outside the workspace: its team fields,
+    ///    then, unless they say so already,
+    ///    [`fill_sender_team`](Self::fill_sender_team), so a sender is home
+    ///    only when the member list or `users.info` agrees.
     ///
-    /// None of the lookups [waits](WebApi::without_waiting) for the bot
+    /// None of the lookups [waits](WebApi::without_waiting) for its
     /// token's quota: past it, or while a 429 holds it, confirming fails
     /// at once with [`SurfaceError::RateLimited`], so forged events can't
     /// hold the caller's place behind the owner's token.
@@ -562,6 +626,7 @@ impl Surface for SlackSurface {
             binding: event.binding,
             bot_user: self.bot_user.as_ref(),
             team: self.directory.team(),
+            home_org: self.directory.home_org(),
             event_id: &event.event_id,
             received_at: event.received_at,
         };
@@ -573,6 +638,7 @@ impl Surface for SlackSurface {
             }
         };
         self.fill_bot_sender(&mut copy).await?;
+        self.fill_sender_team(&mut copy).await?;
         Ok(Some(copy))
     }
 

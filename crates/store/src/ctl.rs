@@ -150,6 +150,7 @@ impl TokenRow {
                             TOKENS,
                             "requester_key",
                         )?,
+                        outside: None,
                     },
                     hop: Hop(self
                         .hop
@@ -500,6 +501,7 @@ mod tests {
             requester: Requester {
                 member: Some(MemberId::new_v4()),
                 key: member_key("u1"),
+                outside: None,
             },
             hop: Hop(3),
             kind,
@@ -538,6 +540,7 @@ mod tests {
                 requester: Requester {
                     member: None,
                     key: member_key("u2"),
+                    outside: None,
                 },
                 hop: Hop(255),
                 thread: ThreadKey {

@@ -627,6 +627,7 @@ impl Stack {
             reply_to: root.map(|root| msg(conv_id, root)),
             files: vec![],
             received_at: OffsetDateTime::now_utc(),
+            outside: None,
         }
     }
 
@@ -1079,6 +1080,7 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
                     requester: &core_types::Requester {
                         member: bob,
                         key: key("bob"),
+                        outside: None,
                     },
                     hop: core_types::Hop(1),
                     consent: None,
@@ -1427,6 +1429,7 @@ async fn writers_post_for_bob(
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: key("bob"),
+                    outside: None,
                 },
                 hop: core_types::Hop(1),
                 consent: None,
@@ -2348,6 +2351,7 @@ async fn only_an_attributed_post_of_the_bot_is_shown_as_from_outside_the_session
                 requester: &core_types::Requester {
                     member: alice,
                     key: key("alice"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 consent: None,
@@ -2770,6 +2774,7 @@ async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
             binding: BindingId::new_v4(),
             bot_user: Some(&writers_bot),
             team: &team,
+            home_org: None,
             event_id: "Ev1",
             received_at: pinned_now(),
         },
@@ -3609,6 +3614,7 @@ async fn a_hop_whose_posting_turn_cant_be_read_waits_rather_than_risk_running_tw
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: key("bob"),
+                    outside: None,
                 },
                 hop: core_types::Hop(1),
                 consent: None,

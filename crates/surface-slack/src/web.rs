@@ -29,18 +29,20 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use core_types::{ConversationId, InFile, MessageId, OutFile, SurfaceError, TeamId, UserId};
+use core_types::{
+    ConversationId, InFile, MessageId, OutFile, Sharing, SurfaceError, TeamId, UserId,
+};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{StatusCode, Url, redirect};
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
-use crate::normalize::{SlackFile, in_files};
+use crate::normalize::{SlackFile, in_files, is_team_id, team_id_or_nothing};
 
 /// The result type of the Web API client.
 pub type Result<T, E = SurfaceError> = std::result::Result<T, E>;
@@ -704,6 +706,11 @@ pub struct AuthTest {
     /// name.
     #[serde(default)]
     pub bot_id: Option<String>,
+    /// The workspace's Enterprise Grid organization (`E…`), when it is in
+    /// one. Read leniently: absent, or anything but a string shaped like a
+    /// team id, is `None`.
+    #[serde(default, deserialize_with = "team_id_or_nothing")]
+    pub enterprise_id: Option<TeamId>,
 }
 
 /// An app configuration token and its refresh token, from
@@ -783,6 +790,66 @@ pub struct Conversation {
     /// Whether the bot is a member.
     #[serde(default)]
     pub is_member: bool,
+    /// Whether it is shared with another workspace, of the organization or
+    /// not. Read leniently, as are the other sharing fields: anything but
+    /// `true` is `false`.
+    #[serde(default, deserialize_with = "true_or_false")]
+    pub is_shared: bool,
+    /// Whether it is shared with other workspaces of the workspace's own
+    /// Enterprise Grid organization.
+    #[serde(default, deserialize_with = "true_or_false")]
+    pub is_org_shared: bool,
+    /// Whether it is shared with another organization (Slack Connect).
+    #[serde(default, deserialize_with = "true_or_false")]
+    pub is_ext_shared: bool,
+    /// The other organizations it is shared with, Slack's
+    /// `connected_team_ids`. `None` when Slack gave none, gave anything but
+    /// a list of strings each shaped like a team id, or more than
+    /// [`MAX_CONNECTED_TEAMS`].
+    #[serde(default, deserialize_with = "connected_teams")]
+    pub connected_team_ids: Option<Vec<TeamId>>,
+}
+
+/// The most organizations a conversation's
+/// [`connected_team_ids`](Conversation::connected_team_ids) are kept with.
+pub const MAX_CONNECTED_TEAMS: usize = 64;
+
+impl Conversation {
+    /// Whether, and with whom, the conversation is shared: externally when
+    /// Slack says `is_ext_shared`, or `is_shared` without `is_org_shared`,
+    /// which fails closed; within the organization when it says
+    /// `is_org_shared`; otherwise not at all.
+    pub fn sharing(&self) -> Sharing {
+        if self.is_ext_shared || (self.is_shared && !self.is_org_shared) {
+            Sharing::External {
+                teams: self.connected_team_ids.clone(),
+            }
+        } else if self.is_org_shared {
+            Sharing::Org
+        } else {
+            Sharing::None
+        }
+    }
+}
+
+/// `true` for a JSON `true`, and `false` for anything else.
+fn true_or_false<'de, D: Deserializer<'de>>(value: D) -> Result<bool, D::Error> {
+    Ok(Value::deserialize(value)?.as_bool().unwrap_or(false))
+}
+
+/// A list of at most [`MAX_CONNECTED_TEAMS`] strings each shaped like a
+/// team id, or `None` for anything else.
+fn connected_teams<'de, D: Deserializer<'de>>(value: D) -> Result<Option<Vec<TeamId>>, D::Error> {
+    let Value::Array(items) = Value::deserialize(value)? else {
+        return Ok(None);
+    };
+    if items.len() > MAX_CONNECTED_TEAMS {
+        return Ok(None);
+    }
+    Ok(items
+        .iter()
+        .map(|item| item.as_str().filter(|id| is_team_id(id)).map(TeamId::from))
+        .collect())
 }
 
 /// A user's profile fields that name them.
@@ -800,8 +867,9 @@ pub struct Profile {
 pub struct User {
     /// The user's id.
     pub id: UserId,
-    /// The workspace the user belongs to.
-    #[serde(default)]
+    /// The workspace the user belongs to. Read leniently: absent, or
+    /// anything but a string shaped like a team id, is `None`.
+    #[serde(default, deserialize_with = "team_id_or_nothing")]
     pub team_id: Option<TeamId>,
     /// The username (a legacy handle).
     #[serde(default)]

@@ -254,6 +254,7 @@ async fn record(
     let requester = Requester {
         member: store.member_for_identity(sender).await?,
         key: sender.clone(),
+        outside: None,
     };
     store
         .record_message_ref(

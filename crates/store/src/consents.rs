@@ -310,6 +310,7 @@ impl Row {
                     .map(|member| parse_column::<MemberId>(&member, TABLE, "requester_member"))
                     .transpose()?,
                 key: parse_column(&self.requester_key, TABLE, "requester_key")?,
+                outside: None,
             },
             hop: Hop(u8::try_from(self.hop).map_err(|_| corrupt("hop"))?),
             task: self.task_text,
@@ -905,6 +906,7 @@ mod tests {
         Requester {
             member,
             key: member_key("bob"),
+            outside: None,
         }
     }
 
@@ -1428,6 +1430,7 @@ mod tests {
                 team: TeamId::new("T1"),
                 user: UserId::new("U1"),
             },
+            outside: None,
         };
         let err = fx
             .store
@@ -1489,6 +1492,7 @@ mod tests {
         let carol = Requester {
             member: None,
             key: member_key("carol"),
+            outside: None,
         };
         let first = fx
             .try_create(&bob, false, None, 1_000, limits)
@@ -1554,6 +1558,7 @@ mod tests {
         let owner = Requester {
             member: fx.store.member_for_identity(&fx.owner).await.unwrap(),
             key: fx.owner.clone(),
+            outside: None,
         };
         assert!(
             fx.store

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, UserId};
+use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, Outside, UserId};
 
 /// The most mentions an [`InboundEvent`] carries: a surface keeps the first
 /// this many different users a message mentions. The router looks each one
@@ -41,6 +41,14 @@ pub struct InboundEvent {
     /// Who sent the message. For a bot, its user id when known, or else its
     /// bot id; see [Bot senders](#bot-senders).
     pub sender: MemberKey,
+    /// Whether the sender is from outside the workspace agentd serves, and
+    /// from which organization; `None` for a member of the workspace, and
+    /// always on Rocket.Chat. On Slack it is what the message's own team
+    /// fields say, and for Slack's copy of it also what a lookup said: an
+    /// event can make a sender outside, never home. A bot's says nothing,
+    /// since the router never takes a bot for a requester.
+    #[serde(default)]
+    pub outside: Option<Outside>,
     /// Whether the sender is a bot, managed by agentd or not.
     pub sender_is_bot: bool,
     /// The sender's bot user id, when the sender is a bot and its user id is
@@ -100,6 +108,9 @@ mod tests {
                 team: "T1".into(),
                 user: "U1".into(),
             },
+            outside: Some(Outside {
+                team: Some("T9".into()),
+            }),
             sender_is_bot: false,
             sender_bot_user: None,
             conv: conv.clone(),
@@ -131,6 +142,15 @@ mod tests {
         let json = json_round_trip(&sample_event(ConvKind::Channel));
         assert_eq!(json["received_at"], "2026-09-30T12:34:56.789Z");
         assert_eq!(json["conv_kind"], "channel");
+        assert_eq!(json["outside"], serde_json::json!({"team": "T9"}));
+    }
+
+    #[test]
+    fn an_event_stored_before_outside_existed_reads_as_home() {
+        let mut json = serde_json::to_value(sample_event(ConvKind::Channel)).unwrap();
+        json.as_object_mut().unwrap().remove("outside");
+        let event: InboundEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event.outside, None);
     }
 
     #[test]

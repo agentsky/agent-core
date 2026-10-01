@@ -3463,15 +3463,16 @@ Deliverables:
     answers from them, then from `users.info` (Tier 4) with the manager
     app's token, as T31 reads the member list. It returns `Ok(true)` only
     when the answer's `team_id` is the workspace, `Ok(false)` for another
-    `team_id` or `user_not_found`, and otherwise the lookup's error as it
+    `team_id`, none, or `user_not_found`, and otherwise the lookup's error as it
     came, whatever its variant, uncached. Both answers are cached for an
     hour, at most 4,096 of them, the oldest dropped first; an answer
     dropped from the cache is looked up again, never taken as home. A
     caller can ask it not to wait for a used-up quota
     (`WebApi::without_waiting`).
   - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
-    SurfaceError>` never waits for a used-up quota, and skips a sender with
-    `sender_bot_user` set, whose `outside` decides nothing. When the fields
+    SurfaceError>` never waits for a used-up quota, and skips a bot sender
+    (`sender_is_bot` or `sender_bot_user` set), whose `outside` decides
+    nothing. When the fields
     left `outside` `None` and `home_user` doesn't say home, it sets
     `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
     `Unauthorized` error too. It returns `Transport` and `RateLimited` as
@@ -3508,8 +3509,9 @@ Deliverables:
     dropped with a debug line throttled per binding as the ingress throttles
     its warnings. That closes T33's open item about interactions with a
     `team` the manager doesn't serve.
-  - The manager DM's home check (`crates/agentd/src/commands/intake.rs`)
-    runs in the member's own intake task, before `answer_text`: for an
+  - The manager DM's home check (`Commands::answer_text`, which the
+    intake's task in `crates/agentd/src/commands/intake.rs` calls) runs in
+    the member's own intake task, before the text is parsed: for an
     `Origin::SlackDm`, it asks `home_user` through `SlackManager`'s surface,
     without waiting. `Inbound::send` runs inside the single `Queue::run`
     worker every app's Slack requests pass through, so no lookup happens

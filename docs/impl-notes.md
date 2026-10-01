@@ -8387,3 +8387,119 @@ were never stored, and the broken link keeps its old refresh token until
 the next login replaces it or `logout` revokes it. A response without `scope` keeps the link: RFC
 6749 says the grant is then what was asked for, and neither the plan nor
 the design says otherwise.
+
+## T36a: Slack Connect: who is outside
+
+No Slack Connect payload was captured for this: T36e is blocked on a live
+workspace, so everything below was built against the design's reading of
+Slack's documentation, bolt-python's fixtures and the hand-written fixtures
+in `testkit::slack` (the Slack Connect ones are listed in that module's
+rustdoc). Each assumption T36e has to confirm lives in one place:
+
+- the sender's team fields and their order: `normalize::SENDER_TEAM_FIELDS`
+  and `MessageEvent::sender_teams`;
+- that `authorizations[0].team_id` names the installation: the ingress's
+  `Installation` reader;
+- that `users.list` and `users.info` give an outside member's own
+  `team_id`: `directory::home_users` and `TeamDirectory::home_user`;
+- the sharing flags and `connected_team_ids`: `web::Conversation::sharing`
+  and `MAX_CONNECTED_TEAMS`;
+- an interaction's `user.team_id`: the ingress's interaction reader.
+
+### Only Slack's own `user_not_found` means "not home"
+
+**Issue.** The plan has `home_user` answer `Ok(false)` for
+`user_not_found` and pass every other error on. `WebApi::user_info` maps
+a whole family of codes to `SurfaceError::NotFound` (`users_not_found`,
+`channel_not_found`, `file_deleted`, …), so matching the variant would have
+cached "not home" for answers that say nothing about the user.
+
+**Solution.** Only `NotFound("user_not_found")` is a verdict; any other
+`NotFound` is returned uncached like the rest. A `users.info` answer with no
+`team_id`, or one not shaped like a team id, is `Ok(false)` and cached: it
+is an answer, and it doesn't name the workspace.
+
+### The answer cache numbers its entries
+
+**Issue.** The cache keeps answers for an hour, at most 4,096, the oldest
+dropped first. Keying the eviction queue by the time an answer was given
+let it grow without bound when one user's answer was given again at the
+same `Instant`, as a coarse clock or a test can do: every duplicate looked
+current.
+
+**Solution.** `HomeAnswers` numbers each answer it keeps and the queue holds
+`(user, number)`, so only the newest entry per user is live; the queue is
+compacted once it holds twice the capacity.
+
+### The manager DM's check runs in `answer_text`
+
+**Issue.** The plan puts the check "in `intake.rs`, before `answer_text`".
+`answer_text` is the one place every DM command passes through (the
+intake's task calls it, and `handle_text` wraps it), so a check before it
+in `intake::start` alone would leave `handle_text` unchecked.
+
+**Solution.** `Commands::answer_text` asks `Commands::admits` first, so the
+check runs in the member's intake task, before the text is even parsed,
+and nowhere else. It needs the Slack manager and a member of its workspace;
+without them a `SlackDm` origin is dropped (it can't arise otherwise).
+`Transport` and `RateLimited` post `pipeline::UNCONFIRMED_TEXT` into the DM
+the event named; any other error is logged at most once a minute
+(`HOME_CHECK_WARNING_INTERVAL`), and a sender who isn't home is dropped at
+debug.
+
+### Every bot is skipped, not only one with a bot user
+
+**Issue.** The plan has `fill_sender_team` skip a sender with
+`sender_bot_user` set. A bot post whose bot user isn't known
+(`sender_is_bot` without `sender_bot_user`, after a failed or userless
+`bots.info`) would then cost a `users.info` for a bot id or a made-up user.
+
+**Solution.** It skips `sender_is_bot` too, as the design's "never a bot"
+says: no bot is a requester, so its `outside` decides nothing.
+
+### An unflagged `is_shared` is external
+
+**Issue.** `Sharing` comes from `is_shared`, `is_org_shared` and
+`is_ext_shared`, and Slack's documentation doesn't say what `is_shared`
+alone, with neither of the others, means.
+
+**Solution.** It is `External { teams: None }`, failing closed: a channel
+that is shared with nobody says it is unknown, never home-only.
+`is_org_shared` alone is `Org`; `is_ext_shared` wins over it. A flag that
+isn't a boolean is `false`. `Sharing` lives in `core-types` beside
+`Outside`, since T36c reads it outside `surface-slack`.
+
+### No installation, no event
+
+**Issue.** An `event_callback` without `authorizations[0].team_id` is
+dropped with a throttled warning. The plan doesn't say how leniently the
+list is read.
+
+**Solution.** Only the first element is read, and the rest is skipped
+unread. A missing, null, empty or non-array `authorizations`, a first
+element that isn't an object, and a `team_id` that is absent, null or not
+shaped like a team id all count as no installation: the event gets its 200,
+nothing is recorded, and the ingress warns once per binding per
+`WARNING_INTERVAL` (debug for the rest). The check comes after the agent
+app's "not a message" ignore, so other events an agent's app gets stay
+quiet as before.
+
+### Outside drops in the Slack queue are debug lines
+
+**Issue.** `slack::Inbound` drops a manager DM whose fields make the sender
+outside and an interaction whose `sender_team` is absent or another team,
+"with a debug line throttled per binding".
+
+**Solution.** `Inbound` keeps a `Throttle<BindingId>` on `WARNING_INTERVAL`:
+the first drop per binding and interval logs at debug with the count since,
+the rest at trace. Neither touches the network.
+
+### Members' home ids include deactivated accounts
+
+**Issue.** The member list drops deactivated users from the names it
+resolves. Whether a deactivated user counts as home matters only for a
+message Slack confirmed from them, which can't happen while deactivated.
+
+**Solution.** The home ids keep every `users.list` entry whose `team_id` is
+the workspace, deactivated or not, so a reactivated member isn't sent to
+`users.info` until the next refresh.

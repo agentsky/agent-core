@@ -100,7 +100,7 @@ async fn fake_slack() -> MockServer {
         ("users.list", json!({"members": []})),
         (
             "users.info",
-            json!({"user": {"id": fixtures::USER, "name": "ada", "profile": {"display_name": "Ada"}}}),
+            json!({"user": {"id": fixtures::USER, "team_id": fixtures::TEAM, "name": "ada", "profile": {"display_name": "Ada"}}}),
         ),
     ] {
         mount(&slack, name, MANAGER_TOKEN, body).await;
@@ -1504,6 +1504,7 @@ impl Turned {
                     requester: &Requester {
                         member: Some(self.ada),
                         key: ada(),
+                        outside: None,
                     },
                     hop: Hop(0),
                     consent: None,
@@ -2294,4 +2295,159 @@ async fn ask_agent_hands_a_capitalized_task_off_on_slack() {
     let (slack, fake) = turned.drained().await;
     assert_eq!(posts_with(&slack, HELPER.token).await.len(), 1);
     assert_eq!(fake.message_requests().await.len(), 2);
+}
+
+impl Turned {
+    /// Makes `users.info` on the manager app's token answer `response`
+    /// about `user`.
+    async fn user_info_is(&self, user: &str, response: ResponseTemplate) {
+        Mock::given(method("POST"))
+            .and(path("/api/users.info"))
+            .and(header(
+                "authorization",
+                format!("Bearer {MANAGER_TOKEN}").as_str(),
+            ))
+            .and(body_string_contains(format!("user={user}").as_str()))
+            .respond_with(response)
+            .with_priority(1)
+            .mount(&self.slack)
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confirm_drops_an_event_that_claims_home_for_an_outside_copy() {
+    let turned = Turned::start(&[HELPER]).await;
+    turned
+        .user_info_is(
+            fixtures::OTHER_USER,
+            ok(json!({"user": {"id": fixtures::OTHER_USER, "team_id": fixtures::OUTSIDE_TEAM}})),
+        )
+        .await;
+    let text = format!("<@{AGENT_BOT}> what's new?");
+    let fields_say = recent_ts(5, 100);
+    let lookup_says = recent_ts(5, 200);
+    for (ts, event_id, copy) in [
+        (
+            &fields_say,
+            "Ev0FIELDSAY",
+            json!({"ts": fields_say, "user": fixtures::OTHER_USER, "text": text,
+                   "team": fixtures::TEAM, "user_team": fixtures::OUTSIDE_TEAM}),
+        ),
+        (
+            &lookup_says,
+            "Ev0LOOKUPSY",
+            json!({"ts": lookup_says, "user": fixtures::OTHER_USER, "text": text,
+                   "team": fixtures::TEAM, "user_team": fixtures::TEAM}),
+        ),
+    ] {
+        turned.slack_has(ts, copy).await;
+        let claims_home = message_event(
+            fixtures::OTHER_USER,
+            ts,
+            event_id,
+            &text,
+            json!({"team": fixtures::TEAM, "user_team": fixtures::TEAM}),
+        );
+        assert_eq!(turned.post(0, SIGNING_SECRET, claims_home).await, 200);
+    }
+    turned.wait_for_confirmations(AGENT_TOKEN, 2).await;
+    settle("the copy's sender was looked up", || async {
+        !turned
+            .requests("users.info", MANAGER_TOKEN)
+            .await
+            .is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        turned.posts(AGENT_TOKEN).await.is_empty(),
+        "no turn, prompt or refusal"
+    );
+    turned.nothing_billed_to_bob().await;
+    let looked_up = turned.requests("users.info", MANAGER_TOKEN).await;
+    assert_eq!(
+        looked_up.len(),
+        1,
+        "only the copy the fields left home is looked up"
+    );
+    assert!(turned.requests("users.info", AGENT_TOKEN).await.is_empty());
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rate_limited_home_lookup_in_confirm_asks_the_thread_to_try_again() {
+    let turned = Turned::start(&[HELPER]).await;
+    turned
+        .user_info_is(
+            fixtures::OTHER_USER,
+            ResponseTemplate::new(429).insert_header("retry-after", "30"),
+        )
+        .await;
+    let ts = recent_ts(5, 100);
+    let text = format!("<@{AGENT_BOT}> hello");
+    turned
+        .slack_has(
+            &ts,
+            json!({"ts": ts, "user": fixtures::OTHER_USER, "text": text}),
+        )
+        .await;
+    let started = Instant::now();
+    let message = channel_message(fixtures::OTHER_USER, &ts, "Ev0BUSYLOOK", &text);
+    assert_eq!(turned.post(0, SIGNING_SECRET, message).await, 200);
+    let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    assert_eq!(posts[0]["text"], UNCONFIRMED_TEXT);
+    assert_eq!(posts[0]["thread_ts"], ts.as_str());
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "never waits for the quota"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(turned.posts(AGENT_TOKEN).await.len(), 1);
+    turned.nothing_billed_to_bob().await;
+    turned.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installation_elsewhere_is_still_dropped() {
+    let turned = Turned::start(&[HELPER]).await;
+    let text = format!("<@{AGENT_BOT}> what's new?");
+    let elsewhere_ts = recent_ts(5, 100);
+    turned
+        .slack_has(
+            &elsewhere_ts,
+            json!({"ts": elsewhere_ts, "user": fixtures::USER, "text": text}),
+        )
+        .await;
+    let mut elsewhere: Value = serde_json::from_str(&channel_message(
+        fixtures::USER,
+        &elsewhere_ts,
+        "Ev0ELSEWHR",
+        &text,
+    ))
+    .unwrap();
+    elsewhere["authorizations"][0]["team_id"] = json!("T0ELSE001");
+    assert_eq!(elsewhere["team_id"], fixtures::TEAM);
+    assert_eq!(
+        turned.post(0, SIGNING_SECRET, elsewhere.to_string()).await,
+        200
+    );
+
+    let ts = recent_ts(5, 200);
+    turned
+        .slack_has(&ts, json!({"ts": ts, "user": fixtures::USER, "text": text}))
+        .await;
+    let home = channel_message(fixtures::USER, &ts, "Ev0HOMEINST", &text);
+    assert_eq!(turned.post(0, SIGNING_SECRET, home).await, 200);
+    let posts = turned.wait_for_posts(AGENT_TOKEN, 1).await;
+    assert_eq!(posts[0]["thread_ts"], ts.as_str());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(turned.posts(AGENT_TOKEN).await.len(), 1);
+    assert_eq!(
+        turned.fake.message_requests().await.len(),
+        1,
+        "one turn: the event installed elsewhere was dropped"
+    );
+    assert_eq!(turned.confirmations(AGENT_TOKEN).await.len(), 1);
+    turned.stop().await;
 }
