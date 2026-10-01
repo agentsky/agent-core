@@ -8127,20 +8127,20 @@ still holds, and T35c's live check covers it.
 
 **Issue.** The plan gives `fire(routine_id, token, task)` and a
 `FireOutcome`, but the routine id goes into the request's path, the token
-into a header, and the endpoint caps the text, while the client is built
-before the commands that call it. A line break in a token would make
-reqwest fail the request before sending it, which its errors report as a
-builder error rather than a connection error.
+into a header, and the endpoint caps the text. A line break in a token
+would make reqwest fail the request before sending it, which its errors
+report as a builder error rather than a connection error.
 
-**Solution.** `fire` returns `Result<FireOutcome, FireError>`, and refuses
-before sending anything: a routine id that isn't `trig_` and 1 to 64 ASCII
-letters and digits (`FireError::RoutineId`), a token that is empty or holds
-a byte outside visible ASCII (`FireError::Token`), and a task that is empty
-or longer than `MAX_TASK_BYTES`, 65,536 bytes (`FireError::Task`). None of
-them repeats the value. T35c's checks come first, so for it an error here
-means only that nothing was started, as a store failure before the request
-does. A reqwest builder error, should one still happen, counts as not
-sent too.
+**Solution.** `fire` takes T35a's `core_types::RoutineId`, which is only
+letters and digits after `trig_`, so the path can't be changed through it
+and the client has no check of its own to keep in step. It returns
+`Result<FireOutcome, FireError>`, and refuses before sending anything a
+token that is empty or holds a byte outside visible ASCII
+(`FireError::Token`) and a task that is empty or longer than
+`MAX_TASK_BYTES`, 65,536 bytes (`FireError::Task`). Neither repeats the
+value. T35c's checks come first, so for it an error here means only that
+nothing was started, as a store failure before the request does. A
+reqwest builder error, should one still happen, counts as not sent too.
 
 ### reqwest retries some requests on its own
 
@@ -8189,8 +8189,10 @@ only when the host is a loopback IP address (IPv4-mapped included;
 `localhost` is a name that could resolve anywhere), as `[proxy] upstream`
 does. Every request's URL is the parsed origin with the fire path set on
 it, and T35c compares a pasted routine URL's origin with this URL's
-`origin()`, so both sides go through the same normalization. Errors never
-repeat the value.
+`origin()`, so both sides go through the same normalization:
+`cloud_config_is_checked` parses routine URLs with T35a's `RoutineUrl` and
+finds the default's origin equal to one with `:443` typed, and different
+from one with another port, scheme or host. Errors never repeat the value.
 
 ### What counts as each outcome
 

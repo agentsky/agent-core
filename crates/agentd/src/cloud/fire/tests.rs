@@ -32,12 +32,16 @@ fn client(base: &str) -> FireClient {
     .unwrap()
 }
 
+fn routine() -> RoutineId {
+    ROUTINE.parse().unwrap()
+}
+
 fn token() -> SecretString {
     SecretString::from(TOKEN)
 }
 
 async fn fire(base: &str) -> FireOutcome {
-    client(base).fire(ROUTINE, &token(), TASK).await.unwrap()
+    client(base).fire(&routine(), &token(), TASK).await.unwrap()
 }
 
 /// Fires once at a fresh fake that answers with `template`, and checks it
@@ -157,7 +161,7 @@ async fn a_custom_beta_header_is_sent() {
     };
     let outcome = FireClient::new(&config)
         .unwrap()
-        .fire(ROUTINE, &token(), TASK)
+        .fire(&routine(), &token(), TASK)
         .await
         .unwrap();
     assert_eq!(outcome.kind(), "fired");
@@ -365,7 +369,7 @@ async fn a_timeout_after_sending_is_unknown() {
         .mount(&server)
         .await;
     let outcome = quick(&server.uri())
-        .fire(ROUTINE, &token(), TASK)
+        .fire(&routine(), &token(), TASK)
         .await
         .unwrap();
     assert_eq!(outcome, unknown_with(None, UnknownReason::Timeout));
@@ -478,7 +482,7 @@ async fn a_connection_lost_after_sending_is_unknown() {
 async fn a_success_whose_body_stalls_or_runs_past_the_limit_is_unknown() {
     let head = b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n{\"claude_code".to_vec();
     let (base, server) = hand_written(Then::AnswerAndStall(head)).await;
-    let outcome = quick(&base).fire(ROUTINE, &token(), TASK).await.unwrap();
+    let outcome = quick(&base).fire(&routine(), &token(), TASK).await.unwrap();
     assert_eq!(outcome, unknown_with(Some(200), UnknownReason::Timeout));
     assert_eq!(server.await.unwrap(), 1);
 
@@ -631,7 +635,7 @@ async fn fire_never_retries() {
 }
 
 #[tokio::test]
-async fn nothing_is_sent_for_a_bad_routine_id_token_or_task() {
+async fn nothing_is_sent_for_a_bad_token_or_task() {
     let server = MockServer::start().await;
     Mock::given(wiremock::matchers::any())
         .respond_with(ResponseTemplate::new(200).set_body_json(session_body(SESSION, None)))
@@ -639,22 +643,6 @@ async fn nothing_is_sent_for_a_bad_routine_id_token_or_task() {
         .mount(&server)
         .await;
     let refusing = client(&server.uri());
-    for id in [
-        "",
-        "trig_",
-        "trig",
-        "trig_a-b",
-        "trig_../x",
-        "trig_abc/fire?x=1",
-        "trig_abc%2e",
-        "TRIG_abc",
-        "routine_abc",
-        "trig_ab\u{e9}",
-        &format!("trig_{}", "a".repeat(65)),
-    ] {
-        let err = refusing.fire(id, &token(), TASK).await.unwrap_err();
-        assert!(matches!(err, FireError::RoutineId), "{id}: {err}");
-    }
     for bad in [
         "",
         "sk-ant oat01",
@@ -663,7 +651,7 @@ async fn nothing_is_sent_for_a_bad_routine_id_token_or_task() {
         "tab\there",
     ] {
         let err = refusing
-            .fire(ROUTINE, &SecretString::from(bad), TASK)
+            .fire(&routine(), &SecretString::from(bad), TASK)
             .await
             .unwrap_err();
         assert!(matches!(err, FireError::Token), "{bad:?}: {err}");
@@ -672,12 +660,12 @@ async fn nothing_is_sent_for_a_bad_routine_id_token_or_task() {
     }
     let too_long = "x".repeat(MAX_TASK_BYTES + 1);
     for task in ["", too_long.as_str()] {
-        let err = refusing.fire(ROUTINE, &token(), task).await.unwrap_err();
+        let err = refusing.fire(&routine(), &token(), task).await.unwrap_err();
         assert!(matches!(err, FireError::Task), "{}", task.len());
     }
     server.verify().await;
 
-    let longest_id = format!("trig_{}", "Z9".repeat(32));
+    let longest_id: RoutineId = format!("trig_{}", "Z9".repeat(32)).parse().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/v1/claude_code/routines/{longest_id}/fire")))

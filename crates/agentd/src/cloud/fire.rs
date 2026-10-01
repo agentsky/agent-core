@@ -4,6 +4,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use core_types::RoutineId;
 use reqwest::header::{HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Response, Url};
 use secrecy::{ExposeSecret, SecretString};
@@ -23,8 +24,6 @@ pub const MAX_TASK_BYTES: usize = 65_536;
 /// What a session's link must start with, followed by exactly its id, to be
 /// kept.
 pub const SESSION_URL_PREFIX: &str = "https://claude.ai/code/";
-/// The most characters after a routine id's `trig_`.
-const MAX_ROUTINE_ID_TAIL: usize = 64;
 /// The most characters after a session id's `session_`.
 const MAX_SESSION_ID_TAIL: usize = 128;
 /// The longest `error.type` kept from an error body.
@@ -65,9 +64,6 @@ pub enum FireError {
     /// The HTTP client couldn't be built.
     #[error("couldn't build the cloud hand-off's HTTP client: {0}")]
     Client(#[source] reqwest::Error),
-    /// The routine id isn't `trig_` and 1 to 64 ASCII letters and digits.
-    #[error("the routine id isn't trig_ and 1 to 64 ASCII letters and digits")]
-    RoutineId,
     /// The routine token is empty or holds a character a header can't
     /// carry, such as a space or a line break.
     #[error("the routine token is empty or holds characters a header can't carry")]
@@ -244,26 +240,24 @@ impl FireClient {
         Ok(Self { http, base, beta })
     }
 
-    /// Fires routine `routine_id` with `task` as its text, authenticated by
+    /// Fires routine `routine` with `task` as its text, authenticated by
     /// the routine's `token`: one `POST
-    /// {base_url}/v1/claude_code/routines/{routine_id}/fire`, never
-    /// retried, whatever comes back. Logs the routine id, the status and
-    /// the outcome's kind, never the token, the task or the body.
+    /// {base_url}/v1/claude_code/routines/{routine}/fire`, never retried,
+    /// whatever comes back. A [`RoutineId`] is only letters and digits
+    /// after `trig_`, so it can't change the path. Logs the routine id, the
+    /// status and the outcome's kind, never the token, the task or the
+    /// body.
     ///
     /// # Errors
     ///
-    /// [`FireError::RoutineId`], [`FireError::Token`] or
-    /// [`FireError::Task`] for an argument that can't be sent, in which
-    /// case nothing is.
+    /// [`FireError::Token`] or [`FireError::Task`] for an argument that
+    /// can't be sent, in which case nothing is.
     pub async fn fire(
         &self,
-        routine_id: &str,
+        routine: &RoutineId,
         token: &SecretString,
         task: &str,
     ) -> Result<FireOutcome, FireError> {
-        if !is_routine_id(routine_id) {
-            return Err(FireError::RoutineId);
-        }
         let token = token.expose_secret();
         if token.is_empty() || !token.bytes().all(|b| b.is_ascii_graphic()) {
             return Err(FireError::Token);
@@ -272,9 +266,9 @@ impl FireClient {
             return Err(FireError::Task);
         }
         let mut url = self.base.clone();
-        url.set_path(&format!("/v1/claude_code/routines/{routine_id}/fire"));
+        url.set_path(&format!("/v1/claude_code/routines/{routine}/fire"));
         let outcome = classify(self.exchange(url, token, task).await);
-        log_outcome(routine_id, &outcome);
+        log_outcome(routine.as_str(), &outcome);
         Ok(outcome)
     }
 
@@ -454,18 +448,11 @@ fn retry_after_secs(value: &str) -> Option<u32> {
     value.parse().ok()
 }
 
-fn is_routine_id(id: &str) -> bool {
-    id.strip_prefix("trig_")
-        .is_some_and(|tail| is_alphanumeric_tail(tail, MAX_ROUTINE_ID_TAIL))
-}
-
 fn is_session_id(id: &str) -> bool {
-    id.strip_prefix("session_")
-        .is_some_and(|tail| is_alphanumeric_tail(tail, MAX_SESSION_ID_TAIL))
-}
-
-fn is_alphanumeric_tail(tail: &str, max: usize) -> bool {
-    (1..=max).contains(&tail.len()) && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+    id.strip_prefix("session_").is_some_and(|tail| {
+        (1..=MAX_SESSION_ID_TAIL).contains(&tail.len())
+            && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
 }
 
 #[cfg(test)]

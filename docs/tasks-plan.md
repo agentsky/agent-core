@@ -3214,9 +3214,9 @@ Acceptance, against `wiremock`:
 - `token_and_task_never_reach_the_log` (a captured log at `trace`).
 
 Decided in T35b ([impl-notes](impl-notes.md#t35b-cloud-hand-off-fire-client)):
-`fire` returns `Result<FireOutcome, FireError>`, refusing before it sends a
-routine id that isn't `trig_` and 1 to 64 letters and digits,
-anything a token that isn't visible ASCII and a task that is empty or over
+`fire` takes T35a's `RoutineId` and returns
+`Result<FireOutcome, FireError>`, refusing before it sends anything a
+token that isn't visible ASCII and a task that is empty or over
 `cloud::MAX_TASK_BYTES` (65,536 bytes); T35c checks first, so an error
 there only means nothing was started. Each fire is one request on a
 connection of its own, with reqwest's own retries off.

@@ -1743,6 +1743,33 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(cloud.timeout(), Duration::from_secs(120));
         let longest = "b".repeat(256);
         assert!(cloud_with(&format!("beta = \"{longest}\"")).is_ok());
+
+        let origin = CloudConfig::default().base_url().unwrap().origin();
+        for (pasted, same) in [
+            (
+                "https://api.anthropic.com/v1/claude_code/routines/trig_1/fire",
+                true,
+            ),
+            (
+                "https://api.anthropic.com:443/v1/claude_code/routines/trig_1/fire",
+                true,
+            ),
+            (
+                "https://api.anthropic.com:8443/v1/claude_code/routines/trig_1/fire",
+                false,
+            ),
+            (
+                "http://api.anthropic.com/v1/claude_code/routines/trig_1/fire",
+                false,
+            ),
+            (
+                "https://api.anthropic.com.evil.example/v1/claude_code/routines/trig_1/fire",
+                false,
+            ),
+        ] {
+            let url: commands::RoutineUrl = pasted.parse().unwrap();
+            assert_eq!(*url.origin() == origin, same, "{pasted}");
+        }
         let err = cloud_with(&format!("beta = \"{longest}b\"")).unwrap_err();
         assert_eq!(err.key(), Some("cloud.beta"));
     }
