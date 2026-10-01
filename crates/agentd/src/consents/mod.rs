@@ -683,7 +683,7 @@ const MAX_INDENT: usize = 32;
 /// The columns a tab counts as in a task's indentation.
 const TAB_COLUMNS: usize = 8;
 /// The longest run of blanks a task may have after a line's first visible
-/// character, enough to align a table.
+/// character, in columns, enough to align a table.
 const MAX_BLANK_RUN: usize = 16;
 /// The most blank lines a task may have in a row.
 const MAX_BLANK_LINES: usize = 2;
@@ -693,11 +693,11 @@ const MAX_MARK_RUN: usize = 4;
 /// Why the owner's card couldn't show `task` as the model reads it, if it
 /// couldn't: a control character other than a newline or tab, or an
 /// invisible one ([`is_invisible`]), which shows as nothing; a line
-/// indented more than [`MAX_INDENT`] columns, or a run of more than
-/// [`MAX_BLANK_RUN`] blanks after a line's first visible character, which
+/// indented more than [`MAX_INDENT`] columns, or a run of blanks wider than
+/// [`MAX_BLANK_RUN`] columns after a line's first visible character, which
 /// can push the rest of the line out of a code block's view; more than
 /// [`MAX_BLANK_LINES`] blank lines in a row, which can push the rest below
-/// the fold; or more than [`MAX_MARK_RUN`] combining diacritical marks in
+/// the fold, a blank line counting only as that however wide it is; or more than [`MAX_MARK_RUN`] combining diacritical marks in
 /// a row, which can draw over the card's own text.
 fn unshowable(task: &str) -> Option<&'static str> {
     if task
@@ -720,10 +720,21 @@ fn unshowable(task: &str) -> Option<&'static str> {
     }
     let mut blank_lines = 0;
     for line in task.split('\n') {
+        if line.chars().all(is_blank) {
+            blank_lines += 1;
+            if blank_lines > MAX_BLANK_LINES {
+                return Some(
+                    "the task has more than 2 blank lines in a row, which could hide what \
+                     follows from the owner's card",
+                );
+            }
+            continue;
+        }
+        blank_lines = 0;
         let indent: usize = line
             .chars()
             .take_while(|c| is_blank(*c))
-            .map(|c| if c == '\t' { TAB_COLUMNS } else { 1 })
+            .map(blank_columns)
             .sum();
         if indent > MAX_INDENT {
             return Some(
@@ -733,33 +744,38 @@ fn unshowable(task: &str) -> Option<&'static str> {
         }
         let mut blanks = 0;
         for c in line.chars().skip_while(|c| is_blank(*c)) {
-            blanks = if is_blank(c) { blanks + 1 } else { 0 };
+            blanks = if is_blank(c) {
+                blanks + blank_columns(c)
+            } else {
+                0
+            };
             if blanks > MAX_BLANK_RUN {
                 return Some(
-                    "the task has a run of more than 16 spaces or tabs, which could hide the \
-                     rest of a line from the owner's card",
+                    "the task has a run of more than 16 columns of spaces or tabs, which could \
+                     hide the rest of a line from the owner's card",
                 );
             }
-        }
-        blank_lines = if line.chars().all(is_blank) {
-            blank_lines + 1
-        } else {
-            0
-        };
-        if blank_lines > MAX_BLANK_LINES {
-            return Some(
-                "the task has more than 2 blank lines in a row, which could hide what follows \
-                 from the owner's card",
-            );
         }
     }
     None
 }
 
-/// Whether `c` shows as blank space: whitespace, and the Braille blank,
-/// which isn't whitespace but draws as nothing.
+/// Whether `c` shows as blank space: whitespace, and the characters that
+/// aren't whitespace but draw as nothing, the Braille blank and the
+/// musical null notehead.
 fn is_blank(c: char) -> bool {
-    c.is_whitespace() || c == '\u{2800}'
+    c.is_whitespace() || matches!(c, '\u{2800}' | '\u{1D159}')
+}
+
+/// The columns blank `c` takes: [`TAB_COLUMNS`] for a tab, two for the
+/// ideographic space, which is as wide as a CJK character, and one for
+/// any other.
+fn blank_columns(c: char) -> usize {
+    match c {
+        '\t' => TAB_COLUMNS,
+        '\u{3000}' => 2,
+        _ => 1,
+    }
 }
 
 /// Whether `c` is in one of the blocks of combining diacritical marks,
@@ -857,6 +873,13 @@ mod tests {
         refused(&format!("Summarize{}attach", "\n".repeat(4)), "blank lines");
         refused("a\n \n\t\n\u{2800}\nb", "blank lines");
         refused("e\u{301}\u{302}\u{303}\u{304}\u{305}", "combining marks");
+        refused(
+            &format!("Summarize{}attach", "\u{1D159}".repeat(17)),
+            "spaces or tabs",
+        );
+        refused("a\n\u{1D159}\n\u{1D159}\n\u{1D159}\nb", "blank lines");
+        refused("Summarize\t\t\tattach", "spaces or tabs");
+        refused(&format!("{}attach", "\u{3000}".repeat(17)), "indented");
         refused("a\u{FE00}b", "invisible");
         for task in [
             "def f(x):\n    for y in x:\n        if y:\n            return y",
@@ -864,6 +887,8 @@ mod tests {
             "- one\n  - two\n    - three\n      - four",
             "| name |                value |\n| ---- | -------------------- |",
             "\t\t\tindented by tabs",
+            "two\t\ttabs inside",
+            "a\n                                        \nb",
             "Summarize\n\n\nthen stop",
             "i\u{328}\u{307}\u{303} and e\u{301}\u{302}\u{303}\u{304}",
         ] {

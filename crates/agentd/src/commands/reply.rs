@@ -55,13 +55,12 @@ pub trait OpenDm: Send + Sync {
     }
 }
 
-/// A member's `name` as agentd shows it: without the presentation and
-/// joining characters [`without_joiners`](crate::ctl::without_joiners)
-/// drops, each other control or invisible character replaced by U+FFFD so
-/// the name can't pass for another, and at most [`MAX_NAME_CHARS`] long.
-/// `None` for a name with nothing to show but blanks and backticks.
+/// A member's `name` as agentd shows it: each control or invisible
+/// character, joiners included, replaced by U+FFFD so the name can't pass
+/// for another, and at most [`MAX_NAME_CHARS`] long. `None` for a name
+/// with nothing to show but blanks and backticks.
 pub(crate) fn shown_name(name: &str) -> Option<String> {
-    let name: String = crate::ctl::without_joiners(name)
+    let name: String = name
         .chars()
         .map(|c| {
             if c.is_control() || crate::ctl::is_invisible(c) {
@@ -266,7 +265,8 @@ impl Replies {
     /// bot that serves their surface and team, at most [`MAX_NAME_CHARS`]
     /// long, with each control or invisible character replaced by U+FFFD,
     /// so the name can't pass for another by hiding a character. `None`
-    /// when no manager bot serves them or the lookup fails.
+    /// when no manager bot serves them, the lookup fails, or the name has
+    /// nothing to show.
     pub async fn name_of(&self, member: &MemberKey) -> Option<String> {
         let bot = self.bot_for(member).ok()?;
         match bot.dms.name_of(member).await {
@@ -404,8 +404,8 @@ mod tests {
         assert_eq!(
             shown_name("\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}")
                 .as_deref(),
-            Some("\u{0645}\u{06CC}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}"),
-            "joiners are dropped, not marked"
+            Some("\u{0645}\u{06CC}\u{FFFD}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}"),
+            "a joiner is marked like any invisible character"
         );
         assert_eq!(
             shown_name(&"x".repeat(200)).map(|name| name.chars().count()),

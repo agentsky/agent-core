@@ -106,6 +106,7 @@ struct Started {
 struct Recording {
     inner: ProcessSandbox,
     started: Mutex<Vec<Started>>,
+    stop_delay: Mutex<Duration>,
 }
 
 #[async_trait::async_trait]
@@ -139,6 +140,8 @@ impl Sandbox for Recording {
     }
 
     async fn stop(&self, container: &ContainerId) -> sandbox::Result<()> {
+        let delay = *self.stop_delay.lock().unwrap();
+        tokio::time::sleep(delay).await;
         self.inner.stop(container).await
     }
 
@@ -336,6 +339,7 @@ async fn start(limits: &str) -> Stack {
     let sandbox = Arc::new(Recording {
         inner: ProcessSandbox::new(store.clone(), dir.path()).unwrap(),
         started: Mutex::default(),
+        stop_delay: Mutex::default(),
     });
     let turns = Turns::start(&app, sandbox.clone(), settings).unwrap();
     let manager = Arc::new(MockSurface::new());
@@ -1470,14 +1474,12 @@ async fn a_stale_claim_leaves_the_newer_claims_session_alone() {
     let work = stack.turns.sessions().work_dir(&second).await.unwrap().work;
     std::fs::write(work.join("newer.txt"), "the newer claim's").unwrap();
     stack.posted(before, &heading(consent)).await;
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
-        assert!(
-            work.join("newer.txt").exists(),
-            "the stale claim deleted the newer claim's session"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert!(
+        work.join("newer.txt").exists(),
+        "the stale claim, now done, deleted the newer claim's session"
+    );
     let row = store.consent(consent).await.unwrap().unwrap();
     assert_eq!(row.finished_at, None, "only the newer claim can finish it");
     assert_eq!(row.private_session, Some(second.id));
@@ -1613,6 +1615,69 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
         [consent],
         "once its turn is known to have ended, another instance may take it up at once"
     );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_shutdown_tells_cut_threads_before_its_kills_end() {
+    let stack = start("").await;
+    let consent = stack.ask("bob", "t1", "sleep 90").await;
+    stack.card_to("alice").await;
+    stack.approve(consent).await;
+    let store = stack.store();
+    let started = Instant::now();
+    let session = loop {
+        if let Some(session) = store
+            .consent(consent)
+            .await
+            .unwrap()
+            .unwrap()
+            .private_session
+            && stack.turns.sessions().is_warm(session)
+        {
+            break session;
+        }
+        assert!(started.elapsed() < WAIT, "the task never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let before = stack.mock.calls().len();
+    let again = stack.mention("bob", "t1-again", Some("t1"));
+    let pipeline = stack.pipeline.clone();
+    let channel = tokio::spawn(async move {
+        pipeline.handle(again, MockSurface::DEFAULT_CAPS).await;
+    });
+    let started = Instant::now();
+    while !stack
+        .mock
+        .calls()
+        .split_off(before)
+        .iter()
+        .any(|call| matches!(call, Call::React { msg, .. } if msg.id.as_str() == "t1-again"))
+    {
+        assert!(started.elapsed() < WAIT, "the channel turn never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    *stack.sandbox.stop_delay.lock().unwrap() = Duration::from_secs(3);
+    let cutting = Instant::now();
+    stack.pipeline.cut_short().await;
+    assert!(
+        cutting.elapsed() < Duration::from_secs(3),
+        "the shutdown went on without waiting for the kill"
+    );
+    assert!(
+        posts(&stack.mock.calls().split_off(before))
+            .iter()
+            .any(|(_, text, _)| text.contains(agentd::pipeline::RESTARTING_TEXT)),
+        "the cut channel turn's thread was told to ask again first"
+    );
+    assert!(
+        stack.turns.sessions().is_warm(session),
+        "the private turn's kill is still under way"
+    );
+    stack.pipeline.wait_for_kills().await;
+    assert!(!stack.turns.sessions().is_warm(session));
+    channel.abort();
+    *stack.sandbox.stop_delay.lock().unwrap() = Duration::ZERO;
     stack.stop().await;
 }
 
