@@ -3335,7 +3335,9 @@ Deliverables:
     carries no `outside` until T36b's column; the event's `outside` on a
     managed agent's post describes the bot and never makes a hop ignored.
     T34's hand-off events, which agentd makes itself, carry `outside:
-    None`.
+    None`. Whether or not a hop's job passes through confirmation, no
+    home lookup is made for a hop or its posting bot: its requester's
+    `outside` comes from an attribution an already checked turn wrote.
 - `surface-slack` ingress (`ingress.rs`):
   - The workspace an event came through is `authorizations[0].team_id`,
     shaped like a team id (`normalize::is_team_id`). For an
@@ -3384,25 +3386,32 @@ Deliverables:
     when the answer's `team_id` is the workspace, `Ok(false)` for another
     `team_id` or `user_not_found`, and otherwise the lookup's error as it
     came, whatever its variant, uncached. Both answers are cached for an
-    hour, at most 4,096 of them, the oldest dropped first. A caller can ask
-    it not to wait for a used-up quota (`WebApi::without_waiting`).
-  - `SlackSurface::fill_sender_team(&mut InboundEvent)` sets `outside` to
-    `Some(Outside { team: None })` when the fields left it `None` and
-    `home_user` doesn't say home. Only two callers use it:
-    - `SlackSurface::confirm`, on Slack's copy, without waiting, so it only
-      ever looks up a real user. `Transport` or `RateLimited` fails the
-      confirmation as T31's lookups do, so the thread gets the "try again"
-      line; any other error makes the sender outside.
-    - `slack::Inbound`, on a DM to the manager app, before the intake;
-      only the operators hold that app's signing secret.
+    hour, at most 4,096 of them, the oldest dropped first; an answer
+    dropped from the cache is looked up again, never taken as home. A
+    caller can ask it not to wait for a used-up quota
+    (`WebApi::without_waiting`).
+  - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
+    SurfaceError>` never waits for a used-up quota, and skips a sender with
+    `sender_bot_user` set, whose `outside` decides nothing. When the fields
+    left `outside` `None` and `home_user` doesn't say home, it sets
+    `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
+    `Unauthorized` error too. It returns `Transport` and `RateLimited` as
+    they came, leaving `outside` alone. Its one caller is
+    `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
+    real user; those two errors fail the confirmation as T31's lookups do,
+    and the thread gets the "try again" line.
 
     The event of an agent's app is never looked up: its first routing takes
     a sender the fields left `None` as home, and nothing acts on that
     decision before confirmation. Link prompts and refusals wait for it
     (T31), and `private` and `ask-agent` exist only inside a turn. So a
-    forged event, whatever user id it names, spends none of the manager
-    token's quota. The ingress has already kept only what may be addressed
-    to the agent (T28), so most traffic costs no lookup either.
+    made-up user id costs no lookup on the manager's token. A forged event
+    that names a real message the bot can read from the last 15 minutes
+    costs at most one lookup per real sender, cached an hour; most are
+    answered from the member list, and only while that list can't be read
+    does each cost a `users.info`. The ingress has already kept only what
+    may be addressed to the agent (T28), so most traffic costs no lookup
+    either.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): when the event's
   `outside` is set and the copy's isn't, the copy takes the event's before
   it is routed. `copy_stands`, which lets a copy stand when only a limit's
@@ -3411,14 +3420,26 @@ Deliverables:
   identity between the two routings, as its rustdoc says (T27).
 - agentd (`crates/agentd/src/slack/mod.rs`):
   - The other-workspace checks of T30 and T31 compare the workspace above.
-  - `slack::Inbound` passes a manager DM to `CommandIntake` only after
-    `fill_sender_team` placed its sender home, and an interaction only when
-    its `sender_team` is present and is the workspace. A slash command
-    carries no sender team; its guard is Slack's rule that only the
-    installing workspace's members can run it, plus the existing check of
-    its `team_id`. The rest are dropped with a debug line throttled per
-    binding as the ingress throttles its warnings. That closes T33's open
-    item about interactions with a `team` the manager doesn't serve.
+  - `slack::Inbound` drops a manager DM whose fields already make its sender
+    outside, without touching the network, and passes the rest to
+    `CommandIntake`. It passes an interaction only when its `sender_team` is
+    present and is the workspace. A slash command carries no sender team;
+    its guard is Slack's rule that only the installing workspace's members
+    can run it, plus the existing check of its `team_id`. The rest are
+    dropped with a debug line throttled per binding as the ingress throttles
+    its warnings. That closes T33's open item about interactions with a
+    `team` the manager doesn't serve.
+  - The manager DM's home check (`crates/agentd/src/commands/intake.rs`)
+    runs in the member's own intake task, before `answer_text`: for an
+    `Origin::SlackDm`, it asks `home_user` through `SlackManager`'s surface,
+    without waiting. `Inbound::send` runs inside the single `Queue::run`
+    worker every app's Slack requests pass through, so no lookup happens
+    there; in the member's task a slow one holds up only that member's
+    commands. `Ok(true)` runs the command and `Ok(false)` drops it.
+    `Transport` or `RateLimited` posts the "try again" line into the
+    `Origin::SlackDm` channel the event named, so nothing is opened. Any
+    other error drops the command with a warning logged at most once a
+    minute.
 - The DM guard (`crates/agentd/src/slack/manager.rs`), in
   `SlackDms::open_dm`, through which every Slack DM the manager bot sends
   is opened, whether it comes through `Replies` (`dm`, `dm_room` and
@@ -3442,8 +3463,8 @@ Deliverables:
   That covers every DM opened for a requester or owner: the ones above,
   and `is_manager_dm`'s `dm_room` in `commands/sessions.rs`. Agent bots
   never open DMs. `reply_private` with `Origin::SlackDm` posts into the
-  member's own manager DM without opening one; the intake gate above
-  covers it, since only a home sender's DM reaches the intake.
+  member's own manager DM without opening one; the manager DM's home
+  check above covers it, since only a home sender's DM runs a command.
 - `router`: until T36b, a requester with `outside` set gets
   `Decision::Ignore(IgnoreReason::Outside)`. The router's rustdoc order says
   where it sits: after the gate, before any refusal.
@@ -3469,24 +3490,27 @@ Acceptance:
 - `a_home_organization_field_with_a_home_lookup_is_home`.
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
-- `a_failed_home_check_is_outside`.
+- `a_home_lookup_slack_refuses_is_outside`.
 - `an_event_saying_outside_keeps_the_copy_outside`.
 - `copy_stands_compares_key_and_outside`.
 - `copy_stands_still_lets_a_member_be_made_between_routings`.
 - `confirm_drops_an_event_that_claims_home_for_an_outside_copy`.
-- `a_teamless_manager_dm_from_outside_never_reaches_the_intake`.
+- `a_teamless_manager_dm_from_outside_never_runs_a_command`.
 - `an_interaction_without_user_team_is_dropped`.
 - `no_dm_is_opened_with_an_outside_user`.
 - `a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached`.
 - `a_bots_outside_never_makes_a_hop_ignored`.
-- `a_forged_event_costs_no_home_lookup`.
-- `the_home_answer_cache_is_bounded`.
+- `a_made_up_sender_costs_no_home_lookup`.
+- `a_bots_post_is_never_looked_up`.
+- `the_home_answer_cache_is_bounded_and_looks_up_an_evicted_no_again`.
 - `a_rate_limited_home_lookup_in_confirm_asks_the_thread_to_try_again`.
+- `a_manager_dm_lookup_never_holds_up_the_slack_queue`.
+- `a_rate_limited_manager_dm_lookup_asks_the_dm_to_try_again`.
 - `conv_info_reads_sharing_and_connected_teams`.
 - `a_malformed_or_overflowing_team_list_is_unknown`.
 - `conv_info_fresh_refreshes_the_cache`.
 - `deduplication_keys_are_unchanged_in_shared_channels`.
-- `outside_commands_dms_and_clicks_never_reach_the_intake`.
+- `outside_commands_dms_and_clicks_never_run`.
 - `the_router_ignores_outside_requesters_until_admitted`.
 
 ### T36b
