@@ -379,6 +379,9 @@ Every PR, in addition to its task's acceptance criteria:
 | [T33](#t33) | Consent cards and private tasks | `private-tasks` | T26, T31 | M5 |
 | [T34](#t34) | Agent-to-agent hand-off | `agent-to-agent` | T27, T32, T33 | M5 |
 | [T35](#t35) | Cloud hand-off (design first) | `cloud-handoff-design` | T34 | M6 |
+| [T35a](#t35a) | Cloud hand-off: store and grammar | `cloud-handoff-store` | T35 | M6 |
+| [T35b](#t35b) | Cloud hand-off: fire client | `cloud-fire-client` | T35 | M6 |
+| [T35c](#t35c) | Cloud hand-off: commands | `cloud-handoff-commands` | T35a, T35b | M6 |
 | [T36](#t36) | Slack Connect (design first) | `slack-connect-design` | T34 | M7 |
 
 Progress:
@@ -419,6 +422,9 @@ Progress:
 - [ ] T33 Consent cards and private tasks
 - [ ] T34 Agent-to-agent hand-off
 - [ ] T35 Cloud hand-off (design first)
+- [ ] T35a Cloud hand-off: store and grammar
+- [ ] T35b Cloud hand-off: fire client
+- [ ] T35c Cloud hand-off: commands
 - [ ] T36 Slack Connect (design first)
 
 The design's milestone 3 (requester-pays) moves ahead of milestone 4 (Slack)
@@ -490,6 +496,10 @@ graph TD
     T32 --> T34
     T33 --> T34
     T34 --> T35
+    T35 --> T35a
+    T35 --> T35b
+    T35a --> T35c
+    T35b --> T35c
     T34 --> T36
 ```
 
@@ -508,6 +518,7 @@ is a suggestion, not an owner: pick any unblocked task.
 | Execution | T17, T20, T21 | `crates/sandbox`, `crates/runner` |
 | Slack | T28, T29, T30, T31, T32 | `crates/surface-slack`, agentd Slack wiring |
 | Integration | T23 to T27, T33, T34 | `crates/agentd` pipeline, `crates/router` |
+| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs` |
 
 ## Phase 0: foundation
 
@@ -2954,7 +2965,233 @@ section in `docs/design.md`) covering:
 - How the session link is returned.
 - Whether and how status is read.
 
-Implementation tasks follow in a later revision of this plan.
+The addendum is [Cloud hand-off](design.md#cloud-hand-off). It hands work to
+a routine's API trigger rather than `claude --cloud`, which the documented
+surface doesn't support from a server, and milestone 6 now says so. Owners
+start a hand-off only by typing `/agent cloud run` where only they and the
+manager bot read it; no `agentctl` command or consent card starts one, and
+agentd doesn't read the session's status. T35a to T35c implement it.
+
+### T35a
+
+**Cloud hand-off: store and grammar.** Branch `cloud-handoff-store`.
+Depends on T35.
+
+Design: [Cloud hand-off](design.md#cloud-hand-off), its
+[Command surface](design.md#command-surface) and
+[Durability and audit](design.md#durability-and-audit);
+[Data model](design.md#data-model) (`CLOUD_ROUTINE`, `CLOUD_HANDOFF`).
+
+Deliverables:
+
+- A migration `…_cloud_handoff.sql`:
+  - `cloud_routines`: `id`, `agent_id`, `label`, `routine_id`, `token_enc`,
+    `added_by` (the identity's `MemberKey` string form) and `added_at`.
+    Unique on `(agent_id, label)`.
+  - `cloud_handoffs`: `id`, `agent_id`, `routine_label`, `routine_id`,
+    `requested_by`, `origin` (`slack_slash`, `slack_dm` or
+    `rocketchat_dm`), `task_len`, `task_sha256`, `state` with a `CHECK` on
+    `sending`, `fired`, `rejected` and `unknown`, `http_status`,
+    `error_type`, `retry_after_secs`, `session_id`, `session_url`,
+    `created_at`, `answered_at`, `notice_claimed_at` and `notified_at`.
+    A partial index on `created_at` where `state = 'sending'` serves the
+    sweep. No column holds the task text.
+- `Store` methods:
+  - `put_cloud_routine(agent, label, routine_id, token, added_by, now)`.
+    The token is a `SecretString`, sealed with
+    `cloud_routines/token_enc/<id>` as associated data. An existing label
+    is replaced in place, which is how an owner registers a new token. A
+    new label past 20 for the agent is refused, counted in the insert's
+    `BEGIN IMMEDIATE` transaction.
+  - `cloud_routine(agent, label)` returns the routine id and the opened
+    token. `cloud_routines(agent)` lists labels, ids and times, never
+    tokens.
+  - `delete_cloud_routine(agent, label)` and
+    `delete_cloud_routines_of(member)`, for `cloud rm` and for `logout` and
+    a member Slack reports deleted. `delete_agent` deletes the agent's
+    routines in its own transaction.
+  - `begin_cloud_handoff(…)` inserts a row as `sending` and returns its id.
+    `finish_cloud_handoff(id, outcome, now)` moves it to `fired`,
+    `rejected` or `unknown` only from `sending`, so a late answer can't
+    overwrite the sweep's `unknown`.
+  - `recent_cloud_handoffs(agent, limit)`.
+  - `stale_cloud_handoffs(before, now)` marks every `sending` row created
+    before `before` as `unknown` and returns them.
+    `pending_cloud_handoff_notices`, `claim_cloud_handoff_notice` (a
+    conditional `UPDATE` with a lease, as T13's relink notice),
+    `mark_cloud_handoff_notified` and `release_cloud_handoff_notice` serve
+    the sweep's notice.
+- `commands`:
+  - `Command::Cloud(CloudCommand)` with `Add { name, label, routine,
+    token }`, `Run { name, label, task }`, `List { name }` and
+    `Rm { name, label }`. `name()` gives `cloud add`, `cloud run`,
+    `cloud list` and `cloud rm`.
+  - `RoutineLabel`: 1 to 64 characters of ASCII letters, digits and
+    `._/-`, starting with a letter or digit.
+  - `RoutineRef` parsed from the pasted URL: `https`, no user info, port,
+    query or fragment, and the path exactly
+    `/v1/claude_code/routines/trig_<id>/fire` with an id of 1 to 64 ASCII
+    letters and digits. It keeps the URL's origin, which T35c compares
+    with `[cloud] base_url`, and the routine id. Slack's `<…>` around a
+    pasted URL is taken off first, as for other Slack entities (T08).
+  - The task is the rest of the text verbatim, like a persona.
+  - `cloud add` is secret-bearing (`Command::is_secret_bearing`). Text that
+    fails to parse counts as secret-bearing when `cloud` is followed by
+    `add` and a value, besides the existing `sk-ant-` prefix rule, which
+    already covers a routine token (`sk-ant-oat01-`).
+  - Help lines for the four commands.
+
+Acceptance, as tests named after the rules:
+
+- `cloud_add_is_secret_bearing`.
+- `a_cloud_add_that_fails_to_parse_is_secret_bearing`.
+- `routine_url_must_be_the_fire_endpoint` (`http`, user info, a port, a
+  query, a fragment, a dot segment, a missing `trig_`, other characters in
+  the id, a trailing slash).
+- `routine_label_grammar`.
+- `cloud_run_task_is_the_rest_verbatim`.
+- `a_routine_label_is_replaced_in_place`.
+- `the_twenty_first_routine_is_refused`.
+- `a_routine_token_is_sealed_to_its_row`.
+- `deleting_the_agent_deletes_its_routines`.
+- `routines_of_a_member_are_deleted_together`.
+- `a_handoff_finishes_only_from_sending`.
+- `stale_sending_handoffs_become_unknown`.
+- `a_handoff_notice_is_claimed_once`.
+- `no_column_holds_the_task_text`.
+
+### T35b
+
+**Cloud hand-off: fire client.** Branch `cloud-fire-client`. Depends on
+T35.
+
+Design: [Credential and billing](design.md#credential-and-billing),
+[The request and the link](design.md#the-request-and-the-link),
+[Failure modes](design.md#failure-modes).
+
+Deliverables:
+
+- `[cloud]` in the configuration: `base_url` (default
+  `https://api.anthropic.com`; `http` only on a loopback IP address, as T23
+  ruled for `[proxy] upstream`), `timeout_secs` (default 30, from 5 to 120)
+  and `connect_timeout_secs` (default 10). `config/agentd.example.toml`
+  documents them.
+- Configuration refuses a `[claude_oauth] scopes` holding any scope that
+  starts with `user:sessions:`, naming the key, so no linked token can
+  control members' cloud sessions through the credential proxy.
+- `agentd::cloud::FireClient`, built on `reqwest` with rustls, following no
+  redirects, decompressing nothing and honoring the system proxy settings
+  as `auth`'s client does. `fire(routine_id, token, task)` sends one
+  `POST {base_url}/v1/claude_code/routines/{routine_id}/fire` with
+  `Authorization: Bearer <token>`, `anthropic-version: 2023-06-01`,
+  `Content-Type: application/json` and `{"text": task}`, and no beta
+  header. It never retries.
+- A pure `classify` over what came back, returning `FireOutcome`:
+  - `Fired { session_id, session_url }` for a 200 whose body holds
+    `claude_code_session_id` shaped `session_` and 1 to 128 ASCII letters
+    and digits. `session_url` is kept only when it equals
+    `https://claude.ai/code/<session_id>`; otherwise it is `None` and the
+    reply falls back to the id.
+  - `Rejected { status, error_type, retry_after }` for 400, 401, 403, 404
+    and 429, reading `error.type` leniently from the error envelope and
+    `Retry-After` in seconds, and for a connection that failed before the
+    request was sent (`reqwest::Error::is_connect`).
+  - `Unknown { status, reason }` for everything else: 5xx, another status,
+    a timeout, a connection lost after sending, a redirect, or a 200 it
+    can't read.
+  - Bodies are read up to 64 KiB.
+- The task is refused before sending when empty or longer than 65,536 bytes
+  of UTF-8.
+- Nothing logs the token, the task text or a response body; logs carry the
+  routine id, the status and the outcome's kind.
+
+Acceptance, against `wiremock`:
+
+- `fire_sends_the_documented_request` (method, path, headers, body, no
+  beta header, the token only in `Authorization`).
+- `fire_reads_the_session_id_and_url`.
+- `a_session_url_elsewhere_falls_back_to_the_id`.
+- `each_documented_4xx_is_rejected_with_its_type`.
+- `retry_after_is_kept`.
+- `server_errors_and_other_statuses_are_unknown`.
+- `a_timeout_after_sending_is_unknown`.
+- `a_refused_connection_is_rejected`.
+- `a_redirect_is_not_followed`.
+- `an_unreadable_success_is_unknown`.
+- `fire_never_retries` (the fake answers 500 and expects one request).
+- `a_task_over_the_limit_is_refused_unsent`.
+- `config_refuses_a_session_scope`.
+- `cloud_base_url_is_https_unless_loopback`.
+- `token_and_task_never_reach_the_log` (a captured log at `trace`).
+
+### T35c
+
+**Cloud hand-off: commands.** Branch `cloud-handoff-commands`. Depends on
+T35a and T35b.
+
+Design: [Cloud hand-off](design.md#cloud-hand-off), all of it, and the
+security rows on cloud hand-off.
+
+Deliverables:
+
+- Handlers in `crates/agentd/src/commands/cloud.rs`, through the one
+  command intake (T30), so commands run once and in order per member:
+  - Every `cloud` command is refused unless `Origin::is_private()`.
+    `cloud add` in a room gets the secret-bearing refusal, with its own arm
+    saying to revoke the token with **Regenerate** or **Revoke** at
+    claude.ai/code/routines, and stores nothing.
+  - Only the agent's owner may use them; anyone else gets the answer an
+    unknown agent gets. A ban refuses all but `cloud rm`, which joins the
+    commands a ban leaves (`me`, `logout`, `pause`, `delete`).
+  - `add` refuses a URL whose origin isn't `[cloud] base_url`'s, then
+    stores the routine.
+  - `run` refuses a paused agent, an unknown label, and a task the client
+    would refuse. It then writes the hand-off as `sending`, fires once,
+    records the outcome and replies privately: the link and how to follow
+    the session for `Fired`, and the failure table's line otherwise. If
+    recording a `Fired` outcome fails, the reply still carries the link and
+    says a notice may follow.
+  - `list` shows the labels and routine ids, the last ten hand-offs with
+    their state, time and link, and one line saying agentd doesn't follow
+    sessions.
+  - `rm` deletes the routine and says to revoke the token at claude.ai.
+- `logout`, agent deletion and a member Slack reports deleted delete the
+  member's routines, and the replies say to revoke the tokens.
+- A sweep on agentd's sweeper, every minute: `sending` hand-offs older than
+  twice `[cloud] timeout_secs` become `unknown`, and each owner is told
+  once, through the manager bot's DM (`Replies::dm`), that the hand-off may
+  have started and to check claude.ai/code before running it again. A
+  notice that fails to send is released and tried on the next pass, for at
+  most a day.
+- No `agentctl` subcommand and no ctl API route for it.
+- `README.md`: the owner's setup (a routine per repository, connectors
+  removed, the prompt from the design, the API trigger, `cloud add`), what
+  agentd does and doesn't do after the link, and `[cloud]` for operators.
+
+Acceptance, as pipeline and command tests named after the rules:
+
+- `cloud_run_fires_once_and_replies_privately_with_the_link`.
+- `cloud_commands_are_refused_in_a_rocketchat_room`.
+- `cloud_add_in_a_room_gets_the_secret_refusal_and_stores_nothing`.
+- `only_the_owner_can_use_cloud_commands`.
+- `a_paused_agent_refuses_cloud_run`.
+- `a_banned_owner_can_only_rm`.
+- `a_bot_message_never_runs_a_cloud_command`.
+- `agentctl_has_no_cloud_command`.
+- `an_unknown_outcome_is_never_retried`.
+- `a_stale_sending_handoff_is_reported_once`.
+- `a_replayed_slack_command_fires_once`.
+- `logout_and_agent_delete_drop_routines`.
+- `a_routine_url_on_another_origin_is_refused`.
+- `the_link_is_never_posted_outside_the_private_reply`.
+
+Live check (manual): with a Pro or Max account, make a routine on a scratch
+repository with the design's prompt, register it, run a task, and open the
+link. Record the response, the session URL's form, what a paused routine,
+a wrong token and a linked member's OAuth token get from the endpoint, and
+whether any of those started a session. Update the design's
+[Verified and assumed](design.md#verified-and-assumed) with the result and
+date. That completes design milestone 6.
 
 ### T36
 
