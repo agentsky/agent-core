@@ -462,7 +462,8 @@ async fn lock_passes_on_the_command_status() {
 }
 
 /// Runs `agentctl lock` twice at once, each appending `start` and `end`
-/// around a sleep, and returns the log.
+/// around a sleep, and returns the log. The second starts once the first
+/// holds the lock, however long the first takes to start.
 async fn two_locks(server: &Server, a: &ProcessToken, b: &ProcessToken) -> Vec<String> {
     let log = server.dir.path(&format!("log-{}", uuid()));
     let script = |tag: &str| {
@@ -476,7 +477,7 @@ async fn two_locks(server: &Server, a: &ProcessToken, b: &ProcessToken) -> Vec<S
         .args(["lock", "--", "sh", "-c", &script("a")])
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for(&log).await;
     let second = server
         .agentctl(b)
         .args(["lock", "--", "sh", "-c", &script("b")])
@@ -523,12 +524,19 @@ async fn a_second_session_waits_for_the_lock() {
 async fn lock_gives_up_after_its_timeout() {
     let server = Server::start().await;
     let (_, token) = server.turn().await;
+    let marker = server.dir.path("holding");
     let holder = server
         .agentctl(&token)
-        .args(["lock", "--", "sleep", "3"])
+        .args([
+            "lock",
+            "--",
+            "sh",
+            "-c",
+            &format!("touch {}; sleep 3", marker.display()),
+        ])
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for(&marker).await;
     let out = server
         .run(&token, &["lock", "--timeout", "1", "--", "true"])
         .await;
