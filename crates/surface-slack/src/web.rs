@@ -43,7 +43,7 @@ use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
 use crate::normalize::{
-    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, is_workspace_id, team_id_or_nothing,
+    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, is_workspace_id,
 };
 
 /// The result type of the Web API client.
@@ -943,9 +943,10 @@ fn grid_teams<'de, D: Deserializer<'de>>(value: D) -> Result<Option<Vec<TeamId>>
 pub struct User {
     /// The user's id.
     pub id: UserId,
-    /// The workspace the user belongs to. Read leniently: absent, or
-    /// anything but a string shaped like a team id, is `None`.
-    #[serde(default, deserialize_with = "team_id_or_nothing")]
+    /// The workspace the user belongs to: `None` when absent or `null`,
+    /// and an empty id, which no team matches, for anything but a string
+    /// shaped like a team id, so it fails the home rule.
+    #[serde(default, deserialize_with = "team_id_or_unreadable")]
     pub team_id: Option<TeamId>,
     /// The username (a legacy handle).
     #[serde(default)]
@@ -971,6 +972,16 @@ pub struct User {
     /// gives them. Anything but an object is an organization no id names.
     #[serde(default, deserialize_with = "enterprise_user")]
     pub enterprise_user: Option<EnterpriseUser>,
+}
+
+/// A string shaped like a team id ([`is_team_id`]), `None` for `null`, and
+/// an empty id, which no team matches, for anything else.
+fn team_id_or_unreadable<'de, D: Deserializer<'de>>(value: D) -> Result<Option<TeamId>, D::Error> {
+    Ok(match Value::deserialize(value)? {
+        Value::Null => None,
+        Value::String(id) if is_team_id(&id) => Some(TeamId::from(id)),
+        _ => Some(TeamId::from(String::new())),
+    })
 }
 
 /// An `enterprise_user` object, `None` for `null`, and for anything else,

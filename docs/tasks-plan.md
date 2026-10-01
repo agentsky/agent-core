@@ -3695,8 +3695,9 @@ Deliverables:
   ids read only the message), but T36b must fill `requester_outside`
   there too: the event's `outside` for its sender, and for a thread
   message what its team fields and the home check say, which `Msg` must
-  then carry, never home by default. T36b replaces the store check with the columns, and keeps it
-  for `consents`, since a consent never has an outside requester.
+  then carry, never home by default. T36b replaces the store check with
+  the columns, and keeps it for `consents`, since a consent never has an
+  outside requester.
   Whether a listed organization can be admitted at all rests on T36e:
   confirmation keeps the copy's own `outside`, and a copy whose fields
   don't name the organization comes back `Outside { team: None }` from
@@ -3916,7 +3917,9 @@ Deliverables:
      list holds any outside member. For each answer, record the fields
      the home check reads: `team_id`, `profile.team`, `is_stranger`,
      `deleted` and `enterprise_user` (`enterprise_id` and `teams`), and
-     whether each is present, absent or `null`.
+     whether each is present, absent or `null`. Also whether `users.info`'s
+     `user.id` is exactly the id asked for, `U…` or `W…` alike, since an
+     answer about another id is refused.
   8. Whether `app_uninstalled` and `tokens_revoked`, sent when a scratch
      app is uninstalled at the end, carry `authorizations`, for the
      deferred work on uninstalls.
@@ -3926,7 +3929,11 @@ Deliverables:
   with the fields of item 7 in both `users.info` and `users.list`. Above
   all, whether `enterprise_user.teams` lists every workspace of the
   organization the member belongs to, the home one included, and whether
-  `auth.test` gives the organization's `enterprise_id`.
+  `auth.test` gives the organization's `enterprise_id`. Deactivate such a
+  member whose `team_id` names another workspace, and record the
+  `user_change` the manager app gets: whether its `enterprise_user.teams`
+  still lists the home workspace, which `member_who_left` needs to delete
+  their configuration token.
 - The redacted payloads as fixture files under
   `crates/testkit/fixtures/slack/connect/`, for `testkit::slack` to load in
   place of T36a's made-up ones. Whichever of T36a and T36e lands second

@@ -19,7 +19,7 @@ use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 use testkit::Held;
 use testkit::slack::{BOT_USER, CHANNEL, HOME_ORG, OUTSIDE_TEAM, SHARED_CHANNEL, TEAM, USER};
 use wiremock::matchers::{body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TOKEN: &str = "xoxb-surface-test";
 
@@ -37,7 +37,7 @@ fn ok(body: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(body)
 }
 
-async fn mount(server: &MockServer, name: &str, response: ResponseTemplate) {
+async fn mount(server: &MockServer, name: &str, response: impl Respond + 'static) {
     Mock::given(method("POST"))
         .and(path(format!("/api/{name}")))
         .respond_with(response)
@@ -1009,6 +1009,34 @@ async fn a_failed_bot_lookup_leaves_the_event_alone_and_is_not_cached() {
 }
 
 #[tokio::test]
+async fn a_bot_answer_about_another_bot_or_not_saying_bot_not_found_is_no_answer() {
+    for (answer, err) in [
+        (
+            ok(json!({"bot": {"id": "B0SOMEONE", "user_id": "U0DEPLOY1"}})),
+            SurfaceError::Api("bots.info answered for another bot".into()),
+        ),
+        (
+            refused("user_not_found"),
+            SurfaceError::NotFound("user_not_found".into()),
+        ),
+    ] {
+        let (server, surface) = setup().await;
+        Mock::given(method("POST"))
+            .and(path("/api/bots.info"))
+            .respond_with(answer)
+            .expect(2)
+            .mount(&server)
+            .await;
+        for _ in 0..2 {
+            let mut event = bot_event();
+            assert_eq!(surface.fill_bot_sender(&mut event).await.unwrap_err(), err);
+            assert_eq!(event.sender.user.as_str(), "B0LEGACY1");
+            assert_eq!(event.sender_bot_user, None);
+        }
+    }
+}
+
+#[tokio::test]
 async fn fill_bot_sender_leaves_humans_known_bots_and_other_teams_alone() {
     let (server, surface) = setup().await;
     let mut human = bot_event();
@@ -1028,11 +1056,10 @@ async fn fill_bot_sender_leaves_humans_known_bots_and_other_teams_alone() {
 #[tokio::test]
 async fn a_bot_lookup_past_the_quota_fails_at_once_without_a_call() {
     let (server, surface) = setup().await;
-    mount(
-        &server,
-        "bots.info",
-        ok(json!({"bot": {"id": "B0MADEUP", "user_id": "U0MADEUP"}})),
-    )
+    mount(&server, "bots.info", |request: &Request| {
+        let bot = form(request).remove("bot").unwrap_or_default();
+        ok(json!({"bot": {"id": bot, "user_id": "U0MADEUP"}}))
+    })
     .await;
     for n in 0..50 {
         let mut event = bot_event();
@@ -1658,6 +1685,36 @@ async fn a_home_lookup_slack_refuses_is_outside() {
 }
 
 #[tokio::test]
+async fn user_not_visible_is_kept_and_noted_once_a_minute() {
+    const HIDING: &str = "T0HIDING1";
+    let logs = testkit::Logs::global();
+    let server = MockServer::start().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let surface = SlackSurface::new(
+        client.bot(SecretString::from(TOKEN)),
+        Arc::new(TeamDirectory::new(HIDING.into())),
+    );
+    for user in ["U0HIDDEN1", "U0HIDDEN2", "U0HIDDEN1"] {
+        mount_user(&server, user, refused("user_not_visible")).await;
+        let mut event = home_event_from(user);
+        event.sender.team = HIDING.into();
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside_unknown(), "{user}");
+    }
+    assert_eq!(lookups(&server, "users.info").await.len(), 2, "kept");
+    let noted = logs
+        .snapshot()
+        .matching("user_not_visible")
+        .matching(HIDING)
+        .to_string();
+    assert_eq!(
+        noted.lines().filter(|line| line.contains("INFO")).count(),
+        1,
+        "{noted}"
+    );
+}
+
+#[tokio::test]
 async fn an_answer_about_someone_else_or_that_doesnt_read_is_no_answer_and_warned_of() {
     let logs = testkit::Logs::global();
     let server = MockServer::start().await;
@@ -1708,30 +1765,44 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
         client.bot(SecretString::from(TOKEN)),
         Arc::new(TeamDirectory::new(LONE.into())),
     );
-    let grid_member = |user: &str| {
+    let grid_member = |user: &str, team: &str, org: &str| {
         ok(json!({"user": {
             "id": user,
-            "team_id": LONE,
-            "enterprise_user": {"enterprise_id": HOME_ORG, "teams": [LONE]},
+            "team_id": team,
+            "enterprise_user": {"enterprise_id": org, "teams": [team]},
         }}))
     };
-    for user in ["U0GRIDMEM", "U0GRIDME2"] {
-        mount_user(&server, user, grid_member(user)).await;
+    let warnings = || {
+        let warned = logs
+            .snapshot()
+            .matching("auth.test gave the workspace none")
+            .matching(LONE)
+            .to_string();
+        warned.lines().filter(|line| line.contains("WARN")).count()
+    };
+    let look_up = async |user: &str| {
         let mut event = home_event_from(user);
         event.sender.team = LONE.into();
         surface.fill_sender_team(&mut event).await.unwrap();
         assert_eq!(event.outside, outside_unknown(), "{user}");
-    }
-    let warned = logs
-        .snapshot()
-        .matching("auth.test gave the workspace none")
-        .matching(LONE)
-        .to_string();
+    };
+    mount_user(
+        &server,
+        "U0THEIRS1",
+        grid_member("U0THEIRS1", OUTSIDE_TEAM, "E0THEIRS1"),
+    )
+    .await;
+    look_up("U0THEIRS1").await;
     assert_eq!(
-        warned.lines().filter(|line| line.contains("WARN")).count(),
-        1,
-        "{warned}"
+        warnings(),
+        0,
+        "another organization's Grid member says nothing of this workspace"
     );
+    for user in ["U0GRIDMEM", "U0GRIDME2"] {
+        mount_user(&server, user, grid_member(user, LONE, HOME_ORG)).await;
+        look_up(user).await;
+    }
+    assert_eq!(warnings(), 1);
 }
 
 #[tokio::test]
