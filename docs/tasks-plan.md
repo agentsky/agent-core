@@ -3362,8 +3362,9 @@ Deliverables:
     `auth.test` gave at startup (T30's `App::open`), if any.
   - When a field names neither the workspace nor `home_org`, `outside` is
     `Some(Outside { team })` with the first such field, in that order.
-    Otherwise it is `Some(Outside { team: None })`, pending the home check
-    below: never `None` from the fields alone.
+    Otherwise it is `None`, which only the event's own first routing uses:
+    the home check below decides for the copy and for manager DMs before
+    anything acts on it.
 - `surface-slack` directory (`directory.rs`):
   - `TeamDirectory::conv_info` returns `ConvInfo { kind, sharing }`, with
     `Sharing::None`, `Sharing::Org`, `Sharing::External { teams:
@@ -3379,17 +3380,29 @@ Deliverables:
   - `TeamDirectory` keeps the ids of the `users.list` entries whose
     `team_id` is the workspace, beside the names. `TeamDirectory::home_user`
     answers from them, then from `users.info` (Tier 4) with the manager
-    app's token, as T31 reads the member list, caching each answer for an
-    hour. It returns `Ok(true)` only when the answer's `team_id` is the
-    workspace, `Ok(false)` for another `team_id` or `user_not_found`, and
-    the lookup's error otherwise, uncached. Routing takes an error as not
-    home; the DM guard below returns it to be retried.
+    app's token, as T31 reads the member list. It returns `Ok(true)` only
+    when the answer's `team_id` is the workspace, `Ok(false)` for another
+    `team_id` or `user_not_found`, and otherwise the lookup's error as it
+    came, whatever its variant, uncached. Both answers are cached for an
+    hour, at most 4,096 of them, the oldest dropped first. A caller can ask
+    it not to wait for a used-up quota (`WebApi::without_waiting`).
   - `SlackSurface::fill_sender_team(&mut InboundEvent)` sets `outside` to
-    `None` only when the fields left it pending and `home_user` says home.
-    agentd's Slack receiver calls it with `fill_bot_sender`, before the
-    first routing, and `confirm` on the copy. The ingress has already
-    dropped what isn't addressed to the agent (T28), so unaddressed traffic
-    costs no lookup.
+    `Some(Outside { team: None })` when the fields left it `None` and
+    `home_user` doesn't say home. Only two callers use it:
+    - `SlackSurface::confirm`, on Slack's copy, without waiting, so it only
+      ever looks up a real user. `Transport` or `RateLimited` fails the
+      confirmation as T31's lookups do, so the thread gets the "try again"
+      line; any other error makes the sender outside.
+    - `slack::Inbound`, on a DM to the manager app, before the intake;
+      only the operators hold that app's signing secret.
+
+    The event of an agent's app is never looked up: its first routing takes
+    a sender the fields left `None` as home, and nothing acts on that
+    decision before confirmation. Link prompts and refusals wait for it
+    (T31), and `private` and `ask-agent` exist only inside a turn. So a
+    forged event, whatever user id it names, spends none of the manager
+    token's quota. The ingress has already kept only what may be addressed
+    to the agent (T28), so most traffic costs no lookup either.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): when the event's
   `outside` is set and the copy's isn't, the copy takes the event's before
   it is routed. `copy_stands`, which lets a copy stand when only a limit's
@@ -3408,18 +3421,29 @@ Deliverables:
     item about interactions with a `team` the manager doesn't serve.
 - The DM guard (`crates/agentd/src/slack/manager.rs`), in
   `SlackDms::open_dm`, through which every Slack DM the manager bot sends
-  is opened, whether it comes through `Replies` or a direct
-  `manager_bot().dm()` call such as those in `slack/agents.rs`:
+  is opened, whether it comes through `Replies` (`dm`, `dm_room` and
+  `dm_rich`, through `ManagerBot::dm_room`) or a direct `manager_bot().dm()`
+  call such as those in `slack/agents.rs`. `SlackDms` gains the manager
+  surface's `TeamDirectory` (`SlackSurface::directory()`) beside its
+  `WebApi`.
   - `home_user` saying the user isn't home fails it with
-    `SurfaceError::Forbidden`, which callers already treat as a refused
-    send.
-  - A `home_user` lookup that failed returns its own `Transport` or
-    `RateLimited` error, which callers retry as they retry any failed send,
-    so a passing Slack error doesn't make a home member unreachable.
+    `SurfaceError::Forbidden`.
+  - A `home_user` error is passed on unchanged and isn't cached, whatever
+    its variant (`Transport`, `RateLimited`, `Api`, `Unauthorized` for a
+    `missing_scope`, …).
+  - Each caller handles either as it handles a failed `conversations.open`
+    today: the sweepers' notices (consent cards, relink notices, token
+    notices, install reminders) try again on their schedules, and the
+    one-shot sends (the link prompt, the personal refusal, T26's
+    credential-failure notice, the install link, the installed notice, the
+    reset-failure notice) log it and drop it, the refusal and T26 notices
+    releasing their claim so the next message tries again.
 
-  That covers every DM sent to a requester or owner: the link prompt, the
-  relink notice, the personal refusal, T26's credential-failure notice,
-  consent cards and the install and token notices.
+  That covers every DM opened for a requester or owner: the ones above,
+  and `is_manager_dm`'s `dm_room` in `commands/sessions.rs`. Agent bots
+  never open DMs. `reply_private` with `Origin::SlackDm` posts into the
+  member's own manager DM without opening one; the intake gate above
+  covers it, since only a home sender's DM reaches the intake.
 - `router`: until T36b, a requester with `outside` set gets
   `Decision::Ignore(IgnoreReason::Outside)`. The router's rustdoc order says
   where it sits: after the gate, before any refusal.
@@ -3453,8 +3477,11 @@ Acceptance:
 - `a_teamless_manager_dm_from_outside_never_reaches_the_intake`.
 - `an_interaction_without_user_team_is_dropped`.
 - `no_dm_is_opened_with_an_outside_user`.
-- `a_failed_home_lookup_makes_a_dm_retry_not_give_up`.
-- `a_hop_takes_outside_from_its_attribution_not_the_bot`.
+- `a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached`.
+- `a_bots_outside_never_makes_a_hop_ignored`.
+- `a_forged_event_costs_no_home_lookup`.
+- `the_home_answer_cache_is_bounded`.
+- `a_rate_limited_home_lookup_in_confirm_asks_the_thread_to_try_again`.
 - `conv_info_reads_sharing_and_connected_teams`.
 - `a_malformed_or_overflowing_team_list_is_unknown`.
 - `conv_info_fresh_refreshes_the_cache`.
@@ -3700,8 +3727,9 @@ Deliverables:
     `conversations.info`, `users.info`, `users.list`) made with `curl` on
     the scratch apps' bot tokens and the manager app's token.
   - A redaction script that replaces every id with a stable made-up one of
-    the same shape, keeping which ids are equal, and drops names, emails,
-    avatars and message text.
+    the same shape, keeping which ids are equal, drops names, emails and
+    avatars, and replaces message text with a placeholder that keeps its
+    redacted `<@U…>` mentions.
 - A live capture on two paid Slack workspaces joined by a Slack Connect
   channel. Record, redacted:
   1. First, for a message from an outside member and one from a home
@@ -3711,7 +3739,9 @@ Deliverables:
      `user_profile.team`. Above all, whether any of them names an outside
      member with the home workspace's team.
   2. The same message read back with `conversations.history` and
-     `conversations.replies` on a scratch app's token: the same fields.
+     `conversations.replies` on a scratch app's token: the same fields,
+     and whether the first field that names another organization is the
+     same in the event and the copy.
   3. `conversations.info` with a scratch app's token on the shared channel,
      and on a Slack Connect DM between an outside member and a scratch
      app's bot, if one can be opened.
