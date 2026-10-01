@@ -47,7 +47,7 @@ mod keyed;
 mod pkce;
 mod plan;
 
-pub use config::{ConfigError, OAuthConfig};
+pub use config::{ALLOWED_SCOPES, ConfigError, OAuthConfig};
 pub use plan::{Plan, PlanInfo};
 
 use client::Exchange;

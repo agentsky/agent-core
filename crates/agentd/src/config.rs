@@ -47,6 +47,7 @@ use std::time::Duration;
 use auth::OAuthConfig;
 use core_types::{Cidr, MemberKey};
 use cred_proxy::{DEFAULT_UPSTREAM, EgressLimits, EgressPolicy, EgressProxy, HostRule};
+use reqwest::Url;
 use router::ModelPolicy;
 use runner::{
     DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP, DEFAULT_IDLE_TIMEOUT_SECS,
@@ -112,6 +113,17 @@ pub const MAX_CONSENT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 pub const DEFAULT_SLACK_API_URL: &str = surface_slack::web::DEFAULT_BASE_URL;
 /// The default for `slack.install_reminder_secs`: an hour.
 pub const DEFAULT_INSTALL_REMINDER_SECS: u64 = 60 * 60;
+/// The default for `cloud.base_url`: where Claude Code's routine endpoint is.
+pub const DEFAULT_CLOUD_BASE_URL: &str = "https://api.anthropic.com";
+/// The default for `cloud.beta`, sent as `anthropic-beta`: the dated header
+/// the routine endpoint's shape was read under.
+pub const DEFAULT_CLOUD_BETA: &str = "experimental-cc-routine-2026-04-01";
+/// The default for `cloud.timeout_secs`.
+pub const DEFAULT_CLOUD_TIMEOUT_SECS: u64 = 30;
+/// The default for `cloud.connect_timeout_secs`.
+pub const DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// The default for `cloud.retention_days`.
+pub const DEFAULT_CLOUD_RETENTION_DAYS: u64 = 90;
 
 /// agentd's configuration, validated.
 #[derive(Debug)]
@@ -148,6 +160,9 @@ pub struct Config {
     /// the section is optional. agentd serves Slack when the manager app's
     /// secrets are set.
     pub slack: SlackConfig,
+    /// `[cloud]`: the routine endpoint cloud hand-offs fire. Cloud hand-off
+    /// is off without it.
+    pub cloud: Option<CloudConfig>,
     /// Secrets from the environment.
     pub secrets: Secrets,
     /// Unknown `AGENTD_` variables that were ignored, by name, sorted.
@@ -178,6 +193,7 @@ struct File {
     rocketchat: Option<RocketChatConfig>,
     #[serde(default)]
     slack: SlackConfig,
+    cloud: Option<CloudConfig>,
 }
 
 /// `[server]`.
@@ -552,6 +568,136 @@ pub struct CommunityConfig {
     pub admins: Vec<MemberKey>,
 }
 
+/// `[cloud]`: the routine endpoint a member's `cloud run` fires. Without the
+/// section cloud hand-off is off. Every key has a default, so an empty
+/// `[cloud]` turns it on with them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct CloudConfig {
+    /// `base_url`: the origin of the routine endpoint, default
+    /// [`DEFAULT_CLOUD_BASE_URL`]. An origin only, with no path, query,
+    /// fragment or credentials; `http` only to a loopback IP address, which
+    /// is where tests' fakes listen. The fire URL is built from it for each
+    /// request, and a pasted routine URL must have its origin.
+    pub base_url: String,
+    /// `beta`: the `anthropic-beta` header the request sends, default
+    /// [`DEFAULT_CLOUD_BETA`]. Requests fail once Anthropic retires it,
+    /// until it is updated.
+    pub beta: String,
+    /// `timeout_secs`: how long one fire request may take, from 5 to 120,
+    /// default [`DEFAULT_CLOUD_TIMEOUT_SECS`]. A hand-off still sending
+    /// after twice this is reported as unknown.
+    pub timeout_secs: u64,
+    /// `connect_timeout_secs`: how long connecting may take, from 1 to
+    /// `timeout_secs`, default [`DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS`].
+    pub connect_timeout_secs: u64,
+    /// `retention_days`: how long hand-offs are kept after they were asked
+    /// for, from 1 to 365, default [`DEFAULT_CLOUD_RETENTION_DAYS`].
+    pub retention_days: u64,
+}
+
+impl Default for CloudConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_CLOUD_BASE_URL.to_owned(),
+            beta: DEFAULT_CLOUD_BETA.to_owned(),
+            timeout_secs: DEFAULT_CLOUD_TIMEOUT_SECS,
+            connect_timeout_secs: DEFAULT_CLOUD_CONNECT_TIMEOUT_SECS,
+            retention_days: DEFAULT_CLOUD_RETENTION_DAYS,
+        }
+    }
+}
+
+impl CloudConfig {
+    /// [`base_url`](Self::base_url), parsed and checked: an `https` origin,
+    /// or an `http` one whose host is a loopback IP address.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] for `cloud.base_url` otherwise. It never
+    /// repeats the value.
+    pub fn base_url(&self) -> Result<Url, ConfigError> {
+        cloud_origin(&self.base_url).map_err(|reason| invalid("cloud.base_url", reason))
+    }
+
+    /// [`timeout_secs`](Self::timeout_secs) as a [`Duration`].
+    pub fn timeout(&self) -> Duration {
+        Duration::from_secs(self.timeout_secs)
+    }
+
+    /// [`connect_timeout_secs`](Self::connect_timeout_secs) as a
+    /// [`Duration`].
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs)
+    }
+
+    /// [`retention_days`](Self::retention_days) as a [`Duration`].
+    pub fn retention(&self) -> Duration {
+        Duration::from_secs(self.retention_days * 24 * 60 * 60)
+    }
+
+    /// Checks every value, as loading the file does.
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        self.base_url()?;
+        if self.beta.is_empty()
+            || self.beta.len() > 256
+            || !self
+                .beta
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.,".contains(&b))
+        {
+            return Err(invalid(
+                "cloud.beta",
+                "must be 1 to 256 ASCII letters, digits, -, _, . and ,",
+            ));
+        }
+        if !(5..=120).contains(&self.timeout_secs) {
+            return Err(invalid("cloud.timeout_secs", "must be from 5 to 120"));
+        }
+        if !(1..=self.timeout_secs).contains(&self.connect_timeout_secs) {
+            return Err(invalid(
+                "cloud.connect_timeout_secs",
+                "must be from 1 to cloud.timeout_secs",
+            ));
+        }
+        if !(1..=365).contains(&self.retention_days) {
+            return Err(invalid("cloud.retention_days", "must be from 1 to 365"));
+        }
+        Ok(())
+    }
+}
+
+/// `text` as an origin: `https`, or `http` to a loopback IP address
+/// (IPv4-mapped included; `localhost` is a name that could resolve
+/// anywhere), with a host, and no credentials, path, query or fragment.
+fn cloud_origin(text: &str) -> Result<Url, &'static str> {
+    const REASON: &str = "must be an https:// origin, or http:// to a loopback IP address, with \
+                          no user info, path, query or fragment";
+    let url = Url::parse(text).map_err(|_| REASON)?;
+    let host = url.host_str().ok_or(REASON)?;
+    let loopback = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    let scheme_ok = match url.scheme() {
+        "https" => true,
+        "http" => loopback,
+        _ => false,
+    };
+    if !scheme_ok
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(REASON);
+    }
+    Ok(url)
+}
+
 /// Reads a list of member keys in their string form.
 fn member_keys<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<MemberKey>, D::Error> {
     Vec::<String>::deserialize(de)?
@@ -698,6 +844,7 @@ impl Config {
             claude_oauth: file.claude_oauth,
             rocketchat: file.rocketchat,
             slack: file.slack,
+            cloud: file.cloud,
             secrets,
             unknown_env,
         })
@@ -952,6 +1099,9 @@ impl File {
             .map_err(|err| invalid(format!("claude_oauth.{}", err.key), err.reason))?;
         if let Some(rocketchat) = &self.rocketchat {
             rocketchat.validate()?;
+        }
+        if let Some(cloud) = &self.cloud {
+            cloud.validate()?;
         }
         self.slack.validate()
     }
@@ -1497,6 +1647,107 @@ data_dir = "/nonexistent/agentd"
     }
 
     #[test]
+    fn cloud_config_is_checked() {
+        assert!(with(MINIMAL, env()).unwrap().cloud.is_none());
+
+        let cloud = with(&format!("{MINIMAL}\n[cloud]\n"), env())
+            .unwrap()
+            .cloud
+            .unwrap();
+        assert_eq!(cloud, CloudConfig::default());
+        assert_eq!(cloud.base_url, "https://api.anthropic.com");
+        assert_eq!(cloud.beta, "experimental-cc-routine-2026-04-01");
+        assert_eq!(cloud.timeout(), Duration::from_secs(30));
+        assert_eq!(cloud.connect_timeout(), Duration::from_secs(10));
+        assert_eq!(cloud.retention(), Duration::from_secs(90 * 24 * 60 * 60));
+        assert_eq!(
+            cloud.base_url().unwrap().as_str(),
+            "https://api.anthropic.com/"
+        );
+
+        let cloud_with = |lines: &str| with(&format!("{MINIMAL}\n[cloud]\n{lines}\n"), env());
+        for base in [
+            "https://api.anthropic.com/",
+            "https://gateway.example.com:8443",
+            "https://203.0.113.7",
+            "http://127.0.0.1:8080",
+            "http://127.9.9.9",
+            "http://[::1]:9",
+            "http://[::ffff:127.0.0.1]:9",
+        ] {
+            let config = cloud_with(&format!("base_url = \"{base}\"")).unwrap();
+            let url = config.cloud.unwrap().base_url().unwrap();
+            assert_eq!(url.path(), "/", "{base}");
+        }
+        let bad_bases = [
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/claude_code/routines/trig_1/fire",
+            "https://api.anthropic.com/?beta=1",
+            "https://api.anthropic.com/#top",
+            "https://user:pw@api.anthropic.com",
+            "https://user@api.anthropic.com",
+            "http://api.anthropic.com",
+            "http://localhost:8080",
+            "http://10.0.0.1:8080",
+            "http://[fe80::1]:8080",
+            "ftp://api.anthropic.com",
+            "api.anthropic.com",
+            "ws://api.anthropic.com",
+            "",
+        ];
+        for base in bad_bases {
+            let err = cloud_with(&format!("base_url = \"{base}\"")).unwrap_err();
+            assert_eq!(err.key(), Some("cloud.base_url"), "{base}: {err}");
+            assert!(
+                base.is_empty() || !err.to_string().contains(base),
+                "{base}: {err}"
+            );
+        }
+
+        for (lines, key) in [
+            ("beta = \"\"", "cloud.beta"),
+            ("beta = \"two words\"", "cloud.beta"),
+            ("beta = \"a;b\"", "cloud.beta"),
+            ("beta = \"line\\nbreak\"", "cloud.beta"),
+            ("timeout_secs = 4", "cloud.timeout_secs"),
+            ("timeout_secs = 121", "cloud.timeout_secs"),
+            ("connect_timeout_secs = 0", "cloud.connect_timeout_secs"),
+            ("connect_timeout_secs = 31", "cloud.connect_timeout_secs"),
+            (
+                "timeout_secs = 5\nconnect_timeout_secs = 6",
+                "cloud.connect_timeout_secs",
+            ),
+            ("retention_days = 0", "cloud.retention_days"),
+            ("retention_days = 366", "cloud.retention_days"),
+        ] {
+            let err = cloud_with(lines).unwrap_err();
+            assert_eq!(err.key(), Some(key), "{lines}: {err}");
+        }
+        let err = cloud_with("base_ur = \"https://api.anthropic.com\"").unwrap_err();
+        assert!(err.key().unwrap().starts_with("cloud"), "{err}");
+
+        let cloud = cloud_with(
+            "beta = \"experimental-cc-routine-2027-01-01,other.beta_2\"\ntimeout_secs = 5\n\
+             connect_timeout_secs = 5\nretention_days = 365",
+        )
+        .unwrap()
+        .cloud
+        .unwrap();
+        assert_eq!(cloud.timeout(), Duration::from_secs(5));
+        assert_eq!(cloud.connect_timeout(), Duration::from_secs(5));
+        assert_eq!(cloud.retention(), Duration::from_secs(365 * 24 * 60 * 60));
+        let cloud = cloud_with("timeout_secs = 120\nconnect_timeout_secs = 1")
+            .unwrap()
+            .cloud
+            .unwrap();
+        assert_eq!(cloud.timeout(), Duration::from_secs(120));
+        let longest = "b".repeat(256);
+        assert!(cloud_with(&format!("beta = \"{longest}\"")).is_ok());
+        let err = cloud_with(&format!("beta = \"{longest}b\"")).unwrap_err();
+        assert_eq!(err.key(), Some("cloud.beta"));
+    }
+
+    #[test]
     fn the_example_file_loads() {
         let text = include_str!("../../../config/agentd.example.toml");
         let config = with(text, with_rc_token()).unwrap();
@@ -1510,6 +1761,7 @@ data_dir = "/nonexistent/agentd"
         assert_eq!(sandbox, SandboxConfig::new("agent-core/sandbox:dev"));
         assert_eq!(config.runner.process(), ProcessConfig::default());
         assert_eq!(config.runner.pool(), PoolConfig::default());
+        assert_eq!(config.cloud, Some(CloudConfig::default()));
     }
 
     #[test]

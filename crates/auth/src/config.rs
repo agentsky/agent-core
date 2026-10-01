@@ -24,7 +24,8 @@ pub struct OAuthConfig {
     pub redirect_uri: String,
     /// The OAuth client ID.
     pub client_id: String,
-    /// The scopes to request, separated by spaces.
+    /// The scopes to request, separated by spaces: a subset of
+    /// [`ALLOWED_SCOPES`].
     pub scopes: String,
     /// The account profile endpoint the plan is read from.
     pub profile_url: String,
@@ -44,6 +45,13 @@ impl Default for OAuthConfig {
     }
 }
 
+/// The only scopes [`OAuthConfig::scopes`] may name: the profile needs the
+/// first and the credential proxy the second. The proxy forwards any path,
+/// so a wider scope on a linked token, such as one that controls the
+/// member's cloud sessions, would be usable from every turn on that
+/// member's credential.
+pub const ALLOWED_SCOPES: [&str; 2] = ["user:profile", "user:inference"];
+
 /// An invalid [`OAuthConfig`] value, named by its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("claude_oauth.{key}: {reason}")]
@@ -60,8 +68,9 @@ impl OAuthConfig {
     /// URLs must be absolute `https` URLs without credentials or a fragment.
     /// Plain `http` is accepted only for a loopback host (`localhost`,
     /// `127.0.0.1`, `[::1]`), for tests and local fakes, because tokens and
-    /// codes travel in these requests. The client ID and scopes must be
-    /// non-empty.
+    /// codes travel in these requests. The client ID must be non-empty, and
+    /// the scopes must name at least one scope and none outside
+    /// [`ALLOWED_SCOPES`].
     ///
     /// # Errors
     ///
@@ -78,6 +87,15 @@ impl OAuthConfig {
             return Err(ConfigError {
                 key: "scopes",
                 reason: "must name at least one scope",
+            });
+        }
+        if self
+            .scope_list()
+            .any(|scope| !ALLOWED_SCOPES.contains(&scope))
+        {
+            return Err(ConfigError {
+                key: "scopes",
+                reason: "may name only user:profile and user:inference",
             });
         }
         Ok(())
@@ -234,6 +252,34 @@ mod tests {
             assert_eq!(err.key, key);
             assert_eq!(err.reason, reason, "{key}");
             assert_eq!(err.to_string(), format!("claude_oauth.{key}: {reason}"));
+        }
+    }
+
+    #[test]
+    fn oauth_scopes_outside_profile_and_inference_are_refused() {
+        for scopes in [
+            "user:profile",
+            "user:inference",
+            "user:inference user:profile",
+            " user:profile\tuser:inference ",
+        ] {
+            assert_eq!(with("scopes", scopes).validate(), Ok(()), "{scopes}");
+        }
+        for scopes in [
+            "user:profile user:inference user:sessions:claude_code",
+            "user:sessions:claude_code",
+            "org:create_api_key user:profile",
+            "user:inference user:mcp_servers",
+            "User:Profile",
+            "user:profile,user:inference",
+        ] {
+            let err = with("scopes", scopes).validate().unwrap_err();
+            assert_eq!(err.key, "scopes", "{scopes}");
+            assert_eq!(
+                err.reason, "may name only user:profile and user:inference",
+                "{scopes}"
+            );
+            assert!(!err.to_string().contains("sessions"), "{scopes}");
         }
     }
 

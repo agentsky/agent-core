@@ -3199,6 +3199,17 @@ Acceptance, against `wiremock`:
   retention out of range).
 - `token_and_task_never_reach_the_log` (a captured log at `trace`).
 
+Decided in T35b ([impl-notes](impl-notes.md#t35b-cloud-hand-off-fire-client)):
+`fire` returns `Result<FireOutcome, FireError>`, refusing before it sends a
+routine id that isn't `trig_` and 1 to 64 letters and digits,
+anything a token that isn't visible ASCII and a task that is empty or over
+`cloud::MAX_TASK_BYTES` (65,536 bytes); T35c checks first, so an error
+there only means nothing was started. Each fire is one request on a
+connection of its own, with reqwest's own retries off.
+`CloudConfig::base_url()` is the parsed origin T35c compares a routine
+URL's with, and `FireOutcome::kind()` names the state to record. The
+configuration's scope check lists its scopes in `auth::ALLOWED_SCOPES`.
+
 ### T35c
 
 **Cloud hand-off: commands.** Branch `cloud-handoff-commands`. Depends on

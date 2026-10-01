@@ -7977,3 +7977,125 @@ answer.
 - Slack not resolving a mention inside code, and pairing any two
   backticks (the model `without_code` reads by), are not verified on a
   live workspace.
+
+## T35b: Cloud hand-off: fire client
+
+No request reached claude.ai from the environment this was built in: the
+client was tested against `wiremock` and hand-written local servers only.
+The design's [Verified and assumed](design.md#verified-and-assumed) list
+still holds, and T35c's live check covers it.
+
+### The fire client refuses what it can't send
+
+**Issue.** The plan gives `fire(routine_id, token, task)` and a
+`FireOutcome`, but the routine id goes into the request's path, the token
+into a header, and the endpoint caps the text, while the client is built
+before the commands that call it. A line break in a token would make
+reqwest fail the request before sending it, which its errors report as a
+builder error rather than a connection error.
+
+**Solution.** `fire` returns `Result<FireOutcome, FireError>`, and refuses
+before sending anything: a routine id that isn't `trig_` and 1 to 64 ASCII
+letters and digits (`FireError::RoutineId`), a token that is empty or holds
+a byte outside visible ASCII (`FireError::Token`), and a task that is empty
+or longer than `MAX_TASK_BYTES`, 65,536 bytes (`FireError::Task`). None of
+them repeats the value. T35c's checks come first, so for it an error here
+means only that nothing was started, as a store failure before the request
+does. A reqwest builder error, should one still happen, counts as not
+sent too.
+
+### reqwest retries some requests on its own
+
+**Issue.** reqwest 0.13's client has a retry policy by default, which
+resends a request the server refused at the protocol level (HTTP/2's
+`REFUSED_STREAM` and `GOAWAY`), up to twice. The workspace builds reqwest
+without `http2`, so it can't happen today, but a feature another crate
+turns on would bring it back. A pooled connection the server closed while
+it sat idle is a second way to end up unsure: a request written to it
+fails after sending, and would be reported `unknown` though the server
+never read it.
+
+**Solution.** The client is built with `retry(reqwest::retry::never())`
+and `pool_max_idle_per_host(0)`, so each fire is one request on a
+connection of its own. That costs a TCP and TLS handshake per hand-off,
+which a member's command can afford. `fire_never_retries` and the
+hand-written server that hangs up after reading the request both check
+that exactly one request, on one connection, was made.
+
+### A connect timeout counts as not sent only when it fires first
+
+**Issue.** reqwest reports its connect timeout through hyper-util's
+connect error, so `is_connect()` holds and the fire is `rejected`: nothing
+was sent. Its total timeout covers connecting too. With
+`connect_timeout_secs` equal to `timeout_secs`, which the plan allows, the
+two race, and when the total one wins, a connection that never opened is a
+plain timeout, reported `unknown`. Probed once against an address that
+drops packets: a 100 ms connect timeout under a 600 ms total gave
+`rejected`, and 300 ms for both gave `unknown` with reason `timeout`.
+
+**Solution.** Kept: `unknown` only tells the member to check claude.ai
+before running the task again, the cautious side, and the defaults (10 and
+30 seconds) keep the two apart. The example configuration doesn't suggest
+setting them equal.
+
+### `base_url` is checked as the `url` crate reads it
+
+**Issue.** The plan asks for an origin with no path, query, fragment or
+credentials. The `url` crate normalizes what it parses: a trailing slash,
+a default port, upper case in the host, and a special scheme written
+without slashes (`https:api.anthropic.com`) all give the same origin.
+
+**Solution.** `CloudConfig::base_url` parses the value and requires the
+path to be `/` and no query, fragment or user info, `https`, or `http`
+only when the host is a loopback IP address (IPv4-mapped included;
+`localhost` is a name that could resolve anywhere), as `[proxy] upstream`
+does. Every request's URL is the parsed origin with the fire path set on
+it, and T35c compares a pasted routine URL's origin with this URL's
+`origin()`, so both sides go through the same normalization. Errors never
+repeat the value.
+
+### What counts as each outcome
+
+**Issue.** The plan names the documented statuses but leaves the rest of
+the edges to the implementation.
+
+**Solution.**
+
+- Only a 200 can be `fired`. A 201, 202 or 204, though successful, is
+  `unknown` with reason `other_status`, and so is every status but 200,
+  400, 401, 403, 404, 429, a 3xx (`redirect`) and a 5xx (`server_error`),
+  a 413 from a proxy in front of the endpoint among them.
+- `claude_code_session_id` must be `session_` and 1 to 128 ASCII letters
+  and digits exactly, with nothing trimmed. `claude_code_session_url` is
+  kept only when it is byte for byte `https://claude.ai/code/` and that
+  id, so a query, an extra segment or another host's look-alike loses the
+  URL and keeps the id.
+- `error.type` is kept from an error body only when it is 1 to 64
+  lowercase ASCII letters, digits and `_`, so arbitrary text never reaches
+  the store or a log. A body that isn't such an envelope gives none, and
+  the status alone decides.
+- `Retry-After` is kept only as digits, surrounding blanks aside, up to
+  `u32::MAX`; Rust's own parse would also take `+5`. A date, a fraction
+  or a larger number is ignored.
+- A body is read up to 64 KiB, refused at once by its `Content-Length`
+  when that says more, and otherwise counted as it arrives. A 200 whose
+  body runs past it, breaks off or stalls past the timeout is `unknown`
+  (`unreadable`, `connection_lost` or `timeout`); an error status whose
+  body does is still `rejected`, without an error type.
+- Each fire logs one line, `fired a cloud routine`, with the routine id,
+  the status, the outcome's kind, and the session id, the error type, the
+  `Retry-After` or the reason for `unknown`: at info for `fired` and at
+  warn otherwise.
+
+### Scopes outside profile and inference fail at startup
+
+**Issue.** `OAuthConfig::validate` now refuses any `[claude_oauth]
+scopes` entry but `user:profile` and `user:inference`. A deployment that
+had widened them stops starting.
+
+**Solution.** That is the point: the error names `claude_oauth.scopes`.
+Members who linked while the scopes were wider keep tokens carrying them
+until their next refresh, which then asks for the narrower set; whether
+the token endpoint narrows a refreshed token that way, or refuses it as
+widening was refused (T09), is unverified, and such members can log in
+again. `auth::ALLOWED_SCOPES` lists the two.

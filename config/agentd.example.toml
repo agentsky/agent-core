@@ -248,7 +248,10 @@ admins = []
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every
 # key is optional; these are the defaults (Claude Code 2.1.285). URLs must be
-# https://, except http:// on a loopback host for local fakes.
+# https://, except http:// on a loopback host for local fakes. `scopes` may
+# name only user:profile and user:inference: the credential proxy forwards any
+# path, so a wider scope, such as one that controls a member's cloud sessions,
+# would be usable from every turn on their account.
 authorize_url = "https://claude.com/cai/oauth/authorize"
 token_url = "https://platform.claude.com/v1/oauth/token"
 revoke_url = "https://platform.claude.com/v1/oauth/token/revoke"
@@ -307,3 +310,30 @@ public_posting = false
 # reminded, once, in seconds (60 to 604800). In a workspace that requires app
 # approval, the install waits for an admin.
 install_reminder_secs = 3600
+
+# Cloud hand-off: `/agent cloud run <routine> <task>` fires a routine a member
+# made at claude.ai/code/routines and registered with `/agent cloud add`, which
+# starts a Claude Code cloud session on the member's own account. agentd sends
+# the request itself, over its egress network, with the routine's own token,
+# never through the credential proxy. Leave the section out to turn cloud
+# hand-off off; `cloud list` and `cloud rm` still work then. Every key is
+# optional; these are the defaults.
+[cloud]
+# The routine endpoint's origin: no path, query or fragment. https://, except
+# http:// to a loopback IP address for a local fake. A routine URL a member
+# pastes must have this origin.
+base_url = "https://api.anthropic.com"
+
+# The anthropic-beta header each request sends, which pins the endpoint's
+# dated shape. Requests fail once Anthropic retires it, until this is updated.
+beta = "experimental-cc-routine-2026-04-01"
+
+# How long one request may take, in seconds (5 to 120), and how long
+# connecting may take (1 to timeout_secs). agentd never retries a request: a
+# hand-off still sending after twice timeout_secs, because agentd stopped
+# during it, is reported to the member as possibly started.
+timeout_secs = 30
+connect_timeout_secs = 10
+
+# How many days hand-offs are kept after they were asked for (1 to 365).
+retention_days = 90
