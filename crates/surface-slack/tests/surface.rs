@@ -558,6 +558,43 @@ async fn can_post_only_where_the_bot_is_a_member_and_trusts_a_yes_until_asked_no
             "{channel}: the no dropped the yes kept before"
         );
     }
+
+    for error in ["channel_not_found", "invalid_auth", "missing_scope"] {
+        server.reset().await;
+        mount(
+            &server,
+            "conversations.info",
+            ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": true}})),
+        )
+        .await;
+        assert!(surface.can_post_now(&conv()).await.unwrap());
+        server.reset().await;
+        mount(
+            &server,
+            "conversations.info",
+            ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": error})),
+        )
+        .await;
+        assert!(
+            !surface.can_post_now(&conv()).await.unwrap(),
+            "{error}: Slack won't let the bot post there"
+        );
+        assert!(
+            !surface.can_post(&conv()).await.unwrap(),
+            "{error}: the no dropped the yes kept before"
+        );
+    }
+    server.reset().await;
+    mount(
+        &server,
+        "conversations.info",
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "fatal_error"})),
+    )
+    .await;
+    assert!(
+        surface.can_post_now(&conv()).await.is_err(),
+        "a failure that may pass stays an error"
+    );
 }
 
 #[tokio::test]

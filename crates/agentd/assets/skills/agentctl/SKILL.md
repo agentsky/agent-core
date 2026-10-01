@@ -110,8 +110,9 @@ posts, your bot posts the task in this thread, mentioning that agent, so
 everyone sees the hand-off. The other agent may then answer in this thread,
 on this turn's requester's account. `<agent>` is the agent's bot's handle in
 the chat written as a mention (`@handle`), or the agent's name. A bare
-word that is one agent's name and another's handle is refused, with their
-handles: ask again with the `@handle` you mean.
+word that is one agent's name and another's handle is refused, listing each
+one's handle, name, and whether it is the requester's own or public: ask
+again with the `@handle` you mean.
 
 Mentioning the other agent's bot in your reply, in this thread, hands off
 too. Use ask-agent or a mention, not both, and ask each agent once: the

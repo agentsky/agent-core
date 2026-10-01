@@ -284,7 +284,11 @@ fn code_is_untouched_except_for_escaping() {
                 "```\n**a**\n\nb",
                 "```\n**a**\n\nb\n```",
             ),
-            ("a code span holding a backtick", "`` a`b ``", "`a`b`"),
+            (
+                "a code span holding a backtick keeps it from closing the span",
+                "`` a`b ``",
+                "`a\u{200b}`\u{200b}b`",
+            ),
         ],
     );
 }
@@ -1406,6 +1410,31 @@ fn a_literal_backtick_never_pairs_into_code_around_a_mention() {
                 "a run of two and a run of one",
                 "``a @ankit` b",
                 "\u{200b}`\u{200b}\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b} b",
+            ),
+            (
+                "a backtick inside inline code",
+                "``x`y`` @ankit `z`",
+                "`x\u{200b}`\u{200b}y` <@U111> `z`",
+            ),
+            (
+                "inline code that starts with a backtick",
+                "`` `a `` @ankit `b`",
+                "`\u{200b}`\u{200b}a` <@U111> `b`",
+            ),
+            (
+                "inline code with a backtick in a link label",
+                "[``a`b``](https://e.x) @ankit `c`",
+                "<https://e.x|`a\u{200b}`\u{200b}b`> <@U111> `c`",
+            ),
+            (
+                "backticks inside words make a code span, whose mention stays unarmed",
+                "a`b @ankit c`d",
+                "a`b @ankit c`d",
+            ),
+            (
+                "a backtick inside a word, alone",
+                "a`b @ankit",
+                "a\u{200b}`\u{200b}b <@U111>",
             ),
         ],
     );

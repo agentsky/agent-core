@@ -2931,10 +2931,12 @@ recorded in `hand_offs` as the post is, and once the delivery is done it is
 queued for that agent as the posting bot's message and goes through routing
 like any other, without a read-back. Only those posts carry attribution
 (`message_refs.hands_off`), so a post in another thread or channel starts
-no hop by either delivery. A hand-off's row is kept until its job settles
-it, leased again while a job of this instance holds it, made due at once
-when a shutdown cuts it, and otherwise taken again after a lease, so it is
-delivered at least once until its hop is claimed. A claim in
+no hop by either delivery. A hand-off's row is written with its post's
+record in one transaction and held from then on, kept until its job
+settles it, leased again while this instance holds it (through a drain,
+which takes no new rows), made due at once when its hold is let go during
+a drain or a shutdown cut, and otherwise taken again after a lease, so it
+is delivered at least once until its hop is claimed. A claim in
 `processed_events`, keyed by the mentioned agent and the posting turn and
 taken after routing and before acting, lets one hop run per turn and agent,
 whichever copy or post arrives first; it is also checked before a copy
@@ -2944,7 +2946,7 @@ for it as before, and the race test shows the hop runs once in both orders.
 `ask-agent` posts the handle and a colon on a paragraph of its own, then the
 task, after the turn with the turn's other queued posts; a mention names a
 handle, a bare word a name or a handle, and a bare word two agents fit is
-refused, as is a second ask to the same agent in a turn and any ask outside
+refused with each one's handle, name and owner side, as is a second ask to the same agent in a turn and any ask outside
 channels and group DMs. The hop-cap notice is said once an hour per agent
 and thread; the personal refusals (rules, ban, not in the channel) stay
 silent on a hop, as T27 and T33 decided for bots' messages.

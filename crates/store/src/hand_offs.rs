@@ -23,6 +23,38 @@ pub struct HandOff {
     pub created_at: OffsetDateTime,
 }
 
+/// A hand-off to record with the post it hands off, by
+/// [`Store::record_post`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewHandOff<'a> {
+    /// The agent the post mentions.
+    pub agent: AgentId,
+    /// The event agentd built for it, as JSON agentd owns.
+    pub event_json: &'a str,
+    /// When it was made.
+    pub created_at: OffsetDateTime,
+    /// When it may first be taken.
+    pub due_at: OffsetDateTime,
+}
+
+/// Inserts `new` with `executor`, returning its id.
+pub(crate) async fn insert<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
+    new: &NewHandOff<'_>,
+) -> Result<i64> {
+    let id = sqlx::query_scalar(
+        "INSERT INTO hand_offs (agent_id, event_json, created_at, due_at) \
+         VALUES (?, ?, ?, ?) RETURNING id",
+    )
+    .bind(new.agent.to_string())
+    .bind(new.event_json)
+    .bind(to_unix(new.created_at))
+    .bind(to_unix(new.due_at))
+    .fetch_one(executor)
+    .await?;
+    Ok(id)
+}
+
 /// What [`Store::take_due_hand_offs`] took, and how many it dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueHandOffs {
@@ -48,25 +80,25 @@ impl Store {
         now: OffsetDateTime,
         due_at: OffsetDateTime,
     ) -> Result<i64> {
-        let id = sqlx::query_scalar(
-            "INSERT INTO hand_offs (agent_id, event_json, created_at, due_at) \
-             VALUES (?, ?, ?, ?) RETURNING id",
+        insert(
+            &self.pool,
+            &NewHandOff {
+                agent,
+                event_json,
+                created_at: now,
+                due_at,
+            },
         )
-        .bind(agent.to_string())
-        .bind(event_json)
-        .bind(to_unix(now))
-        .bind(to_unix(due_at))
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(id)
+        .await
     }
 
     /// Takes up to `limit` hand-offs due at `now`, oldest due first, and
     /// makes each due again `lease` later, so a taker that never finishes
     /// one leaves it to the next. The rows `held`, whose jobs the caller
     /// still has, are made due `lease` later first, so no one takes them
-    /// while the caller lives. Rows recorded before `stale_before` are
-    /// deleted instead: a hand-off that old is no longer wanted.
+    /// while the caller lives. Rows recorded before `stale_before` that
+    /// aren't held are deleted instead: a hand-off that old is no longer
+    /// wanted. A `limit` of 0 only leases the held rows again.
     ///
     /// # Errors
     ///
@@ -88,11 +120,15 @@ impl Store {
             .bind(sqlx::types::Json(held))
             .execute(&mut *tx)
             .await?;
-        let stale = sqlx::query("DELETE FROM hand_offs WHERE created_at < ?")
-            .bind(to_unix(stale_before))
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let stale = sqlx::query(
+            "DELETE FROM hand_offs WHERE created_at < ? \
+             AND id NOT IN (SELECT value FROM json_each(?))",
+        )
+        .bind(to_unix(stale_before))
+        .bind(sqlx::types::Json(held))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         let rows: Vec<(i64, String, String, i64)> = sqlx::query_as(
             "UPDATE hand_offs SET due_at = ?1 WHERE id IN \
              (SELECT id FROM hand_offs WHERE due_at <= ?2 ORDER BY due_at, id LIMIT ?3) \
@@ -269,6 +305,19 @@ mod tests {
             others.taken.iter().all(|h| h.id != held),
             "another taker sees a row its holder keeps leasing as not due"
         );
+        let old = later + Duration::from_secs(3600);
+        let past = store
+            .take_due_hand_offs(old, lease, now + Duration::from_secs(1), 0, &[held])
+            .await
+            .unwrap();
+        assert_eq!(
+            past,
+            DueHandOffs {
+                taken: Vec::new(),
+                stale: 1,
+            },
+            "a row its job still holds isn't dropped as stale, and a limit of 0 takes none"
+        );
         store.release_hand_offs(&[held], later).await.unwrap();
         let released = store
             .take_due_hand_offs(later, lease, stale, 10, &[])
@@ -278,6 +327,24 @@ mod tests {
             released.taken.iter().map(|h| h.id).collect::<Vec<_>>(),
             [held],
             "a released row is due at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hand_offs_id_is_never_given_again() {
+        let store = memory_store().await;
+        let owner = store
+            .ensure_member(&member_key("u1"), "Ada", at(1))
+            .await
+            .unwrap();
+        let agent = agent(&store, owner, "helper").await;
+        let now = datetime!(2026-10-01 12:00 UTC);
+        let first = store.add_hand_off(agent, "{}", now, now).await.unwrap();
+        store.finish_hand_off(first).await.unwrap();
+        let second = store.add_hand_off(agent, "{}", now, now).await.unwrap();
+        assert_ne!(
+            first, second,
+            "a job still holding the first id must not reach the second row"
         );
     }
 }

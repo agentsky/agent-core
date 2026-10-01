@@ -305,7 +305,8 @@ impl Server {
     /// with a pipeline the consents' worker
     /// ([`Consents::run`](crate::consents::Consents::run)), whose private
     /// tasks the pipeline drains like its turns, and the hand-off worker
-    /// ([`Pipeline::run_hand_offs`]),
+    /// ([`Pipeline::run_hand_offs`]), which runs until the pipeline is
+    /// drained or cut short, so the rows its jobs hold stay leased,
     /// with the Slack manager app the configuration token rotator and the
     /// sweeper of agents' apps (install reminders, stale creations), and with
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
@@ -355,7 +356,7 @@ impl Server {
             "ctl listener",
             ctl,
             routers.ctl,
-            internal_stopping,
+            internal_stopping.clone(),
         ));
         for worker in routers.workers {
             tasks.spawn(async move {
@@ -390,7 +391,7 @@ impl Server {
         }
         if let Some(pipeline) = &pipeline {
             let pipeline = pipeline.clone();
-            let replaying = stopping.clone();
+            let replaying = internal_stopping.clone();
             tasks.spawn(async move {
                 pipeline
                     .run_hand_offs(HAND_OFF_SWEEP_INTERVAL, replaying)

@@ -22,8 +22,8 @@ use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
 use store::{
-    Agent, CostUnknown, HandOff, LimitWindow, NewMessageRef, PROCESSED_EVENT_RETENTION, Store,
-    StoreError, TurnUsage,
+    Agent, CostUnknown, HandOff, LimitWindow, NewHandOff, NewMessageRef, PROCESSED_EVENT_RETENTION,
+    Store, StoreError, TurnUsage,
 };
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -254,27 +254,65 @@ struct Inner {
     tasks: Mutex<JoinSet<()>>,
     private: Mutex<HashMap<ConsentId, private::Claim>>,
     kills: Mutex<JoinSet<()>>,
-    closed: AtomicBool,
     working: Mutex<Working>,
     floods: Throttle<(AgentId, Flood)>,
-    held: Held,
+    holder: Holder,
 }
 
-/// The `hand_offs` rows whose jobs are alive on this instance, waiting or
-/// running: a cache in front of the rows, which
-/// [`Pipeline::replay_hand_offs`] keeps leasing rather than queueing
-/// again, and [`Pipeline::cut_short`] makes due at once.
-type Held = Arc<Mutex<HashSet<i64>>>;
+/// The `hand_offs` rows held on this instance, from the moment a delivery
+/// records one or a replay takes one until its job is dropped: a cache in
+/// front of the rows, which [`Pipeline::replay_hand_offs`] keeps leasing
+/// rather than queueing again, draining included. It also holds whether
+/// the pipeline is closed: a row let go after that is set aside, and the
+/// end of [`Pipeline::drain`] or [`Pipeline::cut_short`] makes it due at
+/// once for the next instance.
+#[derive(Clone, Default)]
+struct Holder {
+    ids: Arc<Mutex<HeldIds>>,
+    closed: Arc<AtomicBool>,
+}
 
-/// A job's hold on its `hand_offs` row, let go when the job is dropped.
+/// The ids a [`Holder`] holds, and those let go since the pipeline closed.
+#[derive(Default)]
+struct HeldIds {
+    live: HashSet<i64>,
+    cut: Vec<i64>,
+}
+
+impl Holder {
+    /// Holds the row `id`; `None` when it is held already, so no row has
+    /// two jobs here.
+    fn hold(&self, id: i64) -> Option<Holding> {
+        lock(&self.ids).live.insert(id).then(|| Holding {
+            id,
+            holder: self.clone(),
+        })
+    }
+
+    /// The rows held now.
+    fn held(&self) -> Vec<i64> {
+        lock(&self.ids).live.iter().copied().collect()
+    }
+
+    /// The rows let go since the pipeline closed, taken.
+    fn take_cut(&self) -> Vec<i64> {
+        std::mem::take(&mut lock(&self.ids).cut)
+    }
+}
+
+/// A hold on a `hand_offs` row, let go when dropped.
 struct Holding {
     id: i64,
-    held: Held,
+    holder: Holder,
 }
 
 impl Drop for Holding {
     fn drop(&mut self) {
-        lock(&self.held).remove(&self.id);
+        let mut ids = lock(&self.holder.ids);
+        ids.live.remove(&self.id);
+        if self.holder.closed.load(Ordering::SeqCst) {
+            ids.cut.push(self.id);
+        }
     }
 }
 
@@ -430,10 +468,9 @@ impl Pipeline {
                 tasks: Mutex::new(JoinSet::new()),
                 private: Mutex::new(HashMap::new()),
                 kills: Mutex::new(JoinSet::new()),
-                closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
                 floods: Throttle::new(FLOOD_WARNING_INTERVAL),
-                held: Held::default(),
+                holder: Holder::default(),
             }),
         }
     }
@@ -464,11 +501,11 @@ impl Pipeline {
 
     /// Stops taking messages: those sent from now on are dropped.
     pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.holder.closed.store(true, Ordering::SeqCst);
     }
 
     fn is_closed(&self) -> bool {
-        self.inner.closed.load(Ordering::SeqCst)
+        self.inner.holder.closed.load(Ordering::SeqCst)
     }
 
     /// Waits until every message taken is answered, and the kills of
@@ -486,8 +523,26 @@ impl Pipeline {
                 tracing::error!(error = %err, "a pipeline task failed");
             }
         }
+        self.release_cut_hand_offs().await;
         self.tell_cut().await;
         self.wait_for_kills().await;
+    }
+
+    /// Makes the `hand_offs` rows let go since the pipeline closed due at
+    /// once, for the next instance to take rather than wait out a lease.
+    async fn release_cut_hand_offs(&self) {
+        let cut = self.inner.holder.take_cut();
+        if cut.is_empty() {
+            return;
+        }
+        if let Err(err) = self
+            .inner
+            .store
+            .release_hand_offs(&cut, (self.inner.settings.now)())
+            .await
+        {
+            tracing::warn!(error = %err, hand_offs = cut.len(), "couldn't make the hand-offs let go at shutdown due at once; they are taken after their lease");
+        }
     }
 
     /// Closes the pipeline and drops every message still waiting or being
@@ -503,20 +558,11 @@ impl Pipeline {
     /// the claim once the turn is billed.
     pub async fn cut_short(&self) {
         self.close();
-        let held: Vec<i64> = lock(&self.inner.held).iter().copied().collect();
         let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         tasks.shutdown().await;
         self.release_cut_tasks().await;
         lock(&self.inner.lanes).clear();
-        if !held.is_empty()
-            && let Err(err) = self
-                .inner
-                .store
-                .release_hand_offs(&held, (self.inner.settings.now)())
-                .await
-        {
-            tracing::warn!(error = %err, hand_offs = held.len(), "couldn't make the hand-offs cut short due at once; they are taken after their lease");
-        }
+        self.release_cut_hand_offs().await;
         {
             let mut working = self.working();
             let running: Vec<_> = working.running.drain().map(|(_, cut)| cut).collect();
@@ -633,7 +679,7 @@ impl Pipeline {
         &self,
         event: &Arc<InboundEvent>,
         caps: Caps,
-        candidates: Vec<(AgentId, MemberId, Option<i64>)>,
+        candidates: Vec<(AgentId, MemberId, Option<Holding>)>,
         from_bot: bool,
     ) -> Vec<oneshot::Receiver<()>> {
         let thread = thread_of(event, caps);
@@ -646,7 +692,7 @@ impl Pipeline {
                     event: Arc::clone(event),
                     caps,
                     owner,
-                    hand_off: hand_off.map(|id| self.hold(id)),
+                    hand_off,
                     _pending: places,
                     done: Arc::clone(&done),
                 };
@@ -667,15 +713,6 @@ impl Pipeline {
             }
         }
         waiting
-    }
-
-    /// Holds the `hand_offs` row `id` for a job of this instance.
-    fn hold(&self, id: i64) -> Holding {
-        lock(&self.inner.held).insert(id);
-        Holding {
-            id,
-            held: Arc::clone(&self.inner.held),
-        }
     }
 
     /// Whether a warning about `agent`'s `flood` is due: `Some` of how many
@@ -886,8 +923,8 @@ impl Pipeline {
     ///
     /// Returns whether the message is settled: true unless what deciding
     /// needed couldn't be read, or, on a hop, its claim couldn't be
-    /// recorded, the agent's bot couldn't be checked, or the agent's rules
-    /// couldn't be read. A hand-off's row is deleted only once it is
+    /// recorded, the agent's bot couldn't be checked or has no surface
+    /// there, or the agent's rules couldn't be read. A hand-off's row is deleted only once it is
     /// settled, and is otherwise taken again.
     async fn candidate(&self, job: &Job, agent: AgentId) -> bool {
         let (event, caps) = (job.event.as_ref(), job.caps);
@@ -920,7 +957,18 @@ impl Pipeline {
             return true;
         }
         let copy = if job.hand_off.is_some() {
-            match self.can_post_now(agent, &event.conv).await {
+            let surface = match self.inner.surfaces.surface(agent, &event.conv).await {
+                Ok(Some(surface)) => surface,
+                Ok(None) => {
+                    tracing::debug!(%agent, conv = %event.conv, "the agent of a hand-off has no active binding there; leaving it");
+                    return false;
+                }
+                Err(err) => {
+                    tracing::warn!(%agent, conv = %event.conv, error = %err, "couldn't look up the surface of a hand-off; leaving it");
+                    return false;
+                }
+            };
+            match surface.can_post_now(&event.conv).await {
                 Ok(true) => None,
                 Ok(false) => {
                     tracing::info!(%agent, conv = %event.conv, "not taking a hand-off: the agent's bot isn't in this conversation");
@@ -977,17 +1025,9 @@ impl Pipeline {
                 ..
             }
         );
-        self.act(event, agent, caps, decision).await;
+        self.act(event, agent, caps, decision, job.hand_off.is_some())
+            .await;
         settled
-    }
-
-    /// Whether `agent`'s bot may post in `conv`, asked of the platform now
-    /// ([`Surface::can_post_now`]); false when it has no surface there.
-    async fn can_post_now(&self, agent: AgentId, conv: &ConvRef) -> Result<bool, PipelineError> {
-        match self.inner.surfaces.surface(agent, conv).await? {
-            Some(surface) => Ok(surface.can_post_now(conv).await?),
-            None => Ok(false),
-        }
     }
 
     /// The router's decision on `event` for `agent`. `None` when the store
@@ -1069,8 +1109,16 @@ impl Pipeline {
         }
     }
 
-    /// Acts on `decision` for `agent` on `event`.
-    async fn act(&self, event: &InboundEvent, agent: AgentId, caps: Caps, decision: Decision) {
+    /// Acts on `decision` for `agent` on `event`; `checked` when the
+    /// platform was just asked whether the agent's bot can post there.
+    async fn act(
+        &self,
+        event: &InboundEvent,
+        agent: AgentId,
+        caps: Caps,
+        decision: Decision,
+        checked: bool,
+    ) {
         let result = match decision {
             Decision::Ignore(_) => Ok(()),
             Decision::LinkPrompt { requester } => {
@@ -1097,7 +1145,7 @@ impl Pipeline {
                     scope,
                     side,
                 };
-                self.run(event, agent, caps, turn).await
+                self.run(event, agent, caps, turn, checked).await
             }
         };
         if let Err(err) = result {
@@ -1166,7 +1214,9 @@ impl Pipeline {
     /// day or an hour says so once per thread in that window, so a capped
     /// agent doesn't answer every message with the same line, and so do the
     /// hop cap and, on a hop, rules that can't be read, which every post
-    /// and copy of a chain meets again.
+    /// and copy of a chain meets again. That last one is only posted once
+    /// its claim is recorded: the store failing is what it reports, and
+    /// each post of a chain would otherwise say it again.
     ///
     /// A refusal of them on a hop, where another agent's post named
     /// `agent` for them, is only logged: they never addressed `agent`, so
@@ -1201,7 +1251,7 @@ impl Pipeline {
         let on_hop = requester.key != event.sender;
         let Some((kind, window)) = limit_window(reason).or_else(|| {
             (on_hop && reason == RefuseReason::PolicyUnavailable)
-                .then_some(("policy_unavailable", LimitWindow::Hour))
+                .then_some((POLICY_UNAVAILABLE_NOTICE, LimitWindow::Hour))
         }) else {
             say(surface.as_ref(), &target, &text).await?;
             tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
@@ -1217,6 +1267,10 @@ impl Pipeline {
             Ok(true) => {}
             Ok(false) => {
                 tracing::debug!(%agent, message = %event.message.id, %reason, "refused a message; the thread was told already");
+                return Ok(());
+            }
+            Err(err) if kind == POLICY_UNAVAILABLE_NOTICE => {
+                tracing::warn!(%agent, error = %err, "couldn't claim the notice that a hop's rules can't be read; not posting it");
                 return Ok(());
             }
             Err(err) => {
@@ -1344,30 +1398,36 @@ impl Pipeline {
     }
 
     /// Runs `agent`'s turn on `event` and delivers what it made, unless the
-    /// agent's bot can't post in the conversation. A check that fails
-    /// answers anyway: the message was read back with the bot's own access
-    /// ([`confirmed`](Self::confirmed)), or, for a hand-off, checked just
-    /// before. Once the turn may run, a failure before it reached the model
-    /// posts [`FAILED_TEXT`].
+    /// agent's bot can't post in the conversation, which is asked unless
+    /// `checked` says it was just now, as for a hand-off. A check the
+    /// platform couldn't answer, unreachable or asking to slow down,
+    /// answers anyway, as the message was read back with the bot's own
+    /// access ([`confirmed`](Self::confirmed)); any other failure doesn't.
+    /// Once the turn may run, a failure before it reached the model posts
+    /// [`FAILED_TEXT`].
     async fn run(
         &self,
         event: &InboundEvent,
         agent: AgentId,
         caps: Caps,
         turn: Run,
+        checked: bool,
     ) -> Result<(), PipelineError> {
         let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             tracing::warn!(%agent, conv = %event.conv, "the agent has no surface in this conversation");
             return Ok(());
         };
-        match surface.can_post(&event.conv).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
-                return Ok(());
-            }
-            Err(err) => {
-                tracing::warn!(%agent, conv = %event.conv, error = %err, "couldn't check the agent's bot can post; answering anyway");
+        if !checked {
+            match surface.can_post(&event.conv).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
+                    return Ok(());
+                }
+                Err(err @ (SurfaceError::RateLimited { .. } | SurfaceError::Transport(_))) => {
+                    tracing::warn!(%agent, conv = %event.conv, error = %err, "couldn't check the agent's bot can post; answering anyway");
+                }
+                Err(err) => return Err(err.into()),
             }
         }
         let target = reply_target(event, caps);
@@ -1450,6 +1510,7 @@ impl Pipeline {
                 bot,
                 binding,
                 now: (self.inner.settings.now)(),
+                holder: self.inner.holder.clone(),
             }),
             Ok(_) => None,
             Err(err) => {
@@ -1467,23 +1528,15 @@ impl Pipeline {
     /// the platform's copy, is done with. A hand-off whose job never
     /// settles it, as at a shutdown, or that found no place, keeps its row
     /// for [`replay_hand_offs`](Self::replay_hand_offs), here or on another
-    /// instance; one handed while the pipeline closes is made due at once.
+    /// instance; one handed while the pipeline closes is let go, which
+    /// makes it due once the pipeline drains or is cut short.
     async fn hand_off(&self, caps: Caps, handed: Vec<HandedOff>) {
-        let store = &self.inner.store;
         if self.is_closed() {
-            let ids: Vec<i64> = handed.iter().map(|handed| handed.id).collect();
-            if !ids.is_empty()
-                && let Err(err) = store
-                    .release_hand_offs(&ids, (self.inner.settings.now)())
-                    .await
-            {
-                tracing::warn!(error = %err, "couldn't make the hand-offs of a closing pipeline due at once");
-            }
             return;
         }
         for handed in handed {
             if self.hopped(&handed.hop).await {
-                if let Err(err) = store.finish_hand_off(handed.id).await {
+                if let Err(err) = self.inner.store.finish_hand_off(handed.holding.id).await {
                     tracing::warn!(agent = %handed.agent, error = %err, "couldn't record a hand-off as done");
                 }
                 continue;
@@ -1492,7 +1545,7 @@ impl Pipeline {
             self.queue(
                 &handed.event,
                 caps,
-                vec![(handed.agent, handed.owner, Some(handed.id))],
+                vec![(handed.agent, handed.owner, Some(handed.holding))],
                 true,
             );
         }
@@ -1500,8 +1553,10 @@ impl Pipeline {
 
     /// Queues the hand-offs due in `hand_offs`, recorded by this instance
     /// or another, that no job holds: a shutdown or a crash cut their
-    /// jobs, or they found no place. The rows this instance's jobs hold are
-    /// leased again instead. Each is taken for [`HAND_OFF_LEASE`] and
+    /// jobs, or they found no place. The rows this instance holds are
+    /// leased again instead, and once the pipeline is closed that is all it
+    /// does, until the drain ends, so a drain longer than the lease keeps
+    /// its rows from other instances. Each is taken for [`HAND_OFF_LEASE`] and
     /// queued again as it was, unless its hop ran already, when it is
     /// done with. A row that can't be read now, whose agent is gone, or
     /// whose agent has no active binding there is left, and a row
@@ -1513,11 +1568,9 @@ impl Pipeline {
     ///
     /// If the store can't be read.
     pub async fn replay_hand_offs(&self) -> Result<usize, StoreError> {
-        if self.is_closed() {
-            return Ok(0);
-        }
+        let closed = self.is_closed();
         let now = (self.inner.settings.now)();
-        let held: Vec<i64> = lock(&self.inner.held).iter().copied().collect();
+        let held = self.inner.holder.held();
         let due = self
             .inner
             .store
@@ -1525,7 +1578,7 @@ impl Pipeline {
                 now,
                 HAND_OFF_LEASE,
                 now - HAND_OFF_MAX_AGE,
-                MAX_REPLAYED,
+                if closed { 0 } else { MAX_REPLAYED },
                 &held,
             )
             .await?;
@@ -1545,7 +1598,10 @@ impl Pipeline {
     /// Queues `hand_off` again, as [`replay_hand_offs`](Self::replay_hand_offs)
     /// says; returns how many jobs it queued.
     async fn replay_hand_off(&self, hand_off: HandOff) -> usize {
-        let (id, agent) = (hand_off.id, hand_off.agent);
+        let agent = hand_off.agent;
+        let Some(holding) = self.inner.holder.hold(hand_off.id) else {
+            return 0;
+        };
         let event: InboundEvent = match serde_json::from_str(&hand_off.event_json) {
             Ok(event) => event,
             Err(err) => {
@@ -1575,7 +1631,7 @@ impl Pipeline {
         };
         match self.posting_turn(&event.message).await {
             Ok(Some(turn)) if self.hopped(&hop_key(agent, turn)).await => {
-                if let Err(err) = store.finish_hand_off(id).await {
+                if let Err(err) = store.finish_hand_off(holding.id).await {
                     tracing::warn!(%agent, error = %err, "couldn't record a hand-off as done");
                 }
                 return 0;
@@ -1590,7 +1646,7 @@ impl Pipeline {
         self.queue(
             &Arc::new(event),
             surface.caps(),
-            vec![(agent, owner, Some(id))],
+            vec![(agent, owner, Some(holding))],
             true,
         )
         .len()
@@ -2098,6 +2154,10 @@ const HOP_SOURCE: &str = "hop";
 /// The kind of failure notice that limits a hop's link prompts.
 const HOP_LINK_PROMPT: &str = "link_prompt/hop";
 
+/// The kind of limit notice that says, on a hop, that an agent's rules
+/// can't be read.
+const POLICY_UNAVAILABLE_NOTICE: &str = "policy_unavailable";
+
 /// How long a hand-off recorded or taken from `hand_offs` is left to its
 /// job before it is taken again; the instance whose job holds it leases it
 /// again on each look.
@@ -2138,12 +2198,14 @@ fn on_hop(event: &InboundEvent, decision: &Decision) -> bool {
 
 /// How a turn's posts in its own thread hand off: as messages of the
 /// agent's bot `bot`, of the binding `binding`, in a conversation of the
-/// kind `conv_kind`, recorded in `hand_offs` at `now`.
+/// kind `conv_kind`, recorded in `hand_offs` at `now` and held by
+/// `holder`.
 struct HandOffs {
     conv_kind: ConvKind,
     bot: MemberKey,
     binding: BindingId,
     now: OffsetDateTime,
+    holder: Holder,
 }
 
 impl HandOffs {
@@ -2175,10 +2237,10 @@ impl HandOffs {
 }
 
 /// A hand-off of a turn's post to the agent `agent`, owned by `owner`,
-/// recorded as the `hand_offs` row `id`, with its hop's claim key `hop`:
-/// what [`Pipeline::hand_off`] queues.
+/// recorded as the `hand_offs` row `holding` holds, with its hop's claim
+/// key `hop`: what [`Pipeline::hand_off`] queues.
 struct HandedOff {
-    id: i64,
+    holding: Holding,
     agent: AgentId,
     owner: MemberId,
     hop: String,
@@ -2311,11 +2373,11 @@ impl Delivery<'_> {
     /// text posts nothing. Returns false if a chunk was lost.
     ///
     /// A chunk hands off when a turn posted it in the turn's own thread,
-    /// with [`HandOffs`]: then, as soon as its row is recorded, a
-    /// `hand_offs` row is recorded for each managed agent it mentions, other
-    /// than the poster and those an earlier post of the turn handed off to
-    /// (in `handed`, which gets the new ones), so a turn hands off to an
-    /// agent once.
+    /// with [`HandOffs`]: then a `hand_offs` row is recorded with its row,
+    /// in one transaction, for each managed agent it mentions
+    /// ([`mentioned`](Self::mentioned)), and held at once, so no replay
+    /// takes it while this turn hands it off; the agents go in `handed`,
+    /// so a turn hands off to an agent once.
     async fn post_to(
         &self,
         turn: Option<TurnId>,
@@ -2341,9 +2403,38 @@ impl Delivery<'_> {
                     continue;
                 }
             };
+            let mentioned = match hands_off {
+                Some(_) => self.mentioned(target, &posted, handed).await,
+                None => Vec::new(),
+            };
+            let event = match hands_off.filter(|_| !mentioned.is_empty()) {
+                Some((hand_offs, _)) => {
+                    let event = hand_offs.event(target, &posted, &chunk);
+                    match serde_json::to_string(&event) {
+                        Ok(json) => Some((Arc::new(event), json)),
+                        Err(err) => {
+                            tracing::error!(agent = %self.agent, error = %err, "couldn't encode a hand-off");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            let new_hand_offs: Vec<NewHandOff<'_>> = match (hands_off, &event) {
+                (Some((hand_offs, _)), Some((_, json))) => mentioned
+                    .iter()
+                    .map(|agent| NewHandOff {
+                        agent: agent.id,
+                        event_json: json,
+                        created_at: hand_offs.now,
+                        due_at: hand_offs.now + HAND_OFF_LEASE,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             let recorded = self
                 .store
-                .record_message_ref(
+                .record_post(
                     &NewMessageRef {
                         session: self.session,
                         msg: &posted.msg,
@@ -2359,16 +2450,26 @@ impl Delivery<'_> {
                         hands_off: hands_off.is_some(),
                     },
                     OffsetDateTime::now_utc(),
+                    &new_hand_offs,
                 )
                 .await;
-            match recorded {
+            let ids = match recorded {
+                Ok((_, ids)) => ids,
                 Err(err) => {
-                    tracing::warn!(session = %self.session, msg = %posted.msg.id, error = %err, "recording a posted message failed");
+                    tracing::warn!(session = %self.session, msg = %posted.msg.id, error = %err, "recording a posted message and its hand-offs failed");
+                    continue;
                 }
-                Ok(_) => {
-                    if let Some((hand_offs, turn)) = hands_off {
-                        self.record_hand_offs(hand_offs, turn, target, &posted, &chunk, handed)
-                            .await;
+            };
+            if let (Some((hand_offs, turn)), Some((event, _))) = (hands_off, &event) {
+                for (agent, id) in mentioned.iter().zip(ids) {
+                    if let Some(holding) = hand_offs.holder.hold(id) {
+                        handed.push(HandedOff {
+                            holding,
+                            agent: agent.id,
+                            owner: agent.owner,
+                            hop: hop_key(agent.id, turn),
+                            event: Arc::clone(event),
+                        });
                     }
                 }
             }
@@ -2376,70 +2477,37 @@ impl Delivery<'_> {
         complete
     }
 
-    /// Records a `hand_offs` row for each managed agent `posted` mentions
-    /// whose bot is active on the conversation's surface and team, other
-    /// than the poster and the agents in `handed`, and adds it there.
-    async fn record_hand_offs(
+    /// The managed agents `posted` mentions whose bot is active on the
+    /// conversation's surface and team, other than the poster and the
+    /// agents in `handed`, each once.
+    async fn mentioned(
         &self,
-        hand_offs: &HandOffs,
-        turn: TurnId,
         target: &ReplyTarget,
         posted: &Posted,
-        text: &str,
-        handed: &mut Vec<HandedOff>,
-    ) {
-        let mut event: Option<(Arc<InboundEvent>, String)> = None;
+        handed: &[HandedOff],
+    ) -> Vec<Agent> {
+        let mut mentioned: Vec<Agent> = Vec::new();
         for user in &posted.mentions {
             let key = MemberKey {
                 surface: target.conv.surface,
                 team: target.conv.team.clone(),
                 user: user.clone(),
             };
-            let mentioned = match self.store.agent_for_bot(&key).await {
-                Ok(Some((mentioned, _)))
-                    if mentioned.id != self.agent
-                        && handed.iter().all(|handed| handed.agent != mentioned.id) =>
+            match self.store.agent_for_bot(&key).await {
+                Ok(Some((agent, _)))
+                    if agent.id != self.agent
+                        && handed.iter().all(|handed| handed.agent != agent.id)
+                        && mentioned.iter().all(|seen| seen.id != agent.id) =>
                 {
-                    mentioned
+                    mentioned.push(agent);
                 }
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(err) => {
                     tracing::warn!(agent = %self.agent, msg = %posted.msg.id, error = %err, "couldn't look up an agent a post mentions");
-                    continue;
-                }
-            };
-            let (event, json) = match &event {
-                Some(built) => built,
-                None => {
-                    let built = hand_offs.event(target, posted, text);
-                    let json = match serde_json::to_string(&built) {
-                        Ok(json) => json,
-                        Err(err) => {
-                            tracing::error!(agent = %self.agent, error = %err, "couldn't encode a hand-off");
-                            return;
-                        }
-                    };
-                    event.insert((Arc::new(built), json))
-                }
-            };
-            let due = hand_offs.now + HAND_OFF_LEASE;
-            match self
-                .store
-                .add_hand_off(mentioned.id, json, hand_offs.now, due)
-                .await
-            {
-                Ok(id) => handed.push(HandedOff {
-                    id,
-                    agent: mentioned.id,
-                    owner: mentioned.owner,
-                    hop: hop_key(mentioned.id, turn),
-                    event: Arc::clone(event),
-                }),
-                Err(err) => {
-                    tracing::warn!(agent = %self.agent, mentioned = %mentioned.id, msg = %posted.msg.id, error = %err, "couldn't record a hand-off; not handing the post off");
                 }
             }
         }
+        mentioned
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) {
@@ -2487,6 +2555,24 @@ impl Sink<InboundEvent> for PipelineSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_row_is_held_once_at_a_time_and_set_aside_when_let_go_after_closing() {
+        let holder = Holder::default();
+        let held = holder.hold(7).unwrap();
+        assert!(
+            holder.hold(7).is_none(),
+            "a row held already isn't held again"
+        );
+        drop(held);
+        let held = holder.hold(7).unwrap();
+        assert!(holder.take_cut().is_empty());
+        holder.closed.store(true, Ordering::SeqCst);
+        drop(held);
+        assert!(holder.held().is_empty());
+        assert_eq!(holder.take_cut(), [7]);
+        assert!(holder.take_cut().is_empty());
+    }
 
     /// An agent of a new owner whose bot, `bot`, is active on Slack's team
     /// `T1`.
@@ -2572,6 +2658,7 @@ mod tests {
             thread_root: Some("1.1".into()),
         };
         let now = time::macros::datetime!(2030-01-01 0:00 UTC);
+        let holder = Holder::default();
         let delivery = |answering, hands_off: bool| Delivery {
             store: &store,
             surface: &surface,
@@ -2587,6 +2674,7 @@ mod tests {
                 bot: bot.clone(),
                 binding,
                 now,
+                holder: holder.clone(),
             }),
         };
         let turn = TurnId::new_v4();
@@ -2627,9 +2715,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             handed
                 .iter()
-                .map(|handed| (handed.id, handed.agent))
+                .map(|handed| (handed.holding.id, handed.agent))
                 .collect::<Vec<_>>(),
             "each hand-off is recorded as its post is, due after a lease"
+        );
+        let mut held = holder.held();
+        held.sort_unstable();
+        assert_eq!(
+            held,
+            due.taken.iter().map(|row| row.id).collect::<Vec<_>>(),
+            "each is held the moment it is recorded"
         );
         let recorded: InboundEvent = serde_json::from_str(&due.taken[0].event_json).unwrap();
         assert_eq!(recorded, **event);

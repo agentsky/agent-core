@@ -244,13 +244,24 @@ impl SlackSurface {
     }
 
     /// Whether Slack says the bot may post in `channel`: the conversation
-    /// asked about, not archived, and the bot a member, or a DM. A yes is
-    /// kept for [`MEMBERSHIP_TTL`], and a no drops it.
+    /// asked about, not archived, and the bot a member, or a DM. Slack not
+    /// finding the conversation for the bot, refusing the bot, or no longer
+    /// accepting its token is a no too; only a failure that may pass, as a
+    /// rate limit or a network error, is an error. A yes is kept for
+    /// [`MEMBERSHIP_TTL`], and a no drops it.
     async fn member(&self, channel: &ConversationId) -> Result<bool> {
-        let info = self.api.conversation_info(channel).await?;
-        let member = info.id == *channel
-            && !info.is_archived
-            && (info.is_member || info.is_im || info.is_mpim);
+        let info = match self.api.conversation_info(channel).await {
+            Ok(info) => Some(info),
+            Err(
+                SurfaceError::NotFound(_) | SurfaceError::Forbidden(_) | SurfaceError::Unauthorized,
+            ) => None,
+            Err(err) => return Err(err),
+        };
+        let member = info.is_some_and(|info| {
+            info.id == *channel
+                && !info.is_archived
+                && (info.is_member || info.is_im || info.is_mpim)
+        });
         let mut member_of = self.lock_member_of();
         if member {
             if member_of.len() >= MAX_MEMBERSHIPS {

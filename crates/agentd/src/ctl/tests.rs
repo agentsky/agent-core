@@ -945,7 +945,7 @@ async fn ask_agent_reads_a_mention_as_a_handle_and_refuses_a_bare_word_two_agent
         value["message"]
             .as_str()
             .unwrap()
-            .contains("@U0REVIEW, @U0SQUATBOT"),
+            .contains("@U0REVIEW (reviewer, public), @U0SQUATBOT (u0review, public)"),
         "{value}"
     );
     assert!(texts.is_empty());
@@ -976,12 +976,22 @@ async fn ask_agent_reads_a_mention_as_a_handle_and_refuses_a_bare_word_two_agent
             public,
         )
         .await;
+    let bob = fixture
+        .store
+        .member_for_identity(&MemberKey {
+            surface: SurfaceKind::RocketChat,
+            team: "T1".into(),
+            user: "bob".into(),
+        })
+        .await
+        .unwrap();
     let rc_asked = async |named: &str| {
         let token = fixture
             .running(rc_helper, ScopeKey::Channel(rocket("GENERAL")))
             .await;
         let mut turn = turn(TurnKind::Normal, Side::Public);
         turn.thread.conv = rocket("GENERAL");
+        turn.requester.member = bob;
         fixture.ctl.begin_turn(&token, turn).await.unwrap();
         let (status, value) = fixture.ask(&token, named, "Look").await;
         let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
@@ -1000,7 +1010,8 @@ async fn ask_agent_reads_a_mention_as_a_handle_and_refuses_a_bare_word_two_agent
     );
     let message = value["message"].as_str().unwrap();
     assert!(
-        message.contains("@reviewer") && message.contains("@bob.reviewer"),
+        message.contains("@reviewer (reviewer, public)")
+            && message.contains("@bob.reviewer (reviewer, yours)"),
         "{message}"
     );
     assert!(texts.is_empty());
@@ -1032,7 +1043,13 @@ async fn ask_agent_refuses_what_could_not_hand_off() {
         ("@U0HELPER", "t", 403, "refused", "itself"),
         ("nobody", "t", 404, "not_found", "no agent called nobody"),
         ("secret", "t", 404, "not_found", "no agent called secret"),
-        ("twin", "t", 400, "bad_request", "@U0TWINA, @U0TWINB"),
+        (
+            "twin",
+            "t",
+            400,
+            "bad_request",
+            "@U0TWINA (twin, public), @U0TWINB (twin, public)",
+        ),
         ("reviewer", "  ", 400, "bad_request", "the task is empty"),
         ("@", "t", 400, "bad_request", "name the agent"),
     ];

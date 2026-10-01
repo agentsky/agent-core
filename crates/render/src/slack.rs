@@ -492,7 +492,7 @@ impl Renderer<'_> {
             Kind::Code(code) if ctx.plain => out.push_str(code),
             Kind::Code(code) => {
                 out.push('`');
-                out.push_str(&escape(code));
+                push_backticks_apart(&escape(code), out);
                 out.push('`');
             }
             Kind::Break if ctx.plain || ctx.label || ctx.heading => out.push(' '),
@@ -628,10 +628,9 @@ impl Renderer<'_> {
     }
 
     /// Escapes text outside code and neutralizes broadcasts. The formatting
-    /// characters at the byte offsets in `literal`, and every backtick, are
-    /// kept from pairing up into Slack formatting: Markdown leaves backticks
-    /// of unequal runs as text, but Slack pairs any two, and would show a
-    /// mention between them as code. With `arm`, it also resolves `@Name`
+    /// characters at the byte offsets in `literal` are kept from pairing up
+    /// into Slack formatting, and so is every backtick, even inside a word
+    /// ([`push_backticks_apart`]). With `arm`, it also resolves `@Name`
     /// mentions and gives bare URLs explicit bounds.
     fn slack_text(&self, text: &str, literal: &[usize], arm: bool, out: &mut String) {
         let mut i = 0;
@@ -671,7 +670,12 @@ impl Renderer<'_> {
                 i += url.len();
                 continue;
             }
-            if c == '`' || literal.binary_search(&i).is_ok() {
+            if c == '`' {
+                push_backticks_apart("`", out);
+                i += 1;
+                continue;
+            }
+            if literal.binary_search(&i).is_ok() {
                 push_literal(text, i, c, out);
                 i += c.len_utf8();
                 continue;
@@ -944,6 +948,23 @@ fn push_literal(text: &str, at: usize, c: char, out: &mut String) {
         out.push(ZERO_WIDTH_SPACE);
         out.push(c);
         out.push(ZERO_WIDTH_SPACE);
+    }
+}
+
+/// Pushes `text` with each backtick between zero-width spaces, so Slack
+/// pairs it with no other: Markdown leaves backticks of unequal runs as
+/// text and keeps those inside inline code as its content, but Slack pairs
+/// any two, and would show whatever lies between, a mention included, as
+/// code.
+fn push_backticks_apart(text: &str, out: &mut String) {
+    for c in text.chars() {
+        if c == '`' {
+            out.push(ZERO_WIDTH_SPACE);
+            out.push(c);
+            out.push(ZERO_WIDTH_SPACE);
+        } else {
+            out.push(c);
+        }
     }
 }
 

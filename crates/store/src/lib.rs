@@ -76,7 +76,7 @@ pub use community::CommunityKeyStatus;
 pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
-pub use hand_offs::{DueHandOffs, HandOff};
+pub use hand_offs::{DueHandOffs, HandOff, NewHandOff};
 pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
 pub use policies::{AgentSettings, Ban, NO_RULES};

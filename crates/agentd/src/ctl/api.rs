@@ -25,7 +25,7 @@ use store::{CtlToken, CtlTurn, TokenHash, Visibility};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
-use super::outbox::{QueuedPost, QueuedReaction};
+use super::outbox::{Outbox, QueuedPost, QueuedReaction};
 use super::target;
 use super::token::{MAX_PRESENTED_LEN, hash_token};
 use super::{Ctl, MAX_POST_BYTES};
@@ -413,15 +413,23 @@ async fn post_message(
             to,
             text: request.text,
         },
+        |_| Ok(()),
     )?;
     Ok(Json(Ack {}))
 }
 
 /// Queues `post` for delivery after `caller`'s turn, unless the turn has
-/// queued [`MAX_POSTS`](super::outbox::MAX_POSTS) already.
-fn queue_post(ctl: &Ctl, caller: &Authorized, post: QueuedPost) -> Result<(), ApiError> {
+/// queued [`MAX_POSTS`](super::outbox::MAX_POSTS) already or `allowed`
+/// refuses, which reads the turn's outbox in the same critical section.
+fn queue_post(
+    ctl: &Ctl,
+    caller: &Authorized,
+    post: QueuedPost,
+    allowed: impl FnOnce(&Outbox) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
     let text_len = post.text.len();
     ctl.queue(caller, |outbox| {
+        allowed(outbox)?;
         outbox.push_post(post).then_some(()).ok_or_else(|| {
             error(
                 CtlErrorCode::Refused,
@@ -639,7 +647,8 @@ async fn lock(
 /// bot's handle written as a mention (`@handle` or Slack's `<@…>`), or by
 /// a bare word that is its name or handle; a bare word that fits several
 /// agents, as one's name and another's handle can on Rocket.Chat, is
-/// refused with their handles. The post is the handle and a colon, alone
+/// refused with each one's handle, name, and whether it is the
+/// requester's own or public. The post is the handle and a colon, alone
 /// on its first paragraph, then the task: no word or table of the task is
 /// read as part of the mention, and the renderers resolve a managed bot's
 /// handle before anyone's name. A turn asks each agent once: the other
@@ -684,12 +693,13 @@ async fn ask_agent(
                 entry.agent.id,
                 entry.handle(conv.surface)?,
                 entry.agent.name,
+                Some(entry.agent.owner) == asker,
             ))
         })
         .collect();
     let found: Vec<_> = visible
         .iter()
-        .filter(|(_, handle, name)| {
+        .filter(|(_, handle, name, _)| {
             handle.eq_ignore_ascii_case(wanted) || (!mention && name.eq_ignore_ascii_case(wanted))
         })
         .collect();
@@ -700,14 +710,17 @@ async fn ask_agent(
                 format!("no agent called {wanted} has a bot here"),
             ));
         }
-        [(agent, _, _)] if *agent == caller.token.agent => {
+        [(agent, _, _, _)] if *agent == caller.token.agent => {
             return Err(error(CtlErrorCode::Refused, "an agent can't ask itself"));
         }
-        [(_, handle, _)] => handle,
+        [(_, handle, _, _)] => handle,
         several => {
             let handles: Vec<String> = several
                 .iter()
-                .map(|(_, handle, _)| format!("@{handle}"))
+                .map(|(_, handle, name, yours)| {
+                    let whose = if *yours { "yours" } else { "public" };
+                    format!("@{handle} ({name}, {whose})")
+                })
                 .collect();
             return Err(error(
                 CtlErrorCode::BadRequest,
@@ -726,7 +739,8 @@ async fn ask_agent(
             format!("the task is over {MAX_POST_BYTES} bytes"),
         ));
     }
-    ctl.queue(&caller, |outbox| {
+    let to = ReplyTarget::from(caller.turn.thread.clone());
+    queue_post(&ctl, &caller, QueuedPost { to, text }, |outbox| {
         if outbox
             .posts()
             .iter()
@@ -741,8 +755,6 @@ async fn ask_agent(
         }
         Ok(())
     })?;
-    let to = ReplyTarget::from(caller.turn.thread.clone());
-    queue_post(&ctl, &caller, QueuedPost { to, text })?;
     Ok(Json(Ack {}))
 }
 

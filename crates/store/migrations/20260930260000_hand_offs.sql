@@ -14,12 +14,13 @@
 -- `due_at` on, and a shutdown makes it due at once, so a hand-off a shutdown
 -- or a crash cut is delivered by the next instance to look. The hop claim
 -- in `processed_events` makes a second delivery do nothing. Rows recorded
--- over an hour ago are dropped by `created_at`.
+-- over an hour ago are dropped by `created_at`, unless a job holds them. Ids
+-- are never reused, since instances hold rows by id in memory.
 ALTER TABLE message_refs ADD COLUMN hands_off INTEGER NOT NULL DEFAULT 0
     CHECK (hands_off IN (0, 1));
 
 CREATE TABLE hand_offs (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
     event_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,

@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,6 +60,9 @@ impl SurfaceLookup for Mocks {
         agent: AgentId,
         _conv: &ConvRef,
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        if self.holds.unbound.lock().unwrap().contains(&agent) {
+            return Ok(None);
+        }
         Ok(Some(Arc::new(Held {
             mock: self.mock.clone(),
             holds: self.holds.clone(),
@@ -105,8 +108,10 @@ impl Gate {
 struct Holds {
     confirms: Mutex<HashMap<AgentId, Gate>>,
     failing_confirms: Mutex<VecDeque<SurfaceError>>,
-    failing_can_posts: Mutex<HashMap<AgentId, usize>>,
+    failing_can_posts: Mutex<HashMap<AgentId, VecDeque<SurfaceError>>>,
+    can_posts: Mutex<HashMap<AgentId, Gate>>,
     posts: Mutex<HashMap<String, Gate>>,
+    unbound: Mutex<HashSet<AgentId>>,
 }
 
 impl Holds {
@@ -120,10 +125,31 @@ impl Holds {
         self.failing_confirms.lock().unwrap().push_back(error);
     }
 
-    /// Makes `agent`'s next `times` checks of whether its bot may post fail,
-    /// as the platform being unreachable would.
-    fn fail_can_post(&self, agent: AgentId, times: usize) {
-        self.failing_can_posts.lock().unwrap().insert(agent, times);
+    /// Makes `agent`'s next check of whether its bot may post fail with
+    /// `error`, after those queued before it.
+    fn fail_can_post(&self, agent: AgentId, error: SurfaceError) {
+        self.failing_can_posts
+            .lock()
+            .unwrap()
+            .entry(agent)
+            .or_default()
+            .push_back(error);
+    }
+
+    /// Holds `agent`'s checks of whether its bot may post at `gate`.
+    fn can_posts_of(&self, agent: AgentId, gate: &Gate) {
+        self.can_posts.lock().unwrap().insert(agent, gate.clone());
+    }
+
+    /// Gives `agent` no surface, as when its binding isn't active, or
+    /// gives it back.
+    fn unbind(&self, agent: AgentId, unbound: bool) {
+        let mut agents = self.unbound.lock().unwrap();
+        if unbound {
+            agents.insert(agent);
+        } else {
+            agents.remove(&agent);
+        }
     }
 
     /// How many failures [`fail_next_confirm`](Self::fail_next_confirm)
@@ -179,16 +205,25 @@ impl Surface for Held {
     }
 
     async fn can_post(&self, conv: &ConvRef) -> Result<bool, SurfaceError> {
-        if let Some(left) = self
+        let failure = self
             .holds
             .failing_can_posts
             .lock()
             .unwrap()
             .get_mut(&self.agent)
-            && *left > 0
-        {
-            *left -= 1;
-            return Err(SurfaceError::Transport("unreachable".into()));
+            .and_then(VecDeque::pop_front);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        let gate = self
+            .holds
+            .can_posts
+            .lock()
+            .unwrap()
+            .get(&self.agent)
+            .cloned();
+        if let Some(gate) = gate {
+            gate.pass().await;
         }
         self.mock.can_post(conv).await
     }
@@ -3051,8 +3086,16 @@ async fn a_hand_off_is_taken_again_only_when_no_job_holds_it_and_its_hop_never_r
 async fn a_hand_off_two_instances_hold_runs_once() {
     let stack = start().await;
     let writer = stack.other_agent("writer", "UWRITER").await;
-    let busy = Gate::closed();
-    stack.hand_off_behind_a_busy_writer(writer, &busy).await;
+    let checking = Gate::closed();
+    stack.holds.can_posts_of(writer, &checking);
+    stack.next_turn(Turn::reply("@UWRITER over to you."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    wait_until("this instance's job waits at writer's check", || {
+        checking.waiting() == 1
+    })
+    .await;
     assert_eq!(stack.hand_offs_due_now().await.len(), 1);
     let other = stack.another_pipeline();
     assert_eq!(
@@ -3060,17 +3103,132 @@ async fn a_hand_off_two_instances_hold_runs_once() {
         1,
         "a hold this instance stopped leasing, as a stuck one, is taken"
     );
+    wait_until("both jobs wait at writer's check, past the hint", || {
+        checking.waiting() == 2
+    })
+    .await;
+    checking.open();
     stack.wait_for_posts(2).await;
-    busy.open();
-    stack.wait_for_posts(3).await;
     for pipeline in [&stack.pipeline, &other] {
         pipeline.close();
         pipeline.drain().await;
     }
+    assert_eq!(
+        stack.writers_hops(writer).await,
+        [1],
+        "the hop's claim let one of the two run"
+    );
+    assert!(stack.hand_offs_due_now().await.is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_draining_instance_keeps_leasing_the_hand_offs_it_holds_and_takes_no_more() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let busy = Gate::closed();
+    stack.hand_off_behind_a_busy_writer(writer, &busy).await;
+    stack.pipeline.close();
+    let held = stack.hand_offs_due_now().await;
+    assert_eq!(held.len(), 1, "the drain outlived the hand-off's lease");
+    stack
+        .store()
+        .add_hand_off(writer, &held[0].event_json, pinned_now(), pinned_now())
+        .await
+        .unwrap();
+    assert_eq!(
+        stack.pipeline.replay_hand_offs().await.unwrap(),
+        0,
+        "a closed pipeline takes no row, not even one due that no job holds"
+    );
+    let other = stack.another_pipeline();
+    assert_eq!(
+        other.replay_hand_offs().await.unwrap(),
+        1,
+        "the draining holder leased its row again, so only the copy no job held is taken"
+    );
+    stack.wait_for_posts(2).await;
+    busy.open();
+    stack.pipeline.drain().await;
+    other.close();
+    other.drain().await;
     let mut hops = stack.writers_hops(writer).await;
     hops.sort_unstable();
     assert_eq!(hops, [0, 1], "writer answered bob, and the hop once");
-    assert!(stack.hand_offs_due_now().await.is_empty());
+    assert!(stack.kept_hand_offs().await.is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_whose_agent_has_no_surface_there_is_kept_until_it_has() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.holds.unbind(writer, true);
+    stack.next_turn(Turn::reply("@UWRITER over to you."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert_eq!(stack.mock.posts().len(), 1);
+    assert_eq!(
+        stack.kept_hand_offs().await,
+        [writer],
+        "an agent with no active binding there may get one, as replay waits for"
+    );
+    stack.holds.unbind(writer, false);
+    stack.hand_offs_due_now().await;
+    let next = stack.another_pipeline();
+    assert_eq!(next.replay_hand_offs().await.unwrap(), 1);
+    stack.wait_for_posts(2).await;
+    next.close();
+    next.drain().await;
+    assert_eq!(stack.writers_hops(writer).await, [1]);
+    assert!(stack.kept_hand_offs().await.is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_recorded_by_a_turn_cut_mid_delivery_is_delivered_by_the_next_instance() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.next_turn(
+        Turn::reply("@UWRITER over to you.")
+            .with_command(["agentctl", "post", "--to", "here", "later"]),
+    );
+    let later = Gate::closed();
+    stack.holds.posts_of("later", &later);
+    stack
+        .pipeline
+        .sink(MockSurface::DEFAULT_CAPS)
+        .send(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("helper's reply is posted and its next post waits", || {
+        later.waiting() == 1
+    })
+    .await;
+    assert_eq!(stack.kept_hand_offs().await, [writer]);
+    stack.pipeline.cut_short().await;
+    stack.next_turn(Turn::reply("Done."));
+    let next = stack.another_pipeline();
+    assert_eq!(
+        next.replay_hand_offs().await.unwrap(),
+        1,
+        "the delivery held the row from the moment it was recorded, so the cut made it due"
+    );
+    stack.wait_for_posts(3).await;
+    next.close();
+    next.drain().await;
+    let texts: Vec<String> = stack
+        .mock
+        .posts()
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(texts, ["@UWRITER over to you.", RESTARTING_TEXT, "Done."]);
+    assert_eq!(stack.writers_hops(writer).await, [1]);
+    assert!(stack.kept_hand_offs().await.is_empty());
     stack.stop().await;
 }
 
@@ -3191,6 +3349,51 @@ async fn a_hand_off_refused_because_the_rules_dont_read_is_kept_and_tried_again(
     stack.stop().await;
 }
 
+impl Stack {
+    /// Runs `sql` on the store's database behind the store's back.
+    async fn run_sql(&self, sql: &'static str) {
+        let db = self.dir.path().join("agentd.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display()))
+            .await
+            .unwrap();
+        sqlx::query(sql).execute(&pool).await.unwrap();
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn a_hops_line_that_the_rules_dont_read_is_not_said_when_its_claim_fails() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack
+        .store()
+        .update_agent_settings(writer, |settings| settings.allow_json = "[oops".into())
+        .await
+        .unwrap();
+    stack.run_sql("DROP TABLE limit_notices").await;
+    let reply = "@UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    stack.wait_for_posts(1).await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let texts: Vec<String> = stack
+        .mock
+        .posts()
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        [reply],
+        "without its claim, each post of a chain would say it again"
+    );
+    assert_eq!(stack.kept_hand_offs().await, [writer]);
+    stack.stop().await;
+}
+
 #[tokio::test]
 async fn a_hop_whose_posting_turn_cant_be_read_waits_rather_than_risk_running_twice() {
     let stack = start().await;
@@ -3236,8 +3439,9 @@ async fn a_failed_membership_check_answers_a_read_back_message_and_retries_a_han
     let writer = stack.other_agent("writer", "UWRITER").await;
     let reply = "@UWRITER over to you.";
     stack.next_turn(Turn::reply(reply));
-    stack.holds.fail_can_post(stack.agent, 1);
-    stack.holds.fail_can_post(writer, 1);
+    let unreachable = || SurfaceError::Transport("unreachable".into());
+    stack.holds.fail_can_post(stack.agent, unreachable());
+    stack.holds.fail_can_post(writer, unreachable());
     stack
         .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
         .await;
@@ -3263,5 +3467,22 @@ async fn a_failed_membership_check_answers_a_read_back_message_and_retries_a_han
     next.close();
     next.drain().await;
     assert_eq!(stack.writers_hops(writer).await, [1]);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_membership_check_the_platform_refuses_answers_nothing() {
+    let stack = start().await;
+    stack
+        .holds
+        .fail_can_post(stack.agent, SurfaceError::Unauthorized);
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    assert!(
+        posts(&stack.calls_since(0)).is_empty(),
+        "only a check the platform couldn't answer counts as yes"
+    );
+    assert!(stack.bearers().await.is_empty());
     stack.stop().await;
 }

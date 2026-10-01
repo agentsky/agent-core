@@ -7705,7 +7705,11 @@ surface reads the `<@U…>` tokens of the text it sent, as `normalize`
 reads an event's text; the renderer turns an `@<bot user id>` into one for
 managed bots. The Slack renderer now keeps every backtick outside code
 from pairing, as it does escaped formatting characters (zero-width spaces
-unless it sits inside a word), so a mention it arms is shown as one.
+unless it sits inside a word), so a mention it arms is shown as one. A
+backtick inside inline code, which Markdown allows in a span opened by a
+longer run (``` ``x`y`` ```), is wrapped in zero-width spaces too, so it
+can't close Slack's span early and leave the rest of the line paired
+differently from what agentd read.
 `MockSurface` renders a post with Slack's renderer
 (`render::slack::to_mrkdwn`, with the `name_user` names as its directory)
 and reads the tokens it produces, so a test sees the mentions Slack would:
@@ -7719,7 +7723,7 @@ gets it twice, in either order; and a turn whose reply and queued posts
 (or two chunks) mention the same agent would start it once per post.
 
 **Solution.** A turn's delivery hands off to each agent once, from the
-first of its posts that mentions it (`Delivery::record_hand_offs` skips the
+first of its posts that mentions it (`Delivery::mentioned` skips the
 agents already handed to), so a turn writes one `hand_offs` row and queues
 one job for each agent. `Pipeline::candidate` claims the hop in
 `processed_events` (source `hop`, kept for `PROCESSED_EVENT_RETENTION`),
@@ -7752,17 +7756,21 @@ mentioned agent's bot could see the conversation.
 (`Job::hand_off`) and skips `confirmed`: there is nothing to confirm in a
 copy agentd made itself. Instead, before claiming the hop, it asks the
 platform whether the bot may post there (`Surface::can_post_now`): a no
-settles the hand-off without a word, and an error leaves its row to be
-tried again. Slack's `can_post` asks `conversations.info` (the
-conversation asked about, not archived, and a member, or a DM or group
-DM) and keeps a yes for `MEMBERSHIP_TTL` (five minutes, at most
-`MAX_MEMBERSHIPS` conversations) for the messages it read back;
-`can_post_now` always asks, and a no drops a kept yes, so a bot removed
-from a channel takes no hop there. Where a message was read back with the
-bot's own access, a `can_post` that fails is taken as a yes, so a
-rate-limited membership check doesn't drop a person's message without a
-word. A message the platform doesn't confirm from another bot gets no
-notice.
+settles the hand-off without a word, and an error, or an agent with no
+active binding there (no surface), leaves its row to be tried again, as
+the replay does. The turn then doesn't ask again. Slack's `can_post` asks
+`conversations.info` (the conversation asked about, not archived, and a
+member, or a DM or group DM) and keeps a yes for `MEMBERSHIP_TTL` (five
+minutes, at most `MAX_MEMBERSHIPS` conversations) for the messages it
+read back; `can_post_now` always asks, and a no drops a kept yes, so a bot
+removed from a channel takes no hop there. A `channel_not_found`, an auth
+error (`invalid_auth`, `missing_scope`, ...) or a forbidden answer is a
+no too, and drops the kept yes; a rate limit or a transport failure stays
+an error. Where a message was read back with the bot's own access, a
+`can_post` that fails because the platform is unreachable or asks to slow
+down is taken as a yes, so a rate-limited membership check doesn't drop a
+person's message without a word; any other failure answers nothing. A
+message the platform doesn't confirm from another bot gets no notice.
 
 ### Hand-offs are kept until settled
 
@@ -7772,28 +7780,41 @@ hand-off each five-minute lease, though a job can wait in a lane and run
 for half an hour, so dead copies took queue places and people got busy
 lines; it deleted rows whatever the outcome, so a store error lost the
 hand-off; it wrote the rows only after the whole delivery; and a
-shutdown left its rows due five minutes later.
+shutdown left its rows due five minutes later. A later review found that
+a drain longer than the lease stopped leasing the rows its jobs held, so
+another instance ran them too; that a row was not held between its write
+and its job, so a turn cut mid-delivery left it for a lease; that SQLite
+could give a deleted row's id to a new row while a job still held the
+old one; and that a post's ref and its hand-offs were two writes.
 
-**Solution.** `Delivery::post_to` records a `hand_offs` row (the event as
-JSON and the agent) as soon as a post's `message_refs` row is, due after
-`HAND_OFF_LEASE` (five minutes). The job holds its row (`Holding`, in an
-in-memory set, a cache in front of the rows) while it waits and runs.
-`candidate` says whether it settled the hand-off: claimed and acted on,
-found claimed, ignored, refused for a reason other than unreadable rules,
-or found unable to post; and the lane deletes the row only then. The
-"hand-off worker" calls `Pipeline::replay_hand_offs` every
-`HAND_OFF_SWEEP_INTERVAL` (30 s): it leases this instance's held rows
-again, so neither it nor another instance takes them, then leases up to 64
-due rows, drops rows recorded over an hour ago (logging how many), and
+**Solution.** `Delivery::post_to` records a post's `message_refs` row and
+a `hand_offs` row for each agent it hands off to (the event as JSON and
+the agent), due after `HAND_OFF_LEASE` (five minutes), in one
+transaction (`Store::record_post`), and holds each row at once
+(`Holding`, from the pipeline's `Holder`: an in-memory set, a cache in
+front of the rows, which refuses an id it holds already). The hold passes
+to the job, which keeps it while it waits and runs. `hand_offs.id` is
+`AUTOINCREMENT`, so an id is never given again. `candidate` says whether
+it settled the hand-off: claimed and acted on, found claimed, ignored,
+refused for a reason other than unreadable rules, or found unable to
+post; and the lane deletes the row only then. The "hand-off worker" calls
+`Pipeline::replay_hand_offs` every `HAND_OFF_SWEEP_INTERVAL` (30 s): it
+leases this instance's held rows again, so neither it nor another
+instance takes them, then leases up to 64 due rows, drops rows recorded
+over an hour ago that no job of the caller holds (logging how many), and
 queues each again, unless its hop's claim is taken, when the row is done
 with. A row that doesn't parse, whose agent is gone or has no active
 binding there, or whose posting turn can't be read is left for later or
-to age out, and each row is handled on its own. `cut_short` makes the rows
-its dropped jobs held due at once, and so does `hand_off` on a closing
-pipeline, so the next instance takes them on its first look. A hand-off
-past a full queue keeps its row and is taken again after the lease rather
-than answered with a busy line, which no one would read. The record and
-the replay read `PipelineSettings::now`.
+to age out, and each row is handled on its own. Once the pipeline is
+closed, the worker, which now stops with the proxy and ctl listeners
+after the drain or cut, only leases the held rows again, so a drain
+longer than the lease keeps them. A hold let go while the pipeline is
+closed, by a job that never settled its row or a delivery cut short, is
+set aside, and the end of `drain` or `cut_short` makes those rows due at
+once, so the next instance takes them on its first look. A hand-off past
+a full queue keeps its row and is taken again after the lease rather than
+answered with a busy line, which no one would read. The record and the
+replay read `PipelineSettings::now`.
 
 Delivery is at least once until the hop is claimed, and at most once
 after: a crash between the claim and the turn loses that hop, and a cut
@@ -7818,7 +7839,9 @@ with "1 hand-off" for a cap of one, since "this chain has reached its
 limit" read as if the requester had done something. On a hop, the line for
 rules that can't be read is throttled the same way (`policy_unavailable`,
 one hour), since every post and copy of a chain meets it again and its
-hand-off is retried. A link prompt on a hop is throttled per requester with
+hand-off is retried; when that claim can't be recorded, the line isn't
+posted, since a store failing is what it reports and each retry would
+say it again. A link prompt on a hop is throttled per requester with
 `claim_failure_notice` (`link_prompt/hop`, `FAILURE_DM_INTERVAL`) and
 released when it can't be sent. The personal refusals (rules, ban, not in
 the channel) stay silent on a hop, as T27 and T33 decided for any bot's
@@ -7861,10 +7884,13 @@ agents with a bot on the conversation's surface and team that the turn's
 requester may see (public ones and their own), a mention (`@x`, or
 Slack's `<@…|…>`) names a handle only, and a bare word names a name or a
 handle; a bare word that fits two agents, as one's name and another's
-handle can, is refused with their handles. It is refused outside a
-channel or group DM, for the calling agent itself, for an agent the turn
-asked already (it would take one turn anyway), past the turn's ten queued
-posts, and, as before, inside a private task. It doesn't check what the
+handle can, is refused with each one's handle, name, and whether it is
+the requester's own or public, so the agent can tell which it meant. It
+is refused outside a channel or group DM, for the calling agent itself,
+for an agent the turn asked already (it would take one turn anyway; the
+check and the queueing are one critical section on the outbox, so two
+asks at once can't both pass), past the turn's ten queued posts, and, as
+before, inside a private task. It doesn't check what the
 router will decide (the other agent's rules, the hop cap, its limits):
 those depend on the requester and the thread, and the router says them
 when the hand-off runs, so the skill tells the agent not to promise an

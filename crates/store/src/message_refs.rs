@@ -8,7 +8,7 @@ use core_types::{
 use sqlx::SqliteConnection;
 use time::OffsetDateTime;
 
-use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
+use crate::{NewHandOff, Result, Store, StoreError, from_unix, parse_column, to_unix};
 
 const TABLE: &str = "message_refs";
 
@@ -215,43 +215,76 @@ impl Store {
         new: &NewMessageRef<'_>,
         now: OffsetDateTime,
     ) -> Result<MessageRef> {
+        Ok(self.record_post(new, now, &[]).await?.0)
+    }
+
+    /// Records `new` as [`record_message_ref`](Self::record_message_ref)
+    /// does, and in the same transaction a `hand_offs` row for each of
+    /// `hand_offs`, so a post that hands off is never recorded without its
+    /// hand-offs. Returns the row, and the hand-offs' ids in order.
+    ///
+    /// # Errors
+    ///
+    /// As [`record_message_ref`](Self::record_message_ref), and
+    /// [`StoreError::Database`] if a hand-off can't be inserted, as when
+    /// its agent doesn't exist; then nothing is recorded.
+    pub async fn record_post(
+        &self,
+        new: &NewMessageRef<'_>,
+        now: OffsetDateTime,
+        hand_offs: &[NewHandOff<'_>],
+    ) -> Result<(MessageRef, Vec<i64>)> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(found) = in_session(&mut tx, new.session, new.msg).await? {
-            let row = match (found.agent, new.agent) {
+        let row = match in_session(&mut tx, new.session, new.msg).await? {
+            Some(found) => match (found.agent, new.agent) {
                 (None, Some(_)) => attribute(&mut tx, new).await?,
                 _ => found,
-            };
-            tx.commit().await?;
-            return Ok(row);
+            },
+            None => insert(&mut tx, new, now).await?,
+        };
+        let mut ids = Vec::with_capacity(hand_offs.len());
+        for hand_off in hand_offs {
+            ids.push(crate::hand_offs::insert(&mut *tx, hand_off).await?);
         }
-        let row: Row = sqlx::query_as(concat!(
-            "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
+        tx.commit().await?;
+        Ok((row, ids))
+    }
+}
+
+/// Inserts `new`, posted at `now`, as the next short id of its session.
+async fn insert(
+    tx: &mut SqliteConnection,
+    new: &NewMessageRef<'_>,
+    now: OffsetDateTime,
+) -> Result<MessageRef> {
+    let row: Row = sqlx::query_as(concat!(
+        "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
              thread_root, platform_ref, agent_id, turn_id, requester_member, requester_key, hop, \
              posted_at, consent_id, hands_off) \
              SELECT ?1, COALESCE(MAX(short_id), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, \
              ?12, ?13, ?14 FROM message_refs WHERE session_id = ?1 RETURNING ",
-            columns!()
-        ))
-        .bind(new.session.to_string())
-        .bind(new.msg.conv.surface.as_str())
-        .bind(new.msg.conv.team.as_str())
-        .bind(new.msg.conv.conversation.as_str())
-        .bind(new.thread_root.map_or("", MessageId::as_str))
-        .bind(new.msg.id.as_str())
-        .bind(new.agent.map(|agent| agent.to_string()))
-        .bind(new.turn.map(|turn| turn.to_string()))
-        .bind(new.requester.member.map(|member| member.to_string()))
-        .bind(new.requester.key.to_string())
-        .bind(i64::from(new.hop.0))
-        .bind(to_unix(now))
-        .bind(new.consent.map(|consent| consent.to_string()))
-        .bind(i64::from(new.hands_off))
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        row.into_ref()
-    }
+        columns!()
+    ))
+    .bind(new.session.to_string())
+    .bind(new.msg.conv.surface.as_str())
+    .bind(new.msg.conv.team.as_str())
+    .bind(new.msg.conv.conversation.as_str())
+    .bind(new.thread_root.map_or("", MessageId::as_str))
+    .bind(new.msg.id.as_str())
+    .bind(new.agent.map(|agent| agent.to_string()))
+    .bind(new.turn.map(|turn| turn.to_string()))
+    .bind(new.requester.member.map(|member| member.to_string()))
+    .bind(new.requester.key.to_string())
+    .bind(i64::from(new.hop.0))
+    .bind(to_unix(now))
+    .bind(new.consent.map(|consent| consent.to_string()))
+    .bind(i64::from(new.hands_off))
+    .fetch_one(&mut *tx)
+    .await?;
+    row.into_ref()
+}
 
+impl Store {
     /// Whether agentd posted anything for consent `consent`: a private
     /// task's result, or its outcome, each of which is its last word.
     ///
@@ -507,6 +540,57 @@ mod tests {
             .unwrap();
         assert_ne!(a.short_id, b.short_id);
         assert_eq!(a.thread_root, None);
+    }
+
+    #[tokio::test]
+    async fn a_post_and_its_hand_offs_are_recorded_together_or_not_at_all() {
+        let store = memory_store().await;
+        let owner = store
+            .ensure_member(&member_key("u1"), "Ada", at(1))
+            .await
+            .unwrap();
+        let writer = agent(&store, owner, "writer").await;
+        let payer = requester("U1", Some(owner));
+        let (first, second) = (msg("C1", "1.1"), msg("C1", "2.1"));
+        let post = |msg| NewMessageRef {
+            session: SessionId::new_v4(),
+            msg,
+            thread_root: None,
+            agent: Some(writer),
+            turn: Some(TurnId::new_v4()),
+            requester: &payer,
+            hop: Hop::ZERO,
+            consent: None,
+            hands_off: true,
+        };
+        let hand_off = |agent| NewHandOff {
+            agent,
+            event_json: "{}",
+            created_at: at(2),
+            due_at: at(3),
+        };
+        let (row, ids) = store
+            .record_post(&post(&first), at(2), &[hand_off(writer)])
+            .await
+            .unwrap();
+        assert!(row.hands_off);
+        let due = store
+            .take_due_hand_offs(at(3), std::time::Duration::from_secs(60), at(1), 10, &[])
+            .await
+            .unwrap();
+        assert_eq!(due.taken.iter().map(|h| h.id).collect::<Vec<_>>(), ids);
+
+        assert!(
+            store
+                .record_post(&post(&second), at(2), &[hand_off(AgentId::new_v4())])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.posted_message_ref(&second).await.unwrap(),
+            None,
+            "a hand-off that can't be recorded takes its post's record with it"
+        );
     }
 
     #[tokio::test]
