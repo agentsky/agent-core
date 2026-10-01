@@ -2,6 +2,7 @@
 //! through `response_url`, manager DMs, `/agent slack-token`, the
 //! configuration token rotator, and members who leave.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,7 +116,7 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         .await;
     Mock::given(method("POST"))
         .and(path("/api/users.info"))
-        .respond_with(ok(json!({"user": {"id": "U0HUMAN01", "team_id": TEAM}})))
+        .respond_with(home_member)
         .mount(&slack)
         .await;
     Mock::given(method("POST"))
@@ -797,7 +798,7 @@ async fn a_notice_nobody_can_send_is_tried_a_bounded_number_of_times() {
     h.slack.reset().await;
     Mock::given(method("POST"))
         .and(path("/api/users.info"))
-        .respond_with(ok(json!({"user": {"id": "U0HUMAN01", "team_id": TEAM}})))
+        .respond_with(home_member)
         .mount(&h.slack)
         .await;
     Mock::given(method("POST"))
@@ -1086,19 +1087,20 @@ fn only_a_deleted_user_in_a_user_change_has_left() {
         event: value,
         received_at: OffsetDateTime::now_utc(),
     };
+    let left_of = |value: Value| member_who_left(&event("user_change", value), None);
     let left = envelope["event"].clone();
+    assert_eq!(left_of(left.clone()), Some(slack_key("U0HUMAN02")));
     assert_eq!(
-        member_who_left(&event("user_change", left.clone())),
-        Some(slack_key("U0HUMAN02"))
+        member_who_left(&event("team_join", left.clone()), None),
+        None
     );
-    assert_eq!(member_who_left(&event("team_join", left.clone())), None);
     let mut active = left.clone();
     active["user"]["deleted"] = json!(false);
-    assert_eq!(member_who_left(&event("user_change", active)), None);
+    assert_eq!(left_of(active), None);
     let mut nameless = left.clone();
     nameless["user"]["id"] = json!("");
-    assert_eq!(member_who_left(&event("user_change", nameless)), None);
-    assert_eq!(member_who_left(&event("user_change", json!({}))), None);
+    assert_eq!(left_of(nameless), None);
+    assert_eq!(left_of(json!({})), None);
     for team in [
         json!("T0THEIRS1"),
         json!("E0HOMEORG"),
@@ -1107,15 +1109,41 @@ fn only_a_deleted_user_in_a_user_change_has_left() {
     ] {
         let mut elsewhere = left.clone();
         elsewhere["user"]["team_id"] = team.clone();
-        assert_eq!(
-            member_who_left(&event("user_change", elsewhere)),
-            None,
-            "deactivated in {team}, not here"
-        );
+        assert_eq!(left_of(elsewhere), None, "deactivated in {team}, not here");
     }
-    let mut teamless = left;
+    let mut teamless = left.clone();
     teamless["user"].as_object_mut().unwrap().remove("team_id");
-    assert_eq!(member_who_left(&event("user_change", teamless)), None);
+    assert_eq!(left_of(teamless), None);
+}
+
+#[test]
+fn a_grid_member_of_the_workspace_homed_in_a_sibling_has_left() {
+    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
+    let org = TeamId::new("E0HOMEORG");
+    let left_of = |grid: Value, home_org: Option<&TeamId>| {
+        let mut value = envelope["event"].clone();
+        value["user"]["team_id"] = json!("T0SIBLING");
+        value["user"]["enterprise_user"] = grid;
+        let event = SlackEvent {
+            binding: BindingRef::MANAGER_ID,
+            team: TeamId::new(TEAM),
+            event_id: "Ev1".to_owned(),
+            event_type: "user_change".to_owned(),
+            event: value,
+            received_at: OffsetDateTime::now_utc(),
+        };
+        member_who_left(&event, home_org)
+    };
+    let member = json!({"enterprise_id": "E0HOMEORG", "teams": ["T0SIBLING", TEAM]});
+    assert_eq!(
+        left_of(member.clone(), Some(&org)),
+        Some(slack_key("U0HUMAN02"))
+    );
+    assert_eq!(left_of(member, None), None, "no organization at home");
+    let sibling_only = json!({"enterprise_id": "E0HOMEORG", "teams": ["T0SIBLING"]});
+    assert_eq!(left_of(sibling_only, Some(&org)), None);
+    let other_org = json!({"enterprise_id": "E0THEIRS1", "teams": ["T0SIBLING", TEAM]});
+    assert_eq!(left_of(other_org, Some(&org)), None);
 }
 
 #[tokio::test]
@@ -2052,6 +2080,15 @@ async fn only_owner_can_decide() {
 
 const OUTSIDE_TEAM: &str = "T0THEIRS1";
 
+/// `users.info`'s answer that whoever was asked about is a member of the
+/// workspace.
+fn home_member(request: &Request) -> ResponseTemplate {
+    let form: HashMap<String, String> =
+        serde_urlencoded::from_bytes(&request.body).unwrap_or_default();
+    let user = form.get("user").cloned().unwrap_or_default();
+    ok(json!({"user": {"id": user, "team_id": TEAM}}))
+}
+
 /// Answers `users.info` for `user` alone with `response`, ahead of the
 /// harness's answer for everyone else.
 async fn mount_user_info(h: &SlackHarness, user: &str, response: ResponseTemplate) {
@@ -2211,7 +2248,7 @@ async fn a_manager_dm_lookup_never_holds_up_the_slack_queue() {
     mount_user_info(
         &h,
         "U0SLOW001",
-        user_in("U0SLOW001", TEAM).set_delay(Duration::from_secs(10)),
+        user_in("U0SLOW001", TEAM).set_delay(Duration::from_secs(7)),
     )
     .await;
     let running = Running::start(&h);
@@ -2223,7 +2260,7 @@ async fn a_manager_dm_lookup_never_holds_up_the_slack_queue() {
     );
     answered_marker(&h, &running).await;
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_millis(3500),
         "another member's command didn't wait for the slow lookup"
     );
     assert!(

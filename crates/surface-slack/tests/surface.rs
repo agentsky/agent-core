@@ -1548,6 +1548,24 @@ async fn a_sender_is_home_only_when_the_home_check_agrees() {
 }
 
 #[tokio::test]
+async fn a_sender_of_another_workspace_or_surface_is_outside_without_a_lookup() {
+    let (server, surface) = listing(&[(USER, TEAM)]).await;
+    let mut elsewhere = home_event_from(USER);
+    elsewhere.sender.team = OUTSIDE_TEAM.into();
+    surface.fill_sender_team(&mut elsewhere).await.unwrap();
+    assert_eq!(elsewhere.outside, outside_unknown(), "another workspace");
+    let mut org = home_event_from(USER);
+    org.sender.team = HOME_ORG.into();
+    surface.fill_sender_team(&mut org).await.unwrap();
+    assert_eq!(org.outside, outside_unknown(), "the organization itself");
+    let mut other_surface = home_event_from(USER);
+    other_surface.sender.surface = SurfaceKind::RocketChat;
+    surface.fill_sender_team(&mut other_surface).await.unwrap();
+    assert_eq!(other_surface.outside, outside_unknown(), "another surface");
+    assert!(lookups(&server, "users.info").await.is_empty());
+}
+
+#[tokio::test]
 async fn a_home_member_in_a_shared_channel_is_home() {
     let (server, surface) = listing(&[(USER, TEAM)]).await;
     let mut event = event_from(testkit::slack::MESSAGE_CONNECT_HOME);
@@ -1634,8 +1652,85 @@ async fn a_home_lookup_slack_refuses_is_outside() {
     }
     assert_eq!(
         lookups(&server, "users.info").await.len(),
-        6,
-        "a refusal is no answer and isn't kept"
+        5,
+        "a refusal is no answer and isn't kept; user_not_visible is one"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_about_someone_else_or_that_doesnt_read_is_no_answer_and_warned_of() {
+    let logs = testkit::Logs::global();
+    let server = MockServer::start().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    mount_user(&server, "U0ASKED01", user_in("U0SOMEONE", Some(TEAM))).await;
+    mount_user(&server, "U0GARBLED", ok(json!({"user": "garbled"}))).await;
+    for (team, user, outside, warning) in [
+        ("T0WARNED2", "U0ASKED01", outside_unknown(), "another user"),
+        ("T0WARNED3", "U0GARBLED", None, "unexpected response"),
+    ] {
+        let surface = SlackSurface::new(
+            client.bot(SecretString::from(TOKEN)),
+            Arc::new(TeamDirectory::new(team.into())),
+        );
+        for _ in 0..2 {
+            let mut event = home_event_from(user);
+            event.sender.team = team.into();
+            let filled = surface.fill_sender_team(&mut event).await;
+            assert_eq!(filled.is_ok(), outside.is_some(), "{user}: {filled:?}");
+            assert_eq!(event.outside, outside, "{user}");
+        }
+        let warned = logs
+            .snapshot()
+            .matching("couldn't ask Slack whether a user is home")
+            .matching(team)
+            .to_string();
+        assert_eq!(
+            warned.lines().filter(|line| line.contains("WARN")).count(),
+            1,
+            "{warned}"
+        );
+        assert!(warned.contains(warning), "{warned}");
+    }
+    assert_eq!(
+        lookups(&server, "users.info").await.len(),
+        4,
+        "nothing is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once() {
+    const LONE: &str = "T0NOORG01";
+    let logs = testkit::Logs::global();
+    let server = MockServer::start().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let surface = SlackSurface::new(
+        client.bot(SecretString::from(TOKEN)),
+        Arc::new(TeamDirectory::new(LONE.into())),
+    );
+    let grid_member = |user: &str| {
+        ok(json!({"user": {
+            "id": user,
+            "team_id": LONE,
+            "enterprise_user": {"enterprise_id": HOME_ORG, "teams": [LONE]},
+        }}))
+    };
+    for user in ["U0GRIDMEM", "U0GRIDME2"] {
+        mount_user(&server, user, grid_member(user)).await;
+        let mut event = home_event_from(user);
+        event.sender.team = LONE.into();
+        surface.fill_sender_team(&mut event).await.unwrap();
+        assert_eq!(event.outside, outside_unknown(), "{user}");
+    }
+    let warned = logs
+        .snapshot()
+        .matching("auth.test gave the workspace none")
+        .matching(LONE)
+        .to_string();
+    assert_eq!(
+        warned.lines().filter(|line| line.contains("WARN")).count(),
+        1,
+        "{warned}"
     );
 }
 
@@ -1982,6 +2077,11 @@ async fn conv_info_reads_sharing_and_connected_teams() {
         (json!({"is_shared": 1}), ConvKind::Channel, external(None)),
         (
             json!({"is_shared": null, "is_ext_shared": null, "is_org_shared": "yes"}),
+            ConvKind::Channel,
+            external(None),
+        ),
+        (
+            json!({"is_shared": false, "is_ext_shared": false, "is_org_shared": null}),
             ConvKind::Channel,
             Sharing::None,
         ),

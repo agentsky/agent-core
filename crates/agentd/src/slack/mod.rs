@@ -463,8 +463,8 @@ impl Inbound {
         self
     }
 
-    async fn member_left(&self, event: &SlackEvent) {
-        let Some(key) = member_who_left(event) else {
+    async fn member_left(&self, event: &SlackEvent, home_org: Option<&TeamId>) {
+        let Some(key) = member_who_left(event, home_org) else {
             return;
         };
         let deleted = match self.store.member_for_identity(&key).await {
@@ -531,7 +531,7 @@ impl Sink<SlackInbound> for Inbound {
             }
             SlackInbound::Message(event, _) => dm_command(&event, identity),
             SlackInbound::Event(event) => {
-                self.member_left(&event).await;
+                self.member_left(&event, identity.enterprise.as_ref()).await;
                 None
             }
             SlackInbound::Interaction(interaction)

@@ -19,10 +19,13 @@
 //! are never commands.
 
 use core_types::{
-    ConsentId, ConvKind, ConvRef, InFile, InboundEvent, MemberKey, SurfaceKind, UserId,
+    ConsentId, ConvKind, ConvRef, InFile, InboundEvent, MemberKey, SurfaceKind, TeamId,
 };
+use serde::Deserialize as _;
 use serde_json::Value;
+use surface_slack::directory::is_member;
 use surface_slack::normalize::unescape;
+use surface_slack::web::User;
 use surface_slack::{Interaction, SlackEvent, SlashCommand};
 
 use super::Origin;
@@ -116,27 +119,24 @@ pub fn consent_action(interaction: Interaction) -> Option<(MemberKey, String, Or
 }
 
 /// The member a `user_change` event says was deleted (left the workspace or
-/// was deactivated), in the workspace the event came through. The user's
-/// own `team_id` must be that workspace, so a member of another
-/// organization, or of another workspace of the organization, deactivated
-/// there takes nothing from the identity keyed by their id here.
-pub fn member_who_left(event: &SlackEvent) -> Option<MemberKey> {
+/// was deactivated), in the workspace the event came through, of the
+/// Enterprise Grid organization `home_org` if any. The user must be a
+/// member of that workspace as [`is_member`] reads Slack's user, by their
+/// own `team_id` or their organization's list of workspaces, so a member of
+/// another organization, or of a workspace of the organization they don't
+/// belong to, deactivated there takes nothing from the identity keyed by
+/// their id here.
+pub fn member_who_left(event: &SlackEvent, home_org: Option<&TeamId>) -> Option<MemberKey> {
     if event.event_type != "user_change" {
         return None;
     }
-    let user = event.event.get("user")?;
-    if user.get("deleted").and_then(Value::as_bool) != Some(true)
-        || user.get("team_id").and_then(Value::as_str) != Some(event.team.as_str())
-    {
+    let user = User::deserialize(event.event.get("user")?).ok()?;
+    if !user.deleted || user.id.as_str().is_empty() || !is_member(&user, &event.team, home_org) {
         return None;
     }
-    let id = user
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())?;
     Some(MemberKey {
         surface: SurfaceKind::Slack,
         team: event.team.clone(),
-        user: UserId::new(id),
+        user: user.id,
     })
 }

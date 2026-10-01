@@ -43,7 +43,7 @@ use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
 use crate::normalize::{
-    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, team_id_or_nothing,
+    SlackFile, enterprise_id_or_nothing, in_files, is_team_id, is_workspace_id, team_id_or_nothing,
 };
 
 /// The result type of the Web API client.
@@ -146,7 +146,11 @@ const APP_GONE_CODES: &[&str] = &["app_not_found", "invalid_app_id"];
 const RATE_LIMITED_CODES: &[&str] = &["ratelimited", "rate_limited"];
 
 /// Error codes with which Slack says it couldn't answer this time, as an
-/// HTTP 5xx would.
+/// HTTP 5xx would: `fatal_error` and `internal_error`, after which the call
+/// may have partly taken effect, `service_unavailable`, and
+/// `request_timeout`, Slack's word for POST data it got missing or
+/// truncated. None of them says a write didn't happen, so none is retried
+/// blindly.
 const TRANSIENT_CODES: &[&str] = &[
     "fatal_error",
     "internal_error",
@@ -802,8 +806,8 @@ pub struct Conversation {
     #[serde(default)]
     pub is_member: bool,
     /// Whether it is shared with another workspace, of the organization or
-    /// not. Read leniently, failing closed: anything present but `false` or
-    /// `null` is `true`.
+    /// not. Read leniently, failing closed: anything present but `false` is
+    /// `true`.
     #[serde(default, deserialize_with = "true_unless_false")]
     pub is_shared: bool,
     /// Whether it is shared with other workspaces of the workspace's own
@@ -850,13 +854,11 @@ fn true_or_false<'de, D: Deserializer<'de>>(value: D) -> Result<bool, D::Error> 
     Ok(Value::deserialize(value)?.as_bool().unwrap_or(false))
 }
 
-/// `false` for a JSON `false` or `null`, and `true` for anything else, for
-/// a flag whose unreadable value must fail closed.
+/// `false` for a JSON `false`, and `true` for anything else, `null`
+/// included, for a flag whose unreadable value must fail closed. An absent
+/// flag is `false` by its field's `serde(default)`.
 fn true_unless_false<'de, D: Deserializer<'de>>(value: D) -> Result<bool, D::Error> {
-    Ok(!matches!(
-        Value::deserialize(value)?,
-        Value::Bool(false) | Value::Null
-    ))
+    Ok(Value::deserialize(value)? != Value::Bool(false))
 }
 
 /// A string as it is, `None` for `null`, and an empty string, which no
@@ -907,10 +909,33 @@ pub struct EnterpriseUser {
     /// value that isn't a string.
     #[serde(deserialize_with = "text_or_unreadable")]
     pub enterprise_id: Option<String>,
-    /// The organization's workspaces the member belongs to: at most
-    /// [`MAX_CONNECTED_TEAMS`] ids each shaped like a team id, or `None`.
-    #[serde(deserialize_with = "connected_teams")]
+    /// The organization's workspaces the member belongs to: the entries
+    /// shaped like a workspace id (`T…`), with any other entry skipped, or
+    /// `None` for anything but a list of at most [`MAX_GRID_TEAMS`].
+    #[serde(deserialize_with = "grid_teams")]
     pub teams: Option<Vec<TeamId>>,
+}
+
+/// The most workspaces an [`EnterpriseUser`]'s teams are kept with.
+pub const MAX_GRID_TEAMS: usize = 1024;
+
+/// A list of at most [`MAX_GRID_TEAMS`] entries, keeping those shaped like
+/// a workspace id, or `None` for anything else.
+fn grid_teams<'de, D: Deserializer<'de>>(value: D) -> Result<Option<Vec<TeamId>>, D::Error> {
+    let Value::Array(items) = Value::deserialize(value)? else {
+        return Ok(None);
+    };
+    if items.len() > MAX_GRID_TEAMS {
+        return Ok(None);
+    }
+    Ok(Some(
+        items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|id| is_workspace_id(id))
+            .map(TeamId::from)
+            .collect(),
+    ))
 }
 
 /// A user, from `users.info` or `users.list`.
@@ -935,8 +960,8 @@ pub struct User {
     #[serde(default)]
     pub is_bot: bool,
     /// Whether Slack shows the user as a stranger: someone of another
-    /// organization in a shared channel. Anything present but `false` or
-    /// `null` is `true`.
+    /// organization in a shared channel. Anything present but `false` is
+    /// `true`.
     #[serde(default, deserialize_with = "true_unless_false")]
     pub is_stranger: bool,
     /// The profile.
@@ -948,19 +973,25 @@ pub struct User {
     pub enterprise_user: Option<EnterpriseUser>,
 }
 
-/// An `enterprise_user` object, `None` for `null`, and for anything else
-/// one whose organization no id names, so it fails the home rule.
+/// An `enterprise_user` object, `None` for `null`, and for anything else,
+/// an object that doesn't read, or one naming no organization, one whose
+/// organization no id names, so it fails the home rule.
 fn enterprise_user<'de, D: Deserializer<'de>>(
     value: D,
 ) -> Result<Option<EnterpriseUser>, D::Error> {
+    let unreadable = || EnterpriseUser {
+        enterprise_id: Some(String::new()),
+        teams: None,
+    };
     Ok(match Value::deserialize(value)? {
         Value::Null => None,
-        value => Some(
-            EnterpriseUser::deserialize(value).unwrap_or_else(|_| EnterpriseUser {
-                enterprise_id: Some(String::new()),
-                teams: None,
-            }),
+        value @ Value::Object(_) => Some(
+            EnterpriseUser::deserialize(value)
+                .ok()
+                .filter(|grid| grid.enterprise_id.is_some())
+                .unwrap_or_else(unreadable),
         ),
+        _ => Some(unreadable()),
     })
 }
 
@@ -1884,13 +1915,22 @@ async fn read_file(file: &OutFile) -> Result<Vec<u8>> {
 fn decode<T: DeserializeOwned>(method: Method, bytes: &[u8]) -> Result<T> {
     serde_json::from_slice(bytes).map_err(|err| {
         SurfaceError::Transport(format!(
-            "unexpected response from {} ({:?} error at line {} column {})",
+            "{UNREADABLE} {} ({:?} error at line {} column {})",
             method.name(),
             err.classify(),
             err.line(),
             err.column()
         ))
     })
+}
+
+/// How [`decode`]'s error begins.
+const UNREADABLE: &str = "unexpected response from";
+
+/// Whether `err` is [`decode`]'s: Slack answered, and the answer didn't
+/// read.
+pub(crate) fn is_unreadable(err: &SurfaceError) -> bool {
+    matches!(err, SurfaceError::Transport(detail) if detail.starts_with(UNREADABLE))
 }
 
 /// Reads a Web API answer.
@@ -1970,7 +2010,8 @@ fn sanitize_code(code: &str) -> Option<&str> {
 /// - Codes with which Slack says it couldn't answer this time
 ///   (`fatal_error`, `internal_error`, `request_timeout`,
 ///   `service_unavailable`) are [`SurfaceError::Transport`] with the code,
-///   as an HTTP 5xx is: the caller may try again.
+///   as an HTTP 5xx is. The call may have partly taken effect: a read may
+///   be tried again, a write not blindly.
 /// - Anything else is [`SurfaceError::Api`] with the code.
 ///
 /// ```
