@@ -454,6 +454,17 @@ async fn post_sends_one_chunk_in_the_thread() {
         .await
         .unwrap();
     assert_eq!(mentioning.mentions, [UserId::from("U0HELPER")]);
+    let in_code = surface
+        .post(
+            &thread("1727697600.000100"),
+            "`a <@U0HELPER>` and `x`y` <@U0OTHER> `z`, as a cut can leave it",
+        )
+        .await
+        .unwrap();
+    assert!(
+        in_code.mentions.is_empty(),
+        "Slack shows these as code, so they hand off to no one"
+    );
 }
 
 #[tokio::test]
@@ -479,7 +490,6 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
         .await
         .unwrap();
     surface.unreact(&msg, "eyes").await.unwrap();
-    assert!(surface.can_post(&conv()).await.unwrap());
     let sent = requests(&server).await;
     let update: Value = serde_json::from_slice(&sent[0].body).unwrap();
     assert_eq!(
@@ -494,6 +504,108 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
     let ephemeral: Value = serde_json::from_slice(&sent[2].body).unwrap();
     assert_eq!(ephemeral["user"], USER);
     assert_eq!(ephemeral["thread_ts"], "1.1");
+}
+
+#[tokio::test]
+async fn can_post_only_where_the_bot_is_a_member_and_trusts_a_yes_until_asked_now() {
+    let (server, surface) = setup().await;
+    let elsewhere = ConvRef {
+        team: "T0OTHER01".into(),
+        ..conv()
+    };
+    assert!(surface.can_post(&elsewhere).await.is_err());
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": false}})),
+    )
+    .await;
+    assert!(!surface.can_post(&conv()).await.unwrap());
+    assert!(!surface.can_post(&conv()).await.unwrap());
+    server.reset().await;
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": true}})),
+    )
+    .await;
+    assert!(surface.can_post(&conv()).await.unwrap());
+    assert!(surface.can_post(&conv()).await.unwrap());
+    let asked = |requests: Vec<Request>| {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/conversations.info")
+            .count()
+    };
+    assert_eq!(
+        asked(requests(&server).await),
+        1,
+        "a yes is trusted for a while"
+    );
+    assert!(surface.can_post_now(&conv()).await.unwrap());
+    assert_eq!(
+        asked(requests(&server).await),
+        2,
+        "asked now, Slack is asked whatever it said lately"
+    );
+
+    for channel in [
+        json!({"id": CHANNEL, "is_channel": true, "is_member": true, "is_archived": true}),
+        json!({"id": "C0OTHER01", "is_channel": true, "is_member": true}),
+    ] {
+        server.reset().await;
+        mount(
+            &server,
+            "conversations.info",
+            ok(json!({ "channel": channel })),
+        )
+        .await;
+        assert!(
+            !surface.can_post_now(&conv()).await.unwrap(),
+            "{channel}: not a conversation the bot can post in"
+        );
+        assert!(
+            !surface.can_post(&conv()).await.unwrap(),
+            "{channel}: the no dropped the yes kept before"
+        );
+    }
+
+    for error in ["channel_not_found", "invalid_auth", "missing_scope"] {
+        server.reset().await;
+        mount(
+            &server,
+            "conversations.info",
+            ok(json!({"channel": {"id": CHANNEL, "is_channel": true, "is_member": true}})),
+        )
+        .await;
+        assert!(surface.can_post_now(&conv()).await.unwrap());
+        server.reset().await;
+        mount(
+            &server,
+            "conversations.info",
+            ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": error})),
+        )
+        .await;
+        assert!(
+            !surface.can_post_now(&conv()).await.unwrap(),
+            "{error}: Slack won't let the bot post there"
+        );
+        assert!(
+            !surface.can_post(&conv()).await.unwrap(),
+            "{error}: the no dropped the yes kept before"
+        );
+    }
+    server.reset().await;
+    mount(
+        &server,
+        "conversations.info",
+        ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "fatal_error"})),
+    )
+    .await;
+    assert!(
+        surface.can_post_now(&conv()).await.is_err(),
+        "a failure that may pass stays an error"
+    );
 }
 
 #[tokio::test]

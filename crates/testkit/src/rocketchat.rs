@@ -333,6 +333,11 @@ impl FakeRest {
         id
     }
 
+    /// Every message stored, oldest first.
+    pub fn messages(&self) -> Vec<FakeMessage> {
+        self.state().messages.clone()
+    }
+
     /// A user by username.
     pub fn user(&self, username: &str) -> Option<FakeUser> {
         self.state().user_by_name(username).cloned()

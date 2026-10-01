@@ -335,17 +335,22 @@ keeps an unmanaged or prompt-injected bot from spending anyone's subscription,
 and the hop cap bounds what one request can cost its requester.
 
 agentd delivers those mentions itself rather than waiting for the platform to
-deliver its own bots' posts back. Once a turn's posts are out, each one that
-the platform reads as mentioning other managed agents, in the conversation the
-turn answered and outside a one-to-one DM, is queued for those agents as the
-posting bot's message. It then goes through routing and confirmation like any
-message, so the requester and hop come only from the post's own record, and
-the hop cap, the thread's caps and each agent's rules apply. A private task's
-result is recorded with its consent and never hands off. The platform may
-deliver the same post as well: Rocket.Chat does, and on Slack it is
-unverified. Whichever copy reaches an agent second is dropped once routed and
-confirmed, by a claim on the agent and the post's message reference in the
-store, so a hop runs once whichever copy arrives first.
+deliver its own bots' posts back. Once a turn's posts are out, each one in the
+thread the turn answered, outside a one-to-one DM, that the platform reads as
+mentioning other managed agents, is queued for those agents as the posting
+bot's message, each agent once for the turn. It then goes through routing
+like any message, so the requester and hop come only from the post's own
+record, and the hop cap, the thread's caps and each agent's rules apply. Only
+those posts carry the turn's attribution: a post in another thread or
+channel, or a private task's result, hands nothing off by either delivery.
+Each hand-off is recorded in the store with its post, in one transaction,
+and kept until a job settles it; the instance that holds it keeps it leased,
+through a drain too, so a shutdown or crash before its hop is claimed delays
+it rather than losing it. The
+platform may deliver the same post as well: Rocket.Chat does, and on Slack it
+is unverified. A claim on the mentioned agent and the posting turn, in the
+store, lets one hop run for each turn and agent, however many of the turn's
+posts mention it and whichever copy arrives first.
 
 ### Private tasks
 
@@ -1430,8 +1435,8 @@ Direct calls would also need our own agent loop.
   answer, such as the permissions on a built-in role.
 - Whether Slack delivers one app's bot user's post to another app as a
   `message.*` event. Agent-to-agent turns no longer depend on it, since agentd
-  delivers its agents' mentions itself; a copy Slack delivers too costs one
-  read-back before it is dropped.
+  delivers its agents' mentions itself; a copy Slack delivers too is dropped
+  before its read-back.
 - One container per active session costs more than one per scope. Idle reaping
   bounds it, but a busy channel with many threads needs a per-scope container
   cap and a queue.
@@ -1462,7 +1467,7 @@ Direct calls would also need our own agent loop.
 [^qm-harness]: qm-core `src/harness/claude-harness.ts`: `tools: ["Agent"]`, `settingSources: []`, bridged tools through `createSdkMcpServer`.
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
 [^rc-stream]: [stream-room-messages](https://developer.rocket.chat/api/realtime-api/subscriptions/stream-room-messages).
-[^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace. Since T34, hand-off doesn't depend on it: agentd delivers an agent's post itself to the managed agents the post mentions, in the conversation it was posted in, and whichever copy of the post reaches an agent second, agentd's or the platform's, is dropped by the post's message reference. T32's live check now only shows whether Slack delivers that duplicate.
+[^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace. Since T34, hand-off doesn't depend on it: agentd delivers an agent's post itself to the managed agents the post mentions, in the thread its turn answered, and once an agent's hop from that turn ran, any other copy, agentd's or the platform's, is dropped. T32's live check now only shows whether Slack delivers that duplicate.
 [^slack-approval]: [Manage app approval for your workspace](https://slack.com/help/articles/222386767-Manage-app-approval-for-your-workspace).
 [^rc-create]: [Rocket.Chat Create User](https://developer.rocket.chat/reference/api/rest-api/endpoints/user-management/users-endpoints/create-user).
 [^slack-free]: [Feature limitations on the free version of Slack](https://slack.com/help/articles/27204752526611-Feature-limitations-on-the-free-version-of-Slack).

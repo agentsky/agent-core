@@ -25,7 +25,7 @@ use store::{CtlToken, CtlTurn, TokenHash, Visibility};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
-use super::outbox::{QueuedPost, QueuedReaction};
+use super::outbox::{Outbox, QueuedPost, QueuedReaction};
 use super::target;
 use super::token::{MAX_PRESENTED_LEN, hash_token};
 use super::{Ctl, MAX_POST_BYTES};
@@ -413,15 +413,23 @@ async fn post_message(
             to,
             text: request.text,
         },
+        |_| Ok(()),
     )?;
     Ok(Json(Ack {}))
 }
 
 /// Queues `post` for delivery after `caller`'s turn, unless the turn has
-/// queued [`MAX_POSTS`](super::outbox::MAX_POSTS) already.
-fn queue_post(ctl: &Ctl, caller: &Authorized, post: QueuedPost) -> Result<(), ApiError> {
+/// queued [`MAX_POSTS`](super::outbox::MAX_POSTS) already or `allowed`
+/// refuses, which reads the turn's outbox in the same critical section.
+fn queue_post(
+    ctl: &Ctl,
+    caller: &Authorized,
+    post: QueuedPost,
+    allowed: impl FnOnce(&Outbox) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
     let text_len = post.text.len();
     ctl.queue(caller, |outbox| {
+        allowed(outbox)?;
         outbox.push_post(post).then_some(()).ok_or_else(|| {
             error(
                 CtlErrorCode::Refused,
@@ -634,9 +642,18 @@ async fn lock(
 /// another agent, at the next hop.
 ///
 /// Only in a channel or a group DM, where another agent can answer. The
-/// agent is named by its name or its bot's handle, among the agents with a
-/// bot on this surface and team that the turn's requester may see: public
-/// ones, and the requester's own.
+/// agent is one with a bot on this surface and team that the turn's
+/// requester may see (public ones, and the requester's own), named by its
+/// bot's handle written as a mention (`@handle` or Slack's `<@…>`), or by
+/// a bare word that is its name or handle; a bare word that fits several
+/// agents, as one's name and another's handle can on Rocket.Chat, is
+/// refused with each one's handle, name, and whether it is the
+/// requester's own or public. The post is the handle and a colon, alone
+/// on its first paragraph, then the task: no word or table of the task is
+/// read as part of the mention, and the renderers resolve a managed bot's
+/// handle before anyone's name. A turn asks each agent once: the other
+/// agent takes one turn for this turn however many of its posts mention
+/// it.
 async fn ask_agent(
     State(ctl): State<Ctl>,
     Caller(caller): Caller,
@@ -656,13 +673,13 @@ async fn ask_agent(
     if task.is_empty() {
         return Err(error(CtlErrorCode::BadRequest, "the task is empty"));
     }
-    let wanted = agent_handle(&request.agent);
+    let (wanted, mention) = agent_handle(&request.agent);
     if wanted.is_empty() {
         return Err(error(CtlErrorCode::BadRequest, "name the agent to ask"));
     }
     let conv = &caller.turn.thread.conv;
     let asker = caller.turn.requester.member;
-    let found: Vec<_> = ctl
+    let visible: Vec<_> = ctl
         .store()
         .directory(conv.surface, &conv.team, None)
         .await
@@ -672,9 +689,18 @@ async fn ask_agent(
             entry.agent.visibility == Visibility::Public || Some(entry.agent.owner) == asker
         })
         .filter_map(|entry| {
-            let handle = entry.handle(conv.surface)?;
-            (entry.agent.name.eq_ignore_ascii_case(wanted) || handle.eq_ignore_ascii_case(wanted))
-                .then_some((entry.agent.id, handle))
+            Some((
+                entry.agent.id,
+                entry.handle(conv.surface)?,
+                entry.agent.name,
+                Some(entry.agent.owner) == asker,
+            ))
+        })
+        .collect();
+    let found: Vec<_> = visible
+        .iter()
+        .filter(|(_, handle, name, _)| {
+            handle.eq_ignore_ascii_case(wanted) || (!mention && name.eq_ignore_ascii_case(wanted))
         })
         .collect();
     let handle = match found.as_slice() {
@@ -684,25 +710,29 @@ async fn ask_agent(
                 format!("no agent called {wanted} has a bot here"),
             ));
         }
-        [(agent, _)] if *agent == caller.token.agent => {
+        [(agent, _, _, _)] if *agent == caller.token.agent => {
             return Err(error(CtlErrorCode::Refused, "an agent can't ask itself"));
         }
-        [(_, handle)] => handle,
+        [(_, handle, _, _)] => handle,
         several => {
             let handles: Vec<String> = several
                 .iter()
-                .map(|(_, handle)| format!("@{handle}"))
+                .map(|(_, handle, name, yours)| {
+                    let whose = if *yours { "yours" } else { "public" };
+                    format!("@{handle} ({name}, {whose})")
+                })
                 .collect();
             return Err(error(
                 CtlErrorCode::BadRequest,
                 format!(
-                    "several agents are called {wanted}; name one by its handle: {}",
+                    "several agents go by {wanted}; name one by its handle, with its @: {}",
                     handles.join(", ")
                 ),
             ));
         }
     };
-    let text = format!("@{handle} {task}");
+    let asking = format!("@{handle}:\n\n");
+    let text = format!("{asking}{task}");
     if text.len() > MAX_POST_BYTES {
         return Err(error(
             CtlErrorCode::TooLarge,
@@ -710,19 +740,39 @@ async fn ask_agent(
         ));
     }
     let to = ReplyTarget::from(caller.turn.thread.clone());
-    queue_post(&ctl, &caller, QueuedPost { to, text })?;
+    queue_post(&ctl, &caller, QueuedPost { to, text }, |outbox| {
+        if outbox
+            .posts()
+            .iter()
+            .any(|post| post.text.starts_with(&asking))
+        {
+            return Err(error(
+                CtlErrorCode::Refused,
+                format!(
+                    "this turn already asked @{handle}, which answers a turn once: put everything in one task"
+                ),
+            ));
+        }
+        Ok(())
+    })?;
     Ok(Json(Ack {}))
 }
 
-/// The name or handle `agent` asks for: without the `@` of a mention, or
-/// the `<@` and `>` of a Slack one, and its `|label`.
-fn agent_handle(agent: &str) -> &str {
+/// The name or handle `agent` asks for, without the `@` of a mention, or
+/// the `<@` and `>` of a Slack one and its `|label`, and whether it was
+/// written as a mention, which names a handle only.
+fn agent_handle(agent: &str) -> (&str, bool) {
     let agent = agent.trim();
-    let agent = agent
+    if let Some(inner) = agent
         .strip_prefix("<@")
         .and_then(|rest| rest.strip_suffix('>'))
-        .map_or(agent, |inner| inner.split('|').next().unwrap_or(inner));
-    agent.strip_prefix('@').unwrap_or(agent).trim()
+    {
+        return (inner.split('|').next().unwrap_or(inner).trim(), true);
+    }
+    match agent.strip_prefix('@') {
+        Some(handle) => (handle.trim(), true),
+        None => (agent, false),
+    }
 }
 
 /// `POST /v1/private`: records a consent for the task, with the files it

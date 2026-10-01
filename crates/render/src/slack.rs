@@ -879,12 +879,40 @@ fn looks_like_domain(host: &str) -> bool {
         && (named || tld.starts_with("xn--") || ipv4)
 }
 
+/// `mrkdwn` with what Slack shows as code left out, so the `<@U…>`
+/// tokens left are those Slack shows as mentions. A fence (```` ``` ````)
+/// runs to the next fence; otherwise any two backticks pair, whatever lies
+/// between them, as Slack pairs them, and a backtick that pairs with none
+/// is text. It reads the text as sent, wherever [`to_mrkdwn`] or
+/// [`split`](crate::split) left a backtick, so the mentions read from it
+/// are never more than those Slack shows.
+pub fn without_code(mrkdwn: &str) -> String {
+    let mut out = String::with_capacity(mrkdwn.len());
+    let mut rest = mrkdwn;
+    while let Some(open) = rest.find('`') {
+        out.push_str(&rest[..open]);
+        let from = &rest[open..];
+        let fenced = from
+            .strip_prefix(FENCE)
+            .and_then(|inside| inside.find(FENCE))
+            .map(|end| 2 * FENCE.len() + end);
+        let Some(code) = fenced.or_else(|| from[1..].find('`').map(|end| end + 2)) else {
+            out.push_str(from);
+            return out;
+        };
+        out.push(' ');
+        rest = &from[code..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Writes `<url>` or `<url|label>`. `label` must already be escaped.
 fn push_slack_link(url: &str, label: &str, out: &mut String) {
     out.push('<');
     for (i, c) in url.char_indices() {
         match c {
-            '|' | ' ' => out.push_str(&percent(c)),
+            '|' | ' ' | '`' => out.push_str(&percent(c)),
             '@' | '#' | '!' if i == 0 => out.push_str(&percent(c)),
             _ => push_escaped(c, out),
         }
