@@ -3857,29 +3857,37 @@ Deliverables:
   below the current version and swept; a new app is created with the
   current one. It also adds `manifest_lease_until`, the sweep's lease, which
   registering a configuration token clears for that member's bindings in
-  the workspace. A second migration, `…_channel_id_changes.sql`, adds
-  `channel_id_changes`, which holds each change until it is settled.
+  the workspace, and `manifest_blocked_version`, the version agentd found
+  it can't update an app to. A second migration,
+  `…_channel_id_changes.sql`, adds `channel_id_changes`, which holds each
+  change until it is settled, and a settled one for a day.
 - `SlackClient::update_app` (`apps.manifest.update`, the manifest as a JSON
   string, the owner's configuration token in `Authorization`), and a sweep
   on agentd's sweeper that updates each active binding below the current
   version whose owner's configuration token is usable, once a token is
   registered and every hour, claiming each binding with a lease as T30's
-  rotation does. The update keeps the app's stored scopes and redirect
-  URL, and leaves an app whose scopes agentd wouldn't rebuild alone, so it
-  never takes a new install. `/agent me` lists the owner's agents still on
-  an older manifest and says they won't follow a private channel shared
-  later.
+  rotation does. The update reads the app's manifest with
+  `apps.manifest.export` and adds only the bot events it lacks, so it
+  never takes a new install; an app Slack says is gone, or that subscribes
+  to no events, is blocked at the version and not tried again. `/agent me`
+  lists the owner's agents still on an older manifest and says they won't
+  follow a private channel shared later, and which of them agentd can't
+  update.
 - Ingress: an agent's app queues `channel_id_changed`, the only event other
   than `message` it queues, deduplicated by `event_id`, with
   `old_channel_id` and `new_channel_id` shaped like channel ids, or 400.
 - The handler (`crates/agentd/src/slack/agents.rs`) records the change in
   `channel_id_changes` and settles it at once, claiming the row as T30's
-  rotation claims a token; the sweeper tries one Slack couldn't be asked
-  about again every five minutes, for a day. Settling it: confirm the new id
-  with `conversations.info` on the binding's token (it exists, its id is
-  exactly the new one, and the bot is a member), then rewrite that agent's
-  `Room` targets in `agent_policies` from the old id to the new in one
-  transaction, and drop the old id from the conversation-info cache. When
+  rotation claims a token; the sweeper tries one still waiting again every
+  five minutes. Settling it: follow the binding's recorded changes from
+  the new id to the last one they reach, ask `conversations.info` on the
+  binding's token where that channel is now, and only when Slack answers
+  with the bot a member, rewrite that agent's `Room` targets in
+  `agent_policies` from the old id to the id Slack gave, in one
+  transaction, and drop the old id from the conversation-info cache. Any
+  other answer leaves it waiting. While it waits, the router applies the
+  agent's denies on the old id to the new one; after a day it is given up
+  and those denies are copied to the new id. When
   the agent already has a rule on the new id, the rules merge: a deny on
   either id stays a deny, and duplicates are dropped. Only an old id
   starting with `G` is expected; any other is logged and handled the same
