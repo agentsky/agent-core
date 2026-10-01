@@ -1397,7 +1397,7 @@ fn many_unclosed_wire_broadcasts_stay_linear() {
 }
 
 #[test]
-fn without_code_leaves_out_what_slack_pairs_into_code() {
+fn without_code_leaves_out_all_that_slack_might_show_as_code() {
     let cases = [
         ("`a` <@U111>", true),
         ("<@U111> `a`", true),
@@ -1409,6 +1409,8 @@ fn without_code_leaves_out_what_slack_pairs_into_code() {
         ("\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b}", false),
         ("```\n<@U111>\n```", false),
         ("``` dangling <@U111> `z`", false),
+        ("`a` <@U111> `b`", false),
+        ("```\na\n``` <@U111> ```\nb\n```", false),
     ];
     for (mrkdwn, shown) in cases {
         assert_eq!(
@@ -1429,6 +1431,9 @@ fn a_mention_slack_shows_as_code_is_left_out_whatever_rendering_and_splitting_di
         "`` `a `` @ankit `b`".to_owned(),
         "[``a`b``](https://e.x) @ankit `c`".to_owned(),
         "`a @ankit``".to_owned(),
+        "``a @ankit` b".to_owned(),
+        "a ` b\n\nc ` @ankit `` d".to_owned(),
+        "a ``` x [\\`](https://e.x) @ankit `` z".to_owned(),
         format!("{long_code} @ankit `z`"),
         format!(
             "{} ``x`y {}`` @ankit `z`",

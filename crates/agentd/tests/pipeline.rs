@@ -60,6 +60,10 @@ impl SurfaceLookup for Mocks {
         agent: AgentId,
         _conv: &ConvRef,
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        let gate = self.holds.lookups.lock().unwrap().get(&agent).cloned();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         if self.holds.unbound.lock().unwrap().contains(&agent) {
             return Ok(None);
         }
@@ -112,6 +116,7 @@ struct Holds {
     can_posts: Mutex<HashMap<AgentId, Gate>>,
     posts: Mutex<HashMap<String, Gate>>,
     unbound: Mutex<HashSet<AgentId>>,
+    lookups: Mutex<HashMap<AgentId, Gate>>,
 }
 
 impl Holds {
@@ -134,6 +139,11 @@ impl Holds {
             .entry(agent)
             .or_default()
             .push_back(error);
+    }
+
+    /// Holds every look-up of `agent`'s surface at `gate`.
+    fn lookups_of(&self, agent: AgentId, gate: &Gate) {
+        self.lookups.lock().unwrap().insert(agent, gate.clone());
     }
 
     /// Holds `agent`'s checks of whether its bot may post at `gate`.
@@ -2728,6 +2738,74 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
     stack.stop().await;
 }
 
+/// Every managed bot in these tests, for Slack's renderer: a handle names
+/// the bot user of the same id.
+struct Bots;
+
+impl render::MentionDirectory for Bots {
+    fn resolve(&self, name: &str) -> Option<String> {
+        name.starts_with('U').then(|| name.to_owned())
+    }
+}
+
+#[tokio::test]
+async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.next_turn(Turn::reply("``a @UWRITER` b"));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(1).await;
+    assert!(
+        stack.kept_hand_offs().await.is_empty(),
+        "agentd's own delivery hands nothing off"
+    );
+    let shown = render::slack::to_mrkdwn(&sent[0].1, &Bots);
+    assert!(shown.contains("<@UWRITER>"), "{shown}");
+    let writers_bot = UserId::new("UWRITER");
+    let team = core_types::TeamId::from("T1");
+    let read_by_writers_app = surface_slack::normalize::message(
+        &surface_slack::normalize::Context {
+            binding: BindingId::new_v4(),
+            bot_user: Some(&writers_bot),
+            team: &team,
+            event_id: "Ev1",
+            received_at: pinned_now(),
+        },
+        &serde_json::json!({
+            "type": "message",
+            "channel": "C1",
+            "channel_type": "channel",
+            "user": BOT,
+            "bot_id": "B0HELPER",
+            "text": shown,
+            "ts": "1727697600.000100",
+            "thread_ts": "1727697500.000050",
+            "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "`a ", "style": {"code": true}},
+                    {"type": "user", "user_id": "UWRITER"},
+                    {"type": "text", "text": "` b"},
+                ]},
+            ]}],
+        }),
+    );
+    assert_eq!(
+        read_by_writers_app.map(|event| event.mentions),
+        Err(surface_slack::normalize::Skip::NotAddressed),
+        "writer's app drops the platform's copy at the door: it mentions no one"
+    );
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert!(
+        stack.writers_hops(writer).await.is_empty(),
+        "nor does the platform's copy, read as Slack's surface reads it"
+    );
+    assert_eq!(stack.mock.posts().len(), 1);
+    stack.stop().await;
+}
+
 #[tokio::test]
 async fn ask_agent_posts_the_task_and_hands_it_off_with_the_turns_attribution() {
     let stack = start().await;
@@ -3025,37 +3103,27 @@ async fn a_hand_off_a_shutdown_cut_is_delivered_by_the_next_instance() {
 }
 
 #[tokio::test]
-async fn the_hand_off_worker_makes_what_was_let_go_due_once_more_as_it_stops() {
+async fn a_hand_off_released_at_a_cut_is_not_released_again_from_its_next_holder() {
     let stack = start().await;
     let writer = stack.other_agent("writer", "UWRITER").await;
     let busy = Gate::closed();
     stack.hand_off_behind_a_busy_writer(writer, &busy).await;
     stack.pipeline.cut_short().await;
-    let now = pinned_now();
-    let leased = stack
-        .store()
-        .take_due_hand_offs(
-            now,
-            agentd::pipeline::HAND_OFF_LEASE,
-            now - Duration::from_secs(60),
-            64,
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        leased.taken.len(),
-        1,
-        "a pass that read the hold before the cut leases it again after the cut released it"
-    );
-    let (_stop, stopping) = watch::channel(true);
-    stack.pipeline.clone().run_hand_offs(stopping).await;
+    let checking = Gate::closed();
+    stack.holds.can_posts_of(writer, &checking);
     let next = stack.another_pipeline();
+    assert_eq!(next.replay_hand_offs().await.unwrap(), 1);
+    wait_until("the next instance's job holds the row", || {
+        checking.waiting() == 1
+    })
+    .await;
+    stack.pipeline.release_cut_hand_offs().await;
     assert_eq!(
-        next.replay_hand_offs().await.unwrap(),
-        1,
-        "the worker's last release made it due at once"
+        stack.another_pipeline().replay_hand_offs().await.unwrap(),
+        0,
+        "the cut instance forgot the row it released, so a last release leaves it leased"
     );
+    checking.open();
     stack.wait_for_posts(2).await;
     next.close();
     next.drain().await;
@@ -3088,6 +3156,54 @@ async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
     busy.open();
     stack.wait_for_posts(3).await;
     stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stops() {
+    let mut stack = start_with(Setup {
+        drain_timeout_secs: 30,
+        pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+    })
+    .await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let looking = Gate::closed();
+    stack.holds.lookups_of(writer, &looking);
+    let event = stack.agents_post(BOT, "m9", "c1", &["UWRITER"]);
+    stack
+        .store()
+        .add_hand_off(
+            writer,
+            &serde_json::to_string(&event).unwrap(),
+            pinned_now(),
+            pinned_now(),
+        )
+        .await
+        .unwrap();
+    wait_until("the worker took the hand-off and holds it", || {
+        looking.waiting() == 1
+    })
+    .await;
+    let (still, _still_open) = oneshot::channel();
+    std::mem::replace(&mut stack.stop, still).send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    looking.open();
+    let Stack { task, dir, .. } = stack;
+    task.await.unwrap().unwrap();
+    let db = dir.path().join("agentd.db");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
+        .await
+        .unwrap();
+    let due: Vec<(i64,)> = sqlx::query_as("SELECT due_at FROM hand_offs")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(
+        due,
+        [(pinned_now().unix_timestamp(),)],
+        "the pass queued it on a closed pipeline after the drain's release, \
+         and the server's last release made it due at once"
+    );
 }
 
 #[tokio::test]
