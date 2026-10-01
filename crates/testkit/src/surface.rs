@@ -8,8 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use core_types::surface_trait::Result;
 use core_types::{
-    Binding, BindingId, Caps, ConvRef, Cursor, InboundEvent, LengthUnit, Limit, MessageId, Msg,
-    MsgRef, OutFile, ReplyTarget, Sender, Surface, SurfaceError, ThreadKey,
+    Binding, BindingId, Caps, ConvRef, Cursor, InboundEvent, LengthUnit, Limit, MAX_MENTIONS,
+    MessageId, Msg, MsgRef, OutFile, Posted, ReplyTarget, Sender, Surface, SurfaceError, ThreadKey,
+    UserId,
 };
 use tokio::sync::Notify;
 
@@ -152,6 +153,7 @@ struct State {
     failures: HashMap<Op, VecDeque<SurfaceError>>,
     delays: HashMap<Op, VecDeque<Duration>>,
     queues: HashMap<BindingId, Queue>,
+    usernames: HashMap<String, UserId>,
 }
 
 /// The events injected for one binding and not yet delivered.
@@ -221,6 +223,35 @@ impl MockSurface {
     /// first, replacing what was there.
     pub fn set_history(&self, thread: ThreadKey, messages: Vec<Msg>) {
         self.state().history.insert(thread, messages);
+    }
+
+    /// Makes a post's `@username` mention the user `user`, as a platform
+    /// that resolves usernames does.
+    pub fn name_user(&self, username: &str, user: UserId) {
+        self.state().usernames.insert(username.to_owned(), user);
+    }
+
+    /// The users a post of `text` mentions: each word `@name` without
+    /// trailing punctuation, read as the user [`name_user`](Self::name_user)
+    /// named `name`, or else as the user id `name`; each once, at most
+    /// [`MAX_MENTIONS`].
+    fn mentions_in(state: &State, text: &str) -> Vec<UserId> {
+        let mut found: Vec<UserId> = Vec::new();
+        for word in text.split_whitespace() {
+            let Some(name) = word.strip_prefix('@') else {
+                continue;
+            };
+            let name = name.trim_end_matches(|c: char| !c.is_alphanumeric());
+            let user = state
+                .usernames
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| UserId::from(name));
+            if !name.is_empty() && !found.contains(&user) && found.len() < MAX_MENTIONS {
+                found.push(user);
+            }
+        }
+        found
     }
 
     /// Makes the bot not a member of `conv`: see the type's docs.
@@ -362,7 +393,7 @@ impl Surface for MockSurface {
         }
     }
 
-    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
         self.pause(Op::Post).await;
         let mut state = self.begin(Op::Post, to.thread_root.as_ref())?;
         Self::check_member(&state, &to.conv)?;
@@ -376,7 +407,10 @@ impl Surface for MockSurface {
             text: text.to_owned(),
             msg: msg.clone(),
         });
-        Ok(msg)
+        Ok(Posted {
+            msg,
+            mentions: Self::mentions_in(&state, text),
+        })
     }
 
     async fn edit(&self, msg: &MsgRef, text: &str) -> Result<()> {
@@ -605,6 +639,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_post_mentions_its_at_words_each_once() {
+        let mock = MockSurface::new();
+        mock.name_user("writer", UserId::from("UWRITER"));
+        let to = target("C1", None);
+        let posted = mock
+            .post(&to, "@UBOT, ask @writer and @UBOT. mail a@b @ @UWRITER")
+            .await
+            .unwrap();
+        assert_eq!(
+            posted.mentions,
+            [UserId::from("UBOT"), UserId::from("UWRITER")]
+        );
+        assert!(mock.post(&to, "no one").await.unwrap().mentions.is_empty());
+    }
+
+    #[tokio::test]
     async fn every_call_is_logged_in_order() {
         let dir = std::env::temp_dir().join(format!("testkit-upload-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -619,8 +669,8 @@ mod tests {
         let to = target("C1", Some("1.0"));
         mock.upload(&to, std::slice::from_ref(&file)).await.unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        let first = mock.post(&to, "hello").await.unwrap();
-        let second = mock.post(&target("C2", None), "other").await.unwrap();
+        let first = mock.post(&to, "hello").await.unwrap().msg;
+        let second = mock.post(&target("C2", None), "other").await.unwrap().msg;
         mock.edit(&first, "hello again").await.unwrap();
         mock.react(&second, "eyes").await.unwrap();
 
@@ -906,7 +956,7 @@ mod tests {
             root: Some("1.0".into()),
         };
         assert_eq!(mock.history(&key, None, 5).await, Err(threads));
-        let posted = mock.post(&top, "top level").await.unwrap();
+        let posted = mock.post(&top, "top level").await.unwrap().msg;
         assert_eq!(posted.id.as_str(), "m1");
         assert_eq!(
             mock.edit(&posted, "edited").await,
@@ -951,7 +1001,7 @@ mod tests {
             mock.post(&to, "b").await,
             Err(SurfaceError::Forbidden("not_in_channel".into()))
         );
-        let posted = mock.post(&to, "c").await.unwrap();
+        let posted = mock.post(&to, "c").await.unwrap().msg;
         assert_eq!(posted.id.as_str(), "m1");
         assert_eq!(
             mock.edit(&posted, "x").await,

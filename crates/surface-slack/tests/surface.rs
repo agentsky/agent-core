@@ -427,12 +427,13 @@ async fn post_sends_one_chunk_in_the_thread() {
         .await
         .unwrap();
     assert_eq!(
-        posted,
+        posted.msg,
         MsgRef {
             conv: conv(),
             id: "1727697700.000200".into()
         }
     );
+    assert!(posted.mentions.is_empty());
     let sent = requests(&server).await;
     let post = sent
         .iter()
@@ -445,6 +446,14 @@ async fn post_sends_one_chunk_in_the_thread() {
     assert_eq!(body["unfurl_links"], false);
     assert!(body.get("link_names").is_none());
     assert!(body.get("parse").is_none());
+    let mentioning = surface
+        .post(
+            &thread("1727697600.000100"),
+            "<@U0HELPER> and <@U0HELPER|helper> <!channel>",
+        )
+        .await
+        .unwrap();
+    assert_eq!(mentioning.mentions, [UserId::from("U0HELPER")]);
 }
 
 #[tokio::test]

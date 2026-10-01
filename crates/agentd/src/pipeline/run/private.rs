@@ -489,7 +489,7 @@ impl Pipeline {
             target: ReplyTarget::from(consent.thread.clone()),
             answering: Answering::PrivateTask(consent.id),
         };
-        if !delivery.post(None, text).await {
+        if !delivery.post(None, text).await.0 {
             return Err(PipelineError::NotPosted);
         }
         tracing::info!(consent = %consent.id, "posted a private task's outcome");

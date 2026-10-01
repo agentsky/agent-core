@@ -15,7 +15,7 @@ use time::OffsetDateTime;
 
 use crate::{
     AgentId, BindingId, ConvRef, Cursor, InboundEvent, MemberKey, MessageId, MsgRef, ReplyTarget,
-    ThreadKey,
+    ThreadKey, UserId,
 };
 
 /// The result type of [`Surface`] methods.
@@ -35,7 +35,7 @@ pub trait Surface: Send + Sync {
     async fn events(&self, binding: &Binding, tx: Sender<InboundEvent>) -> Result<()>;
 
     /// Posts one message: one chunk from [`Surface::render`].
-    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef>;
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted>;
 
     /// Replaces the text of a message the bot posted.
     async fn edit(&self, msg: &MsgRef, text: &str) -> Result<()>;
@@ -130,6 +130,16 @@ pub struct InFile {
     pub size: Option<u64>,
     /// Where to download it. Downloading needs the bot's credentials.
     pub url: String,
+}
+
+/// A message [`Surface::post`] sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Posted {
+    /// Where the message landed.
+    pub msg: MsgRef,
+    /// The users the platform reads the message as mentioning: each once,
+    /// at most [`MAX_MENTIONS`](crate::MAX_MENTIONS), never a broadcast.
+    pub mentions: Vec<UserId>,
 }
 
 /// One message read back with [`Surface::history`].
@@ -406,10 +416,13 @@ mod tests {
             Ok(())
         }
 
-        async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
-            Ok(MsgRef {
-                conv: to.conv.clone(),
-                id: MessageId::new(text),
+        async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
+            Ok(Posted {
+                msg: MsgRef {
+                    conv: to.conv.clone(),
+                    id: MessageId::new(text),
+                },
+                mentions: Vec::new(),
             })
         }
 
@@ -499,7 +512,7 @@ mod tests {
             conv: conv(),
             thread_root: None,
         };
-        let posted = ready(surface.post(&target, "hi")).unwrap();
+        let posted = ready(surface.post(&target, "hi")).unwrap().msg;
         assert_eq!(posted.id.as_str(), "hi");
         assert_eq!(
             ready(surface.edit(&posted, "x")),

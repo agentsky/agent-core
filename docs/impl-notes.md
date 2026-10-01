@@ -7635,3 +7635,115 @@ reason if it wants one.
   default. Each try counts toward the card's backoff, so in a deployment
   where only some instances reach the owner, one that can may wait up to
   15 minutes for its turn.
+
+## T34: Agent-to-agent hand-off
+
+### agentd delivers its agents' mentions itself
+
+**Issue.** The plan had the Slack half wait on T32's live check of whether
+Slack delivers one app's bot post to another app, and T32 is blocked on a
+live workspace. Rocket.Chat delivers such posts, but only through the
+mentioned bot's own connection, after agentd's post returns.
+
+**Solution.** The fallback T32 describes, on every surface. Once a turn's
+posts are out, `Pipeline::hand_off` queues each one for the other managed
+agents it mentions, as the posting bot's message, and it then goes through
+routing, confirmation and the turn like any message. Only posts the turn
+recorded with its attribution qualify (its reply's chunks and its queued
+posts), so the requester and hop the router reads come from the post's own
+`message_refs` row, never from the agent, and T27's caps and the agents'
+rules apply as to any hop. A private task's delivery records its consent
+and collects nothing to hand off. A post in another conversation (an
+owner-side `post --to`) or in a one-to-one DM is left to the platform:
+agentd doesn't know the other conversation's kind, and no other agent
+answers in a one-to-one DM. A mention hands off only to an agent whose bot
+is active on the conversation's own surface and team (`agent_for_bot`),
+never to the poster, and the router then requires that agent's mention,
+the poster's attribution and the agent's rules for the requester and
+conversation, and the turn requires its bot to be able to post there.
+
+### Which users a post mentions
+
+**Issue.** agentd needs the mentions of what it posted, as the platform
+reads them, so that its own copy routes like the platform's.
+
+**Solution.** `Surface::post` returns `Posted { msg, mentions }`.
+Rocket.Chat's `chat.postMessage` response carries the server's `mentions[]`,
+read with the same helper the inbound path uses (no broadcasts, each once,
+at most `MAX_MENTIONS`). Slack's response has no parsed mentions, so the
+surface reads the `<@U…>` tokens of the text it sent, as `normalize`
+reads an event's text; the renderer turns an `@<bot user id>` into one for
+managed bots. `MockSurface` reads `@name` words, with `name_user` for
+usernames, and `FakeRest` computes `mentions` for known usernames.
+
+### A hop runs once, whichever copy arrives first
+
+**Issue.** When the platform delivers the post too, the mentioned agent
+gets it twice, in either order, and could run the hop twice.
+
+**Solution.** `Pipeline::first_hop` claims the hop in `processed_events`
+(source `hop`, keyed by the agent and the post's conversation and id, kept
+for `PROCESSED_EVENT_RETENTION`) after the decision is confirmed and just
+before acting on it, for any decision on a hop: a requester other than the
+sender, which only an attributed agent's post gives. The second copy finds
+the claim and is dropped without a word. Claiming only there keeps an
+ignored copy (one whose attribution didn't come within the two-second
+wait) from blocking the other, and keeps a copy the platform doesn't
+confirm from claiming anything; refusals and prompts are claimed too, so a
+hop-cap notice is posted once. A claim the store fails to record drops the
+hop rather than risk running it twice. No migration: `processed_events`
+already keys by source and id, and its sweep expires the claims.
+
+### The ref is still recorded after the post
+
+**Issue.** The plan asked to record the ref before posting, keyed by a
+client-generated id where the platform supports one, so the platform's
+copy finds its attribution at once.
+
+**Solution.** Not done. agentd's own copy is made after the ref is
+recorded, so it never races it; only a platform copy can arrive first, and
+it still waits up to `ATTRIBUTION_WAIT` for the row. If it gives up, it is
+ignored, and agentd's copy runs the hop. A client id would change both
+surfaces' post calls for no hop that isn't already delivered. The race test
+holds the post at a gate, sends the platform's copy before the ref exists,
+and checks the hop runs once, from that copy; the other order is checked
+with the platform's copy after the hop ran.
+
+### `ask-agent` posts after the turn
+
+**Issue.** The plan says to post the task, record it with the turn's
+requester and hop, and return at once.
+
+**Solution.** The handler queues a post to `here` in the turn's outbox,
+`@<handle> <task>`, so it goes out after the turn with the other queued
+posts, recorded with the turn's requester and hop, and hands off like any
+other post; the command returns at once and its output says so. The
+handle is the bot's user id on Slack and its username on Rocket.Chat
+(`DirectoryEntry::handle`, which `list` uses too). The agent is named by
+its name or handle, with or without `@` or Slack's `<@…|…>`, among the
+agents with a bot on the conversation's surface and team that the turn's
+requester may see (public ones and their own); a name two agents share is
+refused with their handles. It is refused outside a channel or group DM,
+for the calling agent itself, and past the turn's ten queued posts, and,
+as before, inside a private task.
+
+### Smaller choices
+
+- A hand-off is a bot's message, so past an agent's queue bounds it is
+  dropped with a warning and no busy line, as the platform's copy would
+  be.
+- The hand-off happens once the whole delivery is done, after any failure
+  notice, and before the working emoji comes off.
+- Each chunk of a long reply is its own message, so two chunks that both
+  mention an agent hand off twice, as the platform would deliver them.
+
+### Open items
+
+- Rocket.Chat's `mentions` in the `chat.postMessage` response is read as
+  the realtime stream gives it; the response shape is not verified on a
+  live server.
+- On Slack, if Slack does deliver bot posts to other apps, each duplicate
+  costs the mentioned agent one `conversations.replies` read-back before
+  it is dropped.
+- A hand-off due after shutdown began is dropped and logged; a hop the
+  platform doesn't deliver is then lost.

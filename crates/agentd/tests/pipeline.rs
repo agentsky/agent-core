@@ -21,8 +21,8 @@ use agentd::skills::{Added, Confirmed, Source};
 use agentd::{App, Config};
 use core_types::{
     AgentId, Binding, BindingId, Caps, ConvKind, ConvRef, Cursor, InboundEvent, MemberId,
-    MemberKey, MessageId, Msg, MsgRef, OutFile, ReplyTarget, ScopeKey, Sender, SessionId, Surface,
-    SurfaceError, SurfaceKind, ThreadKey, UserId, VolumeKey,
+    MemberKey, MessageId, Msg, MsgRef, OutFile, Posted, ReplyTarget, ScopeKey, Sender, SessionId,
+    Surface, SurfaceError, SurfaceKind, ThreadKey, UserId, VolumeKey,
 };
 use runner::{PoolConfig, ProcessConfig};
 use sandbox::ProcessSandbox;
@@ -145,7 +145,7 @@ impl Surface for Held {
         self.mock.events(binding, tx).await
     }
 
-    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef, SurfaceError> {
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted, SurfaceError> {
         let gate = self.holds.posts.lock().unwrap().get(text).cloned();
         if let Some(gate) = gate {
             gate.pass().await;
@@ -2287,5 +2287,286 @@ async fn reset_here_stops_the_warm_process_and_the_next_turn_starts_a_new_id() {
         2,
         "one process per session: {launched}"
     );
+    stack.stop().await;
+}
+
+impl Stack {
+    /// The bearer token of every request upstream so far, in order.
+    async fn bearers(&self) -> Vec<String> {
+        self.fake
+            .message_requests()
+            .await
+            .iter()
+            .map(|request| {
+                request.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The agent, requester and hop the post `msg` is recorded with, once
+    /// it is: the record follows the post.
+    async fn attributed(&self, msg: &MsgRef) -> (Option<AgentId>, MemberKey, u8) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(posted) = self.store().posted_message_ref(msg).await.unwrap() {
+                return (posted.agent, posted.requester.key, posted.hop.0);
+            }
+            assert!(Instant::now() < deadline, "{msg:?} was never recorded");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// `poster`'s post `id` in GENERAL's thread `root`, mentioning
+    /// `mentions`, as the platform delivers it.
+    fn agents_post(&self, poster: &str, id: &str, root: &str, mentions: &[&str]) -> InboundEvent {
+        let mut post = self.event(
+            poster,
+            "GENERAL",
+            ConvKind::Channel,
+            id,
+            Some(root),
+            mentions,
+        );
+        post.sender_is_bot = true;
+        post.sender_bot_user = Some(UserId::new(poster));
+        post
+    }
+
+    /// Waits until the mock has `count` posts, and returns them.
+    async fn wait_for_posts(&self, count: usize) -> Vec<(ReplyTarget, String, MsgRef)> {
+        wait_until(&format!("{count} posts"), || {
+            self.mock.posts().len() >= count
+        })
+        .await;
+        posts(&self.mock.calls())
+    }
+}
+
+#[tokio::test]
+async fn a_reply_that_mentions_an_agent_hands_off_until_the_hop_cap() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let reply = "@UBOT @UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(5).await;
+    let notice = "helper won't answer: this chain of agents has reached its limit of 3 hops.";
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(texts, [reply, reply, reply, reply, notice]);
+    assert!(
+        sent.iter()
+            .all(|(to, _, _)| *to == in_thread("GENERAL", Some("c1"))),
+        "{sent:?}"
+    );
+    let mut chain = Vec::new();
+    for (_, _, posted) in &sent[..4] {
+        chain.push(stack.attributed(posted).await);
+    }
+    let helper = Some(stack.agent);
+    let writer = Some(writer);
+    assert_eq!(
+        chain,
+        [
+            (helper, key("bob"), 0),
+            (writer, key("bob"), 1),
+            (helper, key("bob"), 2),
+            (writer, key("bob"), 3),
+        ],
+        "each hop inherits bob and counts one more"
+    );
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"; 4],
+        "every turn of the chain runs on bob's account"
+    );
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert_eq!(stack.mock.posts().len(), 5, "nothing follows the notice");
+    assert_eq!(
+        stack.store().posted_message_ref(&sent[4].2).await.unwrap(),
+        None,
+        "the notice is agentd's own, and hands nothing off"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn an_agents_own_hop_limit_lowers_the_cap() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack
+        .store()
+        .update_agent_settings(writer, |settings| settings.max_hops = Some(1))
+        .await
+        .unwrap();
+    let reply = "@UBOT @UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(4).await;
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            reply,
+            reply,
+            reply,
+            "writer won't answer: this chain of agents has reached its limit of 1 hops."
+        ]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_thread_token_budget_stops_a_chain() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.limits.thread_tokens_per_day = Some(1),
+        ..Setup::default()
+    })
+    .await;
+    stack.other_agent("writer", "UWRITER").await;
+    let reply = "@UBOT @UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(2).await;
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(
+        texts,
+        [
+            reply,
+            "writer won't answer here for now: agents have used this thread's daily token \
+             budget (1). Try again after midnight UTC, or in a new thread."
+        ]
+    );
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert_eq!(stack.mock.posts().len(), 2);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let reply = "@UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(2).await;
+    assert_eq!(
+        stack.attributed(&sent[1].2).await,
+        (Some(writer), key("bob"), 1),
+        "agentd handed helper's post to writer itself"
+    );
+    let platform = stack.agents_post(BOT, sent[0].2.id.as_str(), "c1", &["UWRITER"]);
+    stack.handle(platform).await;
+    assert_eq!(
+        stack.mock.posts().len(),
+        2,
+        "the platform's copy, arriving second, is dropped"
+    );
+    let gate = Gate::closed();
+    stack.holds.posts_of(reply, &gate);
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("bob", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("helper's reply waits to be posted", || gate.waiting() == 1).await;
+    let next = format!("m{}", stack.mock.posts().len() + 1);
+    sink.send(stack.agents_post(BOT, &next, "c2", &["UWRITER"]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.open();
+    let sent = stack.wait_for_posts(4).await;
+    assert_eq!(sent[2].2.id.as_str(), next);
+    assert_eq!(
+        stack.attributed(&sent[3].2).await,
+        (Some(writer), key("bob"), 1),
+        "the platform's copy, arriving before its attribution, ran the hop"
+    );
+    let unreacted = Call::Unreact {
+        msg: msg("GENERAL", "c2"),
+        emoji: "hourglass".into(),
+    };
+    wait_until("helper's turn is done with, hand-off and all", || {
+        stack.mock.calls().contains(&unreacted)
+    })
+    .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert_eq!(
+        stack.mock.posts().len(),
+        4,
+        "agentd's own copy, arriving second, is dropped"
+    );
+    assert_eq!(stack.bearers().await.len(), 4);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn ask_agent_posts_the_task_and_hands_it_off_with_the_turns_attribution() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.mock.name_user("writer", UserId::new("UWRITER"));
+    stack.next_turn(Turn::reply("Asked.").with_command([
+        "agentctl",
+        "ask-agent",
+        "writer",
+        "review",
+        "this",
+    ]));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(3).await;
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(texts, ["Asked.", "@writer review this", "Asked."]);
+    assert_eq!(
+        stack.attributed(&sent[1].2).await,
+        (Some(stack.agent), key("bob"), 0),
+        "the task is helper's post for bob's turn"
+    );
+    assert_eq!(
+        stack.attributed(&sent[2].2).await,
+        (Some(writer), key("bob"), 1),
+        "writer's turn inherits bob at the next hop"
+    );
+    assert_eq!(stack.bearers().await, vec!["Bearer token-of-bob"; 2]);
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn an_unmanaged_bots_mention_is_ignored() {
+    let stack = start().await;
+    let mut from_bot = stack.event(
+        "UOTHERBOT",
+        "GENERAL",
+        ConvKind::Channel,
+        "b1",
+        None,
+        &[BOT],
+    );
+    from_bot.sender_is_bot = true;
+    stack.handle(from_bot.clone()).await;
+    from_bot.sender_bot_user = Some(UserId::new("UOTHERBOT"));
+    from_bot.message = msg("GENERAL", "b2");
+    stack.handle(from_bot).await;
+    assert!(
+        posts(&stack.mock.calls()).is_empty(),
+        "{:#?}",
+        stack.mock.calls()
+    );
+    assert!(stack.bearers().await.is_empty(), "no turn ran");
     stack.stop().await;
 }

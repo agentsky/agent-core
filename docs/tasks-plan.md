@@ -2755,6 +2755,14 @@ Deliverables:
 Acceptance: the redacted payloads are in the PR description, and the design
 and this plan are updated.
 
+Changed by T34: agentd now delivers agent-to-agent mentions itself on every
+surface, the fallback above, without waiting for this check. Hand-off no
+longer depends on Slack delivering one app's bot post to another. This live
+check now only confirms whether that duplicate arrives; agentd drops whichever
+copy of a post reaches an agent second. If Slack delivers it, record that the
+second copy is dropped (one `conversations.replies` read-back, no second
+turn); if not, record that agentd's own delivery is the only one.
+
 ### T33
 
 **Consent cards and private tasks.** Branch `private-tasks`. Depends on
@@ -2911,6 +2919,23 @@ Acceptance:
 
 Live check (manual): on both surfaces, two agents in one thread hand off once
 and stop at the cap. That completes design milestone 5.
+
+Deviation (decided in T34): agentd delivers agent-to-agent mentions itself,
+on every surface and whether or not Slack or Rocket.Chat also deliver the
+post, instead of following T32's outcome. After a turn's posts are out, each
+one recorded with the turn's attribution, in the conversation the turn
+answered, outside a one-to-one DM, that the platform reads as mentioning other
+managed agents (Rocket.Chat's `mentions[]` in the post's response, the `<@U…>`
+tokens in what was sent to Slack), is queued for those agents as the posting
+bot's message and goes through routing and confirmation like any other. A
+platform copy of the same post is dropped by a claim in `processed_events`
+keyed by the agent and the post's message reference, taken after routing and
+confirmation and before acting, so whichever copy arrives second does
+nothing. The ref is still recorded right after the post returns, not before
+it; the platform's copy waits up to two seconds for it as before, and the race
+test shows the hop runs once in both orders. `ask-agent` posts after the turn
+with the turn's other queued posts, and is refused outside channels and group
+DMs. A private task's result never hands off.
 
 ## Phase 6 and 7: design first
 

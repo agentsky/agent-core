@@ -8,7 +8,7 @@ use time::format_description::well_known::Rfc3339;
 /// What `post` prints.
 pub const POSTED: &str = "Queued. The message is posted after this turn.\n";
 /// What `ask-agent` prints.
-pub const ASKED: &str = "Handed over. The other agent answers in this thread.\n";
+pub const ASKED: &str = "Queued. The task is posted in this thread after this turn, and the other agent answers there.\n";
 
 /// `s` on one line: control characters, line breaks included, become
 /// spaces.

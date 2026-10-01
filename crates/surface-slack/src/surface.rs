@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, MemberKey, Msg, MsgRef, OutFile,
-    ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
+    Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
 };
 use render::MentionDirectory;
 use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
@@ -376,15 +376,18 @@ impl Surface for SlackSurface {
         Err(SurfaceError::Unsupported("events"))
     }
 
-    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
         let channel = self.channel(&to.conv)?;
         let ts = self
             .api
             .post_message(channel, to.thread_root.as_ref(), text)
             .await?;
-        Ok(MsgRef {
-            conv: to.conv.clone(),
-            id: ts,
+        Ok(Posted {
+            msg: MsgRef {
+                conv: to.conv.clone(),
+                id: ts,
+            },
+            mentions: normalize::mentions(text, None),
         })
     }
 

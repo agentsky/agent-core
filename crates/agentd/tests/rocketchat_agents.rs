@@ -1026,3 +1026,32 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
     );
     running.stop().await;
 }
+
+#[tokio::test]
+async fn an_unmanaged_bots_mention_starts_no_turn() {
+    let chat = Chat::start().await;
+    let running = Running::start(&chat, "sqlite::memory:").await;
+    running.link(&chat.alice).await;
+    let helper = chat.create(&running, "alice", "helper").await;
+    let other = chat.fake.add_bot("otherbot");
+    chat.fake.add_member("GENERAL", &other);
+
+    let from_bot = chat
+        .fake
+        .seed_message("GENERAL", &other, "@helper look", None);
+    let mut message = realtime_message(&from_bot, "GENERAL", (&other, "otherbot"), "@helper look");
+    message["mentions"] = json!([{ "_id": helper }]);
+    chat.ddp.send_message(&message);
+    let after = chat.say(
+        "bob",
+        "GENERAL",
+        "@helper and you?",
+        json!({ "mentions": [{ "_id": helper }], "tmid": from_bot }),
+    );
+    chat.wait_for_reaction(&after, &helper).await;
+    assert!(
+        chat.reactors(&from_bot).is_empty(),
+        "the bot's message, answered first in the same thread, started no turn"
+    );
+    running.stop().await;
+}

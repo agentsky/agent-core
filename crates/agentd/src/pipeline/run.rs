@@ -13,15 +13,18 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use core_types::{
-    AgentId, Caps, ConsentId, ConvKind, ConvRef, CredentialRef, Hop, InboundEvent, MemberId,
-    MemberKey, MsgRef, ReplyTarget, Requester, ScopeKey, ScopeKind, SendError, Sender, SessionId,
-    Side, Sink, Surface, SurfaceError, ThreadKey, Throttle, TurnId, TurnKind,
+    AgentId, BindingId, Caps, ConsentId, ConvKind, ConvRef, CredentialRef, Hop, InboundEvent,
+    MemberId, MemberKey, MsgRef, Posted, ReplyTarget, Requester, ScopeKey, ScopeKind, SendError,
+    Sender, SessionId, Side, Sink, Surface, SurfaceError, ThreadKey, Throttle, TurnId, TurnKind,
 };
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
-use store::{Agent, CostUnknown, LimitWindow, NewMessageRef, Store, StoreError, TurnUsage};
+use store::{
+    Agent, CostUnknown, LimitWindow, NewMessageRef, PROCESSED_EVENT_RETENTION, Store, StoreError,
+    TurnUsage,
+};
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -183,7 +186,17 @@ pub struct PipelineSettings {
 ///    with the agent or they were told about the same kind of failure
 ///    within [`FAILURE_DM_INTERVAL`]; the agent's owner never is, unless
 ///    they asked.
-/// 7. [`Decision::LinkPrompt`] sends the requester a DM from the manager
+/// 7. **Hand-off.** Each post of the turn's own, its reply's chunks and the
+///    posts it queued (`agentctl post` and `ask-agent`), that is in the
+///    conversation the turn answered, outside a one-to-one DM, and that the
+///    platform reads as mentioning other managed agents, is queued for those
+///    agents as their bot's message, as the platform would deliver it. A
+///    private task's posts never are. The router gives such a hop the
+///    requester and the next hop of the post's `message_refs` row, so the
+///    hop caps, the thread's budget and the agent's rules hold. When the
+///    platform delivers the post too, whichever copy comes second is dropped
+///    once routed and confirmed: the first claims the hop in the store.
+/// 8. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
 ///    one saying their link stopped working and how to link it again, when
 ///    the agent's bot may post in the conversation; nothing runs for them.
@@ -506,15 +519,28 @@ impl Pipeline {
                 return Vec::new();
             }
         };
-        let event = Arc::new(event);
-        let thread = thread_of(&event, caps);
+        self.queue(&Arc::new(event), caps, candidates, from_bot)
+    }
+
+    /// Queues `event` for each of `candidates`, each with its owner, and
+    /// returns what completes when each is done with. A candidate whose
+    /// places are full is told nothing when `from_bot`, and otherwise gets a
+    /// busy line.
+    fn queue(
+        &self,
+        event: &Arc<InboundEvent>,
+        caps: Caps,
+        candidates: Vec<(AgentId, MemberId)>,
+        from_bot: bool,
+    ) -> Vec<oneshot::Receiver<()>> {
+        let thread = thread_of(event, caps);
         let mut waiting = Vec::new();
         for (agent, owner) in candidates {
             let (done, finished) = oneshot::channel();
             let done: Done = Arc::new(done);
             let taken = self.places(owner).is_some_and(|places| {
                 let job = Job {
-                    event: Arc::clone(&event),
+                    event: Arc::clone(event),
                     caps,
                     owner,
                     _pending: places,
@@ -532,7 +558,7 @@ impl Pipeline {
                 if let Some(quiet) = self.flooded(agent, Flood::Message) {
                     tracing::warn!(%agent, message = %event.message.id, refused_since_last_warning = quiet, "too many messages waiting; not taking this one");
                 }
-                self.notice(&event, agent, owner, caps, Notice::Busy, done);
+                self.notice(event, agent, owner, caps, Notice::Busy, done);
                 waiting.push(finished);
             }
         }
@@ -747,20 +773,58 @@ impl Pipeline {
         let Some(copy) = self.confirmed(job, agent).await else {
             return;
         };
-        if copy == *event {
-            self.act(event, agent, caps, decision).await;
-            return;
-        }
-        let Some(confirmed) = self.decide(&copy, agent, caps).await else {
-            return;
-        };
-        if !copy_stands(&decision, &confirmed) {
-            if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
-                tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message routes differently from its event; dropped it");
+        let (event, decision) = if copy == *event {
+            (event, decision)
+        } else {
+            let Some(confirmed) = self.decide(&copy, agent, caps).await else {
+                return;
+            };
+            if !copy_stands(&decision, &confirmed) {
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message routes differently from its event; dropped it");
+                }
+                return;
             }
+            (&copy, confirmed)
+        };
+        if !self.first_hop(event, agent, &decision).await {
             return;
         }
-        self.act(&copy, agent, caps, confirmed).await;
+        self.act(event, agent, caps, decision).await;
+    }
+
+    /// Whether `agent` acts on `event` for the first time, when `decision`
+    /// is on a hop: another agent's post, attributed to a requester other
+    /// than its sender. A hop reaches its agent twice when the platform
+    /// delivers the post too ([`hand_off`](Self::hand_off)), in either
+    /// order, and only the first copy claims it. Any other message is
+    /// always first. A claim the store fails to record drops the hop, so
+    /// it never runs twice.
+    async fn first_hop(&self, event: &InboundEvent, agent: AgentId, decision: &Decision) -> bool {
+        if decision
+            .requester()
+            .is_none_or(|requester| requester.key == event.sender)
+        {
+            return true;
+        }
+        let key = format!("{agent}/{}/{}", event.message.conv, event.message.id);
+        let now = (self.inner.settings.now)();
+        match self
+            .inner
+            .store
+            .mark_event_processed(HOP_SOURCE, &key, now, PROCESSED_EVENT_RETENTION)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::debug!(%agent, message = %event.message.id, "a hop's other copy was acted on already; dropped this one");
+                false
+            }
+            Err(err) => {
+                tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't claim a hop; dropped it");
+                false
+            }
+        }
     }
 
     /// The router's decision on `event` for `agent`. `None` when the store
@@ -1098,16 +1162,17 @@ impl Pipeline {
             Ok(None) => return Ok(()),
             Ok(Some(prepared)) => {
                 let owner = prepared.owner;
+                let bot = prepared.bot.clone();
                 let working = self.show_working(&surface, event, &target).await;
                 let ran = self
                     .turn(event, agent, caps, &turn, surface.as_ref(), prepared)
                     .await;
-                (Some(working), ran.map(|ran| (owner, ran)))
+                (Some(working), ran.map(|ran| (owner, bot, ran)))
             }
             Err(err) => (None, Err(err)),
         };
         let delivered = match ran {
-            Ok((owner, (session, turn_id, report))) => {
+            Ok((owner, bot, (session, turn_id, report))) => {
                 let for_owner = turn.requester.member == Some(owner);
                 self.meter(
                     agent,
@@ -1129,13 +1194,14 @@ impl Pipeline {
                     target,
                     answering: Answering::Message(&event.message),
                 };
-                delivery.report(turn_id, report).await;
+                let sent = delivery.report(turn_id, report).await;
                 let their_own_dm = event.is_dm() && event.sender == turn.requester.key;
                 if let Some(failure) = failure
                     && !their_own_dm
                 {
                     self.tell_requester(agent, &turn, failure).await;
                 }
+                self.hand_off(event, caps, agent, &bot, sent).await;
                 Ok(())
             }
             Err(err) => {
@@ -1149,6 +1215,77 @@ impl Pipeline {
             working.finish().await;
         }
         delivered
+    }
+
+    /// Delivers what `agent` posted from its bot `bot`, answering
+    /// `answered`, to the other managed agents each post mentions, as the
+    /// platform would, whether or not it does too: each post is queued as
+    /// another agent's message for the agents it mentions, then routed,
+    /// confirmed and run as any message is, so the router inherits the
+    /// requester and the next hop from the post's `message_refs` row, and
+    /// the caps and the agents' rules hold. [`first_hop`](Self::first_hop)
+    /// drops whichever copy of a post arrives second.
+    ///
+    /// Only posts recorded with the turn's attribution are in `sent`, so a
+    /// private task's never hands off. Posts in another conversation, and
+    /// any in a one-to-one DM, are left to the platform. A mention hands
+    /// off only to an agent whose bot is active on the conversation's own
+    /// surface and team.
+    async fn hand_off(
+        &self,
+        answered: &InboundEvent,
+        caps: Caps,
+        agent: AgentId,
+        bot: &MemberKey,
+        sent: Vec<Sent>,
+    ) {
+        if answered.is_dm() || sent.is_empty() {
+            return;
+        }
+        let store = &self.inner.store;
+        let binding = match store.agent_for_bot(bot).await {
+            Ok(Some((poster, binding))) if poster.id == agent => binding,
+            Ok(_) => return,
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "couldn't look up the bot of an agent's posts; not handing them off");
+                return;
+            }
+        };
+        for sent in sent {
+            if sent.target.conv != answered.conv {
+                continue;
+            }
+            let mut candidates: Vec<(AgentId, MemberId)> = Vec::new();
+            for user in &sent.posted.mentions {
+                let key = MemberKey {
+                    surface: answered.conv.surface,
+                    team: answered.conv.team.clone(),
+                    user: user.clone(),
+                };
+                match store.agent_for_bot(&key).await {
+                    Ok(Some((mentioned, _)))
+                        if mentioned.id != agent
+                            && candidates.iter().all(|(known, _)| *known != mentioned.id) =>
+                    {
+                        candidates.push((mentioned.id, mentioned.owner));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(%agent, msg = %sent.posted.msg.id, error = %err, "couldn't look up an agent a post mentions");
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                continue;
+            }
+            if self.is_closed() {
+                tracing::info!(%agent, msg = %sent.posted.msg.id, "shutting down: not handing a post off");
+                return;
+            }
+            tracing::debug!(%agent, msg = %sent.posted.msg.id, agents = candidates.len(), "handing a post off to the agents it mentions");
+            let event = Arc::new(handed_off(answered, binding, bot, sent));
+            self.queue(&event, caps, candidates, true);
+        }
     }
 
     /// What a turn of `agent` in `conv` needs before its session: its
@@ -1560,7 +1697,7 @@ async fn post_chunk(
     surface: &dyn Surface,
     target: &ReplyTarget,
     chunk: &str,
-) -> Result<MsgRef, SurfaceError> {
+) -> Result<Posted, SurfaceError> {
     match surface.post(target, chunk).await {
         Err(SurfaceError::RateLimited { retry_after }) => {
             tokio::time::sleep(retry_after.min(RETRY_WAIT_CAP)).await;
@@ -1625,6 +1762,50 @@ fn open_fence(text: &str) -> Option<&str> {
     open
 }
 
+/// Where [`Pipeline::first_hop`] records its claims among the processed
+/// events.
+const HOP_SOURCE: &str = "hop";
+
+/// The event of `sent`, which `bot`, of the binding `binding`, posted in
+/// `answered`'s conversation: as the platform would deliver it, sent by
+/// that bot, with the mentions the platform reads in it.
+fn handed_off(
+    answered: &InboundEvent,
+    binding: BindingId,
+    bot: &MemberKey,
+    sent: Sent,
+) -> InboundEvent {
+    let thread_root = sent.target.thread_root;
+    InboundEvent {
+        event_id: format!("{HOP_SOURCE}/{}", sent.posted.msg.id),
+        binding,
+        sender: bot.clone(),
+        sender_is_bot: true,
+        sender_bot_user: Some(bot.user.clone()),
+        conv: answered.conv.clone(),
+        conv_kind: answered.conv_kind,
+        reply_to: thread_root.clone().map(|id| MsgRef {
+            conv: answered.conv.clone(),
+            id,
+        }),
+        thread_root,
+        message: sent.posted.msg,
+        text: sent.text,
+        mentions: sent.posted.mentions,
+        files: Vec::new(),
+        received_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// A chunk a turn posted, recorded with the turn's attribution, that
+/// mentions someone: what [`Pipeline::hand_off`] may deliver to the agents
+/// it mentions.
+struct Sent {
+    posted: Posted,
+    text: String,
+    target: ReplyTarget,
+}
+
 /// Delivers what one turn made, as the agent's bot.
 struct Delivery<'a> {
     store: &'a Store,
@@ -1652,8 +1833,9 @@ impl Delivery<'_> {
     /// Delivers `report`: the attachments, then the reply or the failure's
     /// message, then the reactions, then the queued posts. Each part goes
     /// out whatever happened to the others; if any couldn't, the thread is
-    /// told with [`DELIVERY_FAILED_TEXT`].
-    async fn report(&self, turn: TurnId, report: TurnReport<Option<Outbox>>) {
+    /// told with [`DELIVERY_FAILED_TEXT`]. Returns the posts that may hand
+    /// off ([`Sent`]).
+    async fn report(&self, turn: TurnId, report: TurnReport<Option<Outbox>>) -> Vec<Sent> {
         let outbox = match report.finished {
             Ok(outbox) => outbox,
             Err(err) => {
@@ -1704,7 +1886,7 @@ impl Delivery<'_> {
             reply_len = reply.len(),
             "a turn ended"
         );
-        let mut complete = true;
+        let mut uploaded = true;
         if let Some(outbox) = &outbox
             && !outbox.attachments().is_empty()
             && let Err(err) = self
@@ -1713,9 +1895,10 @@ impl Delivery<'_> {
                 .await
         {
             tracing::warn!(session = %self.session, error = %err, "uploading the turn's attachments failed");
-            complete = false;
+            uploaded = false;
         }
-        complete &= self.post(Some(turn), &reply).await;
+        let (posted, mut sent) = self.post(Some(turn), &reply).await;
+        let mut complete = uploaded && posted;
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
                 self.react(answered, &emoji).await;
@@ -1730,21 +1913,27 @@ impl Delivery<'_> {
                     target: queued.to.clone(),
                     ..*self
                 };
-                complete &= target.post(Some(turn), &queued.text).await;
+                let (posted, queued_sent) = target.post(Some(turn), &queued.text).await;
+                complete &= posted;
+                sent.extend(queued_sent);
             }
         }
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
             tracing::warn!(session = %self.session, error = %err, "couldn't say part of a reply was lost");
         }
+        sent
     }
 
     /// Renders and posts Markdown `text` to the target, recording a
     /// `message_refs` row for each chunk, of `turn` if a turn made it. A
     /// chunk that can't be posted is skipped and the rest still go. Empty
-    /// text posts nothing. False if a chunk was lost.
-    async fn post(&self, turn: Option<TurnId>, text: &str) -> bool {
+    /// text posts nothing. Returns false if a chunk was lost, and the
+    /// chunks that may hand off ([`Sent`]): those recorded, not for a
+    /// private task, that mention someone.
+    async fn post(&self, turn: Option<TurnId>, text: &str) -> (bool, Vec<Sent>) {
+        let mut sent = Vec::new();
         if text.trim().is_empty() {
-            return true;
+            return (true, sent);
         }
         let mut complete = true;
         for chunk in self.surface.render(text) {
@@ -1761,7 +1950,7 @@ impl Delivery<'_> {
                 .record_message_ref(
                     &NewMessageRef {
                         session: self.session,
-                        msg: &posted,
+                        msg: &posted.msg,
                         thread_root: self.target.thread_root.as_ref(),
                         agent: Some(self.agent),
                         turn,
@@ -1775,11 +1964,24 @@ impl Delivery<'_> {
                     OffsetDateTime::now_utc(),
                 )
                 .await;
-            if let Err(err) = recorded {
-                tracing::warn!(session = %self.session, msg = %posted.id, error = %err, "recording a posted message failed");
+            match recorded {
+                Err(err) => {
+                    tracing::warn!(session = %self.session, msg = %posted.msg.id, error = %err, "recording a posted message failed");
+                }
+                Ok(_)
+                    if matches!(self.answering, Answering::Message(_))
+                        && !posted.mentions.is_empty() =>
+                {
+                    sent.push(Sent {
+                        posted,
+                        text: chunk,
+                        target: self.target.clone(),
+                    });
+                }
+                Ok(_) => {}
             }
         }
-        complete
+        (complete, sent)
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) {
@@ -1827,6 +2029,67 @@ impl Sink<InboundEvent> for PipelineSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_a_turns_own_posts_that_mention_someone_may_hand_off() {
+        let key = store::Sealer::generate_key().unwrap();
+        let store = Store::open_in_memory(store::Sealer::from_base64(&key).unwrap())
+            .await
+            .unwrap();
+        let surface = testkit::MockSurface::new();
+        let conv = ConvRef {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            conversation: "C1".into(),
+        };
+        let requester = Requester {
+            member: None,
+            key: MemberKey {
+                surface: core_types::SurfaceKind::Slack,
+                team: "T1".into(),
+                user: "U1".into(),
+            },
+        };
+        let answered = MsgRef {
+            conv: conv.clone(),
+            id: "1.1".into(),
+        };
+        let target = ReplyTarget {
+            conv,
+            thread_root: Some("1.1".into()),
+        };
+        let delivery = |answering| Delivery {
+            store: &store,
+            surface: &surface,
+            session: SessionId::new_v4(),
+            agent: AgentId::new_v4(),
+            requester: &requester,
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            target: target.clone(),
+            answering,
+        };
+        let (complete, sent) = delivery(Answering::Message(&answered))
+            .post(None, "@U2 have a look")
+            .await;
+        assert!(complete);
+        let [sent] = sent.as_slice() else {
+            panic!("one post may hand off: {}", sent.len());
+        };
+        assert_eq!(sent.text, "@U2 have a look");
+        assert_eq!(sent.posted.mentions, [core_types::UserId::from("U2")]);
+        assert_eq!(sent.target, target);
+        let (_, sent) = delivery(Answering::Message(&answered))
+            .post(None, "no one")
+            .await;
+        assert!(sent.is_empty(), "a post that mentions no one");
+        let (complete, sent) = delivery(Answering::PrivateTask(ConsentId::new_v4()))
+            .post(None, "@U2 have a look")
+            .await;
+        assert!(complete);
+        assert!(sent.is_empty(), "a private task's result never hands off");
+        assert_eq!(surface.posts().len(), 3);
+    }
 
     #[test]
     fn only_a_limits_refusal_may_differ_between_an_event_and_its_copy() {

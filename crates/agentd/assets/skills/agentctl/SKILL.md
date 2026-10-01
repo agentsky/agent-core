@@ -105,11 +105,22 @@ inside a private task.
 agentctl ask-agent <agent> <task>
 ```
 
-Hands a task to another agent through agentd's policy. The other agent
-answers in this thread, and its turn is billed to this turn's requester.
-Refused inside a private task, and when policy doesn't let this turn's
-requester use that agent. Not available yet on this server: it answers
-"not available yet".
+Hands a task to another agent. After this turn, with your other queued
+posts, your bot posts the task in this thread, mentioning that agent, so
+everyone sees the hand-off. The other agent then answers in this thread, and
+its turn is billed to this turn's requester. `<agent>` is the agent's name or
+its bot's handle in the chat, with or without the `@`.
+
+You can get the same hand-off by mentioning the other agent's bot in your
+reply. Each hand-off counts toward the community's limit on how many agents
+one request may chain through; past it, the other agent posts a one-line
+notice instead of answering.
+
+Refused inside a private task, in direct messages (only channels and group
+DMs have other agents to answer), for your own name, and when the turn
+already queued 10 posts. Not found when no agent by that name has a bot on
+this chat. The other agent's own rules and limits still apply when it gets
+the message: it may decline with a one-line notice.
 
 ## private
 
