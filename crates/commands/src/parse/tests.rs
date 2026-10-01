@@ -734,9 +734,9 @@ fn cloud_add() {
     );
     assert_eq!(token.expose_secret(), "sk-ant-oat01-abc");
 
-    let Command::Cloud(CloudCommand::Add { routine, .. }) =
-        ok(&format!("cloud add r <{FIRE}|api.anthropic.com/v1/x> t"))
-    else {
+    let Command::Cloud(CloudCommand::Add { routine, .. }) = ok(&format!(
+        "cloud add r <{FIRE}|api.anthropic.com/v1/x> sk-ant-t"
+    )) else {
         panic!()
     };
     assert_eq!(routine.routine_id().as_str(), "trig_01AB");
@@ -751,24 +751,47 @@ fn cloud_add() {
         &format!("Missing `<routine>`, `<url>`, `<token>`.\n{usage}"),
     );
     invalid(
-        &format!("cloud add r {FIRE} t extra"),
+        &format!("cloud add r {FIRE} sk-ant-t extra"),
         &format!("Too many arguments.\n{usage}"),
     );
     invalid(
-        &format!("cloud add -r {FIRE} t"),
+        &format!("cloud add -r {FIRE} sk-ant-t"),
         &format!(
             "A routine's label is 1 to 64 characters, each an ASCII letter, a digit or ._/-, \
              starting with a letter or a digit.\n{usage}"
         ),
     );
     invalid(
-        "cloud add r https://api.anthropic.com/v1/claude_code/routines/trig_1/fire/ t",
+        "cloud add r https://api.anthropic.com/v1/claude_code/routines/trig_1/fire/ sk-ant-t",
         &format!(
             "A routine's URL is its API trigger's URL from claude.ai/code/routines, \
              https://api.anthropic.com/v1/claude_code/routines/trig_…/fire, \
              with nothing before or after it.\n{usage}"
         ),
     );
+}
+
+#[test]
+fn a_routine_token_must_look_like_one() {
+    let rule = "A routine's token is the sk-ant-… token its API trigger showed when you \
+                generated it.\nUsage: `cloud add <routine> <url> <token>`";
+    let long = format!("sk-ant-{}", "a".repeat(1_100));
+    for bad in [
+        "t",
+        "SECRET",
+        "xoxb-1-SECRET",
+        "sk-ant-oat01-SECRET\u{7}",
+        "sk-ant-oat01-SECRETé",
+        long.as_str(),
+    ] {
+        let err = fail(&format!("cloud add r {FIRE} {bad}"));
+        assert_eq!(err.to_string(), rule, "{bad:?}");
+        assert!(err.is_secret_bearing(), "{bad:?}");
+    }
+    assert!(matches!(
+        ok(&format!("cloud add r {FIRE} sk-ant-oat01-Ab_9-x")),
+        Command::Cloud(CloudCommand::Add { .. })
+    ));
 }
 
 #[test]
@@ -963,7 +986,7 @@ fn every_command_has_its_own_help_line() {
         "admin slack",
         &format!("approve {CONSENT}"),
         &format!("decline {CONSENT}"),
-        &format!("cloud add r {FIRE} t"),
+        &format!("cloud add r {FIRE} sk-ant-t"),
         "cloud run r task",
         "cloud list",
         "cloud rm r",

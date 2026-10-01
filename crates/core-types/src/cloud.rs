@@ -1,8 +1,10 @@
 //! Cloud hand-off: [`RoutineId`], the id of a Claude Code routine whose API
-//! trigger a member registered.
+//! trigger a member registered, and [`RoutineToken`], that trigger's token.
 
 use std::fmt;
 use std::str::FromStr;
+
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::ParseError;
 
@@ -64,6 +66,73 @@ impl fmt::Display for RoutineId {
 
 crate::serde_as_string!(RoutineId);
 
+/// The prefix every routine token starts with: routine tokens are
+/// `sk-ant-oat01-…`, and only the family is required, in case the version
+/// changes.
+const TOKEN_PREFIX: &str = "sk-ant-";
+/// The longest routine token accepted, in bytes.
+const TOKEN_MAX: usize = 1024;
+
+/// A routine's API trigger token: `sk-ant-` and printable ASCII, at most
+/// 1024 bytes, so it can always go into an `Authorization` header.
+///
+/// It is checked once, by [`parse`](Self::parse), wherever it comes from:
+/// the `cloud add` command, the store opening it, the fire request taking
+/// it. `Debug` redacts it, it has no `Display` or serde form, and its
+/// memory is wiped on drop.
+///
+/// ```
+/// use core_types::RoutineToken;
+/// use secrecy::{ExposeSecret, SecretString};
+///
+/// let token = RoutineToken::parse(SecretString::from("sk-ant-oat01-abc")).unwrap();
+/// assert_eq!(token.expose_secret(), "sk-ant-oat01-abc");
+/// assert!(!format!("{token:?}").contains("abc"));
+/// assert!(RoutineToken::parse(SecretString::from("abc")).is_err());
+/// ```
+#[derive(Clone)]
+pub struct RoutineToken(SecretString);
+
+impl RoutineToken {
+    /// Checks `token` against the rule, without repeating it in the error.
+    ///
+    /// # Errors
+    ///
+    /// A [`ParseError`] if it doesn't start with `sk-ant-`, holds anything
+    /// but printable ASCII, or is longer than 1024 bytes.
+    pub fn parse(token: SecretString) -> Result<Self, ParseError> {
+        let text = token.expose_secret();
+        let valid = text.starts_with(TOKEN_PREFIX)
+            && text.len() <= TOKEN_MAX
+            && text.bytes().all(|b| b.is_ascii_graphic());
+        if valid {
+            Ok(Self(token))
+        } else {
+            Err(ParseError::new(
+                "routine token",
+                "not sk-ant- and at most 1024 printable ASCII characters",
+            ))
+        }
+    }
+
+    /// The token as a [`SecretString`], for sealing.
+    pub fn as_secret(&self) -> &SecretString {
+        &self.0
+    }
+}
+
+impl ExposeSecret<str> for RoutineToken {
+    fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl fmt::Debug for RoutineToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RoutineToken([REDACTED])")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +166,35 @@ mod tests {
         ] {
             let err = bad.parse::<RoutineId>().unwrap_err();
             assert_eq!(err.what(), "routine id", "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn routine_tokens_are_sk_ant_and_printable_ascii() {
+        let longest = format!("sk-ant-{}", "a".repeat(TOKEN_MAX - 7));
+        for ok in ["sk-ant-oat01-Ab_9-x", "sk-ant-", longest.as_str()] {
+            let token = RoutineToken::parse(SecretString::from(ok)).unwrap();
+            assert_eq!(token.expose_secret(), ok);
+            assert_eq!(token.as_secret().expose_secret(), ok);
+            assert_eq!(format!("{token:?}"), "RoutineToken([REDACTED])");
+        }
+        let too_long = format!("{longest}a");
+        for bad in [
+            "",
+            "t",
+            "SK-ANT-oat01-x",
+            "xoxb-1-x",
+            "sk-ant-oat01-x\u{7}",
+            "sk-ant-oat01-é",
+            "sk-ant-oat01 x",
+            too_long.as_str(),
+        ] {
+            let err = RoutineToken::parse(SecretString::from(bad)).unwrap_err();
+            assert_eq!(err.what(), "routine token", "{bad:?}");
+            assert_eq!(
+                err.reason(),
+                "not sk-ant- and at most 1024 printable ASCII characters"
+            );
         }
     }
 

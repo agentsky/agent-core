@@ -10,7 +10,7 @@ use reqwest::{Client, Response, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
-use store::CloudOutcome;
+use store::{CloudOutcome, CloudUnknownReason};
 
 use crate::config::{CloudConfig, ConfigError};
 
@@ -145,7 +145,17 @@ impl From<&FireOutcome> for CloudOutcome {
                 error_type,
                 retry_after_secs,
             },
-            FireOutcome::Unknown { status, reason: _ } => Self::Unknown { status },
+            FireOutcome::Unknown { status, reason } => Self::Unknown {
+                status,
+                reason: match reason {
+                    UnknownReason::ServerError => CloudUnknownReason::ServerError,
+                    UnknownReason::Redirect => CloudUnknownReason::Redirect,
+                    UnknownReason::OtherStatus => CloudUnknownReason::OtherStatus,
+                    UnknownReason::Timeout => CloudUnknownReason::Timeout,
+                    UnknownReason::ConnectionLost => CloudUnknownReason::ConnectionLost,
+                    UnknownReason::Unreadable => CloudUnknownReason::UnreadableAnswer,
+                },
+            },
         }
     }
 }

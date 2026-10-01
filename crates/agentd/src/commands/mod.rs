@@ -837,7 +837,8 @@ impl Commands {
             "Your message looked like it held a secret (a login code, an API key or a token), \
              and others can read the room you posted it in. If it did, that secret is no longer \
              private: I cancelled any pending login, so start again with {}, and revoke any key \
-             or token you posted. Send secrets only {}.\n\n{err}",
+             or token you posted (a routine token with **Regenerate** or **Revoke** at \
+             claude.ai/code/routines). Send secrets only {}.\n\n{err}",
             origin.command("login"),
             origin.private_place(),
         )

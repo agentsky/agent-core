@@ -11,10 +11,10 @@ use std::error::Error as _;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use core_types::ConsentId;
+use core_types::{ConsentId, RoutineToken};
 use secrecy::SecretString;
 
-use crate::cloud::{parse_routine_label, parse_routine_url};
+use crate::cloud::{parse_routine_label, parse_routine_token, parse_routine_url};
 use crate::help::{self, SPECS, Spec};
 use crate::names::{
     Reason, parse_agent_name, parse_skill_name, parse_skill_source, parse_target, parse_user,
@@ -370,8 +370,8 @@ enum CloudCmd {
         label: RoutineLabel,
         #[arg(value_name = "url", value_parser = parse_routine_url)]
         routine: RoutineUrl,
-        #[arg(value_name = "token")]
-        token: String,
+        #[arg(value_name = "token", value_parser = parse_routine_token)]
+        token: RoutineToken,
     },
     Run {
         #[arg(value_name = "routine", value_parser = parse_routine_label)]
@@ -488,7 +488,7 @@ impl Cmd {
                 } => CloudCommand::Add {
                     label,
                     routine,
-                    token: token.into(),
+                    token,
                 },
                 CloudCmd::Run { label, task } => CloudCommand::Run { label, task },
                 CloudCmd::List => CloudCommand::List,

@@ -923,8 +923,11 @@ from the pasted URL. The URL's path must be exactly
 `/v1/claude_code/routines/<routine id>/fire`, with no dot segments in the
 text as pasted, and its origin must be that of `[cloud] base_url`
 (`https://api.anthropic.com` by default; `http` and a port only for a
-loopback `base_url`, which is what tests use). agentd builds the URL again
-from `base_url` for each request and follows no redirects. So a member can't
+loopback `base_url`, which is what tests use). agentd keeps that origin
+with the routine and refuses to fire it once `base_url`'s origin differs,
+so pointing `base_url` at a test server later sends it no stored token.
+agentd builds the URL again from `base_url` for each request and follows no
+redirects. So a member can't
 point agentd's request, token and all, at another host: Rocket.Chat and
 MongoDB share agentd's `egress` network.
 
@@ -1012,27 +1015,29 @@ it knows.
 Two tables, both in the store:
 
 - `cloud_routines`: an id, the member, the label, the routine id (with its
-  `trig_` prefix), the sealed token, who added it (the identity) and when.
-  One label and one routine id per member. A row is deleted by `cloud rm`,
-  by the member's `logout`, and when Slack reports the member deleted, as
-  configuration tokens are; that last one sends no reply, since there is no
-  one to reply to. A deletion acts on the member, not the identity, so a
-  member Slack reports deleted loses every routine and hand-off they have,
-  those registered from Rocket.Chat included. agentd can't revoke a token at Anthropic, which has no
-  public API for it[^cc-routines-fire], so the other replies tell the member
-  to revoke it at claude.ai/code/routines.
+  `trig_` prefix), the fire URL's origin, the sealed token, who added it (the
+  identity) and when. One label and one routine id per member. A row is
+  deleted by `cloud rm`, by the member's `logout`, and when Slack reports the
+  member deleted, as configuration tokens are; that last one sends no reply,
+  since there is no one to reply to. A deletion acts on the member, not the
+  identity, so a member Slack reports deleted loses every routine and hand-off
+  they have, those registered from Rocket.Chat included. agentd can't revoke a
+  token at Anthropic, which has no public API for it[^cc-routines-fire], so
+  the other replies tell the member to revoke it at claude.ai/code/routines.
 - `cloud_handoffs`: an id, the member, the routine's label and id (copied, so
   the record outlives the routine's row), the identity that asked and the
   kind of command origin, the sealed task text, the state (`sending`,
   `fired`, `rejected` or `unknown`), the HTTP status, the error type and any
-  `Retry-After`, the session id and URL, when it was asked and answered, and
+  `Retry-After`, why an `unknown` outcome isn't known, the session id and URL, when it was asked and answered, and
   the notice's state. `cloud list` shows each task's first line, cut to 60
   characters, as literal text. Rows are deleted 90 days after they were
   asked (`[cloud] retention_days`), and with the member's routines on
   `logout`.
 
 Sealed columns use their table, column and row as associated data, like
-every sealed column. The task is kept because a member should be able to see
+every sealed column, and the member as well: a token also with its routine
+id and origin, so a row moved to another member, or pointed at another
+routine or origin, no longer opens. The task is kept because a member should be able to see
 what was sent on their account in their name, as a consent keeps its task.
 
 A fire runs at most once. The row is written as `sending` before the
@@ -1057,10 +1062,14 @@ The member hears each outcome once:
   was removed still goes out; they then use the defaults, 30 seconds for
   `timeout_secs` and 90 days for `retention_days`.
 - An answer that arrives for a row already marked `unknown`, when recording
-  it was held up, is still recorded: `unknown` becomes `fired` with the
-  session's id and link, or `rejected` with its status, and a notice not
-  yet claimed is marked done. Nothing retries a record that failed: such a
-  row stays `unknown`, and the reply already said what happened.
+  it was held up, is still recorded while its notice hasn't gone out:
+  `unknown` becomes `fired` with the session's id and link, or `rejected`
+  with its status, a late `unknown` keeps the row as it is, and either way
+  the notice is marked done, since the reply tells the member. Once the
+  notice has gone out the row stays `unknown`, and the reply still carries
+  the outcome. Nothing retries a record that failed: such a row stays
+  `unknown`, and the reply already said what happened. The purge keeps a
+  row whose notice is still owed.
 
 Logs carry the command's name, the member, routine and hand-off ids, the
 state, the status and the session id. Never the token, the task text, or
@@ -1210,6 +1219,7 @@ erDiagram
         uuid id
         text label
         text routine_id
+        text url_origin
         bytes token_enc
         text added_by
         timestamp added_at
@@ -1231,8 +1241,8 @@ erDiagram
         timestamp answered_at
         int notice_attempts
         timestamp notice_next_attempt_at
-        timestamp notice_leased_until
         timestamp notified_at
+        text unknown_reason
     }
     VOLUME {
         text scope_key
