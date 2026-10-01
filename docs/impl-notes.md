@@ -7855,9 +7855,9 @@ that holds it by then. A drain cut by its timeout while its release is in
 flight may have committed it without forgetting the rows, and
 `cut_short` then releases them again a few milliseconds later; a row
 another instance took in between has its lease reset, which the claim
-keeps from running twice. A forced shutdown skips the server's last
-release, and a second signal cuts it short, leaving those rows to their
-lease. A pass whose re-lease of a row commits after the
+keeps from running twice. The server's last release gets a second on a
+forced shutdown, and otherwise runs until a second signal; one cut short
+leaves those rows to their lease. A pass whose re-lease of a row commits after the
 cut released it leaves that row to its lease, five minutes at most. The
 sweep interval is `PipelineSettings::hand_off_sweep` (30 s), so a test
 drives the server's worker through a drain. A hand-off past

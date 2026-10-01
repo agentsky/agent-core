@@ -2791,10 +2791,11 @@ async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
             ]}],
         }),
     );
-    let mut copy = stack.agents_post(BOT, sent[0].2.id.as_str(), "c1", &[]);
-    copy.text = shown.clone();
-    copy.mentions = read_by_writers_app.map_or_else(|_| Vec::new(), |event| event.mentions);
-    stack.handle(copy).await;
+    assert_eq!(
+        read_by_writers_app.map(|event| event.mentions),
+        Err(surface_slack::normalize::Skip::NotAddressed),
+        "writer's app drops the platform's copy at the door: it mentions no one"
+    );
     stack.pipeline.close();
     stack.pipeline.drain().await;
     assert!(

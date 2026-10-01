@@ -75,8 +75,9 @@
 //!   escaping of `&`, `<` and `>` lengthens the text a member typed, `&`
 //!   to five characters, so a cut in characters of the escaped text could
 //!   cut a real message short; a cut in bytes keeps the same bound and
-//!   more of the message. A mention past the cut is still read from
-//!   `blocks`, where Slack's clients put each one too.
+//!   more of the message. A person's mention past the cut is still read
+//!   from `blocks`, where Slack's clients put each one too; a bot's
+//!   mentions are read from `text` alone.
 //! - Mentions to the first [`MAX_MENTIONS`] different users, each an id
 //!   [`is_user_id`] accepts; the router looks each one up.
 //! - Files to the first [`MAX_FILES`] the bot can download, each with an id

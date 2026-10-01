@@ -2743,7 +2743,9 @@ Deliverables:
   1. Agent A posts `<@B>` in a channel both are in, at top level and in a
      thread.
   2. Record whether B's app receives the `message.channels` event, with which
-     `subtype`, `bot_id` and `user` fields. Redact the payload.
+     `subtype`, `bot_id` and `user` fields, and whether it carries `blocks`
+     Slack made from A's text-only post (T34 reads a bot's mentions from its
+     text alone either way). Redact the payload.
 - Update `docs/design.md`: the table row, the open question, and footnote
   `slack-botmention`, with the result and date.
 - If Slack doesn't deliver it, propose the fallback in the same PR, and change
@@ -2926,7 +2928,9 @@ post, instead of following T32's outcome. Each of a turn's posts in the
 thread the turn answered, outside a one-to-one DM and a private task, hands
 off to the other managed agents the platform reads it as mentioning
 (Rocket.Chat's `mentions[]` in the post's response, the `<@U…>` tokens in
-what was sent to Slack outside what Slack shows as code), each agent once for the turn: the hand-off is
+what was sent to Slack, but none with a backtick both before and after it,
+even one Slack shows as text, and a bot's copy read from its text alone),
+each agent once for the turn: the hand-off is
 recorded in `hand_offs` as the post is, and once the delivery is done it is
 queued for that agent as the posting bot's message and goes through routing
 like any other, without a read-back. Only those posts carry attribution

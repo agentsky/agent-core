@@ -529,7 +529,8 @@ impl Surface for SlackSurface {
     /// 3. The message is read back whole with [`WebApi::message`], in the
     ///    thread the event names, and normalized with
     ///    [`normalize::read_back`], the ingress's rules, with this binding's
-    ///    bot user: subtypes, sender, mentions from `text` and `blocks`,
+    ///    bot user: subtypes, sender, mentions (from `text` and `blocks`,
+    ///    a bot's from `text` alone, none with a backtick on each side),
     ///    thread, files and whether the message addresses the bot: outside
     ///    a one-to-one DM, a mention of the bot or a thread reply under its
     ///    root. A bot known only by its bot id is named by its user, as
