@@ -3129,15 +3129,20 @@ Acceptance, as tests named after the rules:
 - `old_handoffs_are_purged`.
 
 Decided in T35a ([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
-`finish_cloud_handoff` takes a row that is `sending`, or `unknown` whose
-notice hasn't told the member, and always marks the notice done; a late
-`unknown` keeps the row and only marks it. `cloud_routines` also keeps the
+`finish_cloud_handoff` takes a row that is `sending`, or `unknown` because
+the pass gave up on it (`unknown_reason` `no_answer`), once, and marks the
+notice done if it hasn't gone out; a late `unknown` keeps the row with its
+own reason. `cloud_routines` also keeps the
 fire URL's origin (`url_origin`), which `put_cloud_routine` takes and T35c
-compares with `base_url`'s before each fire. Sealed values are bound to the
-member as well as the row. `cloud add`'s token must start with `sk-ant-`
+compares with `base_url`'s before each fire, parsing the stored origin
+rather than comparing strings. Sealed values are bound to the member as
+well as the row, and a token to its routine id, label and origin too. T35c
+answers a stored token that reads as `Corrupt` (one that no longer passes
+`RoutineToken::parse`) by asking the member to `cloud add` the routine
+again, which replaces the row without reading the old token. `cloud add`'s token must start with `sk-ant-`
 and be printable ASCII, checked once by `core_types::RoutineToken::parse`.
 `purge_cloud_handoffs(before, now)` keeps a row whose notice is still
-owed. The shared types are `core_types::RoutineId`, `RoutineToken`,
+owed, and a `sending` row. The shared types are `core_types::RoutineId`, `RoutineToken`,
 `CloudRoutineId` and `CloudHandoffId`, and the store's `CloudOrigin`,
 `CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a `u32`, and
 `Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
@@ -3320,9 +3325,13 @@ link. Record the response and the session URL's form; what a paused routine,
 a wrong token, a linked member's OAuth token and a missing `anthropic-beta`
 get from the endpoint; what it answers with the account out of usage, its
 GitHub connection removed and, if one is at hand, its subscription paused;
-and whether any of those started a session; and whether routine ids are
-case-insensitive (if so, normalize them, since `trig_AB` and `trig_ab` would
-register one routine under two labels). Update the design's
+and whether any of those started a session; whether tokens are still
+`sk-ant-oat01-…`, as the reference says, since `RoutineToken` requires the
+`sk-ant-` family; and whether routine ids are case-insensitive (if so,
+normalize them, since `trig_AB` and `trig_ab` would register one routine
+under two labels; a token's associated data holds the stored routine id, so
+normalize when parsing new ones, and re-seal stored rows in Rust with the
+master key, never with a SQL `UPDATE`). Update the design's
 [Verified and assumed](design.md#verified-and-assumed) and failure table
 with the result and date. That completes design milestone 6.
 

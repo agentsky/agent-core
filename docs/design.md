@@ -1036,9 +1036,10 @@ Two tables, both in the store:
 
 Sealed columns use their table, column and row as associated data, like
 every sealed column, and the member as well: a token also with its routine
-id and origin, so a row moved to another member, or pointed at another
-routine or origin, no longer opens. The task is kept because a member should be able to see
-what was sent on their account in their name, as a consent keeps its task.
+id, label and origin, so a row moved to another member, or pointed at
+another routine, label or origin, no longer opens. The task is kept because
+a member should be able to see what was sent on their account in their
+name, as a consent keeps its task.
 
 A fire runs at most once. The row is written as `sending` before the
 request, and the request is sent once and never retried; only the member,
@@ -1061,15 +1062,17 @@ The member hears each outcome once:
   even when `[cloud]` is absent, so a notice owed from before the section
   was removed still goes out; they then use the defaults, 30 seconds for
   `timeout_secs` and 90 days for `retention_days`.
-- An answer that arrives for a row already marked `unknown`, when recording
-  it was held up, is still recorded while its notice hasn't gone out:
-  `unknown` becomes `fired` with the session's id and link, or `rejected`
-  with its status, a late `unknown` keeps the row as it is, and either way
-  the notice is marked done, since the reply tells the member. Once the
-  notice has gone out the row stays `unknown`, and the reply still carries
-  the outcome. Nothing retries a record that failed: such a row stays
+- An answer that arrives for a row the pass marked `unknown`, when
+  recording it was held up, is still recorded, once, whether or not the
+  notice has gone out: `unknown` becomes `fired` with the session's id and
+  link, or `rejected` with its status, and a late `unknown` keeps the row
+  with its own reason. A notice not yet sent is marked done, since the
+  reply tells the member; one a claim is sending at that moment may still
+  arrive besides the reply. An `unknown` the reply itself recorded takes no
+  later answer. Nothing retries a record that failed: such a row stays
   `unknown`, and the reply already said what happened. The purge keeps a
-  row whose notice is still owed.
+  row whose notice is still owed, and a `sending` row the pass hasn't
+  marked yet.
 
 Logs carry the command's name, the member, routine and hand-off ids, the
 state, the status and the session id. Never the token, the task text, or
@@ -1099,7 +1102,7 @@ the pasted URL as typed.
 Verified, from the documentation on 2026-10-01: everything in
 [What Claude Code documents](#what-claude-code-documents), the routine
 endpoint's request, response, documented errors, limits and token scope,
-the untrusted wrapping of fired text, how routines clone and push, and the
+its tokens' `sk-ant-oat01-` prefix, the untrusted wrapping of fired text, how routines clone and push, and the
 GitHub proxy's limits.
 
 Assumed, until the live check in the plan's implementation tasks:
@@ -1990,7 +1993,7 @@ Direct calls would also need our own agent loop.
 [^cc-headless]: [Run Claude Code programmatically](https://code.claude.com/docs/en/headless): `-p` rejects `--cloud` with a task description.
 [^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web): `--cloud`, follow-ups with `-p`, `--teleport`, the GitHub connection options, and that `--cloud` needs a claude.ai sign-in.
 [^cc-selfhosted-test]: [Test self-hosted environments end to end](https://code.claude.com/docs/en/self-hosted-environments-testing): headless creation with `--environment`, the Stop-hook read-back, and the `user:sessions:claude_code` scope capped at 30 days.
-[^cc-routines-fire]: [Trigger a routine through the API](https://platform.claude.com/docs/en/api/claude-code/routines-fire): the `/fire` request, the optional beta header, the 65,536-character `text`, the response, errors, no idempotency key, rate limits, and the token scoped to one routine with no read access, which only the web UI generates, regenerates or revokes. Experimental.
+[^cc-routines-fire]: [Trigger a routine through the API](https://platform.claude.com/docs/en/api/claude-code/routines-fire): the `/fire` request, the optional beta header, the 65,536-character `text`, the response, errors, no idempotency key, rate limits, and the token scoped to one routine with no read access, prefixed `sk-ant-oat01-`, which only the web UI generates, regenerates or revokes. Experimental.
 [^cc-routines]: [Automate work with routines](https://code.claude.com/docs/en/routines): API triggers, the dated beta header and its migration window, the `routine-fire-payload` wrapping of fired text, connectors included by default, cloning from the default branch unless the prompt says otherwise, `claude/` branches, skipped runs while GitHub is disconnected, the run list's status, usage and hourly limits.
 [^cc-cloud-env]: [Configure cloud environments](https://code.claude.com/docs/en/cloud-environments#github-proxy): the GitHub proxy keeps credentials outside the VM, limits `git push` to the working branch and the API to the session's repositories.
 [^slack-connect]: [Slack Connect guide](https://slack.com/help/articles/115004151203-Slack-Connect-guide--Work-with-external-organizations).

@@ -685,9 +685,14 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
             .unwrap()
     );
     assert!(
-        !finish(&store, told, &fired("session_after_notice"), 310).await,
-        "the notice already told the member"
+        finish(&store, told, &fired("session_after_notice"), 310).await,
+        "a late answer is recorded after the notice too"
     );
+    let row = handoff(&store, ada, told).await;
+    assert_eq!(row.state, CloudHandoffState::Fired);
+    assert_eq!(row.session_id.as_deref(), Some("session_after_notice"));
+    assert_eq!(row.notified_at, Some(at(301)), "the notice's time is kept");
+    assert!(!finish(&store, told, &fired("session_again"), 320).await);
 
     assert!(!finish(&store, CloudHandoffId::new_v4(), &fired("session_9"), 1).await);
 }
@@ -958,7 +963,8 @@ async fn old_handoffs_are_purged() {
     let ada = member(&store, "ada").await;
     let old = begin(&store, ada, "t", 100).await;
     assert!(finish(&store, old, &fired("session_1"), 110).await);
-    begin(&store, ada, "t", 50).await;
+    let rejected_early = begin(&store, ada, "t", 50).await;
+    assert!(finish(&store, rejected_early, &rejected(404), 60).await);
     let kept = begin(&store, ada, "t", 200).await;
     assert_eq!(
         store.purge_cloud_handoffs(at(200), at(300)).await.unwrap(),
@@ -1011,9 +1017,59 @@ async fn a_routine_keeps_the_origin_it_was_registered_with() {
         .execute(&store.pool)
         .await
         .unwrap();
+    let err = store.cloud_routine(ada, "r").await.unwrap_err();
     assert!(
-        store.cloud_routine(ada, "r").await.is_err(),
-        "a token is bound to its origin"
+        matches!(
+            err,
+            StoreError::Seal {
+                table: "cloud_routines",
+                column: "token_enc",
+                source: SealError::Decrypt,
+            }
+        ),
+        "a token is bound to its origin: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_is_bound_to_its_label() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "deploy", "trig_1", "DEPLOY", 10).await;
+    put(&store, ada, "prod", "trig_2", "PROD", 10).await;
+    sqlx::query(
+        "UPDATE cloud_routines SET label = CASE label WHEN 'deploy' THEN 'x' ELSE 'deploy' END",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let err = store.cloud_routine(ada, "deploy").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Seal {
+                source: SealError::Decrypt,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_stale_pass_reads_only_sending_rows() {
+    let store = memory_store().await;
+    let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN UPDATE cloud_handoffs SET state = 'unknown' \
+         WHERE state = 'sending' AND created_at < 1",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    assert!(
+        plan.iter()
+            .any(|row| row.3.contains("cloud_handoffs_sending")),
+        "{plan:?}"
     );
 }
 
@@ -1021,6 +1077,17 @@ async fn a_routine_keeps_the_origin_it_was_registered_with() {
 async fn a_purge_keeps_a_notice_still_owed() {
     let store = memory_store().await;
     let ada = member(&store, "ada").await;
+    let sending = begin(&store, ada, "t", 50).await;
+    assert_eq!(
+        store.purge_cloud_handoffs(at(500), at(500)).await.unwrap(),
+        0,
+        "a row the pass hasn't marked yet is kept"
+    );
+    assert!(finish(&store, sending, &fired("session_0"), 60).await);
+    assert_eq!(
+        store.purge_cloud_handoffs(at(500), at(500)).await.unwrap(),
+        1
+    );
     let owed = unknown(&store, ada, 1_000).await;
     let day = 24 * 60 * 60;
     assert_eq!(

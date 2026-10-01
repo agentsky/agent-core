@@ -6,9 +6,9 @@
 -- (`url_origin`, as `url::Origin::ascii_serialization` writes it, so a fire
 -- can be refused once `[cloud] base_url` points elsewhere), and its API
 -- trigger's token, sealed with
--- `cloud_routines/token_enc/<member>:<id>:<routine id>:<url origin>` as
--- associated data, so a row moved to another member, or given another
--- routine id or origin, no longer opens. `added_by` is the identity that
+-- `cloud_routines/token_enc/<member>:<id>:<routine id>:<label>:<url
+-- origin>` as associated data, so a row moved to another member, or given
+-- another routine id, label or origin, no longer opens. `added_by` is the identity that
 -- registered it, a member key's string form. A member holds a label once
 -- and a routine id once; registering an existing label again replaces that
 -- row in place, keeping its id.
@@ -28,8 +28,8 @@
 -- once like the relink notices: `notice_attempts` counts claims, and
 -- `notice_next_attempt_at` holds a claim's lease or a failed send's
 -- backoff. `notified_at` says the member was told the outcome, by the
--- command's reply or by the notice; a late answer is recorded only while
--- it is empty.
+-- command's reply or by the notice. A row the pass marked
+-- (`unknown_reason` `no_answer`) still takes one late answer.
 
 CREATE TABLE cloud_routines (
     id TEXT PRIMARY KEY NOT NULL,
@@ -77,6 +77,9 @@ CREATE TABLE cloud_handoffs (
 CREATE INDEX cloud_handoffs_by_member ON cloud_handoffs (member_id, created_at);
 
 CREATE INDEX cloud_handoffs_by_created_at ON cloud_handoffs (created_at);
+
+CREATE INDEX cloud_handoffs_sending ON cloud_handoffs (created_at)
+    WHERE state = 'sending';
 
 CREATE INDEX cloud_handoffs_notices ON cloud_handoffs (notice_next_attempt_at)
     WHERE state = 'unknown' AND notified_at IS NULL;

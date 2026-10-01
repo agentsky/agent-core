@@ -7980,12 +7980,11 @@ answer.
 
 ## T35a: Cloud hand-off: store and grammar
 
-### A late answer marks the notice done, and takes the row only while it is owed
+### A late answer is recorded once, on a row the pass marked
 
 **Issue.** The plan records `fired`, `rejected` or `unknown` from
 `sending`, and `fired` or `rejected` from `unknown`, marking the notice
-done "unless a notice claim's lease is live". Three things went wrong with
-taking that literally:
+done "unless a notice claim's lease is live". Taken literally:
 
 - A late `unknown`, such as a reply that timed out and whose record was
   held up past the pass, was refused. Its notice then stayed owed, and the
@@ -7999,14 +7998,24 @@ taking that literally:
 - An `unknown` the command's own reply recorded could still be turned into
   `fired` later, although only a row the pass marked waits on an answer.
 
+A second version took a late answer only while the notice hadn't gone out.
+Review showed that window is about one DM long: T35c's notifier marks rows
+and sends their notices in the same tick, so a late `fired` (a blue-green
+deploy whose instances' timeouts differ, say) would almost never be
+recorded, leaving `cloud list` without the link of a session that exists,
+while refusing the record prevented no message.
+
 **Solution.** `finish_cloud_handoff` takes a row that is `sending`, or
-`unknown` with `notified_at` empty (only a pass leaves an `unknown` row so).
-It always sets `notified_at`, since the reply tells the member. A late
+`unknown` with `unknown_reason` `no_answer`, which only the pass sets, so a
+reply's own `unknown` takes no later answer. It sets `notified_at` if it is
+empty, since the reply tells the member, and keeps a notice's time. A late
 `fired` or `rejected` replaces `unknown` and sets `answered_at`; a late
 `unknown` keeps the row's time and state, fills in a status the row lacked
-and replaces the pass's `no_answer` with its own reason. A claim still sending then finds the notice done, and its mark
-returns false. Once the notice has told the member, a late answer changes
-nothing; the reply still carries it. There is no lease column.
+and replaces `no_answer` with its own reason. Either way the row no longer
+has `no_answer`, so it takes one late answer. A notice a claim is sending at
+that moment may still reach the member besides the reply, and the claim's
+mark then returns false; avoiding that would need a two-phase send. There
+is no lease column.
 
 ### Sealed values are bound to the member
 
@@ -8017,10 +8026,15 @@ without the master key, would let that member open the token and fire the
 routine, and read moved tasks in `cloud list`.
 
 **Solution.** A token's associated data key is
-`<member>:<id>:<routine id>:<url origin>` and a task's `<member>:<id>`
-(only the origin may hold `:`, and it comes last). A row moved to another
-member, or given another routine id or origin, fails with
-`SealError::Decrypt`, which tests show for both tables.
+`<member>:<id>:<routine id>:<label>:<url origin>` and a task's
+`<member>:<id>` (only the origin may hold `:`, since a label never does,
+and it comes last). A row moved to another member, or given another
+routine id, label or origin, fails with `SealError::Decrypt`, which tests
+show for both tables; the label keeps two of a member's own rows from
+swapping labels, which would fire one routine for the other's name. The
+stored routine id and origin strings are the associated data, so
+normalizing either later means re-sealing with the master key, not a SQL
+`UPDATE`.
 
 ### The `url` crate changes what it parses
 
@@ -8057,7 +8071,10 @@ would send every stored token there.
 associated data. `put_cloud_routine` takes it, and `CloudRoutineToken` and
 `CloudRoutine` return it, so a fire (T35b's client, or T35c before
 calling it) refuses a routine whose origin isn't `base_url`'s, and T35c
-tells the member to `cloud add` it again.
+tells the member to `cloud add` it again. The comparison parses the stored
+origin (`Url::parse(stored)?.origin() == base_url.origin()`) rather than
+comparing strings, so a change in how `url` writes an origin can't lock
+members out.
 
 ### A routine token is checked in one place
 
@@ -8067,15 +8084,16 @@ header, after a hand-off row was written; and the grammar, the store and
 the fire client would each have had to agree on what a token is.
 
 **Solution.** `core_types::RoutineToken` wraps a `SecretString` and is
-made only by `RoutineToken::parse`: it starts with `sk-ant-` (the plan says
-routine tokens are `sk-ant-oat01-…`; only the family is required, in case
-the version changes), is printable ASCII and is at most 1024 bytes. Its
+made only by `RoutineToken::parse`: it starts with `sk-ant-` (the routine
+fire reference says its tokens are prefixed `sk-ant-oat01-`; only the
+family is required, in case the version changes), is printable ASCII and is at most 1024 bytes. Its
 `Debug` is redacted and it has no `Display` or serde form. `cloud add`'s
 clap value parser makes one at once, so no `String` copy of the token
 lives in the parsed arguments, and the refusal is a fixed sentence. The
 store seals one (`NewCloudRoutine::token`) and opens one
 (`CloudRoutineToken::token`), reporting a stored token that no longer
-passes as `Corrupt`; T35b's `fire` takes `&RoutineToken`. `core-types`
+passes as `Corrupt`, which T35c answers by asking the member to `cloud add`
+the routine again; T35b's `fire` takes `&RoutineToken`. `core-types`
 now depends on `secrecy`, already a workspace dependency.
 
 ### Where the shared types live
@@ -8171,14 +8189,17 @@ T35c's handlers land.
   cut-off is the caller's, so in a blue-green deploy that changes
   `[cloud] timeout_secs`, the instance with the shorter timeout can mark a
   row the other still waits on; the member then gets the notice and the
-  reply, and the late answer is recorded unless the notice went first. A
-  per-row deadline would close that, at the cost of a column.
-- One index on `created_at` serves the pass and the purge, and one on
+  reply, and the late answer is still recorded. A per-row deadline would
+  close that, at the cost of a column.
+- A partial index on `created_at` where `state = 'sending'` serves the
+  pass, which otherwise reads the whole history for its few `sending` rows;
+  a plain one on `created_at` serves the purge; and one on
   `(member_id, created_at)` serves `recent_cloud_handoffs` (ties broken by
   `rowid`) and the member deletions.
 - `purge_cloud_handoffs(before, now)` keeps a row whose notice is still
   owed at `now`, so a `retention_days` of 1 can't cut the notice's day
-  short.
+  short, and a `sending` row, so a purge that runs before the pass, after
+  a long outage, doesn't lose its notice.
 - The schema checks what each state implies: `answered_at` is set exactly
   when the row isn't `sending`, `session_id` (never empty) exactly when it
   is `fired`, a `session_url` only then, an error type and `Retry-After`

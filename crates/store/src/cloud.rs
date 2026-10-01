@@ -9,9 +9,8 @@
 //!
 //! A hand-off is written `sending` before its request and gets one outcome
 //! ([`CloudOutcome`]) from `sending`. A row a pass marked `unknown` because
-//! its record was held up still takes the answer while its notice hasn't
-//! told the member: `fired` or `rejected` replace `unknown`, and a late
-//! `unknown` only marks the notice done. Recording an outcome marks its
+//! its record was held up still takes one late answer: `fired` or
+//! `rejected` replace `unknown`, and a late `unknown` gives its reason. Recording an outcome marks its
 //! notice done, since the command's reply tells the member. A row the pass
 //! marked `unknown` owes a
 //! notice, sent at least once the way the relink notices are: a
@@ -461,10 +460,16 @@ fn corrupt(table: &'static str, column: &'static str) -> StoreError {
 }
 
 /// The associated data's key for a routine's token: its member, row id,
-/// routine id and URL origin. Only the origin may hold `:`, and it comes
-/// last.
-fn token_key(member: MemberId, id: &str, routine_id: &str, url_origin: &str) -> String {
-    format!("{member}:{id}:{routine_id}:{url_origin}")
+/// routine id, label and URL origin. Only the origin may hold `:` (a label
+/// never does), and it comes last.
+fn token_key(
+    member: MemberId,
+    id: &str,
+    routine_id: &str,
+    label: &str,
+    url_origin: &str,
+) -> String {
+    format!("{member}:{id}:{routine_id}:{label}:{url_origin}")
 }
 
 fn token_aad(key: &str) -> Aad<'_> {
@@ -553,7 +558,7 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?;
         let put = if let Some(id) = existing {
-            let key = token_key(member, &id, routine_id.as_str(), url_origin);
+            let key = token_key(member, &id, routine_id.as_str(), label, url_origin);
             let sealed = self.seal(token_aad(&key), token.as_secret())?;
             sqlx::query(
                 "UPDATE cloud_routines SET routine_id = ?, url_origin = ?, token_enc = ?, \
@@ -578,7 +583,13 @@ impl Store {
                 return Ok(CloudRoutinePut::Full);
             }
             let id = CloudRoutineId::new_v4();
-            let key = token_key(member, &id.to_string(), routine_id.as_str(), url_origin);
+            let key = token_key(
+                member,
+                &id.to_string(),
+                routine_id.as_str(),
+                label,
+                url_origin,
+            );
             let sealed = self.seal(token_aad(&key), token.as_secret())?;
             sqlx::query(
                 "INSERT INTO cloud_routines (id, member_id, label, routine_id, url_origin, \
@@ -624,7 +635,7 @@ impl Store {
         let Some((id, routine_id, url_origin, sealed)) = row else {
             return Ok(None);
         };
-        let key = token_key(member, &id, &routine_id, &url_origin);
+        let key = token_key(member, &id, &routine_id, label, &url_origin);
         Ok(Some(CloudRoutineToken {
             token: RoutineToken::parse(self.open_sealed(token_aad(&key), &sealed)?)
                 .map_err(|_| corrupt(ROUTINES, "token_enc"))?,
@@ -734,13 +745,16 @@ impl Store {
     }
 
     /// Records `outcome` for hand-off `id` at `now`, and marks its notice
-    /// done, since the command's reply tells the member the outcome. False,
-    /// changing nothing, unless the hand-off is `sending`, or a pass marked
-    /// it `unknown` (its record was held up) and its notice hasn't told the
-    /// member yet. Such a late `fired` or `rejected` replaces `unknown`; a
-    /// late `unknown` keeps the row's time and only fills in a status it
-    /// lacked. A claim of the notice still sending then finds it done
-    /// already. Nothing retries a record that fails.
+    /// done if it hasn't gone out yet, since the command's reply tells the
+    /// member the outcome. False, changing nothing, unless the hand-off is
+    /// `sending`, or `unknown` because a pass gave up waiting for its answer
+    /// ([`CloudUnknownReason::NoAnswer`]), whether or not its notice went
+    /// out. Such a late `fired` or `rejected` replaces `unknown`; a late
+    /// `unknown` keeps the row's time, fills in a status it lacked and gives
+    /// its own reason, so a row takes one late answer. A notice a claim is
+    /// sending at that moment may still reach the member besides the reply;
+    /// the claim's mark then returns false. Nothing retries a record that
+    /// fails.
     ///
     /// # Errors
     ///
@@ -787,8 +801,9 @@ impl Store {
              error_type = ?3, retry_after_secs = ?4, session_id = ?5, session_url = ?6, \
              answered_at = CASE WHEN state = 'unknown' AND ?1 = 'unknown' \
              THEN answered_at ELSE ?7 END, \
-             notified_at = ?7, unknown_reason = ?9 \
-             WHERE id = ?8 AND (state = 'sending' OR (state = 'unknown' AND notified_at IS NULL))",
+             notified_at = COALESCE(notified_at, ?7), unknown_reason = ?9 \
+             WHERE id = ?8 AND (state = 'sending' \
+             OR (state = 'unknown' AND unknown_reason = 'no_answer'))",
         )
         .bind(outcome.state().as_str())
         .bind(status.map(i64::from))
@@ -846,8 +861,9 @@ impl Store {
     /// `before` is the caller's: every instance's pass marks every
     /// instance's rows, so during a blue-green deploy that changes
     /// `[cloud] timeout_secs`, an instance with the shorter timeout can mark
-    /// a row whose request the other instance still waits on. The late
-    /// answer is then still recorded, unless the notice went out first.
+    /// a row whose request the other instance still waits on. The member
+    /// may then get the notice besides the reply, and the late answer is
+    /// still recorded.
     ///
     /// # Errors
     ///
@@ -992,7 +1008,9 @@ impl Store {
 
     /// Deletes the hand-offs asked before `before`, and returns how many.
     /// A row whose notice is still owed at `now` is kept until it is sent
-    /// or given up, however short the retention.
+    /// or given up, however short the retention, and so is a `sending` row
+    /// a pass hasn't marked yet, so its notice isn't lost when the purge
+    /// runs first.
     ///
     /// # Errors
     ///
@@ -1003,7 +1021,7 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<u64> {
         let result = sqlx::query(
-            "DELETE FROM cloud_handoffs WHERE created_at < ? AND NOT \
+            "DELETE FROM cloud_handoffs WHERE created_at < ? AND state <> 'sending' AND NOT \
              (state = 'unknown' AND notified_at IS NULL AND answered_at > ?)",
         )
         .bind(to_unix(before))
