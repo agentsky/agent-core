@@ -295,7 +295,10 @@ impl Server {
     ///    requests, the workers and the sweeper get what is left of the
     ///    same timeout to finish. Whatever is still running then is
     ///    dropped.
-    /// 4. The pipeline is dropped, and the store is closed.
+    /// 4. The hand-offs let go since the drain began, by the hand-off
+    ///    worker's last pass included, are made due at once
+    ///    ([`Pipeline::release_cut_hand_offs`]), the pipeline is dropped,
+    ///    and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -527,6 +530,9 @@ impl Server {
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
+        }
+        if let Some(pipeline) = &pipeline {
+            pipeline.release_cut_hand_offs().await;
         }
         drop(pipeline);
         app.store().close().await;

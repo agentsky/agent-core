@@ -453,7 +453,11 @@ pub fn unescape(text: &str) -> String {
 
 /// The first [`MAX_MENTIONS`] users mentioned in `text` and `blocks`, once
 /// each, in order of first appearance: `<@U…>` tokens in `text`, then
-/// `rich_text` `user` elements and tokens in `mrkdwn` text objects.
+/// `rich_text` `user` elements and tokens in `mrkdwn` text objects. A
+/// token Slack might show as code is no mention
+/// ([`without_code`](render::slack::without_code)): agentd's own post and
+/// the platform's copy of it are read alike, so neither hands off what the
+/// thread sees as code.
 pub fn mentions(text: &str, blocks: Option<&Value>) -> Vec<UserId> {
     let mut found = Vec::new();
     scan_tokens(text, &mut found);
@@ -492,9 +496,11 @@ fn walk_blocks(value: &Value, found: &mut Vec<UserId>) {
     }
 }
 
-/// Collects the ids of `<@U…>` and `<@U…|label>` tokens.
+/// Collects the ids of `<@U…>` and `<@U…|label>` tokens outside what
+/// Slack might show as code.
 fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
-    let mut rest = text;
+    let text = render::slack::without_code(text);
+    let mut rest = text.as_str();
     while let Some(at) = rest.find("<@") {
         rest = &rest[at + 2..];
         let end = rest
@@ -664,6 +670,19 @@ mod tests {
         let found = mentions("<@U1> and <@U1>", Some(&blocks));
         let ids: Vec<&str> = found.iter().map(UserId::as_str).collect();
         assert_eq!(ids, ["U1", "U2", "U3", "U4", "U5"]);
+    }
+
+    #[test]
+    fn a_token_slack_might_show_as_code_mentions_no_one() {
+        let blocks = json!([
+            {"type": "section", "text": {"type": "mrkdwn", "text": "`<@U4>` and `a` <@U5> `b`"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "```\nx\n``` <@U6>"}},
+        ]);
+        let found = mentions("`<@U1>` over to <@U2>, see `x`y` <@U3> `z`", Some(&blocks));
+        let ids: Vec<&str> = found.iter().map(UserId::as_str).collect();
+        assert_eq!(ids, ["U6"]);
+        let found = mentions("<@U1>, see `code`", None);
+        assert_eq!(found, [UserId::from("U1")]);
     }
 
     #[test]
@@ -905,6 +924,9 @@ mod tests {
                 with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER", "text": "hi"})),
                 with(json!({"user": "U0OTHERBOT", "bot_profile": {"id": "B0OTHER"}, "text": "hi"})),
                 with(json!({"bot_id": "B0OTHER", "text": "hi <@U0HUMAN>"})),
+                with(
+                    json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER", "text": format!("`<@{BOT}>` over to you")}),
+                ),
             ];
             quiet_bots[2].as_object_mut().unwrap().remove("user");
             for quiet in quiet_bots {

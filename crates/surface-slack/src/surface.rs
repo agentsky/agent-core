@@ -10,7 +10,7 @@ use core_types::{
     Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
 };
 use render::MentionDirectory;
-use render::slack::{MESSAGE_LIMIT, to_mrkdwn, without_code};
+use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
 use crate::directory::{MemberDirectory, TeamDirectory};
@@ -429,10 +429,9 @@ impl Surface for SlackSurface {
         Err(SurfaceError::Unsupported("events"))
     }
 
-    /// Posts the mrkdwn `text`. Its mentions are the `<@U…>` tokens Slack
-    /// shows as mentions, so none it shows as code ([`without_code`]),
-    /// whatever the renderer or the splitter left around them: they hand a
-    /// post off, and a hand-off the thread can't see would run unnoticed.
+    /// Posts the mrkdwn `text`. Its mentions are read as Slack's copy of it
+    /// is ([`normalize::mentions`]), so both deliveries of a post hand off
+    /// to the same agents.
     async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
         let channel = self.channel(&to.conv)?;
         let ts = self
@@ -444,7 +443,7 @@ impl Surface for SlackSurface {
                 conv: to.conv.clone(),
                 id: ts,
             },
-            mentions: normalize::mentions(&without_code(text), None),
+            mentions: normalize::mentions(text, None),
         })
     }
 

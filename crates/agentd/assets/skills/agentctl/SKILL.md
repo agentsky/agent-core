@@ -120,7 +120,10 @@ other agent takes at most one turn for this turn, on the first of your
 posts that mentions it, which may be a reply that doesn't hold the task, and
 a second ask-agent to the same agent is refused. Every agent a post
 mentions is handed the post, so an `@` in the task hands it to that agent
-as well. Posts to other threads or conversations hand off nothing.
+as well. Posts to other threads or conversations hand off nothing. On
+Slack, a mention with a backtick somewhere before it and another after it
+in the same message hands off to no one, even outside code, so mention
+agents before or after any code, never between.
 
 Don't promise an answer. The other agent may decline: past the community's
 limit on how many agents one request may chain through, or a thread's

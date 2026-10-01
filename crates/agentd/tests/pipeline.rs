@@ -2729,6 +2729,34 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
 }
 
 #[tokio::test]
+async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.next_turn(Turn::reply("``a @UWRITER` b"));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let sent = stack.wait_for_posts(1).await;
+    assert!(
+        stack.kept_hand_offs().await.is_empty(),
+        "agentd's own delivery hands nothing off"
+    );
+    let shown = "``a <@UWRITER>` b";
+    let mut copy = stack.agents_post(BOT, sent[0].2.id.as_str(), "c1", &[]);
+    copy.text = shown.to_owned();
+    copy.mentions = surface_slack::normalize::mentions(shown, None);
+    stack.handle(copy).await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    assert!(
+        stack.writers_hops(writer).await.is_empty(),
+        "nor does the platform's copy, read as Slack's surface reads it"
+    );
+    assert_eq!(stack.mock.posts().len(), 1);
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn ask_agent_posts_the_task_and_hands_it_off_with_the_turns_attribution() {
     let stack = start().await;
     let writer = stack.other_agent("writer", "UWRITER").await;
@@ -3025,37 +3053,27 @@ async fn a_hand_off_a_shutdown_cut_is_delivered_by_the_next_instance() {
 }
 
 #[tokio::test]
-async fn the_hand_off_worker_makes_what_was_let_go_due_once_more_as_it_stops() {
+async fn a_hand_off_released_at_a_cut_is_not_released_again_from_its_next_holder() {
     let stack = start().await;
     let writer = stack.other_agent("writer", "UWRITER").await;
     let busy = Gate::closed();
     stack.hand_off_behind_a_busy_writer(writer, &busy).await;
     stack.pipeline.cut_short().await;
-    let now = pinned_now();
-    let leased = stack
-        .store()
-        .take_due_hand_offs(
-            now,
-            agentd::pipeline::HAND_OFF_LEASE,
-            now - Duration::from_secs(60),
-            64,
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        leased.taken.len(),
-        1,
-        "a pass that read the hold before the cut leases it again after the cut released it"
-    );
-    let (_stop, stopping) = watch::channel(true);
-    stack.pipeline.clone().run_hand_offs(stopping).await;
+    let checking = Gate::closed();
+    stack.holds.can_posts_of(writer, &checking);
     let next = stack.another_pipeline();
+    assert_eq!(next.replay_hand_offs().await.unwrap(), 1);
+    wait_until("the next instance's job holds the row", || {
+        checking.waiting() == 1
+    })
+    .await;
+    stack.pipeline.release_cut_hand_offs().await;
     assert_eq!(
-        next.replay_hand_offs().await.unwrap(),
-        1,
-        "the worker's last release made it due at once"
+        stack.another_pipeline().replay_hand_offs().await.unwrap(),
+        0,
+        "the cut instance forgot the row it released, so a last release leaves it leased"
     );
+    checking.open();
     stack.wait_for_posts(2).await;
     next.close();
     next.drain().await;
