@@ -4,7 +4,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use core_types::RoutineId;
+use core_types::{RoutineId, RoutineToken};
 use secrecy::SecretString;
 
 use crate::ParseError;
@@ -24,7 +24,7 @@ pub enum CloudCommand {
         /// What agentd keeps of the pasted fire URL.
         routine: RoutineUrl,
         /// The API trigger's token.
-        token: SecretString,
+        token: RoutineToken,
     },
     /// `cloud run <routine> <task>`: fire the routine with the task.
     Run {
@@ -117,6 +117,15 @@ pub(crate) fn parse_routine_label(s: &str) -> Result<RoutineLabel, Reason> {
     } else {
         Err(ROUTINE_LABEL_RULE)
     }
+}
+
+const ROUTINE_TOKEN_RULE: Reason =
+    Reason("A routine's token is the sk-ant-… token its API trigger showed when you generated it.");
+
+/// Parses a routine's API trigger token into a [`RoutineToken`], whose rule
+/// is the one place a token is checked. The reason never repeats it.
+pub(crate) fn parse_routine_token(s: &str) -> Result<RoutineToken, Reason> {
+    RoutineToken::parse(SecretString::from(s)).map_err(|_| ROUTINE_TOKEN_RULE)
 }
 
 const ROUTINE_URL_RULE: Reason = Reason(
@@ -400,7 +409,7 @@ mod tests {
         let add = CloudCommand::Add {
             label: parse_routine_label("r").unwrap(),
             routine: parse_routine_url(FIRE).unwrap(),
-            token: SecretString::from("sk-ant-oat01-SECRET"),
+            token: RoutineToken::parse(SecretString::from("sk-ant-oat01-SECRET")).unwrap(),
         };
         let run = CloudCommand::Run {
             label: parse_routine_label("r").unwrap(),

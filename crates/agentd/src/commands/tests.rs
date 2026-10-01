@@ -489,6 +489,10 @@ async fn a_routine_token_in_a_channel_is_refused_with_revoke_advice() {
         .await;
     let reply = h.last_reply("alice");
     assert!(reply.contains("looked like it held a secret"), "{reply}");
+    assert!(
+        reply.contains("**Regenerate** or **Revoke**") && reply.contains("claude.ai/code/routines"),
+        "{reply}"
+    );
     assert!(!reply.contains(TOKEN));
 }
 

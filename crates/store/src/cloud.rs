@@ -1,24 +1,34 @@
 //! Cloud hand-off: `cloud_routines`, the routines members registered, and
 //! `cloud_handoffs`, the record of each `cloud run`.
 //!
-//! A routine's token and a hand-off's task are sealed with their row's
-//! table, column and id as associated data. A member holds at most
-//! [`MAX_CLOUD_ROUTINES`] routines, each label and each routine id once.
+//! A routine's token is sealed with its table, column, member, row id,
+//! routine id and URL origin as associated data, and a hand-off's task with
+//! its table, column, member and row id, so neither opens once its row is
+//! moved to another member. A member holds at most [`MAX_CLOUD_ROUTINES`]
+//! routines, each label and each routine id once.
 //!
 //! A hand-off is written `sending` before its request and gets one outcome
-//! ([`CloudOutcome`]) from `sending`, or, for an answer whose record was held
-//! up until a pass marked the row `unknown`, `fired` or `rejected` from
-//! `unknown`. Recording an outcome marks its notice done, since the
-//! command's reply tells the member. A row the pass marked `unknown` owes a
+//! ([`CloudOutcome`]) from `sending`. A row a pass marked `unknown` because
+//! its record was held up still takes the answer while its notice hasn't
+//! told the member: `fired` or `rejected` replace `unknown`, and a late
+//! `unknown` only marks the notice done. Recording an outcome marks its
+//! notice done, since the command's reply tells the member. A row the pass
+//! marked `unknown` owes a
 //! notice, sent at least once the way the relink notices are: a
 //! [claim](Store::claim_cloud_handoff_notice) counts an attempt and takes a
 //! [lease](CLOUD_NOTICE_LEASE), a failed send
 //! [backs off](Store::defer_cloud_handoff_notice), and the notice is given
 //! up [a day](CLOUD_NOTICE_GIVE_UP) after the row was answered.
+//!
+//! Hand-off ids are minted by agentd in
+//! [`begin_cloud_handoff`](Store::begin_cloud_handoff) and never taken from
+//! what a member types, so the methods that take one aren't scoped to a
+//! member.
 
+use std::fmt;
 use std::time::Duration;
 
-use core_types::{CloudHandoffId, CloudRoutineId, MemberId, MemberKey, RoutineId};
+use core_types::{CloudHandoffId, CloudRoutineId, MemberId, MemberKey, RoutineId, RoutineToken};
 use secrecy::SecretString;
 use time::OffsetDateTime;
 
@@ -47,7 +57,7 @@ macro_rules! handoff_columns {
     () => {
         "id, member_id, routine_label, routine_id, requested_by, origin, state, http_status, \
          error_type, retry_after_secs, session_id, session_url, created_at, answered_at, \
-         notice_attempts, notified_at"
+         notice_attempts, notified_at, unknown_reason"
     };
 }
 
@@ -72,6 +82,8 @@ pub struct CloudRoutine {
     pub label: String,
     /// The routine's id.
     pub routine_id: RoutineId,
+    /// The origin of the fire URL it was registered with.
+    pub url_origin: String,
     /// The identity that registered it, or last replaced its token.
     pub added_by: MemberKey,
     /// When.
@@ -86,8 +98,30 @@ pub struct CloudRoutineToken {
     pub id: CloudRoutineId,
     /// The routine's id.
     pub routine_id: RoutineId,
+    /// The origin of the fire URL it was registered with, which a fire
+    /// compares with `[cloud] base_url`'s.
+    pub url_origin: String,
     /// The routine's API trigger token.
-    pub token: SecretString,
+    pub token: RoutineToken,
+}
+
+/// A routine to register, for [`Store::put_cloud_routine`]. `Debug`
+/// redacts the token.
+#[derive(Debug, Clone, Copy)]
+pub struct NewCloudRoutine<'a> {
+    /// The member registering it.
+    pub member: MemberId,
+    /// The member's label for it.
+    pub label: &'a str,
+    /// The routine's id.
+    pub routine_id: &'a RoutineId,
+    /// The origin of the fire URL it was registered with, as
+    /// `url::Origin::ascii_serialization` writes it.
+    pub url_origin: &'a str,
+    /// The routine's API trigger token.
+    pub token: &'a RoutineToken,
+    /// The identity that typed the command.
+    pub added_by: &'a MemberKey,
 }
 
 /// What [`Store::put_cloud_routine`] did.
@@ -207,7 +241,56 @@ pub enum CloudOutcome {
     Unknown {
         /// The HTTP status, if there was an answer.
         status: Option<u16>,
+        /// Why it isn't known.
+        reason: CloudUnknownReason,
     },
+}
+
+/// Why a hand-off's outcome isn't known, kept with an `unknown` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CloudUnknownReason {
+    /// The endpoint answered with a server error (5xx).
+    ServerError,
+    /// The endpoint answered with a status the fire client doesn't expect.
+    OtherStatus,
+    /// The request timed out after it was sent.
+    Timeout,
+    /// The connection was lost after the request was sent.
+    ConnectionLost,
+    /// The endpoint answered with a redirect, which isn't followed.
+    Redirect,
+    /// The endpoint answered with success, but the answer can't be read.
+    UnreadableAnswer,
+    /// No answer was recorded: a pass gave up waiting for one.
+    NoAnswer,
+}
+
+impl CloudUnknownReason {
+    /// The stored form, such as `server_error` or `no_answer`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerError => "server_error",
+            Self::OtherStatus => "other_status",
+            Self::Timeout => "timeout",
+            Self::ConnectionLost => "connection_lost",
+            Self::Redirect => "redirect",
+            Self::UnreadableAnswer => "unreadable_answer",
+            Self::NoAnswer => "no_answer",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "server_error" => Ok(Self::ServerError),
+            "other_status" => Ok(Self::OtherStatus),
+            "timeout" => Ok(Self::Timeout),
+            "connection_lost" => Ok(Self::ConnectionLost),
+            "redirect" => Ok(Self::Redirect),
+            "unreadable_answer" => Ok(Self::UnreadableAnswer),
+            "no_answer" => Ok(Self::NoAnswer),
+            _ => Err(corrupt(HANDOFFS, "unknown_reason")),
+        }
+    }
 }
 
 impl CloudOutcome {
@@ -221,8 +304,9 @@ impl CloudOutcome {
     }
 }
 
-/// A hand-off to record, for [`Store::begin_cloud_handoff`].
-#[derive(Debug, Clone, Copy)]
+/// A hand-off to record, for [`Store::begin_cloud_handoff`]. `Debug` leaves
+/// out the task.
+#[derive(Clone, Copy)]
 pub struct NewCloudHandoff<'a> {
     /// The member whose routine it fires.
     pub member: MemberId,
@@ -236,6 +320,18 @@ pub struct NewCloudHandoff<'a> {
     pub origin: CloudOrigin,
     /// The task text, sealed before it is stored. Never logged.
     pub task: &'a str,
+}
+
+impl fmt::Debug for NewCloudHandoff<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewCloudHandoff")
+            .field("member", &self.member)
+            .field("routine_label", &self.routine_label)
+            .field("routine_id", self.routine_id)
+            .field("requested_by", self.requested_by)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A `cloud_handoffs` row, without its task.
@@ -273,6 +369,8 @@ pub struct CloudHandoff {
     pub notice_attempts: u32,
     /// When the member was told the outcome, by the reply or the notice.
     pub notified_at: Option<OffsetDateTime>,
+    /// Why the outcome isn't known, while the row is `unknown`.
+    pub unknown_reason: Option<CloudUnknownReason>,
 }
 
 /// A hand-off with its task opened, from [`Store::recent_cloud_handoffs`].
@@ -303,6 +401,7 @@ struct HandoffRow {
     answered_at: Option<i64>,
     notice_attempts: i64,
     notified_at: Option<i64>,
+    unknown_reason: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -338,6 +437,11 @@ impl HandoffRow {
                 .notified_at
                 .map(|at| from_unix(at, HANDOFFS, "notified_at"))
                 .transpose()?,
+            unknown_reason: self
+                .unknown_reason
+                .as_deref()
+                .map(CloudUnknownReason::parse)
+                .transpose()?,
         })
     }
 }
@@ -356,19 +460,31 @@ fn corrupt(table: &'static str, column: &'static str) -> StoreError {
     StoreError::Corrupt { table, column }
 }
 
-fn token_aad(id: &str) -> Aad<'_> {
+/// The associated data's key for a routine's token: its member, row id,
+/// routine id and URL origin. Only the origin may hold `:`, and it comes
+/// last.
+fn token_key(member: MemberId, id: &str, routine_id: &str, url_origin: &str) -> String {
+    format!("{member}:{id}:{routine_id}:{url_origin}")
+}
+
+fn token_aad(key: &str) -> Aad<'_> {
     Aad {
         table: ROUTINES,
         column: "token_enc",
-        key: id,
+        key,
     }
 }
 
-fn task_aad(id: &str) -> Aad<'_> {
+/// The associated data's key for a hand-off's task: its member and row id.
+fn task_key(member: MemberId, id: &str) -> String {
+    format!("{member}:{id}")
+}
+
+fn task_aad(key: &str) -> Aad<'_> {
     Aad {
         table: HANDOFFS,
         column: "task_enc",
-        key: id,
+        key,
     }
 }
 
@@ -390,8 +506,7 @@ fn notice_backoff(claim: u32) -> Duration {
 }
 
 impl Store {
-    /// Registers `member`'s routine `routine_id` under `label` with its
-    /// `token`, added by the identity `added_by` at `now`.
+    /// Registers `routine` at `now`.
     ///
     /// A label the member registered already is replaced in place: its row
     /// keeps its id and takes the new routine id, token, identity and time,
@@ -407,13 +522,17 @@ impl Store {
     /// exist, [`StoreError::Seal`] if the token can't be sealed.
     pub async fn put_cloud_routine(
         &self,
-        member: MemberId,
-        label: &str,
-        routine_id: &RoutineId,
-        token: &SecretString,
-        added_by: &MemberKey,
+        routine: &NewCloudRoutine<'_>,
         now: OffsetDateTime,
     ) -> Result<CloudRoutinePut> {
+        let NewCloudRoutine {
+            member,
+            label,
+            routine_id,
+            url_origin,
+            token,
+            added_by,
+        } = *routine;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let taken: Option<String> = sqlx::query_scalar(
             "SELECT label FROM cloud_routines WHERE member_id = ? AND routine_id = ? \
@@ -434,12 +553,14 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?;
         let put = if let Some(id) = existing {
-            let sealed = self.seal(token_aad(&id), token)?;
+            let key = token_key(member, &id, routine_id.as_str(), url_origin);
+            let sealed = self.seal(token_aad(&key), token.as_secret())?;
             sqlx::query(
-                "UPDATE cloud_routines SET routine_id = ?, token_enc = ?, added_by = ?, \
-                 added_at = ? WHERE id = ?",
+                "UPDATE cloud_routines SET routine_id = ?, url_origin = ?, token_enc = ?, \
+                 added_by = ?, added_at = ? WHERE id = ?",
             )
             .bind(routine_id.as_str())
+            .bind(url_origin)
             .bind(sealed)
             .bind(added_by.to_string())
             .bind(to_unix(now))
@@ -457,15 +578,17 @@ impl Store {
                 return Ok(CloudRoutinePut::Full);
             }
             let id = CloudRoutineId::new_v4();
-            let sealed = self.seal(token_aad(&id.to_string()), token)?;
+            let key = token_key(member, &id.to_string(), routine_id.as_str(), url_origin);
+            let sealed = self.seal(token_aad(&key), token.as_secret())?;
             sqlx::query(
-                "INSERT INTO cloud_routines (id, member_id, label, routine_id, token_enc, \
-                 added_by, added_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO cloud_routines (id, member_id, label, routine_id, url_origin, \
+                 token_enc, added_by, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id.to_string())
             .bind(member.to_string())
             .bind(label)
             .bind(routine_id.as_str())
+            .bind(url_origin)
             .bind(sealed)
             .bind(added_by.to_string())
             .bind(to_unix(now))
@@ -490,21 +613,24 @@ impl Store {
         member: MemberId,
         label: &str,
     ) -> Result<Option<CloudRoutineToken>> {
-        let row: Option<(String, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, routine_id, token_enc FROM cloud_routines \
+        let row: Option<(String, String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, routine_id, url_origin, token_enc FROM cloud_routines \
              WHERE member_id = ? AND label = ?",
         )
         .bind(member.to_string())
         .bind(label)
         .fetch_optional(&self.pool)
         .await?;
-        let Some((id, routine_id, sealed)) = row else {
+        let Some((id, routine_id, url_origin, sealed)) = row else {
             return Ok(None);
         };
+        let key = token_key(member, &id, &routine_id, &url_origin);
         Ok(Some(CloudRoutineToken {
-            token: self.open_sealed(token_aad(&id), &sealed)?,
+            token: RoutineToken::parse(self.open_sealed(token_aad(&key), &sealed)?)
+                .map_err(|_| corrupt(ROUTINES, "token_enc"))?,
             id: parse_column(&id, ROUTINES, "id")?,
             routine_id: parse_column(&routine_id, ROUTINES, "routine_id")?,
+            url_origin,
         }))
     }
 
@@ -515,19 +641,20 @@ impl Store {
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
     /// if a row doesn't parse.
     pub async fn cloud_routines(&self, member: MemberId) -> Result<Vec<CloudRoutine>> {
-        let rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
-            "SELECT id, label, routine_id, added_by, added_at FROM cloud_routines \
+        let rows: Vec<(String, String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT id, label, routine_id, url_origin, added_by, added_at FROM cloud_routines \
              WHERE member_id = ? ORDER BY label",
         )
         .bind(member.to_string())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(id, label, routine_id, added_by, added_at)| {
+            .map(|(id, label, routine_id, url_origin, added_by, added_at)| {
                 Ok(CloudRoutine {
                     id: parse_column(&id, ROUTINES, "id")?,
                     label,
                     routine_id: parse_column(&routine_id, ROUTINES, "routine_id")?,
+                    url_origin,
                     added_by: parse_column(&added_by, ROUTINES, "added_by")?,
                     added_at: from_unix(added_at, ROUTINES, "added_at")?,
                 })
@@ -586,7 +713,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<CloudHandoffId> {
         let id = CloudHandoffId::new_v4();
-        let task = self.seal(task_aad(&id.to_string()), &SecretString::from(handoff.task))?;
+        let key = task_key(handoff.member, &id.to_string());
+        let task = self.seal(task_aad(&key), &SecretString::from(handoff.task))?;
         sqlx::query(
             "INSERT INTO cloud_handoffs (id, member_id, routine_label, routine_id, \
              requested_by, origin, task_enc, state, created_at) \
@@ -605,16 +733,14 @@ impl Store {
         Ok(id)
     }
 
-    /// Records `outcome` for hand-off `id` at `now`. False, changing
-    /// nothing, unless the hand-off is `sending`, or `unknown` and the
-    /// outcome is `fired` or `rejected`: an answer whose record was held up
-    /// until a pass gave up on it.
-    ///
-    /// The command's reply tells the member the outcome, so recording one
-    /// marks its notice done: always from `sending`, and from `unknown`
-    /// unless a notice claim's lease is live, in which case the claim's
-    /// sender [marks it](Self::mark_cloud_handoff_notified) once sent.
-    /// Nothing retries a record that fails.
+    /// Records `outcome` for hand-off `id` at `now`, and marks its notice
+    /// done, since the command's reply tells the member the outcome. False,
+    /// changing nothing, unless the hand-off is `sending`, or a pass marked
+    /// it `unknown` (its record was held up) and its notice hasn't told the
+    /// member yet. Such a late `fired` or `rejected` replaces `unknown`; a
+    /// late `unknown` keeps the row's time and only fills in a status it
+    /// lacked. A claim of the notice still sending then finds it done
+    /// already. Nothing retries a record that fails.
     ///
     /// # Errors
     ///
@@ -647,17 +773,22 @@ impl Store {
                 None,
                 None,
             ),
-            CloudOutcome::Unknown { status } => (*status, None, None, None, None),
+            CloudOutcome::Unknown { status, .. } => (*status, None, None, None, None),
+        };
+        let unknown_reason = match outcome {
+            CloudOutcome::Unknown { reason, .. } => Some(reason.as_str()),
+            CloudOutcome::Fired { .. } | CloudOutcome::Rejected { .. } => None,
         };
         let now = to_unix(now);
         let result = sqlx::query(
-            "UPDATE cloud_handoffs SET state = ?1, http_status = ?2, error_type = ?3, \
-             retry_after_secs = ?4, session_id = ?5, session_url = ?6, answered_at = ?7, \
-             notified_at = CASE WHEN state = 'sending' THEN ?7 \
-             WHEN notified_at IS NULL \
-             AND (notice_leased_until IS NULL OR notice_leased_until <= ?7) THEN ?7 \
-             ELSE notified_at END \
-             WHERE id = ?8 AND (state = 'sending' OR (state = 'unknown' AND ?1 <> 'unknown'))",
+            "UPDATE cloud_handoffs SET state = ?1, \
+             http_status = CASE WHEN state = 'unknown' AND ?1 = 'unknown' \
+             THEN COALESCE(http_status, ?2) ELSE ?2 END, \
+             error_type = ?3, retry_after_secs = ?4, session_id = ?5, session_url = ?6, \
+             answered_at = CASE WHEN state = 'unknown' AND ?1 = 'unknown' \
+             THEN answered_at ELSE ?7 END, \
+             notified_at = ?7, unknown_reason = ?9 \
+             WHERE id = ?8 AND (state = 'sending' OR (state = 'unknown' AND notified_at IS NULL))",
         )
         .bind(outcome.state().as_str())
         .bind(status.map(i64::from))
@@ -667,6 +798,7 @@ impl Store {
         .bind(session_url)
         .bind(now)
         .bind(id.to_string())
+        .bind(unknown_reason)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -696,7 +828,8 @@ impl Store {
         .await?;
         rows.into_iter()
             .map(|RecentRow { task_enc, row }| {
-                let task = self.open_sealed(task_aad(&row.id), &task_enc)?;
+                let key = task_key(member, &row.id);
+                let task = self.open_sealed(task_aad(&key), &task_enc)?;
                 Ok(RecentCloudHandoff {
                     handoff: row.into_handoff()?,
                     task,
@@ -710,6 +843,12 @@ impl Store {
     /// never recorded, so each owes its member a notice. One statement, so
     /// concurrent passes return each row once.
     ///
+    /// `before` is the caller's: every instance's pass marks every
+    /// instance's rows, so during a blue-green deploy that changes
+    /// `[cloud] timeout_secs`, an instance with the shorter timeout can mark
+    /// a row whose request the other instance still waits on. The late
+    /// answer is then still recorded, unless the notice went out first.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
@@ -720,7 +859,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<Vec<CloudHandoff>> {
         let rows: Vec<HandoffRow> = sqlx::query_as(concat!(
-            "UPDATE cloud_handoffs SET state = 'unknown', answered_at = ? \
+            "UPDATE cloud_handoffs SET state = 'unknown', answered_at = ?, \
+             unknown_reason = 'no_answer' \
              WHERE state = 'sending' AND created_at < ? RETURNING ",
             handoff_columns!()
         ))
@@ -782,11 +922,10 @@ impl Store {
         let lease = to_unix(later(now, CLOUD_NOTICE_LEASE));
         let claim: Option<i64> = sqlx::query_scalar(concat!(
             "UPDATE cloud_handoffs SET notice_attempts = notice_attempts + 1, \
-             notice_next_attempt_at = ?, notice_leased_until = ? WHERE id = ? AND ",
+             notice_next_attempt_at = ? WHERE id = ? AND ",
             notice_claimable!(),
             " RETURNING notice_attempts"
         ))
-        .bind(lease)
         .bind(lease)
         .bind(id.to_string())
         .bind(to_unix(now))
@@ -812,7 +951,7 @@ impl Store {
     ) -> Result<bool> {
         let retry_at = later(now, notice_backoff(claim));
         let result = sqlx::query(
-            "UPDATE cloud_handoffs SET notice_next_attempt_at = ?, notice_leased_until = NULL \
+            "UPDATE cloud_handoffs SET notice_next_attempt_at = ? \
              WHERE id = ? AND notice_attempts = ? AND state = 'unknown' AND notified_at IS NULL",
         )
         .bind(to_unix(retry_at))
@@ -838,8 +977,8 @@ impl Store {
         now: OffsetDateTime,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE cloud_handoffs SET notified_at = ?, notice_next_attempt_at = NULL, \
-             notice_leased_until = NULL WHERE id = ? AND notice_attempts >= ? AND ? > 0 \
+            "UPDATE cloud_handoffs SET notified_at = ?, notice_next_attempt_at = NULL \
+             WHERE id = ? AND notice_attempts >= ? AND ? > 0 \
              AND state <> 'sending' AND notified_at IS NULL",
         )
         .bind(to_unix(now))
@@ -852,15 +991,25 @@ impl Store {
     }
 
     /// Deletes the hand-offs asked before `before`, and returns how many.
+    /// A row whose notice is still owed at `now` is kept until it is sent
+    /// or given up, however short the retention.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails.
-    pub async fn purge_cloud_handoffs(&self, before: OffsetDateTime) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM cloud_handoffs WHERE created_at < ?")
-            .bind(to_unix(before))
-            .execute(&self.pool)
-            .await?;
+    pub async fn purge_cloud_handoffs(
+        &self,
+        before: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM cloud_handoffs WHERE created_at < ? AND NOT \
+             (state = 'unknown' AND notified_at IS NULL AND answered_at > ?)",
+        )
+        .bind(to_unix(before))
+        .bind(to_unix(earlier(now, CLOUD_NOTICE_GIVE_UP)))
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 }

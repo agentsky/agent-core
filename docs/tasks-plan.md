@@ -3129,15 +3129,24 @@ Acceptance, as tests named after the rules:
 - `old_handoffs_are_purged`.
 
 Decided in T35a ([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
-`cloud_handoffs` also has `notice_leased_until`, so a late outcome can
-tell a claim still sending from one that a failed send ended. The shared
-types are `core_types::RoutineId`, `CloudRoutineId` and `CloudHandoffId`,
-and the store's `CloudOrigin`, `CloudHandoffState` and `CloudOutcome`,
-for T35b's `fire` to take a `RoutineId` and for T35c to map
-`FireOutcome` onto `CloudOutcome`. `RoutineUrl::origin()` is a `url::Origin`.
-A notice's mark needs a claim that was made, not the latest one; its
-deferral needs the latest. `CloudCommand`'s `Debug` leaves out the task,
-and the store hands a task back only as a `SecretString`. agentd's
+`finish_cloud_handoff` takes a row that is `sending`, or `unknown` whose
+notice hasn't told the member, and always marks the notice done; a late
+`unknown` keeps the row and only marks it. `cloud_routines` also keeps the
+fire URL's origin (`url_origin`), which `put_cloud_routine` takes and T35c
+compares with `base_url`'s before each fire. Sealed values are bound to the
+member as well as the row. `cloud add`'s token must start with `sk-ant-`
+and be printable ASCII, checked once by `core_types::RoutineToken::parse`.
+`purge_cloud_handoffs(before, now)` keeps a row whose notice is still
+owed. The shared types are `core_types::RoutineId`, `RoutineToken`,
+`CloudRoutineId` and `CloudHandoffId`, and the store's `CloudOrigin`,
+`CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a `u32`, and
+`Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
+`unknown_reason` column. T35b's `fire` takes a `RoutineId` and a
+`&RoutineToken` and can compare the opened routine's `url_origin` with
+`base_url`'s; T35c maps `FireOutcome` onto `CloudOutcome`. `RoutineUrl::origin()` is a `url::Origin`. A notice's mark
+needs a claim that was made, not the latest one; its deferral needs the
+latest. `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the
+task, and the store hands a task back only as a `SecretString`. agentd's
 public-secret refusal has its `cloud add` arm already; the other `cloud`
 commands answer "isn't available yet" until T35c.
 
@@ -3311,7 +3320,9 @@ link. Record the response and the session URL's form; what a paused routine,
 a wrong token, a linked member's OAuth token and a missing `anthropic-beta`
 get from the endpoint; what it answers with the account out of usage, its
 GitHub connection removed and, if one is at hand, its subscription paused;
-and whether any of those started a session. Update the design's
+and whether any of those started a session; and whether routine ids are
+case-insensitive (if so, normalize them, since `trig_AB` and `trig_ab` would
+register one routine under two labels). Update the design's
 [Verified and assumed](design.md#verified-and-assumed) and failure table
 with the result and date. That completes design milestone 6.
 

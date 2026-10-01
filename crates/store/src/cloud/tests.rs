@@ -12,12 +12,18 @@ async fn member(store: &Store, user: &str) -> MemberId {
         .unwrap()
 }
 
+const API: &str = "https://api.anthropic.com";
+
 fn routine(id: &str) -> RoutineId {
     id.parse().unwrap()
 }
 
-fn token(text: &str) -> SecretString {
-    SecretString::from(text)
+fn token(text: &str) -> RoutineToken {
+    RoutineToken::parse(SecretString::from(format!("sk-ant-{text}"))).unwrap()
+}
+
+fn shown(token: &RoutineToken) -> &str {
+    token.expose_secret().strip_prefix("sk-ant-").unwrap()
 }
 
 fn slack_key(user: &str) -> MemberKey {
@@ -38,11 +44,14 @@ async fn put(
 ) -> CloudRoutinePut {
     store
         .put_cloud_routine(
-            member,
-            label,
-            &routine(id),
-            &token(secret),
-            &member_key("ada"),
+            &NewCloudRoutine {
+                member,
+                label,
+                routine_id: &routine(id),
+                url_origin: API,
+                token: &token(secret),
+                added_by: &member_key("ada"),
+            },
             at(now),
         )
         .await
@@ -54,7 +63,7 @@ async fn opened(store: &Store, member: MemberId, label: &str) -> Option<(Routine
         .cloud_routine(member, label)
         .await
         .unwrap()
-        .map(|found| (found.routine_id, found.token.expose_secret().to_owned()))
+        .map(|found| (found.routine_id, shown(&found.token).to_owned()))
 }
 
 async fn begin(store: &Store, member: MemberId, task: &str, now: i64) -> CloudHandoffId {
@@ -150,7 +159,7 @@ async fn a_routine_is_registered_listed_and_opened() {
         .unwrap();
     assert_eq!(found.id, id);
     assert_eq!(found.routine_id, routine("trig_1"));
-    assert_eq!(found.token.expose_secret(), "sk-1");
+    assert_eq!(shown(&found.token), "sk-1");
     assert!(!format!("{found:?}").contains("sk-1"));
     assert_eq!(
         store.cloud_routines(ada).await.unwrap(),
@@ -164,6 +173,7 @@ async fn a_routine_is_registered_listed_and_opened() {
                     .id,
                 label: "Docs.site/x".to_owned(),
                 routine_id: routine("trig_2"),
+                url_origin: API.to_owned(),
                 added_by: member_key("ada"),
                 added_at: at(11),
             },
@@ -171,6 +181,7 @@ async fn a_routine_is_registered_listed_and_opened() {
                 id,
                 label: "agent-core".to_owned(),
                 routine_id: routine("trig_1"),
+                url_origin: API.to_owned(),
                 added_by: member_key("ada"),
                 added_at: at(10),
             },
@@ -199,12 +210,15 @@ async fn a_routine_label_is_replaced_in_place() {
     assert_eq!(
         store
             .put_cloud_routine(
-                ada,
-                "agent-core",
-                &routine("trig_1"),
-                &token("new"),
-                &slack_key("U1"),
-                at(20)
+                &NewCloudRoutine {
+                    member: ada,
+                    label: "agent-core",
+                    routine_id: &routine("trig_1"),
+                    url_origin: API,
+                    token: &token("new"),
+                    added_by: &slack_key("U1")
+                },
+                at(20),
             )
             .await
             .unwrap(),
@@ -309,11 +323,14 @@ async fn concurrent_registrations_never_pass_the_cap_together() {
         tasks.spawn(async move {
             store
                 .put_cloud_routine(
-                    ada,
-                    &format!("r{n}"),
-                    &routine(&format!("trig_{n}")),
-                    &token("t"),
-                    &member_key("ada"),
+                    &NewCloudRoutine {
+                        member: ada,
+                        label: &format!("r{n}"),
+                        routine_id: &routine(&format!("trig_{n}")),
+                        url_origin: API,
+                        token: &token("t"),
+                        added_by: &member_key("ada"),
+                    },
                     at(10),
                 )
                 .await
@@ -464,6 +481,7 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
             answered_at: None,
             notice_attempts: 0,
             notified_at: None,
+            unknown_reason: None,
         }
     );
 }
@@ -500,11 +518,14 @@ async fn routines_of_a_member_are_deleted_by_member_id() {
     put(&store, ada, "rc", "trig_1", "a", 10).await;
     store
         .put_cloud_routine(
-            ada,
-            "slack",
-            &routine("trig_2"),
-            &token("b"),
-            &slack_key("U1"),
+            &NewCloudRoutine {
+                member: ada,
+                label: "slack",
+                routine_id: &routine("trig_2"),
+                url_origin: API,
+                token: &token("b"),
+                added_by: &slack_key("U1"),
+            },
             at(10),
         )
         .await
@@ -583,7 +604,10 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
     for outcome in [
         fired("session_02"),
         rejected(429),
-        CloudOutcome::Unknown { status: None },
+        CloudOutcome::Unknown {
+            status: None,
+            reason: CloudUnknownReason::ServerError,
+        },
     ] {
         assert!(
             !finish(&store, id, &outcome, 120).await,
@@ -619,7 +643,10 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
         finish(
             &store,
             id,
-            &CloudOutcome::Unknown { status: Some(503) },
+            &CloudOutcome::Unknown {
+                status: Some(503),
+                reason: CloudUnknownReason::ServerError
+            },
             110
         )
         .await
@@ -628,12 +655,12 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
     assert_eq!(row.state, CloudHandoffState::Unknown);
     assert_eq!(row.http_status, Some(503));
     assert!(
-        finish(&store, id, &fired("session_late"), 120).await,
-        "an answer whose record was held up is still recorded"
+        !finish(&store, id, &fired("session_late"), 120).await,
+        "only a row the pass marked takes a late answer"
     );
     assert_eq!(
         handoff(&store, ada, id).await.state,
-        CloudHandoffState::Fired
+        CloudHandoffState::Unknown
     );
 
     for (late, state) in [
@@ -641,18 +668,69 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
         (rejected(404), CloudHandoffState::Rejected),
     ] {
         let id = unknown(&store, ada, 200).await;
-        assert!(
-            !finish(&store, id, &CloudOutcome::Unknown { status: None }, 210).await,
-            "unknown stays unknown"
-        );
         assert!(finish(&store, id, &late, 210).await);
         let row = handoff(&store, ada, id).await;
         assert_eq!(row.state, state);
+        assert_eq!(row.unknown_reason, None);
         assert_eq!(row.answered_at, Some(at(210)));
         assert!(!finish(&store, id, &late, 220).await);
     }
 
+    let told = unknown(&store, ada, 300).await;
+    let attempt = claim(&store, told, 300).await.unwrap();
+    assert!(
+        store
+            .mark_cloud_handoff_notified(told, attempt, at(301))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !finish(&store, told, &fired("session_after_notice"), 310).await,
+        "the notice already told the member"
+    );
+
     assert!(!finish(&store, CloudHandoffId::new_v4(), &fired("session_9"), 1).await);
+}
+
+#[tokio::test]
+async fn a_late_unknown_answer_marks_the_notice_done() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let id = unknown(&store, ada, 200).await;
+    assert_eq!(due(&store, 205).await, [id]);
+    assert!(
+        finish(
+            &store,
+            id,
+            &CloudOutcome::Unknown {
+                status: Some(503),
+                reason: CloudUnknownReason::Timeout
+            },
+            210
+        )
+        .await
+    );
+    let row = handoff(&store, ada, id).await;
+    assert_eq!(row.state, CloudHandoffState::Unknown);
+    assert_eq!(row.http_status, Some(503));
+    assert_eq!(row.answered_at, Some(at(200)));
+    assert_eq!(row.notified_at, Some(at(210)));
+    assert_eq!(row.unknown_reason, Some(CloudUnknownReason::Timeout));
+    assert!(due(&store, 220).await.is_empty(), "no second notice");
+    assert_eq!(claim(&store, id, 220).await, None);
+    assert!(
+        !finish(
+            &store,
+            id,
+            &CloudOutcome::Unknown {
+                status: None,
+                reason: CloudUnknownReason::ServerError
+            },
+            230
+        )
+        .await
+    );
+    assert!(!finish(&store, id, &fired("session_1"), 230).await);
 }
 
 #[tokio::test]
@@ -663,7 +741,10 @@ async fn recording_an_outcome_marks_its_notice_done() {
     for outcome in [
         fired("session_1"),
         rejected(401),
-        CloudOutcome::Unknown { status: Some(500) },
+        CloudOutcome::Unknown {
+            status: Some(500),
+            reason: CloudUnknownReason::ServerError,
+        },
     ] {
         let id = begin(&store, ada, "t", 100).await;
         assert!(finish(&store, id, &outcome, 110).await);
@@ -690,19 +771,19 @@ async fn recording_an_outcome_marks_its_notice_done() {
     assert!(finish(&store, leased, &rejected(403), 310).await);
     assert_eq!(
         handoff(&store, ada, leased).await.notified_at,
-        None,
-        "a claim still sending marks it once sent"
+        Some(at(310)),
+        "the reply tells the member, whatever a claim is doing"
     );
     assert!(due(&store, 2_000).await.is_empty());
     assert!(
-        store
+        !store
             .mark_cloud_handoff_notified(leased, attempt, at(320))
             .await
             .unwrap()
     );
     assert_eq!(
         handoff(&store, ada, leased).await.notified_at,
-        Some(at(320))
+        Some(at(310))
     );
 
     let deferred = unknown(&store, ada, 400).await;
@@ -746,6 +827,7 @@ async fn stale_sending_handoffs_become_unknown() {
     for handoff in &stale {
         assert_eq!(handoff.state, CloudHandoffState::Unknown);
         assert_eq!(handoff.answered_at, Some(at(170)));
+        assert_eq!(handoff.unknown_reason, Some(CloudUnknownReason::NoAnswer));
         assert_eq!(handoff.notified_at, None);
         assert_eq!(handoff.http_status, None);
     }
@@ -876,9 +958,12 @@ async fn old_handoffs_are_purged() {
     let ada = member(&store, "ada").await;
     let old = begin(&store, ada, "t", 100).await;
     assert!(finish(&store, old, &fired("session_1"), 110).await);
-    let older = begin(&store, ada, "t", 50).await;
+    begin(&store, ada, "t", 50).await;
     let kept = begin(&store, ada, "t", 200).await;
-    assert_eq!(store.purge_cloud_handoffs(at(200)).await.unwrap(), 2);
+    assert_eq!(
+        store.purge_cloud_handoffs(at(200), at(300)).await.unwrap(),
+        2
+    );
     let left: Vec<CloudHandoffId> = store
         .recent_cloud_handoffs(ada, 10)
         .await
@@ -887,8 +972,90 @@ async fn old_handoffs_are_purged() {
         .map(|recent| recent.handoff.id)
         .collect();
     assert_eq!(left, [kept]);
-    assert_ne!(older, kept);
-    assert_eq!(store.purge_cloud_handoffs(at(200)).await.unwrap(), 0);
+    assert_eq!(
+        store.purge_cloud_handoffs(at(200), at(300)).await.unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_routine_keeps_the_origin_it_was_registered_with() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    store
+        .put_cloud_routine(
+            &NewCloudRoutine {
+                member: ada,
+                label: "r",
+                routine_id: &routine("trig_1"),
+                url_origin: "http://127.0.0.1:8080",
+                token: &token("sk-1"),
+                added_by: &member_key("ada"),
+            },
+            at(10),
+        )
+        .await
+        .unwrap();
+    let found = store.cloud_routine(ada, "r").await.unwrap().unwrap();
+    assert_eq!(found.url_origin, "http://127.0.0.1:8080");
+    assert_eq!(
+        store.cloud_routines(ada).await.unwrap()[0].url_origin,
+        "http://127.0.0.1:8080"
+    );
+    put(&store, ada, "r", "trig_1", "sk-2", 20).await;
+    let found = store.cloud_routine(ada, "r").await.unwrap().unwrap();
+    assert_eq!(found.url_origin, API, "a replacement takes the new origin");
+    assert_eq!(shown(&found.token), "sk-2");
+
+    sqlx::query("UPDATE cloud_routines SET url_origin = 'https://evil.example'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(
+        store.cloud_routine(ada, "r").await.is_err(),
+        "a token is bound to its origin"
+    );
+}
+
+#[tokio::test]
+async fn a_purge_keeps_a_notice_still_owed() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let owed = unknown(&store, ada, 1_000).await;
+    let day = 24 * 60 * 60;
+    assert_eq!(
+        store
+            .purge_cloud_handoffs(at(500), at(1_000 + day - 1))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(handoff(&store, ada, owed).await.id, owed);
+    assert_eq!(
+        store
+            .purge_cloud_handoffs(at(500), at(1_000 + day))
+            .await
+            .unwrap(),
+        1,
+        "given up, it goes"
+    );
+
+    let told = unknown(&store, ada, 1_000).await;
+    let attempt = claim(&store, told, 1_000).await.unwrap();
+    assert!(
+        store
+            .mark_cloud_handoff_notified(told, attempt, at(1_001))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .purge_cloud_handoffs(at(500), at(1_002))
+            .await
+            .unwrap(),
+        1,
+        "sent, it goes"
+    );
 }
 
 #[tokio::test]
@@ -906,6 +1073,18 @@ async fn the_schema_refuses_rows_that_contradict_their_state() {
         "UPDATE cloud_handoffs SET http_status = 42 WHERE id = ?",
         "UPDATE cloud_handoffs SET state = 'rejected', answered_at = 1, session_id = 'x' \
          WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'fired', answered_at = 1, session_id = '' \
+         WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'unknown', answered_at = 1, error_type = 'x', \
+         unknown_reason = 'timeout' WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'unknown', answered_at = 1 WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'unknown', answered_at = 1, \
+         unknown_reason = 'because' WHERE id = ?",
+        "UPDATE cloud_handoffs SET unknown_reason = 'timeout' WHERE id = ?",
+        "UPDATE cloud_handoffs SET state = 'fired', answered_at = 1, session_id = 's', \
+         retry_after_secs = 1 WHERE id = ?",
+        "UPDATE cloud_handoffs SET routine_id = 'routine_1' WHERE id = ?",
+        "UPDATE cloud_handoffs SET routine_id = 'trig_' WHERE id = ?",
     ] {
         let err = sqlx::query(sql)
             .bind(id.to_string())
@@ -914,6 +1093,99 @@ async fn the_schema_refuses_rows_that_contradict_their_state() {
             .unwrap_err();
         assert!(err.to_string().contains("CHECK"), "{sql}: {err}");
     }
+}
+
+#[tokio::test]
+async fn the_schema_refuses_a_routine_id_without_trig() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "r", "trig_1", "t", 10).await;
+    for bad in ["1", "trig_", "TRIG_1"] {
+        let err = sqlx::query("UPDATE cloud_routines SET routine_id = ?")
+            .bind(bad)
+            .execute(&store.pool)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("CHECK"), "{bad}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn a_routine_moved_to_another_member_fails_to_open() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let mallory = member(&store, "mallory").await;
+    put(&store, ada, "r", "trig_1", "sk-ant-oat01-ADA", 10).await;
+    sqlx::query("UPDATE cloud_routines SET member_id = ?")
+        .bind(mallory.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let err = store.cloud_routine(mallory, "r").await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Seal {
+                table: "cloud_routines",
+                column: "token_enc",
+                source: SealError::Decrypt,
+            }
+        ),
+        "{err:?}"
+    );
+
+    put(&store, ada, "s", "trig_2", "sk-ant-oat01-ADA2", 10).await;
+    sqlx::query("UPDATE cloud_routines SET routine_id = 'trig_3' WHERE label = 's'")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(
+        store.cloud_routine(ada, "s").await.is_err(),
+        "a token is bound to its routine id"
+    );
+}
+
+#[tokio::test]
+async fn a_handoff_moved_to_another_member_fails_to_open() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let mallory = member(&store, "mallory").await;
+    begin(&store, ada, "ADA-TASK", 100).await;
+    sqlx::query("UPDATE cloud_handoffs SET member_id = ?")
+        .bind(mallory.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let err = store.recent_cloud_handoffs(mallory, 10).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Seal {
+                table: "cloud_handoffs",
+                column: "task_enc",
+                source: SealError::Decrypt,
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_new_handoff_leaves_its_task_out_of_debug() {
+    let member = MemberId::new_v4();
+    let routine_id = routine("trig_1");
+    let requested_by = member_key("ada");
+    let new = NewCloudHandoff {
+        member,
+        routine_label: "r",
+        routine_id: &routine_id,
+        requested_by: &requested_by,
+        origin: CloudOrigin::SlackDm,
+        task: "TASK-TEXT",
+    };
+    let debug = format!("{new:?} {new:#?}");
+    assert!(!debug.contains("TASK-TEXT"), "{debug}");
+    assert!(debug.contains("trig_1"), "{debug}");
 }
 
 #[tokio::test]
@@ -974,6 +1246,18 @@ fn origins_and_states_have_their_stored_forms() {
         assert_eq!(CloudHandoffState::parse(state.as_str()).unwrap(), state);
     }
     assert!(CloudHandoffState::parse("done").is_err());
+    for reason in [
+        CloudUnknownReason::ServerError,
+        CloudUnknownReason::OtherStatus,
+        CloudUnknownReason::Timeout,
+        CloudUnknownReason::ConnectionLost,
+        CloudUnknownReason::Redirect,
+        CloudUnknownReason::UnreadableAnswer,
+        CloudUnknownReason::NoAnswer,
+    ] {
+        assert_eq!(CloudUnknownReason::parse(reason.as_str()).unwrap(), reason);
+    }
+    assert!(CloudUnknownReason::parse("because").is_err());
 }
 
 #[test]
