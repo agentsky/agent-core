@@ -2922,27 +2922,32 @@ and stop at the cap. That completes design milestone 5.
 
 Deviation (decided in T34): agentd delivers agent-to-agent mentions itself,
 on every surface and whether or not Slack or Rocket.Chat also deliver the
-post, instead of following T32's outcome. After a turn's posts are out, each
-of its posts in the thread the turn answered, outside a one-to-one DM and a
-private task, that the platform reads as mentioning other managed agents
+post, instead of following T32's outcome. Each of a turn's posts in the
+thread the turn answered, outside a one-to-one DM and a private task, hands
+off to the other managed agents the platform reads it as mentioning
 (Rocket.Chat's `mentions[]` in the post's response, the `<@U…>` tokens in
-what was sent to Slack), is queued for those agents as the posting bot's
-message and goes through routing like any other, without a read-back. Only
-those posts carry attribution (`message_refs.hands_off`), so a post in
-another thread or channel starts no hop by either delivery. Each hand-off is
-kept in `hand_offs` until its job ran, and taken again after a lease when a
-shutdown, a crash or a full queue cut it, so it is delivered at least once. A
-claim in `processed_events`, keyed by the mentioned agent and the posting
-turn and taken after routing and before acting, lets one hop run per turn
-and agent, whichever copy or post arrives first; it is also checked before a
-copy takes a place or a read-back. The ref is still recorded right after the
-post returns, not before it; the platform's copy waits up to two seconds for
-it as before, and the race test shows the hop runs once in both orders.
-`ask-agent` posts `@handle: task` after the turn with the turn's other
-queued posts, matches handles before names, and is refused outside channels
-and group DMs. The hop-cap notice is said once an hour per agent and thread;
-the personal refusals (rules, ban, not in the channel) stay silent on a hop,
-as T27 and T33 decided for bots' messages.
+what was sent to Slack), each agent once for the turn: the hand-off is
+recorded in `hand_offs` as the post is, and once the delivery is done it is
+queued for that agent as the posting bot's message and goes through routing
+like any other, without a read-back. Only those posts carry attribution
+(`message_refs.hands_off`), so a post in another thread or channel starts
+no hop by either delivery. A hand-off's row is kept until its job settles
+it, leased again while a job of this instance holds it, made due at once
+when a shutdown cuts it, and otherwise taken again after a lease, so it is
+delivered at least once until its hop is claimed. A claim in
+`processed_events`, keyed by the mentioned agent and the posting turn and
+taken after routing and before acting, lets one hop run per turn and agent,
+whichever copy or post arrives first; it is also checked before a copy
+takes a place or a read-back. The ref is still recorded right after the
+post returns, not before it; the platform's copy waits up to two seconds
+for it as before, and the race test shows the hop runs once in both orders.
+`ask-agent` posts the handle and a colon on a paragraph of its own, then the
+task, after the turn with the turn's other queued posts; a mention names a
+handle, a bare word a name or a handle, and a bare word two agents fit is
+refused, as is a second ask to the same agent in a turn and any ask outside
+channels and group DMs. The hop-cap notice is said once an hour per agent
+and thread; the personal refusals (rules, ban, not in the channel) stay
+silent on a hop, as T27 and T33 decided for bots' messages.
 
 ## Phase 6 and 7: design first
 

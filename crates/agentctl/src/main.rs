@@ -88,7 +88,8 @@ enum Command {
     /// turn, mentioning that agent. The hop is billed to this turn's
     /// requester.
     AskAgent {
-        /// The other agent's name, or its bot's handle.
+        /// The other agent's name, or its bot's handle as a mention
+        /// (`@handle`).
         agent: String,
         /// The task. Several words are joined with spaces.
         #[arg(required = true, num_args = 1.., allow_hyphen_values = true, trailing_var_arg = true)]

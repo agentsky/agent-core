@@ -274,9 +274,10 @@ fn code_is_untouched_except_for_escaping() {
                 "```\nUse ``\u{200B}`bash\nls\n``\u{200B}` to fence\n```",
             ),
             (
-                "qm-core: an unclosed backtick run after a tilde fence",
+                "qm-core, differs: an unclosed backtick run after a tilde fence is kept from \
+                 pairing with a later one",
                 "~~~\na\n~~~\nthen ``` dangling",
-                "```\na\n```\nthen ``` dangling",
+                "```\na\n```\nthen \u{200b}`\u{200b}\u{200b}`\u{200b}\u{200b}`\u{200b} dangling",
             ),
             (
                 "an unclosed fence runs to the end, as CommonMark says",
@@ -1389,4 +1390,23 @@ fn many_unclosed_wire_broadcasts_stay_linear() {
     let out = to_mrkdwn(&md, &NOBODY);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert_eq!(out, escape(&md));
+}
+
+#[test]
+fn a_literal_backtick_never_pairs_into_code_around_a_mention() {
+    check(
+        &TEAM,
+        &[
+            (
+                "a run of one and a run of two",
+                "`a @ankit``",
+                "\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b}\u{200b}`\u{200b}",
+            ),
+            (
+                "a run of two and a run of one",
+                "``a @ankit` b",
+                "\u{200b}`\u{200b}\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b} b",
+            ),
+        ],
+    );
 }

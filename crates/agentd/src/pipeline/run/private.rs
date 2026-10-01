@@ -436,6 +436,7 @@ impl Pipeline {
             credential,
             target: ReplyTarget::from(consent.thread.clone()),
             answering: Answering::PrivateTask(consent.id),
+            hand_offs: None,
         }
         .report(turn, report)
         .await;
@@ -488,8 +489,9 @@ impl Pipeline {
             credential: CredentialRef::Community,
             target: ReplyTarget::from(consent.thread.clone()),
             answering: Answering::PrivateTask(consent.id),
+            hand_offs: None,
         };
-        if !delivery.post(None, text).await.0 {
+        if !delivery.post(None, text, &mut Vec::new()).await {
             return Err(PipelineError::NotPosted);
         }
         tracing::info!(consent = %consent.id, "posted a private task's outcome");

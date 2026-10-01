@@ -2277,7 +2277,7 @@ async fn ask_agent_hands_a_capitalized_task_off_on_slack() {
     let scouts = turned.wait_for_posts(SCOUT.token, 2).await;
     assert_eq!(
         scouts[1]["text"],
-        format!("<@{}>: Check the changelog", HELPER.bot),
+        format!("<@{}>:\n\nCheck the changelog", HELPER.bot),
         "the handle is a mention, whatever the task starts with"
     );
     let helpers = turned.wait_for_posts(HELPER.token, 1).await;

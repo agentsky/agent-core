@@ -243,6 +243,26 @@ impl SlackSurface {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether Slack says the bot may post in `channel`: the conversation
+    /// asked about, not archived, and the bot a member, or a DM. A yes is
+    /// kept for [`MEMBERSHIP_TTL`], and a no drops it.
+    async fn member(&self, channel: &ConversationId) -> Result<bool> {
+        let info = self.api.conversation_info(channel).await?;
+        let member = info.id == *channel
+            && !info.is_archived
+            && (info.is_member || info.is_im || info.is_mpim);
+        let mut member_of = self.lock_member_of();
+        if member {
+            if member_of.len() >= MAX_MEMBERSHIPS {
+                member_of.clear();
+            }
+            member_of.insert(channel.clone(), Instant::now() + MEMBERSHIP_TTL);
+        } else {
+            member_of.remove(channel);
+        }
+        Ok(member)
+    }
+
     fn channel<'a>(&self, conv: &'a ConvRef) -> Result<&'a ConversationId> {
         if conv.surface != SurfaceKind::Slack || conv.team != *self.directory.team() {
             return Err(SurfaceError::Api(
@@ -424,29 +444,27 @@ impl Surface for SlackSurface {
     /// Slack never joins a bot to a conversation it posts in; it refuses
     /// the post with `not_in_channel` instead. So this checks that the
     /// conversation is in this surface's workspace and, with
-    /// `conversations.info`, that the bot is a member, or that it is a DM.
-    /// Slack's yes is trusted for [`MEMBERSHIP_TTL`]; a no is asked again
-    /// each time, so a bot just added posts at once.
+    /// `conversations.info`, that the bot is a member, or that it is a DM,
+    /// and that it isn't archived. Slack's yes is trusted for
+    /// [`MEMBERSHIP_TTL`]; a no is asked again each time, so a bot just
+    /// added posts at once.
     async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
         let channel = self.channel(conv)?;
-        let now = Instant::now();
         if self
             .lock_member_of()
             .get(channel)
-            .is_some_and(|until| *until > now)
+            .is_some_and(|until| *until > Instant::now())
         {
             return Ok(true);
         }
-        let info = self.api.conversation_info(channel).await?;
-        let member = info.is_member || info.is_im || info.is_mpim;
-        if member {
-            let mut member_of = self.lock_member_of();
-            if member_of.len() >= MAX_MEMBERSHIPS {
-                member_of.clear();
-            }
-            member_of.insert(channel.clone(), now + MEMBERSHIP_TTL);
-        }
-        Ok(member)
+        self.member(channel).await
+    }
+
+    /// Asks Slack as [`can_post`](Self::can_post) does, whatever it said
+    /// lately, and keeps the answer: a no forgets an earlier yes.
+    async fn can_post_now(&self, conv: &ConvRef) -> Result<bool> {
+        let channel = self.channel(conv)?;
+        self.member(channel).await
     }
 
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {

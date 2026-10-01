@@ -772,9 +772,23 @@ impl Fixture {
         bot: &str,
         visibility: store::Visibility,
     ) -> AgentId {
+        self.bot_agent_on(SurfaceKind::Slack, owner, name, bot, visibility)
+            .await
+    }
+
+    /// An agent of `owner` named `name`, whose active bot on `surface` in
+    /// `T1` is the user `bot`; on Rocket.Chat, `bot` is its username too.
+    async fn bot_agent_on(
+        &self,
+        surface: SurfaceKind,
+        owner: &str,
+        name: &str,
+        bot: &str,
+        visibility: store::Visibility,
+    ) -> AgentId {
         let now = OffsetDateTime::now_utc();
         let owner_key = MemberKey {
-            surface: SurfaceKind::Slack,
+            surface,
             team: "T1".into(),
             user: owner.into(),
         };
@@ -792,7 +806,7 @@ impl Fixture {
                     name,
                     persona: "p",
                     visibility,
-                    surface: SurfaceKind::Slack,
+                    surface,
                     team: &team,
                 },
                 10,
@@ -803,8 +817,12 @@ impl Fixture {
         else {
             panic!("created");
         };
+        let username = match surface {
+            SurfaceKind::Slack => name,
+            SurfaceKind::RocketChat => bot,
+        };
         self.store
-            .set_binding_bot_user(binding, &bot.into(), name)
+            .set_binding_bot_user(binding, &bot.into(), username)
             .await
             .unwrap();
         self.store
@@ -847,37 +865,48 @@ async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
     fixture
         .bot_agent("U0OWNER", "reviewer", "U0REVIEW", public)
         .await;
-    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    fixture
+        .bot_agent("U0OWNER", "scout", "U0SCOUT", public)
+        .await;
     for (named, task) in [
         ("reviewer", " look at this "),
         ("@U0REVIEW", "and this"),
         ("<@U0REVIEW|reviewer>", "and that"),
-        ("REVIEWER", "Once more"),
+        ("REVIEWER", "a | b\n---|---"),
     ] {
+        let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
         let (status, value) = fixture.ask(&token, named, task).await;
         assert_eq!(status, 200, "{named}: {value}");
+        let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+        let [post] = outbox.posts() else {
+            panic!("{named}: one post");
+        };
+        assert_eq!(post.to, ReplyTarget::from(thread()));
+        assert_eq!(
+            post.text,
+            format!("@U0REVIEW:\n\n{}", task.trim()),
+            "the mention is a paragraph of its own, whatever the task holds"
+        );
     }
-    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
-    let here = ReplyTarget::from(thread());
-    let texts: Vec<&str> = outbox
-        .posts()
-        .iter()
-        .inspect(|post| assert_eq!(post.to, here))
-        .map(|post| post.text.as_str())
-        .collect();
-    assert_eq!(
-        texts,
-        [
-            "@U0REVIEW: look at this",
-            "@U0REVIEW: and this",
-            "@U0REVIEW: and that",
-            "@U0REVIEW: Once more",
-        ]
-    );
+
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    for (named, status) in [("reviewer", 200), ("@U0REVIEW", 403), ("scout", 200)] {
+        let (got, value) = fixture.ask(&token, named, "t").await;
+        assert_eq!(got, status, "{named}: {value}");
+        if got == 403 {
+            assert_eq!(code(&value), "refused");
+            assert!(
+                value["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already asked @U0REVIEW")
+            );
+        }
+    }
 }
 
 #[tokio::test]
-async fn ask_agent_finds_a_handle_before_a_name_that_spells_it() {
+async fn ask_agent_reads_a_mention_as_a_handle_and_refuses_a_bare_word_two_agents_fit() {
     let fixture = Fixture::new().await;
     let public = store::Visibility::Public;
     let helper = fixture
@@ -889,30 +918,100 @@ async fn ask_agent_finds_a_handle_before_a_name_that_spells_it() {
     fixture
         .bot_agent("U0SQUAT", "u0review", "U0SQUATBOT", public)
         .await;
-    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
-    for named in ["@U0REVIEW", "<@U0REVIEW|reviewer>", "U0REVIEW", "reviewer"] {
+    let asked = async |named: &str| {
+        let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
         let (status, value) = fixture.ask(&token, named, "Look").await;
+        let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+        let texts: Vec<String> = outbox
+            .posts()
+            .iter()
+            .map(|post| post.text.clone())
+            .collect();
+        (status, value, texts)
+    };
+    for (named, to) in [
+        ("@U0REVIEW", "@U0REVIEW"),
+        ("<@U0REVIEW|u0review>", "@U0REVIEW"),
+        ("reviewer", "@U0REVIEW"),
+        ("@U0SQUATBOT", "@U0SQUATBOT"),
+    ] {
+        let (status, value, texts) = asked(named).await;
         assert_eq!(status, 200, "{named}: {value}");
+        assert_eq!(texts, [format!("{to}:\n\nLook")], "{named}");
     }
-    let (status, value) = fixture.ask(&token, "@U0SQUATBOT", "Look").await;
-    assert_eq!(status, 200, "{value}");
-    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
-    let texts: Vec<&str> = outbox
-        .posts()
-        .iter()
-        .map(|post| post.text.as_str())
-        .collect();
-    assert_eq!(
-        texts,
-        [
-            "@U0REVIEW: Look",
-            "@U0REVIEW: Look",
-            "@U0REVIEW: Look",
-            "@U0REVIEW: Look",
-            "@U0SQUATBOT: Look",
-        ],
-        "an agent whose name spells another's handle takes nothing from it"
+    let (status, value, texts) = asked("U0REVIEW").await;
+    assert_eq!((status, code(&value)), (400, "bad_request"), "{value}");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("@U0REVIEW, @U0SQUATBOT"),
+        "{value}"
     );
+    assert!(texts.is_empty());
+
+    let rocket = |id: &str| ConvRef {
+        surface: SurfaceKind::RocketChat,
+        team: "T1".into(),
+        conversation: id.into(),
+    };
+    let rc_helper = fixture
+        .bot_agent_on(SurfaceKind::RocketChat, "carol", "helper", "helper", public)
+        .await;
+    fixture
+        .bot_agent_on(
+            SurfaceKind::RocketChat,
+            "mallory",
+            "reviewer",
+            "reviewer",
+            public,
+        )
+        .await;
+    fixture
+        .bot_agent_on(
+            SurfaceKind::RocketChat,
+            "bob",
+            "reviewer",
+            "bob.reviewer",
+            public,
+        )
+        .await;
+    let rc_asked = async |named: &str| {
+        let token = fixture
+            .running(rc_helper, ScopeKey::Channel(rocket("GENERAL")))
+            .await;
+        let mut turn = turn(TurnKind::Normal, Side::Public);
+        turn.thread.conv = rocket("GENERAL");
+        fixture.ctl.begin_turn(&token, turn).await.unwrap();
+        let (status, value) = fixture.ask(&token, named, "Look").await;
+        let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+        let texts: Vec<String> = outbox
+            .posts()
+            .iter()
+            .map(|post| post.text.clone())
+            .collect();
+        (status, value, texts)
+    };
+    let (status, value, texts) = rc_asked("reviewer").await;
+    assert_eq!(
+        (status, code(&value)),
+        (400, "bad_request"),
+        "mallory's bot took the username reviewer, the name of bob's agent: {value}"
+    );
+    let message = value["message"].as_str().unwrap();
+    assert!(
+        message.contains("@reviewer") && message.contains("@bob.reviewer"),
+        "{message}"
+    );
+    assert!(texts.is_empty());
+    for (named, to) in [
+        ("@bob.reviewer", "@bob.reviewer"),
+        ("@reviewer", "@reviewer"),
+    ] {
+        let (status, value, texts) = rc_asked(named).await;
+        assert_eq!(status, 200, "{named}: {value}");
+        assert_eq!(texts, [format!("{to}:\n\nLook")], "{named}");
+    }
 }
 
 #[tokio::test]
@@ -948,11 +1047,18 @@ async fn ask_agent_refuses_what_could_not_hand_off() {
         .await;
     assert_eq!((status, code(&value)), (413, "too_large"), "{value}");
     for _ in 0..super::outbox::MAX_POSTS {
-        let (status, value) = fixture.ask(&token, "@U0TWINA", "t").await;
+        let (status, value) = fixture.call(Some(&token), "/v1/post", post("here")).await;
         assert_eq!(status, 200, "{value}");
     }
     let (status, value) = fixture.ask(&token, "@U0TWINA", "t").await;
     assert_eq!((status, code(&value)), (403, "refused"), "{value}");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("already queued"),
+        "{value}"
+    );
 
     for scope in [ScopeKey::Private, ScopeKey::Dm(conv("D1"))] {
         let dm = fixture.running(helper, scope).await;

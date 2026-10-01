@@ -1182,7 +1182,7 @@ async fn owner_requester_at_hop_one_needs_a_card() {
                 msg: &by_writer,
                 thread_root: None,
                 agent: Some(writer.id),
-                turn: None,
+                turn: Some(core_types::TurnId::new_v4()),
                 requester: &core_types::Requester {
                     member: Some(stack.alice),
                     key: key("alice"),

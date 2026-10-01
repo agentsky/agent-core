@@ -5,7 +5,7 @@ mod private;
 
 pub use private::{WORK_LEASE, WORK_MAX_ATTEMPTS, WORK_RETRY};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +22,8 @@ use render::directives::{self, Directive};
 use router::{Decision, ModelPolicy, RefuseReason};
 use runner::{RunnerError, Session, TurnOutcome, TurnReport, TurnRequest};
 use store::{
-    Agent, CostUnknown, LimitWindow, NewMessageRef, PROCESSED_EVENT_RETENTION, Store, StoreError,
-    TurnUsage,
+    Agent, CostUnknown, HandOff, LimitWindow, NewMessageRef, PROCESSED_EVENT_RETENTION, Store,
+    StoreError, TurnUsage,
 };
 use time::OffsetDateTime;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
@@ -114,11 +114,19 @@ pub struct PipelineSettings {
     pub max_pending_per_owner: usize,
     /// The community's caps on threads and hops, from `[limits]`.
     pub limits: Limits,
-    /// The clock the limits, the meter and the notices read: which day and
-    /// hour a turn counts in, which window a limit's notice is for, and
-    /// when a requester was last told of a failure or a refusal.
+    /// The clock the limits, the meter, the notices and the hand-offs read:
+    /// which day and hour a turn counts in, which window a limit's notice
+    /// is for, when a requester was last told of a failure or a refusal,
+    /// and when a hand-off was recorded and is due.
     pub now: fn() -> OffsetDateTime,
+    /// How long the attribution of a message an agent's bot sent is waited
+    /// for: agentd records it just after posting, and the platform may
+    /// deliver the message sooner. [`ATTRIBUTION_WAIT`] by default.
+    pub attribution_wait: Duration,
 }
+
+/// The default [`PipelineSettings::attribution_wait`].
+pub const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
 
 /// Takes every surface's messages that aren't commands, decides which
 /// agents answer, runs their turns and delivers their replies.
@@ -186,16 +194,22 @@ pub struct PipelineSettings {
 ///    with the agent or they were told about the same kind of failure
 ///    within [`FAILURE_DM_INTERVAL`]; the agent's owner never is, unless
 ///    they asked.
-/// 7. **Hand-off.** Each post of the turn's own, its reply's chunks and the
-///    posts it queued (`agentctl post` and `ask-agent`), that is in the
-///    conversation the turn answered, outside a one-to-one DM, and that the
-///    platform reads as mentioning other managed agents, is queued for those
-///    agents as their bot's message, as the platform would deliver it. A
-///    private task's posts never are. The router gives such a hop the
-///    requester and the next hop of the post's `message_refs` row, so the
-///    hop caps, the thread's budget and the agent's rules hold. When the
-///    platform delivers the post too, whichever copy comes second is dropped
-///    once routed and confirmed: the first claims the hop in the store.
+/// 7. **Hand-off.** Each post of the turn's own in the thread it answered,
+///    its reply's chunks and the posts it queued (`agentctl post` and
+///    `ask-agent`), outside a one-to-one DM and a private task, hands off
+///    to the other managed agents the platform reads it as mentioning, each
+///    agent once for the turn, from the first post that mentions it: as the
+///    post is recorded, a `hand_offs` row keeps it, and once the delivery
+///    is done it is queued for that agent as the posting bot's message,
+///    without a read-back, as the platform would deliver it. The router
+///    gives such a hop the requester and the next hop of the post's
+///    `message_refs` row, so the hop caps, the thread's budget and the
+///    agent's rules hold. One hop runs for each agent and posting turn: the
+///    first copy to act claims it in the store, and any other, agentd's or
+///    the platform's, is dropped. A row is deleted once its job settled the
+///    hand-off, and is otherwise taken again by
+///    [`replay_hand_offs`](Self::replay_hand_offs), here or on another
+///    instance.
 /// 8. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
 ///    one saying their link stopped working and how to link it again, when
@@ -243,6 +257,25 @@ struct Inner {
     closed: AtomicBool,
     working: Mutex<Working>,
     floods: Throttle<(AgentId, Flood)>,
+    held: Held,
+}
+
+/// The `hand_offs` rows whose jobs are alive on this instance, waiting or
+/// running: a cache in front of the rows, which
+/// [`Pipeline::replay_hand_offs`] keeps leasing rather than queueing
+/// again, and [`Pipeline::cut_short`] makes due at once.
+type Held = Arc<Mutex<HashSet<i64>>>;
+
+/// A job's hold on its `hand_offs` row, let go when the job is dropped.
+struct Holding {
+    id: i64,
+    held: Held,
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        lock(&self.held).remove(&self.id);
+    }
 }
 
 /// What an agent's flood makes the pipeline refuse or drop, each warned
@@ -261,9 +294,10 @@ enum Flood {
 type LaneKey = (AgentId, ThreadKey);
 
 /// A message waiting for one candidate agent, whose owner is `owner`. A
-/// hand-off agentd built itself names its `hand_offs` row in `hand_off`:
+/// hand-off agentd built itself holds its `hand_offs` row in `hand_off`:
 /// it skips confirmation, since agentd posted the message, and the row is
-/// deleted once the job has run.
+/// deleted once the job has settled the hand-off
+/// ([`Pipeline::candidate`]).
 /// Dropping it releases its places under [`PipelineSettings::max_pending`]
 /// and [`PipelineSettings::max_pending_per_owner`]; once it and the notices
 /// it started are gone, whoever waits for it in [`Pipeline::handle`] is
@@ -272,7 +306,7 @@ struct Job {
     event: Arc<InboundEvent>,
     caps: Caps,
     owner: MemberId,
-    hand_off: Option<i64>,
+    hand_off: Option<Holding>,
     _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
     done: Done,
 }
@@ -399,6 +433,7 @@ impl Pipeline {
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
                 floods: Throttle::new(FLOOD_WARNING_INTERVAL),
+                held: Held::default(),
             }),
         }
     }
@@ -460,16 +495,28 @@ impl Pipeline {
     /// its working emoji taken off and its thread told to ask again
     /// ([`RESTARTING_TEXT`]), within a few seconds. Messages still waiting
     /// are dropped without a word: no decision was made about them yet.
+    /// The hand-offs among them are made due at once, for the next
+    /// instance to take.
     /// The private tasks it drops are released for another instance, but
     /// those whose turn had started are left to their kills, which
     /// [`wait_for_kills`](Self::wait_for_kills) waits for: they release
     /// the claim once the turn is billed.
     pub async fn cut_short(&self) {
         self.close();
+        let held: Vec<i64> = lock(&self.inner.held).iter().copied().collect();
         let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         tasks.shutdown().await;
         self.release_cut_tasks().await;
         lock(&self.inner.lanes).clear();
+        if !held.is_empty()
+            && let Err(err) = self
+                .inner
+                .store
+                .release_hand_offs(&held, (self.inner.settings.now)())
+                .await
+        {
+            tracing::warn!(error = %err, hand_offs = held.len(), "couldn't make the hand-offs cut short due at once; they are taken after their lease");
+        }
         {
             let mut working = self.working();
             let running: Vec<_> = working.running.drain().map(|(_, cut)| cut).collect();
@@ -523,16 +570,24 @@ impl Pipeline {
                 return Vec::new();
             }
         };
-        if from_bot && let Some(turn) = self.posting_turn(&event.message).await {
-            let mut fresh = Vec::with_capacity(candidates.len());
-            for (agent, owner) in candidates {
-                if self.hopped(&hop_key(agent, turn)).await {
-                    tracing::debug!(%agent, message = %event.message.id, "the hop from this post's turn ran already; dropped this copy");
-                } else {
-                    fresh.push((agent, owner));
+        if from_bot {
+            match self.posting_turn(&event.message).await {
+                Ok(Some(turn)) => {
+                    let mut fresh = Vec::with_capacity(candidates.len());
+                    for (agent, owner) in candidates {
+                        if self.hopped(&hop_key(agent, turn)).await {
+                            tracing::debug!(%agent, message = %event.message.id, "the hop from this post's turn ran already; dropped this copy");
+                        } else {
+                            fresh.push((agent, owner));
+                        }
+                    }
+                    candidates = fresh;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(message = %event.message.id, error = %err, "couldn't read which turn posted a message");
                 }
             }
-            candidates = fresh;
         }
         let candidates = candidates
             .into_iter()
@@ -542,22 +597,21 @@ impl Pipeline {
     }
 
     /// The turn that posted `msg` where a mention in it hands off, if it
-    /// is one ([`StoreView`] attributes only those). A store failure is
-    /// logged and taken as none.
-    async fn posting_turn(&self, msg: &MsgRef) -> Option<TurnId> {
-        match self.inner.store.posted_message_ref(msg).await {
-            Ok(posted) => posted.filter(|posted| posted.hands_off)?.turn,
-            Err(err) => {
-                tracing::warn!(msg = %msg.id, error = %err, "couldn't read who posted a message");
-                None
-            }
-        }
+    /// is one ([`StoreView`] attributes only those).
+    async fn posting_turn(&self, msg: &MsgRef) -> Result<Option<TurnId>, StoreError> {
+        Ok(self
+            .inner
+            .store
+            .posted_message_ref(msg)
+            .await?
+            .filter(|posted| posted.hands_off)
+            .and_then(|posted| posted.turn))
     }
 
     /// Whether the hop `key` was claimed already
-    /// ([`claim_hop`](Self::claim_hop)): only a hint, which saves a copy
-    /// that comes second its places and its read-back. A failed read says
-    /// no; the claim still decides.
+    /// ([`candidate`](Self::candidate) claims it): only a hint, which saves
+    /// a copy that comes second its places and its read-back. A failed
+    /// read says no; the claim still decides.
     async fn hopped(&self, key: &str) -> bool {
         self.inner
             .store
@@ -570,10 +624,11 @@ impl Pipeline {
     }
 
     /// Queues `event` for each of `candidates`, each with its owner and
-    /// the `hand_offs` row it delivers, if any, and returns what completes
-    /// when each is done with. A candidate whose places are full is told
-    /// nothing when `from_bot`, and otherwise gets a busy line; a hand-off
-    /// it couldn't take keeps its row, to be taken again.
+    /// the `hand_offs` row it delivers, if any, which the job holds, and
+    /// returns what completes when each is taken and done with. A candidate
+    /// whose places are full is told nothing when `from_bot`, and
+    /// otherwise gets a busy line; a hand-off it couldn't take keeps its
+    /// row, to be taken again.
     fn queue(
         &self,
         event: &Arc<InboundEvent>,
@@ -591,7 +646,7 @@ impl Pipeline {
                     event: Arc::clone(event),
                     caps,
                     owner,
-                    hand_off,
+                    hand_off: hand_off.map(|id| self.hold(id)),
                     _pending: places,
                     done: Arc::clone(&done),
                 };
@@ -612,6 +667,15 @@ impl Pipeline {
             }
         }
         waiting
+    }
+
+    /// Holds the `hand_offs` row `id` for a job of this instance.
+    fn hold(&self, id: i64) -> Holding {
+        lock(&self.inner.held).insert(id);
+        Holding {
+            id,
+            held: Arc::clone(&self.inner.held),
+        }
     }
 
     /// Whether a warning about `agent`'s `flood` is due: `Some` of how many
@@ -674,14 +738,16 @@ impl Pipeline {
     async fn lane(self, key: LaneKey, mut job: Job) {
         let agent = key.0;
         loop {
-            let answered = AssertUnwindSafe(self.candidate(&job, agent))
+            let settled = AssertUnwindSafe(self.candidate(&job, agent))
                 .catch_unwind()
-                .await;
-            if answered.is_err() {
-                tracing::error!(%agent, message = %job.event.message.id, "handling a message panicked");
-            }
-            if let Some(id) = job.hand_off
-                && let Err(err) = self.inner.store.finish_hand_off(id).await
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::error!(%agent, message = %job.event.message.id, "handling a message panicked");
+                    false
+                });
+            if settled
+                && let Some(holding) = &job.hand_off
+                && let Err(err) = self.inner.store.finish_hand_off(holding.id).await
             {
                 tracing::warn!(%agent, error = %err, "couldn't record a hand-off as done; it will be delivered again");
             }
@@ -814,108 +880,113 @@ impl Pipeline {
 
     /// Routes `job`'s message for `agent`, and unless the decision is to
     /// ignore it, routes the platform's copy again and acts on the copy
-    /// if its decision may stand ([`copy_stands`]).
-    async fn candidate(&self, job: &Job, agent: AgentId) {
+    /// if its decision may stand ([`copy_stands`]). A hand-off agentd built
+    /// itself is acted on as it is, once the agent's bot is found, asking
+    /// the platform now, to be able to post in the conversation.
+    ///
+    /// Returns whether the message is settled: true unless what deciding
+    /// needed couldn't be read, or, on a hop, its claim couldn't be
+    /// recorded, the agent's bot couldn't be checked, or the agent's rules
+    /// couldn't be read. A hand-off's row is deleted only once it is
+    /// settled, and is otherwise taken again.
+    async fn candidate(&self, job: &Job, agent: AgentId) -> bool {
         let (event, caps) = (job.event.as_ref(), job.caps);
         let Some(decision) = self.decide(event, agent, caps).await else {
-            return;
+            return false;
         };
         if let Decision::Ignore(reason) = decision {
             tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
-            return;
+            return true;
         }
-        let hop = self.hop_of(event, agent, &decision).await;
+        let hop = if on_hop(event, &decision) {
+            match self.posting_turn(&event.message).await {
+                Ok(Some(turn)) => Some(hop_key(agent, turn)),
+                Ok(None) => {
+                    tracing::warn!(%agent, message = %event.message.id, "a hop's post has no turn on record; leaving it");
+                    return false;
+                }
+                Err(err) => {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't read which turn posted a hop's message; leaving it");
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(key) = &hop
             && self.hopped(key).await
         {
             tracing::debug!(%agent, message = %event.message.id, "the hop from this post's turn ran already; dropped this copy");
-            return;
+            return true;
         }
         let copy = if job.hand_off.is_some() {
-            None
+            match self.can_post_now(agent, &event.conv).await {
+                Ok(true) => None,
+                Ok(false) => {
+                    tracing::info!(%agent, conv = %event.conv, "not taking a hand-off: the agent's bot isn't in this conversation");
+                    return true;
+                }
+                Err(err) => {
+                    tracing::warn!(%agent, conv = %event.conv, error = %err, "couldn't check the agent's bot can post; leaving the hand-off");
+                    return false;
+                }
+            }
         } else {
             let Some(copy) = self.confirmed(job, agent).await else {
-                return;
+                return true;
             };
             Some(copy).filter(|copy| copy != event)
         };
         let (event, decision) = if let Some(copy) = &copy {
             let Some(confirmed) = self.decide(copy, agent, caps).await else {
-                return;
+                return false;
             };
             if !copy_stands(&decision, &confirmed) {
                 if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
                     tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message routes differently from its event; dropped it");
                 }
-                return;
+                return true;
             }
             (copy, confirmed)
         } else {
             (event, decision)
         };
-        if let Some(key) = &hop
-            && !self.claim_hop(key, agent, event).await
-        {
-            return;
-        }
-        self.act(event, agent, caps, decision).await;
-    }
-
-    /// The claim key of `decision` for `agent` on `event` when it is on a
-    /// hop: a requester other than the sender, which only an attributed
-    /// agent's post gives. One hop runs for each agent and posting turn,
-    /// however many of the turn's posts mention the agent and however
-    /// many copies of them arrive. `None` for any other decision, and for a
-    /// refusal because the agent's rules couldn't be read, which another
-    /// copy may then get past.
-    async fn hop_of(
-        &self,
-        event: &InboundEvent,
-        agent: AgentId,
-        decision: &Decision,
-    ) -> Option<String> {
-        if decision
-            .requester()
-            .is_none_or(|requester| requester.key == event.sender)
-            || matches!(
-                decision,
-                Decision::Refuse {
-                    reason: RefuseReason::PolicyUnavailable,
-                    ..
+        if let Some(key) = &hop {
+            let now = (self.inner.settings.now)();
+            match self
+                .inner
+                .store
+                .mark_event_processed(HOP_SOURCE, key, now, PROCESSED_EVENT_RETENTION)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(%agent, message = %event.message.id, "a hop's other copy was acted on already; dropped this one");
+                    return true;
                 }
-            )
-        {
-            return None;
+                Err(err) => {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't claim a hop; leaving it");
+                    return false;
+                }
+            }
         }
-        Some(match self.posting_turn(&event.message).await {
-            Some(turn) => hop_key(agent, turn),
-            None => format!("{agent}/{}/{}", event.message.conv, event.message.id),
-        })
+        let settled = !matches!(
+            decision,
+            Decision::Refuse {
+                reason: RefuseReason::PolicyUnavailable,
+                ..
+            }
+        );
+        self.act(event, agent, caps, decision).await;
+        settled
     }
 
-    /// Claims the hop `key` for `agent` on `event`: true for the first
-    /// claim. A hop reaches its agent from every post of the turn that
-    /// mentions it, and from the platform's copy of each too
-    /// ([`hand_off`](Self::hand_off)), in any order, and only the first
-    /// claims it. A claim the store fails to record drops the hop, so it
-    /// never runs twice.
-    async fn claim_hop(&self, key: &str, agent: AgentId, event: &InboundEvent) -> bool {
-        let now = (self.inner.settings.now)();
-        match self
-            .inner
-            .store
-            .mark_event_processed(HOP_SOURCE, key, now, PROCESSED_EVENT_RETENTION)
-            .await
-        {
-            Ok(true) => true,
-            Ok(false) => {
-                tracing::debug!(%agent, message = %event.message.id, "a hop's other copy was acted on already; dropped this one");
-                false
-            }
-            Err(err) => {
-                tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't claim a hop; dropped it");
-                false
-            }
+    /// Whether `agent`'s bot may post in `conv`, asked of the platform now
+    /// ([`Surface::can_post_now`]); false when it has no surface there.
+    async fn can_post_now(&self, agent: AgentId, conv: &ConvRef) -> Result<bool, PipelineError> {
+        match self.inner.surfaces.surface(agent, conv).await? {
+            Some(surface) => Ok(surface.can_post_now(conv).await?),
+            None => Ok(false),
         }
     }
 
@@ -931,6 +1002,7 @@ impl Pipeline {
             thread: &thread,
             limits: &settings.limits,
             now: (settings.now)(),
+            attribution_wait: settings.attribution_wait,
         };
         let view = match StoreView::load(store, event, agent, context).await {
             Ok(view) => view,
@@ -1092,7 +1164,9 @@ impl Pipeline {
     /// them for a refusal of them ([`RefuseReason::is_personal`]), or in
     /// one line in the thread. A limit that counts turns or tokens over a
     /// day or an hour says so once per thread in that window, so a capped
-    /// agent doesn't answer every message with the same line.
+    /// agent doesn't answer every message with the same line, and so do the
+    /// hop cap and, on a hop, rules that can't be read, which every post
+    /// and copy of a chain meets again.
     ///
     /// A refusal of them on a hop, where another agent's post named
     /// `agent` for them, is only logged: they never addressed `agent`, so
@@ -1124,7 +1198,11 @@ impl Pipeline {
             return Ok(());
         }
         let target = reply_target(event, caps);
-        let Some((kind, window)) = limit_window(reason) else {
+        let on_hop = requester.key != event.sender;
+        let Some((kind, window)) = limit_window(reason).or_else(|| {
+            (on_hop && reason == RefuseReason::PolicyUnavailable)
+                .then_some(("policy_unavailable", LimitWindow::Hour))
+        }) else {
             say(surface.as_ref(), &target, &text).await?;
             tracing::info!(%agent, message = %event.message.id, %reason, "refused a message");
             return Ok(());
@@ -1265,9 +1343,12 @@ impl Pipeline {
             .map_or_else(|| "This agent".to_owned(), |agent| agent.name))
     }
 
-    /// Runs `agent`'s turn on `event` and delivers what it made. Once the
-    /// agent's bot is known to be able to post, a failure before the turn
-    /// reached the model posts [`FAILED_TEXT`].
+    /// Runs `agent`'s turn on `event` and delivers what it made, unless the
+    /// agent's bot can't post in the conversation. A check that fails
+    /// answers anyway: the message was read back with the bot's own access
+    /// ([`confirmed`](Self::confirmed)), or, for a hand-off, checked just
+    /// before. Once the turn may run, a failure before it reached the model
+    /// posts [`FAILED_TEXT`].
     async fn run(
         &self,
         event: &InboundEvent,
@@ -1279,9 +1360,15 @@ impl Pipeline {
             tracing::warn!(%agent, conv = %event.conv, "the agent has no surface in this conversation");
             return Ok(());
         };
-        if !surface.can_post(&event.conv).await? {
-            tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
-            return Ok(());
+        match surface.can_post(&event.conv).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(%agent, conv = %event.conv, "not answering: the agent's bot isn't in this conversation");
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(%agent, conv = %event.conv, error = %err, "couldn't check the agent's bot can post; answering anyway");
+            }
         }
         let target = reply_target(event, caps);
         let (working, ran) = match self.prepare(agent, &event.conv, turn.credential).await {
@@ -1319,15 +1406,16 @@ impl Pipeline {
                     credential: turn.credential,
                     target,
                     answering: Answering::Message(&event.message),
+                    hand_offs: self.hand_offs(event, agent, bot).await,
                 };
-                let sent = delivery.report(turn_id, report).await;
+                let handed = delivery.report(turn_id, report).await;
                 let their_own_dm = event.is_dm() && event.sender == turn.requester.key;
                 if let Some(failure) = failure
                     && !their_own_dm
                 {
                     self.tell_requester(agent, &turn, failure).await;
                 }
-                self.hand_off(event, caps, agent, &bot, sent).await;
+                self.hand_off(caps, handed).await;
                 Ok(())
             }
             Err(err) => {
@@ -1343,119 +1431,83 @@ impl Pipeline {
         delivered
     }
 
-    /// Delivers what `agent` posted from its bot `bot`, answering
-    /// `answered`, to the other managed agents each post mentions, as the
-    /// platform would, whether or not it does too. For each agent a post
-    /// mentions, a `hand_offs` row records the event first, then the event
-    /// is queued as that bot's message, routed and run as any message is,
-    /// so the router inherits the requester and the next hop from the
-    /// post's `message_refs` row, and the caps and the agents' rules hold.
-    /// [`claim_hop`](Self::claim_hop) runs one hop for each agent and
-    /// posting turn, so a second post or copy does nothing. A row whose job
-    /// never runs, as at a shutdown, or that found no place, is taken again
-    /// by [`replay_hand_offs`](Self::replay_hand_offs), here or on another
-    /// instance.
-    ///
-    /// `sent` holds only posts in the turn's own thread, never a private
-    /// task's. A one-to-one DM hands off nothing. A mention hands off only
-    /// to an agent whose bot is active on the conversation's own surface
-    /// and team.
-    async fn hand_off(
+    /// How the posts of `agent`'s turn on `event`, made by its bot `bot`,
+    /// hand off ([`HandOffs`]): `None` in a one-to-one DM, where no other
+    /// agent answers, or when the bot's binding can't be found as
+    /// `agent`'s, so nothing it posts is attributed.
+    async fn hand_offs(
         &self,
-        answered: &InboundEvent,
-        caps: Caps,
+        event: &InboundEvent,
         agent: AgentId,
-        bot: &MemberKey,
-        sent: Vec<Sent>,
-    ) {
-        if answered.is_dm() || sent.is_empty() {
-            return;
+        bot: MemberKey,
+    ) -> Option<HandOffs> {
+        if event.is_dm() {
+            return None;
         }
-        let store = &self.inner.store;
-        let binding = match store.agent_for_bot(bot).await {
-            Ok(Some((poster, binding))) if poster.id == agent => binding,
-            Ok(_) => return,
+        match self.inner.store.agent_for_bot(&bot).await {
+            Ok(Some((poster, binding))) if poster.id == agent => Some(HandOffs {
+                conv_kind: event.conv_kind,
+                bot,
+                binding,
+                now: (self.inner.settings.now)(),
+            }),
+            Ok(_) => None,
             Err(err) => {
                 tracing::warn!(%agent, error = %err, "couldn't look up the bot of an agent's posts; not handing them off");
-                return;
-            }
-        };
-        let thread_root = reply_target(answered, caps).thread_root;
-        for sent in sent {
-            let mut candidates: Vec<(AgentId, MemberId)> = Vec::new();
-            for user in &sent.posted.mentions {
-                let key = MemberKey {
-                    surface: answered.conv.surface,
-                    team: answered.conv.team.clone(),
-                    user: user.clone(),
-                };
-                match store.agent_for_bot(&key).await {
-                    Ok(Some((mentioned, _)))
-                        if mentioned.id != agent
-                            && candidates.iter().all(|(known, _)| *known != mentioned.id) =>
-                    {
-                        candidates.push((mentioned.id, mentioned.owner));
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        tracing::warn!(%agent, msg = %sent.posted.msg.id, error = %err, "couldn't look up an agent a post mentions");
-                    }
-                }
-            }
-            let turn = sent.turn;
-            let event = Arc::new(handed_off(
-                answered,
-                binding,
-                bot,
-                thread_root.clone(),
-                sent,
-            ));
-            for (mentioned, owner) in candidates {
-                if self.hopped(&hop_key(mentioned, turn)).await {
-                    continue;
-                }
-                let Some(id) = self.record_hand_off(mentioned, &event).await else {
-                    continue;
-                };
-                tracing::debug!(%agent, %mentioned, msg = %event.message.id, "handing a post off");
-                self.queue(&event, caps, vec![(mentioned, owner, Some(id))], true);
-            }
-        }
-    }
-
-    /// Records the hand-off of `event` to `agent` in `hand_offs`, due to be
-    /// taken again after [`HAND_OFF_LEASE`], or at once when the pipeline
-    /// is closed and another instance should deliver it. `None`, logged,
-    /// when it can't be recorded: an event agentd can't keep is not run.
-    async fn record_hand_off(&self, agent: AgentId, event: &InboundEvent) -> Option<i64> {
-        let json = match serde_json::to_string(event) {
-            Ok(json) => json,
-            Err(err) => {
-                tracing::error!(%agent, error = %err, "couldn't encode a hand-off");
-                return None;
-            }
-        };
-        let now = OffsetDateTime::now_utc();
-        let due = if self.is_closed() {
-            now
-        } else {
-            now + HAND_OFF_LEASE
-        };
-        match self.inner.store.add_hand_off(agent, &json, now, due).await {
-            Ok(id) => Some(id),
-            Err(err) => {
-                tracing::warn!(%agent, msg = %event.message.id, error = %err, "couldn't record a hand-off; not handing the post off");
                 None
             }
         }
     }
 
+    /// Queues each hand-off of a turn's posts ([`HandedOff`], recorded as
+    /// it was posted) for the agent it names, as its bot's message: it is
+    /// routed and run as any message is, so the router inherits the
+    /// requester and the next hop from the post's `message_refs` row, and
+    /// the caps and the agents' rules hold. One whose hop ran already, from
+    /// the platform's copy, is done with. A hand-off whose job never
+    /// settles it, as at a shutdown, or that found no place, keeps its row
+    /// for [`replay_hand_offs`](Self::replay_hand_offs), here or on another
+    /// instance; one handed while the pipeline closes is made due at once.
+    async fn hand_off(&self, caps: Caps, handed: Vec<HandedOff>) {
+        let store = &self.inner.store;
+        if self.is_closed() {
+            let ids: Vec<i64> = handed.iter().map(|handed| handed.id).collect();
+            if !ids.is_empty()
+                && let Err(err) = store
+                    .release_hand_offs(&ids, (self.inner.settings.now)())
+                    .await
+            {
+                tracing::warn!(error = %err, "couldn't make the hand-offs of a closing pipeline due at once");
+            }
+            return;
+        }
+        for handed in handed {
+            if self.hopped(&handed.hop).await {
+                if let Err(err) = store.finish_hand_off(handed.id).await {
+                    tracing::warn!(agent = %handed.agent, error = %err, "couldn't record a hand-off as done");
+                }
+                continue;
+            }
+            tracing::debug!(agent = %handed.agent, msg = %handed.event.message.id, "handing a post off");
+            self.queue(
+                &handed.event,
+                caps,
+                vec![(handed.agent, handed.owner, Some(handed.id))],
+                true,
+            );
+        }
+    }
+
     /// Queues the hand-offs due in `hand_offs`, recorded by this instance
-    /// or another, whose jobs never ran: a shutdown or a crash cut them,
-    /// or they found no place. Each is taken for [`HAND_OFF_LEASE`] and
-    /// queued again as it was, and one recorded more than an hour ago is
-    /// dropped. Returns how many were queued. A hand-off delivered twice
-    /// runs once, as the hop's claim allows one run.
+    /// or another, that no job holds: a shutdown or a crash cut their
+    /// jobs, or they found no place. The rows this instance's jobs hold are
+    /// leased again instead. Each is taken for [`HAND_OFF_LEASE`] and
+    /// queued again as it was, unless its hop ran already, when it is
+    /// done with. A row that can't be read now, whose agent is gone, or
+    /// whose agent has no active binding there is left, and a row
+    /// recorded more than an hour ago is dropped. Returns how many jobs
+    /// were queued. A hand-off delivered twice runs once, as the hop's
+    /// claim allows one run.
     ///
     /// # Errors
     ///
@@ -1464,48 +1516,84 @@ impl Pipeline {
         if self.is_closed() {
             return Ok(0);
         }
-        let now = OffsetDateTime::now_utc();
+        let now = (self.inner.settings.now)();
+        let held: Vec<i64> = lock(&self.inner.held).iter().copied().collect();
         let due = self
             .inner
             .store
-            .take_due_hand_offs(now, HAND_OFF_LEASE, now - HAND_OFF_MAX_AGE, MAX_REPLAYED)
+            .take_due_hand_offs(
+                now,
+                HAND_OFF_LEASE,
+                now - HAND_OFF_MAX_AGE,
+                MAX_REPLAYED,
+                &held,
+            )
             .await?;
-        let mut queued = 0;
-        for hand_off in due {
-            let agent = hand_off.agent;
-            let event: InboundEvent = match serde_json::from_str(&hand_off.event_json) {
-                Ok(event) => event,
-                Err(err) => {
-                    tracing::error!(%agent, error = %err, "a recorded hand-off doesn't parse; dropping it");
-                    self.inner.store.finish_hand_off(hand_off.id).await?;
-                    continue;
-                }
-            };
-            let Some(row) = self.inner.store.agent(agent).await? else {
-                self.inner.store.finish_hand_off(hand_off.id).await?;
-                continue;
-            };
-            let surface = match self.inner.surfaces.surface(agent, &event.conv).await {
-                Ok(Some(surface)) => surface,
-                Ok(None) => {
-                    self.inner.store.finish_hand_off(hand_off.id).await?;
-                    continue;
-                }
-                Err(err) => {
-                    tracing::warn!(%agent, error = %err, "couldn't look up the surface of a hand-off; trying it later");
-                    continue;
-                }
-            };
-            tracing::info!(%agent, msg = %event.message.id, "delivering a hand-off again");
-            self.queue(
-                &Arc::new(event),
-                surface.caps(),
-                vec![(agent, row.owner, Some(hand_off.id))],
-                true,
+        if due.stale > 0 {
+            tracing::warn!(
+                dropped = due.stale,
+                "dropped hand-offs recorded over an hour ago that never ran"
             );
-            queued += 1;
+        }
+        let mut queued = 0;
+        for hand_off in due.taken {
+            queued += self.replay_hand_off(hand_off).await;
         }
         Ok(queued)
+    }
+
+    /// Queues `hand_off` again, as [`replay_hand_offs`](Self::replay_hand_offs)
+    /// says; returns how many jobs it queued.
+    async fn replay_hand_off(&self, hand_off: HandOff) -> usize {
+        let (id, agent) = (hand_off.id, hand_off.agent);
+        let event: InboundEvent = match serde_json::from_str(&hand_off.event_json) {
+            Ok(event) => event,
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "a recorded hand-off doesn't parse; leaving it");
+                return 0;
+            }
+        };
+        let store = &self.inner.store;
+        let owner = match store.agent(agent).await {
+            Ok(Some(row)) => row.owner,
+            Ok(None) => return 0,
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "couldn't look up the agent of a hand-off; trying it later");
+                return 0;
+            }
+        };
+        let surface = match self.inner.surfaces.surface(agent, &event.conv).await {
+            Ok(Some(surface)) => surface,
+            Ok(None) => {
+                tracing::debug!(%agent, "the agent of a hand-off has no active binding there; leaving it");
+                return 0;
+            }
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "couldn't look up the surface of a hand-off; trying it later");
+                return 0;
+            }
+        };
+        match self.posting_turn(&event.message).await {
+            Ok(Some(turn)) if self.hopped(&hop_key(agent, turn)).await => {
+                if let Err(err) = store.finish_hand_off(id).await {
+                    tracing::warn!(%agent, error = %err, "couldn't record a hand-off as done");
+                }
+                return 0;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "couldn't read which turn posted a hand-off; trying it later");
+                return 0;
+            }
+        }
+        tracing::info!(%agent, msg = %event.message.id, "delivering a hand-off again");
+        self.queue(
+            &Arc::new(event),
+            surface.caps(),
+            vec![(agent, owner, Some(id))],
+            true,
+        )
+        .len()
     }
 
     /// Calls [`replay_hand_offs`](Self::replay_hand_offs) now and then
@@ -2003,15 +2091,16 @@ fn open_fence(text: &str) -> Option<&str> {
     open
 }
 
-/// Where [`Pipeline::claim_hop`] records its claims among the processed
+/// Where [`Pipeline::candidate`] records hops' claims among the processed
 /// events.
 const HOP_SOURCE: &str = "hop";
 
 /// The kind of failure notice that limits a hop's link prompts.
 const HOP_LINK_PROMPT: &str = "link_prompt/hop";
 
-/// How long a hand-off taken from `hand_offs` is left to its job before
-/// it is taken again.
+/// How long a hand-off recorded or taken from `hand_offs` is left to its
+/// job before it is taken again; the instance whose job holds it leases it
+/// again on each look.
 pub const HAND_OFF_LEASE: Duration = Duration::from_secs(5 * 60);
 
 /// How often due hand-offs are looked for.
@@ -2028,45 +2117,72 @@ fn hop_key(agent: AgentId, turn: TurnId) -> String {
     format!("{agent}/{turn}")
 }
 
-/// The event of `sent`, which `bot`, of the binding `binding`, posted in
-/// `answered`'s conversation, in the thread of `thread_root`: as the
-/// platform would deliver it, sent by that bot, with the mentions the
-/// platform reads in it.
-fn handed_off(
-    answered: &InboundEvent,
+/// Whether `decision` on `event` is on a hop, whose claim
+/// [`Pipeline::candidate`] takes: a requester other than the sender, which
+/// only an attributed agent's post gives. One hop runs for each agent and
+/// posting turn, however many of the turn's posts mention the agent and
+/// however many copies of them arrive. Not a refusal because the agent's
+/// rules couldn't be read, which another copy may then get past.
+fn on_hop(event: &InboundEvent, decision: &Decision) -> bool {
+    decision
+        .requester()
+        .is_some_and(|requester| requester.key != event.sender)
+        && !matches!(
+            decision,
+            Decision::Refuse {
+                reason: RefuseReason::PolicyUnavailable,
+                ..
+            }
+        )
+}
+
+/// How a turn's posts in its own thread hand off: as messages of the
+/// agent's bot `bot`, of the binding `binding`, in a conversation of the
+/// kind `conv_kind`, recorded in `hand_offs` at `now`.
+struct HandOffs {
+    conv_kind: ConvKind,
+    bot: MemberKey,
     binding: BindingId,
-    bot: &MemberKey,
-    thread_root: Option<core_types::MessageId>,
-    sent: Sent,
-) -> InboundEvent {
-    InboundEvent {
-        event_id: format!("{HOP_SOURCE}/{}", sent.posted.msg.id),
-        binding,
-        sender: bot.clone(),
-        sender_is_bot: true,
-        sender_bot_user: Some(bot.user.clone()),
-        conv: answered.conv.clone(),
-        conv_kind: answered.conv_kind,
-        reply_to: thread_root.clone().map(|id| MsgRef {
-            conv: answered.conv.clone(),
-            id,
-        }),
-        thread_root,
-        message: sent.posted.msg,
-        text: sent.text,
-        mentions: sent.posted.mentions,
-        files: Vec::new(),
-        received_at: OffsetDateTime::now_utc(),
+    now: OffsetDateTime,
+}
+
+impl HandOffs {
+    /// The event of `posted`, the chunk `text` posted to `target`: as the
+    /// platform would deliver it, sent by the bot, with the mentions the
+    /// platform reads in it.
+    fn event(&self, target: &ReplyTarget, posted: &Posted, text: &str) -> InboundEvent {
+        let thread_root = target.thread_root.clone();
+        InboundEvent {
+            event_id: format!("{HOP_SOURCE}/{}", posted.msg.id),
+            binding: self.binding,
+            sender: self.bot.clone(),
+            sender_is_bot: true,
+            sender_bot_user: Some(self.bot.user.clone()),
+            conv: target.conv.clone(),
+            conv_kind: self.conv_kind,
+            reply_to: thread_root.clone().map(|id| MsgRef {
+                conv: target.conv.clone(),
+                id,
+            }),
+            thread_root,
+            message: posted.msg.clone(),
+            text: text.to_owned(),
+            mentions: posted.mentions.clone(),
+            files: Vec::new(),
+            received_at: self.now,
+        }
     }
 }
 
-/// A chunk a turn posted in its own thread, recorded as handing off, that
-/// mentions someone: what [`Pipeline::hand_off`] may deliver to the agents
-/// it mentions.
-struct Sent {
-    posted: Posted,
-    text: String,
-    turn: TurnId,
+/// A hand-off of a turn's post to the agent `agent`, owned by `owner`,
+/// recorded as the `hand_offs` row `id`, with its hop's claim key `hop`:
+/// what [`Pipeline::hand_off`] queues.
+struct HandedOff {
+    id: i64,
+    agent: AgentId,
+    owner: MemberId,
+    hop: String,
+    event: Arc<InboundEvent>,
 }
 
 /// Delivers what one turn made, as the agent's bot.
@@ -2080,6 +2196,7 @@ struct Delivery<'a> {
     credential: CredentialRef,
     target: ReplyTarget,
     answering: Answering<'a>,
+    hand_offs: Option<HandOffs>,
 }
 
 /// What a delivered turn answers.
@@ -2096,9 +2213,9 @@ impl Delivery<'_> {
     /// Delivers `report`: the attachments, then the reply or the failure's
     /// message, then the reactions, then the queued posts. Each part goes
     /// out whatever happened to the others; if any couldn't, the thread is
-    /// told with [`DELIVERY_FAILED_TEXT`]. Returns the posts that may hand
-    /// off ([`Sent`]).
-    async fn report(&self, turn: TurnId, report: TurnReport<Option<Outbox>>) -> Vec<Sent> {
+    /// told with [`DELIVERY_FAILED_TEXT`]. Returns the hand-offs its posts
+    /// recorded ([`HandedOff`]).
+    async fn report(&self, turn: TurnId, report: TurnReport<Option<Outbox>>) -> Vec<HandedOff> {
         let outbox = match report.finished {
             Ok(outbox) => outbox,
             Err(err) => {
@@ -2160,8 +2277,8 @@ impl Delivery<'_> {
             tracing::warn!(session = %self.session, error = %err, "uploading the turn's attachments failed");
             uploaded = false;
         }
-        let (posted, mut sent) = self.post(Some(turn), &reply).await;
-        let mut complete = uploaded && posted;
+        let mut handed = Vec::new();
+        let mut complete = uploaded && self.post(Some(turn), &reply, &mut handed).await;
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
                 self.react(answered, &emoji).await;
@@ -2172,41 +2289,47 @@ impl Delivery<'_> {
                 self.react(&reaction.msg, &reaction.emoji).await;
             }
             for queued in outbox.posts() {
-                let (posted, queued_sent) =
-                    self.post_to(Some(turn), &queued.to, &queued.text).await;
-                complete &= posted;
-                sent.extend(queued_sent);
+                complete &= self
+                    .post_to(Some(turn), &queued.to, &queued.text, &mut handed)
+                    .await;
             }
         }
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
             tracing::warn!(session = %self.session, error = %err, "couldn't say part of a reply was lost");
         }
-        sent
+        handed
     }
 
     /// [`post_to`](Self::post_to) the target: the turn's own thread.
-    async fn post(&self, turn: Option<TurnId>, text: &str) -> (bool, Vec<Sent>) {
-        self.post_to(turn, &self.target, text).await
+    async fn post(&self, turn: Option<TurnId>, text: &str, handed: &mut Vec<HandedOff>) -> bool {
+        self.post_to(turn, &self.target, text, handed).await
     }
 
     /// Renders and posts Markdown `text` to `target`, recording a
     /// `message_refs` row for each chunk, of `turn` if a turn made it. A
     /// chunk that can't be posted is skipped and the rest still go. Empty
-    /// text posts nothing. A chunk hands off when a turn posted it in the
-    /// turn's own thread, not for a private task. Returns false if a chunk
-    /// was lost, and the chunks that hand off and mention someone
-    /// ([`Sent`]).
+    /// text posts nothing. Returns false if a chunk was lost.
+    ///
+    /// A chunk hands off when a turn posted it in the turn's own thread,
+    /// with [`HandOffs`]: then, as soon as its row is recorded, a
+    /// `hand_offs` row is recorded for each managed agent it mentions, other
+    /// than the poster and those an earlier post of the turn handed off to
+    /// (in `handed`, which gets the new ones), so a turn hands off to an
+    /// agent once.
     async fn post_to(
         &self,
         turn: Option<TurnId>,
         target: &ReplyTarget,
         text: &str,
-    ) -> (bool, Vec<Sent>) {
-        let hand_off_turn = turn
-            .filter(|_| *target == self.target && matches!(self.answering, Answering::Message(_)));
-        let mut sent = Vec::new();
+        handed: &mut Vec<HandedOff>,
+    ) -> bool {
+        let hands_off = self
+            .hand_offs
+            .as_ref()
+            .zip(turn)
+            .filter(|_| *target == self.target);
         if text.trim().is_empty() {
-            return (true, sent);
+            return true;
         }
         let mut complete = true;
         for chunk in self.surface.render(text) {
@@ -2233,7 +2356,7 @@ impl Delivery<'_> {
                             Answering::PrivateTask(consent) => Some(consent),
                             Answering::Message(_) => None,
                         },
-                        hands_off: hand_off_turn.is_some(),
+                        hands_off: hands_off.is_some(),
                     },
                     OffsetDateTime::now_utc(),
                 )
@@ -2243,19 +2366,80 @@ impl Delivery<'_> {
                     tracing::warn!(session = %self.session, msg = %posted.msg.id, error = %err, "recording a posted message failed");
                 }
                 Ok(_) => {
-                    if let Some(turn) = hand_off_turn
-                        && !posted.mentions.is_empty()
-                    {
-                        sent.push(Sent {
-                            posted,
-                            text: chunk,
-                            turn,
-                        });
+                    if let Some((hand_offs, turn)) = hands_off {
+                        self.record_hand_offs(hand_offs, turn, target, &posted, &chunk, handed)
+                            .await;
                     }
                 }
             }
         }
-        (complete, sent)
+        complete
+    }
+
+    /// Records a `hand_offs` row for each managed agent `posted` mentions
+    /// whose bot is active on the conversation's surface and team, other
+    /// than the poster and the agents in `handed`, and adds it there.
+    async fn record_hand_offs(
+        &self,
+        hand_offs: &HandOffs,
+        turn: TurnId,
+        target: &ReplyTarget,
+        posted: &Posted,
+        text: &str,
+        handed: &mut Vec<HandedOff>,
+    ) {
+        let mut event: Option<(Arc<InboundEvent>, String)> = None;
+        for user in &posted.mentions {
+            let key = MemberKey {
+                surface: target.conv.surface,
+                team: target.conv.team.clone(),
+                user: user.clone(),
+            };
+            let mentioned = match self.store.agent_for_bot(&key).await {
+                Ok(Some((mentioned, _)))
+                    if mentioned.id != self.agent
+                        && handed.iter().all(|handed| handed.agent != mentioned.id) =>
+                {
+                    mentioned
+                }
+                Ok(_) => continue,
+                Err(err) => {
+                    tracing::warn!(agent = %self.agent, msg = %posted.msg.id, error = %err, "couldn't look up an agent a post mentions");
+                    continue;
+                }
+            };
+            let (event, json) = match &event {
+                Some(built) => built,
+                None => {
+                    let built = hand_offs.event(target, posted, text);
+                    let json = match serde_json::to_string(&built) {
+                        Ok(json) => json,
+                        Err(err) => {
+                            tracing::error!(agent = %self.agent, error = %err, "couldn't encode a hand-off");
+                            return;
+                        }
+                    };
+                    event.insert((Arc::new(built), json))
+                }
+            };
+            let due = hand_offs.now + HAND_OFF_LEASE;
+            match self
+                .store
+                .add_hand_off(mentioned.id, json, hand_offs.now, due)
+                .await
+            {
+                Ok(id) => handed.push(HandedOff {
+                    id,
+                    agent: mentioned.id,
+                    owner: mentioned.owner,
+                    hop: hop_key(mentioned.id, turn),
+                    event: Arc::clone(event),
+                }),
+                Err(err) => {
+                    tracing::warn!(agent = %self.agent, mentioned = %mentioned.id, msg = %posted.msg.id, error = %err, "couldn't record a hand-off; not handing the post off");
+                }
+            }
+        }
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) {
@@ -2304,25 +2488,79 @@ impl Sink<InboundEvent> for PipelineSink {
 mod tests {
     use super::*;
 
+    /// An agent of a new owner whose bot, `bot`, is active on Slack's team
+    /// `T1`.
+    async fn bot_agent(store: &Store, name: &str, bot: &str) -> (AgentId, BindingId) {
+        let now = OffsetDateTime::now_utc();
+        let owner = store
+            .ensure_member(
+                &MemberKey {
+                    surface: core_types::SurfaceKind::Slack,
+                    team: "T1".into(),
+                    user: format!("owner-of-{name}").as_str().into(),
+                },
+                name,
+                now,
+            )
+            .await
+            .unwrap();
+        let store::AgentCreation::Created(agent, binding) = store
+            .create_agent(
+                &store::NewAgent {
+                    owner,
+                    name,
+                    persona: "p",
+                    visibility: store::Visibility::Public,
+                    surface: core_types::SurfaceKind::Slack,
+                    team: &"T1".into(),
+                },
+                10,
+                now,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        store
+            .set_binding_bot_user(binding, &bot.into(), name)
+            .await
+            .unwrap();
+        store
+            .activate_binding(binding, &secrecy::SecretString::from("t"), now)
+            .await
+            .unwrap();
+        (agent.id, binding)
+    }
+
     #[tokio::test]
-    async fn only_a_turns_own_posts_in_its_thread_that_mention_someone_hand_off() {
+    async fn a_turn_hands_off_its_own_threads_posts_once_to_each_agent_they_mention() {
         let key = store::Sealer::generate_key().unwrap();
         let store = Store::open_in_memory(store::Sealer::from_base64(&key).unwrap())
             .await
             .unwrap();
+        let (poster, binding) = bot_agent(&store, "helper", "U1BOT").await;
+        let (writer, _) = bot_agent(&store, "writer", "U2").await;
+        let (scout, _) = bot_agent(&store, "scout", "U3").await;
         let surface = testkit::MockSurface::new();
-        surface.name_user("U2", core_types::UserId::from("U2"));
+        for user in ["U1BOT", "U2", "U3", "U4"] {
+            surface.name_user(user, core_types::UserId::from(user));
+        }
         let conv = ConvRef {
             surface: core_types::SurfaceKind::Slack,
             team: "T1".into(),
             conversation: "C1".into(),
         };
+        let bot = MemberKey {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            user: "U1BOT".into(),
+        };
         let requester = Requester {
             member: None,
             key: MemberKey {
-                surface: core_types::SurfaceKind::Slack,
-                team: "T1".into(),
                 user: "U1".into(),
+                ..bot.clone()
             },
         };
         let answered = MsgRef {
@@ -2333,50 +2571,80 @@ mod tests {
             conv: conv.clone(),
             thread_root: Some("1.1".into()),
         };
-        let delivery = |answering| Delivery {
+        let now = time::macros::datetime!(2030-01-01 0:00 UTC);
+        let delivery = |answering, hands_off: bool| Delivery {
             store: &store,
             surface: &surface,
             session: SessionId::new_v4(),
-            agent: AgentId::new_v4(),
+            agent: poster,
             requester: &requester,
             hop: Hop::ZERO,
             credential: CredentialRef::Community,
             target: target.clone(),
             answering,
+            hand_offs: hands_off.then(|| HandOffs {
+                conv_kind: ConvKind::Channel,
+                bot: bot.clone(),
+                binding,
+                now,
+            }),
         };
         let turn = TurnId::new_v4();
-        let (complete, sent) = delivery(Answering::Message(&answered))
-            .post(Some(turn), "@U2 have a look")
-            .await;
-        assert!(complete);
-        let [sent] = sent.as_slice() else {
-            panic!("one post hands off: {}", sent.len());
-        };
-        assert_eq!(sent.text, "@U2 have a look");
-        assert_eq!(sent.posted.mentions, [core_types::UserId::from("U2")]);
-        assert_eq!(sent.turn, turn);
-        let row = store
-            .posted_message_ref(&sent.posted.msg)
+        let mut handed = Vec::new();
+        let posting = delivery(Answering::Message(&answered), true);
+        for text in [
+            "@U2 have a look, @U1BOT",
+            "@U2 and @U3 and @U4 too",
+            "@U3 again",
+        ] {
+            assert!(posting.post(Some(turn), text, &mut handed).await);
+        }
+        let to: Vec<(AgentId, &str)> = handed
+            .iter()
+            .map(|handed| (handed.agent, handed.event.text.as_str()))
+            .collect();
+        assert_eq!(
+            to,
+            [
+                (writer, "@U2 have a look, @U1BOT"),
+                (scout, "@U2 and @U3 and @U4 too")
+            ],
+            "each agent once, from the first post that mentions it, never the poster"
+        );
+        let event = &handed[0].event;
+        assert_eq!(event.sender, bot);
+        assert_eq!(event.binding, binding);
+        assert_eq!(event.thread_root, target.thread_root);
+        assert_eq!(handed[0].hop, hop_key(writer, turn));
+        let due = store
+            .take_due_hand_offs(now + HAND_OFF_LEASE, HAND_OFF_LEASE, now, 10, &[])
             .await
-            .unwrap()
             .unwrap();
-        assert!(row.hands_off);
+        assert_eq!(
+            due.taken
+                .iter()
+                .map(|row| (row.id, row.agent))
+                .collect::<Vec<_>>(),
+            handed
+                .iter()
+                .map(|handed| (handed.id, handed.agent))
+                .collect::<Vec<_>>(),
+            "each hand-off is recorded as its post is, due after a lease"
+        );
+        let recorded: InboundEvent = serde_json::from_str(&due.taken[0].event_json).unwrap();
+        assert_eq!(recorded, **event);
 
         let cases = [
             (
                 Answering::Message(&answered),
-                Some(turn),
-                target.clone(),
-                "no one",
-            ),
-            (
-                Answering::Message(&answered),
+                true,
                 None,
                 target.clone(),
                 "@U2 notice",
             ),
             (
                 Answering::Message(&answered),
+                true,
                 Some(turn),
                 ReplyTarget {
                     conv: conv.clone(),
@@ -2385,25 +2653,40 @@ mod tests {
                 "@U2 at the top level",
             ),
             (
+                Answering::Message(&answered),
+                false,
+                Some(turn),
+                target.clone(),
+                "@U2 in a DM",
+            ),
+            (
                 Answering::PrivateTask(ConsentId::new_v4()),
+                false,
                 Some(turn),
                 target.clone(),
                 "@U2 private",
             ),
         ];
-        for (answering, turn, to, text) in cases {
-            let (complete, sent) = delivery(answering).post_to(turn, &to, text).await;
-            assert!(complete, "{text}");
-            assert!(sent.is_empty(), "{text}");
+        for (answering, hands_off, turn, to, text) in cases {
+            let mut handed = Vec::new();
+            assert!(
+                delivery(answering, hands_off)
+                    .post_to(turn, &to, text, &mut handed)
+                    .await,
+                "{text}"
+            );
+            assert!(handed.is_empty(), "{text}");
         }
-        assert_eq!(surface.calls().len(), 5);
         for (_, text, msg) in surface.calls().iter().filter_map(|call| match call {
             testkit::Call::Post { to, text, msg } => Some((to, text, msg)),
             _ => None,
         }) {
             let row = store.posted_message_ref(msg).await.unwrap().unwrap();
-            let in_its_thread = ["@U2 have a look", "no one"].contains(&text.as_str());
-            assert_eq!(row.hands_off, in_its_thread, "{text}");
+            assert_eq!(
+                row.hands_off,
+                text.starts_with("@U2 have") || text.ends_with("too") || text.ends_with("again"),
+                "{text}"
+            );
         }
     }
 

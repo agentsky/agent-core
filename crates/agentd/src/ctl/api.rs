@@ -634,12 +634,17 @@ async fn lock(
 /// another agent, at the next hop.
 ///
 /// Only in a channel or a group DM, where another agent can answer. The
-/// agent is named by its bot's handle, or by its name when no handle
-/// matches, among the agents with a bot on this surface and team that the
-/// turn's requester may see: public ones, and the requester's own. The
-/// handle ends at a colon, so no word of the task is read as part of a
-/// name, and the renderers resolve a managed bot's handle before anyone's
-/// name.
+/// agent is one with a bot on this surface and team that the turn's
+/// requester may see (public ones, and the requester's own), named by its
+/// bot's handle written as a mention (`@handle` or Slack's `<@…>`), or by
+/// a bare word that is its name or handle; a bare word that fits several
+/// agents, as one's name and another's handle can on Rocket.Chat, is
+/// refused with their handles. The post is the handle and a colon, alone
+/// on its first paragraph, then the task: no word or table of the task is
+/// read as part of the mention, and the renderers resolve a managed bot's
+/// handle before anyone's name. A turn asks each agent once: the other
+/// agent takes one turn for this turn however many of its posts mention
+/// it.
 async fn ask_agent(
     State(ctl): State<Ctl>,
     Caller(caller): Caller,
@@ -659,7 +664,7 @@ async fn ask_agent(
     if task.is_empty() {
         return Err(error(CtlErrorCode::BadRequest, "the task is empty"));
     }
-    let wanted = agent_handle(&request.agent);
+    let (wanted, mention) = agent_handle(&request.agent);
     if wanted.is_empty() {
         return Err(error(CtlErrorCode::BadRequest, "name the agent to ask"));
     }
@@ -682,18 +687,12 @@ async fn ask_agent(
             ))
         })
         .collect();
-    let by_handle: Vec<_> = visible
+    let found: Vec<_> = visible
         .iter()
-        .filter(|(_, handle, _)| handle.eq_ignore_ascii_case(wanted))
+        .filter(|(_, handle, name)| {
+            handle.eq_ignore_ascii_case(wanted) || (!mention && name.eq_ignore_ascii_case(wanted))
+        })
         .collect();
-    let found: Vec<_> = if by_handle.is_empty() {
-        visible
-            .iter()
-            .filter(|(_, _, name)| name.eq_ignore_ascii_case(wanted))
-            .collect()
-    } else {
-        by_handle
-    };
     let handle = match found.as_slice() {
         [] => {
             return Err(error(
@@ -713,33 +712,55 @@ async fn ask_agent(
             return Err(error(
                 CtlErrorCode::BadRequest,
                 format!(
-                    "several agents are called {wanted}; name one by its handle: {}",
+                    "several agents go by {wanted}; name one by its handle, with its @: {}",
                     handles.join(", ")
                 ),
             ));
         }
     };
-    let text = format!("@{handle}: {task}");
+    let asking = format!("@{handle}:\n\n");
+    let text = format!("{asking}{task}");
     if text.len() > MAX_POST_BYTES {
         return Err(error(
             CtlErrorCode::TooLarge,
             format!("the task is over {MAX_POST_BYTES} bytes"),
         ));
     }
+    ctl.queue(&caller, |outbox| {
+        if outbox
+            .posts()
+            .iter()
+            .any(|post| post.text.starts_with(&asking))
+        {
+            return Err(error(
+                CtlErrorCode::Refused,
+                format!(
+                    "this turn already asked @{handle}, which answers a turn once: put everything in one task"
+                ),
+            ));
+        }
+        Ok(())
+    })?;
     let to = ReplyTarget::from(caller.turn.thread.clone());
     queue_post(&ctl, &caller, QueuedPost { to, text })?;
     Ok(Json(Ack {}))
 }
 
-/// The name or handle `agent` asks for: without the `@` of a mention, or
-/// the `<@` and `>` of a Slack one, and its `|label`.
-fn agent_handle(agent: &str) -> &str {
+/// The name or handle `agent` asks for, without the `@` of a mention, or
+/// the `<@` and `>` of a Slack one and its `|label`, and whether it was
+/// written as a mention, which names a handle only.
+fn agent_handle(agent: &str) -> (&str, bool) {
     let agent = agent.trim();
-    let agent = agent
+    if let Some(inner) = agent
         .strip_prefix("<@")
         .and_then(|rest| rest.strip_suffix('>'))
-        .map_or(agent, |inner| inner.split('|').next().unwrap_or(inner));
-    agent.strip_prefix('@').unwrap_or(agent).trim()
+    {
+        return (inner.split('|').next().unwrap_or(inner).trim(), true);
+    }
+    match agent.strip_prefix('@') {
+        Some(handle) => (handle.trim(), true),
+        None => (agent, false),
+    }
 }
 
 /// `POST /v1/private`: records a consent for the task, with the files it

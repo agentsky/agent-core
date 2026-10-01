@@ -336,12 +336,14 @@ agentd delivers those mentions itself rather than waiting for the platform to
 deliver its own bots' posts back. Once a turn's posts are out, each one in the
 thread the turn answered, outside a one-to-one DM, that the platform reads as
 mentioning other managed agents, is queued for those agents as the posting
-bot's message. It then goes through routing like any message, so the
-requester and hop come only from the post's own record, and the hop cap, the
-thread's caps and each agent's rules apply. Only those posts carry the turn's
-attribution: a post in another thread or channel, or a private task's result,
-hands nothing off by either delivery. Each hand-off is kept in the store until
-its turn ran, so a shutdown or crash delays it rather than losing it. The
+bot's message, each agent once for the turn. It then goes through routing
+like any message, so the requester and hop come only from the post's own
+record, and the hop cap, the thread's caps and each agent's rules apply. Only
+those posts carry the turn's attribution: a post in another thread or
+channel, or a private task's result, hands nothing off by either delivery.
+Each hand-off is recorded in the store as its post is, and kept until a job
+settles it, so a shutdown or crash before its hop is claimed delays it
+rather than losing it. The
 platform may deliver the same post as well: Rocket.Chat does, and on Slack it
 is unverified. A claim on the mentioned agent and the posting turn, in the
 store, lets one hop run for each turn and agent, however many of the turn's

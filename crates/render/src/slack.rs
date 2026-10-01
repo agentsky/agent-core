@@ -628,9 +628,11 @@ impl Renderer<'_> {
     }
 
     /// Escapes text outside code and neutralizes broadcasts. The formatting
-    /// characters at the byte offsets in `literal` are kept from pairing up
-    /// into Slack formatting. With `arm`, it also resolves `@Name` mentions
-    /// and gives bare URLs explicit bounds.
+    /// characters at the byte offsets in `literal`, and every backtick, are
+    /// kept from pairing up into Slack formatting: Markdown leaves backticks
+    /// of unequal runs as text, but Slack pairs any two, and would show a
+    /// mention between them as code. With `arm`, it also resolves `@Name`
+    /// mentions and gives bare URLs explicit bounds.
     fn slack_text(&self, text: &str, literal: &[usize], arm: bool, out: &mut String) {
         let mut i = 0;
         while let Some(c) = text[i..].chars().next() {
@@ -669,7 +671,7 @@ impl Renderer<'_> {
                 i += url.len();
                 continue;
             }
-            if literal.binary_search(&i).is_ok() {
+            if c == '`' || literal.binary_search(&i).is_ok() {
                 push_literal(text, i, c, out);
                 i += c.len_utf8();
                 continue;

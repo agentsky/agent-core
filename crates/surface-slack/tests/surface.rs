@@ -496,7 +496,7 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
 }
 
 #[tokio::test]
-async fn can_post_only_where_the_bot_is_a_member_and_trusts_a_yes_for_a_while() {
+async fn can_post_only_where_the_bot_is_a_member_and_trusts_a_yes_until_asked_now() {
     let (server, surface) = setup().await;
     let elsewhere = ConvRef {
         team: "T0OTHER01".into(),
@@ -520,12 +520,44 @@ async fn can_post_only_where_the_bot_is_a_member_and_trusts_a_yes_for_a_while() 
     .await;
     assert!(surface.can_post(&conv()).await.unwrap());
     assert!(surface.can_post(&conv()).await.unwrap());
-    let asked = requests(&server)
-        .await
-        .iter()
-        .filter(|request| request.url.path() == "/api/conversations.info")
-        .count();
-    assert_eq!(asked, 1, "a yes is trusted for a while");
+    let asked = |requests: Vec<Request>| {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/conversations.info")
+            .count()
+    };
+    assert_eq!(
+        asked(requests(&server).await),
+        1,
+        "a yes is trusted for a while"
+    );
+    assert!(surface.can_post_now(&conv()).await.unwrap());
+    assert_eq!(
+        asked(requests(&server).await),
+        2,
+        "asked now, Slack is asked whatever it said lately"
+    );
+
+    for channel in [
+        json!({"id": CHANNEL, "is_channel": true, "is_member": true, "is_archived": true}),
+        json!({"id": "C0OTHER01", "is_channel": true, "is_member": true}),
+    ] {
+        server.reset().await;
+        mount(
+            &server,
+            "conversations.info",
+            ok(json!({ "channel": channel })),
+        )
+        .await;
+        assert!(
+            !surface.can_post_now(&conv()).await.unwrap(),
+            "{channel}: not a conversation the bot can post in"
+        );
+        assert!(
+            !surface.can_post(&conv()).await.unwrap(),
+            "{channel}: the no dropped the yes kept before"
+        );
+    }
 }
 
 #[tokio::test]

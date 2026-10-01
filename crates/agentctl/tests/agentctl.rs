@@ -69,8 +69,7 @@ impl SurfaceLookup for Lookup {
 }
 
 /// What `ask-agent` prints, without its newline.
-const ASKED: &str =
-    "Queued. The task is posted in this thread after this turn, and the other agent answers there.";
+const ASKED: &str = "Queued. The task is posted in this thread after this turn, and the other agent may answer there.";
 
 /// Stores the agent `reviewer`, whose active Slack bot in `T1` is
 /// `U0REVIEW`, for `ask-agent` to name.
@@ -412,7 +411,7 @@ async fn each_subcommand_works_against_the_server() {
         posts,
         [
             ("all done", thread().into()),
-            ("@U0REVIEW: look at this", thread().into()),
+            ("@U0REVIEW:\n\nlook at this", thread().into()),
         ]
     );
     assert_eq!(outbox.reactions().len(), 1);
@@ -1142,7 +1141,7 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
         .iter()
         .map(|post| post.text.as_str())
         .collect();
-    assert_eq!(texts, ["see the plot", "@U0REVIEW: review"]);
+    assert_eq!(texts, ["see the plot", "@U0REVIEW:\n\nreview"]);
     assert_eq!(outbox.reactions()[0].msg.id, MessageId::new("99.9"));
 }
 

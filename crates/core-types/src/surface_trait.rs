@@ -56,6 +56,13 @@ pub trait Surface: Send + Sync {
     /// platform refuses a post itself, and this answers true.
     async fn can_post(&self, conv: &ConvRef) -> Result<bool>;
 
+    /// [`can_post`](Self::can_post), asked of the platform now: an answer
+    /// the surface keeps for a while isn't used. For a message nothing read
+    /// back from the platform with the bot's own access.
+    async fn can_post_now(&self, conv: &ConvRef) -> Result<bool> {
+        self.can_post(conv).await
+    }
+
     /// Uploads files to a conversation or thread.
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()>;
 

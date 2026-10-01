@@ -43,7 +43,7 @@ pub use billing::{
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
 pub use message::HISTORY_LIMIT;
 pub use run::{
-    DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_OWNER, DEFAULT_QUEUE_PER_THREAD,
+    ATTRIBUTION_WAIT, DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_OWNER, DEFAULT_QUEUE_PER_THREAD,
     DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT, FAILED_TEXT, HAND_OFF_LEASE,
     HAND_OFF_SWEEP_INTERVAL, Pipeline, PipelineSettings, REFUSAL_DM_INTERVAL, RESTARTING_TEXT,
     TIMED_OUT_TEXT, TRUNCATED_NOTE, UNCONFIRMED_TEXT, WORK_LEASE, WORK_MAX_ATTEMPTS, WORK_RETRY,
@@ -151,8 +151,8 @@ impl Turns {
 impl PipelineSettings {
     /// The settings `app` gives: its data directory, its manager bots,
     /// `[community]`'s admins, `[runner]`'s working emoji and models, and
-    /// `[limits]`' caps, with the default queue bounds and the system
-    /// clock.
+    /// `[limits]`' caps, with the default queue bounds, the system clock and
+    /// the default [`ATTRIBUTION_WAIT`].
     pub fn from_app(app: &App) -> Self {
         let managers = app
             .rocketchat()
@@ -172,6 +172,7 @@ impl PipelineSettings {
             max_pending_per_owner: DEFAULT_MAX_PENDING_PER_OWNER,
             limits: Limits::from_config(&app.config().limits),
             now: OffsetDateTime::now_utc,
+            attribution_wait: ATTRIBUTION_WAIT,
         }
     }
 }
