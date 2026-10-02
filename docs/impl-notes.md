@@ -4243,7 +4243,7 @@ yet.
 ### A bot sets its own avatar
 
 **Issue.** Setting another user's avatar needs `edit-other-user-avatar`
-(T11's table), one more permission for the manager's role.
+(T11's table), one more permission for the manager's roles.
 
 **Solution.** The new bot sets `rocketchat.avatar_url` as its own avatar
 with its token, which Rocket.Chat allows while `Accounts_AllowUserAvatarChange`
