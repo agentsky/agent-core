@@ -454,6 +454,22 @@ can't see. A `--profile` flag doesn't change feature resolution: it would
 only help under `cargo test --release`, which nothing here runs, so it isn't
 passed.
 
+### Tests wait for what they assume, not for time
+
+**Issue.** A fixed sleep before a step that assumes something has happened
+passes on an idle machine, then fails or stops testing anything under load.
+A warm private session is not yet a running turn, so a kill sent once the
+session was warm went unbilled; a Slack test slept 200 ms and assumed its
+client had connected before agentd stopped; and pipeline tests slept 200 ms
+and assumed the platform's copy of an agent's post was already waiting for
+its attribution.
+
+**Solution.** A test waits, with a bound, for a state it can observe: the
+upstream model request, the request reaching agentd's routes. Where nothing
+marks the state, the steps are ordered so that it holds by construction:
+the platform's copy is sent before the turn that posts it starts. A sleep
+stays only as a settle before asserting that nothing more happened.
+
 ## T05: store
 
 ### The key reaches the store through `open`
