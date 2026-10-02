@@ -127,7 +127,7 @@ A mentionable agent therefore needs its own bot identity.
 | Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
 | How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel or group DM message only if it mentions the bot (`<@U…>` in the text or blocks, another bot's in its text alone, and none with a backtick both before and after it in the same text) or replies in a thread whose root the bot may have posted (its `parent_user_id` is the bot user, or isn't known), so the router can see replies to the agent's own messages. When the bot user is known, it drops the bot's own posts, and other bots' messages that don't mention it, in every kind of conversation. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
 | Bot-to-bot mentions | Delivered by agentd itself for its agents' own posts. Whether Slack also delivers one app's bot user's post to another app as a `message.*` event is not yet verified; a copy that does arrive is dropped[^slack-botmention] | Delivered by agentd itself for its agents' own posts, and by the server too; the second copy is dropped |
-| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a dedicated role (`create-user`, plus token creation granted to `bot`)[^rc-create] |
+| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with dedicated roles (`create-user`, plus token creation granted to `bot`)[^rc-create] |
 | Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
 
 ### Slack
@@ -240,7 +240,7 @@ reckons it, but only as a record: no limit reads it.
 ### Rocket.Chat
 
 The community admin installs agentd once and gives its manager account the
-role below. After that `/agent create` is self-service: agentd calls `users.create`
+roles below. After that `/agent create` is self-service: agentd calls `users.create`
 with the `bot` role and the agent's name as display name, obtains a token for
 the new user, and the bot sets its own avatar. The owner invites the bot into
 rooms with Rocket.Chat's own invite, or the manager adds it to a room it is in
@@ -258,8 +258,8 @@ own token. Deactivating a bot needs `edit-other-user-active-status`, adding a
 bot to a room the manager is in needs `add-user-to-joined-room`, and reading
 another user's roles in `users.info` needs `view-full-other-user-info`. A bot
 sets its own name and avatar without any permission. The manager's token must
-ignore two-factor authentication, or 2FA-gated endpoints refuse it 30 minutes
-after the manager is created.
+ignore two-factor authentication, or 2FA-gated endpoints refuse it at the latest
+30 minutes after the manager is created.
 
 Where those permissions live depends on the edition. Custom roles need an
 Enterprise license: on the Community Edition `roles.create` answers
@@ -1348,7 +1348,7 @@ for members of other organizations too, whose own organization is kept as
 | A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
 | Agents loop on each other | Hop cap per chain, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
-| Manager account compromise on Rocket.Chat | A dedicated role (a custom role, or the built-in `app` role on the Community Edition) instead of admin. The manager token never enters sandboxes. |
+| Manager account compromise on Rocket.Chat | Dedicated roles (a custom role with a license, or the built-in `bot` and `app` roles on the Community Edition) instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
 | Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo, for a binding still being created, and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals, answered challenges and retried deliveries are logged at most once a minute per app. |
