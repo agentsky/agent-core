@@ -1210,7 +1210,6 @@ struct DmEnvelope {
 struct DmRoom {
     #[serde(rename = "_id")]
     id: ConversationId,
-    #[serde(default)]
     usernames: Vec<String>,
 }
 

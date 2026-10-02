@@ -626,6 +626,25 @@ async fn get_message_reads_only_a_bare_json_failure_as_not_found() {
     }
 }
 
+#[tokio::test]
+async fn create_dm_fails_to_decode_an_answer_without_usernames() {
+    let fake = FakeRest::start().await;
+    fake.add_user("alice");
+    Mock::given(path("/api/v1/im.create"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": true, "room": { "_id": "D1" } })),
+        )
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
+    let err = manager(&fake).create_dm("alice").await.unwrap_err();
+    assert!(
+        matches!(&err, SurfaceError::Transport(text) if text.contains("im.create")),
+        "{err:?}"
+    );
+}
+
 fn temp_file(name: &str, contents: &[u8]) -> OutFile {
     let dir = std::env::temp_dir().join(format!("rc-rest-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
