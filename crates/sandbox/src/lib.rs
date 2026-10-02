@@ -306,8 +306,9 @@ impl ExitStatus {
 /// handle to wait for it or kill it. Its stderr is discarded.
 pub struct ChildIo {
     /// Waits for or kills the process. Declared before `stdin`, so a drop
-    /// kills a process still waiting for input instead of closing its
-    /// input first and killing it in the middle of exiting.
+    /// under a process sandbox kills a process still waiting for input
+    /// instead of closing its input first and killing it in the middle of
+    /// exiting. A dropped Docker child kills nothing.
     pub child: ChildHandle,
     /// The process's stdin. Shutting it down closes the stream.
     pub stdin: Pin<Box<dyn AsyncWrite + Send>>,

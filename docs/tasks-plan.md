@@ -1419,7 +1419,7 @@ Deliverables:
     shortcut with a note that production should use a socket proxy.
 - `deploy/compose/README.md`:
   1. Bring the stack up.
-  2. Create the Rocket.Chat admin, then the manager user and its role (with
+  2. Create the Rocket.Chat admin, then the manager user and its roles (with
      the permissions T11 settled: a custom role with a license, otherwise
      the built-in `bot` and `app` roles).
   3. Configure agentd.
