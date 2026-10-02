@@ -2976,10 +2976,11 @@ needs more running at once widens the subnet in both `compose.yaml` and
 
 **Issue.** The design gives the manager a custom role. On 7.13.9,
 `roles.create` is registered in `apps/meteor/ee/server/api/roles.ts` with
-`license: ['custom-roles']` and refuses without that license module, and
-`roles.update` refuses for any role that isn't protected (built in). The
-Community Edition, which the Compose stack runs, can only change which
-built-in roles hold a permission (`permissions.update`, which needs
+`license: ['custom-roles']` and refuses without that license module.
+`roles.update` refuses too: [T11's live check](#the-live-check-against-7139)
+got the same `This is an enterprise feature` answer for the built-in `bot`
+role. The Community Edition, which the Compose stack runs, can only change
+which built-in roles hold a permission (`permissions.update`, which needs
 `access-permissions`).
 
 **Solution.** `deploy/compose/README.md` lists the permissions
@@ -4597,8 +4598,32 @@ at the next start stops what is left either way.
 
 With T23b's pipeline, `Server::run` reaches it through
 `Pipeline::stop_sessions`, once the turns and then the listeners have
-drained in time and before the pipeline is dropped. Turns cut short, or
-in-flight work dropped, skip it.
+drained in time and before the pipeline is dropped. Turns cut short,
+in-flight work dropped, or a drain that ends with no time left skip it.
+
+A stop cut short, by the timeout or a second signal, still races the
+store's close for the sessions it had begun: `stop` runs each session's
+release in a task of its own, which dropping `stop_all` doesn't end. Those
+tasks go on after `Server::run` closes the store, so their
+`process_stopping` revocations fail and the runner logs that it gives up,
+and the idle reaper, which they keep alive, runs until the process exits.
+The next start's `purge` deletes the agentctl tokens and `reap_orphans`
+stops the containers. Waiting for those tasks would take the time the
+deadline or the second signal just refused.
+
+With T34's hand-offs, the stop runs after the server's last
+`release_cut_hand_offs`: both write the store, and the release, which
+lets another instance take the rows at once rather than after their
+lease, matters more. The stop is skipped once a second signal has
+arrived, in the drain or during that release, or once the deadline has
+passed, in the drain or during the release. On a graceful shutdown the
+release isn't bounded by the deadline: a drain that used its whole
+budget would cancel it at once and leave the rows to their five-minute
+lease. It is one `UPDATE`, which the pool's acquire timeout and SQLite's
+busy timeout already bound, and a store stuck past those would hold the
+stop's revocations and the store's close as well. A release that hangs
+anyway holds the process until a second signal, which then skips the
+stop.
 
 ### A process sandbox gives every container one address
 
