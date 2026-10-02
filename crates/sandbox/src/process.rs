@@ -361,6 +361,7 @@ mod tests {
     use super::*;
     use crate::SharedAccess;
     use crate::test_util::{TempDir, awkward_channel, memory_store};
+    use testkit::child::NotingStdin;
 
     async fn sandbox(dir: &TempDir) -> ProcessSandbox {
         ProcessSandbox::new(memory_store().await, dir.0.clone()).unwrap()
@@ -643,6 +644,41 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(10), io.stdout.read_to_end(&mut rest));
         read.await.unwrap().unwrap();
         io.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_a_child_kills_it_before_closing_its_stdin() {
+        let dir = TempDir::new();
+        let sandbox = sandbox(&dir).await;
+        let container = started(&sandbox, &dir, ScopeKey::Private).await;
+        let pid_file = dir.0.join("pid");
+        let script = format!("echo $$ > '{}'; exec cat >/dev/null", pid_file.display());
+        let io = sandbox
+            .exec(
+                &container,
+                &argv(&["/bin/sh", "-c", &script]),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (stdin, killed_first) = NotingStdin::new(io.stdin, pid_file);
+        let io = ChildIo {
+            stdin: Box::pin(stdin),
+            ..io
+        };
+        drop(io);
+        assert!(
+            killed_first.load(Ordering::SeqCst),
+            "the child's stdin closed before it was killed, so it could start exiting"
+        );
     }
 
     fn is_gone(pid: &str) -> bool {
