@@ -84,9 +84,24 @@ impl Gate {
 
     async fn pass(&self) {
         let mut open = self.open.subscribe();
-        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = Waiting::new(&self.waiting);
         let _ = open.wait_for(|open| *open).await;
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One caller counted at a gate, until it passes or is dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -96,6 +111,7 @@ struct Holds {
     confirms: Mutex<HashMap<AgentId, Gate>>,
     failing_confirms: Mutex<VecDeque<SurfaceError>>,
     posts: Mutex<HashMap<String, Gate>>,
+    histories: Mutex<HashMap<ThreadKey, VecDeque<Gate>>>,
 }
 
 impl Holds {
@@ -107,6 +123,17 @@ impl Holds {
     /// Makes the next confirmation fail with `error`.
     fn fail_next_confirm(&self, error: SurfaceError) {
         self.failing_confirms.lock().unwrap().push_back(error);
+    }
+
+    /// Holds the next read of `thread`'s history, by any agent, at `gate`,
+    /// after those queued before it for that thread.
+    fn history_at(&self, thread: ThreadKey, gate: &Gate) {
+        self.histories
+            .lock()
+            .unwrap()
+            .entry(thread)
+            .or_default()
+            .push_back(gate.clone());
     }
 
     /// Holds every post of `text` at `gate`.
@@ -169,6 +196,16 @@ impl Surface for Held {
         before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Msg>, SurfaceError> {
+        let gate = self
+            .holds
+            .histories
+            .lock()
+            .unwrap()
+            .get_mut(thread)
+            .and_then(VecDeque::pop_front);
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         self.mock.history(thread, before, limit).await
     }
 
@@ -1185,9 +1222,12 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
     let s1 = stack.session_of(&first).await;
 
     let before = stack.mock.calls().len();
-    let delay = Duration::from_secs(2);
-    stack.mock.delay_next(Op::History, delay);
-    stack.mock.delay_next(Op::History, delay);
+    let first_read = Gate::closed();
+    let second_read = Gate::closed();
+    stack.holds.history_at(thread("GENERAL", "r1"), &first_read);
+    stack
+        .holds
+        .history_at(thread("GENERAL", "r1"), &second_read);
     let handling = stack.handle(stack.event(
         "alice",
         "GENERAL",
@@ -1197,8 +1237,8 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
         &[BOT],
     ));
     let resetting = async {
-        wait_until("the second turn starts", || {
-            stack.calls_since(before).contains(&working_on("r2"))
+        wait_until("the first attempt reads the thread", || {
+            first_read.waiting() == 1
         })
         .await;
         let s2 = store
@@ -1207,18 +1247,16 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
             .unwrap()
             .expect("a replacement")
             .id;
-        wait_until("the first read of the thread ends", || {
-            stack
-                .calls_since(before)
-                .iter()
-                .any(|call| matches!(call, Call::History { .. }))
+        first_read.open();
+        wait_until("the second attempt reads the thread", || {
+            second_read.waiting() == 1
         })
         .await;
-        tokio::time::sleep(delay / 2).await;
         store
             .reset_session(s2, OffsetDateTime::now_utc())
             .await
             .unwrap();
+        second_read.open();
         s2
     };
     let ((), s2) = tokio::join!(handling, resetting);
@@ -1305,7 +1343,8 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
     let upstream = stack.fake.message_requests().await.len();
     let before = stack.mock.calls().len();
     stack.next_turn(Turn::reply("Answer."));
-    stack.mock.delay_next(Op::History, Duration::from_secs(1));
+    let reading = Gate::closed();
+    stack.holds.history_at(thread("GENERAL", "r1"), &reading);
     let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
     for (id, text) in [("q2", "question two"), ("q3", "question three")] {
         let mut event = stack.event(
@@ -1318,7 +1357,14 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
         );
         event.text = format!("@UBOT {text}");
         sink.send(event).await.unwrap();
+        if id == "q2" {
+            wait_until("question two's turn reads the thread", || {
+                reading.waiting() == 1
+            })
+            .await;
+        }
     }
+    reading.open();
     wait_until("both are answered", || {
         posts(&stack.calls_since(before)).len() >= 2
     })
@@ -1610,7 +1656,8 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
     })
     .await;
     stack.next_turn(Turn::reply("Posted too late."));
-    stack.mock.delay_next(Op::Post, Duration::from_secs(20));
+    let posting = Gate::closed();
+    stack.holds.posts_of("Posted too late.", &posting);
     let event = stack.event("alice", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]);
     stack
         .pipeline
@@ -1618,12 +1665,7 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
         .send(event)
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while stack.fake.message_requests().await.is_empty() {
-        assert!(Instant::now() < deadline, "timed out waiting for the turn");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until("the reply is being delivered", || posting.waiting() == 1).await;
     let Stack {
         pipeline,
         turns,
