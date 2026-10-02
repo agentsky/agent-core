@@ -81,9 +81,8 @@ logs -f rocketchat` shows when it is up.
 
 The Community Edition must be able to reach Rocket.Chat Cloud over HTTPS to
 report its statistics. A workspace that never has, or hasn't for ten days,
-is restricted: posts and edits, through the REST API and DDP, and the
-confirm step of uploads answer `restricted-workspace` until it reports or
-gets a license
+is restricted: posts and edits through the REST API, and the confirm step
+of uploads, answer `restricted-workspace` until it reports or gets a license
 ([impl-notes](../../docs/impl-notes.md#the-live-check-against-7139)). Reads,
 reactions, invites and user management still work, so a restricted
 workspace looks healthy until an agent tries to answer.
