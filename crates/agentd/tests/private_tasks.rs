@@ -640,7 +640,10 @@ impl Stack {
         let stops = self.sandbox.stops.load(Ordering::SeqCst);
         self.stop.send(()).unwrap();
         let started = Instant::now();
-        while once_killing && self.sandbox.stops.load(Ordering::SeqCst) == stops {
+        while once_killing
+            && self.sandbox.stops.load(Ordering::SeqCst) == stops
+            && !self.task.is_finished()
+        {
             assert!(started.elapsed() < WAIT, "the shutdown never killed a turn");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
