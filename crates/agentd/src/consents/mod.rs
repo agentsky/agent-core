@@ -56,7 +56,9 @@ pub const CONSENTS_DIR: &str = "consents";
 /// The longest task text, in UTF-16 code units, as Slack counts it: what
 /// a Slack plain-text section, which shows it on the card, holds.
 pub const MAX_TASK_LEN: usize = card::SLACK_TEXT_MAX;
-/// The most files one private task may be handed.
+/// The most files one private task may be handed: as many as a Slack
+/// `context` block holds elements, since a Slack card gives each file's
+/// name its own.
 pub const MAX_FILES: usize = 10;
 /// The most consents one agent may have unfinished at once that anyone but
 /// its owner asked for.
