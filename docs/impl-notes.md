@@ -2678,11 +2678,13 @@ Community Edition, which the Compose stack runs, can only change which
 built-in roles hold a permission (`permissions.update`, which needs
 `access-permissions`).
 
-**Solution.** `deploy/compose/README.md` lists the permissions from T11's
-reading of the source, creates the custom role where a license allows it,
-and otherwise gives the manager `admin` for development. What least
-privilege looks like on the Community Edition is added to the design's
-open question on the manager's role, for T11's live check to settle.
+**Solution.** `deploy/compose/README.md` lists the permissions
+[T11's live check](#the-live-check-against-7139) settled, creates the
+custom role where a license allows it, and otherwise gives the manager the
+built-in `bot` and `app` roles, with the manager's permissions added to
+`app` and `create-personal-access-tokens` to `bot`. The manager is not an
+admin on either edition. The README also says the Community Edition must
+reach Rocket.Chat Cloud, or posts are refused with `restricted-workspace`.
 
 ### The native installer isn't pinned
 
