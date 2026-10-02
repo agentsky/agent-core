@@ -511,6 +511,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_process_kills_it_before_closing_its_stdin() {
+        let dir = std::env::temp_dir().join(format!("runner-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
+        let store = store::Store::open_in_memory(sealer).await.unwrap();
+        let sandbox = sandbox::ProcessSandbox::new(store, dir.clone()).unwrap();
+        let volume = sandbox
+            .ensure_volume(&core_types::VolumeKey {
+                agent: core_types::AgentId::new_v4(),
+                scope: core_types::ScopeKey::Private,
+            })
+            .await
+            .unwrap();
+        let spec = sandbox::SessionSpec::new(session(), volume, "unused", dir.join("persona"));
+        let container = sandbox.start(&spec).await.unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'; exec cat >/dev/null", pid_file.display());
+        let argv = ["/bin/sh", "-c", &script].map(str::to_owned);
+        let io = sandbox
+            .exec(&container, &argv, &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (stdin, killed_first) = testkit::child::NotingStdin::new(io.stdin, pid_file);
+        let process = ClaudeProcess {
+            session: container.session(),
+            container: container.id().clone(),
+            credential: CredentialKind::Subscription,
+            model: None,
+            turn_timeout: Duration::from_secs(60),
+            child: io.child,
+            stdin: Box::pin(stdin),
+            stdout: BufReader::new(io.stdout),
+            state: State::Idle,
+            line: Vec::new(),
+            process_total_cost_usd: Ok(0.0),
+        };
+        drop(process);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            killed_first.load(std::sync::atomic::Ordering::SeqCst),
+            "the process's stdin closed before it was killed, so it could start exiting"
+        );
+    }
+
+    #[tokio::test]
     async fn a_process_that_exits_is_reaped_without_a_kill() {
         let mut child = FakeChild {
             exited: true,
