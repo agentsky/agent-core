@@ -880,29 +880,38 @@ fn the_sandbox_environment_points_every_proxy_variable_at_the_proxy() {
 }
 
 #[tokio::test]
-async fn refusals_are_logged_with_the_session_and_never_the_request() {
+async fn logs_carry_the_session_and_rule_and_never_the_host_or_request() {
     const SANDBOX: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5));
     const UNKNOWN: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 4));
     let logs = Logs::global();
     let (echo, _) = echo_server().await;
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| egress).await;
     let session = proxy.sandbox(SANDBOX);
-    proxy.network.answer("git.example.com", &[PUBLIC]);
     proxy
         .network
-        .answer("x.example.org", &["169.254.169.254".parse().unwrap()]);
+        .answer("allowed-secret-token.example.org", &[PUBLIC]);
+    proxy.network.answer(
+        "metadata-secret-token.example.org",
+        &["169.254.169.254".parse().unwrap()],
+    );
     proxy.network.route(SocketAddr::new(PUBLIC, 443), echo);
     let (mut stream, _) = proxy
         .send_from(
             SANDBOX,
-            "CONNECT git.example.com:443 HTTP/1.1\r\nHost: x\r\n\
+            "CONNECT allowed-secret-token.example.org:443 HTTP/1.1\r\nHost: x\r\n\
              Proxy-Authorization: Basic cHJveHktc2VjcmV0\r\n\r\n",
         )
         .await;
     echoes(&mut stream, b"hello").await;
-    proxy.refused(SANDBOX, "other.example:443").await;
-    proxy.refused(SANDBOX, "x.example.org:443").await;
-    proxy.refused(UNKNOWN, "git.example.com:443").await;
+    proxy
+        .refused(SANDBOX, "denied-secret-token.other.example:443")
+        .await;
+    proxy
+        .refused(SANDBOX, "metadata-secret-token.example.org:443")
+        .await;
+    proxy
+        .refused(UNKNOWN, "unknown-secret-token.example.com:443")
+        .await;
     proxy
         .send_from(
             SANDBOX,
@@ -921,10 +930,21 @@ async fn refusals_are_logged_with_the_session_and_never_the_request() {
 
     let logs = logs.snapshot();
     let mine = |line: &&str| line.contains("peer=127.0.0.5") || line.contains("peer=127.0.0.4");
+    let tunnel_lines = |message: &str| {
+        logs.lines()
+            .filter(|line| line.contains(message) && line.contains(&format!("session={session}")))
+            .count()
+    };
+    for message in ["opened an egress tunnel", "an egress tunnel ended"] {
+        assert_eq!(tunnel_lines(message), 1, "{message}\n{logs}");
+    }
     assert!(
         logs.lines()
             .any(|line| line.contains("opened an egress tunnel")
-                && line.contains(&format!("session={session}"))),
+                && line.contains(&format!("session={session}"))
+                && line.contains("rule=*.example.org")
+                && line.contains("port=443")
+                && line.contains(&format!("address={PUBLIC}:443"))),
         "{logs}"
     );
     let refusals: Vec<&str> = logs
@@ -935,13 +955,14 @@ async fn refusals_are_logged_with_the_session_and_never_the_request() {
     assert_eq!(refusals.len(), 4, "{logs}");
     assert!(
         refusals[0].contains(&format!("session={session}"))
-            && refusals[0].contains("host=\"other.example\"")
             && refusals[0].contains("port=443")
-            && refusals[0].contains("host not allowed"),
+            && refusals[0].contains("host not allowed")
+            && !refusals[0].contains("rule="),
         "{logs}"
     );
     assert!(
         refusals[1].contains("address=\"169.254.169.254\"")
+            && refusals[1].contains("rule=\"*.example.org\"")
             && refusals[1].contains("link-local or cloud metadata address"),
         "{logs}"
     );
@@ -950,7 +971,7 @@ async fn refusals_are_logged_with_the_session_and_never_the_request() {
         "{logs}"
     );
     assert!(
-        refusals[3].contains("invalid target") && !refusals[3].contains("host="),
+        refusals[3].contains("invalid target") && !refusals[3].contains("port="),
         "{logs}"
     );
     for secret in [
@@ -958,6 +979,7 @@ async fn refusals_are_logged_with_the_session_and_never_the_request() {
         "url-secret",
         "query-secret",
         "secret-looking_host",
+        "secret-token",
     ] {
         logs.assert_lacks(secret);
     }

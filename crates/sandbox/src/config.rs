@@ -54,7 +54,8 @@ pub struct SandboxConfig {
     /// Memory limit per sandbox, in MiB, with no swap on top.
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
-    /// CPU limit per sandbox, in CPUs.
+    /// CPU limit per sandbox, in CPUs: at least 0.01, Docker's minimum, and
+    /// at most 1024. Docker receives it in billionths of a CPU.
     #[serde(default = "default_cpus")]
     pub cpus: f64,
     /// Maximum number of processes per sandbox.
@@ -142,7 +143,8 @@ pub const MAX_STOP_TIMEOUT_SECS: u32 = 60;
 const RESERVED_NETWORKS: [&str; 4] = ["host", "none", "default", "bridge"];
 
 const MAX_MEMORY_MB: u64 = 1 << 20;
-const MAX_CPUS: f64 = 1024.0;
+const MIN_NANO_CPUS: i64 = 10_000_000;
+const MAX_NANO_CPUS: i64 = 1024 * 1_000_000_000;
 
 impl SandboxConfig {
     /// A configuration with every default and the given image.
@@ -161,6 +163,14 @@ impl SandboxConfig {
             cleanup_period_days: default_cleanup_period_days(),
             instance: default_instance(),
         }
+    }
+
+    /// [`cpus`](Self::cpus) in billionths of a CPU, rounded to the nearest,
+    /// as Docker's `NanoCpus` takes it. Docker reads 0 as no limit at all,
+    /// so [`validate`](Self::validate) refuses any `cpus` this makes less
+    /// than 0.01 CPU, NaN included.
+    pub(crate) fn nano_cpus(&self) -> i64 {
+        (self.cpus * 1e9).round() as i64
     }
 
     /// Checks what serde can't.
@@ -200,8 +210,8 @@ impl SandboxConfig {
         if !(64..=MAX_MEMORY_MB).contains(&self.memory_mb) {
             return fail("memory_mb", "must be between 64 and 1048576");
         }
-        if !(self.cpus > 0.0 && self.cpus <= MAX_CPUS) {
-            return fail("cpus", "must be above 0 and at most 1024");
+        if !(MIN_NANO_CPUS..=MAX_NANO_CPUS).contains(&self.nano_cpus()) {
+            return fail("cpus", "must be between 0.01 and 1024");
         }
         if self.pids_limit == 0 {
             return fail("pids_limit", "must be at least 1");
@@ -298,7 +308,7 @@ mod tests {
     #[test]
     fn out_of_range_values_name_their_key() {
         type Change = fn(&mut SandboxConfig);
-        let cases: [(&str, Change); 21] = [
+        let cases: [(&str, Change); 25] = [
             ("image", |c| c.image = " ".into()),
             ("network", |c| c.network = String::new()),
             ("network", |c| c.network = "host".into()),
@@ -316,6 +326,10 @@ mod tests {
             ("memory_mb", |c| c.memory_mb = MAX_MEMORY_MB + 1),
             ("cpus", |c| c.cpus = 0.0),
             ("cpus", |c| c.cpus = f64::NAN),
+            ("cpus", |c| c.cpus = 1e-10),
+            ("cpus", |c| c.cpus = 0.0099),
+            ("cpus", |c| c.cpus = -1.0),
+            ("cpus", |c| c.cpus = f64::NEG_INFINITY),
             ("pids_limit", |c| c.pids_limit = 0),
             ("tmp_size_mb", |c| c.tmp_size_mb = 0),
             ("stop_timeout_secs", |c| {
@@ -339,6 +353,15 @@ mod tests {
         config.stop_timeout_secs = MAX_STOP_TIMEOUT_SECS;
         config.network = "sandbox-bridge".into();
         config.validate().unwrap();
+        config.cpus = 0.01;
+        config.validate().unwrap();
+        assert_eq!(config.nano_cpus(), MIN_NANO_CPUS);
+        config.cpus = 2.01;
+        assert_eq!(config.nano_cpus(), 2_010_000_000);
+        config.cpus = 1024.0;
+        config.validate().unwrap();
+        config.cpus = f64::INFINITY;
+        assert_eq!(config.validate().unwrap_err().key, "cpus");
     }
 
     #[test]

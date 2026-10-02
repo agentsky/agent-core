@@ -295,7 +295,12 @@ impl Server {
     ///    requests, the workers and the sweeper get what is left of the
     ///    same timeout to finish. Whatever is still running then is
     ///    dropped.
-    /// 4. The pipeline is dropped, and the store is closed.
+    /// 4. With turns, every warm session's process and container is
+    ///    stopped, within what is left of the same timeout
+    ///    ([`Pipeline::stop_sessions`]). A drain that was cut short, by the
+    ///    timeout or by `abort`, skips it, and the next start reaps what is
+    ///    left.
+    /// 5. The pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -475,6 +480,7 @@ impl Server {
         stop.send_replace(true);
 
         let mut forced = false;
+        let mut turns_cut = false;
         if let Some(pipeline) = &pipeline {
             pipeline.close();
             let drained = tokio::select! {
@@ -485,6 +491,7 @@ impl Server {
                 }
             };
             if !drained {
+                turns_cut = true;
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
                 if !forced {
@@ -517,6 +524,21 @@ impl Server {
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
+        }
+        if let Some(pipeline) = &pipeline {
+            if turns_cut || cut_short.is_some() {
+                tracing::warn!("leaving warm sandboxes for the next start to reap");
+            } else {
+                let left = tokio::select! {
+                    stopped = tokio::time::timeout_at(deadline, pipeline.stop_sessions()) => {
+                        stopped.is_err().then_some("drain timeout elapsed")
+                    }
+                    () = abort.as_mut() => Some("shutdown forced"),
+                };
+                if let Some(reason) = left {
+                    tracing::warn!("{reason}; leaving warm sandboxes for the next start to reap");
+                }
+            }
         }
         drop(pipeline);
         app.store().close().await;
