@@ -3204,7 +3204,8 @@ async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
     stack.hand_off_behind_a_busy_writer(writer, &busy).await;
     let (still, _still_open) = oneshot::channel();
     std::mem::replace(&mut stack.stop, still).send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    wait_until("the server closes the pipeline", || sink.is_closed()).await;
     stack.hand_offs_due_now().await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while stack.kept_due_at().await != [pinned_now() + agentd::pipeline::HAND_OFF_LEASE] {
@@ -3247,7 +3248,8 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
     .await;
     let (still, _still_open) = oneshot::channel();
     std::mem::replace(&mut stack.stop, still).send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    wait_until("the server closes the pipeline", || sink.is_closed()).await;
     looking.open();
     let Stack { task, dir, .. } = stack;
     task.await.unwrap().unwrap();
