@@ -9157,9 +9157,10 @@ the channel gains outside members.
 - **Cap.** To keep the router's read small, a binding keeps at most
   `MAX_CHANNEL_CHANGES` (64) changes, waiting or settled. Recording a
   change past that forgets its earliest settled ones, never a waiting one
-  and never one a waiting change's chain runs through: one from a waiting
-  change's old id or from an id such a chain reaches, found with a
-  recursive CTE over the binding's rows. When none can go, the binding is
+  and never one a waiting change's chain runs through, the one being
+  recorded included: one from a waiting change's old id, from the new
+  change's old or new id, or from an id such a chain reaches, found with
+  a recursive CTE over the binding's rows. When none can go, the binding is
   full. Slack confirms a real change at once unless it can't answer, so
   the owner forging changes can fill it with waiting ones, and so can a
   burst of more than 64 real shares during a Slack outage or while the
@@ -9179,9 +9180,28 @@ the channel gains outside members.
   `MAX_DENIES` (200). A copy that would take the list past it denies
   everyone instead, and a list that denies everyone takes no copies. A
   real change copies at most one deny, so only a flood of forged changes
-  gets there, and then only its owner is refused, which they undo with
-  `allow everyone` and their rules set again. The router's pending denials
-  go through the same bound, so its work per message stays bounded too.
+  gets there, and then the agent refuses everyone except its owner.
+- **The owner recovers.** Copies are marked (`copied` on a room rule, left
+  out of the JSON when false, so stored lists read as before) and don't
+  count toward `MAX_RULES`, and `deny everyone` is always taken, so copies
+  never stop the owner's own `deny`. `allow everyone` drops the copies
+  past the list's first `MAX_RULES` rules, which after a flood are the
+  flood's, so the list doesn't stay at `MAX_DENIES` and flip back to
+  denying everyone at the next copy. Those it drops may include a real
+  copy made after the first `MAX_RULES` rules; the owner sees the list
+  that is left in the reply. The owner's own denies are still capped, so
+  a stored list holds at most `MAX_RULES` of theirs and `MAX_DENIES` in
+  all before their last `deny`, about 300 rules at most.
+- **Pending denials.** The router's pending denials go through the same
+  bound, so its work per message stays bounded too. A stored list near
+  `MAX_DENIES` with enough pending copies can make the router deny
+  everyone for as long as those changes wait, up to a day, while the
+  agent's rules, which the owner sees, don't say so. Real traffic doesn't
+  get there: 100 of the owner's denies and a copy for each of 64 waiting
+  changes make 164. With one cap of 64 waiting changes instead of 16, a
+  forged chain of 64 makes about 2,000 pending pairs instead of about 120,
+  each scanning a list of at most 200: some hundreds of thousands of
+  comparisons per message, bounded, on the forger's own agent only.
 - **The write lock.** Whether the change is known, or the binding full,
   is read first without `BEGIN IMMEDIATE`, then read again under it, one
   query that also counts the rows the eviction could forget. A full
@@ -9528,3 +9548,26 @@ The light review found nothing blocking. These items were fixed:
   name them, since that would take a durable record of each.
 - D: the warnings for a change the store lost are throttled per binding.
 - E: design.md names the one cause of a full binding left.
+
+### Review round 5
+
+The light review found nothing blocking. These items were fixed:
+
+- After a flood, `allow everyone` left the copies, so the owner's `deny`,
+  `deny everyone` included, was refused at `MAX_RULES`. Copies are now
+  marked and don't count toward it, `deny everyone` is always taken, and
+  `allow everyone` drops the copies past the list's first `MAX_RULES`
+  rules (`after_a_flood_of_copies_the_owner_can_open_the_agent_and_deny_again`,
+  `everyone_is_denied_past_the_most_rules`). Of the two ways the review
+  offered to clear copies, `allow everyone` dropping them past the cap is
+  the simpler: it needs no new command. The sentence that said only the
+  owner is refused now says everyone except the owner is.
+- NIT 2: the router's deny-everyone while changes wait, which the agent's
+  rules don't show, is documented under "Pending denials" rather than
+  shown: showing it would mean reading the pending changes into
+  `/agent me`, for a state real traffic doesn't reach.
+- NIT 3: the 4× growth of the router's work under a forged chain is
+  documented under "Pending denials".
+- NIT 4: recording a change keeps the settled changes from its own old
+  and new ids, so the eviction in the same transaction doesn't cut its
+  chain (`a_new_change_keeps_the_settled_ones_its_own_chain_runs_through`).
