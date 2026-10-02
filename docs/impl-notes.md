@@ -2262,7 +2262,7 @@ open the manager bot's DM with the member. Rocket.Chat's `im.create` takes a
 **Solution.** `RocketChatDms` calls `users.info` for the username, then
 `im.create`, which returns the existing DM when there is one. To keep the
 common case to one call (the manager is subject to the REST rate limiter
-unless its role has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
+unless one of its roles has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
 the DM's room, which the event already names, and a reply there posts
 straight to it. The plan's `RocketChatDm` had no field; the T13 bullet
 says so now. `Origin::SlackSlash`'s `response_url` is a `SecretString`,
@@ -2365,7 +2365,7 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   because deriving it from the URL would change every stored identity when
   the URL changes.
 - The manager bot now posts every command reply, and `users.info` plus
-  `im.create` for a channel command, so its role should include
+  `im.create` for a channel command, so its roles should include
   `api-bypass-rate-limit`, as the T11 note on the role expected; the
   README says so. The built-in `bot` and `app` roles the manager holds on
   the Community Edition already have it, and `create-d` for `im.create`
