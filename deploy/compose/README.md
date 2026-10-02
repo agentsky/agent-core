@@ -106,7 +106,7 @@ Docker daemon, which is root on the host. In production, put a socket proxy
 in front of the daemon that allows only the container, exec and event calls
 agentd makes, and give agentd that instead.
 
-## 2. Rocket.Chat admin, manager user and role
+## 2. Rocket.Chat admin, manager user and roles
 
 1. Log in at <http://localhost:3000> as `admin` (`RC_ADMIN_USERNAME`) with
    the `RC_ADMIN_PASS` from `.env`. Compose marks the setup wizard as
@@ -154,8 +154,8 @@ agentd makes, and give agentd that instead.
    license.
 5. Log in as the manager and, in **My account > Personal access tokens**,
    create a token with **Ignore Two Factor Authentication** ticked (without
-   it, 2FA-gated endpoints refuse the token 30 minutes after the manager is
-   created).
+   it, 2FA-gated endpoints refuse the token at the latest 30 minutes after
+   the manager is created).
    Note the token and the user id shown with it.
 
 ## 3. Configure agentd
@@ -199,8 +199,8 @@ which name the key at fault.
 The plan's live checks run against this stack. Record in the pull request
 what was run and what was seen, with tokens and ids redacted.
 
-- **T11, Rocket.Chat REST.** Using a manager with only the role from step
-  3, create a bot user and obtain its token, and record the exact
+- **T11, Rocket.Chat REST.** Using a manager with only the roles from
+  steps 3 and 4, create a bot user and obtain its token, and record the exact
   permissions that needed. By hand, with the manager's id and token in
   `MANAGER_ID` and `TOKEN`:
 
