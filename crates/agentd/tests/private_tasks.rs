@@ -115,6 +115,7 @@ struct Recording {
     inner: ProcessSandbox,
     started: Mutex<Vec<Started>>,
     stop_delay: Mutex<Duration>,
+    stops: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -148,6 +149,7 @@ impl Sandbox for Recording {
     }
 
     async fn stop(&self, container: &ContainerId) -> sandbox::Result<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
         let delay = *self.stop_delay.lock().unwrap();
         tokio::time::sleep(delay).await;
         self.inner.stop(container).await
@@ -358,6 +360,7 @@ async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
         inner: ProcessSandbox::new(store.clone(), dir.path()).unwrap(),
         started: Mutex::default(),
         stop_delay: Mutex::default(),
+        stops: AtomicUsize::default(),
     });
     let turns = Turns::start(&app, sandbox.clone(), settings).unwrap();
     let manager = Arc::new(MockSurface::new());
@@ -517,8 +520,12 @@ impl Stack {
         }
     }
 
-    /// Waits until consent `id`'s task runs, and returns its session.
-    async fn running(&self, id: ConsentId) -> SessionId {
+    /// Approves consent `id`, waits until its task's turn reached the
+    /// model, and returns its session. A turn cut before then ends in an
+    /// error, not a crash, and isn't billed.
+    async fn run_task(&self, id: ConsentId) -> SessionId {
+        let upstream = self.fake.message_requests().await.len();
+        self.approve(id).await;
         let started = Instant::now();
         loop {
             if let Some(session) = self
@@ -529,12 +536,13 @@ impl Stack {
                 .unwrap()
                 .private_session
                 && self.turns.sessions().is_warm(session)
+                && self.fake.message_requests().await.len() > upstream
             {
                 return session;
             }
             assert!(
                 started.elapsed() < WAIT,
-                "consent {id}'s task never started"
+                "consent {id}'s task never reached the model"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -620,14 +628,21 @@ impl Stack {
         self.task.await.unwrap().unwrap();
     }
 
-    /// Shuts agentd down and, `after` that, while the shutdown is still
-    /// under way, forces it with a second signal; returns how long the
-    /// shutdown took once forced. Then kills `session`, whose turn the
-    /// forced shutdown left to its kills, at once, and stops every
-    /// session, so no turn outlives the test.
-    async fn force(self, after: Duration, session: SessionId) -> Duration {
+    /// Shuts agentd down and, while the shutdown is still under way,
+    /// forces it with a second signal: at once, or, `once_killing`, once
+    /// the shutdown has started stopping a container, so it is past the
+    /// turn drain and waits for its kills. Returns how long the shutdown
+    /// took once forced. Then kills `session`, whose turn the forced
+    /// shutdown left to its kills, at once, and stops every session, so no
+    /// turn outlives the test.
+    async fn force(self, once_killing: bool, session: SessionId) -> Duration {
+        let stops = self.sandbox.stops.load(Ordering::SeqCst);
         self.stop.send(()).unwrap();
-        tokio::time::sleep(after).await;
+        let started = Instant::now();
+        while once_killing && self.sandbox.stops.load(Ordering::SeqCst) == stops {
+            assert!(started.elapsed() < WAIT, "the shutdown never killed a turn");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(
             !self.task.is_finished(),
             "the shutdown ended before it was forced"
@@ -1506,8 +1521,7 @@ async fn a_stale_claim_leaves_the_newer_claims_session_alone() {
         )
         .await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
-    stack.running(consent).await;
+    stack.run_task(consent).await;
     let store = stack.store();
     let lapsed = OffsetDateTime::now_utc() + agentd::pipeline::WORK_LEASE + Duration::from_secs(1);
     let newer = store
@@ -1617,8 +1631,7 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
         )
         .await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
-    let session = stack.running(consent).await;
+    let session = stack.run_task(consent).await;
     let (store, alice) = (stack.store(), stack.alice);
     let billed = || async move {
         store
@@ -1667,8 +1680,7 @@ async fn a_shutdown_tells_cut_threads_before_its_kills_end() {
     let stack = start("").await;
     let consent = stack.ask("bob", "t1", "sleep 90").await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
-    let session = stack.running(consent).await;
+    let session = stack.run_task(consent).await;
     let before = stack.mock.calls().len();
     let again = stack.mention("bob", "t1-again", Some("t1"));
     let pipeline = stack.pipeline.clone();
@@ -1715,10 +1727,9 @@ async fn a_second_signal_leaves_the_kills_of_the_turns_it_cuts_short() {
     let stack = start("").await;
     let consent = stack.ask("bob", "t1", "sleep 90").await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
-    let session = stack.running(consent).await;
+    let session = stack.run_task(consent).await;
     *stack.sandbox.stop_delay.lock().unwrap() = Duration::from_secs(20);
-    let took = stack.force(Duration::ZERO, session).await;
+    let took = stack.force(false, session).await;
     assert!(
         took < Duration::from_secs(10),
         "the forced shutdown waited {took:?} for the kills"
@@ -1730,10 +1741,9 @@ async fn a_second_signal_while_a_shutdown_waits_for_its_kills_stops_the_wait() {
     let stack = start_with_drain("", 1).await;
     let consent = stack.ask("bob", "t1", "sleep 90").await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
-    let session = stack.running(consent).await;
+    let session = stack.run_task(consent).await;
     *stack.sandbox.stop_delay.lock().unwrap() = Duration::from_secs(20);
-    let took = stack.force(Duration::from_secs(2), session).await;
+    let took = stack.force(true, session).await;
     assert!(
         took < Duration::from_secs(10),
         "the second signal still waited {took:?} for the kills"
