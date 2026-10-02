@@ -5394,7 +5394,10 @@ runner reaps every exit it sees, a crash, a refused resume or a failed
 write, before the turn returns. What is left for a drop to kill is a
 warm process a `SessionManager` holds when a test ends, which waits for
 input and has nothing to write; the tests wait for the stops they start,
-and agentd's drain for the turns in flight. `ProcessChild::drop` keeps
+and agentd's graceful drain for the turns in flight. A drain timeout or a
+second signal returns without waiting for the turns it cuts short, which
+run on in the runner's own tasks, so a test that cuts turns short calls
+`stop_all` on the sessions before it returns. `ProcessChild::drop` keeps
 killing at once: waiting there would block a runtime thread.
 
 ### A stand-in `git` is written by a child process
