@@ -160,7 +160,7 @@ pub fn container_config(
         cap_drop: Some(vec!["ALL".into()]),
         memory: Some(memory),
         memory_swap: Some(memory),
-        nano_cpus: Some((config.cpus * 1e9) as i64),
+        nano_cpus: Some(config.nano_cpus()),
         pids_limit: Some(i64::from(config.pids_limit)),
         tmpfs: Some(HashMap::from([(
             "/tmp".to_string(),
