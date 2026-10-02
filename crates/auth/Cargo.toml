@@ -27,4 +27,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+testkit.workspace = true
 wiremock.workspace = true
