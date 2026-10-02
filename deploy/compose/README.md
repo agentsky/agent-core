@@ -81,9 +81,8 @@ logs -f rocketchat` shows when it is up.
 
 The Community Edition must be able to reach Rocket.Chat Cloud over HTTPS to
 report its statistics. A workspace that never has, or hasn't for ten days,
-is restricted: posts and edits, through the REST API and DDP, and the
-confirm step of uploads answer `restricted-workspace` until it reports or
-gets a license
+is restricted: posts and edits through the REST API, and the confirm step
+of uploads, answer `restricted-workspace` until it reports or gets a license
 ([impl-notes](../../docs/impl-notes.md#the-live-check-against-7139)). Reads,
 reactions, invites and user management still work, so a restricted
 workspace looks healthy until an agent tries to answer.
@@ -147,8 +146,9 @@ agentd makes, and give agentd that instead.
    `app` on the Community Edition, or `user` and `agent-manager` with a
    license.
 5. Log in as the manager and, in **My account > Personal access tokens**,
-   create a token with **Ignore Two Factor Authentication** ticked (the
-   endpoint for renaming a bot requires two-factor authentication otherwise).
+   create a token with **Ignore Two Factor Authentication** ticked (without
+   it, 2FA-gated endpoints refuse the token 30 minutes after the manager is
+   created).
    Note the token and the user id shown with it.
 
 ## 3. Configure agentd
