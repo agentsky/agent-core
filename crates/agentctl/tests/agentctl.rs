@@ -557,16 +557,29 @@ async fn lock_gives_up_after_its_timeout() {
 async fn the_lock_renews_while_the_command_runs() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
     let (_, token) = server.turn().await;
+    let (marker, release) = (server.dir.path("holding"), server.dir.path("release"));
     let holder = server
         .agentctl(&token)
-        .args(["lock", "--", "sleep", "5"])
+        .args([
+            "lock",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
+                marker.display(),
+                release.display()
+            ),
+        ])
         .spawn()
         .unwrap();
+    wait_for(&marker).await;
     tokio::time::sleep(Duration::from_millis(4_000)).await;
     server
         .run(&token, &["lock", "--timeout", "0", "--", "true"])
         .await
         .refused("gave up");
+    std::fs::write(&release, "").unwrap();
     Run::from(holder.wait_with_output().await.unwrap()).ok();
     server.run(&token, &["lock", "--", "true"]).await.ok();
 }
