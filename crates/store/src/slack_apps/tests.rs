@@ -448,7 +448,7 @@ async fn register_token(store: &Store, owner: MemberId, expires_at: i64) {
 
 async fn due_bindings(store: &Store, now: i64) -> Vec<BindingId> {
     store
-        .due_manifest_updates(&team(), CURRENT, at(now), 10)
+        .due_manifest_updates(&team(), CURRENT, at(now), at(now), 10)
         .await
         .unwrap()
         .into_iter()
@@ -467,7 +467,7 @@ async fn older_installed_apps_are_due_while_their_owner_has_a_usable_token() {
 
     register_token(&store, ada, 10_000).await;
     let due = store
-        .due_manifest_updates(&team(), CURRENT, at(5_000), 10)
+        .due_manifest_updates(&team(), CURRENT, at(5_000), at(5_000), 10)
         .await
         .unwrap();
     assert_eq!(
@@ -484,7 +484,15 @@ async fn older_installed_apps_are_due_while_their_owner_has_a_usable_token() {
     );
     assert!(
         store
-            .due_manifest_updates(&TeamId::new("T0ELSE001"), CURRENT, at(5_000), 10)
+            .due_manifest_updates(&team(), CURRENT, at(5_000), at(10_000), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the token doesn't last as long as a call may"
+    );
+    assert!(
+        store
+            .due_manifest_updates(&TeamId::new("T0ELSE001"), CURRENT, at(5_000), at(5_000), 10)
             .await
             .unwrap()
             .is_empty()
@@ -547,6 +555,23 @@ async fn registering_a_token_ends_the_owners_manifest_leases_in_that_workspace()
     }
     register_token(&store, ada, 100_000).await;
     assert_eq!(due_bindings(&store, 5_001).await, [adas]);
+}
+
+#[tokio::test]
+async fn apps_never_tried_come_before_those_tried_again() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    register_token(&store, ada, 100_000).await;
+    let first = installed(&store, ada, "first", 0).await;
+    let second = installed(&store, ada, "second", 0).await;
+    assert_eq!(due_bindings(&store, 5_000).await, [first, second]);
+    assert!(
+        store
+            .claim_manifest_update(first, CURRENT, at(5_000), at(8_600))
+            .await
+            .unwrap()
+    );
+    assert_eq!(due_bindings(&store, 8_600).await, [second, first]);
 }
 
 #[tokio::test]
@@ -625,7 +650,7 @@ async fn a_blocked_update_is_never_claimed_again_for_its_version_and_says_so() {
     );
     assert_eq!(
         store
-            .due_manifest_updates(&team(), CURRENT + 1, at(5_001), 10)
+            .due_manifest_updates(&team(), CURRENT + 1, at(5_001), at(5_001), 10)
             .await
             .unwrap()
             .into_iter()
@@ -737,7 +762,7 @@ async fn existing_bindings_start_at_manifest_version_zero() {
     register_token(&store, ada, 100_000).await;
     assert_eq!(
         store
-            .due_manifest_updates(&team(), 1, at(5_000), 10)
+            .due_manifest_updates(&team(), 1, at(5_000), at(5_000), 10)
             .await
             .unwrap()
             .into_iter()

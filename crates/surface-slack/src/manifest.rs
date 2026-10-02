@@ -15,11 +15,12 @@
 //! An app keeps the manifest it was made from until agentd updates it: it
 //! reads the app's manifest with `apps.manifest.export`
 //! ([`SlackClient::export_app`](crate::SlackClient::export_app)), adds the
-//! [`BOT_EVENTS`] it lacks ([`add_bot_events`]) and writes it back with
-//! `apps.manifest.update`
+//! [`ADDED_BOT_EVENTS`] it lacks ([`add_bot_events`]) and writes it back
+//! with `apps.manifest.update`
 //! ([`SlackClient::update_app`](crate::SlackClient::update_app)), so
-//! nothing else in it changes. Each new bot event an existing app should
-//! get raises [`MANIFEST_VERSION`], and agentd records the version each app
+//! nothing else in it changes, events its owner removed included. Each new
+//! bot event an existing app should get goes into [`ADDED_BOT_EVENTS`] and
+//! raises [`MANIFEST_VERSION`], and agentd records the version each app
 //! has. A change of scopes would take a new install, which an update can't
 //! do, so a version never adds one.
 //!
@@ -55,8 +56,13 @@ pub const BOT_EVENTS: [&str; 5] = [
 /// version doesn't have what it added.
 pub const MANIFEST_VERSION: u32 = 1;
 
+/// The bot events [`agent_manifest`] gained since version 0, which an
+/// update adds to an older app: only those, so an event its owner removed
+/// stays removed.
+pub const ADDED_BOT_EVENTS: [&str; 1] = ["channel_id_changed"];
+
 /// Adds to `manifest`, an app's manifest as `apps.manifest.export` gives
-/// it, the [`BOT_EVENTS`] its `settings.event_subscriptions.bot_events`
+/// it, the [`ADDED_BOT_EVENTS`] its `settings.event_subscriptions.bot_events`
 /// lacks, after the ones it has, and says whether it added any. `None`,
 /// changing nothing, when the manifest has no such list of strings: an app
 /// that subscribes to no events isn't one agentd should change.
@@ -69,7 +75,7 @@ pub fn add_bot_events(manifest: &mut Value) -> Option<bool> {
     if !events.iter().all(Value::is_string) {
         return None;
     }
-    let missing: Vec<&str> = BOT_EVENTS
+    let missing: Vec<&str> = ADDED_BOT_EVENTS
         .into_iter()
         .filter(|event| !events.iter().any(|known| known == event))
         .collect();
@@ -320,7 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn the_bot_events_an_app_lacks_are_added_and_nothing_else_changes() {
+    fn only_the_bot_events_added_since_are_added_and_nothing_else_changes() {
+        assert!(
+            ADDED_BOT_EVENTS
+                .iter()
+                .all(|event| BOT_EVENTS.contains(event))
+        );
         let mut current = agent_manifest(&app(false));
         let unchanged = current.clone();
         assert_eq!(add_bot_events(&mut current), Some(false));
@@ -335,8 +346,6 @@ mod tests {
             "message.im",
             "app_mention",
             "message.channels",
-            "message.groups",
-            "message.mpim",
             "channel_id_changed",
         ]);
         assert_eq!(add_bot_events(&mut older), Some(true));

@@ -85,8 +85,9 @@ use core_types::{
 use secrecy::SecretString;
 use serde::Deserialize;
 use store::{
-    AgentBinding, AgentCreation, BindingState, ChannelIdChange, ChannelIdChangeRecord,
-    ManifestUpdate, NewAgent, NewSlackApp, SlackConfigToken, Store, StoreError, Visibility,
+    AgentBinding, AgentCreation, BindingState, ChannelIdChange, ChannelIdChangeLimits,
+    ChannelIdChangeRecord, ManifestUpdate, NewAgent, NewSlackApp, SlackConfigToken, Store,
+    StoreError, Visibility,
 };
 use surface_slack::ChannelIdChanged;
 use surface_slack::ingress::WARNING_INTERVAL;
@@ -142,10 +143,23 @@ pub const CHANNEL_CHANGE_RETRY: Duration = Duration::from_secs(5 * 60);
 /// How long after it was received a channel id change is given up.
 pub const CHANNEL_CHANGE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The most channel id changes one binding may have recorded, waiting or
-/// settled within [`CHANNEL_CHANGE_TTL`]. Past that, another is dropped:
-/// only the app's owner can send so many.
+/// The most channel id changes one binding may have waiting for Slack at
+/// once. Past that, another is dropped: Slack confirms a real change at
+/// once unless it is down, so only the app's owner, forging changes, can
+/// keep so many waiting.
 pub const MAX_CHANNEL_CHANGES: u32 = 16;
+
+/// The most channel id changes one binding keeps, waiting or settled
+/// within [`CHANNEL_CHANGE_TTL`]. Past that, its earliest settled ones are
+/// forgotten to make room, so the router's read of them stays small.
+pub const MAX_CHANNEL_CHANGES_KEPT: u32 = 64;
+
+/// [`MAX_CHANNEL_CHANGES`] and [`MAX_CHANNEL_CHANGES_KEPT`], as the store
+/// takes them.
+pub const CHANNEL_CHANGE_LIMITS: ChannelIdChangeLimits = ChannelIdChangeLimits {
+    waiting: MAX_CHANNEL_CHANGES,
+    kept: MAX_CHANNEL_CHANGES_KEPT,
+};
 
 /// The most channel id changes one sweeper pass tries, and gives up.
 const CHANNEL_CHANGES_PER_PASS: u32 = 64;
@@ -926,16 +940,16 @@ impl SlackAgents {
         now: &impl Fn() -> OffsetDateTime,
         budget: Duration,
     ) -> Result<usize, StoreError> {
-        let until = Instant::now() + budget;
         let at = now();
         let since = at - self.inner.settings.reminder_after;
-        let mut reminded = 0;
-        for due in self
+        let due = self
             .inner
             .store
             .due_install_reminders(self.team(), since, at, REMINDER_MAX_ATTEMPTS)
-            .await?
-        {
+            .await?;
+        let until = Instant::now() + budget;
+        let mut reminded = 0;
+        for due in due {
             if Instant::now() >= until {
                 break;
             }
@@ -957,19 +971,21 @@ impl SlackAgents {
         now: &impl Fn() -> OffsetDateTime,
         budget: Duration,
     ) -> Result<usize, StoreError> {
-        let until = Instant::now() + budget;
-        let mut updated = 0;
-        for due in self
+        let at = now();
+        let due = self
             .inner
             .store
             .due_manifest_updates(
                 self.team(),
                 MANIFEST_VERSION,
-                now(),
+                at,
+                at + APP_CALL_TIMEOUT,
                 MANIFEST_UPDATES_PER_PASS,
             )
-            .await?
-        {
+            .await?;
+        let until = Instant::now() + budget;
+        let mut updated = 0;
+        for due in due {
             if Instant::now() >= until {
                 break;
             }
@@ -1066,7 +1082,7 @@ impl SlackAgents {
     /// records it, and tries to settle it at once in a task of its own,
     /// which leaves it to the sweeper when it can't. A change recorded
     /// already is left as it is, and one past the binding's
-    /// [`MAX_CHANNEL_CHANGES`] is dropped.
+    /// [`MAX_CHANNEL_CHANGES`] waiting is dropped.
     pub async fn channel_id_changed(&self, changed: ChannelIdChanged) {
         let binding = changed.binding;
         if !changed.old.as_str().starts_with('G') {
@@ -1083,7 +1099,7 @@ impl SlackAgents {
         match self
             .inner
             .store
-            .record_channel_id_change(&change, MAX_CHANNEL_CHANGES)
+            .record_channel_id_change(&change, CHANNEL_CHANGE_LIMITS)
             .await
         {
             Ok(ChannelIdChangeRecord::Recorded) => {
@@ -1099,7 +1115,7 @@ impl SlackAgents {
             }
             Ok(ChannelIdChangeRecord::Full) => {
                 self.note(binding, "too many channel id changes", |quiet| {
-                    tracing::warn!(%binding, old = %change.old, new = %change.new, recorded = MAX_CHANNEL_CHANGES, dropped_since_last_warning = quiet, "dropped a channel id change: the binding has as many recorded as it may, which only its owner can send");
+                    tracing::warn!(%binding, old = %change.old, new = %change.new, waiting = MAX_CHANNEL_CHANGES, dropped_since_last_warning = quiet, "dropped a channel id change: the binding has as many waiting for Slack as it may");
                 });
             }
             Err(err) => {
@@ -1121,16 +1137,16 @@ impl SlackAgents {
         }
     }
 
-    /// Forgets the settled channel id changes received over
-    /// [`CHANNEL_CHANGE_TTL`] ago, and gives up the ones still waiting;
-    /// how many were given up.
+    /// Gives up the channel id changes received over
+    /// [`CHANNEL_CHANGE_TTL`] ago that still wait, then forgets the
+    /// settled ones as old, after the give-ups, which follow their chains
+    /// through them; how many were given up.
     async fn give_up_channel_changes(
         &self,
         now: &impl Fn() -> OffsetDateTime,
     ) -> Result<usize, StoreError> {
         let store = &self.inner.store;
         let before = now() - CHANNEL_CHANGE_TTL;
-        store.purge_settled_channel_id_changes(before).await?;
         let mut given_up = 0;
         for change in store
             .expired_channel_id_changes(before, CHANNEL_CHANGES_PER_PASS)
@@ -1143,6 +1159,9 @@ impl SlackAgents {
                     tracing::warn!(binding = %change.binding, error = %err, "giving up a channel id change failed in the store; trying again later");
                 }
             }
+        }
+        if let Err(err) = store.purge_settled_channel_id_changes(before).await {
+            tracing::warn!(error = %err, "couldn't forget old settled channel id changes; trying again next pass");
         }
         Ok(given_up)
     }
@@ -1202,14 +1221,14 @@ impl SlackAgents {
         now: &impl Fn() -> OffsetDateTime,
         budget: Duration,
     ) -> Result<usize, StoreError> {
-        let until = Instant::now() + budget;
-        let mut settled = 0;
-        for change in self
+        let due = self
             .inner
             .store
             .due_channel_id_changes(now(), CHANNEL_CHANGES_PER_PASS)
-            .await?
-        {
+            .await?;
+        let until = Instant::now() + budget;
+        let mut settled = 0;
+        for change in due {
             if Instant::now() >= until {
                 break;
             }

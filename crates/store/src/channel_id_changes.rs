@@ -50,9 +50,20 @@ pub enum ChannelIdChangeRecord {
     /// The same change of the same binding is recorded already, waiting or
     /// settled.
     Known,
-    /// The binding has as many changes recorded as it may; nothing was
+    /// The binding has as many changes waiting as it may; nothing was
     /// recorded.
     Full,
+}
+
+/// How many channel id changes [`Store::record_channel_id_change`] lets
+/// one binding have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelIdChangeLimits {
+    /// The most waiting at once. Past it, a new change isn't recorded.
+    pub waiting: u32,
+    /// The most kept, waiting or settled. Past it, the earliest settled
+    /// ones are deleted to make room; a waiting one never is.
+    pub kept: u32,
 }
 
 type Row = (String, String, String, i64);
@@ -68,8 +79,12 @@ fn change_of((binding, old, new, received_at): Row) -> Result<ChannelIdChange> {
 
 impl Store {
     /// Records `change`, waiting and due at once, unless the same change of
-    /// the same binding is recorded already, or the binding has `max`
-    /// changes recorded, waiting or settled.
+    /// the same binding is recorded already, or the binding has
+    /// `limits.waiting` changes waiting. To keep it at `limits.kept` rows,
+    /// the binding's earliest settled changes are deleted. Whether the
+    /// change is known, or the binding full, is read first without the
+    /// write lock, so a replay or a flood of forged changes doesn't hold up
+    /// the store's writers.
     ///
     /// # Errors
     ///
@@ -79,25 +94,50 @@ impl Store {
     pub async fn record_channel_id_change(
         &self,
         change: &ChannelIdChange,
-        max: u32,
+        limits: ChannelIdChangeLimits,
     ) -> Result<ChannelIdChangeRecord> {
+        const COUNTS: &str = "SELECT COUNT(CASE WHEN settled_at IS NULL THEN 1 END), \
+             COUNT(CASE WHEN old_channel = ? AND new_channel = ? THEN 1 END) \
+             FROM channel_id_changes WHERE binding_id = ?";
         let binding = change.binding.to_string();
+        let refused = |(waiting, known): (i64, i64)| {
+            if known > 0 {
+                Some(ChannelIdChangeRecord::Known)
+            } else if waiting >= i64::from(limits.waiting) {
+                Some(ChannelIdChangeRecord::Full)
+            } else {
+                None
+            }
+        };
+        let counts: (i64, i64) = sqlx::query_as(COUNTS)
+            .bind(change.old.as_str())
+            .bind(change.new.as_str())
+            .bind(&binding)
+            .fetch_one(&self.pool)
+            .await?;
+        if let Some(refused) = refused(counts) {
+            return Ok(refused);
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let (recorded, known): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COUNT(CASE WHEN old_channel = ? AND new_channel = ? THEN 1 END) \
-             FROM channel_id_changes WHERE binding_id = ?",
+        let counts: (i64, i64) = sqlx::query_as(COUNTS)
+            .bind(change.old.as_str())
+            .bind(change.new.as_str())
+            .bind(&binding)
+            .fetch_one(&mut *tx)
+            .await?;
+        if let Some(refused) = refused(counts) {
+            return Ok(refused);
+        }
+        sqlx::query(
+            "DELETE FROM channel_id_changes WHERE rowid IN (SELECT rowid FROM channel_id_changes \
+             WHERE binding_id = ? AND settled_at IS NOT NULL ORDER BY received_at, rowid \
+             LIMIT max(0, (SELECT COUNT(*) FROM channel_id_changes WHERE binding_id = ?) - ? + 1))",
         )
-        .bind(change.old.as_str())
-        .bind(change.new.as_str())
         .bind(&binding)
-        .fetch_one(&mut *tx)
+        .bind(&binding)
+        .bind(i64::from(limits.kept))
+        .execute(&mut *tx)
         .await?;
-        if known > 0 {
-            return Ok(ChannelIdChangeRecord::Known);
-        }
-        if recorded >= i64::from(max) {
-            return Ok(ChannelIdChangeRecord::Full);
-        }
         let at = to_unix(change.received_at);
         sqlx::query(
             "INSERT INTO channel_id_changes \
@@ -115,8 +155,8 @@ impl Store {
         Ok(ChannelIdChangeRecord::Recorded)
     }
 
-    /// Up to `limit` waiting changes that may be claimed at `now`, the
-    /// earliest received first.
+    /// Up to `limit` waiting changes that may be claimed at `now`, the one
+    /// due longest first, so changes tried and not settled go to the back.
     ///
     /// # Errors
     ///
@@ -131,7 +171,7 @@ impl Store {
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT binding_id, old_channel, new_channel, received_at FROM channel_id_changes \
              WHERE settled_at IS NULL AND next_attempt_at <= ? \
-             ORDER BY received_at, rowid LIMIT ?",
+             ORDER BY next_attempt_at, received_at LIMIT ?",
         )
         .bind(to_unix(now))
         .bind(i64::from(limit))
@@ -237,8 +277,10 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Deletes the settled changes received before `received_before`, and
-    /// says how many there were.
+    /// Deletes the settled changes received before `received_before` of
+    /// bindings with no change waiting, and says how many there were. A
+    /// binding with one waiting keeps them, so that change, given up, still
+    /// follows its chain through them.
     ///
     /// # Errors
     ///
@@ -249,7 +291,9 @@ impl Store {
         received_before: OffsetDateTime,
     ) -> Result<u64> {
         let result = sqlx::query(
-            "DELETE FROM channel_id_changes WHERE settled_at IS NOT NULL AND received_at < ?",
+            "DELETE FROM channel_id_changes AS c WHERE settled_at IS NOT NULL AND received_at < ? \
+             AND NOT EXISTS (SELECT 1 FROM channel_id_changes AS w \
+             WHERE w.binding_id = c.binding_id AND w.settled_at IS NULL)",
         )
         .bind(to_unix(received_before))
         .execute(&self.pool)

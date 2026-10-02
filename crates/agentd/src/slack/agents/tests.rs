@@ -886,7 +886,7 @@ fn change(binding: BindingId) -> ChannelIdChange {
 async fn recorded(h: &Harness, change: &ChannelIdChange) {
     assert_eq!(
         h.store
-            .record_channel_id_change(change, MAX_CHANNEL_CHANGES)
+            .record_channel_id_change(change, CHANNEL_CHANGE_LIMITS)
             .await
             .unwrap(),
         ChannelIdChangeRecord::Recorded
@@ -1161,7 +1161,7 @@ async fn a_replayed_channel_id_change_is_dropped() {
     );
     assert_eq!(
         h.store
-            .record_channel_id_change(&changed, MAX_CHANNEL_CHANGES)
+            .record_channel_id_change(&changed, CHANNEL_CHANGE_LIMITS)
             .await
             .unwrap(),
         ChannelIdChangeRecord::Known,
@@ -1547,4 +1547,50 @@ async fn register_token(h: &Harness, at: OffsetDateTime) {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_busy_day_of_shares_records_every_change() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let count = MAX_CHANNEL_CHANGES as usize + 4;
+    let olds: Vec<String> = (0..count).map(|n| format!("G0BUSY{n:03}")).collect();
+    let news: Vec<String> = (0..count).map(|n| format!("C0BUSY{n:03}")).collect();
+    set_rules(&h, helper, &denying(&ids(&olds))).await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.info"))
+        .and(header(
+            "authorization",
+            format!("Bearer {AGENT_TOKEN}").as_str(),
+        ))
+        .respond_with(|request: &wiremock::Request| {
+            let form: std::collections::HashMap<String, String> =
+                serde_urlencoded::from_bytes(&request.body).unwrap_or_default();
+            member_of(form.get("channel").map_or("", String::as_str))
+        })
+        .mount(&h.slack)
+        .await;
+    for (old, new) in olds.iter().zip(&news) {
+        h.agents
+            .channel_id_changed(ChannelIdChanged {
+                old: old.as_str().into(),
+                new: new.as_str().into(),
+                ..the_event(helper)
+            })
+            .await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while rules_of(&h, helper).await != denying(&ids(&news)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not every change moved its deny: {:?}",
+            changes_of(&h, helper).await
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(changes_of(&h, helper).await.len(), count);
+}
+
+fn ids(list: &[String]) -> Vec<&str> {
+    list.iter().map(String::as_str).collect()
 }

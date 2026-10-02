@@ -473,7 +473,9 @@ impl Store {
     /// may be claimed at `now`: made, or last updated, from a manifest
     /// older than `version`, not blocked at `version`, with no lease
     /// running, of an agent that isn't deleted, whose owner has a
-    /// configuration token usable at `now`. Longest installed first.
+    /// configuration token that isn't broken and still works at
+    /// `token_until`. The ones never tried come first, then those whose
+    /// lease ended longest ago, so a failing app doesn't hold up the rest.
     ///
     /// # Errors
     ///
@@ -484,6 +486,7 @@ impl Store {
         team: &TeamId,
         version: u32,
         now: OffsetDateTime,
+        token_until: OffsetDateTime,
         limit: u32,
     ) -> Result<Vec<ManifestUpdate>> {
         let rows: Vec<(String, String, String)> = sqlx::query_as(concat!(
@@ -493,10 +496,10 @@ impl Store {
              AND EXISTS (SELECT 1 FROM slack_config_tokens t WHERE t.member_id = a.owner_id \
              AND t.team_id = b.team_id AND t.broken_at IS NULL AND t.expires_at > ?) AND ",
             manifest_due!(),
-            " ORDER BY b.state_changed_at, b.rowid LIMIT ?"
+            " ORDER BY b.manifest_lease_until, b.state_changed_at, b.rowid LIMIT ?"
         ))
         .bind(team.as_str())
-        .bind(to_unix(now))
+        .bind(to_unix(token_until))
         .bind(i64::from(version))
         .bind(i64::from(version))
         .bind(to_unix(now))

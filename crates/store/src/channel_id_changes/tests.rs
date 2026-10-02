@@ -1,6 +1,7 @@
 use core_types::{MemberKey, SurfaceKind, TeamId, UserId};
 
 use super::*;
+use crate::ChannelIdChangeLimits;
 use crate::ChannelIdChangeRecord::{Full, Known, Recorded};
 use crate::agents::{AgentCreation, NewAgent, Visibility};
 use crate::test_util::*;
@@ -27,6 +28,10 @@ async fn binding(store: &Store, name: &str) -> BindingId {
     }
 }
 
+fn limits(waiting: u32) -> ChannelIdChangeLimits {
+    ChannelIdChangeLimits { waiting, kept: 64 }
+}
+
 fn change(binding: BindingId, old: &str, new: &str, received_at: i64) -> ChannelIdChange {
     ChannelIdChange {
         binding,
@@ -43,28 +48,43 @@ async fn a_change_is_recorded_once_and_due_at_once() {
     let writer = binding(&store, "writer").await;
     let first = change(helper, "G0PRIVAT1", "C0PRIVAT1", 1_000);
     assert_eq!(
-        store.record_channel_id_change(&first, 2).await.unwrap(),
+        store
+            .record_channel_id_change(&first, limits(2))
+            .await
+            .unwrap(),
         Recorded
     );
     let again = change(helper, "G0PRIVAT1", "C0PRIVAT1", 1_100);
     assert_eq!(
-        store.record_channel_id_change(&again, 2).await.unwrap(),
+        store
+            .record_channel_id_change(&again, limits(2))
+            .await
+            .unwrap(),
         Known
     );
     let second = change(helper, "G0PRIVAT2", "C0PRIVAT2", 1_050);
     assert_eq!(
-        store.record_channel_id_change(&second, 2).await.unwrap(),
+        store
+            .record_channel_id_change(&second, limits(2))
+            .await
+            .unwrap(),
         Recorded
     );
     let third = change(helper, "G0PRIVAT3", "C0PRIVAT3", 1_060);
     assert_eq!(
-        store.record_channel_id_change(&third, 2).await.unwrap(),
+        store
+            .record_channel_id_change(&third, limits(2))
+            .await
+            .unwrap(),
         Full,
-        "the binding has as many recorded as it may"
+        "the binding has as many waiting as it may"
     );
     let others = change(writer, "G0PRIVAT3", "C0PRIVAT3", 1_060);
     assert_eq!(
-        store.record_channel_id_change(&others, 2).await.unwrap(),
+        store
+            .record_channel_id_change(&others, limits(2))
+            .await
+            .unwrap(),
         Recorded,
         "another binding has its own"
     );
@@ -78,7 +98,7 @@ async fn a_change_is_recorded_once_and_due_at_once() {
     );
     assert!(
         store
-            .record_channel_id_change(&change(BindingId::new_v4(), "G0X", "C0X", 1), 2)
+            .record_channel_id_change(&change(BindingId::new_v4(), "G0X", "C0X", 1), limits(2))
             .await
             .is_err(),
         "no such binding"
@@ -90,7 +110,10 @@ async fn a_try_is_claimed_once_until_its_retry_is_due_and_a_settled_change_stays
     let store = memory_store().await;
     let helper = binding(&store, "helper").await;
     let changed = change(helper, "G0PRIVAT1", "C0PRIVAT1", 1_000);
-    store.record_channel_id_change(&changed, 16).await.unwrap();
+    store
+        .record_channel_id_change(&changed, limits(16))
+        .await
+        .unwrap();
     let claim = |now: i64| store.claim_channel_id_change(&changed, at(now), at(now + 300));
     assert!(claim(1_000).await.unwrap());
     assert!(!claim(1_299).await.unwrap(), "claimed until 1,300");
@@ -127,27 +150,36 @@ async fn a_try_is_claimed_once_until_its_retry_is_due_and_a_settled_change_stays
             .is_empty()
     );
     assert_eq!(
-        store.record_channel_id_change(&changed, 16).await.unwrap(),
+        store
+            .record_channel_id_change(&changed, limits(16))
+            .await
+            .unwrap(),
         Known,
         "a settled change is known while it is kept"
     );
     assert!(store.delete_channel_id_change(&changed).await.unwrap());
     assert!(!store.delete_channel_id_change(&changed).await.unwrap());
     assert_eq!(
-        store.record_channel_id_change(&changed, 16).await.unwrap(),
+        store
+            .record_channel_id_change(&changed, limits(16))
+            .await
+            .unwrap(),
         Recorded
     );
 }
 
 #[tokio::test]
-async fn waiting_changes_received_long_ago_expire_and_settled_ones_are_purged() {
+async fn waiting_changes_received_long_ago_expire_and_settled_ones_are_purged_after_them() {
     let store = memory_store().await;
     let helper = binding(&store, "helper").await;
     let waiting = change(helper, "G0PRIVAT1", "C0PRIVAT1", 1_000);
-    let settled = change(helper, "G0PRIVAT2", "C0PRIVAT2", 1_000);
+    let settled = change(helper, "C0PRIVAT1", "C0PRIVAT2", 900);
     let recent = change(helper, "G0PRIVAT3", "C0PRIVAT3", 5_000);
     for changed in [&waiting, &settled, &recent] {
-        store.record_channel_id_change(changed, 16).await.unwrap();
+        store
+            .record_channel_id_change(changed, limits(16))
+            .await
+            .unwrap();
     }
     store
         .settle_channel_id_change(&settled, at(1_001))
@@ -160,6 +192,31 @@ async fn waiting_changes_received_long_ago_expire_and_settled_ones_are_purged() 
             .unwrap(),
         std::slice::from_ref(&waiting)
     );
+    let agent = store.binding(helper).await.unwrap().unwrap().agent;
+    let kept = async || -> Vec<ChannelIdChange> {
+        store
+            .channel_id_changes_of_agent(agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|known| known.change)
+            .collect()
+    };
+    assert_eq!(
+        store
+            .purge_settled_channel_id_changes(at(5_000))
+            .await
+            .unwrap(),
+        0,
+        "the waiting change's chain goes through it"
+    );
+    assert_eq!(
+        kept().await,
+        [settled.clone(), waiting.clone(), recent.clone()]
+    );
+    for changed in [&waiting, &recent] {
+        store.delete_channel_id_change(changed).await.unwrap();
+    }
     assert_eq!(
         store
             .purge_settled_channel_id_changes(at(5_000))
@@ -167,14 +224,74 @@ async fn waiting_changes_received_long_ago_expire_and_settled_ones_are_purged() 
             .unwrap(),
         1
     );
-    let kept: Vec<_> = store
-        .channel_id_changes_of_agent(store.binding(helper).await.unwrap().unwrap().agent)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|known| known.change)
-        .collect();
-    assert_eq!(kept, [waiting, recent], "a waiting change is never purged");
+    assert!(kept().await.is_empty());
+}
+
+#[tokio::test]
+async fn only_waiting_changes_fill_a_binding_and_the_earliest_settled_make_room() {
+    let store = memory_store().await;
+    let helper = binding(&store, "helper").await;
+    let few = ChannelIdChangeLimits {
+        waiting: 2,
+        kept: 4,
+    };
+    let mut recorded = Vec::new();
+    for n in 0..20 {
+        let changed = change(
+            helper,
+            &format!("G0BUSY{n:03}"),
+            &format!("C0BUSY{n:03}"),
+            1_000 + n,
+        );
+        assert_eq!(
+            store.record_channel_id_change(&changed, few).await.unwrap(),
+            Recorded,
+            "change {n}"
+        );
+        store
+            .settle_channel_id_change(&changed, at(1_000 + n))
+            .await
+            .unwrap();
+        recorded.push(changed);
+    }
+    let agent = store.binding(helper).await.unwrap().unwrap().agent;
+    let kept = async || -> Vec<ChannelIdChange> {
+        store
+            .channel_id_changes_of_agent(agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|known| known.change)
+            .collect()
+    };
+    assert_eq!(kept().await, recorded[16..], "the latest four are kept");
+
+    let first = change(helper, "G0WAIT001", "C0WAIT001", 2_000);
+    let second = change(helper, "G0WAIT002", "C0WAIT002", 2_001);
+    for changed in [&first, &second] {
+        assert_eq!(
+            store.record_channel_id_change(changed, few).await.unwrap(),
+            Recorded
+        );
+    }
+    assert_eq!(
+        store
+            .record_channel_id_change(&change(helper, "G0WAIT003", "C0WAIT003", 2_002), few)
+            .await
+            .unwrap(),
+        Full,
+        "two wait already"
+    );
+    assert_eq!(
+        kept().await,
+        [
+            recorded[18].clone(),
+            recorded[19].clone(),
+            first.clone(),
+            second.clone()
+        ],
+        "waiting changes are never deleted to make room"
+    );
 }
 
 #[tokio::test]
@@ -189,7 +306,10 @@ async fn an_agents_changes_name_their_workspace_and_whether_they_wait() {
         &second,
         &change(writer, "G0OTHER01", "C0OTHER01", 900),
     ] {
-        store.record_channel_id_change(changed, 16).await.unwrap();
+        store
+            .record_channel_id_change(changed, limits(16))
+            .await
+            .unwrap();
     }
     store
         .settle_channel_id_change(&first, at(1_050))
@@ -226,7 +346,7 @@ async fn only_two_different_channel_ids_are_stored() {
     ] {
         assert!(
             store
-                .record_channel_id_change(&change(helper, old, new, 1_000), 16)
+                .record_channel_id_change(&change(helper, old, new, 1_000), limits(16))
                 .await
                 .is_err(),
             "{old} to {new}"
