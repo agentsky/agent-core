@@ -4958,8 +4958,8 @@ each process. `Server::run` calls it after the drain and before closing the
 store, which the hooks need, within what is left of
 `server.drain_timeout_secs`. A drain cut short by the timeout or a forced
 shutdown skips it, since the time is spent and a late stop would race the
-store's close, and a second signal during it cuts it short; `reap_orphans` at the next start stops what
-is left either way.
+store's close, and a second signal during it cuts it short; `reap_orphans`
+at the next start stops what is left either way.
 
 ### A process sandbox gives every container one address
 
