@@ -1416,6 +1416,54 @@ async fn a_failed_process_stopping_runs_again_once_the_container_is_stopped() {
 }
 
 #[tokio::test]
+async fn a_later_successful_process_stopping_takes_the_process_off_the_retry_list() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let id = h.thread_session("1.1").await.id;
+    reply(&h.run(id, request("1")).await);
+    h.clear();
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    let container = h.sandbox.inner.list_managed().await.unwrap()[0].id.clone();
+    h.sandbox.inner.stop(&container).await.unwrap();
+    eventually("the dead container is let go", || !h.manager.is_warm(id)).await;
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_process_stopping_that_fails_its_retry_too_is_given_up() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let id = h.thread_session("1.1").await.id;
+    reply(&h.run(id, request("1")).await);
+    h.clear();
+    h.faults
+        .panic_process_stopping
+        .store(true, Ordering::SeqCst);
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    h.manager.stop(id).await;
+    assert!(!h.manager.is_warm(id));
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+            Event::ProcessStopping(id, 1),
+        ]
+    );
+    h.logs
+        .snapshot()
+        .matching(&format!("session={id}"))
+        .assert_has("the process_stopping hook panicked")
+        .assert_has("the process_stopping hook failed again after its container stopped")
+        .assert_has("given_up=1");
+}
+
+#[tokio::test]
 async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn_instead_of_rerunning() {
     let h = Harness::new(&[Turn::reply("first"), Turn::reply("again")]).await;
     let session = h.thread_session("1.1").await;
