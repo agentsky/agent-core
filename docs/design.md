@@ -1890,20 +1890,21 @@ and settles it from the store. Only Slack answering where the channel is,
 with the bot in it, settles it; any other answer, a channel not found yet
 included, is tried again for a day. Until then the agent's denies on the
 old id also apply to the new one, and a change given up after the day
-copies them there, so a deny never stops applying while agentd waits for
+copies them there, so a deny doesn't stop applying while agentd waits for
 Slack. A chain of changes (A to B, then B to C) settles on its last id in
 any order.
 
 Only the receiving agent's rules move: each agent whose bot is in the channel
 gets its own event, and an owner who forges one can change only rules they
 could set anyway, since only an agent's owner sets its rules. Rules that
-someone else sets on an agent would need the old id checked too. Nothing else moves. Sessions, volumes, thread counts and
-message references stay under the old id, unused, and threads in the
-channel start new sessions: agentd can't confirm that the old id and the new
-are one channel, and moving another channel's sessions into this one would
-show its threads to this channel's turns. An agent whose bot isn't in the
-channel gets no event and keeps a rule naming the old id. It can't hear the
-channel until it is invited, and its owner must then set the rule again.
+someone else sets on an agent would need the old id checked too. Nothing else
+moves. Sessions, volumes, thread counts and message references stay under the
+old id, unused, and threads in the channel start new sessions: agentd can't
+confirm that the old id and the new are one channel, and moving another
+channel's sessions into this one would show its threads to this channel's
+turns. An agent whose bot isn't in the channel gets no event and keeps a rule
+naming the old id. It can't hear the channel until it is invited, and its
+owner must then set the rule again.
 
 Existing agents' apps get the subscription through `apps.manifest.update`
 with their owner's configuration token (T30) when it works, and keep missing

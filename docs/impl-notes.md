@@ -9149,13 +9149,24 @@ the channel gains outside members.
   (five minutes) has passed, at most `CHANNEL_CHANGES_PER_PASS` (64) a
   pass.
 - **After settling.** A settled row is kept until a day after it arrived
-  (`CHANNEL_CHANGE_TTL`). A chain finds its way through it, and a replay
-  under another `event_id`, or after the ingress's dedup window, is known
-  without asking Slack again.
-- **Cap.** A binding has at most `MAX_CHANNEL_CHANGES` (16) rows, waiting
-  or settled; the next is dropped with a throttled warning. Only the app's
-  owner, who holds its signing secret, can send that many: Slack sends one
-  per real change.
+  (`CHANNEL_CHANGE_TTL`), and longer while its binding has a change
+  waiting, so that change, given up, still follows its chain through it.
+  A replay under another `event_id`, or after the ingress's dedup window,
+  is known without asking Slack again.
+- **Cap.** A binding has at most `MAX_CHANNEL_CHANGES` (16) changes
+  waiting; the next is dropped with a throttled warning. Slack confirms a
+  real change at once unless it can't answer, so only the app's owner,
+  who holds its signing secret, can keep that many waiting. Settled
+  changes never fill it: round 1 counted them, so the 17th real share in
+  a day was dropped and its deny stopped applying. To keep the router's
+  read small, a binding keeps at most `MAX_CHANNEL_CHANGES_KEPT` (64)
+  rows, and recording a change past that forgets its earliest settled
+  ones, never a waiting one. A forged flood only churns its owner's
+  history.
+- **No write lock for a refusal.** Whether the change is known, or the
+  binding full, is read first without `BEGIN IMMEDIATE`, then read again
+  under it, so replays and forged floods don't hold up the store's
+  writers.
 - **Constraints.** The table's `CHECK`s take only two different ids shaped
   like Slack's conversation ids, as the ingress does.
 
@@ -9194,6 +9205,22 @@ store with its settings on every message. `policy::pending_denials` pairs
 each waiting change's old id with every id the channel had since.
 `agent_policy` copies the old id's room denies to each of those. Allows
 never move early, so a pending change only ever narrows access.
+
+The view reads the changes before the rules. A settle writes the moved
+rules and only then marks the change settled, and a give-up copies the
+denies and only then deletes it. So rules read after a change was seen
+waiting are either the old ones, which its pending denials cover, or the
+new ones, which cover themselves; a change seen settled or gone had its
+rules written earlier. Read the other way round, a settle between the two
+reads would leave a message covered by neither. No test drives that
+interleaving: the view reads through `Store` with nothing to pause it
+between statements, and adding a hook only for that would be code the
+system doesn't need.
+
+An owner can grow their own agent's deny list without bound by forging
+changes toward ids the bot isn't in and letting them be given up: each
+give-up copies denies past `MAX_RULES`. Only the owner can, only on their
+own agent, and the cost is their own agent's rule list, so it is left.
 
 A change still waiting after `CHANNEL_CHANGE_TTL` is given up with a
 warning: its denies are copied to the new ids in the agent's rules for
@@ -9244,10 +9271,12 @@ back request URLs an operator moved by hand at api.slack.com, and it
 needed heuristics to refuse apps it couldn't rebuild exactly.
 
 **Solution.** The sweep reads the app's manifest with
-`apps.manifest.export` (`SlackClient::export_app`), adds the `BOT_EVENTS`
-its `settings.event_subscriptions.bot_events` lacks (`add_bot_events`),
-and writes it back. Nothing else in the manifest changes, so no scope
-changes and no new install is needed.
+`apps.manifest.export` (`SlackClient::export_app`), adds the
+`ADDED_BOT_EVENTS` (only `channel_id_changed` so far) its
+`settings.event_subscriptions.bot_events` lacks (`add_bot_events`), and
+writes it back. Nothing else in the manifest changes, so no scope changes
+and no new install is needed, and an event its owner removed, such as
+`message.mpim`, stays removed.
 
 - **Already current.** An app that already has every event is only
   recorded at the version, without an update call.
@@ -9322,8 +9351,16 @@ install reminders for an hour.
 - **Store errors.** Each part's store error is logged, and the next part
   runs.
 - **Budget.** Each part that asks Slack starts no new call after
-  `SWEEP_PHASE_BUDGET` (20 seconds), so a part takes at most that plus
-  one call's timeout. The rest waits for the next pass.
+  `SWEEP_PHASE_BUDGET` (20 seconds), counted from when its due list was
+  read, so a part always makes at least one call and takes at most the
+  budget plus one call's timeout. The rest waits for the next pass.
+- **Rotation.** The due changes come longest-due first
+  (`next_attempt_at`, through the partial index), and the due manifest
+  updates never-tried first, then by when their lease ended. A head that
+  keeps failing goes to the back instead of being retried every pass.
+- **Token margin.** The manifest due query asks for a token that still
+  works `APP_CALL_TIMEOUT` from now, as `usable_token` does, so an app
+  isn't leased for an hour and then skipped.
 
 ### The events of an agent's app
 
@@ -9346,10 +9383,13 @@ by `event_id` under `slack:<binding>`.
   memory, as for messages, and Slack doesn't send again after a 200. A
   graceful shutdown drains the queue, so only a crash or a drain timeout
   loses it. Recording before the 200 would need a store write before
-  the ingress answers, which it makes for no event.
+  the ingress answers, which it makes for no event. A message in the new
+  channel routed in the milliseconds before the record isn't covered
+  either.
 - **A store that refuses the one write that records it.** This is logged
   as a warning.
-- **A binding at its cap.** Only its owner can fill it.
+- **A binding with 16 changes waiting.** Only its owner, forging changes,
+  can keep that many waiting.
 - **A binding that isn't active when the change settles.** Its app
   answers no one, and a deleted agent's binding never comes back.
 - **The old binary in a blue-green swap.** It drops the event, because it
@@ -9389,3 +9429,28 @@ These nits were taken without code:
   twice. Both send the same manifest, the version only goes up, and a
   refusal marks only the token version it used, so it is left.
 - The blue-green window is described above.
+
+### Review round 2
+
+The two reviews found nothing blocking. These items were fixed:
+
+- Only waiting changes fill a binding's cap, with settled ones forgotten
+  past 64 (`only_waiting_changes_fill_a_binding_and_the_earliest_settled_make_room`,
+  `a_busy_day_of_shares_records_every_change`).
+- The router reads the changes before the rules; see above for why no
+  test drives it.
+- Settled rows outlive any earlier waiting link of their binding, and the
+  give-ups run before the purge. A failed purge is logged and skips
+  nothing.
+- The due queues rotate, and the change queue uses its partial index.
+- The manifest due query uses the token margin.
+- Each part's budget starts after its due list is read.
+- A known change or a full binding is refused without the write lock.
+- An update adds only `ADDED_BOT_EVENTS`.
+
+Taken without code:
+
+- Forged give-ups growing an owner's deny list; see above.
+- The migrations were edited in place before merging, so a dev database
+  that applied an earlier version of them fails sqlx's checksum and needs
+  a reset before the live check.
