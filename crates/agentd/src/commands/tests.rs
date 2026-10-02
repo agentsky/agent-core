@@ -2455,12 +2455,10 @@ async fn a_room_agentd_cant_find_is_found_among_the_rules_by_its_name() {
     rules.allow(crate::policy::Rule::Room {
         conv: conv("GENERAL"),
         label: "#general".into(),
-        copied: false,
     });
     rules.deny(crate::policy::Rule::Room {
         conv: conv("SECRET"),
         label: "#secret".into(),
-        copied: false,
     });
     h.store
         .update_agent_settings(helper, |settings| rules.write(settings))

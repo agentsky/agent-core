@@ -18,10 +18,7 @@
 //!   the list already limits the agent, so lifting a deny never limits an
 //!   agent open to everyone, and one `allow` always lets the target in.
 //! - `allow everyone` empties the allow list and takes `everyone` off the
-//!   deny list, so everyone not denied by name may use the agent again. It
-//!   also drops the denies agentd copied from channels' old ids past the
-//!   first [`MAX_RULES`] rules of the list, so after a flood of forged
-//!   channel id changes the copies don't keep the list at [`MAX_DENIES`].
+//!   deny list, so everyone not denied by name may use the agent again.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,9 +31,9 @@ use store::{AgentSettings, KnownChannelIdChange, ThreadSpend};
 
 use crate::config::LimitsConfig;
 
-/// The most rules the owner sets in an agent's allow or deny list. The
-/// denies agentd copies from channels' old ids don't count, and `deny
-/// everyone` is always taken.
+/// The most rules the owner may put in an agent's allow or deny list, but
+/// for `deny everyone`, which is always taken. The denies agentd copies from
+/// channels' old ids count, and may take a deny list past it.
 pub const MAX_RULES: usize = 100;
 
 /// The most rules an agent's deny list holds with the denies copied from
@@ -112,11 +109,6 @@ pub enum Rule {
         conv: ConvRef,
         /// How the owner wrote it, such as `#general`.
         label: String,
-        /// Whether agentd copied it from a deny on a channel's old id
-        /// ([`Rules::copy_denies`]) rather than the owner setting it. A copy
-        /// doesn't count toward [`MAX_RULES`].
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        copied: bool,
     },
     /// Everyone.
     Everyone,
@@ -132,10 +124,6 @@ impl Rule {
             Self::Room { conv, .. } => PolicyTarget::Room(conv.clone()),
             Self::Everyone => PolicyTarget::Everyone,
         }
-    }
-
-    fn is_copy(&self) -> bool {
-        matches!(self, Self::Room { copied: true, .. })
     }
 
     /// Whether `self` and `other` name the same member, room or everyone.
@@ -208,11 +196,7 @@ impl Rules {
         if rule == Rule::Everyone {
             let before = (self.allow.len(), self.deny.len());
             self.allow.clear();
-            let mut at = 0;
-            self.deny.retain(|denied| {
-                at += 1;
-                *denied != Rule::Everyone && (at <= MAX_RULES || !denied.is_copy())
-            });
+            self.deny.retain(|denied| *denied != Rule::Everyone);
             return changed(before != (self.allow.len(), self.deny.len()));
         }
         if !self.deny.iter().any(|denied| denied.same_target(&rule)) {
@@ -265,10 +249,9 @@ impl Rules {
                 .deny
                 .iter()
                 .filter_map(|rule| match rule {
-                    Rule::Room { conv, label, .. } if conv == from => Some(Rule::Room {
+                    Rule::Room { conv, label } if conv == from => Some(Rule::Room {
                         conv: to.clone(),
                         label: label.clone(),
-                        copied: true,
                     }),
                     _ => None,
                 })
@@ -358,14 +341,12 @@ fn move_room(rules: &mut Vec<Rule>, from: &ConvRef, to: &ConvRef) -> bool {
 }
 
 /// Adds `rule` to `rules` unless it names a target already there or the
-/// list is full: it has [`MAX_RULES`] the owner set, copies aside, and
-/// `rule` isn't `everyone`, which only ever narrows who may use an agent.
+/// list holds [`MAX_RULES`]; `everyone`, which only ever narrows who may use
+/// an agent, is taken all the same.
 fn add(rules: &mut Vec<Rule>, rule: Rule) -> Change {
     if rules.iter().any(|known| known.same_target(&rule)) {
         Change::Unchanged
-    } else if rule != Rule::Everyone
-        && rules.iter().filter(|known| !known.is_copy()).count() >= MAX_RULES
-    {
+    } else if rule != Rule::Everyone && rules.len() >= MAX_RULES {
         Change::Full
     } else {
         rules.push(rule);
@@ -485,7 +466,6 @@ mod tests {
         Rule::Room {
             conv: conv(id),
             label: format!("#{id}"),
-            copied: false,
         }
     }
 
@@ -726,8 +706,7 @@ mod tests {
             [
                 Rule::Room {
                     conv: new.clone(),
-                    label: "#G0PRIVAT1".to_owned(),
-                    copied: false,
+                    label: "#G0PRIVAT1".to_owned()
                 },
                 member("carol")
             ]
@@ -768,7 +747,6 @@ mod tests {
                     ..old.clone()
                 },
                 label: "#G0PRIVAT1".to_owned(),
-                copied: false,
             }],
             deny: vec![member("G0PRIVAT1")],
         };
@@ -873,7 +851,22 @@ mod tests {
     }
 
     #[test]
-    fn after_a_flood_of_copies_the_owner_can_open_the_agent_and_deny_again() {
+    fn a_real_copy_past_the_most_rules_survives_allow_everyone() {
+        let mut rules = Rules {
+            allow: vec![room("C0")],
+            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
+        };
+        assert!(rules.copy_denies([(&conv("C1"), &conv("G0SHARED1"))]));
+        assert_eq!(rules.allow(Rule::Everyone), Change::Changed);
+        assert_eq!(rules.deny.len(), MAX_RULES + 1, "nothing dropped");
+        assert!(
+            !permits(&rules, "bob", "G0SHARED1"),
+            "the channel under its new id stays denied"
+        );
+    }
+
+    #[test]
+    fn after_a_flood_of_copies_the_owner_can_deny_everyone_and_open_the_agent_again() {
         let mut rules = Rules {
             allow: Vec::new(),
             deny: vec![room("C0")],
@@ -887,25 +880,14 @@ mod tests {
         assert_eq!(rules.deny.len(), MAX_DENIES + 1);
         assert_eq!(rules.allow(Rule::Everyone), Change::Changed);
         assert!(!rules.denies_everyone());
+        assert_eq!(rules.deny.len(), MAX_DENIES, "nothing else dropped");
         assert_eq!(
-            rules.deny.len(),
-            MAX_RULES,
-            "the copies past the first rules are dropped"
+            rules.deny(member("mallory")),
+            Change::Full,
+            "the copies fill the list"
         );
-        assert_eq!(rules.deny(member("mallory")), Change::Changed);
         assert_eq!(rules.deny(Rule::Everyone), Change::Changed);
         assert!(rules.denies_everyone());
-    }
-
-    #[test]
-    fn everyone_is_denied_past_the_most_rules() {
-        let mut rules = Rules {
-            allow: Vec::new(),
-            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
-        };
-        assert_eq!(rules.deny(member("mallory")), Change::Full);
-        assert_eq!(rules.deny(Rule::Everyone), Change::Changed);
-        assert_eq!(rules.deny.len(), MAX_RULES + 1);
     }
 
     #[test]

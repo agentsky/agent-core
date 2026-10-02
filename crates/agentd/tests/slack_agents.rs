@@ -2490,7 +2490,6 @@ fn denying_room(channel: &str) -> agentd::policy::Rules {
     rules.deny(agentd::policy::Rule::Room {
         conv: msg_in(channel, "1.0").conv,
         label: "#plans".into(),
-        copied: false,
     });
     rules
 }

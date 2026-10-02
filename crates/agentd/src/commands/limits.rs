@@ -186,7 +186,6 @@ impl Commands {
                             conversation,
                         },
                         label,
-                        copied: false,
                     }),
                 }
             }
@@ -206,7 +205,7 @@ impl Commands {
             return Ok(None);
         };
         Ok(rules.deny.into_iter().chain(rules.allow).find(|rule| {
-            matches!(rule, Rule::Room { conv, label: named, .. }
+            matches!(rule, Rule::Room { conv, label: named }
                 if named == label && conv.surface == key.surface && conv.team == key.team)
         }))
     }
