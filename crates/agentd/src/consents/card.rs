@@ -23,6 +23,10 @@ pub const APPROVE_ACTION: &str = "consent_approve";
 pub const DECLINE_ACTION: &str = "consent_decline";
 /// The most UTF-16 code units Slack takes in one text object of a block.
 pub const SLACK_TEXT_MAX: usize = 3000;
+/// The most UTF-16 code units a text object of a Slack `context` block
+/// may hold, assumed below [`SLACK_TEXT_MAX`] so a card is never refused
+/// by Slack.
+pub const SLACK_CONTEXT_TEXT_MAX: usize = 2000;
 
 /// Inserted after each backtick of a task on a Rocket.Chat card.
 const ZERO_WIDTH_SPACE: char = '\u{200B}';
@@ -118,7 +122,8 @@ pub struct Card<'a> {
 impl Card<'_> {
     /// Whether the card fits wherever it may be shown, before it is asked
     /// for, in its longest form (for a paused agent): on Slack each block's
-    /// text within [`SLACK_TEXT_MAX`] UTF-16 code units, and on
+    /// text within [`SLACK_TEXT_MAX`] UTF-16 code units, a `context`
+    /// block's within [`SLACK_CONTEXT_TEXT_MAX`], and on
     /// Rocket.Chat the whole card, as the surface renders it, in one
     /// message of the server's default limit. The requester's name, looked
     /// up only when the card is sent, is counted at its longest.
@@ -135,20 +140,26 @@ impl Card<'_> {
             ..self.clone()
         };
         let open = longest(SurfaceKind::Slack).open();
-        let texts = open
+        let too_long = open
             .blocks
             .as_ref()
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .flat_map(block_texts);
-        if texts
-            .into_iter()
-            .any(|text| utf16_len(text) > SLACK_TEXT_MAX)
-        {
+            .any(|block| {
+                let max = if block["type"] == "context" {
+                    SLACK_CONTEXT_TEXT_MAX
+                } else {
+                    SLACK_TEXT_MAX
+                };
+                block_texts(block)
+                    .into_iter()
+                    .any(|text| utf16_len(text) > max)
+            });
+        if too_long {
             return Err(format!(
-                "the task, or the list of its files' names, is over {SLACK_TEXT_MAX} UTF-16 \
-                 code units, more than a consent card holds"
+                "the task is over {SLACK_TEXT_MAX} UTF-16 code units, or the list of its files' \
+                 names over {SLACK_CONTEXT_TEXT_MAX}, more than a consent card holds"
             ));
         }
         let markdown = longest(SurfaceKind::RocketChat).open().markdown;
@@ -811,9 +822,15 @@ mod tests {
             card(&"`".repeat(2600), &[]).is_err(),
             "a task whose backticks are broken up must still fit one Rocket.Chat message"
         );
-        let long: Vec<String> = (0..10).map(|n| format!("{n}{}", "x".repeat(250))).collect();
-        assert_eq!(card("x", &long), Ok(()));
-        assert!(card(&"a".repeat(2500), &long).is_err());
+        let longest: Vec<String> = (0..10).map(|n| format!("{n}{}", "x".repeat(254))).collect();
+        assert!(
+            card("x", &longest).is_err(),
+            "ten 255-byte names are over Slack's context text limit"
+        );
+        let fitting: Vec<String> = (0..10).map(|n| format!("{n}{}", "x".repeat(190))).collect();
+        assert_eq!(card("x", &fitting), Ok(()));
+        let err = card(&"a".repeat(2900), &fitting).unwrap_err();
+        assert!(err.contains("one consent card message"), "{err}");
     }
 
     #[test]

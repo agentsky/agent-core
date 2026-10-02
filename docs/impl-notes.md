@@ -7277,8 +7277,12 @@ consent owns after ten minutes, for requests that failed half way.
 
 The task text is refused when empty or over 3000 UTF-16 code units, what a
 Slack plain-text section holds as Slack counts it, and a task whose card
-wouldn't fit (Slack's 3000 units per text object, or one Rocket.Chat message
-at the server's default limit, rendered) is refused when it is asked for.
+wouldn't fit (Slack's 3000 units per text object, 2000 in a `context` block,
+or one Rocket.Chat message at the server's default limit, rendered) is
+refused when it is asked for. The files' names share one `context` text, so
+ten names near the 255-byte limit are refused. Slack's own limit for a
+`context` text couldn't be checked from here; 2000 is the lower figure
+review reported, taken so the card is never rejected with `invalid_blocks`.
 
 ### Everything a consent owes is in its row
 
