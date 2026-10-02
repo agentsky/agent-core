@@ -4,9 +4,10 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentd::commands::Origin;
@@ -19,9 +20,9 @@ use agentd::server::{Routers, Server};
 use agentd::skills::{Added, Confirmed, Source};
 use agentd::{App, Config};
 use core_types::{
-    AgentId, BindingId, Caps, ConvKind, ConvRef, InboundEvent, MemberId, MemberKey, MessageId, Msg,
-    MsgRef, ReplyTarget, ScopeKey, SessionId, Surface, SurfaceError, SurfaceKind, ThreadKey,
-    UserId, VolumeKey,
+    AgentId, Binding, BindingId, Caps, ConvKind, ConvRef, Cursor, InboundEvent, MemberId,
+    MemberKey, MessageId, Msg, MsgRef, OutFile, ReplyTarget, ScopeKey, Sender, SessionId, Surface,
+    SurfaceError, SurfaceKind, ThreadKey, UserId, VolumeKey,
 };
 use runner::{PoolConfig, ProcessConfig};
 use sandbox::ProcessSandbox;
@@ -31,7 +32,7 @@ use testkit::{
     Call, FakeAnthropic, MockSurface, Op, Turn, agentctl_path, fake_anthropic, fake_claude_path,
 };
 use time::OffsetDateTime;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use common::{TempDir, env};
@@ -39,14 +40,167 @@ use common::{TempDir, env};
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
 
-/// Every agent's bot acts through the one mock.
+/// Every agent's bot acts through the one mock, past the [`Holds`].
 #[derive(Debug)]
-struct Mocks(Arc<MockSurface>);
+struct Mocks {
+    mock: Arc<MockSurface>,
+    holds: Arc<Holds>,
+}
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Mocks {
     async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        Some(self.0.clone())
+        Some(Arc::new(Held {
+            mock: self.mock.clone(),
+            holds: self.holds.clone(),
+        }))
+    }
+}
+
+/// Holds what passes through it until it is opened.
+#[derive(Debug, Clone)]
+struct Gate {
+    open: Arc<watch::Sender<bool>>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl Gate {
+    fn closed() -> Self {
+        Self {
+            open: Arc::new(watch::channel(false).0),
+            waiting: Arc::default(),
+        }
+    }
+
+    fn open(&self) {
+        self.open.send_replace(true);
+    }
+
+    /// How many are held at the gate now.
+    fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
+    async fn pass(&self) {
+        let mut open = self.open.subscribe();
+        let _waiting = Waiting::new(&self.waiting);
+        let _ = open.wait_for(|open| *open).await;
+    }
+}
+
+/// One caller counted at a gate, until it passes or is dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What the agents' surfaces hold up, besides the mock's own delays.
+#[derive(Debug, Default)]
+struct Holds {
+    posts: Mutex<HashMap<String, Gate>>,
+    histories: Mutex<HashMap<ThreadKey, VecDeque<Gate>>>,
+}
+
+impl Holds {
+    /// Holds the next read of `thread`'s history, by any agent, at `gate`,
+    /// after those queued before it for that thread.
+    fn history_at(&self, thread: ThreadKey, gate: &Gate) {
+        self.histories
+            .lock()
+            .unwrap()
+            .entry(thread)
+            .or_default()
+            .push_back(gate.clone());
+    }
+
+    /// Holds every post of `text` at `gate`.
+    fn posts_of(&self, text: &str, gate: &Gate) {
+        self.posts
+            .lock()
+            .unwrap()
+            .insert(text.to_owned(), gate.clone());
+    }
+}
+
+/// One agent's bot: the mock, past the holds.
+struct Held {
+    mock: Arc<MockSurface>,
+    holds: Arc<Holds>,
+}
+
+#[async_trait::async_trait]
+impl Surface for Held {
+    async fn events(
+        &self,
+        binding: &Binding,
+        tx: Sender<InboundEvent>,
+    ) -> Result<(), SurfaceError> {
+        self.mock.events(binding, tx).await
+    }
+
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef, SurfaceError> {
+        let gate = self.holds.posts.lock().unwrap().get(text).cloned();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+        self.mock.post(to, text).await
+    }
+
+    async fn edit(&self, msg: &MsgRef, text: &str) -> Result<(), SurfaceError> {
+        self.mock.edit(msg, text).await
+    }
+
+    async fn react(&self, msg: &MsgRef, emoji: &str) -> Result<(), SurfaceError> {
+        self.mock.react(msg, emoji).await
+    }
+
+    async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<(), SurfaceError> {
+        self.mock.unreact(msg, emoji).await
+    }
+
+    async fn can_post(&self, conv: &ConvRef) -> Result<bool, SurfaceError> {
+        self.mock.can_post(conv).await
+    }
+
+    async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<(), SurfaceError> {
+        self.mock.upload(to, files).await
+    }
+
+    async fn history(
+        &self,
+        thread: &ThreadKey,
+        before: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Vec<Msg>, SurfaceError> {
+        let gate = self
+            .holds
+            .histories
+            .lock()
+            .unwrap()
+            .get_mut(thread)
+            .and_then(VecDeque::pop_front);
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+        self.mock.history(thread, before, limit).await
+    }
+
+    fn render(&self, markdown: &str) -> Vec<String> {
+        self.mock.render(markdown)
+    }
+
+    fn caps(&self) -> Caps {
+        self.mock.caps()
     }
 }
 
@@ -55,6 +209,7 @@ struct Stack {
     pipeline: Pipeline,
     turns: Turns,
     mock: Arc<MockSurface>,
+    holds: Arc<Holds>,
     script: PathBuf,
     agent: AgentId,
     binding: BindingId,
@@ -153,8 +308,12 @@ async fn start_with(setup: Setup) -> Stack {
     let config = Config::parse(&text, env()).unwrap();
     let store = agentd::app::open_store(&config).await.unwrap();
     let mock = Arc::new(MockSurface::new());
-    let app =
-        App::with_surfaces(config, store.clone(), None, Arc::new(Mocks(mock.clone()))).unwrap();
+    let holds = Arc::new(Holds::default());
+    let mocks = Mocks {
+        mock: mock.clone(),
+        holds: holds.clone(),
+    };
+    let app = App::with_surfaces(config, store.clone(), None, Arc::new(mocks)).unwrap();
     let alice = link(&store, "alice").await;
     link(&store, "bob").await;
     let team = TEAM.into();
@@ -251,6 +410,7 @@ async fn start_with(setup: Setup) -> Stack {
         pipeline,
         turns,
         mock,
+        holds,
         script,
         agent: agent.id,
         binding,
@@ -1026,9 +1186,12 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
     let s1 = stack.session_of(&first).await;
 
     let before = stack.mock.calls().len();
-    let delay = Duration::from_secs(2);
-    stack.mock.delay_next(Op::History, delay);
-    stack.mock.delay_next(Op::History, delay);
+    let first_read = Gate::closed();
+    let second_read = Gate::closed();
+    stack.holds.history_at(thread("GENERAL", "r1"), &first_read);
+    stack
+        .holds
+        .history_at(thread("GENERAL", "r1"), &second_read);
     let handling = stack.handle(stack.event(
         "alice",
         "GENERAL",
@@ -1038,8 +1201,8 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
         &[BOT],
     ));
     let resetting = async {
-        wait_until("the second turn starts", || {
-            stack.calls_since(before).contains(&working_on("r2"))
+        wait_until("the first attempt reads the thread", || {
+            first_read.waiting() == 1
         })
         .await;
         let s2 = store
@@ -1048,18 +1211,16 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
             .unwrap()
             .expect("a replacement")
             .id;
-        wait_until("the first read of the thread ends", || {
-            stack
-                .calls_since(before)
-                .iter()
-                .any(|call| matches!(call, Call::History { .. }))
+        first_read.open();
+        wait_until("the second attempt reads the thread", || {
+            second_read.waiting() == 1
         })
         .await;
-        tokio::time::sleep(delay / 2).await;
         store
             .reset_session(s2, OffsetDateTime::now_utc())
             .await
             .unwrap();
+        second_read.open();
         s2
     };
     let ((), s2) = tokio::join!(handling, resetting);
@@ -1146,7 +1307,8 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
     let upstream = stack.fake.message_requests().await.len();
     let before = stack.mock.calls().len();
     stack.next_turn(Turn::reply("Answer."));
-    stack.mock.delay_next(Op::History, Duration::from_secs(1));
+    let reading = Gate::closed();
+    stack.holds.history_at(thread("GENERAL", "r1"), &reading);
     let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
     for (id, text) in [("q2", "question two"), ("q3", "question three")] {
         let mut event = stack.event(
@@ -1159,7 +1321,14 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
         );
         event.text = format!("@UBOT {text}");
         sink.send(event).await.unwrap();
+        if id == "q2" {
+            wait_until("question two's turn reads the thread", || {
+                reading.waiting() == 1
+            })
+            .await;
+        }
     }
+    reading.open();
     wait_until("both are answered", || {
         posts(&stack.calls_since(before)).len() >= 2
     })
@@ -1301,7 +1470,8 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
     })
     .await;
     stack.next_turn(Turn::reply("Posted too late."));
-    stack.mock.delay_next(Op::Post, Duration::from_secs(20));
+    let posting = Gate::closed();
+    stack.holds.posts_of("Posted too late.", &posting);
     let event = stack.event("alice", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]);
     stack
         .pipeline
@@ -1309,12 +1479,7 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
         .send(event)
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while stack.fake.message_requests().await.is_empty() {
-        assert!(Instant::now() < deadline, "timed out waiting for the turn");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until("the reply is being delivered", || posting.waiting() == 1).await;
     let Stack {
         pipeline,
         turns,
