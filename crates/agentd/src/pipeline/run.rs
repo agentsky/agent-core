@@ -591,6 +591,13 @@ impl Pipeline {
         self.tell_cut().await;
     }
 
+    /// Stops every warm session's process and container, as
+    /// [`SessionManager::stop_all`](runner::SessionManager::stop_all) does.
+    /// A graceful shutdown calls it once the pipeline has drained.
+    pub async fn stop_sessions(&self) {
+        self.inner.turns.sessions().stop_all().await;
+    }
+
     /// Takes the working emoji off the turns a shutdown cut short, and
     /// tells their threads.
     async fn tell_cut(&self) {

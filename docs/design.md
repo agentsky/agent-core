@@ -125,7 +125,7 @@ A mentionable agent therefore needs its own bot identity.
 | Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
 | How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel or group DM message only if it mentions the bot (`<@U…>` in the text or blocks, another bot's in its text alone, and none with a backtick both before and after it in the same text) or replies in a thread whose root the bot may have posted (its `parent_user_id` is the bot user, or isn't known), so the router can see replies to the agent's own messages. When the bot user is known, it drops the bot's own posts, and other bots' messages that don't mention it, in every kind of conversation. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
 | Bot-to-bot mentions | Delivered by agentd itself for its agents' own posts. Whether Slack also delivers one app's bot user's post to another app as a `message.*` event is not yet verified; a copy that does arrive is dropped[^slack-botmention] | Delivered by agentd itself for its agents' own posts, and by the server too; the second copy is dropped |
-| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a custom role (`create-user` and token creation)[^rc-create] |
+| Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with a dedicated role (`create-user`, plus token creation granted to `bot`)[^rc-create] |
 | Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
 
 ### Slack
@@ -237,21 +237,41 @@ reckons it, but only as a record: no limit reads it.
 
 ### Rocket.Chat
 
-The community admin installs agentd once and gives its manager account a custom
-role. After that `/agent create` is self-service: agentd calls `users.create`
+The community admin installs agentd once and gives its manager account the
+role below. After that `/agent create` is self-service: agentd calls `users.create`
 with the `bot` role and the agent's name as display name, obtains a token for
 the new user, and the bot sets its own avatar. The owner invites the bot into
 rooms with Rocket.Chat's own invite, or the manager adds it to a room it is in
 where the owner ran `!agent create`. `/agent delete` deactivates the bot user.
 Bot users bypass the REST rate limiter by default[^rc-perms].
 
-The custom role needs `create-user`, plus `edit-other-user-active-status` if
-agentd passes `active` on create, and the permission for creating the bot's
-token. It also needs `view-full-other-user-info`: messages don't carry
-the sender's roles, and `users.info` shows another user's roles only with it,
-which is how agentd tells bots from people. A reviewer's reading of the current server source is that `users.create`
-with `roles: ["bot"]` checks only those, and that `assign-roles` is checked on
-update only. That needs a test on the target server version.
+A live check against Rocket.Chat 7.13.9 settled the manager's permissions
+([impl-notes](impl-notes.md#the-live-check-against-7139)). `users.create` with
+`roles: ["bot"]` needs only `create-user`: not `assign-roles`, and not the
+edit-user permissions a 2017 report described[^rc-7351]. agentd doesn't pass
+`active`, which would also need `edit-other-user-active-status`. The bot's
+token comes from the bot itself, which needs `create-personal-access-tokens`;
+the admin grants it to the `bot` role, which also lets the manager create its
+own token. Deactivating a bot needs `edit-other-user-active-status`, adding a
+bot to a room the manager is in needs `add-user-to-joined-room`, and reading
+another user's roles in `users.info` needs `view-full-other-user-info`. A bot
+sets its own name and avatar without any permission. The manager's token must
+ignore two-factor authentication, or 2FA-gated endpoints refuse it 30 minutes
+after the manager is created.
+
+Where those permissions live depends on the edition. Custom roles need an
+Enterprise license: on the Community Edition `roles.create` answers
+`This is an enterprise feature [error-action-not-allowed]`. There the manager
+holds the built-in `bot` and `app` roles and the admin adds the permissions
+to `app`, whose only other holders are Apps-Engine app users, which can't
+call the REST API. Adding them to `bot` would give every bot in the
+workspace the manager's powers. With a license, the same permissions form a
+custom role. Either way the manager is not an admin.
+
+A Community Edition server must also be able to report statistics to
+Rocket.Chat Cloud: one that never has, or hasn't for ten days, refuses posts
+and edits through the REST API and DDP, and the confirm step of uploads, with
+`restricted-workspace` until it does or gets a license.
 
 Custom slash commands on Rocket.Chat require an Apps-Engine app written in
 TypeScript[^rc-slash]. agent-core instead takes commands as DMs to the manager
@@ -897,7 +917,7 @@ for Rocket.Chat bindings.
 | A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
 | Agents loop on each other | Hop cap per chain, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
-| Manager account compromise on Rocket.Chat | Custom role instead of admin. The manager token never enters sandboxes. |
+| Manager account compromise on Rocket.Chat | A dedicated role (a custom role, or the built-in `app` role on the Community Edition) instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
 | Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo, for a binding still being created, and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals, answered challenges and retried deliveries are logged at most once a minute per app. |
@@ -1013,13 +1033,6 @@ Direct calls would also need our own agent loop.
 
 - Claude Code's OAuth client id, scopes and endpoints are not a public contract.
   A change breaks linking until configuration is updated.
-- The exact Rocket.Chat custom role. The current reading is `create-user`,
-  `edit-other-user-active-status` when passing `active`, and token creation.
-  An issue from 2017 reported that `users.create` also needed edit-user
-  permissions[^rc-7351]. Needs a test on the target server version. Creating
-  a custom role needs an Enterprise license (`roles.create` requires the
-  `custom-roles` module on 7.13.9), so the Community Edition needs another
-  answer, such as the permissions on a built-in role.
 - Whether Slack delivers one app's bot user's post to another app as a
   `message.*` event. Agent-to-agent turns no longer depend on it, since agentd
   delivers its agents' mentions itself; a copy Slack delivers too is dropped
