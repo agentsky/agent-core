@@ -5738,7 +5738,9 @@ whose every target is denied reads "Only you may use". `allow everyone`
 empties the allow list and takes `everyone` off the deny list; denies by
 name stay. An `allow` of a member or a channel while `everyone` is denied
 changes nothing anyone can see, so its reply says to send `allow <name>
-everyone` first. Each list holds at most 100 rules. Rules are JSON agentd
+everyone` first. The owner may put at most 100 rules in each list, but
+`deny everyone` is always taken, and the denies T36d copies from a
+channel's old id may take the deny list to 200. Rules are JSON agentd
 owns (`policy::Rule`), with the identity or conversation and how the owner
 wrote it; replies name them in code spans, which neither surface turns
 into a mention. A member is resolved as `list` does (Slack sends an id,
@@ -9181,17 +9183,17 @@ the channel gains outside members.
   everyone instead, and a list that denies everyone takes no copies. A
   real change copies at most one deny, so only a flood of forged changes
   gets there, and then the agent refuses everyone except its owner.
-- **The owner recovers.** Copies are marked (`copied` on a room rule, left
-  out of the JSON when false, so stored lists read as before) and don't
-  count toward `MAX_RULES`, and `deny everyone` is always taken, so copies
-  never stop the owner's own `deny`. `allow everyone` drops the copies
-  past the list's first `MAX_RULES` rules, which after a flood are the
-  flood's, so the list doesn't stay at `MAX_DENIES` and flip back to
-  denying everyone at the next copy. Those it drops may include a real
-  copy made after the first `MAX_RULES` rules; the owner sees the list
-  that is left in the reply. The owner's own denies are still capped, so
-  a stored list holds at most `MAX_RULES` of theirs and `MAX_DENIES` in
-  all before their last `deny`, about 300 rules at most.
+- **The owner can always close the agent.** Copies count toward the
+  list, so past `MAX_RULES` the owner's own `deny` of a member or a
+  channel is refused until they lift some, but `deny everyone` is always
+  taken. `allow everyone` takes `everyone` off the list and drops nothing
+  else, so a copy keeps applying under the channel's new id. After a flood
+  of their own forged changes, the owner's agent keeps up to `MAX_DENIES`
+  copies, and the next copy denies everyone again; the owner can lift
+  copies one at a time only by naming a channel that doesn't resolve,
+  since `allow #name` takes the real channel's id. Only the forger's own
+  agent is affected. A stored list holds at most `MAX_DENIES` rules and
+  `everyone`.
 - **Pending denials.** The router's pending denials go through the same
   bound, so its work per message stays bounded too. A stored list near
   `MAX_DENIES` with enough pending copies can make the router deny
@@ -9199,9 +9201,10 @@ the channel gains outside members.
   agent's rules, which the owner sees, don't say so. Real traffic doesn't
   get there: 100 of the owner's denies and a copy for each of 64 waiting
   changes make 164. With one cap of 64 waiting changes instead of 16, a
-  forged chain of 64 makes about 2,000 pending pairs instead of about 120,
-  each scanning a list of at most 200: some hundreds of thousands of
-  comparisons per message, bounded, on the forger's own agent only.
+  forged chain of 64 makes up to about 4,000 pending pairs instead of
+  about 250, each scanning a list of at most `MAX_DENIES` and `everyone`:
+  up to about a million comparisons per message, bounded, on the
+  forger's own agent only.
 - **The write lock.** Whether the change is known, or the binding full,
   is read first without `BEGIN IMMEDIATE`, then read again under it, one
   query that also counts the rows the eviction could forget. A full
@@ -9571,3 +9574,24 @@ The light review found nothing blocking. These items were fixed:
 - NIT 4: recording a change keeps the settled changes from its own old
   and new ids, so the eviction in the same transaction doesn't cut its
   chain (`a_new_change_keeps_the_settled_ones_its_own_chain_runs_through`).
+
+### Review round 6
+
+The light review found nothing blocking. Its should-fix: round 5's
+`allow everyone` dropped copies by their place in the list, which could
+drop a real copy and reopen a channel under its new id while the reply
+still named its label. The `copied` flag behind it didn't track who set
+a rule, and an older binary, which denies unknown fields, couldn't read
+it after a rollback. Both are removed, which leaves the system simpler:
+
+- Copies count toward the list again, bounded by `MAX_DENIES` and then
+  `everyone`, and `allow everyone` drops nothing but `everyone`
+  (`a_real_copy_past_the_most_rules_survives_allow_everyone`, which fails
+  on round 5's code).
+- `deny everyone` is still always taken, so the owner can always close
+  the agent; after a flood of their own forged changes, they can't add a
+  deny by name past `MAX_RULES`
+  (`after_a_flood_of_copies_the_owner_can_deny_everyone_and_open_the_agent_again`).
+- With the flag gone, round 5's rollback hazard is gone too.
+- The 100-rule line in T27's notes and the "Pending denials" figures are
+  corrected.
