@@ -630,7 +630,7 @@ async fn unresolvable_and_unreachable_hosts_are_bad_gateways() {
 async fn tunnels_close_when_idle() {
     let (echo, _) = echo_server().await;
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
-        egress.with_limits(limits(|l| l.idle_timeout = Duration::from_millis(300)))
+        egress.with_limits(limits(|l| l.idle_timeout = Duration::from_secs(1)))
     })
     .await;
     proxy.sandbox(LOCAL);
@@ -638,8 +638,8 @@ async fn tunnels_close_when_idle() {
     proxy.network.route(SocketAddr::new(PUBLIC, 443), echo);
     let (mut stream, head) = proxy.connect("git.example.com:443").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    for _ in 0..3 {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
         echoes(&mut stream, b"still here").await;
     }
     closes(&mut stream).await;
