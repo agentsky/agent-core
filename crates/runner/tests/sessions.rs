@@ -27,20 +27,11 @@ use testkit::claude::REPLY_COST_USD;
 use testkit::{FakeAnthropic, Logs, Turn};
 use tokio::sync::Notify;
 
-struct TempDir(PathBuf);
+use common::temp_dir::TempDir;
 
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("runner-sessions-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// The one helper of `tests/common` these tests use, without its harness.
+mod common {
+    pub mod temp_dir;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
