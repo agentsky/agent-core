@@ -9151,22 +9151,34 @@ the channel gains outside members.
 - **After settling.** A settled row is kept until a day after it arrived
   (`CHANNEL_CHANGE_TTL`), and longer while its binding has a change
   waiting, so that change, given up, still follows its chain through it.
-  A replay under another `event_id`, or after the ingress's dedup window,
-  is known without asking Slack again.
+  The purge spares those rows, and so does the eviction below. A replay
+  under another `event_id`, or after the ingress's dedup window, is known
+  without asking Slack again.
 - **Cap.** A binding has at most `MAX_CHANNEL_CHANGES` (16) changes
-  waiting; the next is dropped with a throttled warning. Slack confirms a
-  real change at once unless it can't answer, so only the app's owner,
-  who holds its signing secret, can keep that many waiting. Settled
-  changes never fill it: round 1 counted them, so the 17th real share in
-  a day was dropped and its deny stopped applying. To keep the router's
-  read small, a binding keeps at most `MAX_CHANNEL_CHANGES_KEPT` (64)
-  rows, and recording a change past that forgets its earliest settled
-  ones, never a waiting one. A forged flood only churns its owner's
-  history.
+  waiting. Slack confirms a real change at once unless it can't answer,
+  so the owner forging changes can fill that, and so can a burst of real
+  shares during a Slack outage or while the bot's `conversations.info`
+  quota, shared with message confirmation, is used up. Settled changes
+  never fill it: round 1 counted them, so the 17th real share in a day
+  was dropped and its deny stopped applying.
+- **Kept rows.** To keep the router's read small, a binding keeps at most
+  `MAX_CHANNEL_CHANGES_KEPT` (64) rows. Recording a change past that
+  forgets its earliest settled ones, never a waiting one and never one a
+  waiting change's chain runs through: one from a waiting change's old id
+  or from an id such a chain reaches, found with a recursive CTE over the
+  binding's rows. When none can go, the binding is full. A forged flood
+  only churns its owner's history.
+- **A full binding fails closed.** A change the binding has no room for
+  isn't recorded. Instead, the agent's denies on its old id are copied at
+  once to its new id and to every id the binding's changes say it had
+  since, through `copy_denies_onward`, the code a give-up after a day
+  uses, with a throttled warning. Its allows stay on the old id, so this
+  only narrows access, and an owner forging it gains nothing a `deny`
+  wouldn't give them.
 - **No write lock for a refusal.** Whether the change is known, or the
-  binding full, is read first without `BEGIN IMMEDIATE`, then read again
-  under it, so replays and forged floods don't hold up the store's
-  writers.
+  binding has too many waiting, is read first without `BEGIN IMMEDIATE`,
+  then read again under it, so replays and forged floods don't hold up
+  the store's writers.
 - **Constraints.** The table's `CHECK`s take only two different ids shaped
   like Slack's conversation ids, as the ingress does.
 
@@ -9386,10 +9398,9 @@ by `event_id` under `slack:<binding>`.
   the ingress answers, which it makes for no event. A message in the new
   channel routed in the milliseconds before the record isn't covered
   either.
-- **A store that refuses the one write that records it.** This is logged
+- **A store that refuses the one write that records it**, or, for a
+  binding with no room, the write that copies its denies. This is logged
   as a warning.
-- **A binding with 16 changes waiting.** Only its owner, forging changes,
-  can keep that many waiting.
 - **A binding that isn't active when the change settles.** Its app
   answers no one, and a deleted agent's binding never comes back.
 - **The old binary in a blue-green swap.** It drops the event, because it
@@ -9397,8 +9408,9 @@ by `event_id` under `slack:<binding>`.
   lasts until the swap ends.
 
 None of these is visible to the owner. The first and the last are short
-windows. In every other case a change is either settled or given up with
-its denies copied, so no deny on a channel stops applying.
+windows. In every other case a change is either settled, or given up or
+refused for want of room with its denies copied, so no deny on a channel
+stops applying.
 
 ### Review round 1
 
@@ -9439,8 +9451,9 @@ The two reviews found nothing blocking. These items were fixed:
   `a_busy_day_of_shares_records_every_change`).
 - The router reads the changes before the rules; see above for why no
   test drives it.
-- Settled rows outlive any earlier waiting link of their binding, and the
-  give-ups run before the purge. A failed purge is logged and skips
+- The purge spares settled rows while their binding has a change waiting
+  (round 3 extends this to the eviction), and the give-ups run before the
+  purge. A failed purge is logged and skips
   nothing.
 - The due queues rotate, and the change queue uses its partial index.
 - The manifest due query uses the token margin.
@@ -9454,3 +9467,24 @@ Taken without code:
 - The migrations were edited in place before merging, so a dev database
   that applied an earlier version of them fails sqlx's checksum and needs
   a reset before the live check.
+
+### Review round 3
+
+The light review found nothing blocking. These items were fixed:
+
+- A full binding copies the denies of the change it has no room for at
+  once, through the give-up's code, instead of dropping it
+  (`a_change_the_binding_has_no_room_for_copies_its_denies_at_once`). The
+  two lines that said only the owner can fill the cap are corrected.
+- Recording past 64 rows never forgets a settled change a waiting chain
+  runs through, and is refused as full when nothing else can go
+  (`settled_changes_a_waiting_chain_runs_through_are_never_forgotten`).
+  The two lines that said settled rows outlive a waiting link now say the
+  eviction spares them too.
+- A manifest update checks the owner's token before taking its lease
+  (`a_token_too_close_to_expiry_by_the_time_its_update_comes_burns_no_lease`).
+- `later_ids` follows a map from old id to new ids, linear in the
+  binding's changes, in the same order as before.
+- `ChannelIdChangeLimits`' rustdoc says `kept` should be well above
+  `waiting`. Nothing breaks if it isn't: a binding at `kept` with nothing
+  to forget is refused as full and fails closed.
