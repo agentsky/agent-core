@@ -353,7 +353,6 @@ impl Drop for ProcessChild {
 
 #[cfg(test)]
 mod tests {
-    use std::pin::Pin;
     use std::time::Duration;
 
     use core_types::{AgentId, ScopeKey};
@@ -362,6 +361,7 @@ mod tests {
     use super::*;
     use crate::SharedAccess;
     use crate::test_util::{TempDir, awkward_channel, memory_store};
+    use testkit::child::NotingStdin;
 
     async fn sandbox(dir: &TempDir) -> ProcessSandbox {
         ProcessSandbox::new(memory_store().await, dir.0.clone()).unwrap()
@@ -646,107 +646,33 @@ mod tests {
         io.child.kill().await.unwrap();
     }
 
-    /// Whether process `pid` is gone, exiting or has a SIGKILL pending.
-    fn killed(pid: &str) -> bool {
-        const SIGKILL_BIT: u64 = 1 << 8;
-        const PF_EXITING: u64 = 0x4;
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return true;
-        };
-        let Some((_, rest)) = stat.rsplit_once(") ") else {
-            return true;
-        };
-        let fields: Vec<&str> = rest.split_whitespace().collect();
-        let exiting = fields
-            .first()
-            .is_some_and(|state| matches!(*state, "Z" | "X"))
-            || fields
-                .get(6)
-                .and_then(|flags| flags.parse::<u64>().ok())
-                .is_some_and(|flags| flags & PF_EXITING != 0);
-        let pending = std::fs::read_to_string(format!("/proc/{pid}/status"))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                line.strip_prefix("SigPnd:")
-                    .or_else(|| line.strip_prefix("ShdPnd:"))
-            })
-            .any(|mask| {
-                u64::from_str_radix(mask.trim(), 16).is_ok_and(|mask| mask & SIGKILL_BIT != 0)
-            });
-        exiting || pending
-    }
-
-    /// A child's stdin that notes, when dropped, whether the child was
-    /// killed already.
-    struct NotingStdin {
-        inner: Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
-        pid: String,
-        killed_first: Arc<AtomicBool>,
-    }
-
-    impl tokio::io::AsyncWrite for NotingStdin {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            self.inner.as_mut().poll_write(cx, buf)
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            self.inner.as_mut().poll_flush(cx)
-        }
-
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            self.inner.as_mut().poll_shutdown(cx)
-        }
-    }
-
-    impl Drop for NotingStdin {
-        fn drop(&mut self) {
-            self.killed_first.store(killed(&self.pid), Ordering::SeqCst);
-        }
-    }
-
     #[tokio::test]
     async fn dropping_a_child_kills_it_before_closing_its_stdin() {
         let dir = TempDir::new();
         let sandbox = sandbox(&dir).await;
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
+        let pid_file = dir.0.join("pid");
+        let script = format!("echo $$ > '{}'; exec cat >/dev/null", pid_file.display());
         let io = sandbox
             .exec(
                 &container,
-                &argv(&["/bin/sh", "-c", "echo $$; exec cat >/dev/null"]),
+                &argv(&["/bin/sh", "-c", &script]),
                 &BTreeMap::new(),
             )
             .await
             .unwrap();
-        let ChildIo {
-            child,
-            stdin,
-            mut stdout,
-        } = io;
-        let mut pid = Vec::new();
-        let mut byte = [0u8; 1];
-        while stdout.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {
-            pid.push(byte[0]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&pid_file).is_ok_and(|pid| pid.ends_with('\n')) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let killed_first = Arc::new(AtomicBool::new(false));
+        let (stdin, killed_first) = NotingStdin::new(io.stdin, pid_file);
         let io = ChildIo {
-            child,
-            stdin: Box::pin(NotingStdin {
-                inner: stdin,
-                pid: String::from_utf8(pid).unwrap(),
-                killed_first: Arc::clone(&killed_first),
-            }),
-            stdout,
+            stdin: Box::pin(stdin),
+            ..io
         };
         drop(io);
         assert!(
