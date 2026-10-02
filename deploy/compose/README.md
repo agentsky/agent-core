@@ -149,8 +149,9 @@ agentd makes, and give agentd that instead.
    `app` on the Community Edition, or `user` and `agent-manager` with a
    license.
 5. Log in as the manager and, in **My account > Personal access tokens**,
-   create a token with **Ignore Two Factor Authentication** ticked (the
-   endpoint for renaming a bot requires two-factor authentication otherwise).
+   create a token with **Ignore Two Factor Authentication** ticked (without
+   it, 2FA-gated endpoints refuse the token 30 minutes after the manager is
+   created).
    Note the token and the user id shown with it.
 
 ## 3. Configure agentd
