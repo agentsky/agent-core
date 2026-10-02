@@ -479,6 +479,12 @@ task dropped before its first poll still frees it. The plan-after-lock test
 waits for the profile request and checks 2 s after it. A sleep stays only
 as a settle before asserting that nothing more happened.
 
+agentd's `a_stalled_body_does_not_hold_up_shutdown` slept 200 ms and
+assumed its client had sent its partial request by then; a client thread
+that started late found the listener closed. The test layers the public
+routes with a hook that signals each request, and stops agentd once the
+request has reached them.
+
 ## T05: store
 
 ### The key reaches the store through `open`
