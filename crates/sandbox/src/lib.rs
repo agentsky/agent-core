@@ -305,12 +305,14 @@ impl ExitStatus {
 /// A process started with [`Sandbox::exec`]: its stdin, its stdout and a
 /// handle to wait for it or kill it. Its stderr is discarded.
 pub struct ChildIo {
+    /// Waits for or kills the process. Declared before `stdin`, so a drop
+    /// kills a process still waiting for input instead of closing its
+    /// input first and killing it in the middle of exiting.
+    pub child: ChildHandle,
     /// The process's stdin. Shutting it down closes the stream.
     pub stdin: Pin<Box<dyn AsyncWrite + Send>>,
     /// The process's stdout. It ends when the process exits.
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
-    /// Waits for or kills the process.
-    pub child: ChildHandle,
 }
 
 impl fmt::Debug for ChildIo {
