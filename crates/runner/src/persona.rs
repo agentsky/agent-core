@@ -72,22 +72,7 @@ pub async fn write_persona(data_dir: &Path, agent: AgentId, persona: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("runner-persona-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_util::TempDir;
 
     #[test]
     fn the_persona_directory_is_under_agents() {
