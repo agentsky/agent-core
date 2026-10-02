@@ -3559,6 +3559,18 @@ at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
 "Killing leftover processes" entry covers that).
 
+### Log lines don't name the host
+
+**Issue.** Refusals and tunnel lines logged the host the sandbox asked
+for. A host name is chosen by the sandbox, so a refused `CONNECT` to
+`<secret>.attacker.example` wrote the secret into agentd's logs, which
+leave the trust boundary the allowlist guards.
+
+**Solution.** Egress log lines give the session, port, reason, the rule
+that allowed the host (once one has) and the address, never the host. The
+log test sends secret-bearing hosts that are allowed, refused by the
+allowlist and refused by address, and finds none of them in the log.
+
 ### Testing without the network
 
 **Issue.** Every address a real test server has is loopback, which the
