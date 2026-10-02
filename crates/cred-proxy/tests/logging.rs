@@ -123,12 +123,20 @@ async fn logs_never_hold_placeholders_or_credentials() {
             .await
             .unwrap();
     }
+    client
+        .get(format!(
+            "{base}/v1/path-secret-marker/models?beta=query-secret-marker"
+        ))
+        .header("authorization", format!("Bearer {}", sub.expose_secret()))
+        .send()
+        .await
+        .unwrap();
     let other = registry
         .mint(SessionId::new_v4(), LOCAL, key.kind())
         .unwrap();
 
     let logs = capture.text();
-    assert!(logs.contains("forwarded a request"), "{logs}");
+    assert_eq!(logs.matches("forwarded a request").count(), 3, "{logs}");
     assert!(
         logs.contains("the credential proxy refused a request"),
         "{logs}"
@@ -142,6 +150,8 @@ async fn logs_never_hold_placeholders_or_credentials() {
         key.expose_secret(),
         other.expose_secret(),
         "agentd-sub-unknown-marker",
+        "path-secret-marker",
+        "query-secret-marker",
         OAUTH_TOKEN,
         COMMUNITY_KEY,
     ] {

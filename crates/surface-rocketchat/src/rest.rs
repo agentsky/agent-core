@@ -50,8 +50,10 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_RETRY_WAIT: Duration = Duration::from_secs(1);
 
 /// The default for [`RestClient::with_max_retry_wait`]: Rocket.Chat's
-/// default rate-limit window (`API_Enable_Rate_Limiter_Limit_Time_Default`).
-const DEFAULT_MAX_RETRY_WAIT: Duration = Duration::from_secs(60);
+/// default rate-limit window (`API_Enable_Rate_Limiter_Limit_Time_Default`,
+/// 60 seconds) plus the second the whole-second `Date` header can add to
+/// the measured wait, so a limit hit early in a window is still retried.
+const DEFAULT_MAX_RETRY_WAIT: Duration = Duration::from_secs(61);
 
 /// The default for [`RestClient::with_max_upload_size`]: Rocket.Chat's
 /// default `FileUpload_MaxFileSize`, 100 MiB.
@@ -545,7 +547,9 @@ impl RestClient {
 
     /// Sets the longest wait before retrying a 429. A 429 whose
     /// `x-ratelimit-reset` is further away fails at once with
-    /// [`SurfaceError::RateLimited`]. The default is 60 seconds.
+    /// [`SurfaceError::RateLimited`]. The default is 61 seconds: the
+    /// server's default 60-second window, plus a second for the `Date`
+    /// header's resolution.
     pub fn with_max_retry_wait(mut self, wait: Duration) -> Self {
         self.max_retry_wait = wait;
         self
@@ -736,10 +740,18 @@ impl RestClient {
 
     /// `POST im.create`: opens (or finds) the direct message with the user
     /// named `username` and returns its room id.
+    ///
+    /// Rocket.Chat answers a username it doesn't know (the match is
+    /// case-sensitive) with success and the caller's own self-DM, so a room
+    /// whose `usernames` leave out `username` fails with
+    /// [`SurfaceError::NotFound`] carrying `error-invalid-user`.
     pub async fn create_dm(&self, username: &str) -> Result<ConversationId> {
         let created: DmEnvelope = self
             .call(Call::post("im.create", json!({ "username": username })))
             .await?;
+        if !created.room.usernames.iter().any(|u| u == username) {
+            return Err(SurfaceError::NotFound("error-invalid-user".into()));
+        }
         Ok(created.room.id)
     }
 
@@ -780,10 +792,24 @@ impl RestClient {
     }
 
     /// `GET chat.getMessage`: one message by id.
+    ///
+    /// Rocket.Chat answers an unknown id with a bare `{"success": false}`
+    /// (HTTP 400, no code), which this maps to [`SurfaceError::NotFound`]
+    /// carrying `message`. Any other 400 without a code, such as an empty
+    /// body or a proxy's error page, stays [`SurfaceError::Api`]. A message
+    /// in a room the caller can't see is [`SurfaceError::Forbidden`].
     pub async fn get_message(&self, message: &MessageId) -> Result<Message> {
         let found: MessageEnvelope = self
             .call(Call::get("chat.getMessage").query("msgId", message.as_str()))
-            .await?;
+            .await
+            .map_err(|err| match err {
+                SurfaceError::Api(description)
+                    if description == bare_failure(StatusCode::BAD_REQUEST) =>
+                {
+                    SurfaceError::NotFound("message".into())
+                }
+                err => err,
+            })?;
         Ok(found.message)
     }
 
@@ -1175,8 +1201,18 @@ fn describe(status: StatusCode, body: Option<&Value>) -> String {
         (Some(error), Some(code)) if !error.contains(code) => format!("{error} [{code}]"),
         (Some(error), _) => error,
         (None, Some(code)) => code.to_owned(),
+        (None, None) if body.is_some_and(|b| *b == json!({ "success": false })) => {
+            bare_failure(status)
+        }
         (None, None) => format!("HTTP {}", status.as_u16()),
     }
+}
+
+/// The description of a failure whose body is exactly `{"success": false}`,
+/// as `API.v1.failure()` answers with no error. An empty or non-JSON body,
+/// such as a proxy's error page, is described by its status alone.
+fn bare_failure(status: StatusCode) -> String {
+    format!("HTTP {} with a bare failure", status.as_u16())
 }
 
 fn truncate(text: &str) -> String {
@@ -1236,6 +1272,7 @@ struct DmEnvelope {
 struct DmRoom {
     #[serde(rename = "_id")]
     id: ConversationId,
+    usernames: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1342,6 +1379,16 @@ mod tests {
             retry_wait(Some(&reset), Some(&not_text), now),
             Duration::from_millis(2500)
         );
+    }
+
+    #[test]
+    fn the_default_max_wait_covers_a_full_window_measured_by_a_whole_second_date() {
+        let date = HeaderValue::from_static("Fri, 02 Oct 2026 08:23:37 GMT");
+        let window_start_ms = 1_790_929_417_999;
+        let reset = HeaderValue::from_str(&(window_start_ms + 60_000).to_string()).unwrap();
+        let wait = retry_wait(Some(&reset), Some(&date), at_ms(window_start_ms));
+        assert_eq!(wait, Duration::from_millis(60_999));
+        assert!(wait <= DEFAULT_MAX_RETRY_WAIT);
     }
 
     #[test]
