@@ -305,10 +305,19 @@ impl Server {
     ///    ([`Pipeline::release_cut_hand_offs`]), within a second if the
     ///    shutdown was forced and until a second signal otherwise.
     /// 5. With turns, every warm session's process and container is
-    ///    stopped, within what is left of the same timeout
-    ///    ([`Pipeline::stop_sessions`]). A drain that was cut short, by the
-    ///    timeout or by `abort`, skips it, and the next start reaps what is
-    ///    left.
+    ///    stopped, after that release, which writes the same store and
+    ///    matters more, and within what is left of the same timeout
+    ///    ([`Pipeline::stop_sessions`]). It is skipped once `abort` has
+    ///    completed or the deadline has passed, whether in the drain or
+    ///    during the release, and the next start reaps what is left. A
+    ///    release that hangs on a graceful shutdown holds the process until
+    ///    a second signal, which skips the stop. A stop that runs out of
+    ///    time or is cut short by `abort` leaves the sessions it already
+    ///    began stopping to finish in the background: their agentctl token
+    ///    revocations fail once the store is closed, which the runner logs
+    ///    as giving up, and the idle reaper they keep alive runs until the
+    ///    process exits. The next start purges the tokens and reaps the
+    ///    containers.
     /// 6. The pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
@@ -499,7 +508,6 @@ impl Server {
         stop.send_replace(true);
 
         let mut forced = false;
-        let mut turns_cut = false;
         if let Some(pipeline) = &pipeline {
             pipeline.close();
             let drained = tokio::select! {
@@ -510,7 +518,6 @@ impl Server {
                 }
             };
             if !drained {
-                turns_cut = true;
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
                 if !forced {
@@ -555,7 +562,10 @@ impl Server {
             } else {
                 tokio::select! {
                     () = pipeline.release_cut_hand_offs() => true,
-                    () = abort.as_mut() => false,
+                    () = abort.as_mut() => {
+                        forced = true;
+                        false
+                    }
                 }
             };
             if !released {
@@ -563,11 +573,7 @@ impl Server {
                     "shutdown forced; the hand-offs let go last are taken after their lease"
                 );
             }
-            if turns_cut
-                || cut_short.is_some()
-                || !released
-                || tokio::time::Instant::now() >= deadline
-            {
+            if forced || tokio::time::Instant::now() >= deadline {
                 tracing::warn!("leaving warm sandboxes for the next start to reap");
             } else {
                 let left = tokio::select! {
