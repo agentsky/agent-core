@@ -4296,7 +4296,7 @@ under the cap, and returns `LimitReached`; `create` then tells the member
 the limit and to delete one first. Deleted agents don't count, but their
 bot users stay, deactivated.
 
-### The manager's permissions on the Community Edition are still open
+### The manager's permissions on the Community Edition
 
 **Issue.** T16 found that custom roles need an Enterprise license. T14 adds
 nothing to the role T11 derived: `create-user`, `edit-other-user-active-status`
@@ -4304,10 +4304,10 @@ for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
 `view-full-other-user-info` and `api-bypass-rate-limit`, plus
 `create-personal-access-tokens` on the `bot` role.
 
-**Solution.** Unresolved, as the design's open question says. On the
-Community Edition these permissions can only be added to a built-in role,
-and the built-in roles the manager would hold are shared (`user` with every
-member, `bot` with every agent), so granting them there grants them to
-everyone who holds that role. Until a live check settles it, the Compose
-README gives the manager `admin` for development. This task couldn't test
-it without a server.
+**Solution.** [T11's live check](#the-live-check-against-7139) settled it.
+On the Community Edition the manager holds the built-in `bot` and `app`
+roles, and the admin adds these permissions to `app`, whose only other
+holders are Apps-Engine app users, which can't log in; `app` and `bot`
+already have `api-bypass-rate-limit`. Granting them to `user` or `bot`
+would grant them to every member or every agent. The Compose README walks
+through it, and the manager is never an admin.

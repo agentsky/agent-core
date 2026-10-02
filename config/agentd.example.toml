@@ -116,5 +116,6 @@ team = "chat.example.com"
 manager_user_id = "aBcD1234eFgH5678"
 
 # An image URL every new agent's bot sets as its avatar. Optional: without
-# it, bots keep Rocket.Chat's default avatar.
+# it, bots keep Rocket.Chat's default avatar. Rocket.Chat fetches it itself
+# and refuses private addresses, redirects and anything not image/*.
 # avatar_url = "https://chat.example.com/assets/agent.png"

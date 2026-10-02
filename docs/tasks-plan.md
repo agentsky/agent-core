@@ -1270,7 +1270,10 @@ reply; `!agent login <code>` in a DM with the agent's bot is refused.
 
 Live check (manual): create two agents on the Compose Rocket.Chat and mention
 each in a channel. Before T23 the reply can be a fixed acknowledgement; record
-that mentions arrive per bot.
+that mentions arrive per bot. To check avatars, set `avatar_url` to a public
+image URL: `users.setAvatar` refuses private addresses, redirects and
+anything not `image/*`
+([impl-notes](impl-notes.md#the-live-check-against-7139)).
 
 ## Phase 2: sessions, sandboxes, credential proxy (design milestone 2)
 
