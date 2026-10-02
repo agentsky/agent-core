@@ -8,23 +8,11 @@ use secrecy::SecretString;
 use store::{Sealer, Store};
 use testkit::{FakeAnthropic, Turn};
 
+use temp_dir::TempDir;
+
+mod temp_dir;
+
 pub const PLACEHOLDER: &str = "agentd-placeholder-7f3a";
-
-pub struct TempDir(pub PathBuf);
-
-impl TempDir {
-    pub fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("runner-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 pub struct Harness {
     pub _dir: TempDir,
