@@ -607,6 +607,25 @@ async fn get_message_reads_one_message() {
     );
 }
 
+#[tokio::test]
+async fn get_message_reads_only_a_bare_json_failure_as_not_found() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    for body in ["", "<html>Bad Request</html>", r#"{"success":false,"x":1}"#] {
+        let mock = Mock::given(path("/api/v1/chat.getMessage"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .with_priority(1)
+            .mount_as_scoped(fake.server())
+            .await;
+        assert_eq!(
+            client.get_message(&"m1".into()).await,
+            Err(SurfaceError::Api("HTTP 400".into())),
+            "{body}"
+        );
+        drop(mock);
+    }
+}
+
 fn temp_file(name: &str, contents: &[u8]) -> OutFile {
     let dir = std::env::temp_dir().join(format!("rc-rest-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

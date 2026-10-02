@@ -746,7 +746,8 @@ impl RestClient {
     ///
     /// Rocket.Chat answers an unknown id with a bare `{"success": false}`
     /// (HTTP 400, no code), which this maps to [`SurfaceError::NotFound`]
-    /// carrying `message`. A message in a room the caller can't see is
+    /// carrying `message`. Any other 400 without a code, such as an empty
+    /// body or a proxy's error page, stays [`SurfaceError::Api`]. A message in a room the caller can't see is
     /// [`SurfaceError::Forbidden`].
     pub async fn get_message(&self, message: &MessageId) -> Result<Message> {
         let found: MessageEnvelope = self
@@ -1138,14 +1139,18 @@ fn describe(status: StatusCode, body: Option<&Value>) -> String {
         (Some(error), Some(code)) if !error.contains(code) => format!("{error} [{code}]"),
         (Some(error), _) => error,
         (None, Some(code)) => code.to_owned(),
-        (None, None) => bare_failure(status),
+        (None, None) if body.is_some_and(|b| *b == json!({ "success": false })) => {
+            bare_failure(status)
+        }
+        (None, None) => format!("HTTP {}", status.as_u16()),
     }
 }
 
-/// The description of a failure whose body names no error, such as
-/// `API.v1.failure()`'s `{"success": false}`.
+/// The description of a failure whose body is exactly `{"success": false}`,
+/// as `API.v1.failure()` answers with no error. An empty or non-JSON body,
+/// such as a proxy's error page, is described by its status alone.
 fn bare_failure(status: StatusCode) -> String {
-    format!("HTTP {}", status.as_u16())
+    format!("HTTP {} with a bare failure", status.as_u16())
 }
 
 fn truncate(text: &str) -> String {
