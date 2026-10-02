@@ -104,7 +104,8 @@ pub enum ProxyError {
 ///    after telling the [`ProxyObserver`], if any.
 ///
 /// A refusal is an Anthropic-style JSON error with a fixed message. No
-/// response or log line contains a placeholder or a credential.
+/// response or log line contains a placeholder or a credential, and no log
+/// line contains the request's path or query, which the sandbox chooses.
 pub struct CredProxy {
     upstream: Upstream,
     http: reqwest::Client,
@@ -254,7 +255,6 @@ impl CredProxy {
         tracing::debug!(
             session = %grant.session,
             method = %parts.method,
-            path = parts.uri.path(),
             status = status.as_u16(),
             "forwarded a request"
         );
