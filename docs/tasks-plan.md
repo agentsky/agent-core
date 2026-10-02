@@ -1278,7 +1278,10 @@ reply; `!agent login <code>` in a DM with the agent's bot is refused.
 
 Live check (manual): create two agents on the Compose Rocket.Chat and mention
 each in a channel. Before T23 the reply can be a fixed acknowledgement; record
-that mentions arrive per bot.
+that mentions arrive per bot. To check avatars, set `avatar_url` to a public
+image URL: `users.setAvatar` refuses private addresses, redirects and
+anything not `image/*`
+([impl-notes](impl-notes.md#the-live-check-against-7139)).
 
 ## Phase 2: sessions, sandboxes, credential proxy (design milestone 2)
 
@@ -1421,8 +1424,9 @@ Deliverables:
     shortcut with a note that production should use a socket proxy.
 - `deploy/compose/README.md`:
   1. Bring the stack up.
-  2. Create the Rocket.Chat admin, then the manager user and its custom role
-     (with the permissions T11 settled).
+  2. Create the Rocket.Chat admin, then the manager user and its role (with
+     the permissions T11 settled: a custom role with a license, otherwise
+     the built-in `app` role).
   3. Configure agentd.
   4. Run the live checks listed in T11, T14 and T23.
 - CI: a job that builds both images (no push) when `images/**` or the Rust code
