@@ -95,28 +95,32 @@ impl RelinkNotifier {
         let pending = self
             .store
             .pending_relink_notices(now(), RELINK_MAX_ATTEMPTS)
-            .await?;
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(error = %err, "couldn't read the relink notices owed");
+            })?;
         let mut told = 0;
         let mut first_err = None;
         for notice in pending {
-            let member = notice.member;
             match self.send_one(&notice, &now).await {
                 Ok(true) => told += 1,
                 Ok(false) => {}
                 Err(err) => {
-                    tracing::warn!(%member, error = %err, "a relink notice failed in the store; left it for a later pass");
                     first_err.get_or_insert(err);
                 }
             }
         }
         match first_err {
-            Some(err) => Err(err),
+            Some(err) => {
+                tracing::debug!(told, "a relink pass met a store failure");
+                Err(err)
+            }
             None => Ok(told),
         }
     }
 
     /// Claims and sends `notice`, or defers it if no send worked; true if
-    /// the member was told.
+    /// the member was told. Logs each store failure where it happens.
     async fn send_one(
         &self,
         notice: &PendingRelinkNotice,
@@ -126,7 +130,10 @@ impl RelinkNotifier {
         let reachable: Vec<MemberKey> = self
             .store
             .member_identities(member)
-            .await?
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(%member, error = %err, "couldn't read a member's identities for the relink notice; left it for a later pass");
+            })?
             .into_iter()
             .filter(|identity| self.replies.can_dm(identity))
             .collect();
@@ -144,19 +151,28 @@ impl RelinkNotifier {
                 claimed_at + RELINK_LEASE,
                 RELINK_MAX_ATTEMPTS,
             )
-            .await?
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(%member, error = %err, "couldn't claim a relink notice; left it for a later pass");
+            })?
         else {
             return Ok(false);
         };
         if self.send(member, &reachable).await {
             self.store
                 .mark_relink_notice_sent(member, notice.generation, now())
-                .await?;
+                .await
+                .inspect_err(|err| {
+                    tracing::warn!(%member, error = %err, "told a member to log in again but couldn't record it; the notice may go again after its lease");
+                })?;
             return Ok(true);
         }
         self.store
             .defer_relink_notice(member, notice.generation, now() + backoff(attempt))
-            .await?;
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(%member, error = %err, "couldn't put off a relink notice; it is tried again after its lease");
+            })?;
         if attempt >= RELINK_MAX_ATTEMPTS {
             tracing::warn!(%member, attempts = attempt, "giving up on the relink notice");
         }
@@ -208,7 +224,7 @@ impl RelinkNotifier {
             match self.send_pending().await {
                 Ok(0) => {}
                 Ok(told) => tracing::debug!(told, "sent relink notices"),
-                Err(err) => tracing::warn!(error = %err, "sending relink notices failed"),
+                Err(err) => tracing::debug!(error = %err, "the relink pass met a store failure"),
             }
         }
     }
