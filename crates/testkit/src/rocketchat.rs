@@ -598,10 +598,9 @@ impl Respond for Router {
                 ),
             },
             (true, ["im.create"]) => {
-                let Some(target) = state.user_by_name(&text("username")).map(|u| u.id.clone())
-                else {
-                    return meteor_error("error-invalid-user", "Invalid user");
-                };
+                let target = state
+                    .user_by_name(&text("username"))
+                    .map_or_else(|| caller.clone(), |u| u.id.clone());
                 let mut ids = [caller, target];
                 ids.sort();
                 let id = ids.concat();
@@ -611,8 +610,15 @@ impl Respond for Router {
                     members: BTreeSet::new(),
                 });
                 room.members.extend(ids);
+                let usernames: Vec<&str> = state.rooms[&id]
+                    .members
+                    .iter()
+                    .filter_map(|member| state.users.get(member))
+                    .map(|user| user.username.as_str())
+                    .collect();
                 let mut room = state.room_json(&id);
                 room["rid"] = json!(id);
+                room["usernames"] = json!(usernames);
                 ok(json!({ "room": room }))
             }
             (true, ["chat.postMessage"]) => post_message(&mut state, &caller, &body),
@@ -663,7 +669,7 @@ impl Respond for Router {
                     let message = state.message_json(&state.messages[at]);
                     ok(json!({ "message": message }))
                 }
-                None => meteor_error("error-invalid-message", "Invalid message"),
+                None => ResponseTemplate::new(400).set_body_json(json!({ "success": false })),
             },
             (true, ["rooms.media", rid]) => {
                 if !state
