@@ -23,10 +23,6 @@ pub const APPROVE_ACTION: &str = "consent_approve";
 pub const DECLINE_ACTION: &str = "consent_decline";
 /// The most UTF-16 code units Slack takes in one text object of a block.
 pub const SLACK_TEXT_MAX: usize = 3000;
-/// The most UTF-16 code units a text object of a Slack `context` block
-/// may hold, assumed below [`SLACK_TEXT_MAX`] so a card is never refused
-/// by Slack.
-pub const SLACK_CONTEXT_TEXT_MAX: usize = 2000;
 
 /// Inserted after each backtick of a task on a Rocket.Chat card.
 const ZERO_WIDTH_SPACE: char = '\u{200B}';
@@ -122,8 +118,7 @@ pub struct Card<'a> {
 impl Card<'_> {
     /// Whether the card fits wherever it may be shown, before it is asked
     /// for, in its longest form (for a paused agent): on Slack each block's
-    /// text within [`SLACK_TEXT_MAX`] UTF-16 code units, a `context`
-    /// block's within [`SLACK_CONTEXT_TEXT_MAX`], and on
+    /// text within [`SLACK_TEXT_MAX`] UTF-16 code units, and on
     /// Rocket.Chat the whole card, as the surface renders it, in one
     /// message of the server's default limit. The requester's name, looked
     /// up only when the card is sent, is counted at its longest.
@@ -140,26 +135,20 @@ impl Card<'_> {
             ..self.clone()
         };
         let open = longest(SurfaceKind::Slack).open();
-        let too_long = open
+        let texts = open
             .blocks
             .as_ref()
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .any(|block| {
-                let max = if block["type"] == "context" {
-                    SLACK_CONTEXT_TEXT_MAX
-                } else {
-                    SLACK_TEXT_MAX
-                };
-                block_texts(block)
-                    .into_iter()
-                    .any(|text| utf16_len(text) > max)
-            });
-        if too_long {
+            .flat_map(block_texts);
+        if texts
+            .into_iter()
+            .any(|text| utf16_len(text) > SLACK_TEXT_MAX)
+        {
             return Err(format!(
-                "the task is over {SLACK_TEXT_MAX} UTF-16 code units, or the list of its files' \
-                 names over {SLACK_CONTEXT_TEXT_MAX}, more than a consent card holds"
+                "the task is over {SLACK_TEXT_MAX} UTF-16 code units, more than a consent card \
+                 holds"
             ));
         }
         let markdown = longest(SurfaceKind::RocketChat).open().markdown;
@@ -329,7 +318,9 @@ impl Card<'_> {
 
     /// The Block Kit both states of a Slack card share: who asked where,
     /// the task under a label, boxed as preformatted literal text, the
-    /// files and what approving means.
+    /// files under a label, each its own element of one `context` block
+    /// (Slack takes at most 10, as many as [`MAX_FILES`](super::MAX_FILES)),
+    /// and what approving means.
     fn blocks(&self) -> Vec<Value> {
         let mut blocks = vec![
             json!({
@@ -357,10 +348,16 @@ impl Card<'_> {
                 "type": "context",
                 "elements": [{
                     "type": "plain_text",
-                    "text": format!("Files handed to it: {}.", self.files.join(", ")),
+                    "text": "Files handed to it:",
                     "emoji": false,
                 }],
             }));
+            let names: Vec<Value> = self
+                .files
+                .iter()
+                .map(|name| json!({"type": "plain_text", "text": name, "emoji": false}))
+                .collect();
+            blocks.push(json!({"type": "context", "elements": names}));
         }
         blocks.push(json!({
             "type": "context",
@@ -590,7 +587,13 @@ mod tests {
             text.contains("https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/"),
             "{text}"
         );
-        assert!(text.contains("Files handed to it: a.csv."), "{text}");
+        assert_eq!(blocks[3]["elements"][0]["text"], "Files handed to it:");
+        assert_eq!(
+            blocks[4],
+            json!({"type": "context", "elements": [
+                {"type": "plain_text", "text": "a.csv", "emoji": false},
+            ]})
+        );
         assert!(text.contains("can read your agent's shared files but not change them"));
         let actions = blocks.as_array().unwrap().last().unwrap();
         assert_eq!(actions["block_id"], BLOCK_ID);
@@ -822,15 +825,60 @@ mod tests {
             card(&"`".repeat(2600), &[]).is_err(),
             "a task whose backticks are broken up must still fit one Rocket.Chat message"
         );
-        let longest: Vec<String> = (0..10).map(|n| format!("{n}{}", "x".repeat(254))).collect();
-        assert!(
-            card("x", &longest).is_err(),
-            "ten 255-byte names are over Slack's context text limit"
-        );
-        let fitting: Vec<String> = (0..10).map(|n| format!("{n}{}", "x".repeat(190))).collect();
-        assert_eq!(card("x", &fitting), Ok(()));
-        let err = card(&"a".repeat(2900), &fitting).unwrap_err();
+        let longest = longest_names();
+        assert_eq!(card("x", &longest), Ok(()), "ten 255-byte names fit");
+        let err = card(&"a".repeat(2500), &longest).unwrap_err();
         assert!(err.contains("one consent card message"), "{err}");
+    }
+
+    /// Ten file names of 255 bytes, the most a task may be handed.
+    fn longest_names() -> Vec<String> {
+        (0..crate::consents::MAX_FILES)
+            .map(|n| format!("{n}{}", "x".repeat(254)))
+            .collect()
+    }
+
+    #[test]
+    fn a_slack_card_gives_each_file_its_own_context_element() {
+        let consent = consent(SurfaceKind::Slack, "Summarize these");
+        let files = longest_names();
+        let blocks = Card {
+            consent: &consent,
+            agent: "helper",
+            files: &files,
+            owners: false,
+            paused: true,
+            surface: consent.thread.conv.surface,
+            requester_name: None,
+        }
+        .open()
+        .blocks
+        .unwrap();
+        let blocks = blocks.as_array().unwrap();
+        let label = blocks
+            .iter()
+            .position(|block| block["elements"][0]["text"] == "Files handed to it:")
+            .expect("the files' label");
+        assert_eq!(blocks[label]["type"], "context");
+        assert_eq!(blocks[label]["elements"].as_array().unwrap().len(), 1);
+        let names = &blocks[label + 1];
+        assert_eq!(names["type"], "context");
+        let elements = names["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), files.len());
+        for (element, name) in elements.iter().zip(&files) {
+            assert_eq!(
+                *element,
+                json!({"type": "plain_text", "text": name, "emoji": false})
+            );
+        }
+        for block in blocks.iter().filter(|block| block["type"] == "context") {
+            let elements = block["elements"].as_array().unwrap();
+            assert!(elements.len() <= 10, "{block}");
+            for element in elements {
+                let text = element["text"].as_str().unwrap();
+                assert!(utf16_len(text) < 2000, "{block}");
+            }
+        }
     }
 
     #[test]

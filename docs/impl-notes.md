@@ -7277,12 +7277,132 @@ consent owns after ten minutes, for requests that failed half way.
 
 The task text is refused when empty or over 3000 UTF-16 code units, what a
 Slack plain-text section holds as Slack counts it, and a task whose card
-wouldn't fit (Slack's 3000 units per text object, 2000 in a `context` block,
-or one Rocket.Chat message at the server's default limit, rendered) is
-refused when it is asked for. The files' names share one `context` text, so
-ten names near the 255-byte limit are refused. Slack's own limit for a
-`context` text couldn't be checked from here; 2000 is the lower figure
-review reported, taken so the card is never rejected with `invalid_blocks`.
+wouldn't fit (Slack's 3000 units per text object, or one Rocket.Chat message
+at the server's default limit, rendered) is refused when it is asked for.
+
+### Each file's name is its own element of the Slack card
+
+**Issue.** The Slack card listed the files' names in one `context` text,
+"Files handed to it: a, b.", which ten 255-byte names make about 2,600
+units long. Slack's SDKs document 3000 for a text object, but review also
+reported 2000 for `context` elements, and neither could be checked against
+Slack from here. A card Slack refuses with `invalid_blocks` never reaches
+the owner.
+
+**Solution.** The label is a `context` block of its own, as the task's is,
+and the names follow in one `context` block with one `plain_text` element
+each. Slack takes at most 10 elements in a `context` block, as many as
+`MAX_FILES`, and a name is at most 255 bytes, so the card fits under either
+limit and no task is refused for its files' names. Names with `, ` in them
+are no longer ambiguous either. The Rocket.Chat card and the Markdown text
+keep the one-line list. A Slack screenshot isn't possible from here; this is
+the open card's Block Kit for a task handed two files:
+
+```json
+[
+  {
+    "type": "section",
+    "text": {
+      "type": "mrkdwn",
+      "text": "*Private task request* for *helper* from someone other than you: <@U0BOB> (`U0BOB`), in <#C0CHAN001> (<https://app.slack.com/client/T0TEAM001/C0CHAN001/thread/C0CHAN001-1727697600.000100|the thread>)."
+    }
+  },
+  {
+    "type": "context",
+    "elements": [
+      {
+        "type": "plain_text",
+        "emoji": false,
+        "text": "The task, exactly as written:"
+      }
+    ]
+  },
+  {
+    "type": "rich_text",
+    "elements": [
+      {
+        "type": "rich_text_preformatted",
+        "elements": [
+          {
+            "type": "text",
+            "text": "Summarize the attached notes in three bullets."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "type": "context",
+    "elements": [
+      {
+        "type": "plain_text",
+        "emoji": false,
+        "text": "Files handed to it:"
+      }
+    ]
+  },
+  {
+    "type": "context",
+    "elements": [
+      {
+        "type": "plain_text",
+        "emoji": false,
+        "text": "notes.md"
+      },
+      {
+        "type": "plain_text",
+        "emoji": false,
+        "text": "q3 figures.csv"
+      }
+    ]
+  },
+  {
+    "type": "context",
+    "elements": [
+      {
+        "type": "mrkdwn",
+        "text": "If you approve, it runs once in a new private session on your Claude account. It can read your agent's shared files but not change them, and doesn't see its memory. The files handed to it aren't shown here, and their contents can direct it like its text. Only its reply and the files it attaches are posted to the thread."
+      }
+    ]
+  },
+  {
+    "type": "context",
+    "elements": [
+      {
+        "type": "plain_text",
+        "emoji": false,
+        "text": "It expires at 1970-01-02 00:00 UTC."
+      }
+    ]
+  },
+  {
+    "type": "actions",
+    "block_id": "consent",
+    "elements": [
+      {
+        "type": "button",
+        "action_id": "consent_approve",
+        "style": "primary",
+        "text": {
+          "type": "plain_text",
+          "text": "Approve"
+        },
+        "value": "<consent id>"
+      },
+      {
+        "type": "button",
+        "action_id": "consent_decline",
+        "style": "danger",
+        "text": {
+          "type": "plain_text",
+          "text": "Decline"
+        },
+        "value": "<consent id>"
+      }
+    ]
+  }
+]
+```
 
 ### Everything a consent owes is in its row
 
