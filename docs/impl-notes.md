@@ -1486,9 +1486,10 @@ caller needs `user-generate-access-token` for another user, which only
 returns a login (resume) token, which expires after `Accounts_LoginExpiration`
 (90 days by default) and counts against the user's login-token limit.
 
-**Solution.** Use the other route, which works for a manager with only a
-custom role: `RestClient::issue_bot_token` logs in as the bot with its random
-password (`POST login`), calls `users.generatePersonalAccessToken`, then
+**Solution.** Use the other route, which works for a manager with only the
+roles the design gives it: `RestClient::issue_bot_token` logs in as the bot
+with its random password (`POST login`), calls
+`users.generatePersonalAccessToken`, then
 `POST logout`s the login session. A personal access token doesn't expire. The
 manager needs no permission for this step. The password is generated in
 `create_bot_user`, held in a `BotPassword` that can't be cloned or
