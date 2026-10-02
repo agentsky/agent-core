@@ -1623,7 +1623,7 @@ Server behavior below was read from the Rocket.Chat source on `develop`
 where it lives in `apps/meteor/app/api/server/`. On 2026-10-02 it was checked
 against a live Rocket.Chat 7.13.9 Community Edition server; see
 [The live check against 7.13.9](#the-live-check-against-7139) for what held,
-what didn't, and the role the manager needs.
+what didn't, and the roles the manager needs.
 
 ### `rooms.upload` is gone in Rocket.Chat 8.0
 
@@ -2670,7 +2670,7 @@ bot users stay, deactivated.
 ### The manager's permissions on the Community Edition
 
 **Issue.** T16 found that custom roles need an Enterprise license. T14 adds
-nothing to the role T11 derived: `create-user`, `edit-other-user-active-status`
+nothing to the permissions T11 derived: `create-user`, `edit-other-user-active-status`
 for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
 `view-full-other-user-info` and `api-bypass-rate-limit`, plus
 `create-personal-access-tokens` on the `bot` role.
