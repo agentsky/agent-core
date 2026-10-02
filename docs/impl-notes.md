@@ -9154,31 +9154,42 @@ the channel gains outside members.
   The purge spares those rows, and so does the eviction below. A replay
   under another `event_id`, or after the ingress's dedup window, is known
   without asking Slack again.
-- **Cap.** A binding has at most `MAX_CHANNEL_CHANGES` (16) changes
-  waiting. Slack confirms a real change at once unless it can't answer,
-  so the owner forging changes can fill that, and so can a burst of real
-  shares during a Slack outage or while the bot's `conversations.info`
-  quota, shared with message confirmation, is used up. Settled changes
-  never fill it: round 1 counted them, so the 17th real share in a day
-  was dropped and its deny stopped applying.
-- **Kept rows.** To keep the router's read small, a binding keeps at most
-  `MAX_CHANNEL_CHANGES_KEPT` (64) rows. Recording a change past that
-  forgets its earliest settled ones, never a waiting one and never one a
-  waiting change's chain runs through: one from a waiting change's old id
-  or from an id such a chain reaches, found with a recursive CTE over the
-  binding's rows. When none can go, the binding is full. A forged flood
-  only churns its owner's history.
+- **Cap.** To keep the router's read small, a binding keeps at most
+  `MAX_CHANNEL_CHANGES` (64) changes, waiting or settled. Recording a
+  change past that forgets its earliest settled ones, never a waiting one
+  and never one a waiting change's chain runs through: one from a waiting
+  change's old id or from an id such a chain reaches, found with a
+  recursive CTE over the binding's rows. When none can go, the binding is
+  full. Slack confirms a real change at once unless it can't answer, so
+  the owner forging changes can fill it with waiting ones, and so can a
+  burst of more than 64 real shares during a Slack outage or while the
+  bot's `conversations.info` quota, shared with message confirmation, is
+  used up. Rounds 2 and 3 had a separate cap of 16 waiting, which such a
+  burst filled four times sooner.
 - **A full binding fails closed.** A change the binding has no room for
-  isn't recorded. Instead, the agent's denies on its old id are copied at
-  once to its new id and to every id the binding's changes say it had
-  since, through `copy_denies_onward`, the code a give-up after a day
-  uses, with a throttled warning. Its allows stay on the old id, so this
-  only narrows access, and an owner forging it gains nothing a `deny`
-  wouldn't give them.
-- **No write lock for a refusal.** Whether the change is known, or the
-  binding has too many waiting, is read first without `BEGIN IMMEDIATE`,
-  then read again under it, so replays and forged floods don't hold up
-  the store's writers.
+  isn't recorded. Instead, the agent's denies on its old id, and on the
+  old id of any waiting change whose chain reaches it, are copied at once
+  to its new id and to every id the binding's changes say it had since,
+  through `copy_denies_onward`, the code a give-up after a day uses, with
+  a throttled warning. Its allows stay on the old id, so this only
+  narrows access; a real share that overflows the cap loses its allows
+  there (see "What can still lose a change").
+- **Copies are bounded.** `Rules::copy_denies` lets copied denies take a
+  list past `MAX_RULES`, since a deny never lets anyone in, but not past
+  `MAX_DENIES` (200). A copy that would take the list past it denies
+  everyone instead, and a list that denies everyone takes no copies. A
+  real change copies at most one deny, so only a flood of forged changes
+  gets there, and then only its owner is refused, which they undo with
+  `allow everyone` and their rules set again. The router's pending denials
+  go through the same bound, so its work per message stays bounded too.
+- **The write lock.** Whether the change is known, or the binding full,
+  is read first without `BEGIN IMMEDIATE`, then read again under it, one
+  query that also counts the rows the eviction could forget. A full
+  binding's copy reads the rules without the lock too, and takes it only
+  when they would change: once the list denies everyone, or has the
+  copies already, a forged flood takes no write lock. Until then, each
+  change that copies a deny takes it once, at most about `MAX_DENIES`
+  times.
 - **Constraints.** The table's `CHECK`s take only two different ids shaped
   like Slack's conversation ids, as the ingress does.
 
@@ -9229,17 +9240,12 @@ interleaving: the view reads through `Store` with nothing to pause it
 between statements, and adding a hook only for that would be code the
 system doesn't need.
 
-An owner can grow their own agent's deny list without bound by forging
-changes toward ids the bot isn't in and letting them be given up: each
-give-up copies denies past `MAX_RULES`. Only the owner can, only on their
-own agent, and the cost is their own agent's rule list, so it is left.
-
 A change still waiting after `CHANNEL_CHANGE_TTL` is given up with a
 warning: its denies are copied to the new ids in the agent's rules for
 good (`Rules::copy_denies`), and the row is deleted. Its allows stay on
 the old id, which narrows access rather than widening it; the owner sees
 both in the agent's rules. A copy may take the deny list past
-`MAX_RULES`, since a deny never lets anyone in.
+`MAX_RULES`, since a deny never lets anyone in, up to `MAX_DENIES`.
 
 ### The rules move in one transaction, and a deny wins
 
@@ -9398,6 +9404,11 @@ by `event_id` under `slack:<binding>`.
   the ingress answers, which it makes for no event. A message in the new
   channel routed in the milliseconds before the record isn't covered
   either.
+- **The allows of a real share past the cap.** A binding that keeps 64
+  changes, none it can forget, copies the denies of the next one, but its
+  allows stay on the old id, so that channel refuses those the allows let
+  in until the owner allows it again. This takes more than 64 shares
+  waiting at once, during an outage, on one agent's bot.
 - **A store that refuses the one write that records it**, or, for a
   binding with no room, the write that copies its denies. This is logged
   as a warning.
@@ -9463,7 +9474,8 @@ The two reviews found nothing blocking. These items were fixed:
 
 Taken without code:
 
-- Forged give-ups growing an owner's deny list; see above.
+- Forged give-ups growing an owner's deny list (round 4 bounds it at
+  `MAX_DENIES`).
 - The migrations were edited in place before merging, so a dev database
   that applied an earlier version of them fails sqlx's checksum and needs
   a reset before the live check.
@@ -9488,3 +9500,31 @@ The light review found nothing blocking. These items were fixed:
 - `ChannelIdChangeLimits`' rustdoc says `kept` should be well above
   `waiting`. Nothing breaks if it isn't: a binding at `kept` with nothing
   to forget is refused as full and fails closed.
+
+### Review round 4
+
+The light review found nothing blocking. These items were fixed:
+
+- A forged flood against a full binding grew its agent's deny list by one
+  rule an event, without bound, each under the write lock. Copies now
+  stop at `MAX_DENIES` and deny everyone instead
+  (`copies_past_the_most_denies_deny_everyone_instead`,
+  `a_flood_of_changes_a_full_binding_has_no_room_for_keeps_the_deny_list_bounded`).
+  The two sentences the review quoted are corrected above.
+- A full binding is found without the write lock
+  (`a_known_change_or_a_full_binding_is_refused_without_the_write_lock`,
+  on a database file, with another connection holding the lock).
+- A full binding's copy reads the rules without the lock first. No test
+  shows that it skips the lock: agentd's tests use the one-connection
+  in-memory store, which has no second connection to hold it.
+- B: a change with no room carries the denies a waiting change brings to
+  its old id
+  (`a_change_with_no_room_carries_the_denies_a_waiting_change_brings_to_its_old_id`).
+- C: waiting changes may use all 64 kept slots, with the separate cap of
+  16 gone, so real bursts of up to 64 keep their allows. The cost is an
+  owner's forged waiting changes: up to 64 per binding take sweeper tries
+  and pending denials, both bounded, rather than 16. The allows lost past
+  64 are listed in "What can still lose a change"; `/agent me` doesn't
+  name them, since that would take a durable record of each.
+- D: the warnings for a change the store lost are throttled per binding.
+- E: design.md names the one cause of a full binding left.
