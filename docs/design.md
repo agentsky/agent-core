@@ -202,9 +202,9 @@ workspace the manager's powers. With a license, the same permissions form a
 custom role. Either way the manager is not an admin.
 
 A Community Edition server must also be able to report statistics to
-Rocket.Chat Cloud: one that never has, or hasn't for ten days, refuses every
-post, edit and upload with `restricted-workspace` until it does or gets a
-license.
+Rocket.Chat Cloud: one that never has, or hasn't for ten days, refuses posts
+and edits through the REST API and DDP, and the confirm step of uploads, with
+`restricted-workspace` until it does or gets a license.
 
 Custom slash commands on Rocket.Chat require an Apps-Engine app written in
 TypeScript[^rc-slash]. agent-core instead takes commands as DMs to the manager

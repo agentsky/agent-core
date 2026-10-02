@@ -1233,14 +1233,19 @@ as the bot. The caller supplies the email; T14 has to pick an address
 (`<name>@<something>.invalid` passes the default checks). With
 `Accounts_EmailVerification` on (off by default), password login refuses
 unverified emails (`validateLoginAttempt` in `startup.js`; live, HTTP 401
-`error-invalid-email`, which the client reports as `Unauthorized`), so such a
-server needs email 2FA auto opt-in off and `verified: true`.
+`error-invalid-email`, which the client reports as `Unauthorized`, though the
+saved logs don't keep that answer), so such a server needs email 2FA auto
+opt-in off and `verified: true`.
 
 ### What the server source says about the manager's custom role
 
 **Issue.** The design leaves the custom role open. The source narrows it
-down, and the live check confirmed every row (see
-[The live check against 7.13.9](#the-live-check-against-7139)):
+down, and the live check confirmed the rows agentd relies on (see
+[The live check against 7.13.9](#the-live-check-against-7139)). It didn't
+exercise `users.create` with `active` (agentd never sends it), the
+`manage-moderation-actions` alternative for `users.setActiveStatus`,
+`assign-admin-role` or `Accounts_AllowUserAvatarChange`; those rows rest on
+the source alone:
 
 | Operation | Permission checked | Where |
 | --- | --- | --- |
@@ -1342,8 +1347,9 @@ local clock, and the bounded maximum still applies. `Date` has whole seconds,
 so the wait can come out up to a second longer than the server's, never
 shorter. The default maximum is therefore 61 seconds, not the window's 60:
 live, a burst that hits the limit sees a reset about 60 s away, and with
-`Date` truncated the wait measured 60.13 s, which a 60 s maximum refused. `FakeRest::rate_limit_at` sends a 429 from a skewed server clock,
-with a `Date` in whole seconds and a reset measured from it.
+`Date` truncated the wait measured 60.13 s, which a 60 s maximum refused.
+`FakeRest::rate_limit_at` sends a 429 from a skewed server clock, with a
+`Date` in whole seconds and a reset measured from it.
 
 ### Uploads are capped and read once
 
@@ -1431,7 +1437,10 @@ login session without the `x-2fa-*` headers, while a token with the bypass
 passed. The manager's token must be created with the bypass. With a verified
 email and default settings, the password login itself answers 401
 `totp-required` with `method: "email"`, which is why bots are created with
-`verified: false`.
+`verified: false`. These refusals were seen during the run but the saved
+logs don't keep them: they hold only the within-grace success
+(`users.update name (manager PAT without bypass): ()`). They match the
+server source, and a rerun should save them.
 
 **A workspace that can't reach Rocket.Chat Cloud can't post.** 7.13.9 restricts
 a Community Edition workspace that hasn't reported statistics to
