@@ -256,8 +256,9 @@ impl Server {
     ///    then is dropped. If `abort` completes first, as a second shutdown
     ///    signal does, it is dropped at once instead.
     /// 3. With turns, every warm session's process and container is
-    ///    stopped, within what is left of the drain timeout. A forced
-    ///    shutdown skips it, and the next start reaps what is left.
+    ///    stopped, within what is left of the drain timeout. A drain that
+    ///    was cut short, by the timeout or by `abort`, skips it, and the
+    ///    next start reaps what is left.
     /// 4. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
@@ -411,23 +412,19 @@ impl Server {
                 }
             }
         };
-        let mut forced = false;
         let cut_short = tokio::select! {
             drained = tokio::time::timeout_at(deadline, drain) => {
                 drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
             }
-            () = &mut abort => {
-                forced = true;
-                Some("shutdown forced; dropping in-flight work")
-            }
+            () = &mut abort => Some("shutdown forced; dropping in-flight work"),
         };
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
-        if let Some(turns) = &turns
-            && !forced
-        {
+        if cut_short.is_some() && turns.is_some() {
+            tracing::warn!("leaving warm sandboxes for the next start to reap");
+        } else if let Some(turns) = &turns {
             let left = tokio::select! {
                 stopped = tokio::time::timeout_at(deadline, turns.sessions().stop_all()) => {
                     stopped.is_err().then_some("drain timeout elapsed")
