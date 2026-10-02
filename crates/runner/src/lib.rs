@@ -153,6 +153,9 @@ pub enum RunnerError {
 pub type Result<T, E = RunnerError> = std::result::Result<T, E>;
 
 #[cfg(test)]
+mod test_util;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
