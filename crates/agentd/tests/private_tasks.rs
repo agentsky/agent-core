@@ -1617,8 +1617,14 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
         )
         .await;
     stack.card_to("alice").await;
+    let upstream = stack.fake.message_requests().await.len();
     stack.approve(consent).await;
     let session = stack.running(consent).await;
+    let started = Instant::now();
+    while stack.fake.message_requests().await.len() == upstream {
+        assert!(started.elapsed() < WAIT, "the task never reached the model");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (store, alice) = (stack.store(), stack.alice);
     let billed = || async move {
         store
