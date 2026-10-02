@@ -3570,6 +3570,9 @@ leave the trust boundary the allowlist guards.
 that allowed the host (once one has) and the address, never the host. The
 log test sends secret-bearing hosts that are allowed, refused by the
 allowlist and refused by address, and finds none of them in the log.
+The port stays in refusal lines on purpose, even for denied hosts: it
+carries at most 16 bits a line at the rate of refused `CONNECT`s, and
+operators need it to tell a wrong port from a wrong host.
 
 ### Testing without the network
 
