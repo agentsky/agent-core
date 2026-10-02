@@ -1817,7 +1817,7 @@ async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
         ..Setup::default()
     })
     .await;
-    stack.next_turn(Turn::reply("Too late.").with_delay(Duration::from_secs(20)));
+    stack.next_turn(Turn::reply("Too late.").with_delay(Duration::from_secs(3)));
     let event = stack.event("alice", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]);
     stack
         .pipeline
@@ -1831,6 +1831,7 @@ async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
     .await;
     let Stack {
         pipeline,
+        turns,
         mock,
         stop,
         task,
@@ -1857,6 +1858,7 @@ async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
     assert_eq!(sent.len(), 1, "{calls:#?}");
     assert_eq!(sent[0].0, in_thread("GENERAL", Some("c1")));
     assert_eq!(sent[0].1, RESTARTING_TEXT);
+    turns.sessions().stop_all().await;
 }
 
 #[tokio::test]
@@ -1866,7 +1868,7 @@ async fn a_second_signal_while_a_turn_runs_cuts_it_short_at_once() {
         ..Setup::default()
     })
     .await;
-    stack.next_turn(Turn::reply("Too late.").with_delay(Duration::from_secs(20)));
+    stack.next_turn(Turn::reply("Too late.").with_delay(Duration::from_secs(3)));
     let event = stack.event("alice", "GENERAL", ConvKind::Channel, "f1", None, &[BOT]);
     stack
         .pipeline
@@ -1880,6 +1882,7 @@ async fn a_second_signal_while_a_turn_runs_cuts_it_short_at_once() {
     .await;
     let Stack {
         pipeline,
+        turns,
         mock,
         stop,
         abort,
@@ -1901,6 +1904,7 @@ async fn a_second_signal_while_a_turn_runs_cuts_it_short_at_once() {
     assert_eq!(sent.len(), 1, "{calls:#?}");
     assert_eq!(sent[0].0, in_thread("GENERAL", Some("f1")));
     assert_eq!(sent[0].1, RESTARTING_TEXT);
+    turns.sessions().stop_all().await;
 }
 
 #[tokio::test]
@@ -2424,6 +2428,7 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
     wait_until("the reply is being delivered", || posting.waiting() == 1).await;
     let Stack {
         pipeline,
+        turns,
         mock,
         stop,
         task,
@@ -2444,6 +2449,7 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
     assert_eq!(sent.len(), 1, "{calls:#?}");
     assert_eq!(sent[0].0, in_thread("GENERAL", Some("c2")));
     assert_eq!(sent[0].1, RESTARTING_TEXT);
+    turns.sessions().stop_all().await;
 }
 
 #[tokio::test]
