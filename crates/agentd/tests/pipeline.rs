@@ -1104,6 +1104,15 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     let sent = posts(&stack.calls_since(0));
     assert_eq!(sent[0].1, agentd::pipeline::LOGIN_EXPIRED_TEXT);
 
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let mut hop = stack.event("UWRITER", "GENERAL", ConvKind::Channel, "w1", None, &[BOT]);
+    hop.sender_is_bot = true;
+    hop.sender_bot_user = Some(UserId::new("UWRITER"));
+    let hopping = tokio::spawn({
+        let pipeline = stack.pipeline.clone();
+        async move { pipeline.handle(hop, MockSurface::DEFAULT_CAPS).await }
+    });
+
     let before = stack.mock.calls().len();
     stack.next_turn(Turn::crash());
     stack
@@ -1111,46 +1120,41 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
         .await;
     let sent = posts(&stack.calls_since(before));
     assert_eq!(sent[0].1, agentd::pipeline::FAILED_TEXT);
+    assert!(
+        !hopping.is_finished(),
+        "the writer's post waits for its attribution while another turn runs"
+    );
 
-    let writer = stack.other_agent("writer", "UWRITER").await;
     let bob = store.member_for_identity(&key("bob")).await.unwrap();
-    let by_writer = msg("GENERAL", "w1");
-    let recording = store.clone();
-    let recorded = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        recording
-            .record_message_ref(
-                &store::NewMessageRef {
-                    session: SessionId::new_v4(),
-                    msg: &by_writer,
-                    thread_root: None,
-                    agent: Some(writer),
-                    turn: Some(core_types::TurnId::new_v4()),
-                    requester: &core_types::Requester {
-                        member: bob,
-                        key: key("bob"),
-                    },
-                    hop: core_types::Hop(1),
-                    consent: None,
-                    hands_off: true,
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap();
-    });
     let before = stack.mock.calls().len();
     stack.next_turn(Turn::reply("Picking this up."));
-    let mut hop = stack.event("UWRITER", "GENERAL", ConvKind::Channel, "w1", None, &[BOT]);
-    hop.sender_is_bot = true;
-    hop.sender_bot_user = Some(UserId::new("UWRITER"));
-    stack.handle(hop).await;
-    recorded.await.unwrap();
+    store
+        .record_message_ref(
+            &store::NewMessageRef {
+                session: SessionId::new_v4(),
+                msg: &msg("GENERAL", "w1"),
+                thread_root: None,
+                agent: Some(writer),
+                turn: Some(core_types::TurnId::new_v4()),
+                requester: &core_types::Requester {
+                    member: bob,
+                    key: key("bob"),
+                },
+                hop: core_types::Hop(1),
+                consent: None,
+                hands_off: true,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    hopping.await.unwrap();
     let sent = posts(&stack.calls_since(before));
     assert_eq!(
         sent.len(),
         1,
-        "the writer's post is attributed a moment after it arrives, and still starts a turn"
+        "the writer's post, attributed only once a whole turn had run after it arrived, still \
+         starts a turn"
     );
     let attributed = store.posted_message_ref(&sent[0].2).await.unwrap().unwrap();
     assert_eq!(attributed.requester.key, key("bob"), "the hop is bob's");
@@ -1621,7 +1625,6 @@ async fn a_bots_message_that_cant_be_checked_gets_no_ask_to_try_again() {
     sink.send(stack.agents_post(BOT, "m1", "c1", &["UWRITER"]))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
     gate.open();
     stack.wait_for_posts(2).await;
     stack.pipeline.close();
@@ -2438,6 +2441,29 @@ async fn an_agents_post_that_names_no_other_agent_holds_no_lane_up() {
 }
 
 #[tokio::test]
+async fn an_agents_post_that_names_this_agent_waits_out_the_attribution_wait() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.attribution_wait = Duration::from_secs(1),
+        ..Setup::default()
+    })
+    .await;
+    stack.other_agent("writer", "UWRITER").await;
+    let before = stack.mock.calls().len();
+    let mut hop = stack.event("UWRITER", "GENERAL", ConvKind::Channel, "w1", None, &[BOT]);
+    hop.sender_is_bot = true;
+    hop.sender_bot_user = Some(UserId::new("UWRITER"));
+    let started = Instant::now();
+    stack.handle(hop).await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the post was ignored only once its attribution had been waited for: {:?}",
+        started.elapsed()
+    );
+    assert!(posts(&stack.calls_since(before)).is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn only_an_attributed_post_of_the_bot_is_shown_as_from_outside_the_session() {
     let stack = start().await;
     let first = stack.answered_root("r1", "First.").await;
@@ -2792,21 +2818,31 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
         "the platform's copy, arriving second, is dropped"
     );
     stack.next_turn(Turn::reply(reply).with_command(["agentctl", "post", "--to", "here", "later"]));
-    let gate = Gate::closed();
-    stack.holds.posts_of(reply, &gate);
     let later = Gate::closed();
     stack.holds.posts_of("later", &later);
-    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
-    sink.send(stack.event("bob", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]))
+    let gate = Gate::closed();
+    stack.holds.posts_of(reply, &gate);
+    let before = stack.mock.posts().len();
+    let next = format!("m{}", before + 1);
+    let copy = tokio::spawn({
+        let (pipeline, post) = (
+            stack.pipeline.clone(),
+            stack.agents_post(BOT, &next, "c2", &["UWRITER"]),
+        );
+        async move { pipeline.handle(post, MockSurface::DEFAULT_CAPS).await }
+    });
+    stack
+        .pipeline
+        .sink(MockSurface::DEFAULT_CAPS)
+        .send(stack.event("bob", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]))
         .await
         .unwrap();
     wait_until("helper's reply waits to be posted", || gate.waiting() == 1).await;
-    let before = stack.mock.posts().len();
-    let next = format!("m{}", before + 1);
-    sink.send(stack.agents_post(BOT, &next, "c2", &["UWRITER"]))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !copy.is_finished(),
+        "the platform's copy, which arrived before the turn that posts it ran, waits for its \
+         attribution"
+    );
     gate.open();
     let sent = stack.wait_for_posts(before + 2).await;
     assert_eq!(sent[before].2.id.as_str(), next);
@@ -2825,6 +2861,7 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
         "the platform's copy, which arrived before its attribution and waited for it, ran the hop"
     );
     later.open();
+    copy.await.unwrap();
     let unreacted = Call::Unreact {
         msg: msg("GENERAL", "c2"),
         emoji: "hourglass".into(),
