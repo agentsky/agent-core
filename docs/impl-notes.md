@@ -4437,8 +4437,9 @@ called, since the placeholder may have been pointed. A failed
 `turn_finished` is logged and returned in `TurnReport::finished`, and the
 process is stopped (with `process_stopping`), since the runner can't tell
 whether the placeholder is still pointed. A failed `process_stopping` is
-logged and the stop goes ahead, and it runs once more for that process
-after the container is stopped. Retrying only when it was called again
+logged and the stop goes ahead, and unless a later call for that process
+succeeds it runs once more after the container is stopped; a second
+failure is logged and given up on. Retrying only when it was called again
 missed manager-initiated stops: the process is taken from the session
 before the call, and a death event for a container already marked dead is
 ignored, so a failed revocation used to leave the agentctl token valid for

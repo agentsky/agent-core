@@ -191,8 +191,8 @@ struct TrackedState<H: TurnHooks> {
     last_used: Instant,
     /// The process running in it now.
     process: Option<Arc<H::Process>>,
-    /// Processes whose `process_stopping` failed or panicked: it runs again
-    /// for each once the container is stopped.
+    /// Processes whose last `process_stopping` failed or panicked: it runs
+    /// once more for each once the container is stopped.
     unrevoked: Vec<Arc<H::Process>>,
 }
 
@@ -224,8 +224,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A failed or panicking `process_starting` fails the turn and stops the
 /// container, and so does a process that fails or panics while starting. A
 /// panic in `process_stopping` is logged like its failure, and the stop goes
-/// ahead; the hook runs once more for that process when its container has
-/// been stopped.
+/// ahead; unless a later call for that process succeeds, the hook runs
+/// once more when its container has been stopped, and if that fails too
+/// the runner logs it and gives up.
 ///
 /// A turn reuses the session's warm process when its credential kind, its
 /// model and its mounts match, and otherwise stops it (and the container,
@@ -957,9 +958,10 @@ impl<H: TurnHooks> Inner<H> {
     /// If the sandbox fails to stop it, the session keeps holding it,
     /// marked dead, with its places under the caps: it may still be running,
     /// so no other process may resume its transcript, and the reaper tries
-    /// again. Once it is stopped, `process_stopping` runs again for every
-    /// process of it whose call failed, since the hook is idempotent and its
-    /// address may now go to another container.
+    /// again. Once it is stopped, `process_stopping` runs once more for
+    /// every process of it whose last call failed, since the hook is
+    /// idempotent and its address may now go to another container. A retry
+    /// that fails too is logged and not tried again.
     ///
     /// # Errors
     ///
@@ -978,6 +980,10 @@ impl<H: TurnHooks> Inner<H> {
         let unrevoked = std::mem::take(&mut held.tracked.state().unrevoked);
         for handle in &unrevoked {
             self.process_stopping(&held.tracked, handle).await;
+        }
+        let given_up = std::mem::take(&mut held.tracked.state().unrevoked).len();
+        if given_up > 0 {
+            tracing::warn!(session = %warm.session, given_up, "the process_stopping hook failed again after its container stopped; giving up, so what it revokes lasts until the session's next process or a restart");
         }
         lock(&self.containers).remove(held.container.id());
         warm.held = None;
@@ -1020,20 +1026,22 @@ impl<H: TurnHooks> Inner<H> {
 
     /// Calls `process_stopping` for a process of `tracked`'s container. A
     /// failure or a panic is logged, and the process is kept in
-    /// `unrevoked` for the call to run again once the
-    /// container is stopped.
+    /// `unrevoked` for the call to run once more when the container is
+    /// stopped; a success takes it out again.
     async fn process_stopping(&self, tracked: &Tracked<H>, handle: &Arc<H::Process>) {
         let session = &tracked.session;
         let stopped = AssertUnwindSafe(self.hooks.process_stopping(session, handle))
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err("the process_stopping hook panicked".into()));
+        let mut state = tracked.state();
         if let Err(error) = stopped {
             tracing::warn!(session = %session.id, %error, "the process_stopping hook failed");
-            let mut state = tracked.state();
             if !state.unrevoked.iter().any(|kept| Arc::ptr_eq(kept, handle)) {
                 state.unrevoked.push(Arc::clone(handle));
             }
+        } else {
+            state.unrevoked.retain(|kept| !Arc::ptr_eq(kept, handle));
         }
     }
 
