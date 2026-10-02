@@ -266,7 +266,12 @@ impl Server {
     ///    stopped, within what is left of the same timeout
     ///    ([`Pipeline::stop_sessions`]). A drain that was cut short, by the
     ///    timeout or by `abort`, skips it, and the next start reaps what is
-    ///    left.
+    ///    left. A stop that runs out of time or is cut short by `abort`
+    ///    leaves the sessions it already began stopping to finish in the
+    ///    background: their agentctl token revocations fail once the store
+    ///    is closed, which the runner logs as giving up, and the idle reaper
+    ///    they keep alive runs until the process exits. The next start
+    ///    purges the tokens and reaps the containers.
     /// 5. The pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown

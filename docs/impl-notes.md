@@ -2976,10 +2976,11 @@ needs more running at once widens the subnet in both `compose.yaml` and
 
 **Issue.** The design gives the manager a custom role. On 7.13.9,
 `roles.create` is registered in `apps/meteor/ee/server/api/roles.ts` with
-`license: ['custom-roles']` and refuses without that license module, and
-`roles.update` refuses for any role that isn't protected (built in). The
-Community Edition, which the Compose stack runs, can only change which
-built-in roles hold a permission (`permissions.update`, which needs
+`license: ['custom-roles']` and refuses without that license module.
+`roles.update` refuses too: [T11's live check](#the-live-check-against-7139)
+got the same `This is an enterprise feature` answer for the built-in `bot`
+role. The Community Edition, which the Compose stack runs, can only change
+which built-in roles hold a permission (`permissions.update`, which needs
 `access-permissions`).
 
 **Solution.** `deploy/compose/README.md` lists the permissions
@@ -5161,6 +5162,16 @@ With T23b's pipeline, `Server::run` reaches it through
 `Pipeline::stop_sessions`, once the turns and then the listeners have
 drained in time and before the pipeline is dropped. Turns cut short, or
 in-flight work dropped, skip it.
+
+A stop cut short, by the timeout or a second signal, still races the
+store's close for the sessions it had begun: `stop` runs each session's
+release in a task of its own, which dropping `stop_all` doesn't end. Those
+tasks go on after `Server::run` closes the store, so their
+`process_stopping` revocations fail and the runner logs that it gives up,
+and the idle reaper, which they keep alive, runs until the process exits.
+The next start's `purge` deletes the agentctl tokens and `reap_orphans`
+stops the containers. Waiting for those tasks would take the time the
+deadline or the second signal just refused.
 
 ### A process sandbox gives every container one address
 
