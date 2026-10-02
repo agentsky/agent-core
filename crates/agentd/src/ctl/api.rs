@@ -338,10 +338,10 @@ async fn stage(
 }
 
 /// Whether `name` is a plain file name, never a path: at most 255 bytes,
-/// not `.` or `..`, with no slash, backslash, control or invisible
-/// formatting character.
+/// not only whitespace, not `.` or `..`, with no slash, backslash, control
+/// or invisible formatting character.
 pub(crate) fn is_plain_file_name(name: &str) -> bool {
-    !name.is_empty()
+    !name.trim().is_empty()
         && name.len() <= MAX_NAME_LEN
         && name != "."
         && name != ".."
@@ -357,8 +357,8 @@ fn attachment_name(name: &str) -> Result<String, ApiError> {
     } else {
         Err(error(
             CtlErrorCode::BadRequest,
-            "the attachment name must be a plain file name of at most 255 bytes, with no \
-             control or invisible formatting characters",
+            "the attachment name must be a plain file name of at most 255 bytes, not only \
+             whitespace, with no control or invisible formatting characters",
         ))
     }
 }
@@ -697,6 +697,9 @@ mod tests {
         assert_eq!(attachment_name("résumé 1.txt").unwrap(), "résumé 1.txt");
         for bad in [
             "",
+            " ",
+            "   ",
+            "\u{3000}",
             ".",
             "..",
             "a/b",
