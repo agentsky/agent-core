@@ -130,9 +130,9 @@ pub struct ClaudeProcess {
     credential: CredentialKind,
     model: Option<String>,
     turn_timeout: Duration,
-    /// Declared before `stdin`, so a drop kills a process still waiting
-    /// for input instead of closing its input first and killing it in the
-    /// middle of exiting.
+    /// Declared before `stdin`, so a drop under a process sandbox kills a
+    /// process still waiting for input instead of closing its input first
+    /// and killing it in the middle of exiting.
     child: ChildHandle,
     stdin: Pin<Box<dyn AsyncWrite + Send>>,
     stdout: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
@@ -512,11 +512,10 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_process_kills_it_before_closing_its_stdin() {
-        let dir = std::env::temp_dir().join(format!("runner-drop-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = crate::test_util::TempDir::new();
         let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
         let store = store::Store::open_in_memory(sealer).await.unwrap();
-        let sandbox = sandbox::ProcessSandbox::new(store, dir.clone()).unwrap();
+        let sandbox = sandbox::ProcessSandbox::new(store, dir.0.clone()).unwrap();
         let volume = sandbox
             .ensure_volume(&core_types::VolumeKey {
                 agent: core_types::AgentId::new_v4(),
@@ -524,9 +523,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let spec = sandbox::SessionSpec::new(session(), volume, "unused", dir.join("persona"));
+        let spec = sandbox::SessionSpec::new(session(), volume, "unused", dir.0.join("persona"));
         let container = sandbox.start(&spec).await.unwrap();
-        let pid_file = dir.join("pid");
+        let pid_file = dir.0.join("pid");
         let script = format!("echo $$ > '{}'; exec cat >/dev/null", pid_file.display());
         let argv = ["/bin/sh", "-c", &script].map(str::to_owned);
         let io = sandbox
@@ -556,7 +555,6 @@ mod tests {
             process_total_cost_usd: Ok(0.0),
         };
         drop(process);
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             killed_first.load(std::sync::atomic::Ordering::SeqCst),
             "the process's stdin closed before it was killed, so it could start exiting"

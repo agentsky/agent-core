@@ -1653,9 +1653,10 @@ caller needs `user-generate-access-token` for another user, which only
 returns a login (resume) token, which expires after `Accounts_LoginExpiration`
 (90 days by default) and counts against the user's login-token limit.
 
-**Solution.** Use the other route, which works for a manager with only a
-custom role: `RestClient::issue_bot_token` logs in as the bot with its random
-password (`POST login`), calls `users.generatePersonalAccessToken`, then
+**Solution.** Use the other route, which works for a manager with only the
+roles the design gives it: `RestClient::issue_bot_token` logs in as the bot
+with its random password (`POST login`), calls
+`users.generatePersonalAccessToken`, then
 `POST logout`s the login session. A personal access token doesn't expire. The
 manager needs no permission for this step. The password is generated in
 `create_bot_user`, held in a `BotPassword` that can't be cloned or
@@ -2027,7 +2028,7 @@ set it.
 
 **Solution.** `BotRoles` reads roles with `users.info` and remembers them for
 ten minutes. agentd builds one from the manager's client and shares it
-between every surface, so the manager's role also needs
+between every surface, so the manager's roles also need
 `view-full-other-user-info`; on the Community Edition the admin adds it to
 `app` ([T11's live check](#the-live-check-against-7139)), and the design's
 Rocket.Chat section says so. A sender is a bot when the message has a
@@ -2261,7 +2262,7 @@ open the manager bot's DM with the member. Rocket.Chat's `im.create` takes a
 **Solution.** `RocketChatDms` calls `users.info` for the username, then
 `im.create`, which returns the existing DM when there is one. To keep the
 common case to one call (the manager is subject to the REST rate limiter
-unless its role has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
+unless one of its roles has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
 the DM's room, which the event already names, and a reply there posts
 straight to it. The plan's `RocketChatDm` had no field; the T13 bullet
 says so now. `Origin::SlackSlash`'s `response_url` is a `SecretString`,
@@ -2364,7 +2365,7 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   because deriving it from the URL would change every stored identity when
   the URL changes.
 - The manager bot now posts every command reply, and `users.info` plus
-  `im.create` for a channel command, so its role should include
+  `im.create` for a channel command, so its roles should include
   `api-bypass-rate-limit`, as the T11 note on the role expected; the
   README says so. The built-in `bot` and `app` roles the manager holds on
   the Community Edition already have it, and `create-d` for `im.create`
@@ -2611,7 +2612,7 @@ yet.
 ### A bot sets its own avatar
 
 **Issue.** Setting another user's avatar needs `edit-other-user-avatar`
-(T11's table), one more permission for the manager's role.
+(T11's table), one more permission for the manager's roles.
 
 **Solution.** The new bot sets `rocketchat.avatar_url` as its own avatar
 with its token, which Rocket.Chat allows while `Accounts_AllowUserAvatarChange`
@@ -2918,8 +2919,9 @@ key named one.
 display text and is refused if it holds `/`, `\`, a control character, an
 invisible formatting character (bidirectional controls such as U+202E, which
 can make `exe.txt` read as `txt.exe`, zero-width characters, tag characters,
-or a line or paragraph separator), or is `.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
-directory, and startup empties `ctl-outbox/`. The cap is
+or a line or paragraph separator), or is only whitespace, `.` or `..`.
+Dropping the `Outbox` that `end_turn` returns deletes the directory, and
+startup empties `ctl-outbox/`. The cap is
 `limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
 files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in
 flight count against the 10.
@@ -5263,11 +5265,12 @@ anywhere, and ends up mounted into sandboxes.
 **Solution.** `skills::package` checks every skill the same way, whatever
 it came from: at most 10 MB of files, 1,000 files and directories, 16
 levels and paths of 1,024 bytes (so a deep tree of long names is refused
-before the file system answers `ENAMETOOLONG`); names without an empty, `.`
-or `..` part, `\`, control or invisible formatting characters; only regular
-files and directories (a symlink or a special file in a zip is refused; a
-clone checks symlinks out as plain files holding their targets, and a
-symlink found in any tree is refused); modes rewritten to
+before the file system answers `ENAMETOOLONG`); names without an empty,
+whitespace-only, `.` or `..` part, `\`, control or invisible formatting
+characters; only regular files and directories (a symlink or a special
+file in a zip is refused; a clone checks symlinks out as plain files
+holding their targets, and a symlink found in any tree is refused); modes
+rewritten to
 `0755` for directories and `0644`, or `0755` with an execute bit, for files.
 A `.zip` is read with the `zip` crate (MIT) with only
 `deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`
@@ -5407,7 +5410,10 @@ runner reaps every exit it sees, a crash, a refused resume or a failed
 write, before the turn returns. What is left for a drop to kill is a
 warm process a `SessionManager` holds when a test ends, which waits for
 input and has nothing to write; the tests wait for the stops they start,
-and agentd's drain for the turns in flight. `ProcessChild::drop` keeps
+and agentd's graceful drain for the turns in flight. A drain timeout or a
+second signal returns without waiting for the turns it cuts short, which
+run on in the runner's own tasks, so a test that cuts turns short calls
+`stop_all` on the sessions before it returns. `ProcessChild::drop` keeps
 killing at once: waiting there would block a runtime thread.
 
 ### A stand-in `git` is written by a child process
