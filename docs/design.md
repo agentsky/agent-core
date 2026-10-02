@@ -262,7 +262,7 @@ custom role. Either way the manager is not an admin.
 
 A Community Edition server must also be able to report statistics to
 Rocket.Chat Cloud: one that never has, or hasn't for ten days, refuses posts
-and edits through the REST API and DDP, and the confirm step of uploads, with
+and edits through the REST API, and the confirm step of uploads, with
 `restricted-workspace` until it does or gets a license.
 
 Custom slash commands on Rocket.Chat require an Apps-Engine app written in
