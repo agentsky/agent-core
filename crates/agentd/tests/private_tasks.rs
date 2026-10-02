@@ -1566,6 +1566,7 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
         )
         .await;
     stack.card_to("alice").await;
+    let upstream = stack.fake.message_requests().await.len();
     stack.approve(consent).await;
     let started = Instant::now();
     let session = loop {
@@ -1577,10 +1578,11 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
             .unwrap()
             .private_session
             && stack.turns.sessions().is_warm(session)
+            && stack.fake.message_requests().await.len() > upstream
         {
             break session;
         }
-        assert!(started.elapsed() < WAIT, "the task never started");
+        assert!(started.elapsed() < WAIT, "the task never reached the model");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let (store, alice) = (stack.store(), stack.alice);
