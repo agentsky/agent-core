@@ -747,8 +747,8 @@ impl RestClient {
     /// Rocket.Chat answers an unknown id with a bare `{"success": false}`
     /// (HTTP 400, no code), which this maps to [`SurfaceError::NotFound`]
     /// carrying `message`. Any other 400 without a code, such as an empty
-    /// body or a proxy's error page, stays [`SurfaceError::Api`]. A message in a room the caller can't see is
-    /// [`SurfaceError::Forbidden`].
+    /// body or a proxy's error page, stays [`SurfaceError::Api`]. A message
+    /// in a room the caller can't see is [`SurfaceError::Forbidden`].
     pub async fn get_message(&self, message: &MessageId) -> Result<Message> {
         let found: MessageEnvelope = self
             .call(Call::get("chat.getMessage").query("msgId", message.as_str()))
