@@ -5160,8 +5160,8 @@ at the next start stops what is left either way.
 
 With T23b's pipeline, `Server::run` reaches it through
 `Pipeline::stop_sessions`, once the turns and then the listeners have
-drained in time and before the pipeline is dropped. Turns cut short, or
-in-flight work dropped, skip it.
+drained in time and before the pipeline is dropped. Turns cut short,
+in-flight work dropped, or a drain that ends with no time left skip it.
 
 A stop cut short, by the timeout or a second signal, still races the
 store's close for the sessions it had begun: `stop` runs each session's
