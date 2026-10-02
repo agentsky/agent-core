@@ -2027,10 +2027,11 @@ set it.
 
 **Solution.** `BotRoles` reads roles with `users.info` and remembers them for
 ten minutes. agentd builds one from the manager's client and shares it
-between every surface, so the manager's custom role also needs
-`view-full-other-user-info`; the design's Rocket.Chat section says so now. A
-sender is a bot when the message has a non-false `bot` field or the sender has
-the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
+between every surface, so the manager's role also needs
+`view-full-other-user-info`; on the Community Edition the admin adds it to
+`app` ([T11's live check](#the-live-check-against-7139)), and the design's
+Rocket.Chat section says so. A sender is a bot when the message has a
+non-false `bot` field or the sender has the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
 only to the user itself and to the manager.
 
 Without the permission, `users.info` leaves `roles` out rather than
