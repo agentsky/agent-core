@@ -2735,6 +2735,11 @@ known without a live capture, and refusing one it needs would break turns.
 The plan's Deferred work has an entry for a path allowlist. Methods are
 limited already (see the refusal table).
 
+Since the sandbox chooses the path, it is never logged: a path could carry
+whatever the sandbox wants written into agentd's logs. "forwarded a
+request" names the session, method and status only, and the log test sends
+a secret-bearing path and query and finds neither in the log.
+
 ## T22: router
 
 ### The plan and the design name no order for the checks
