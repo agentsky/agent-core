@@ -983,7 +983,12 @@ impl<H: TurnHooks> Inner<H> {
         }
         let given_up = std::mem::take(&mut held.tracked.state().unrevoked).len();
         if given_up > 0 {
-            tracing::warn!(session = %warm.session, given_up, "the process_stopping hook failed again after its container stopped; giving up, so what it revokes lasts until the session's next process or a restart");
+            tracing::warn!(
+                session = %warm.session,
+                given_up,
+                "the process_stopping hook failed again after its container stopped; giving \
+                 up, so what it revokes lasts until the session's next process or a restart"
+            );
         }
         lock(&self.containers).remove(held.container.id());
         warm.held = None;
