@@ -55,7 +55,7 @@ pub struct SandboxConfig {
     #[serde(default = "default_memory_mb")]
     pub memory_mb: u64,
     /// CPU limit per sandbox, in CPUs: at least 0.01, Docker's minimum, and
-    /// at most 1024. Docker receives it as [`nano_cpus`](Self::nano_cpus).
+    /// at most 1024. Docker receives it in billionths of a CPU.
     #[serde(default = "default_cpus")]
     pub cpus: f64,
     /// Maximum number of processes per sandbox.
@@ -161,12 +161,12 @@ impl SandboxConfig {
         }
     }
 
-    /// [`cpus`](Self::cpus) in billionths of a CPU, rounded down, as Docker's
-    /// `NanoCpus` takes it. Docker reads 0 as no limit at all, so
-    /// [`validate`](Self::validate) refuses any `cpus` this makes less than
-    /// 0.01 CPU, NaN included.
-    pub fn nano_cpus(&self) -> i64 {
-        (self.cpus * 1e9) as i64
+    /// [`cpus`](Self::cpus) in billionths of a CPU, rounded to the nearest,
+    /// as Docker's `NanoCpus` takes it. Docker reads 0 as no limit at all,
+    /// so [`validate`](Self::validate) refuses any `cpus` this makes less
+    /// than 0.01 CPU, NaN included.
+    pub(crate) fn nano_cpus(&self) -> i64 {
+        (self.cpus * 1e9).round() as i64
     }
 
     /// Checks what serde can't.
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn out_of_range_values_name_their_key() {
         type Change = fn(&mut SandboxConfig);
-        let cases: [(&str, Change); 23] = [
+        let cases: [(&str, Change); 25] = [
             ("image", |c| c.image = " ".into()),
             ("network", |c| c.network = String::new()),
             ("network", |c| c.network = "host".into()),
@@ -324,6 +324,8 @@ mod tests {
             ("cpus", |c| c.cpus = f64::NAN),
             ("cpus", |c| c.cpus = 1e-10),
             ("cpus", |c| c.cpus = 0.0099),
+            ("cpus", |c| c.cpus = -1.0),
+            ("cpus", |c| c.cpus = f64::NEG_INFINITY),
             ("pids_limit", |c| c.pids_limit = 0),
             ("tmp_size_mb", |c| c.tmp_size_mb = 0),
             ("stop_timeout_secs", |c| {
@@ -350,6 +352,8 @@ mod tests {
         config.cpus = 0.01;
         config.validate().unwrap();
         assert_eq!(config.nano_cpus(), MIN_NANO_CPUS);
+        config.cpus = 2.01;
+        assert_eq!(config.nano_cpus(), 2_010_000_000);
         config.cpus = 1024.0;
         config.validate().unwrap();
         config.cpus = f64::INFINITY;
