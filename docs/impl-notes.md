@@ -1653,9 +1653,10 @@ caller needs `user-generate-access-token` for another user, which only
 returns a login (resume) token, which expires after `Accounts_LoginExpiration`
 (90 days by default) and counts against the user's login-token limit.
 
-**Solution.** Use the other route, which works for a manager with only a
-custom role: `RestClient::issue_bot_token` logs in as the bot with its random
-password (`POST login`), calls `users.generatePersonalAccessToken`, then
+**Solution.** Use the other route, which works for a manager with only the
+roles the design gives it: `RestClient::issue_bot_token` logs in as the bot
+with its random password (`POST login`), calls
+`users.generatePersonalAccessToken`, then
 `POST logout`s the login session. A personal access token doesn't expire. The
 manager needs no permission for this step. The password is generated in
 `create_bot_user`, held in a `BotPassword` that can't be cloned or
@@ -2027,7 +2028,7 @@ set it.
 
 **Solution.** `BotRoles` reads roles with `users.info` and remembers them for
 ten minutes. agentd builds one from the manager's client and shares it
-between every surface, so the manager's role also needs
+between every surface, so the manager's roles also need
 `view-full-other-user-info`; on the Community Edition the admin adds it to
 `app` ([T11's live check](#the-live-check-against-7139)), and the design's
 Rocket.Chat section says so. A sender is a bot when the message has a
@@ -2261,7 +2262,7 @@ open the manager bot's DM with the member. Rocket.Chat's `im.create` takes a
 **Solution.** `RocketChatDms` calls `users.info` for the username, then
 `im.create`, which returns the existing DM when there is one. To keep the
 common case to one call (the manager is subject to the REST rate limiter
-unless its role has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
+unless one of its roles has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
 the DM's room, which the event already names, and a reply there posts
 straight to it. The plan's `RocketChatDm` had no field; the T13 bullet
 says so now. `Origin::SlackSlash`'s `response_url` is a `SecretString`,
@@ -2364,7 +2365,7 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   because deriving it from the URL would change every stored identity when
   the URL changes.
 - The manager bot now posts every command reply, and `users.info` plus
-  `im.create` for a channel command, so its role should include
+  `im.create` for a channel command, so its roles should include
   `api-bypass-rate-limit`, as the T11 note on the role expected; the
   README says so. The built-in `bot` and `app` roles the manager holds on
   the Community Edition already have it, and `create-d` for `im.create`
