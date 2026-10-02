@@ -17,7 +17,7 @@ use core_types::{
     Side, SurfaceKind, ThreadKey, TurnId, TurnKind,
 };
 use runner::{PoolConfig, ProcessConfig, SessionStart, TurnOutcome, TurnRequest};
-use sandbox::ProcessSandbox;
+use sandbox::{ProcessSandbox, Sandbox as _};
 use secrecy::SecretString;
 use store::NewClaudeLink;
 use testkit::{FakeAnthropic, Turn, agentctl_path, fake_anthropic, fake_claude_path, write_script};
@@ -35,7 +35,9 @@ struct Running {
     fake: FakeAnthropic,
     member: MemberId,
     script: std::path::PathBuf,
+    sandbox: Arc<ProcessSandbox>,
     stop: oneshot::Sender<()>,
+    abort: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
     dir: TempDir,
 }
@@ -82,15 +84,20 @@ async fn start(turns: &[Turn]) -> Running {
     let script = dir.path().join("script.json");
     write_script(&script, turns).unwrap();
     let settings = settings(server.addrs(), claude, agentctl, &script, dir.path());
-    let sandbox = ProcessSandbox::new(app.store().clone(), dir.path()).unwrap();
-    let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
+    let sandbox = Arc::new(ProcessSandbox::new(app.store().clone(), dir.path()).unwrap());
+    let turns = Turns::start(&app, Arc::clone(&sandbox) as _, settings).unwrap();
     let server = server.with_turns(turns.clone());
     let (stop, stopped) = oneshot::channel::<()>();
+    let (abort, aborted) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
         async {
             let _ = stopped.await;
         },
-        std::future::pending(),
+        async {
+            if aborted.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        },
     ));
     Running {
         app,
@@ -98,7 +105,9 @@ async fn start(turns: &[Turn]) -> Running {
         fake,
         member,
         script,
+        sandbox,
         stop,
+        abort,
         task,
         dir,
     }
@@ -179,10 +188,62 @@ impl Running {
     }
 
     async fn stop(self) {
+        self.shut_down(false).await;
+    }
+
+    /// Shuts agentd down, forced at once by a second signal if `forced`.
+    async fn shut_down(self, forced: bool) {
+        if forced {
+            self.abort.send(()).unwrap();
+        }
         self.stop.send(()).unwrap();
         self.task.await.unwrap().unwrap();
         drop(self.dir);
     }
+
+    /// A session of a new agent in thread `root`, after one turn, so its
+    /// sandbox is warm.
+    async fn warm_session(&self, root: &str) -> core_types::SessionId {
+        let agent = AgentId::new_v4();
+        runner::write_persona(self.dir.path(), agent, "You are a test.\n")
+            .await
+            .unwrap();
+        let thread = thread(root);
+        let scope = ScopeKey::Channel(thread.conv.clone());
+        let sessions = self.turns.sessions();
+        let session = sessions
+            .lookup_or_create(agent, &thread, &scope)
+            .await
+            .unwrap();
+        let report = sessions
+            .run_turn(session.id, self.request(root))
+            .await
+            .unwrap();
+        assert!(report.outcome.is_success(), "{:?}", report.outcome);
+        assert!(sessions.is_warm(session.id));
+        assert_eq!(self.sandbox.list_managed().await.unwrap().len(), 1);
+        session.id
+    }
+}
+
+#[tokio::test]
+async fn a_graceful_shutdown_stops_warm_sandboxes() {
+    let running = start(&[Turn::reply("warm")]).await;
+    let session = running.warm_session("m1").await;
+    let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
+    running.stop().await;
+    assert!(!turns.sessions().is_warm(session));
+    assert_eq!(sandbox.list_managed().await.unwrap(), []);
+}
+
+#[tokio::test]
+async fn a_forced_shutdown_leaves_warm_sandboxes_to_the_next_start() {
+    let running = start(&[Turn::reply("warm")]).await;
+    let session = running.warm_session("m1").await;
+    let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
+    running.shut_down(true).await;
+    assert!(turns.sessions().is_warm(session));
+    assert_eq!(sandbox.list_managed().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

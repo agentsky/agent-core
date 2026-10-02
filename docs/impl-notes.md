@@ -4945,6 +4945,21 @@ checkout is. `docker_startup_reaps_only_this_instances_sandboxes` plants a
 container labeled with the configured instance and a session, and one
 without labels, and checks that `connect_docker` removes only the first.
 
+### A graceful shutdown stops warm sandboxes
+
+**Issue.** Dropping the runner only aborts its reaper and event follower,
+so every warm container outlived a graceful shutdown with its process
+running, until the next start's `reap_orphans`. With no next start, or a
+different `instance`, nothing stopped them.
+
+**Solution.** `SessionManager::stop_all` stops every session as `stop`
+does, all at once, after its queued turns, with `process_stopping` for
+each process. `Server::run` calls it after the drain and before closing the
+store, which the hooks need, within what is left of
+`server.drain_timeout_secs`. A forced shutdown skips it, and a second
+signal during it cuts it short; `reap_orphans` at the next start stops what
+is left either way.
+
 ### A process sandbox gives every container one address
 
 **Issue.** `ProcessSandbox::ip` answers `127.0.0.1` for every container,

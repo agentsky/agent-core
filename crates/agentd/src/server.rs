@@ -255,7 +255,10 @@ impl Server {
     ///    `server.drain_timeout_secs` to finish. Whatever is still running
     ///    then is dropped. If `abort` completes first, as a second shutdown
     ///    signal does, it is dropped at once instead.
-    /// 3. The store is closed.
+    /// 3. With turns, every warm session's process and container is
+    ///    stopped, within what is left of the drain timeout. A forced
+    ///    shutdown skips it, and the next start reaps what is left.
+    /// 4. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
@@ -286,6 +289,7 @@ impl Server {
         } = self;
         let drain_timeout = app.config().server.drain_timeout();
         let (stop, stopping) = watch::channel(false);
+        tokio::pin!(abort);
 
         let mut tasks = JoinSet::new();
         tasks.spawn(serve_listener(
@@ -398,6 +402,7 @@ impl Server {
             "shutting down: no longer accepting connections"
         );
         stop.send_replace(true);
+        let deadline = tokio::time::Instant::now() + drain_timeout;
 
         let drain = async {
             while let Some(joined) = tasks.join_next().await {
@@ -406,15 +411,32 @@ impl Server {
                 }
             }
         };
+        let mut forced = false;
         let cut_short = tokio::select! {
-            drained = tokio::time::timeout(drain_timeout, drain) => {
+            drained = tokio::time::timeout_at(deadline, drain) => {
                 drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
             }
-            () = abort => Some("shutdown forced; dropping in-flight work"),
+            () = &mut abort => {
+                forced = true;
+                Some("shutdown forced; dropping in-flight work")
+            }
         };
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
+        }
+        if let Some(turns) = &turns
+            && !forced
+        {
+            let left = tokio::select! {
+                stopped = tokio::time::timeout_at(deadline, turns.sessions().stop_all()) => {
+                    stopped.is_err().then_some("drain timeout elapsed")
+                }
+                () = &mut abort => Some("shutdown forced"),
+            };
+            if let Some(reason) = left {
+                tracing::warn!("{reason}; leaving warm sandboxes for the next start to reap");
+            }
         }
         drop(turns);
         app.store().close().await;

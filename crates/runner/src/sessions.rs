@@ -430,6 +430,14 @@ impl<H: TurnHooks> SessionManager<H> {
         }
     }
 
+    /// [`stop`](Self::stop)s every session, all at once, so a shutdown
+    /// leaves no warm container running. Each waits for its session's
+    /// queued turns first.
+    pub async fn stop_all(&self) {
+        let sessions: Vec<SessionId> = lock(&self.inner.slots).keys().copied().collect();
+        futures::future::join_all(sessions.into_iter().map(|session| self.stop(session))).await;
+    }
+
     /// Whether `session` has a warm container, or a turn running.
     pub fn is_warm(&self, session: SessionId) -> bool {
         let slot = lock(&self.inner.slots).get(&session).cloned();
