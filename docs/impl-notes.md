@@ -4437,7 +4437,12 @@ called, since the placeholder may have been pointed. A failed
 `turn_finished` is logged and returned in `TurnReport::finished`, and the
 process is stopped (with `process_stopping`), since the runner can't tell
 whether the placeholder is still pointed. A failed `process_stopping` is
-logged and the stop goes ahead.
+logged and the stop goes ahead, and it runs once more for that process
+after the container is stopped. Retrying only when it was called again
+missed manager-initiated stops: the process is taken from the session
+before the call, and a death event for a container already marked dead is
+ignored, so a failed revocation used to leave the agentctl token valid for
+the next container on the address.
 
 A panic in `process_starting` is taken for its failure, and one in
 `process_stopping` is logged and the stop goes ahead: otherwise a panic in
@@ -4551,6 +4556,10 @@ yet, and the send clears it: a resumed process whose first turn failed in
 didn't start the process. Judged by whether the turn started the process,
 that refusal came back as an error result, the turn didn't run again, and
 its message was lost.
+
+If the store fails to mark the session unstarted, the turn fails with
+`RunnerError::Store` instead of running again: the session still reads as
+started, so the second run would `--resume` and be refused again.
 
 ### What is durable
 

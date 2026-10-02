@@ -176,8 +176,9 @@ pub trait TurnHooks: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Any failure. It is logged, and the stop goes ahead. A panic is
-    /// handled the same way.
+    /// Any failure. It is logged, and the stop goes ahead; the runner calls
+    /// it once more for the process after stopping its container. A panic
+    /// is handled the same way.
     async fn process_stopping(
         &self,
         session: &Session,

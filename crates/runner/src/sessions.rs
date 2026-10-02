@@ -191,6 +191,9 @@ struct TrackedState<H: TurnHooks> {
     last_used: Instant,
     /// The process running in it now.
     process: Option<Arc<H::Process>>,
+    /// Processes whose `process_stopping` failed or panicked: it runs again
+    /// for each once the container is stopped.
+    unrevoked: Vec<Arc<H::Process>>,
 }
 
 impl<H: TurnHooks> Tracked<H> {
@@ -221,7 +224,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A failed or panicking `process_starting` fails the turn and stops the
 /// container, and so does a process that fails or panics while starting. A
 /// panic in `process_stopping` is logged like its failure, and the stop goes
-/// ahead.
+/// ahead; the hook runs once more for that process when its container has
+/// been stopped.
 ///
 /// A turn reuses the session's warm process when its credential kind, its
 /// model and its mounts match, and otherwise stops it (and the container,
@@ -241,7 +245,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// refuses a `--resume` for want of a transcript
 /// ([`TurnOutcome::resume_refused`] on the first turn sent to a process
 /// started with [`SessionStart::Resume`]), the session is marked unstarted
-/// and the turn runs again, once, with `--session-id` under the same id.
+/// and the turn runs again, once, with `--session-id` under the same id. If
+/// the store fails to mark it, the turn fails with [`RunnerError::Store`]
+/// instead, since running it again would `--resume` again.
 ///
 /// Before a turn goes to an unstarted session's CLI, the store records
 /// that the session may have started; the turn's end clears it once the
@@ -568,6 +574,9 @@ impl<H: TurnHooks> Inner<H> {
     /// called. After any panic, `turn_finished`'s included, the turn is
     /// recorded if it has an outcome and the process is stopped as after a
     /// failed `turn_finished`; then the panic resumes.
+    ///
+    /// A refusal the store fails to record comes back as
+    /// [`RunnerError::Store`], so the turn isn't run again.
     async fn exchange(
         &self,
         warm: &mut Warm<H>,
@@ -588,7 +597,7 @@ impl<H: TurnHooks> Inner<H> {
         let sent = AssertUnwindSafe(self.send(session, &handle, running, request))
             .catch_unwind()
             .await;
-        let outcome = sent.unwrap_or_else(|panic| {
+        let mut outcome = sent.unwrap_or_else(|panic| {
             panicked = Some(panic);
             Err(RunnerError::TurnTask)
         });
@@ -604,20 +613,24 @@ impl<H: TurnHooks> Inner<H> {
         } else if panicked.is_some() {
             tracing::warn!(session = %session.id, "the turn panicked; stopping the process");
         }
-        if let Ok((outcome, refused)) = &outcome {
-            let recorded = if *refused {
+        if let Ok((turn, refused)) = &outcome {
+            let refused = *refused;
+            let recorded = if refused {
                 self.store.mark_session_unstarted(session.id).await
             } else {
                 self.store
                     .record_session_turn(
                         session.id,
-                        outcome.stats().init_seen,
+                        turn.stats().init_seen,
                         OffsetDateTime::now_utc(),
                     )
                     .await
             };
             if let Err(error) = recorded {
                 tracing::warn!(session = %session.id, %error, "recording the turn failed");
+                if refused {
+                    outcome = Err(error.into());
+                }
             }
         }
         let dead = {
@@ -779,7 +792,7 @@ impl<H: TurnHooks> Inner<H> {
             }
             Err(error) => {
                 held.tracked.state().process = None;
-                self.process_stopping(session, &handle).await;
+                self.process_stopping(&held.tracked, &handle).await;
                 self.release_container(warm).await.ok();
                 Err(error)
             }
@@ -817,6 +830,7 @@ impl<H: TurnHooks> Inner<H> {
                 dead: false,
                 last_used: Instant::now(),
                 process: None,
+                unrevoked: Vec::new(),
             }),
         });
         lock(&self.containers).insert(container.id().clone(), Arc::clone(&tracked));
@@ -943,7 +957,9 @@ impl<H: TurnHooks> Inner<H> {
     /// If the sandbox fails to stop it, the session keeps holding it,
     /// marked dead, with its places under the caps: it may still be running,
     /// so no other process may resume its transcript, and the reaper tries
-    /// again.
+    /// again. Once it is stopped, `process_stopping` runs again for every
+    /// process of it whose call failed, since the hook is idempotent and its
+    /// address may now go to another container.
     ///
     /// # Errors
     ///
@@ -959,6 +975,10 @@ impl<H: TurnHooks> Inner<H> {
             return Err(error.into());
         }
         tracing::info!(session = %warm.session, container = %held.container.id(), "stopped a session container");
+        let unrevoked = std::mem::take(&mut held.tracked.state().unrevoked);
+        for handle in &unrevoked {
+            self.process_stopping(&held.tracked, handle).await;
+        }
         lock(&self.containers).remove(held.container.id());
         warm.held = None;
         self.idle.notify_waiters();
@@ -973,8 +993,7 @@ impl<H: TurnHooks> Inner<H> {
             return false;
         };
         held.tracked.state().process = None;
-        self.process_stopping(&held.tracked.session, &running.handle)
-            .await;
+        self.process_stopping(&held.tracked, &running.handle).await;
         running.process.stop().await;
         running.process.may_be_alive()
     }
@@ -999,14 +1018,22 @@ impl<H: TurnHooks> Inner<H> {
         })
     }
 
-    /// Calls `process_stopping`, logging a failure or a panic.
-    async fn process_stopping(&self, session: &Session, handle: &H::Process) {
+    /// Calls `process_stopping` for a process of `tracked`'s container. A
+    /// failure or a panic is logged, and the process is kept in
+    /// `unrevoked` for the call to run again once the
+    /// container is stopped.
+    async fn process_stopping(&self, tracked: &Tracked<H>, handle: &Arc<H::Process>) {
+        let session = &tracked.session;
         let stopped = AssertUnwindSafe(self.hooks.process_stopping(session, handle))
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err("the process_stopping hook panicked".into()));
         if let Err(error) = stopped {
             tracing::warn!(session = %session.id, %error, "the process_stopping hook failed");
+            let mut state = tracked.state();
+            if !state.unrevoked.iter().any(|kept| Arc::ptr_eq(kept, handle)) {
+                state.unrevoked.push(Arc::clone(handle));
+            }
         }
     }
 
@@ -1026,7 +1053,7 @@ impl<H: TurnHooks> Inner<H> {
         };
         tracing::warn!(session = %tracked.session.id, %container, "a session container died");
         if let Some(process) = process {
-            self.process_stopping(&tracked.session, &process).await;
+            self.process_stopping(&tracked, &process).await;
         }
         if self.stop_if_idle(&tracked, |_| true).await {
             self.idle.notify_waiters();
