@@ -34,6 +34,8 @@ use axum::routing::get;
 use axum::serve::Listener;
 use core_types::{Sender, Surface as _};
 use cred_proxy::CredProxy;
+use futures::FutureExt as _;
+use futures::future::FusedFuture as _;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -508,7 +510,7 @@ impl Server {
             "listening"
         );
 
-        let mut abort = std::pin::pin!(abort);
+        let mut abort = std::pin::pin!(abort.fuse());
         let mut failure = tokio::select! {
             () = shutdown => None,
             Some(joined) = tasks.join_next() => Some(stopped_early(joined)),
@@ -520,30 +522,26 @@ impl Server {
         let deadline = tokio::time::Instant::now() + drain_timeout;
         stop.send_replace(true);
 
-        let mut forced = false;
         if let Some(pipeline) = &pipeline {
             pipeline.close();
             let drained = tokio::select! {
                 drained = tokio::time::timeout_at(deadline, pipeline.drain()) => drained.is_ok(),
-                () = abort.as_mut() => {
-                    forced = true;
-                    false
-                }
+                () = abort.as_mut() => false,
             };
             if !drained {
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
-                if !forced {
+                if !abort.is_terminated() {
                     tokio::select! {
                         () = pipeline.wait_for_kills() => {}
-                        () = abort.as_mut() => forced = true,
+                        () = abort.as_mut() => {}
                     }
                 }
             }
         }
         stop_internal.send_replace(true);
 
-        let cut_short = if forced {
+        let cut_short = if abort.is_terminated() {
             Some("shutdown forced; dropping in-flight work")
         } else {
             let drain = async {
@@ -557,10 +555,7 @@ impl Server {
                 drained = tokio::time::timeout_at(deadline, drain) => {
                     drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
                 }
-                () = abort.as_mut() => {
-                    forced = true;
-                    Some("shutdown forced; dropping in-flight work")
-                }
+                () = abort.as_mut() => Some("shutdown forced; dropping in-flight work"),
             }
         };
         if let Some(reason) = cut_short {
@@ -568,17 +563,14 @@ impl Server {
             tasks.shutdown().await;
         }
         if let Some(pipeline) = &pipeline {
-            let released = if forced {
+            let released = if abort.is_terminated() {
                 tokio::time::timeout(FORCED_RELEASE_TIMEOUT, pipeline.release_cut_hand_offs())
                     .await
                     .is_ok()
             } else {
                 tokio::select! {
                     () = pipeline.release_cut_hand_offs() => true,
-                    () = abort.as_mut() => {
-                        forced = true;
-                        false
-                    }
+                    () = abort.as_mut() => false,
                 }
             };
             if !released {
@@ -586,7 +578,7 @@ impl Server {
                     "shutdown forced; the hand-offs let go last are taken after their lease"
                 );
             }
-            if forced || tokio::time::Instant::now() >= deadline {
+            if abort.is_terminated() || tokio::time::Instant::now() >= deadline {
                 tracing::warn!("leaving warm sandboxes for the next start to reap");
             } else {
                 let left = tokio::select! {
