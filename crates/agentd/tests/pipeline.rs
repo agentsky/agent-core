@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
-use common::{TempDir, env};
+use common::{TempDir, env, with_a_hung_worker};
 
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
@@ -101,9 +101,24 @@ impl Gate {
 
     async fn pass(&self) {
         let mut open = self.open.subscribe();
-        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = Waiting::new(&self.waiting);
         let _ = open.wait_for(|open| *open).await;
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One caller counted at a gate, until it passes or is dropped.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -117,6 +132,7 @@ struct Holds {
     posts: Mutex<HashMap<String, Gate>>,
     unbound: Mutex<HashSet<AgentId>>,
     lookups: Mutex<HashMap<AgentId, Gate>>,
+    histories: Mutex<HashMap<ThreadKey, VecDeque<Gate>>>,
 }
 
 impl Holds {
@@ -166,6 +182,17 @@ impl Holds {
     /// queued are still to happen.
     fn confirm_failures_left(&self) -> usize {
         self.failing_confirms.lock().unwrap().len()
+    }
+
+    /// Holds the next read of `thread`'s history, by any agent, at `gate`,
+    /// after those queued before it for that thread.
+    fn history_at(&self, thread: ThreadKey, gate: &Gate) {
+        self.histories
+            .lock()
+            .unwrap()
+            .entry(thread)
+            .or_default()
+            .push_back(gate.clone());
     }
 
     /// Holds every post of `text` at `gate`.
@@ -248,6 +275,16 @@ impl Surface for Held {
         before: Option<Cursor>,
         limit: usize,
     ) -> Result<Vec<Msg>, SurfaceError> {
+        let gate = self
+            .holds
+            .histories
+            .lock()
+            .unwrap()
+            .get_mut(thread)
+            .and_then(VecDeque::pop_front);
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
         self.mock.history(thread, before, limit).await
     }
 
@@ -355,6 +392,7 @@ async fn link(store: &Store, user: &str) -> MemberId {
 struct Setup {
     drain_timeout_secs: u64,
     pipeline: fn(&mut PipelineSettings),
+    routers: fn(Routers) -> Routers,
 }
 
 impl Default for Setup {
@@ -362,6 +400,7 @@ impl Default for Setup {
         Self {
             drain_timeout_secs: 5,
             pipeline: |_| {},
+            routers: |routers| routers,
         }
     }
 }
@@ -440,7 +479,7 @@ async fn start_with(setup: Setup) -> Stack {
             .unwrap()
     );
 
-    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+    let server = Server::bind(app.clone(), (setup.routers)(Routers::new(&app).unwrap()))
         .await
         .unwrap();
     let addrs = server.addrs();
@@ -1814,6 +1853,7 @@ async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
 async fn a_second_signal_while_a_turn_runs_cuts_it_short_at_once() {
     let stack = start_with(Setup {
         drain_timeout_secs: 30,
+        routers: with_a_hung_worker,
         ..Setup::default()
     })
     .await;
@@ -1864,9 +1904,12 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
     let s1 = stack.session_of(&first).await;
 
     let before = stack.mock.calls().len();
-    let delay = Duration::from_secs(2);
-    stack.mock.delay_next(Op::History, delay);
-    stack.mock.delay_next(Op::History, delay);
+    let first_read = Gate::closed();
+    let second_read = Gate::closed();
+    stack.holds.history_at(thread("GENERAL", "r1"), &first_read);
+    stack
+        .holds
+        .history_at(thread("GENERAL", "r1"), &second_read);
     let handling = stack.handle(stack.event(
         "alice",
         "GENERAL",
@@ -1876,8 +1919,8 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
         &[BOT],
     ));
     let resetting = async {
-        wait_until("the second turn starts", || {
-            stack.calls_since(before).contains(&working_on("r2"))
+        wait_until("the first attempt reads the thread", || {
+            first_read.waiting() == 1
         })
         .await;
         let s2 = store
@@ -1886,18 +1929,16 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
             .unwrap()
             .expect("a replacement")
             .id;
-        wait_until("the first read of the thread ends", || {
-            stack
-                .calls_since(before)
-                .iter()
-                .any(|call| matches!(call, Call::History { .. }))
+        first_read.open();
+        wait_until("the second attempt reads the thread", || {
+            second_read.waiting() == 1
         })
         .await;
-        tokio::time::sleep(delay / 2).await;
         store
             .reset_session(s2, OffsetDateTime::now_utc())
             .await
             .unwrap();
+        second_read.open();
         s2
     };
     let ((), s2) = tokio::join!(handling, resetting);
@@ -1984,7 +2025,8 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
     let upstream = stack.fake.message_requests().await.len();
     let before = stack.mock.calls().len();
     stack.next_turn(Turn::reply("Answer."));
-    stack.mock.delay_next(Op::History, Duration::from_secs(1));
+    let reading = Gate::closed();
+    stack.holds.history_at(thread("GENERAL", "r1"), &reading);
     let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
     for (id, text) in [("q2", "question two"), ("q3", "question three")] {
         let mut event = stack.event(
@@ -1997,7 +2039,14 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
         );
         event.text = format!("@UBOT {text}");
         sink.send(event).await.unwrap();
+        if id == "q2" {
+            wait_until("question two's turn reads the thread", || {
+                reading.waiting() == 1
+            })
+            .await;
+        }
     }
+    reading.open();
     wait_until("both are answered", || {
         posts(&stack.calls_since(before)).len() >= 2
     })
@@ -2356,7 +2405,8 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
     })
     .await;
     stack.next_turn(Turn::reply("Posted too late."));
-    stack.mock.delay_next(Op::Post, Duration::from_secs(20));
+    let posting = Gate::closed();
+    stack.holds.posts_of("Posted too late.", &posting);
     let event = stack.event("alice", "GENERAL", ConvKind::Channel, "c2", None, &[BOT]);
     stack
         .pipeline
@@ -2364,12 +2414,7 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
         .send(event)
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while stack.fake.message_requests().await.is_empty() {
-        assert!(Instant::now() < deadline, "timed out waiting for the turn");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until("the reply is being delivered", || posting.waiting() == 1).await;
     let Stack {
         pipeline,
         turns,
@@ -3265,6 +3310,7 @@ async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
     let mut stack = start_with(Setup {
         drain_timeout_secs: 30,
         pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+        ..Setup::default()
     })
     .await;
     let writer = stack.other_agent("writer", "UWRITER").await;
@@ -3272,7 +3318,8 @@ async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
     stack.hand_off_behind_a_busy_writer(writer, &busy).await;
     let (still, _still_open) = oneshot::channel();
     std::mem::replace(&mut stack.stop, still).send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    wait_until("the server closes the pipeline", || sink.is_closed()).await;
     stack.hand_offs_due_now().await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while stack.kept_due_at().await != [pinned_now() + agentd::pipeline::HAND_OFF_LEASE] {
@@ -3292,6 +3339,7 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
     let mut stack = start_with(Setup {
         drain_timeout_secs: 30,
         pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+        ..Setup::default()
     })
     .await;
     let writer = stack.other_agent("writer", "UWRITER").await;
@@ -3314,7 +3362,8 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
     .await;
     let (still, _still_open) = oneshot::channel();
     std::mem::replace(&mut stack.stop, still).send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    wait_until("the server closes the pipeline", || sink.is_closed()).await;
     looking.open();
     let Stack { task, dir, .. } = stack;
     task.await.unwrap().unwrap();

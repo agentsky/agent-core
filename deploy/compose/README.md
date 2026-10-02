@@ -116,7 +116,7 @@ agentd makes, and give agentd that instead.
    creates a personal access token for it. In **Administration >
    Workspace > Permissions**, find `create-personal-access-tokens` and tick
    the `bot` role.
-3. Give the manager its permissions. The design asks for a role with only
+3. Give the manager its permissions. The design gives the manager only
    what agentd needs. T11's live check against 7.13.9
    ([impl-notes](../../docs/impl-notes.md#the-live-check-against-7139))
    found that is:

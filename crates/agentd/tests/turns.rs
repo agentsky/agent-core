@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentd::pipeline::{Pipeline, TurnSettings, Turns};
-use agentd::server::{Addrs, Routers, Server, Worker};
+use agentd::server::{Addrs, Routers, Server};
 use agentd::{App, Config};
 use core_types::{
     AgentId, ConvRef, CredentialRef, Hop, MemberId, MemberKey, MessageId, Requester, ScopeKey,
@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use common::{TempDir, env};
+use common::{TempDir, env, with_a_hung_worker};
 
 const ACCESS_TOKEN: &str = "real-access-token";
 
@@ -210,12 +210,19 @@ impl Running {
     /// Shuts agentd down, then forces it with a second signal once the
     /// listeners' and workers' drain is under way: once the ctl listener,
     /// which closes as that drain begins, after the turns', refuses
-    /// connections.
+    /// connections. The forced shutdown has to return at once, well within
+    /// the drain timeout.
     async fn force_during_the_drain(self) {
         self.stop.send(()).unwrap();
         refused(self.addrs.ctl).await;
+        let forced = Instant::now();
         self.abort.send(()).unwrap();
         self.task.await.unwrap().unwrap();
+        assert!(
+            forced.elapsed() < Duration::from_secs(10),
+            "the forced shutdown took {:?}",
+            forced.elapsed()
+        );
         drop(self.dir);
     }
 
@@ -255,15 +262,6 @@ async fn refused(addr: SocketAddr) {
     .expect("the listener closes");
 }
 
-/// `routers` with a worker that never ends, so the drain takes all of
-/// `server.drain_timeout_secs`.
-fn with_a_hung_worker(mut routers: Routers) -> Routers {
-    routers
-        .workers
-        .push(Worker::new("hung worker", std::future::pending::<()>()));
-    routers
-}
-
 #[tokio::test]
 async fn a_graceful_shutdown_stops_warm_sandboxes() {
     let running = start(&[Turn::reply("warm")]).await;
@@ -276,7 +274,8 @@ async fn a_graceful_shutdown_stops_warm_sandboxes() {
 
 #[tokio::test]
 async fn a_forced_shutdown_leaves_warm_sandboxes_to_the_next_start() {
-    let running = start_with(&[Turn::reply("warm")], common::CONFIG, with_a_hung_worker).await;
+    let config = common::CONFIG.replace("drain_timeout_secs = 5", "drain_timeout_secs = 30");
+    let running = start_with(&[Turn::reply("warm")], &config, with_a_hung_worker).await;
     let session = running.warm_session("m1").await;
     let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
     running.force_during_the_drain().await;
