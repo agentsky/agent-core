@@ -886,7 +886,7 @@ fn change(binding: BindingId) -> ChannelIdChange {
 async fn recorded(h: &Harness, change: &ChannelIdChange) {
     assert_eq!(
         h.store
-            .record_channel_id_change(change, CHANNEL_CHANGE_LIMITS)
+            .record_channel_id_change(change, MAX_CHANNEL_CHANGES)
             .await
             .unwrap(),
         ChannelIdChangeRecord::Recorded
@@ -1161,7 +1161,7 @@ async fn a_replayed_channel_id_change_is_dropped() {
     );
     assert_eq!(
         h.store
-            .record_channel_id_change(&changed, CHANNEL_CHANGE_LIMITS)
+            .record_channel_id_change(&changed, MAX_CHANNEL_CHANGES)
             .await
             .unwrap(),
         ChannelIdChangeRecord::Known,
@@ -1174,7 +1174,7 @@ async fn a_replayed_channel_id_change_is_dropped() {
 }
 
 #[tokio::test]
-async fn too_many_changes_drop_the_next_and_an_inactive_binding_settles_none() {
+async fn a_full_binding_records_no_more_and_an_inactive_binding_settles_none() {
     let h = harness().await;
     let helper = installed(&h).await;
     for n in 0..MAX_CHANNEL_CHANGES {
@@ -1553,7 +1553,7 @@ async fn register_token(h: &Harness, at: OffsetDateTime) {
 async fn a_busy_day_of_shares_records_every_change() {
     let h = harness().await;
     let helper = installed(&h).await;
-    let count = MAX_CHANNEL_CHANGES as usize + 4;
+    let count = 20;
     let olds: Vec<String> = (0..count).map(|n| format!("G0BUSY{n:03}")).collect();
     let news: Vec<String> = (0..count).map(|n| format!("C0BUSY{n:03}")).collect();
     set_rules(&h, helper, &denying(&ids(&olds))).await;
@@ -1663,4 +1663,64 @@ async fn a_token_too_close_to_expiry_by_the_time_its_update_comes_burns_no_lease
         due,
         "not leased"
     );
+}
+
+#[tokio::test]
+async fn a_flood_of_changes_a_full_binding_has_no_room_for_keeps_the_deny_list_bounded() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    for n in 0..MAX_CHANNEL_CHANGES {
+        recorded(
+            &h,
+            &change_of(helper, &format!("G0WAIT{n:03}"), &format!("C0WAIT{n:03}")),
+        )
+        .await;
+    }
+    set_rules(&h, helper, &denying(&[OLD])).await;
+    let flood = crate::policy::MAX_DENIES + 50;
+    for n in 0..flood {
+        h.agents
+            .channel_id_changed(ChannelIdChanged {
+                event_id: format!("Ev0FLOOD{n:04}"),
+                new: format!("C0FLOOD{n:04}").as_str().into(),
+                ..the_event(helper)
+            })
+            .await;
+    }
+    let rules = rules_of(&h, helper).await;
+    assert!(rules.denies_everyone(), "the flood ends in deny everyone");
+    assert_eq!(rules.deny.len(), crate::policy::MAX_DENIES + 1);
+    assert!(!permits(&h, helper, &format!("C0FLOOD{:04}", flood - 1)).await);
+    assert_eq!(
+        changes_of(&h, helper).await.len(),
+        MAX_CHANNEL_CHANGES as usize
+    );
+}
+
+#[tokio::test]
+async fn a_change_with_no_room_carries_the_denies_a_waiting_change_brings_to_its_old_id() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    recorded(&h, &change_of(helper, OLD, NEW)).await;
+    for n in 1..MAX_CHANNEL_CHANGES {
+        recorded(
+            &h,
+            &change_of(helper, &format!("G0WAIT{n:03}"), &format!("C0WAIT{n:03}")),
+        )
+        .await;
+    }
+    set_rules(&h, helper, &denying(&[OLD])).await;
+    h.agents
+        .channel_id_changed(ChannelIdChanged {
+            old: NEW.into(),
+            new: "C0LATER01".into(),
+            ..the_event(helper)
+        })
+        .await;
+    assert_eq!(
+        rules_of(&h, helper).await,
+        denying(&[OLD, "C0LATER01"]),
+        "the deny on the waiting change's old id reaches the id after its new one"
+    );
+    assert!(!permits(&h, helper, "C0LATER01").await);
 }

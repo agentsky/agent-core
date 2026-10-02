@@ -85,7 +85,7 @@ use core_types::{
 use secrecy::SecretString;
 use serde::Deserialize;
 use store::{
-    AgentBinding, AgentCreation, BindingState, ChannelIdChange, ChannelIdChangeLimits,
+    AgentBinding, AgentCreation, AgentSettings, BindingState, ChannelIdChange,
     ChannelIdChangeRecord, KnownChannelIdChange, ManifestUpdate, NewAgent, NewSlackApp,
     SlackConfigToken, Store, StoreError, Visibility,
 };
@@ -143,27 +143,16 @@ pub const CHANNEL_CHANGE_RETRY: Duration = Duration::from_secs(5 * 60);
 /// How long after it was received a channel id change is given up.
 pub const CHANNEL_CHANGE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// The most channel id changes one binding may have waiting for Slack at
-/// once. Slack confirms a real change at once unless it can't answer, as
-/// in an outage or while the bot's quota is used up, so a burst of real
-/// shares then can fill it, as can the app's owner forging changes. Past
-/// it, another isn't recorded: the agent's denies on its old id are copied
-/// to its new one at once, as when a change is given up.
-pub const MAX_CHANNEL_CHANGES: u32 = 16;
-
 /// The most channel id changes one binding keeps, waiting or settled
-/// within [`CHANNEL_CHANGE_TTL`]. Past that, its earliest settled ones that
-/// no waiting change's chain runs through are forgotten to make room, so
-/// the router's read of them stays small; when none can go, a new change
-/// is handled as past [`MAX_CHANNEL_CHANGES`].
-pub const MAX_CHANNEL_CHANGES_KEPT: u32 = 64;
-
-/// [`MAX_CHANNEL_CHANGES`] and [`MAX_CHANNEL_CHANGES_KEPT`], as the store
-/// takes them.
-pub const CHANNEL_CHANGE_LIMITS: ChannelIdChangeLimits = ChannelIdChangeLimits {
-    waiting: MAX_CHANNEL_CHANGES,
-    kept: MAX_CHANNEL_CHANGES_KEPT,
-};
+/// within [`CHANNEL_CHANGE_TTL`], so the router's read of them stays small.
+/// Past that, its earliest settled ones that no waiting change's chain runs
+/// through are forgotten to make room. Slack confirms a real change at
+/// once unless it can't answer, as in an outage or while the bot's quota
+/// is used up, so a burst of real shares then can fill it with waiting
+/// ones, as can the app's owner forging changes. When none can go, a new
+/// change isn't recorded: the agent's denies on its old id are copied to
+/// its new one at once, as when a change is given up.
+pub const MAX_CHANNEL_CHANGES: u32 = 64;
 
 /// The most channel id changes one sweeper pass tries, and gives up.
 const CHANNEL_CHANGES_PER_PASS: u32 = 64;
@@ -1085,10 +1074,9 @@ impl SlackAgents {
     /// Takes the channel id change the app of its binding was told of:
     /// records it, and tries to settle it at once in a task of its own,
     /// which leaves it to the sweeper when it can't. A change recorded
-    /// already is left as it is. One the binding has no room for, past
-    /// [`MAX_CHANNEL_CHANGES`] waiting or [`MAX_CHANNEL_CHANGES_KEPT`] kept,
-    /// isn't recorded, and the agent's denies on its old id are copied to
-    /// its new one at once.
+    /// already is left as it is. One the binding has no room for
+    /// ([`MAX_CHANNEL_CHANGES`]) isn't recorded, and the agent's denies on
+    /// its old id are copied to its new one at once.
     pub async fn channel_id_changed(&self, changed: ChannelIdChanged) {
         let binding = changed.binding;
         if !changed.old.as_str().starts_with('G') {
@@ -1105,7 +1093,7 @@ impl SlackAgents {
         match self
             .inner
             .store
-            .record_channel_id_change(&change, CHANNEL_CHANGE_LIMITS)
+            .record_channel_id_change(&change, MAX_CHANNEL_CHANGES)
             .await
         {
             Ok(ChannelIdChangeRecord::Recorded) => {
@@ -1126,11 +1114,15 @@ impl SlackAgents {
                     });
                 }
                 Err(err) => {
-                    tracing::warn!(%binding, old = %change.old, new = %change.new, error = %err, "couldn't copy the denies of a channel id change the binding has no room for; dropped it");
+                    self.note(binding, "a channel id change lost in the store", |quiet| {
+                        tracing::warn!(%binding, old = %change.old, new = %change.new, error = %err, since_last_warning = quiet, "couldn't copy the denies of a channel id change the binding has no room for; dropped it");
+                    });
                 }
             },
             Err(err) => {
-                tracing::warn!(%binding, old = %change.old, new = %change.new, error = %err, "couldn't record a channel id change; dropped it");
+                self.note(binding, "a channel id change lost in the store", |quiet| {
+                    tracing::warn!(%binding, old = %change.old, new = %change.new, error = %err, since_last_warning = quiet, "couldn't record a channel id change; dropped it");
+                });
             }
         }
     }
@@ -1200,18 +1192,22 @@ impl SlackAgents {
         Ok(true)
     }
 
-    /// Copies the denies of the agent of `change`'s binding on the old id
-    /// to the new id and every id the channel had since, as far as the
+    /// Copies the denies of the agent of `change`'s binding on the old id,
+    /// and on the old id of each waiting change whose chain reaches it, to
+    /// the new id and every id the channel had since, as far as the
     /// binding's changes tell, so they keep applying without the change
-    /// waiting. The agent's other rules on the old id stay there. Whether
-    /// any was copied: `None` if the binding is gone or its rules don't
-    /// read.
+    /// ([`Rules::copy_denies`], which keeps the list bounded). The agent's
+    /// other rules on the old id stay there. The rules are read first
+    /// without the write lock, which is taken only when they would change.
+    /// Whether any was copied: `None` if the binding is gone or its rules
+    /// don't read.
     async fn copy_denies_onward(
         &self,
         change: &ChannelIdChange,
     ) -> Result<Option<bool>, StoreError> {
         let store = &self.inner.store;
-        let Some(row) = store.binding(change.binding).await? else {
+        let binding = change.binding;
+        let Some(row) = store.binding(binding).await? else {
             return Ok(None);
         };
         let mut known = store.channel_id_changes_of_agent(row.agent).await?;
@@ -1225,24 +1221,36 @@ impl SlackAgents {
             team: row.team.clone(),
             conversation: conversation.clone(),
         };
-        let from = room(&change.old);
-        let targets: Vec<ConvRef> = later_ids(&known, change.binding, &change.old)
+        let upstream = known.iter().filter(|other| {
+            other.waiting
+                && other.change.binding == binding
+                && later_ids(&known, binding, &other.change.old).contains(&change.old)
+        });
+        let sources: Vec<ConvRef> = std::iter::once(&change.old)
+            .chain(upstream.map(|other| &other.change.old))
+            .map(room)
+            .collect();
+        let targets: Vec<ConvRef> = later_ids(&known, binding, &change.old)
             .iter()
             .map(room)
             .collect();
-        store
-            .update_agent_settings(row.agent, |settings| {
-                let mut rules = Rules::read(settings).ok()?;
-                let mut copied = false;
-                for to in &targets {
-                    copied |= rules.copy_denies(&from, to);
-                }
-                if copied {
-                    rules.write(settings);
-                }
-                Some(copied)
-            })
-            .await
+        let pairs = || {
+            sources
+                .iter()
+                .flat_map(|from| targets.iter().map(move |to| (from, to)))
+        };
+        let copy = |settings: &mut AgentSettings| {
+            let mut rules = Rules::read(settings).ok()?;
+            let copied = rules.copy_denies(pairs());
+            if copied {
+                rules.write(settings);
+            }
+            Some(copied)
+        };
+        match copy(&mut store.agent_settings(row.agent).await?) {
+            Some(true) => store.update_agent_settings(row.agent, copy).await,
+            unchanged => Ok(unchanged),
+        }
     }
 
     /// Tries to settle the channel id changes due, until `budget` has

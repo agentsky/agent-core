@@ -50,26 +50,43 @@ pub enum ChannelIdChangeRecord {
     /// The same change of the same binding is recorded already, waiting or
     /// settled.
     Known,
-    /// The binding has as many changes waiting as it may, or as many kept
-    /// as it may with none it can forget; nothing was recorded.
+    /// The binding has as many changes as it may keep, and none it can
+    /// forget; nothing was recorded.
     Full,
 }
 
-/// How many channel id changes [`Store::record_channel_id_change`] lets
-/// one binding have. `kept` should be well above `waiting`, so a binding
-/// at `kept` has settled changes to forget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChannelIdChangeLimits {
-    /// The most waiting at once. Past it, a new change isn't recorded.
-    pub waiting: u32,
-    /// The most kept, waiting or settled. Past it, the earliest settled
-    /// ones no waiting change's chain runs through are deleted to make
-    /// room; a waiting one never is, and if none can go, a new change
-    /// isn't recorded.
-    pub kept: u32,
+type Row = (String, String, String, i64);
+
+macro_rules! reached {
+    () => {
+        "WITH RECURSIVE reached(channel) AS (SELECT old_channel FROM channel_id_changes \
+         WHERE binding_id = ? AND settled_at IS NULL \
+         UNION SELECT c.new_channel FROM channel_id_changes AS c \
+         JOIN reached AS r ON c.old_channel = r.channel WHERE c.binding_id = ?) "
+    };
 }
 
-type Row = (String, String, String, i64);
+macro_rules! forgettable {
+    () => {
+        "settled_at IS NOT NULL AND old_channel NOT IN (SELECT channel FROM reached)"
+    };
+}
+
+const COUNTS: &str = concat!(
+    reached!(),
+    "SELECT COUNT(CASE WHEN old_channel = ? AND new_channel = ? THEN 1 END), COUNT(*), \
+     COUNT(CASE WHEN ",
+    forgettable!(),
+    " THEN 1 END) FROM channel_id_changes WHERE binding_id = ?"
+);
+
+const FORGET: &str = concat!(
+    reached!(),
+    "DELETE FROM channel_id_changes WHERE rowid IN (SELECT rowid FROM channel_id_changes \
+     WHERE binding_id = ? AND ",
+    forgettable!(),
+    " ORDER BY received_at, rowid LIMIT ?)"
+);
 
 fn change_of((binding, old, new, received_at): Row) -> Result<ChannelIdChange> {
     Ok(ChannelIdChange {
@@ -82,15 +99,14 @@ fn change_of((binding, old, new, received_at): Row) -> Result<ChannelIdChange> {
 
 impl Store {
     /// Records `change`, waiting and due at once, unless the same change of
-    /// the same binding is recorded already, or the binding has
-    /// `limits.waiting` changes waiting. To keep it at `limits.kept` rows,
-    /// the binding's earliest settled changes are deleted, but never one
-    /// that the chain of a waiting change runs through: one from the old
-    /// id of a waiting change, or from an id such a chain reaches. When
-    /// none can go, the change isn't recorded. Whether the change is
-    /// known, or the binding has too many waiting, is read first without
-    /// the write lock, so a replay or a flood of forged changes doesn't
-    /// hold up the store's writers.
+    /// the same binding is recorded already, or the binding has `kept`
+    /// changes and none it can forget. To keep it under `kept`, the
+    /// binding's earliest settled changes are forgotten, but never one that
+    /// the chain of a waiting change runs through: one from the old id of a
+    /// waiting change, or from an id such a chain reaches. Whether the change
+    /// is known, or the binding full, is read first without the write lock,
+    /// so a replay or a flood of forged changes doesn't hold up the store's
+    /// writers.
     ///
     /// # Errors
     ///
@@ -100,66 +116,46 @@ impl Store {
     pub async fn record_channel_id_change(
         &self,
         change: &ChannelIdChange,
-        limits: ChannelIdChangeLimits,
+        kept: u32,
     ) -> Result<ChannelIdChangeRecord> {
-        const COUNTS: &str = "SELECT COUNT(CASE WHEN settled_at IS NULL THEN 1 END), \
-             COUNT(CASE WHEN old_channel = ? AND new_channel = ? THEN 1 END) \
-             FROM channel_id_changes WHERE binding_id = ?";
         let binding = change.binding.to_string();
-        let refused = |(waiting, known): (i64, i64)| {
+        let kept = i64::from(kept);
+        let room = |(known, all, forgettable): (i64, i64, i64)| {
             if known > 0 {
-                Some(ChannelIdChangeRecord::Known)
-            } else if waiting >= i64::from(limits.waiting) {
-                Some(ChannelIdChangeRecord::Full)
+                Err(ChannelIdChangeRecord::Known)
+            } else if all - forgettable >= kept {
+                Err(ChannelIdChangeRecord::Full)
             } else {
-                None
+                Ok((all - kept + 1).max(0))
             }
         };
-        let counts: (i64, i64) = sqlx::query_as(COUNTS)
+        let read = sqlx::query_as(COUNTS)
+            .bind(&binding)
+            .bind(&binding)
             .bind(change.old.as_str())
             .bind(change.new.as_str())
-            .bind(&binding)
-            .fetch_one(&self.pool)
-            .await?;
-        if let Some(refused) = refused(counts) {
+            .bind(&binding);
+        if let Err(refused) = room(read.fetch_one(&self.pool).await?) {
             return Ok(refused);
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let counts: (i64, i64) = sqlx::query_as(COUNTS)
+        let read = sqlx::query_as(COUNTS)
+            .bind(&binding)
+            .bind(&binding)
             .bind(change.old.as_str())
             .bind(change.new.as_str())
+            .bind(&binding);
+        let forget = match room(read.fetch_one(&mut *tx).await?) {
+            Ok(forget) => forget,
+            Err(refused) => return Ok(refused),
+        };
+        sqlx::query(FORGET)
             .bind(&binding)
-            .fetch_one(&mut *tx)
+            .bind(&binding)
+            .bind(&binding)
+            .bind(forget)
+            .execute(&mut *tx)
             .await?;
-        if let Some(refused) = refused(counts) {
-            return Ok(refused);
-        }
-        sqlx::query(
-            "WITH RECURSIVE reached(channel) AS (\
-             SELECT old_channel FROM channel_id_changes \
-             WHERE binding_id = ? AND settled_at IS NULL \
-             UNION SELECT c.new_channel FROM channel_id_changes AS c \
-             JOIN reached AS r ON c.old_channel = r.channel WHERE c.binding_id = ?) \
-             DELETE FROM channel_id_changes WHERE rowid IN (SELECT rowid FROM channel_id_changes \
-             WHERE binding_id = ? AND settled_at IS NOT NULL \
-             AND old_channel NOT IN (SELECT channel FROM reached) ORDER BY received_at, rowid \
-             LIMIT max(0, (SELECT COUNT(*) FROM channel_id_changes WHERE binding_id = ?) - ? + 1))",
-        )
-        .bind(&binding)
-        .bind(&binding)
-        .bind(&binding)
-        .bind(&binding)
-        .bind(i64::from(limits.kept))
-        .execute(&mut *tx)
-        .await?;
-        let (kept,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM channel_id_changes WHERE binding_id = ?")
-                .bind(&binding)
-                .fetch_one(&mut *tx)
-                .await?;
-        if kept >= i64::from(limits.kept) {
-            return Ok(ChannelIdChangeRecord::Full);
-        }
         let at = to_unix(change.received_at);
         sqlx::query(
             "INSERT INTO channel_id_changes \

@@ -34,6 +34,12 @@ use crate::config::LimitsConfig;
 /// The most rules an agent's allow or deny list holds.
 pub const MAX_RULES: usize = 100;
 
+/// The most rules an agent's deny list holds with the denies copied from
+/// channels' old ids ([`Rules::copy_denies`]). A real channel id change
+/// copies at most one deny, so only a flood of forged changes, which only
+/// the agent's owner can send, takes a list there.
+pub const MAX_DENIES: usize = 2 * MAX_RULES;
+
 /// The community's caps, from `[limits]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
@@ -219,31 +225,46 @@ impl Rules {
         allow || deny
     }
 
-    /// Puts a deny on `to` beside each deny on `from`, keeping its label,
-    /// unless the deny list names `to` already, and says whether it added
-    /// one: so a deny on a channel's old id applies under its new one too.
-    /// It never lets anyone in, so it may take the list past
-    /// [`MAX_RULES`].
-    pub fn copy_denies(&mut self, from: &ConvRef, to: &ConvRef) -> bool {
-        let copies: Vec<Rule> = self
-            .deny
-            .iter()
-            .filter_map(|rule| match rule {
-                Rule::Room { conv, label } if conv == from => Some(Rule::Room {
-                    conv: to.clone(),
-                    label: label.clone(),
-                }),
-                _ => None,
-            })
-            .collect();
-        let mut copied = false;
-        for copy in copies {
-            if !self.deny.iter().any(|known| known.same_target(&copy)) {
-                self.deny.push(copy);
-                copied = true;
+    /// For each `(from, to)` in `pairs`, puts a deny on `to` beside each
+    /// deny on `from`, keeping its label, unless the deny list names `to`
+    /// already, so a deny on a channel's old id applies under its new ones
+    /// too. Says whether the list changed. Copies never let anyone in, so
+    /// they may take the list past [`MAX_RULES`]; one that would take it
+    /// past [`MAX_DENIES`] denies everyone instead of all of them, which
+    /// refuses at least as much and keeps the list short. A list that
+    /// denies everyone takes no copies.
+    pub fn copy_denies<'a>(
+        &mut self,
+        pairs: impl IntoIterator<Item = (&'a ConvRef, &'a ConvRef)>,
+    ) -> bool {
+        if self.denies_everyone() {
+            return false;
+        }
+        let before = self.deny.len();
+        for (from, to) in pairs {
+            let copies: Vec<Rule> = self
+                .deny
+                .iter()
+                .filter_map(|rule| match rule {
+                    Rule::Room { conv, label } if conv == from => Some(Rule::Room {
+                        conv: to.clone(),
+                        label: label.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            for copy in copies {
+                if !self.deny.iter().any(|known| known.same_target(&copy)) {
+                    self.deny.push(copy);
+                }
+            }
+            if self.deny.len() > MAX_DENIES {
+                self.deny.truncate(before);
+                self.deny.push(Rule::Everyone);
+                return true;
             }
         }
-        copied
+        self.deny.len() > before
     }
 
     /// Whether `everyone` is denied, which leaves the agent to its owner
@@ -397,9 +418,7 @@ pub fn agent_policy(
     pending: &[(ConvRef, ConvRef)],
 ) -> Result<AgentPolicy, serde_json::Error> {
     let mut rules = Rules::read(settings)?;
-    for (from, to) in pending {
-        rules.copy_denies(from, to);
-    }
+    rules.copy_denies(pending.iter().map(|(from, to)| (from, to)));
     Ok(AgentPolicy {
         allow: rules.allow.iter().map(Rule::target).collect(),
         deny: rules.deny.iter().map(Rule::target).collect(),
@@ -818,12 +837,43 @@ mod tests {
             allow: Vec::new(),
             deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
         };
-        assert!(rules.copy_denies(&conv("C0"), &conv("G9")));
+        assert!(rules.copy_denies([(&conv("C0"), &conv("G9"))]));
         assert_eq!(rules.deny.len(), MAX_RULES + 1);
-        assert!(!rules.copy_denies(&conv("C0"), &conv("G9")), "once");
+        assert!(!rules.copy_denies([(&conv("C0"), &conv("G9"))]), "once");
         assert!(
-            !rules.copy_denies(&conv("C99999"), &conv("G8")),
+            !rules.copy_denies([(&conv("C99999"), &conv("G8"))]),
             "no deny there"
         );
+    }
+
+    #[test]
+    fn copies_past_the_most_denies_deny_everyone_instead() {
+        let mut rules = Rules {
+            allow: vec![room("C1")],
+            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
+        };
+        let from = conv("C0");
+        let targets: Vec<ConvRef> = (0..MAX_DENIES).map(|n| conv(&format!("G{n}"))).collect();
+        assert!(
+            rules.copy_denies(
+                targets[..MAX_DENIES - MAX_RULES]
+                    .iter()
+                    .map(|to| (&from, to))
+            )
+        );
+        assert_eq!(rules.deny.len(), MAX_DENIES);
+        assert!(!rules.denies_everyone());
+        let full = rules.deny.clone();
+        assert!(rules.copy_denies(targets.iter().map(|to| (&from, to))));
+        assert_eq!(
+            rules.deny,
+            [full, vec![Rule::Everyone]].concat(),
+            "no copy past the bound is kept"
+        );
+        assert!(
+            !rules.copy_denies([(&from, &conv("C9999999"))]),
+            "everyone is denied already"
+        );
+        assert_eq!(rules.deny.len(), MAX_DENIES + 1);
     }
 }

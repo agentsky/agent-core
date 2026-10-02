@@ -75,9 +75,7 @@ pub use agents::{
     ActiveBot, Agent, AgentBinding, AgentCreation, AgentState, BindingState, DirectoryEntry,
     NewAgent, PendingRetirement, Visibility,
 };
-pub use channel_id_changes::{
-    ChannelIdChange, ChannelIdChangeLimits, ChannelIdChangeRecord, KnownChannelIdChange,
-};
+pub use channel_id_changes::{ChannelIdChange, ChannelIdChangeRecord, KnownChannelIdChange};
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use cloud::{
     CLOUD_HANDOFF_WINDOW, CLOUD_NOTICE_GIVE_UP, CLOUD_NOTICE_LEASE, CloudBegun, CloudDeleted,
