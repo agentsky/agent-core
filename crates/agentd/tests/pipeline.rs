@@ -35,7 +35,7 @@ use time::OffsetDateTime;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
-use common::{TempDir, env};
+use common::{TempDir, env, with_a_hung_worker};
 
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
@@ -355,6 +355,7 @@ async fn link(store: &Store, user: &str) -> MemberId {
 struct Setup {
     drain_timeout_secs: u64,
     pipeline: fn(&mut PipelineSettings),
+    routers: fn(Routers) -> Routers,
 }
 
 impl Default for Setup {
@@ -362,6 +363,7 @@ impl Default for Setup {
         Self {
             drain_timeout_secs: 5,
             pipeline: |_| {},
+            routers: |routers| routers,
         }
     }
 }
@@ -440,7 +442,7 @@ async fn start_with(setup: Setup) -> Stack {
             .unwrap()
     );
 
-    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+    let server = Server::bind(app.clone(), (setup.routers)(Routers::new(&app).unwrap()))
         .await
         .unwrap();
     let addrs = server.addrs();
@@ -1811,6 +1813,7 @@ async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
 async fn a_second_signal_while_a_turn_runs_cuts_it_short_at_once() {
     let stack = start_with(Setup {
         drain_timeout_secs: 30,
+        routers: with_a_hung_worker,
         ..Setup::default()
     })
     .await;
@@ -3193,6 +3196,7 @@ async fn the_servers_hand_off_worker_keeps_leasing_through_the_drain() {
     let mut stack = start_with(Setup {
         drain_timeout_secs: 30,
         pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+        ..Setup::default()
     })
     .await;
     let writer = stack.other_agent("writer", "UWRITER").await;
@@ -3220,6 +3224,7 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
     let mut stack = start_with(Setup {
         drain_timeout_secs: 30,
         pipeline: |settings| settings.hand_off_sweep = Duration::from_millis(20),
+        ..Setup::default()
     })
     .await;
     let writer = stack.other_agent("writer", "UWRITER").await;

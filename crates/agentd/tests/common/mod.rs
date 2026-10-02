@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentd::server::{Routers, Worker};
 use secrecy::ExposeSecret;
 
 pub const CONFIG: &str = r#"
@@ -119,4 +120,13 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// `routers` with a worker that never ends, so the drain takes all of
+/// `server.drain_timeout_secs`.
+pub fn with_a_hung_worker(mut routers: Routers) -> Routers {
+    routers
+        .workers
+        .push(Worker::new("hung worker", std::future::pending::<()>()));
+    routers
 }
