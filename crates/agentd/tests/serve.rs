@@ -148,13 +148,14 @@ async fn healthz_is_503_when_the_store_is_down() {
 #[tokio::test]
 async fn shutdown_stops_accepting_and_waits_for_in_flight_requests() {
     let started = Arc::new(Notify::new());
-    let notify = started.clone();
+    let release = Arc::new(Notify::new());
+    let (notify, released) = (started.clone(), release.clone());
     let running = Running::start(CONFIG, move |mut routers| {
         routers.public = routers.public.route(
             "/slow",
             routing::get(move || async move {
                 notify.notify_one();
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                released.notified().await;
                 "done"
             }),
         );
@@ -171,6 +172,7 @@ async fn shutdown_stops_accepting_and_waits_for_in_flight_requests() {
         assert!(Instant::now() < deadline, "still accepting after shutdown");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    release.notify_one();
 
     let response = within(Duration::from_secs(5), request)
         .await

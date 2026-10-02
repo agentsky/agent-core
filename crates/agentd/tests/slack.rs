@@ -5,6 +5,7 @@ mod common;
 
 use std::io::Write as _;
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentd::server::{Routers, Server, Worker, public_router};
@@ -15,8 +16,9 @@ use surface_slack::ingress::DEDUP_RETENTION;
 use surface_slack::{BindingRef, SlackInbound};
 use testkit::slack as fixtures;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tower::util::MapRequestLayer;
 use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -389,7 +391,16 @@ async fn only_kept_messages_reach_processed_events_and_only_by_channel_and_ts() 
 async fn a_stalled_body_does_not_hold_up_shutdown() {
     let slack = fake_slack().await;
     let app = App::open(config(Some(&slack))).await.unwrap();
-    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
+    let arrived = Arc::new(Notify::new());
+    let mut routers = Routers::new(&app).unwrap();
+    routers.public = routers.public.layer(MapRequestLayer::new({
+        let arrived = Arc::clone(&arrived);
+        move |request: axum::extract::Request| {
+            arrived.notify_one();
+            request
+        }
+    }));
+    let running = Running::start(app.clone(), routers).await;
     let addr = running.public;
     let client = tokio::task::spawn_blocking(move || {
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
@@ -404,7 +415,9 @@ async fn a_stalled_body_does_not_hold_up_shutdown() {
             .unwrap();
         common::read_response(&mut stream)
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+        .await
+        .expect("the request never reached agentd's routes");
 
     let begun = Instant::now();
     running.stop().await;
