@@ -304,8 +304,13 @@ impl Server {
     /// 4. The hand-offs let go since the drain began, by the hand-off
     ///    worker's last pass included, are made due at once
     ///    ([`Pipeline::release_cut_hand_offs`]), within a second if the
-    ///    shutdown was forced and until a second signal otherwise, the
-    ///    pipeline is dropped, and the store is closed.
+    ///    shutdown was forced and until a second signal otherwise.
+    /// 5. With turns, every warm session's process and container is
+    ///    stopped, within what is left of the same timeout
+    ///    ([`Pipeline::stop_sessions`]). A drain that was cut short, by the
+    ///    timeout or by `abort`, skips it, and the next start reaps what is
+    ///    left.
+    /// 6. The pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -507,6 +512,7 @@ impl Server {
         stop.send_replace(true);
 
         let mut forced = false;
+        let mut turns_cut = false;
         if let Some(pipeline) = &pipeline {
             pipeline.close();
             let drained = tokio::select! {
@@ -517,6 +523,7 @@ impl Server {
                 }
             };
             if !drained {
+                turns_cut = true;
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
                 if !forced {
@@ -568,6 +575,23 @@ impl Server {
                 tracing::warn!(
                     "shutdown forced; the hand-offs let go last are taken after their lease"
                 );
+            }
+            if turns_cut
+                || cut_short.is_some()
+                || !released
+                || tokio::time::Instant::now() >= deadline
+            {
+                tracing::warn!("leaving warm sandboxes for the next start to reap");
+            } else {
+                let left = tokio::select! {
+                    stopped = tokio::time::timeout_at(deadline, pipeline.stop_sessions()) => {
+                        stopped.is_err().then_some("drain timeout elapsed")
+                    }
+                    () = abort.as_mut() => Some("shutdown forced"),
+                };
+                if let Some(reason) = left {
+                    tracing::warn!("{reason}; leaving warm sandboxes for the next start to reap");
+                }
             }
         }
         drop(pipeline);
