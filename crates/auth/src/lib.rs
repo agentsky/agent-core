@@ -237,8 +237,9 @@ pub struct Auth {
 /// What a refresh hands every caller waiting for it.
 type Outcome = Result<SecretString, AuthError>;
 
-/// The refresh in flight for a member: its result, once it has one.
-type Flight = watch::Receiver<Option<Outcome>>;
+/// The refresh in flight for a member: where it publishes its result. Each
+/// caller waiting for it holds a receiver.
+type Flight = watch::Sender<Option<Outcome>>;
 
 struct Inner {
     config: OAuthConfig,
@@ -504,31 +505,48 @@ impl Auth {
         Ok(deleted)
     }
 
-    /// The refresh in flight for `member`, started now if there is none.
-    fn flight(&self, member: MemberId) -> Flight {
+    /// How many callers wait for the refresh in flight for `member`; 0 when
+    /// none is in flight. For tests that need every caller to have joined a
+    /// refresh before it ends.
+    #[doc(hidden)]
+    pub fn refresh_waiters(&self, member: MemberId) -> usize {
+        locked(&self.inner.flights)
+            .get(&member)
+            .map_or(0, Flight::receiver_count)
+    }
+
+    /// Joins the refresh in flight for `member`, started now if there is
+    /// none.
+    fn flight(&self, member: MemberId) -> watch::Receiver<Option<Outcome>> {
         let mut flights = locked(&self.inner.flights);
         if let Some(flight) = flights.get(&member) {
-            return flight.clone();
+            return flight.subscribe();
         }
-        let (result, flight) = watch::channel(None);
-        flights.insert(member, flight.clone());
+        let result = Flight::new(None);
+        let joined = result.subscribe();
+        flights.insert(member, result.clone());
         drop(flights);
-        tokio::spawn(Arc::clone(&self.inner).refresh(member, result));
-        flight
+        let landing = Landing {
+            inner: Arc::clone(&self.inner),
+            member,
+        };
+        tokio::spawn(Arc::clone(&self.inner).refresh(landing, result));
+        joined
     }
 }
 
 /// Removes a member's flight from [`Inner::flights`] when dropped, so a
-/// refresh task that ends in any way, a panic included, lets the next caller
-/// start a new one.
-struct Landing<'a> {
-    flights: &'a Mutex<HashMap<MemberId, Flight>>,
+/// refresh task that ends in any way, a panic or being dropped before it
+/// first runs included, lets the next caller start a new one. The task owns
+/// it from the moment it is spawned.
+struct Landing {
+    inner: Arc<Inner>,
     member: MemberId,
 }
 
-impl Drop for Landing<'_> {
+impl Drop for Landing {
     fn drop(&mut self) {
-        locked(self.flights).remove(&self.member);
+        locked(&self.inner.flights).remove(&self.member);
     }
 }
 
@@ -577,14 +595,11 @@ impl Inner {
         }
     }
 
-    /// The refresh task: refreshes `member`'s token under their lock, hands
-    /// the result to every waiting caller, then does what is left without the
-    /// lock. It runs to the end whether or not anyone still waits.
-    async fn refresh(self: Arc<Self>, member: MemberId, result: watch::Sender<Option<Outcome>>) {
-        let landing = Landing {
-            flights: &self.flights,
-            member,
-        };
+    /// The refresh task: refreshes the token of `landing`'s member under their
+    /// lock, hands the result to every waiting caller, then does what is left
+    /// without the lock. It runs to the end whether or not anyone still waits.
+    async fn refresh(self: Arc<Self>, landing: Landing, result: Flight) {
+        let member = landing.member;
         let guard = self.locks.lock(member).await;
         let (outcome, afterwards) = self.refresh_locked(member).await;
         drop(guard);
