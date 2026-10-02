@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentd::pipeline::{TurnSettings, Turns};
-use agentd::server::{Addrs, Routers, Server};
+use agentd::server::{Addrs, Routers, Server, Worker};
 use agentd::{App, Config};
 use core_types::{
     AgentId, ConvRef, CredentialRef, Hop, MemberId, MemberKey, MessageId, Requester, ScopeKey,
@@ -46,13 +46,22 @@ struct Running {
 /// processes are `fake-claude` running `turns`, and a member with a linked
 /// account.
 async fn start(turns: &[Turn]) -> Running {
+    start_with(turns, common::CONFIG, |routers| routers).await
+}
+
+/// [`start`] with config `config`, and the routers `change` returns.
+async fn start_with(
+    turns: &[Turn],
+    config: &str,
+    change: impl FnOnce(Routers) -> Routers,
+) -> Running {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
     let dir = TempDir::new();
     let fake = fake_anthropic().await;
     let text = format!(
         "{}\n[proxy]\nupstream = \"{}\"\n",
-        common::CONFIG.replace("/nonexistent/agentd", &dir.path().display().to_string()),
+        config.replace("/nonexistent/agentd", &dir.path().display().to_string()),
         fake.uri()
     );
     let app = App::open(Config::parse(&text, env()).unwrap())
@@ -78,7 +87,7 @@ async fn start(turns: &[Turn]) -> Running {
         )
         .await
         .unwrap();
-    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+    let server = Server::bind(app.clone(), change(Routers::new(&app).unwrap()))
         .await
         .unwrap();
     let script = dir.path().join("script.json");
@@ -242,6 +251,24 @@ async fn a_forced_shutdown_leaves_warm_sandboxes_to_the_next_start() {
     let session = running.warm_session("m1").await;
     let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
     running.shut_down(true).await;
+    assert!(turns.sessions().is_warm(session));
+    assert_eq!(sandbox.list_managed().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_drain_cut_short_by_its_timeout_leaves_warm_sandboxes_to_the_next_start() {
+    let config = common::CONFIG.replace("drain_timeout_secs = 5", "drain_timeout_secs = 1");
+    let running = start_with(&[Turn::reply("warm")], &config, |mut routers| {
+        routers
+            .workers
+            .push(Worker::new("hung worker", std::future::pending::<()>()));
+        routers
+    })
+    .await;
+    let session = running.warm_session("m1").await;
+    let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
+    running.stop().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(turns.sessions().is_warm(session));
     assert_eq!(sandbox.list_managed().await.unwrap().len(), 1);
 }
