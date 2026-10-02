@@ -2364,9 +2364,11 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   because deriving it from the URL would change every stored identity when
   the URL changes.
 - The manager bot now posts every command reply, and `users.info` plus
-  `im.create` for a channel command, so its custom role should include
+  `im.create` for a channel command, so its role should include
   `api-bypass-rate-limit`, as the T11 note on the role expected; the
-  README says so.
+  README says so. The built-in `bot` and `app` roles the manager holds on
+  the Community Edition already have it, and `create-d` for `im.create`
+  ([T11's live check](#the-live-check-against-7139)).
 - `surface-rocketchat`'s `conv_kind` took a `d` room whose `rooms.info`
   had neither `usersCount` nor `uids` for a one-to-one DM, which would
   make a DM of unknown size private enough for a login code if it reached
