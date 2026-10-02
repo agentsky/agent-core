@@ -6,6 +6,8 @@
 //!   other crates find with [`fake_claude_path`] and script with
 //!   [`claude::Turn`]. [`claude`] documents what it checks and prints.
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
+//! - [`child`]: whether dropping a child's handles killed it before closing
+//!   its stdin.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.
 //! - [`held`]: a wiremock responder that answers when the test says so.
 //! - [`Logs`]: a test binary's log lines, captured by one global
