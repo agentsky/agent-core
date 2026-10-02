@@ -558,7 +558,10 @@ impl Server {
             } else {
                 tokio::select! {
                     () = pipeline.release_cut_hand_offs() => true,
-                    () = abort.as_mut() => false,
+                    () = abort.as_mut() => {
+                        forced = true;
+                        false
+                    }
                 }
             };
             if !released {
@@ -566,7 +569,7 @@ impl Server {
                     "shutdown forced; the hand-offs let go last are taken after their lease"
                 );
             }
-            if forced || !released || tokio::time::Instant::now() >= deadline {
+            if forced || tokio::time::Instant::now() >= deadline {
                 tracing::warn!("leaving warm sandboxes for the next start to reap");
             } else {
                 let left = tokio::select! {
