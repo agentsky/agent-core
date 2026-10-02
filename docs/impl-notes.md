@@ -2672,10 +2672,11 @@ needs more running at once widens the subnet in both `compose.yaml` and
 
 **Issue.** The design gives the manager a custom role. On 7.13.9,
 `roles.create` is registered in `apps/meteor/ee/server/api/roles.ts` with
-`license: ['custom-roles']` and refuses without that license module, and
-`roles.update` refuses for any role that isn't protected (built in). The
-Community Edition, which the Compose stack runs, can only change which
-built-in roles hold a permission (`permissions.update`, which needs
+`license: ['custom-roles']` and refuses without that license module.
+`roles.update` refuses too: [T11's live check](#the-live-check-against-7139)
+got the same `This is an enterprise feature` answer for the built-in `bot`
+role. The Community Edition, which the Compose stack runs, can only change
+which built-in roles hold a permission (`permissions.update`, which needs
 `access-permissions`).
 
 **Solution.** `deploy/compose/README.md` lists the permissions

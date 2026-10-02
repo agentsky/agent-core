@@ -1043,7 +1043,8 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
     false` and `requirePasswordChange: false`, with a random password that is
     never stored.
   - A token for the new bot, in one of two ways. Pick the one that works with
-    the custom role on the target server version and record which in the PR:
+    the manager's roles from the design on the target server version and
+    record which in the PR:
     - `users.createToken`. 7.x refuses it unless the server runs with
       `CREATE_TOKENS_FOR_USERS=true`; 8.0 and later require a `secret` equal
       to the server's `CREATE_TOKENS_FOR_USERS_SECRET`
@@ -1075,7 +1076,9 @@ Acceptance: a wiremock test per method, including error mapping to
 
 Live check (manual): against a Rocket.Chat 7.x server (T16's Compose stack
 works once it lands; until then a local container). Using a manager with only
-the custom role from the design, create a bot user and obtain its token.
+the roles the design gives it (the built-in `bot` and `app` roles on the
+Community Edition, a custom role with a license), create a bot user and obtain
+its token.
 Record the exact permissions needed. This settles the design's open question.
 Update the Rocket.Chat section of `docs/design.md` with the result.
 
@@ -1418,7 +1421,7 @@ Deliverables:
   1. Bring the stack up.
   2. Create the Rocket.Chat admin, then the manager user and its role (with
      the permissions T11 settled: a custom role with a license, otherwise
-     the built-in `app` role).
+     the built-in `bot` and `app` roles).
   3. Configure agentd.
   4. Run the live checks listed in T11, T14 and T23.
 - CI: a job that builds both images (no push) when `images/**` or the Rust code
