@@ -68,9 +68,10 @@ agentd's bots is in. Replies always come as a direct message from the manager
 bot. A login code or API key posted outside that direct message is refused and
 the member is told to start again or revoke the key. Members whose Claude link
 breaks get a direct message saying so, retried with a growing wait for about
-three days if it can't be delivered. The manager posts every reply, so give its role
-`api-bypass-rate-limit`, or Rocket.Chat's REST rate limiter will delay
-replies when many members use commands at once.
+three days if it can't be delivered. The manager posts every reply, so one of
+its roles needs `api-bypass-rate-limit` (on the Community Edition, its `bot`
+and `app` roles already have it), or Rocket.Chat's REST rate limiter will
+delay replies when many members use commands at once.
 A linked member creates an agent with `create <name> [persona]`: the manager
 creates a bot user named `<name>` (or `<owner>.<name>` when that is taken),
 which logs in once to create its own personal access token, so the `bot` role
