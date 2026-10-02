@@ -59,7 +59,8 @@ type Row = (String, String, String, i64);
 
 macro_rules! reached {
     () => {
-        "WITH RECURSIVE reached(channel) AS (SELECT old_channel FROM channel_id_changes \
+        "WITH RECURSIVE reached(channel) AS (VALUES (?), (?) \
+         UNION SELECT old_channel FROM channel_id_changes \
          WHERE binding_id = ? AND settled_at IS NULL \
          UNION SELECT c.new_channel FROM channel_id_changes AS c \
          JOIN reached AS r ON c.old_channel = r.channel WHERE c.binding_id = ?) "
@@ -102,11 +103,11 @@ impl Store {
     /// the same binding is recorded already, or the binding has `kept`
     /// changes and none it can forget. To keep it under `kept`, the
     /// binding's earliest settled changes are forgotten, but never one that
-    /// the chain of a waiting change runs through: one from the old id of a
-    /// waiting change, or from an id such a chain reaches. Whether the change
-    /// is known, or the binding full, is read first without the write lock,
-    /// so a replay or a flood of forged changes doesn't hold up the store's
-    /// writers.
+    /// the chain of a waiting change, `change` among them, runs through: one
+    /// from the old or new id of `change` or the old id of a waiting change,
+    /// or from an id such a chain reaches. Whether the change is known, or
+    /// the binding full, is read first without the write lock, so a replay
+    /// or a flood of forged changes doesn't hold up the store's writers.
     ///
     /// # Errors
     ///
@@ -130,6 +131,8 @@ impl Store {
             }
         };
         let read = sqlx::query_as(COUNTS)
+            .bind(change.old.as_str())
+            .bind(change.new.as_str())
             .bind(&binding)
             .bind(&binding)
             .bind(change.old.as_str())
@@ -140,6 +143,8 @@ impl Store {
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let read = sqlx::query_as(COUNTS)
+            .bind(change.old.as_str())
+            .bind(change.new.as_str())
             .bind(&binding)
             .bind(&binding)
             .bind(change.old.as_str())
@@ -150,6 +155,8 @@ impl Store {
             Err(refused) => return Ok(refused),
         };
         sqlx::query(FORGET)
+            .bind(change.old.as_str())
+            .bind(change.new.as_str())
             .bind(&binding)
             .bind(&binding)
             .bind(&binding)

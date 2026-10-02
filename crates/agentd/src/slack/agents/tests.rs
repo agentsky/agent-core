@@ -752,6 +752,16 @@ fn room_rule(id: &str) -> crate::policy::Rule {
     crate::policy::Rule::Room {
         conv: room(id),
         label: "#secret".to_owned(),
+        copied: false,
+    }
+}
+
+/// [`room_rule`] as a copy agentd made from a deny on a channel's old id.
+fn copied_rule(id: &str) -> crate::policy::Rule {
+    crate::policy::Rule::Room {
+        conv: room(id),
+        label: "#secret".to_owned(),
+        copied: true,
     }
 }
 
@@ -1109,7 +1119,7 @@ async fn a_change_slack_never_confirms_is_given_up_with_its_denies_copied() {
         rules_of(&h, helper).await,
         Rules {
             allow: vec![room_rule(OLD)],
-            deny: vec![room_rule(OLD), room_rule(NEW)],
+            deny: vec![room_rule(OLD), copied_rule(NEW)],
         },
         "the deny applies to the new id for good, and the allow didn't move"
     );
@@ -1621,11 +1631,13 @@ async fn a_change_the_binding_has_no_room_for_copies_its_denies_at_once() {
     let waiting = changes_of(&h, helper).await;
     assert_eq!(waiting.len(), room_for);
     assert!(waiting.iter().all(|(_, _, waiting)| *waiting));
-    let mut expected = ids(&olds);
-    expected.extend(ids(&news[room_for..]));
+    let mut expected = denying(&ids(&olds));
+    expected
+        .deny
+        .extend(news[room_for..].iter().map(|new| copied_rule(new)));
     assert_eq!(
         rules_of(&h, helper).await,
-        denying(&expected),
+        expected,
         "the denies of the changes without room apply to their new ids for good"
     );
     for new in &news {
@@ -1719,7 +1731,10 @@ async fn a_change_with_no_room_carries_the_denies_a_waiting_change_brings_to_its
         .await;
     assert_eq!(
         rules_of(&h, helper).await,
-        denying(&[OLD, "C0LATER01"]),
+        Rules {
+            allow: Vec::new(),
+            deny: vec![room_rule(OLD), copied_rule("C0LATER01")],
+        },
         "the deny on the waiting change's old id reaches the id after its new one"
     );
     assert!(!permits(&h, helper, "C0LATER01").await);

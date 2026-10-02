@@ -262,6 +262,46 @@ async fn the_earliest_settled_changes_make_room_and_waiting_ones_fill_it() {
 }
 
 #[tokio::test]
+async fn a_new_change_keeps_the_settled_ones_its_own_chain_runs_through() {
+    let store = memory_store().await;
+    let helper = binding(&store, "helper").await;
+    let onward = change(helper, "G0LINK00N", "C0LINK00M", 1_000);
+    let sibling = change(helper, "G0LINK00X", "C0LINK00Y", 1_001);
+    let other = change(helper, "G0OTHER01", "C0OTHER01", 1_002);
+    let later = change(helper, "G0OTHER02", "C0OTHER02", 1_003);
+    for changed in [&onward, &sibling, &other, &later] {
+        assert_eq!(
+            store.record_channel_id_change(changed, 4).await.unwrap(),
+            Recorded
+        );
+        assert!(
+            store
+                .settle_channel_id_change(changed, changed.received_at)
+                .await
+                .unwrap()
+        );
+    }
+    let forged = change(helper, "G0LINK00X", "G0LINK00N", 1_004);
+    assert_eq!(
+        store.record_channel_id_change(&forged, 4).await.unwrap(),
+        Recorded
+    );
+    let agent = store.binding(helper).await.unwrap().unwrap().agent;
+    let kept: Vec<ChannelIdChange> = store
+        .channel_id_changes_of_agent(agent)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|known| known.change)
+        .collect();
+    assert_eq!(
+        kept,
+        [onward, sibling, later, forged],
+        "the links from its old and new ids stay, the earliest other one goes"
+    );
+}
+
+#[tokio::test]
 async fn a_known_change_or_a_full_binding_is_refused_without_the_write_lock() {
     let dir = crate::test_util::TempDir::new();
     let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
