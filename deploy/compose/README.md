@@ -79,6 +79,15 @@ curl -fsS http://127.0.0.1:8443/healthz   # "ok" once agentd serves
 Rocket.Chat takes a minute or two to start the first time. `docker compose
 logs -f rocketchat` shows when it is up.
 
+The Community Edition must be able to reach Rocket.Chat Cloud over HTTPS to
+report its statistics. A workspace that never has, or hasn't for ten days,
+is restricted: posts and edits, through the REST API and DDP, and the
+confirm step of uploads answer `restricted-workspace` until it reports or
+gets a license
+([impl-notes](../../docs/impl-notes.md#the-live-check-against-7139)). Reads,
+reactions, invites and user management still work, so a restricted
+workspace looks healthy until an agent tries to answer.
+
 agentd keeps its database and, later, the agents' volumes under `./data`
 (`AGENT_CORE_DATA`), owned by uid 10001 with mode 0700, so reading it on
 the host needs `sudo`. `docker compose down` stops the stack and keeps
@@ -102,9 +111,9 @@ agentd makes, and give agentd that instead.
    Workspace > Permissions**, find `create-personal-access-tokens` and tick
    the `bot` role.
 3. Give the manager its permissions. The design asks for a role with only
-   what agentd needs. From the server source
-   ([impl-notes](../../docs/impl-notes.md#what-the-server-source-says-about-the-managers-custom-role)),
-   that is:
+   what agentd needs. T11's live check against 7.13.9
+   ([impl-notes](../../docs/impl-notes.md#the-live-check-against-7139))
+   found that is:
 
    | Permission | For |
    | --- | --- |
@@ -115,20 +124,28 @@ agentd makes, and give agentd that instead.
    | `api-bypass-rate-limit` | the manager's own REST calls |
    | `create-personal-access-tokens` | the manager's own token |
 
-   A new bot sets its avatar itself, so the manager needs no
-   `edit-other-user-avatar`
+   A new bot sets its own avatar, and agentd renames no bot, so the manager
+   needs neither `edit-other-user-avatar` nor `edit-other-user-info`
    ([impl-notes](../../docs/impl-notes.md#a-bot-sets-its-own-avatar)).
 
    Creating a role is an Enterprise feature: `roles.create` needs the
    `custom-roles` license module
    ([impl-notes](../../docs/impl-notes.md#custom-roles-need-a-rocketchat-enterprise-license)).
-   With a license, create a global role `agent-manager` in **Administration >
-   Workspace > Permissions > Roles** and tick the permissions above. On the
-   Community Edition this stack runs by default, there is no least-privilege
-   setup yet; for development, give the manager the `admin` role.
+   On the Community Edition this stack runs by default, the manager holds
+   the built-in `bot` and `app` roles instead. In **Administration >
+   Workspace > Permissions**, tick the `app` role for `create-user`,
+   `view-full-other-user-info`, `edit-other-user-active-status` and
+   `add-user-to-joined-room`. `app` already has
+   `api-bypass-rate-limit`, and step 2 gave `bot`
+   `create-personal-access-tokens`. `app`'s only other holders are
+   Apps-Engine app users, which can't log in; ticking these for `bot` would
+   give them to every bot in the workspace. With a license, create a global
+   role `agent-manager` in **Administration > Workspace > Permissions >
+   Roles** and tick the permissions above instead.
 4. Create the manager in **Administration > Workspace > Users > New user**:
-   username `agent-manager`, any email, a password, roles `user` and the role
-   from step 3.
+   username `agent-manager`, any email, a password, and the roles `bot` and
+   `app` on the Community Edition, or `user` and `agent-manager` with a
+   license.
 5. Log in as the manager and, in **My account > Personal access tokens**,
    create a token with **Ignore Two Factor Authentication** ticked (the
    endpoint for renaming a bot requires two-factor authentication otherwise).

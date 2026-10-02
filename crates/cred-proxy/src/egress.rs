@@ -193,8 +193,10 @@ impl Network for SystemNetwork {
 ///
 /// A refusal is a 403 (429 or 503 when a cap is reached, 502 if the host
 /// can't be resolved or reached) with a one-line plain-text reason of fixed
-/// text, and is logged with the session. Log lines name the host only once
-/// it is known to be a valid host name, and never the request line.
+/// text, and is logged with the session. Log lines never name the host
+/// the sandbox asked for, which can carry data out, nor hold the request
+/// line: they give the port, the rule that allowed the host and the
+/// address, as far as each is known.
 pub struct EgressProxy {
     policy: EgressPolicy,
     network: Arc<dyn Network>,
@@ -275,14 +277,15 @@ impl EgressProxy {
             Ok(response) => response,
             Err(Refused {
                 why,
-                target,
+                port,
+                rule,
                 address,
             }) => {
                 tracing::warn!(
                     %peer,
                     %session,
-                    host = target.as_ref().map(|t| t.host.as_str()),
-                    port = target.as_ref().map(|t| t.port),
+                    port,
+                    rule = rule.map(|r| r.to_string()),
                     address = address.map(|a| a.to_string()),
                     reason = why.reason(),
                     "the egress proxy refused a CONNECT"
@@ -302,12 +305,16 @@ impl EgressProxy {
             return Err(Refused::new(Why::Version, None));
         }
         let target = Target::of(request.uri()).map_err(|why| Refused::new(why, None))?;
-        let refuse = |why| Refused::new(why, Some(target.clone()));
+        let refuse = |why| Refused::new(why, Some(target.port));
         if target.host == ANTHROPIC_API_HOST {
             return Err(refuse(Why::Anthropic));
         }
         let slot = self.take_slot(session).map_err(refuse)?;
-        self.allowed(session, &target).await.map_err(refuse)?;
+        let rule = self.allowed(session, &target).await.map_err(refuse)?;
+        let refuse = |why| Refused {
+            rule: Some(rule.clone()),
+            ..refuse(why)
+        };
         let (slot, addresses) = self.resolve(slot, &target).await.map_err(refuse)?;
         if let Some((address, why)) = addresses
             .iter()
@@ -327,8 +334,8 @@ impl EgressProxy {
         }
         tracing::debug!(
             %session,
-            host = target.host.as_str(),
             port = target.port,
+            %rule,
             %address,
             "opened an egress tunnel"
         );
@@ -342,7 +349,8 @@ impl EgressProxy {
             },
             self.limits,
             slot,
-            target,
+            rule,
+            target.port,
         ));
         Ok(StatusCode::OK.into_response())
     }
@@ -374,13 +382,13 @@ impl EgressProxy {
         })
     }
 
-    /// Whether a rule allows `target`: `Err(Port)` when a rule names the
-    /// host on another port. The extension is asked only when no
+    /// The first rule that allows `target`: `Err(Port)` when a rule names
+    /// the host on another port. The extension is asked only when no
     /// configured rule allows it.
-    async fn allowed(&self, session: SessionId, target: &Target) -> Result<(), Why> {
-        let allows = |rule: &HostRule| rule.allows(&target.host, target.port);
-        if self.policy.rules().iter().any(allows) {
-            return Ok(());
+    async fn allowed(&self, session: SessionId, target: &Target) -> Result<HostRule, Why> {
+        let allows = |rule: &&HostRule| rule.allows(&target.host, target.port);
+        if let Some(rule) = self.policy.rules().iter().find(allows) {
+            return Ok(rule.clone());
         }
         let extra = match &self.extension {
             Some(extension) => {
@@ -391,8 +399,8 @@ impl EgressProxy {
             None => Vec::new(),
         };
         let rules = || self.policy.rules().iter().chain(&extra);
-        if extra.iter().any(allows) {
-            Ok(())
+        if let Some(rule) = extra.iter().find(allows) {
+            Ok(rule.clone())
         } else if rules().any(|rule| rule.names(&target.host)) {
             Err(Why::Port)
         } else {
@@ -460,7 +468,7 @@ impl EgressProxy {
 }
 
 /// A `CONNECT` target: a valid, normalized host name and a port.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Target {
     host: String,
     port: u16,
@@ -497,15 +505,17 @@ impl Target {
 /// A refused `CONNECT`, with what is known about it for the log line.
 struct Refused {
     why: Why,
-    target: Option<Target>,
+    port: Option<u16>,
+    rule: Option<HostRule>,
     address: Option<IpAddr>,
 }
 
 impl Refused {
-    fn new(why: Why, target: Option<Target>) -> Self {
+    fn new(why: Why, port: Option<u16>) -> Self {
         Self {
             why,
-            target,
+            port,
+            rule: None,
             address: None,
         }
     }
@@ -668,7 +678,8 @@ async fn tunnel(
     mut closers: Closers,
     limits: EgressLimits,
     slot: Slot,
-    target: Target,
+    rule: HostRule,
+    port: u16,
 ) {
     let outcome = tokio::select! {
         outcome = relay(upgrade, upstream, limits.idle_timeout) => outcome,
@@ -678,8 +689,8 @@ async fn tunnel(
     };
     tracing::debug!(
         session = %slot.session,
-        host = target.host.as_str(),
-        port = target.port,
+        port,
+        %rule,
         outcome,
         "an egress tunnel ended"
     );
