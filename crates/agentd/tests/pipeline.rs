@@ -1090,7 +1090,11 @@ async fn failures_and_refusals_say_why_and_a_bot_never_joins_a_room() {
 
 #[tokio::test]
 async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_mentioned() {
-    let stack = start().await;
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.attribution_wait = Duration::from_secs(30),
+        ..Setup::default()
+    })
+    .await;
     let store = stack.store();
 
     stack.next_turn(Turn::api_error(401, "Invalid bearer token"));
@@ -2404,7 +2408,11 @@ async fn a_bot_past_the_queue_bounds_gets_no_busy_line() {
 
 #[tokio::test]
 async fn an_agents_post_that_names_no_other_agent_holds_no_lane_up() {
-    let stack = start().await;
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.attribution_wait = Duration::from_secs(30),
+        ..Setup::default()
+    })
+    .await;
     let first = stack.answered_root("r1", "First.").await;
     stack.other_agent("writer", "UWRITER").await;
     let before = stack.mock.calls().len();
@@ -2421,7 +2429,7 @@ async fn an_agents_post_that_names_no_other_agent_holds_no_lane_up() {
     let started = Instant::now();
     stack.handle(upload).await;
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(10),
         "the unattributed post was ignored without waiting for its attribution: {:?}",
         started.elapsed()
     );
