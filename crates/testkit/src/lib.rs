@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 
 pub mod anthropic;
+pub mod child;
 pub mod claude;
 pub mod fixtures;
 pub mod held;
