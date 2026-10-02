@@ -4611,6 +4611,20 @@ The next start's `purge` deletes the agentctl tokens and `reap_orphans`
 stops the containers. Waiting for those tasks would take the time the
 deadline or the second signal just refused.
 
+With T34's hand-offs, the stop runs after the server's last
+`release_cut_hand_offs`: both write the store, and the release, which
+lets another instance take the rows at once rather than after their
+lease, matters more. The stop is skipped once a second signal has
+arrived, in the drain or during that release, or once the deadline has
+passed, in the drain or during the release. On a graceful shutdown the
+release isn't bounded by the deadline: a drain that used its whole
+budget would cancel it at once and leave the rows to their five-minute
+lease. It is one `UPDATE`, which the pool's acquire timeout and SQLite's
+busy timeout already bound, and a store stuck past those would hold the
+stop's revocations and the store's close as well. A release that hangs
+anyway holds the process until a second signal, which then skips the
+stop.
+
 ### A process sandbox gives every container one address
 
 **Issue.** `ProcessSandbox::ip` answers `127.0.0.1` for every container,
