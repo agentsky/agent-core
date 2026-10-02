@@ -1333,11 +1333,12 @@ async fn the_plan_is_read_after_the_members_lock_is_released() {
         !requests_to(&h.server, PROFILE_PATH).await.is_empty()
     })
     .await;
+    let requested = tokio::time::Instant::now();
     let logged_out = tokio::time::timeout(Duration::from_millis(1_000), h.auth.logout(h.member))
         .await
         .expect("logout doesn't wait for the profile");
     assert!(logged_out.unwrap());
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    tokio::time::sleep_until(requested + Duration::from_millis(2_000)).await;
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
 }
 
