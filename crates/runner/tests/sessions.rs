@@ -21,6 +21,7 @@ use sandbox::{
     SandboxError, SessionSpec, VolumeRef,
 };
 use secrecy::SecretString;
+use sqlx::Connection as _;
 use store::{Sealer, Store};
 use testkit::claude::REPLY_COST_USD;
 use testkit::{FakeAnthropic, Logs, Turn};
@@ -67,6 +68,7 @@ struct Faults {
     panic_turn_finished: AtomicBool,
     panic_process_starting: AtomicBool,
     panic_process_stopping: AtomicBool,
+    fail_process_stopping: AtomicBool,
 }
 
 impl Faults {
@@ -156,6 +158,9 @@ impl TurnHooks for Hooks {
         push(&self.log, Event::ProcessStopping(session.id, *process));
         if Faults::take(&self.faults.panic_process_stopping) {
             panic!("process_stopping panicked");
+        }
+        if Faults::take(&self.faults.fail_process_stopping) {
+            return Err("process_stopping failed".into());
         }
         Ok(())
     }
@@ -1492,4 +1497,126 @@ async fn a_panicking_process_starting_fails_the_turn_and_stops_the_container() {
     let report = h.run(session.id, request("sent")).await;
     assert_eq!(reply(&report), "one");
     assert_eq!(report.process_start, Some(SessionStart::New));
+}
+
+#[tokio::test]
+async fn a_failed_process_stopping_runs_again_once_the_container_is_stopped() {
+    let h = Harness::new(&[Turn::reply("one"), Turn::reply("two")]).await;
+    let first = h.thread_session("1.1").await.id;
+    reply(&h.run(first, request("1")).await);
+    h.clear();
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    h.manager.stop(first).await;
+    assert!(!h.manager.is_warm(first));
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(first, 1),
+            Event::ContainerStopped(first),
+            Event::ProcessStopping(first, 1),
+        ]
+    );
+
+    let second = h.thread_session("2.2").await.id;
+    reply(&h.run(second, request("2")).await);
+    h.clear();
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    h.sandbox.fail_stops.store(true, Ordering::SeqCst);
+    h.manager.stop(second).await;
+    assert!(h.manager.is_warm(second));
+    h.sandbox.fail_stops.store(false, Ordering::SeqCst);
+    h.manager.stop(second).await;
+    assert!(!h.manager.is_warm(second));
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(second, 2),
+            Event::ContainerStopped(second),
+            Event::ProcessStopping(second, 2),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_later_successful_process_stopping_takes_the_process_off_the_retry_list() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let id = h.thread_session("1.1").await.id;
+    reply(&h.run(id, request("1")).await);
+    h.clear();
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    let container = h.sandbox.inner.list_managed().await.unwrap()[0].id.clone();
+    h.sandbox.inner.stop(&container).await.unwrap();
+    eventually("the dead container is let go", || !h.manager.is_warm(id)).await;
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_process_stopping_that_fails_its_retry_too_is_given_up() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let id = h.thread_session("1.1").await.id;
+    reply(&h.run(id, request("1")).await);
+    h.clear();
+    h.faults
+        .panic_process_stopping
+        .store(true, Ordering::SeqCst);
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    h.manager.stop(id).await;
+    assert!(!h.manager.is_warm(id));
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+            Event::ProcessStopping(id, 1),
+        ]
+    );
+    h.logs
+        .snapshot()
+        .matching(&format!("session={id}"))
+        .assert_has("the process_stopping hook panicked")
+        .assert_has("the process_stopping hook failed again after its container stopped")
+        .assert_has("given_up=1");
+}
+
+#[tokio::test]
+async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn_instead_of_rerunning() {
+    let h = Harness::new(&[Turn::reply("first"), Turn::reply("again")]).await;
+    let session = h.thread_session("1.1").await;
+    reply(&h.run(session.id, request("one")).await);
+    h.manager.stop(session.id).await;
+    std::fs::remove_dir_all(projects_dir(&h, &session)).unwrap();
+    let mut db = sqlx::SqliteConnection::connect(&format!(
+        "sqlite://{}",
+        h._dir.0.join("agentd.db").display()
+    ))
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER unstarting_fails BEFORE UPDATE OF started ON sessions \
+         WHEN OLD.started = 1 AND NEW.started = 0 \
+         BEGIN SELECT RAISE(ABORT, 'unstarting fails'); END",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    let err = h
+        .manager
+        .run_turn(session.id, request("two"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunnerError::Store(_)), "{err}");
+    assert_eq!(
+        h.process_starts(),
+        2,
+        "the turn ran once more with --resume"
+    );
+    let stored = h.store.session(session.id).await.unwrap().unwrap();
+    assert!(stored.started, "{stored:?}");
 }
