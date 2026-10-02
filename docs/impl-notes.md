@@ -2919,8 +2919,9 @@ key named one.
 display text and is refused if it holds `/`, `\`, a control character, an
 invisible formatting character (bidirectional controls such as U+202E, which
 can make `exe.txt` read as `txt.exe`, zero-width characters, tag characters,
-or a line or paragraph separator), or is `.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
-directory, and startup empties `ctl-outbox/`. The cap is
+or a line or paragraph separator), or is only whitespace, `.` or `..`.
+Dropping the `Outbox` that `end_turn` returns deletes the directory, and
+startup empties `ctl-outbox/`. The cap is
 `limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
 files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in
 flight count against the 10.
@@ -5250,11 +5251,12 @@ anywhere, and ends up mounted into sandboxes.
 **Solution.** `skills::package` checks every skill the same way, whatever
 it came from: at most 10 MB of files, 1,000 files and directories, 16
 levels and paths of 1,024 bytes (so a deep tree of long names is refused
-before the file system answers `ENAMETOOLONG`); names without an empty, `.`
-or `..` part, `\`, control or invisible formatting characters; only regular
-files and directories (a symlink or a special file in a zip is refused; a
-clone checks symlinks out as plain files holding their targets, and a
-symlink found in any tree is refused); modes rewritten to
+before the file system answers `ENAMETOOLONG`); names without an empty,
+whitespace-only, `.` or `..` part, `\`, control or invisible formatting
+characters; only regular files and directories (a symlink or a special
+file in a zip is refused; a clone checks symlinks out as plain files
+holding their targets, and a symlink found in any tree is refused); modes
+rewritten to
 `0755` for directories and `0644`, or `0755` with an execute bit, for files.
 A `.zip` is read with the `zip` crate (MIT) with only
 `deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`

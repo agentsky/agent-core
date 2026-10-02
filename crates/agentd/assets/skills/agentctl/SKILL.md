@@ -30,7 +30,7 @@ it.
 
 Refused when the file is over the size limit (50 MB by default), when a turn
 already staged 10 files, or when the file name holds `/`, `\`, control or
-invisible characters, or is `.` or `..`.
+invisible characters, or is only whitespace, `.` or `..`.
 
 ## post
 
