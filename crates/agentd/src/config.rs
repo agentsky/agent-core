@@ -602,8 +602,8 @@ pub struct CloudConfig {
     /// `handoffs_per_hour`: how many hand-offs one member may ask for in an
     /// hour, from 1 to 100, default [`DEFAULT_CLOUD_HANDOFFS_PER_HOUR`]: the
     /// `cloud run`s that passed their checks and were recorded, each
-    /// whatever came of it. One past the cap is refused before anything is written
-    /// or sent.
+    /// whatever came of it. One past the cap is refused before anything is
+    /// written or sent.
     pub handoffs_per_hour: u32,
 }
 

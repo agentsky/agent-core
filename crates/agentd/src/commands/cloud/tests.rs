@@ -1384,7 +1384,6 @@ fn a_session_without_its_link_is_shown_by_id() {
     );
 }
 
-/// Runs `statements` on the SQLite database at `url`.
 /// A Slack harness on a database file, whose commands fire routines at
 /// `endpoint`, with `U0HUMAN01` linked and the routine registered; the
 /// database's URL and directory.

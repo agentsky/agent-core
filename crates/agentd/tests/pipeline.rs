@@ -1689,16 +1689,18 @@ async fn the_thread_turn_cap_stops_a_thread_but_not_a_dm() {
     stack.stop().await;
 }
 
-/// Waits up to 30 seconds for `done`.
 /// `future`'s output, or a panic naming `what` after a minute, longer
-/// than any drain timeout here: a regression that leaves a gate shut or a
-/// shutdown waiting fails the test instead of hanging it.
+/// than any drain timeout here. The tests wait on the server task, on
+/// `cut_short` and on drains through it, so a shutdown that stops cutting
+/// short what a shut gate holds fails with that name; other waits rely on
+/// CI's job timeouts.
 async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(60), future)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting until {what}"))
 }
 
+/// Waits up to 30 seconds for `done`.
 async fn wait_until(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !done() {

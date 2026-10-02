@@ -1328,7 +1328,7 @@ pub(super) async fn file_store() -> (Store, String, std::path::PathBuf) {
     (store, url, dir)
 }
 
-/// Runs `statements` on the database at `url`, beside the store.
+/// Runs `statements` on the SQLite database at `url`.
 pub(super) async fn sql(url: &str, statements: &str) {
     use sqlx::Connection as _;
     let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
@@ -2534,7 +2534,8 @@ async fn a_relink_notice_the_store_fails_on_leaves_the_others() {
     let h = slack_harness_on(store).await;
     let alice = h.linked("U0HUMAN01").await;
     let grace = h.linked("U0HUMAN02").await;
-    for member in [alice, grace] {
+    let now = OffsetDateTime::now_utc();
+    for (member, broken_at) in [(alice, now - time::Duration::minutes(1)), (grace, now)] {
         let generation = h
             .store
             .get_claude_link(member)
@@ -2543,7 +2544,7 @@ async fn a_relink_notice_the_store_fails_on_leaves_the_others() {
             .unwrap()
             .generation;
         h.store
-            .mark_claude_link_broken(member, generation, OffsetDateTime::now_utc())
+            .mark_claude_link_broken(member, generation, broken_at)
             .await
             .unwrap();
     }

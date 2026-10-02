@@ -9086,10 +9086,31 @@ it passes.
   has the link, so nothing is lost but the record.
 - A `Retry-After` up to two hours reads in minutes (61 minutes, not 2
   hours) and past that in hours to the nearest.
-- A test races eight hand-offs at one under the cap on a database file, so
-  a deferred transaction would let two through.
+- A test races eight hand-offs at one under the cap on a database file
+  and expects exactly one through. SQLite never lets two through here: in
+  WAL mode a deferred transaction whose snapshot went stale fails its write
+  with a busy error, so dropping `BEGIN IMMEDIATE` would fail runs with
+  busy errors, which the test catches when two transactions overlap.
 - A refusal past the cap logs at debug, so a looping member stays out of
   the logs. Its reply names the configured cap, not the count, which
   differs only when the cap was lowered within the hour.
 - The example config and `CloudConfig`'s rustdoc say "hand-offs", the runs
   that passed their checks and were recorded, rather than "`cloud run`s".
+
+### Review round 3
+
+- The relink regression test breaks alice's link a minute before grace's,
+  so alice's failing notice always comes first; with ties in the same
+  second the random member ids decided the order, and the old
+  abort-on-error loop passed about half the time. With the loop restored
+  it now fails 20 runs in 20, and passes 20 in 20 with the fix.
+- CI's `rust` and `coverage` jobs (about 7 and 6 minutes in recent runs),
+  `docker-tests` (about 5), `msrv` (about 2) and `docs` (doctests) now have
+  `timeout-minutes` of 30, 30, 30, 15 and 20, so a test hung behind a shut
+  gate fails its job instead of holding a runner for six hours. `bounded`
+  stays for its named failures on the server task, `cut_short` and
+  drains, and its rustdoc now says only that.
+- The relink notifier logs each store failure where it happens, with what
+  it was doing (a failure to record a notice that was sent says the notice
+  may go again after its lease), and the pass's summary, the members told
+  included, at debug, as the cloud notifier does.
