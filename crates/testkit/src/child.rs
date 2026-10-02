@@ -69,15 +69,23 @@ impl Drop for NotingStdin {
 
 /// Whether process `pid` is gone, exiting or has a SIGKILL pending: what a
 /// kill leaves in `/proc` at once.
+///
+/// # Panics
+///
+/// If this host has no `/proc`, so that every process would look gone.
 pub fn killed(pid: u32) -> bool {
     const SIGKILL_BIT: u64 = 1 << 8;
     const PF_EXITING: u64 = 0x4;
+    assert!(
+        std::fs::metadata("/proc/self/stat").is_ok(),
+        "no /proc on this host, so whether a child was killed can't be told"
+    );
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return true;
     };
-    let Some((_, rest)) = stat.rsplit_once(") ") else {
-        return true;
-    };
+    let (_, rest) = stat
+        .rsplit_once(") ")
+        .expect("/proc/<pid>/stat names the command in parentheses");
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let exiting = fields
         .first()
