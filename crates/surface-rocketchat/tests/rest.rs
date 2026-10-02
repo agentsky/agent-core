@@ -458,6 +458,22 @@ async fn create_dm_returns_the_room_id() {
 }
 
 #[tokio::test]
+async fn create_dm_refuses_the_self_dm_rocket_chat_returns_for_an_unknown_name() {
+    let fake = FakeRest::start().await;
+    fake.add_user("alice");
+    let client = manager(&fake);
+    assert_eq!(
+        client.create_dm("Alice").await,
+        Err(SurfaceError::NotFound("error-invalid-user".into()))
+    );
+    let own = client.create_dm(FakeRest::MANAGER_USERNAME).await.unwrap();
+    assert_eq!(
+        fake.members(own.as_str()),
+        [FakeRest::MANAGER_ID.to_owned()]
+    );
+}
+
+#[tokio::test]
 async fn post_message_top_level_and_in_a_thread() {
     let fake = FakeRest::start().await;
     fake.add_room("C1", "c", "general");
@@ -587,7 +603,45 @@ async fn get_message_reads_one_message() {
     assert_eq!(message.sender.username, FakeRest::MANAGER_USERNAME);
     assert_eq!(
         client.get_message(&"missing".into()).await,
-        Err(SurfaceError::NotFound("error-invalid-message".into()))
+        Err(SurfaceError::NotFound("message".into()))
+    );
+}
+
+#[tokio::test]
+async fn get_message_reads_only_a_bare_json_failure_as_not_found() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    for body in ["", "<html>Bad Request</html>", r#"{"success":false,"x":1}"#] {
+        let mock = Mock::given(path("/api/v1/chat.getMessage"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .with_priority(1)
+            .mount_as_scoped(fake.server())
+            .await;
+        assert_eq!(
+            client.get_message(&"m1".into()).await,
+            Err(SurfaceError::Api("HTTP 400".into())),
+            "{body}"
+        );
+        drop(mock);
+    }
+}
+
+#[tokio::test]
+async fn create_dm_fails_to_decode_an_answer_without_usernames() {
+    let fake = FakeRest::start().await;
+    fake.add_user("alice");
+    Mock::given(path("/api/v1/im.create"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": true, "room": { "_id": "D1" } })),
+        )
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
+    let err = manager(&fake).create_dm("alice").await.unwrap_err();
+    assert!(
+        matches!(&err, SurfaceError::Transport(text) if text.contains("im.create")),
+        "{err:?}"
     );
 }
 
