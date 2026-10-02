@@ -5,6 +5,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +32,7 @@ const ACCESS_TOKEN: &str = "real-access-token";
 
 struct Running {
     app: App,
+    addrs: Addrs,
     turns: Turns,
     fake: FakeAnthropic,
     member: MemberId,
@@ -95,6 +97,7 @@ async fn start_with(
     let settings = settings(server.addrs(), claude, agentctl, &script, dir.path());
     let sandbox = Arc::new(ProcessSandbox::new(app.store().clone(), dir.path()).unwrap());
     let turns = Turns::start(&app, Arc::clone(&sandbox) as _, settings).unwrap();
+    let addrs = server.addrs();
     let server = server.with_pipeline(Pipeline::for_app(&app, turns.clone()));
     let (stop, stopped) = oneshot::channel::<()>();
     let (abort, aborted) = oneshot::channel::<()>();
@@ -110,6 +113,7 @@ async fn start_with(
     ));
     Running {
         app,
+        addrs,
         turns,
         fake,
         member,
@@ -197,15 +201,19 @@ impl Running {
     }
 
     async fn stop(self) {
-        self.shut_down(false).await;
+        self.stop.send(()).unwrap();
+        self.task.await.unwrap().unwrap();
+        drop(self.dir);
     }
 
-    /// Shuts agentd down, forced at once by a second signal if `forced`.
-    async fn shut_down(self, forced: bool) {
-        if forced {
-            self.abort.send(()).unwrap();
-        }
+    /// Shuts agentd down, then forces it with a second signal once the
+    /// listeners' and workers' drain is under way: once the ctl listener,
+    /// which closes as that drain begins, after the turns', refuses
+    /// connections.
+    async fn force_during_the_drain(self) {
         self.stop.send(()).unwrap();
+        refused(self.addrs.ctl).await;
+        self.abort.send(()).unwrap();
         self.task.await.unwrap().unwrap();
         drop(self.dir);
     }
@@ -235,6 +243,26 @@ impl Running {
     }
 }
 
+/// Waits until nothing accepts connections at `addr`.
+async fn refused(addr: SocketAddr) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while tokio::net::TcpStream::connect(addr).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the listener closes");
+}
+
+/// `routers` with a worker that never ends, so the drain takes all of
+/// `server.drain_timeout_secs`.
+fn with_a_hung_worker(mut routers: Routers) -> Routers {
+    routers
+        .workers
+        .push(Worker::new("hung worker", std::future::pending::<()>()));
+    routers
+}
+
 #[tokio::test]
 async fn a_graceful_shutdown_stops_warm_sandboxes() {
     let running = start(&[Turn::reply("warm")]).await;
@@ -247,10 +275,10 @@ async fn a_graceful_shutdown_stops_warm_sandboxes() {
 
 #[tokio::test]
 async fn a_forced_shutdown_leaves_warm_sandboxes_to_the_next_start() {
-    let running = start(&[Turn::reply("warm")]).await;
+    let running = start_with(&[Turn::reply("warm")], common::CONFIG, with_a_hung_worker).await;
     let session = running.warm_session("m1").await;
     let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
-    running.shut_down(true).await;
+    running.force_during_the_drain().await;
     assert!(turns.sessions().is_warm(session));
     assert_eq!(sandbox.list_managed().await.unwrap().len(), 1);
 }
@@ -258,13 +286,7 @@ async fn a_forced_shutdown_leaves_warm_sandboxes_to_the_next_start() {
 #[tokio::test]
 async fn a_drain_cut_short_by_its_timeout_leaves_warm_sandboxes_to_the_next_start() {
     let config = common::CONFIG.replace("drain_timeout_secs = 5", "drain_timeout_secs = 1");
-    let running = start_with(&[Turn::reply("warm")], &config, |mut routers| {
-        routers
-            .workers
-            .push(Worker::new("hung worker", std::future::pending::<()>()));
-        routers
-    })
-    .await;
+    let running = start_with(&[Turn::reply("warm")], &config, with_a_hung_worker).await;
     let session = running.warm_session("m1").await;
     let (turns, sandbox) = (running.turns.clone(), Arc::clone(&running.sandbox));
     running.stop().await;
