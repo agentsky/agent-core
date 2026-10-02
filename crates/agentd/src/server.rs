@@ -274,8 +274,13 @@ impl Server {
     /// 4. With turns, every warm session's process and container is
     ///    stopped, within what is left of the same timeout
     ///    ([`Pipeline::stop_sessions`]). A drain that was cut short, by the
-    ///    timeout or by `abort`, skips it, and the next start reaps what is
-    ///    left.
+    ///    timeout or by `abort`, or that left no time, skips it, and the
+    ///    next start reaps what is left. A stop that runs out of time or is
+    ///    cut short by `abort` leaves the sessions it already began stopping
+    ///    to finish in the background: their agentctl token revocations
+    ///    fail once the store is closed, which the runner logs as giving up,
+    ///    and the idle reaper they keep alive runs until the process exits.
+    ///    The next start purges the tokens and reaps the containers.
     /// 5. The pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
@@ -432,7 +437,6 @@ impl Server {
         stop.send_replace(true);
 
         let mut forced = false;
-        let mut turns_cut = false;
         if let Some(pipeline) = &pipeline {
             pipeline.close();
             let drained = tokio::select! {
@@ -443,7 +447,6 @@ impl Server {
                 }
             };
             if !drained {
-                turns_cut = true;
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
             }
@@ -464,7 +467,10 @@ impl Server {
                 drained = tokio::time::timeout_at(deadline, drain) => {
                     drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
                 }
-                () = abort.as_mut() => Some("shutdown forced; dropping in-flight work"),
+                () = abort.as_mut() => {
+                    forced = true;
+                    Some("shutdown forced; dropping in-flight work")
+                }
             }
         };
         if let Some(reason) = cut_short {
@@ -472,7 +478,7 @@ impl Server {
             tasks.shutdown().await;
         }
         if let Some(pipeline) = &pipeline {
-            if turns_cut || cut_short.is_some() {
+            if forced || tokio::time::Instant::now() >= deadline {
                 tracing::warn!("leaving warm sandboxes for the next start to reap");
             } else {
                 let left = tokio::select! {
