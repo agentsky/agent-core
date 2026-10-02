@@ -4301,7 +4301,7 @@ bot users stay, deactivated.
 ### The manager's permissions on the Community Edition
 
 **Issue.** T16 found that custom roles need an Enterprise license. T14 adds
-nothing to the role T11 derived: `create-user`, `edit-other-user-active-status`
+nothing to the permissions T11 derived: `create-user`, `edit-other-user-active-status`
 for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
 `view-full-other-user-info` and `api-bypass-rate-limit`, plus
 `create-personal-access-tokens` on the `bot` role.
