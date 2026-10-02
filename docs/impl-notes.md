@@ -2028,7 +2028,7 @@ set it.
 
 **Solution.** `BotRoles` reads roles with `users.info` and remembers them for
 ten minutes. agentd builds one from the manager's client and shares it
-between every surface, so the manager's role also needs
+between every surface, so the manager's roles also need
 `view-full-other-user-info`; on the Community Edition the admin adds it to
 `app` ([T11's live check](#the-live-check-against-7139)), and the design's
 Rocket.Chat section says so. A sender is a bot when the message has a
