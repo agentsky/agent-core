@@ -295,6 +295,73 @@ async fn only_waiting_changes_fill_a_binding_and_the_earliest_settled_make_room(
 }
 
 #[tokio::test]
+async fn settled_changes_a_waiting_chain_runs_through_are_never_forgotten() {
+    let store = memory_store().await;
+    let helper = binding(&store, "helper").await;
+    let few = ChannelIdChangeLimits {
+        waiting: 3,
+        kept: 4,
+    };
+    let record = async |changed: &ChannelIdChange| {
+        store.record_channel_id_change(changed, few).await.unwrap()
+    };
+    let waiting = change(helper, "G0CHAIN0A", "C0CHAIN0B", 1_000);
+    let onward = change(helper, "C0CHAIN0B", "C0CHAIN0C", 1_001);
+    let further = change(helper, "C0CHAIN0C", "C0CHAIN0D", 1_002);
+    let other = change(helper, "G0OTHER01", "C0OTHER01", 1_003);
+    assert_eq!(record(&waiting).await, Recorded);
+    for changed in [&onward, &further, &other] {
+        assert_eq!(record(changed).await, Recorded);
+        assert!(
+            store
+                .settle_channel_id_change(changed, changed.received_at)
+                .await
+                .unwrap()
+        );
+    }
+    let agent = store.binding(helper).await.unwrap().unwrap().agent;
+    let kept = async || -> Vec<ChannelIdChange> {
+        store
+            .channel_id_changes_of_agent(agent)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|known| known.change)
+            .collect()
+    };
+
+    let first = change(helper, "G0NEW0001", "C0NEW0001", 1_004);
+    assert_eq!(record(&first).await, Recorded);
+    assert_eq!(
+        kept().await,
+        [
+            waiting.clone(),
+            onward.clone(),
+            further.clone(),
+            first.clone()
+        ],
+        "the earliest settled change off the waiting chain made room"
+    );
+
+    let second = change(helper, "G0NEW0002", "C0NEW0002", 1_005);
+    assert_eq!(record(&second).await, Full, "none can go");
+    assert_eq!(kept().await.len(), 4);
+
+    assert!(
+        store
+            .settle_channel_id_change(&waiting, at(1_006))
+            .await
+            .unwrap()
+    );
+    assert_eq!(record(&second).await, Recorded);
+    assert_eq!(
+        kept().await,
+        [onward, further, first, second],
+        "a chain no change waits on can go"
+    );
+}
+
+#[tokio::test]
 async fn an_agents_changes_name_their_workspace_and_whether_they_wait() {
     let store = memory_store().await;
     let helper = binding(&store, "helper").await;

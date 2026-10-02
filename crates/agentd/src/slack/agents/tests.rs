@@ -1594,3 +1594,73 @@ async fn a_busy_day_of_shares_records_every_change() {
 fn ids(list: &[String]) -> Vec<&str> {
     list.iter().map(String::as_str).collect()
 }
+
+#[tokio::test]
+async fn a_change_the_binding_has_no_room_for_copies_its_denies_at_once() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let room_for = MAX_CHANNEL_CHANGES as usize;
+    let count = room_for + 3;
+    let olds: Vec<String> = (0..count).map(|n| format!("G0FULL{n:03}")).collect();
+    let news: Vec<String> = (0..count).map(|n| format!("C0FULL{n:03}")).collect();
+    set_rules(&h, helper, &denying(&ids(&olds))).await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.info"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&h.slack)
+        .await;
+    for (old, new) in olds.iter().zip(&news) {
+        h.agents
+            .channel_id_changed(ChannelIdChanged {
+                old: old.as_str().into(),
+                new: new.as_str().into(),
+                ..the_event(helper)
+            })
+            .await;
+    }
+    let waiting = changes_of(&h, helper).await;
+    assert_eq!(waiting.len(), room_for);
+    assert!(waiting.iter().all(|(_, _, waiting)| *waiting));
+    let mut expected = ids(&olds);
+    expected.extend(ids(&news[room_for..]));
+    assert_eq!(
+        rules_of(&h, helper).await,
+        denying(&expected),
+        "the denies of the changes without room apply to their new ids for good"
+    );
+    for new in &news {
+        assert!(!permits(&h, helper, new).await, "{new}");
+    }
+}
+
+#[tokio::test]
+async fn a_token_too_close_to_expiry_by_the_time_its_update_comes_burns_no_lease() {
+    let h = harness().await;
+    installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    let team = TeamId::new(TEAM);
+    let start = OffsetDateTime::now_utc();
+    let due = h
+        .store
+        .due_manifest_updates(&team, MANIFEST_VERSION, start, start + APP_CALL_TIMEOUT, 10)
+        .await
+        .unwrap();
+    assert_eq!(due.len(), 1);
+    let expiry = h
+        .store
+        .slack_config_token_status(h.owner, &team)
+        .await
+        .unwrap()
+        .unwrap()
+        .expires_at;
+    let close = expiry - APP_CALL_TIMEOUT + Duration::from_secs(1);
+    assert!(!h.agents.update_manifest(&due[0], &|| close).await.unwrap());
+    assert_eq!(h.calls("apps.manifest.export").await, 0);
+    assert_eq!(
+        h.store
+            .due_manifest_updates(&team, MANIFEST_VERSION, start, start + APP_CALL_TIMEOUT, 10)
+            .await
+            .unwrap(),
+        due,
+        "not leased"
+    );
+}

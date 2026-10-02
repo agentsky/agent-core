@@ -20,6 +20,8 @@
 //! - `allow everyone` empties the allow list and takes `everyone` off the
 //!   deny list, so everyone not denied by name may use the agent again.
 
+use std::collections::{HashMap, HashSet};
+
 use core_types::{
     BindingId, ConvRef, ConversationId, Hop, MemberId, MemberKey, SurfaceKind, TeamId,
 };
@@ -336,20 +338,28 @@ pub fn later_ids(
     binding: BindingId,
     start: &ConversationId,
 ) -> Vec<ConversationId> {
-    let mut seen = vec![start.clone()];
+    let mut onward: HashMap<&ConversationId, Vec<&ConversationId>> = HashMap::new();
+    for known in changes
+        .iter()
+        .filter(|known| known.change.binding == binding)
+    {
+        onward
+            .entry(&known.change.old)
+            .or_default()
+            .push(&known.change.new);
+    }
+    let mut seen = HashSet::from([start]);
+    let mut order = vec![start];
     let mut next = 0;
-    while next < seen.len() {
-        let id = seen[next].clone();
+    while let Some(id) = order.get(next).copied() {
         next += 1;
-        for known in changes {
-            let change = &known.change;
-            if change.binding == binding && change.old == id && !seen.contains(&change.new) {
-                seen.push(change.new.clone());
+        for &new in onward.get(id).into_iter().flatten() {
+            if seen.insert(new) {
+                order.push(new);
             }
         }
     }
-    seen.remove(0);
-    seen
+    order.into_iter().skip(1).cloned().collect()
 }
 
 /// The conversations whose denies apply to others too while `changes`, an
