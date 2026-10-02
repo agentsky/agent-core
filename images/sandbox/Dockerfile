@@ -34,7 +34,7 @@ ARG CLAUDE_CODE_RELEASES=https://downloads.claude.ai/claude-code-releases
 FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS agentctl
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,id=agent-core-sandbox-target \
     target="$(uname -m)-unknown-linux-musl" \
     && rustup target add "$target" \

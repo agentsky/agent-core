@@ -1620,8 +1620,10 @@ SIGTERM and checks that each future completes on its own signal.
 Server behavior below was read from the Rocket.Chat source on `develop`
 (commit `fad30ab`, 8.8.x), where the REST API lives in
 `apps/meteor/server/api/`, and checked against the 7.0.0 and 7.10.0 tags,
-where it lives in `apps/meteor/app/api/server/`. No server was available to
-run against, so none of it is verified live yet.
+where it lives in `apps/meteor/app/api/server/`. On 2026-10-02 it was checked
+against a live Rocket.Chat 7.13.9 Community Edition server; see
+[The live check against 7.13.9](#the-live-check-against-7139) for what held,
+what didn't, and the role the manager needs.
 
 ### `rooms.upload` is gone in Rocket.Chat 8.0
 
@@ -1688,16 +1690,22 @@ ignores when it doesn't need them. The token is created with
 factor at all, so without it every 2FA-gated endpoint would fail for the bot
 after the 30-minute grace period, and anyone holding the token can already act
 as the bot. The caller supplies the email; T14 has to pick an address
-(`<name>@<something>.invalid` passes the default checks). One case is left
-for the live check: with `Accounts_EmailVerification` on (off by default),
-password login refuses unverified emails (`validateLoginAttempt` in
-`startup.js`), so such a server needs email 2FA auto opt-in off and
-`verified: true`.
+(`<name>@<something>.invalid` passes the default checks). With
+`Accounts_EmailVerification` on (off by default), password login refuses
+unverified emails (`validateLoginAttempt` in `startup.js`; live, HTTP 401
+`error-invalid-email`, which the client reports as `Unauthorized`, though the
+saved logs don't keep that answer), so such a server needs email 2FA auto
+opt-in off and `verified: true`.
 
 ### What the server source says about the manager's custom role
 
-**Issue.** The design leaves the custom role open. It stays open until the
-live check, but the source narrows it down:
+**Issue.** The design leaves the custom role open. The source narrows it
+down, and the live check confirmed the rows agentd relies on (see
+[The live check against 7.13.9](#the-live-check-against-7139)). It didn't
+exercise `users.create` with `active` (agentd never sends it), the
+`manage-moderation-actions` alternative for `users.setActiveStatus`,
+`assign-admin-role` or `Accounts_AllowUserAvatarChange`; those rows rest on
+the source alone:
 
 | Operation | Permission checked | Where |
 | --- | --- | --- |
@@ -1715,8 +1723,8 @@ role for create is `create-user`, plus the one-time admin change that grants
 `edit-other-user-active-status`. The manager is subject to the REST rate
 limiter (10 calls per route per minute per IP by default; `bot` bypasses it
 through `api-bypass-rate-limit`), so the role should include
-`api-bypass-rate-limit` once the manager bot posts DMs (T13). The design's
-open question is left as it is until a server confirms this.
+`api-bypass-rate-limit` once the manager bot posts DMs (T13). The live check
+settled the design's open question.
 
 ### `x-ratelimit-reset` is an absolute time in milliseconds
 
@@ -1732,7 +1740,8 @@ the local clock; see
 [Clock skew defeated the 429 retry](#clock-skew-defeated-the-429-retry)),
 floored at zero, and one second when the header is missing or unreadable. A 429, or either
 code in any status, is retried once when the wait is at most
-`with_max_retry_wait` (60 s by default, the server's default window);
+`with_max_retry_wait` (61 s by default, the server's default window plus a
+second; see [Clock skew defeated the 429 retry](#clock-skew-defeated-the-429-retry));
 otherwise, or on a second limit, the call fails with
 `SurfaceError::RateLimited`. The 429 is raised before the endpoint runs, so
 retrying a POST can't apply it twice.
@@ -1796,10 +1805,11 @@ parsed as RFC 7231's IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) with the
 sends, count as unreadable. A missing or unreadable `Date` falls back to the
 local clock, and the bounded maximum still applies. `Date` has whole seconds,
 so the wait can come out up to a second longer than the server's, never
-shorter; a reset near the end of a full 60-second window can therefore exceed
-the default maximum by that second and fail with `RateLimited` instead of
-waiting. `FakeRest::rate_limit_at` sends a 429 from a skewed server clock,
-with a `Date` in whole seconds and a reset measured from it.
+shorter. The default maximum is therefore 61 seconds, not the window's 60:
+live, a burst that hits the limit sees a reset about 60 s away, and with
+`Date` truncated the wait measured 60.13 s, which a 60 s maximum refused.
+`FakeRest::rate_limit_at` sends a 429 from a skewed server clock, with a
+`Date` in whole seconds and a reset measured from it.
 
 ### Uploads are capped and read once
 
@@ -1822,6 +1832,157 @@ Streaming the file instead would need reqwest's `stream` feature and
 then send different content), and would send a malformed body if the file
 changed size after its length was declared; with the cap, reading into memory
 is bounded and simpler.
+
+### The live check against 7.13.9
+
+**Setup.** On 2026-10-02, `rocketchat/rocket.chat:7.13.9` and `mongo:7.0` as
+a one-node replica set, started like the T16 Compose file but with only those
+two services, the admin created from `ADMIN_USERNAME`/`ADMIN_PASS`. The server
+is the Community Edition: `licenses.info` lists no active modules. An ignored
+integration test, not committed, drove `RestClient` for every method; the
+admin's steps (`permissions.update`, rooms, integrations) and the raw bodies
+below were plain REST calls.
+
+**Custom roles need an Enterprise license.** `roles.create` answers HTTP 400
+`{"success":false,"error":"This is an enterprise feature [error-action-not-allowed]","errorType":"error-action-not-allowed"}`,
+and so does `roles.update` on the built-in `bot` role. `users.create` with a
+role id that doesn't exist fails with `The field Roles consist invalid role id
+[error-action-not-allowed]` (`details.action: "Assign_role"`). On the
+Community Edition the only lever is which built-in roles hold a permission.
+
+**The role.** The manager holds the built-in roles `bot` and `app`, the
+manager's extra permissions are added to `app`, and `create-personal-access-tokens`
+is added to `bot`. `app` is a global built-in role whose other holders are
+Apps-Engine app users, which have no password or token to call the REST API
+with. Nothing in the 7.13.9 server treats the role specially beyond its default
+permissions, which already include all of `bot`'s, `api-bypass-rate-limit`
+among them. Adding the permissions to `bot` instead would give them to every
+bot in the workspace, agentd's agents and other integrations alike, and the
+`livechat-*`, `guest` and `anonymous` roles carry omnichannel or guest
+behavior. With an Enterprise license the same permissions go on a custom role.
+Every row below was run with the permission missing, then present:
+
+| What agentd does | Endpoint | Permission, on the manager unless noted | Without it (HTTP, body, client error) |
+| --- | --- | --- | --- |
+| The manager's own token | `users.generatePersonalAccessToken` | `create-personal-access-tokens` on a role it holds (`bot`) | 400 `Not Authorized [not-authorized]`, `Forbidden("not-authorized")` |
+| Create a bot | `users.create` with `roles: ["bot"]` | `create-user` only: no `assign-roles`, no `edit-other-user-info` | 400 `Adding user is not allowed [error-action-not-allowed]`, `Forbidden` |
+| The bot's token | `login`, `users.generatePersonalAccessToken`, `logout` | none on the manager; `create-personal-access-tokens` on `bot` | 400 `not-authorized`, `Forbidden`; the bot user stays behind |
+| Deactivate, reactivate | `users.setActiveStatus` | `edit-other-user-active-status` | 403 `User does not have the permissions required for this action [error-unauthorized]`, `Forbidden("error-unauthorized")` |
+| Invite into a room the manager is in | `channels.invite`, `groups.invite` | `add-user-to-joined-room` (default: `owner`, `moderator`, not a plain member) | 400 `Not allowed [error-not-allowed]`, `Forbidden` |
+| Invite into another room | same | `add-user-to-any-c-room`, `add-user-to-any-p-room` | the same |
+| Read another user's roles | `users.info` | `view-full-other-user-info` | 200 with no `roles` field (only `_id`, `active`, `avatarETag`, `canViewAllInfo`, `name`, `status`, `type`, `username`, `utcOffset`) |
+| Rename another user | `users.update` | `edit-other-user-info`, and a token that bypasses 2FA | 400 `Editing user is not allowed [error-action-not-allowed]`, `Forbidden` |
+| Another user's avatar | `users.setAvatar` | `edit-other-user-avatar` | 403 `{"error":"unauthorized"}`, `Forbidden("unauthorized")` |
+| Room details | `rooms.info` | none for a public room or one it is in | private room it isn't in: 400 `error: "not-allowed"`, `Forbidden`; unknown: `NotFound("error-room-not-found")` |
+| Open a DM | `im.create` | `create-d` (`bot` has it) | |
+| Not be rate limited | every call | `api-bypass-rate-limit` (`bot` and `app` have it) | twelve `me` calls in a row passed |
+
+A bot renames itself and sets its own avatar with its own token and no
+permission, so agentd needs `edit-other-user-info` and `edit-other-user-avatar`
+only if the manager edits bots. The Community Edition recipe is therefore: the
+manager holds `bot` and `app`; `app` gains `create-user`,
+`edit-other-user-active-status`, `add-user-to-joined-room` and
+`view-full-other-user-info`; `bot` gains `create-personal-access-tokens`.
+`users.create`'s answer shows the new user's `roles` only to a caller with
+`view-full-other-user-info` (otherwise `[]`), so nothing should read the
+role from it.
+
+**Two-factor authentication.** A personal access token made without "Ignore
+Two Factor Authentication" passes 2FA-gated endpoints only during the
+registration grace (`Accounts_TwoFactorAuthentication_RememberFor`, 1800 s
+after the user's creation). With the grace cut to one second, `users.update`
+and `users.generatePersonalAccessToken` answered 400 `TOTP Required
+[totp-required]` (`details.method: "password"`) for such a token and for a
+login session without the `x-2fa-*` headers, while a token with the bypass
+passed. The manager's token must be created with the bypass. With a verified
+email and default settings, the password login itself answers 401
+`totp-required` with `method: "email"`, which is why bots are created with
+`verified: false`. These refusals were seen during the run but the saved
+logs don't keep them: they hold only the within-grace success
+(`users.update name (manager PAT without bypass): ()`). They match the
+server source, and a rerun should save them.
+
+**A workspace that can't reach Rocket.Chat Cloud can't post.** 7.13.9 restricts
+a Community Edition workspace that hasn't reported statistics to
+`collector.rocket.chat` within ten days, and one that never has (no stats
+token) from its first start (`AirGappedRestriction` in `@rocket.chat/license`,
+applied by `ee/server/patches/airGappedRestrictionsWrapper.ts`; any valid
+license lifts it). The test container's egress allowed no Rocket.Chat Cloud
+host, so `Cloud_Workspace_AirGapped_Restrictions_Remaining_Days` read 0 and
+`chat.postMessage`, `chat.update` and `rooms.mediaConfirm` answered 400
+`{"success":false,"error":"restricted-workspace"}`, which the client reports
+as `Api("restricted-workspace")`. Reads, reactions, invites and user
+management were unaffected. A deployment on the Community Edition needs
+outbound HTTPS to Rocket.Chat Cloud's statistics collector, or a license.
+Posting, editing and the upload's confirm step were therefore not run end to
+end. `rooms.media` itself accepted the client's multipart upload (stored
+complete, expiring after 24 hours unless confirmed). The messages the read
+paths were checked against were posted as the bot and the manager through
+incoming webhooks, which 7.13.9 doesn't restrict and which run the same
+`sendMessage` as `chat.postMessage`.
+
+**What held.** `chat.react` with `shouldReact: true` twice left one `:eyes:`
+reaction, with and without colons. `chat.getThreadMessages` returned the
+replies newest first without the root; an unknown root is
+`NotFound("error-invalid-message")`. `channels.history`, `groups.history` and
+`im.history` returned top-level messages only, newest first, and `latest` set
+to a message's `ts` left that message out. A room the bot isn't in is
+`Forbidden("unauthorized")` (public) or `NotFound("error-room-not-found")`
+(private); `chat.getMessage` there is `Forbidden("error-not-allowed")`, and
+`chat.react` `Forbidden("not-authorized")`. A wrong token is 401 `You must be
+logged in to do this.`, `Unauthorized`. A taken username is
+`Api("… is already in use :( [error-field-unavailable]")`. REST messages
+carry `ts` as ISO 8601 with milliseconds, `u` with `_id`, `username` and
+`name`, `mentions[]` with `_id`, `username`, `name` and `type`, and system
+messages `t` (`au` with the added username as `msg`).
+
+**What didn't, and was fixed.**
+
+- `im.create` with a username it doesn't know, including one that differs
+  only in case, answers success with the caller's self-DM
+  (`{"room":{"t":"d","usernames":["admin"],…},"success":true}`), so
+  `create_dm` returned a room that wasn't the requested DM. It now checks that
+  the room's `usernames` include the name and otherwise fails with
+  `NotFound("error-invalid-user")`. `FakeRest` answers the same way.
+- `chat.getMessage` with an unknown id answers a bare `{"success":false}`
+  (HTTP 400, `API.v1.failure()`), which mapped to `Api("HTTP 400")`.
+  `get_message` now maps it to `NotFound("message")`, and `FakeRest` sends that
+  body.
+- The 429 retry. With the default 60 s maximum, the client gave up on the first
+  429 of a burst: the reset was 59.9 s away and the wait measured against the
+  whole-second `Date` came to 60.13 s. The default is now 61 s; live, the same
+  call then waited out the window and succeeded.
+
+**Other shapes, for T12 to T14.**
+
+- Every response to a caller without `api-bypass-rate-limit` carries
+  `x-ratelimit-limit` (10), `x-ratelimit-remaining` and `x-ratelimit-reset` (an
+  epoch time in milliseconds). The 429 body is
+  `{"success":false,"error":"Error, too many requests. Please slow down. You must wait 60 seconds before trying this endpoint again. [error-too-many-requests]"}`,
+  with no `errorType`. `login` has no caller to exempt, so it is limited per
+  client address like any route: a burst of logins from one host, the bots'
+  token logins included, gets the same 429.
+- A message from a user without `mention-all` or `mention-here` (`bot` has
+  neither) that contains `@all` or `@here` is refused whole with
+  `error-action-not-allowed`, not stripped, so the neutralizing in `render`
+  is required, not cosmetic.
+- `users.setAvatar` from a URL refuses private addresses
+  (`checkUrlForSsrf`): `http://172.18.0.1:8765/avatar.png` got
+  `Api("Invalid avatar URL: … [error-avatar-invalid-url]")`, while a public
+  `https` image worked. The server also refuses redirects and anything not
+  `image/*`. T14 needs a public avatar URL.
+- The messages posted through integrations carried `bot` (`{"i":
+  "<integration id>"}`). Whether a bot user's own `chat.postMessage` does
+  could not be checked, so the sender's `bot` role stays the reliable signal.
+- Realtime, over DDP on 7.13.9: `login` with `resume` returns `id`, `token`,
+  `tokenExpires` and `type: "resume"`; the server pings every 30 s;
+  `stream-room-messages` sends `ts` and `_updatedAt` as `{"$date": ms}`; a
+  thread reply makes the server send the root again, same `_id`, with
+  `tcount`, `replies` and `tlm` and no `editedAt`. `__my_messages__` delivered
+  messages from a joined channel and a DM, each with a second argument such as
+  `{"roomParticipant":true,"roomType":"c","roomName":"…"}`.
+  `<uid>/subscriptions-changed` sent `inserted` when a DM or channel was
+  created with the user and `updated` on new messages.
 
 ## T12: Rocket.Chat realtime
 
@@ -1866,10 +2027,11 @@ set it.
 
 **Solution.** `BotRoles` reads roles with `users.info` and remembers them for
 ten minutes. agentd builds one from the manager's client and shares it
-between every surface, so the manager's custom role also needs
-`view-full-other-user-info`; the design's Rocket.Chat section says so now. A
-sender is a bot when the message has a non-false `bot` field or the sender has
-the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
+between every surface, so the manager's role also needs
+`view-full-other-user-info`; on the Community Edition the admin adds it to
+`app` ([T11's live check](#the-live-check-against-7139)), and the design's
+Rocket.Chat section says so. A sender is a bot when the message has a
+non-false `bot` field or the sender has the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
 only to the user itself and to the manager.
 
 Without the permission, `users.info` leaves `roles` out rather than
@@ -2202,9 +2364,11 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   because deriving it from the URL would change every stored identity when
   the URL changes.
 - The manager bot now posts every command reply, and `users.info` plus
-  `im.create` for a channel command, so its custom role should include
+  `im.create` for a channel command, so its role should include
   `api-bypass-rate-limit`, as the T11 note on the role expected; the
-  README says so.
+  README says so. The built-in `bot` and `app` roles the manager holds on
+  the Community Edition already have it, and `create-d` for `im.create`
+  ([T11's live check](#the-live-check-against-7139)).
 - `surface-rocketchat`'s `conv_kind` took a `d` room whose `rooms.info`
   had neither `usersCount` nor `uids` for a one-to-one DM, which would
   make a DM of unknown size private enough for a login code if it reached
@@ -2502,7 +2666,7 @@ under the cap, and returns `LimitReached`; `create` then tells the member
 the limit and to delete one first. Deleted agents don't count, but their
 bot users stay, deactivated.
 
-### The manager's permissions on the Community Edition are still open
+### The manager's permissions on the Community Edition
 
 **Issue.** T16 found that custom roles need an Enterprise license. T14 adds
 nothing to the role T11 derived: `create-user`, `edit-other-user-active-status`
@@ -2510,13 +2674,13 @@ for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
 `view-full-other-user-info` and `api-bypass-rate-limit`, plus
 `create-personal-access-tokens` on the `bot` role.
 
-**Solution.** Unresolved, as the design's open question says. On the
-Community Edition these permissions can only be added to a built-in role,
-and the built-in roles the manager would hold are shared (`user` with every
-member, `bot` with every agent), so granting them there grants them to
-everyone who holds that role. Until a live check settles it, the Compose
-README gives the manager `admin` for development. This task couldn't test
-it without a server.
+**Solution.** [T11's live check](#the-live-check-against-7139) settled it.
+On the Community Edition the manager holds the built-in `bot` and `app`
+roles, and the admin adds these permissions to `app`, whose only other
+holders are Apps-Engine app users, which can't log in; `app` and `bot`
+already have `api-bypass-rate-limit`. Granting them to `user` or `bot`
+would grant them to every member or every agent. The Compose README walks
+through it, and the manager is never an admin.
 
 ## T15: agentctl
 
@@ -2818,11 +2982,13 @@ Community Edition, which the Compose stack runs, can only change which
 built-in roles hold a permission (`permissions.update`, which needs
 `access-permissions`).
 
-**Solution.** `deploy/compose/README.md` lists the permissions from T11's
-reading of the source, creates the custom role where a license allows it,
-and otherwise gives the manager `admin` for development. What least
-privilege looks like on the Community Edition is added to the design's
-open question on the manager's role, for T11's live check to settle.
+**Solution.** `deploy/compose/README.md` lists the permissions
+[T11's live check](#the-live-check-against-7139) settled, creates the
+custom role where a license allows it, and otherwise gives the manager the
+built-in `bot` and `app` roles, with the manager's permissions added to
+`app` and `create-personal-access-tokens` to `bot`. The manager is not an
+admin on either edition. The README also says the Community Edition must
+reach Rocket.Chat Cloud, or posts are refused with `restricted-workspace`.
 
 ### The native installer isn't pinned
 
@@ -3408,6 +3574,11 @@ known without a live capture, and refusing one it needs would break turns.
 The plan's Deferred work has an entry for a path allowlist. Methods are
 limited already (see the refusal table).
 
+Since the sandbox chooses the path, it is never logged: a path could carry
+whatever the sandbox wants written into agentd's logs. "forwarded a
+request" names the session, method and status only, and the log test sends
+a secret-bearing path and query and finds neither in the log.
+
 ## T19: Credential proxy egress allowlist
 
 ### The target comes from the request line, in one spelling
@@ -3558,6 +3729,21 @@ sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
 "Killing leftover processes" entry covers that).
+
+### Log lines don't name the host
+
+**Issue.** Refusals and tunnel lines logged the host the sandbox asked
+for. A host name is chosen by the sandbox, so a refused `CONNECT` to
+`<secret>.attacker.example` wrote the secret into agentd's logs, which
+leave the trust boundary the allowlist guards.
+
+**Solution.** Egress log lines give the session, port, reason, the rule
+that allowed the host (once one has) and the address, never the host. The
+log test sends secret-bearing hosts that are allowed, refused by the
+allowlist and refused by address, and finds none of them in the log.
+The port stays in refusal lines on purpose, even for denied hosts: it
+carries at most 16 bits a line at the rate of refused `CONNECT`s, and
+operators need it to tell a wrong port from a wrong host.
 
 ### Testing without the network
 
@@ -3908,7 +4094,13 @@ called, since the placeholder may have been pointed. A failed
 `turn_finished` is logged and returned in `TurnReport::finished`, and the
 process is stopped (with `process_stopping`), since the runner can't tell
 whether the placeholder is still pointed. A failed `process_stopping` is
-logged and the stop goes ahead.
+logged and the stop goes ahead, and unless a later call for that process
+succeeds it runs once more after the container is stopped; a second
+failure is logged and given up on. Retrying only when it was called again
+missed manager-initiated stops: the process is taken from the session
+before the call, and a death event for a container already marked dead is
+ignored, so a failed revocation used to leave the agentctl token valid for
+the next container on the address.
 
 A panic in `process_starting` is taken for its failure, and one in
 `process_stopping` is logged and the stop goes ahead: otherwise a panic in
@@ -4022,6 +4214,10 @@ yet, and the send clears it: a resumed process whose first turn failed in
 didn't start the process. Judged by whether the turn started the process,
 that refusal came back as an error result, the turn didn't run again, and
 its message was lost.
+
+If the store fails to mark the session unstarted, the turn fails with
+`RunnerError::Store` instead of running again: the session still reads as
+started, so the second run would `--resume` and be refused again.
 
 ### What is durable
 
@@ -4382,6 +4578,27 @@ builds; the Compose README adds `host_data_dir`, which depends on where the
 checkout is. `docker_startup_reaps_only_this_instances_sandboxes` plants a
 container labeled with the configured instance and a session, and one
 without labels, and checks that `connect_docker` removes only the first.
+
+### A graceful shutdown stops warm sandboxes
+
+**Issue.** Dropping the runner only aborts its reaper and event follower,
+so every warm container outlived a graceful shutdown with its process
+running, until the next start's `reap_orphans`. With no next start, or a
+different `instance`, nothing stopped them.
+
+**Solution.** `SessionManager::stop_all` stops every session as `stop`
+does, all at once, after its queued turns, with `process_stopping` for
+each process. `Server::run` calls it after the drain and before closing the
+store, which the hooks need, within what is left of
+`server.drain_timeout_secs`. A drain cut short by the timeout or a forced
+shutdown skips it, since the time is spent and a late stop would race the
+store's close, and a second signal during it cuts it short; `reap_orphans`
+at the next start stops what is left either way.
+
+With T23b's pipeline, `Server::run` reaches it through
+`Pipeline::stop_sessions`, once the turns and then the listeners have
+drained in time and before the pipeline is dropped. Turns cut short, or
+in-flight work dropped, skip it.
 
 ### A process sandbox gives every container one address
 
