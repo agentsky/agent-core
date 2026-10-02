@@ -5158,6 +5158,16 @@ shutdown skips it, since the time is spent and a late stop would race the
 store's close, and a second signal during it cuts it short; `reap_orphans`
 at the next start stops what is left either way.
 
+A stop cut short, by the timeout or a second signal, still races the
+store's close for the sessions it had begun: `stop` runs each session's
+release in a task of its own, which dropping `stop_all` doesn't end. Those
+tasks go on after `Server::run` closes the store, so their
+`process_stopping` revocations fail and the runner logs that it gives up,
+and the idle reaper, which they keep alive, runs until the process exits.
+The next start's `purge` deletes the agentctl tokens and `reap_orphans`
+stops the containers. Waiting for those tasks would take the time the
+deadline or the second signal just refused.
+
 ### A process sandbox gives every container one address
 
 **Issue.** `ProcessSandbox::ip` answers `127.0.0.1` for every container,

@@ -258,7 +258,13 @@ impl Server {
     /// 3. With turns, every warm session's process and container is
     ///    stopped, within what is left of the drain timeout. A drain that
     ///    was cut short, by the timeout or by `abort`, skips it, and the
-    ///    next start reaps what is left.
+    ///    next start reaps what is left. A stop that runs out of time or
+    ///    is cut short by `abort` leaves the sessions it already began
+    ///    stopping to finish in the background: their agentctl token
+    ///    revocations fail once the store is closed, which the runner logs
+    ///    as giving up, and the idle reaper they keep alive runs until the
+    ///    process exits. The next start purges the tokens and reaps the
+    ///    containers.
     /// 4. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
