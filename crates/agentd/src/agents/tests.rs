@@ -23,7 +23,8 @@ use wiremock::matchers::path;
 use wiremock::{Mock, ResponseTemplate};
 
 use super::*;
-use crate::commands::rocketchat::{CommandIntake, StoreDedup};
+use crate::commands::intake::CommandIntake;
+use crate::commands::rocketchat::{CommandFeed, StoreDedup};
 use crate::commands::{Commands, Replies};
 
 const TEAM: &str = "chat.example";
@@ -556,13 +557,14 @@ fn new_supervisor(
     onward: Option<Sender<InboundEvent>>,
 ) -> (Supervisor, CommandIntake) {
     let auth = Arc::new(auth::Auth::new(auth::OAuthConfig::default(), h.store.clone()).unwrap());
-    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None);
+    let commands = Commands::new(h.store.clone(), auth, Replies::default(), None, None);
     let manager = core_types::Binding {
         id: BindingId::new_v4(),
         agent: None,
         bot: key(FakeRest::MANAGER_ID),
     };
-    let (intake, feed) = CommandIntake::new(commands, manager);
+    let (intake, submitter) = CommandIntake::new(commands);
+    let feed = CommandFeed::new(submitter, manager);
     let mut template = RocketChatConfig::new(h.fake.uri(), TEAM.into(), manager_credentials());
     template.websocket_url = Some(ddp.url());
     let bots = BotRoles::new(h.agents.rest().clone());

@@ -158,7 +158,9 @@ impl Commands {
                     false
                 }
             },
-            Origin::RocketChatDm { .. } | Origin::SlackSlash { .. } => false,
+            Origin::RocketChatDm { .. } | Origin::SlackSlash { .. } | Origin::SlackDm { .. } => {
+                false
+            }
         };
         if invited {
             reply.push_str(" I added it to the room you asked in.");

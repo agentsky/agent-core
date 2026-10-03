@@ -1231,7 +1231,11 @@ Deliverables:
     5. Reply with how to invite it.
   - `persona <name> <text>`: owner only. A `persona.md` file attached to a
     DM with the manager bot, with `persona <name>` as its text, replaces the
-    persona the same way. Size is capped at 64 KB.
+    persona the same way. Size is capped at 64 KB. On Slack (T30 landed
+    first) the file is downloaded with the manager's
+    `WebApi::download_file`, and the DM's files have to be passed from
+    `commands::slack::dm_command` to the handler
+    ([impl-notes](impl-notes.md#files-in-the-manager-dm-wait-for-their-handlers)).
   - `list [@user]`: an agent directory.
   - `pause`, `resume` and `delete`, owner only. Delete deactivates the bot user
     and stops its connection; state becomes `deleted`. A paused agent's bot
@@ -2168,6 +2172,10 @@ Deliverables:
     submodules, passing the URL after `--` and the ref only inside an
     `--opt=value` word, so neither can be read as an option;
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
+    On Slack the DM's files are the `InboundEvent::files` that T30's
+    `commands::slack::dm_command` sees but doesn't pass on yet; download
+    them with the manager's `WebApi::download_file`, which caps the size
+    ([impl-notes](impl-notes.md#files-in-the-manager-dm-wait-for-their-handlers)).
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
 - `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
@@ -2447,6 +2455,29 @@ Deliverables:
 - `/agent me` shows the manager app's name and app id on Slack, from
   `auth.test` at startup, so members notice a takeover.
 
+Notes from implementing it
+([impl-notes](impl-notes.md#t30-slack-manager-app-and-configuration-token)):
+
+- agentd serves one workspace, the one `AGENTD_SLACK_MANAGER_BOT_TOKEN`
+  belongs to, which is required with the signing secret. `App::open` reads
+  the team, bot user and app (`auth.test`, then `bots.info`) and refuses to
+  start without them. `[slack] api_url` points tests at a fake Web API.
+- `slack_config_tokens` also has `version`, `updated_at`, `lease_until`,
+  `broken_at`, `notified_at` and `notice_attempts`: rotations and notices
+  are claimed with a lease, and act only on the version of the tokens they
+  read. Only a refused refresh token breaks a token and DMs its member
+  (once, at most 20 attempts); other failures are retried when the lease
+  ends. The token the member typed is discarded: the rotation's pair is
+  stored, and must belong to the sender's workspace and user.
+- Commands from every surface go through one `commands::intake::CommandIntake`.
+  A DM to the manager app is `Origin::SlackDm`. Command text is decoded with
+  `surface_slack::normalize::unescape` before parsing.
+- Files attached to the manager DM aren't passed on yet, since `persona`
+  (T14) and `skill add` (T25) aren't in place; `WebApi::download_file` is
+  the download they use.
+- The manifest's tests use `serde_norway`, a dev-dependency (MIT or
+  Apache-2.0).
+
 Acceptance: tests for the token command (success, invalid token, secret never
 logged), rotation (a wiremock sequence of two rotations), logout and a
 deleted-user event each deleting tokens, a command sent as a manager DM, and
@@ -2481,8 +2512,10 @@ Deliverables:
 - On `/agent create <name>` on Slack:
   1. Insert a binding row with a new id in state `creating`, so the public
      endpoint answers `url_verification` for it (T28).
-  2. `apps.manifest.create` with the member's configuration token and a
-     manifest whose URLs use that binding id.
+  2. `apps.manifest.create` with the member's configuration token
+     (`Store::slack_config_token(member, team)`, T30; one that is broken or
+     expired needs a new `/agent slack-token`) and a manifest whose URLs
+     use that binding id.
   3. Store `app_id`, `client_id`, `client_secret_enc` and
      `signing_secret_enc` on the binding, and move it to `pending_install`. If
      creation fails, delete the row.
@@ -2506,8 +2539,9 @@ Deliverables:
   agentd disables the binding, stops handling its events, and tells the owner
   to delete the app at api.slack.com. `pause` stops handling its events
   without touching Slack.
-- agentd's receiver of T28's `SlackInbound` builds a T29 `SlackSurface` per
-  active binding, with one `TeamDirectory` per team. Whenever a team's
+- agentd's receiver of T28's `SlackInbound` (T30's `slack::Inbound`, which
+  handles only the manager app's requests so far) builds a T29
+  `SlackSurface` per active binding, with one `TeamDirectory` per team. Whenever a team's
   active agent bindings change, it passes their `bot_user_id`s to
   `TeamDirectory::set_managed_bots`, so agents win names humans share. It
   awaits `refresh_members` when a binding starts, and passes each message

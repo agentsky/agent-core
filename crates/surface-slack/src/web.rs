@@ -2,7 +2,8 @@
 //!
 //! [`SlackClient`] holds the connection pool and the rate limiter;
 //! [`SlackClient::bot`] gives a [`WebApi`] that acts with one binding's bot
-//! token. The token goes only in the `Authorization` header, never in a URL
+//! token, and [`SlackClient::rotate_config_token`] renews a member's app
+//! configuration token. The token goes only in the `Authorization` header, never in a URL
 //! or a body, and never in an error or a log line.
 //!
 //! Requests follow Slack's SDKs (`slackapi/python-slack-sdk`): the `chat.*`
@@ -32,6 +33,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
@@ -79,6 +81,7 @@ const MAX_PAGES: usize = 1000;
 const UNAUTHORIZED_CODES: &[&str] = &[
     "account_inactive",
     "invalid_auth",
+    "invalid_refresh_token",
     "not_authed",
     "token_expired",
     "token_revoked",
@@ -137,11 +140,13 @@ enum Method {
     ConversationsHistory,
     ConversationsInfo,
     ConversationsJoin,
+    ConversationsOpen,
     ConversationsReplies,
     FilesCompleteUploadExternal,
     FilesGetUploadUrlExternal,
     ReactionsAdd,
     ReactionsRemove,
+    ToolingTokensRotate,
     UsersInfo,
     UsersList,
 }
@@ -157,11 +162,13 @@ impl Method {
             Self::ConversationsHistory => "conversations.history",
             Self::ConversationsInfo => "conversations.info",
             Self::ConversationsJoin => "conversations.join",
+            Self::ConversationsOpen => "conversations.open",
             Self::ConversationsReplies => "conversations.replies",
             Self::FilesCompleteUploadExternal => "files.completeUploadExternal",
             Self::FilesGetUploadUrlExternal => "files.getUploadURLExternal",
             Self::ReactionsAdd => "reactions.add",
             Self::ReactionsRemove => "reactions.remove",
+            Self::ToolingTokensRotate => "tooling.tokens.rotate",
             Self::UsersInfo => "users.info",
             Self::UsersList => "users.list",
         }
@@ -173,12 +180,14 @@ impl Method {
         match self {
             Self::AuthTest => Tier::AuthTest,
             Self::ChatPostMessage => Tier::PostMessage,
+            Self::ToolingTokensRotate => Tier::Tier1,
             Self::UsersList | Self::ReactionsRemove => Tier::Tier2,
             Self::BotsInfo
             | Self::ChatUpdate
             | Self::ConversationsHistory
             | Self::ConversationsInfo
             | Self::ConversationsJoin
+            | Self::ConversationsOpen
             | Self::ConversationsReplies
             | Self::ReactionsAdd => Tier::Tier3,
             Self::ChatPostEphemeral
@@ -303,8 +312,43 @@ impl SlackClient {
         WebApi {
             client: self.clone(),
             key: TokenKey::of(&token),
-            token,
+            token: Some(token),
         }
+    }
+
+    /// `tooling.tokens.rotate`: exchanges an app configuration token's
+    /// `refresh_token` for a new configuration token and refresh token.
+    /// The refresh token is used up: only the returned one works from now
+    /// on, so store it before anything else.
+    ///
+    /// No token is sent in `Authorization`; the refresh token goes in the
+    /// form body, never in the URL, and never in an error or a log line.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Unauthorized`] when Slack refuses the refresh token
+    /// (`invalid_refresh_token`, among others); otherwise see
+    /// [`map_error`].
+    pub async fn rotate_config_token(&self, refresh_token: &SecretString) -> Result<ConfigToken> {
+        let api = WebApi {
+            client: self.clone(),
+            key: TokenKey::of(refresh_token),
+            token: None,
+        };
+        let form = vec![("refresh_token", refresh_token.expose_secret().to_owned())];
+        let rotated: RotateResponse = api
+            .call(Method::ToolingTokensRotate, Body::Form(form), None)
+            .await?;
+        let expires_at = OffsetDateTime::from_unix_timestamp(rotated.exp).map_err(|_| {
+            SurfaceError::Transport("tooling.tokens.rotate returned an invalid exp".into())
+        })?;
+        Ok(ConfigToken {
+            token: rotated.token,
+            refresh_token: rotated.refresh_token,
+            team: rotated.team_id,
+            user: rotated.user_id,
+            expires_at,
+        })
     }
 
     /// Replies privately to a slash command or an interaction through its
@@ -373,7 +417,7 @@ impl SlackClient {
 #[derive(Clone)]
 pub struct WebApi {
     client: SlackClient,
-    token: SecretString,
+    token: Option<SecretString>,
     key: TokenKey,
 }
 
@@ -405,7 +449,25 @@ pub struct AuthTest {
     pub bot_id: Option<String>,
 }
 
-/// A conversation, from `conversations.info` or `conversations.join`.
+/// An app configuration token and its refresh token, from
+/// [`SlackClient::rotate_config_token`]. `Debug` redacts both.
+#[derive(Debug)]
+pub struct ConfigToken {
+    /// The configuration token (`xoxe.xoxp-…`), which calls the
+    /// `apps.manifest.*` methods.
+    pub token: SecretString,
+    /// The refresh token (`xoxe-…`) for the next rotation.
+    pub refresh_token: SecretString,
+    /// The workspace the token acts in.
+    pub team: TeamId,
+    /// The member the token acts as.
+    pub user: UserId,
+    /// When `token` stops working. Configuration tokens last 12 hours.
+    pub expires_at: OffsetDateTime,
+}
+
+/// A conversation, from `conversations.info`, `conversations.join` or
+/// `conversations.open`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Conversation {
     /// The conversation's id.
@@ -634,6 +696,15 @@ struct BotResponse {
 }
 
 #[derive(Deserialize)]
+struct RotateResponse {
+    token: SecretString,
+    refresh_token: SecretString,
+    team_id: TeamId,
+    user_id: UserId,
+    exp: i64,
+}
+
+#[derive(Deserialize)]
 struct UploadUrlResponse {
     upload_url: SecretString,
     file_id: String,
@@ -838,6 +909,70 @@ impl WebApi {
             .call(Method::ConversationsJoin, Body::Form(form), None)
             .await?;
         Ok(joined.channel)
+    }
+
+    /// `conversations.open`: the bot's direct message with `user`, opened if
+    /// there is none yet. Needs the `im:write` scope.
+    ///
+    /// # Errors
+    ///
+    /// See [`map_error`]; `user_not_found` is [`SurfaceError::NotFound`].
+    pub async fn open_dm(&self, user: &UserId) -> Result<ConversationId> {
+        let form = vec![("users", user.to_string())];
+        let opened: ChannelResponse = self
+            .call(Method::ConversationsOpen, Body::Form(form), None)
+            .await?;
+        Ok(opened.channel.id)
+    }
+
+    /// Downloads a file a message carried ([`InFile::url`], Slack's
+    /// `url_private_download`) with the bot token, reading at most
+    /// `max_bytes`. Needs the `files:read` scope.
+    ///
+    /// The token is sent only to Slack: an `https` URL on `slack.com` or one
+    /// of its subdomains, or the origin of this client's API URL. Redirects
+    /// are not followed, since Slack answers a request it doesn't accept
+    /// with a redirect to its sign-in page.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Api`] if the URL isn't Slack's, the file is larger
+    /// than `max_bytes`, or Slack answers anything but 200;
+    /// [`SurfaceError::Transport`] if the download fails. No error repeats
+    /// the URL.
+    pub async fn download_file(&self, file: &InFile, max_bytes: u64) -> Result<Vec<u8>> {
+        let url = Url::parse(&file.url)
+            .ok()
+            .filter(|url| self.client.may_send_token_to(url))
+            .ok_or_else(|| SurfaceError::Api("the file's URL is not a Slack URL".into()))?;
+        let too_large = || SurfaceError::Api(format!("the file is larger than {max_bytes} bytes"));
+        if file.size.is_some_and(|size| size > max_bytes) {
+            return Err(too_large());
+        }
+        let mut response = self
+            .authorized(self.client.http.get(url))?
+            .timeout(UPLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        let status = response.status();
+        if status != StatusCode::OK {
+            return Err(SurfaceError::Api(format!(
+                "the file download was refused (HTTP {})",
+                status.as_u16()
+            )));
+        }
+        if response.content_length().is_some_and(|len| len > max_bytes) {
+            return Err(too_large());
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport)? {
+            data.extend_from_slice(&chunk);
+            if data.len() as u64 > max_bytes {
+                return Err(too_large());
+            }
+        }
+        Ok(data)
     }
 
     /// `users.info`: one user by id. Slack can't look a user up by name;
@@ -1074,14 +1209,8 @@ impl WebApi {
             .base
             .join(method.name())
             .map_err(|err| SurfaceError::Api(format!("invalid Slack API URL: {err}")))?;
-        let mut auth = HeaderValue::try_from(format!("Bearer {}", self.token.expose_secret()))
-            .map_err(|_| SurfaceError::Api("the bot token has invalid header characters".into()))?;
-        auth.set_sensitive(true);
         let request = self
-            .client
-            .http
-            .post(url)
-            .header(AUTHORIZATION, auth)
+            .authorized(self.client.http.post(url))?
             .timeout(REQUEST_TIMEOUT);
         Ok(match body {
             Body::Form(form) => request.form(form),
@@ -1089,6 +1218,33 @@ impl WebApi {
                 .header(CONTENT_TYPE, "application/json; charset=utf-8")
                 .body(json.to_string()),
         })
+    }
+}
+
+impl WebApi {
+    /// `request` with the bot token in `Authorization`, if this client has
+    /// one.
+    fn authorized(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        let Some(token) = &self.token else {
+            return Ok(request);
+        };
+        let mut auth = HeaderValue::try_from(format!("Bearer {}", token.expose_secret()))
+            .map_err(|_| SurfaceError::Api("the bot token has invalid header characters".into()))?;
+        auth.set_sensitive(true);
+        Ok(request.header(AUTHORIZATION, auth))
+    }
+}
+
+impl SlackClient {
+    /// Whether a bot token may go to `url`: an `https` URL on `slack.com` or
+    /// a subdomain, or the API URL's own origin.
+    fn may_send_token_to(&self, url: &Url) -> bool {
+        let slack = url.scheme() == "https"
+            && url.port().is_none()
+            && url
+                .host_str()
+                .is_some_and(|host| host == "slack.com" || host.ends_with(".slack.com"));
+        slack || url.origin() == self.base.origin()
     }
 }
 
@@ -1265,11 +1421,13 @@ mod tests {
             (Method::ConversationsHistory, Tier::Tier3),
             (Method::ConversationsInfo, Tier::Tier3),
             (Method::ConversationsJoin, Tier::Tier3),
+            (Method::ConversationsOpen, Tier::Tier3),
             (Method::ConversationsReplies, Tier::Tier3),
             (Method::FilesCompleteUploadExternal, Tier::Tier4),
             (Method::FilesGetUploadUrlExternal, Tier::Tier4),
             (Method::ReactionsAdd, Tier::Tier3),
             (Method::ReactionsRemove, Tier::Tier2),
+            (Method::ToolingTokensRotate, Tier::Tier1),
             (Method::UsersInfo, Tier::Tier4),
             (Method::UsersList, Tier::Tier2),
         ];
