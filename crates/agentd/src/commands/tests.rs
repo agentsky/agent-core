@@ -2,6 +2,7 @@
 //! endpoints.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -55,12 +56,14 @@ fn dm_room(user: &str) -> String {
     format!("dm-{user}")
 }
 
-/// Opens `dm-<user>` for every member.
-struct Dms;
+/// Opens `dm-<user>` for every member, and counts the opens.
+#[derive(Default)]
+struct Dms(AtomicUsize);
 
 #[async_trait]
 impl OpenDm for Dms {
     async fn open_dm(&self, member: &MemberKey) -> Result<ConversationId, SurfaceError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(dm_room(member.user.as_str()).into())
     }
 }
@@ -72,6 +75,7 @@ struct Harness {
     mock: Arc<MockSurface>,
     oauth: MockServer,
     manager: Binding,
+    dms: Arc<Dms>,
 }
 
 async fn harness() -> Harness {
@@ -93,10 +97,11 @@ async fn harness() -> Harness {
         agent: None,
         bot: key("manager"),
     };
+    let dms = Arc::new(Dms::default());
     let bot = Arc::new(ManagerBot::new(
         manager.bot.clone(),
         mock.clone(),
-        Arc::new(Dms),
+        dms.clone(),
     ));
     let commands = Commands::new(
         store.clone(),
@@ -112,6 +117,7 @@ async fn harness() -> Harness {
         mock,
         oauth,
         manager,
+        dms,
     }
 }
 
@@ -676,9 +682,16 @@ async fn without_the_slack_manager_app_slack_and_unknown_workspaces_get_no_repli
     };
     let origin = Origin::SlackSlash {
         response_url: SecretString::from("https://hooks.slack.com/commands/secret"),
+        conv: ConvRef {
+            surface: SurfaceKind::Slack,
+            team: "T1".into(),
+            conversation: "C1".into(),
+        },
     };
     assert!(origin.is_private());
-    assert_eq!(format!("{origin:?}"), "SlackSlash");
+    let debug = format!("{origin:?}");
+    assert!(debug.starts_with("SlackSlash { conv: "), "{debug}");
+    assert!(!debug.contains("hooks.slack.com"), "{debug}");
     let err = replies
         .reply_private(&slack, &origin, "hi")
         .await
@@ -734,12 +747,12 @@ async fn a_relink_notice_is_sent_once_per_break_across_instances() {
 
 /// Opens no DM: every open fails, and each try is counted.
 #[derive(Default)]
-struct DeadDms(std::sync::atomic::AtomicUsize);
+struct DeadDms(AtomicUsize);
 
 #[async_trait]
 impl OpenDm for DeadDms {
     async fn open_dm(&self, _: &MemberKey) -> Result<ConversationId, SurfaceError> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_add(1, Ordering::SeqCst);
         Err(SurfaceError::Transport("down".into()))
     }
 }
@@ -799,7 +812,7 @@ async fn an_unreachable_member_is_retried_with_growing_waits_then_given_up_once(
         dms.clone(),
     ));
     let notifier = RelinkNotifier::new(h.store.clone(), Replies::new(Some(bot)));
-    let tries = || dms.0.load(std::sync::atomic::Ordering::SeqCst);
+    let tries = || dms.0.load(Ordering::SeqCst);
     let mut now = OffsetDateTime::now_utc();
     let mut waits = Vec::new();
     for _ in 0..RELINK_MAX_ATTEMPTS {
@@ -1018,4 +1031,747 @@ async fn agent_commands_without_rocketchat_agents() {
     );
     h.dm("alice", "delete helper").await;
     assert_eq!(h.last_reply("alice"), "Deleted `helper`.");
+}
+
+/// A runner for the session commands: warm sessions are listed, and a
+/// reset holds its session's lock, wakes itself and yields once, which
+/// makes a `FuturesUnordered` stop polling the others after two, then goes
+/// to the store once the gate lets it through, except for sessions whose
+/// sandbox won't stop.
+struct FakeRunner {
+    store: Store,
+    mock: Arc<MockSurface>,
+    warm: std::sync::Mutex<std::collections::HashSet<core_types::SessionId>>,
+    stuck: std::sync::Mutex<std::collections::HashSet<core_types::SessionId>>,
+    slots: std::sync::Mutex<
+        std::collections::HashMap<core_types::SessionId, Arc<tokio::sync::Mutex<()>>>,
+    >,
+    resets: std::sync::Mutex<Vec<(core_types::SessionId, usize)>>,
+    gate: tokio::sync::Semaphore,
+}
+
+impl FakeRunner {
+    fn new(h: &Harness) -> Arc<Self> {
+        Self::with_gate(h, tokio::sync::Semaphore::MAX_PERMITS)
+    }
+
+    /// A runner whose resets each wait for a permit of its gate, which
+    /// starts closed.
+    fn gated(h: &Harness) -> Arc<Self> {
+        Self::with_gate(h, 0)
+    }
+
+    fn with_gate(h: &Harness, permits: usize) -> Arc<Self> {
+        Arc::new(Self {
+            store: h.store.clone(),
+            mock: Arc::clone(&h.mock),
+            warm: std::sync::Mutex::default(),
+            stuck: std::sync::Mutex::default(),
+            slots: std::sync::Mutex::default(),
+            resets: std::sync::Mutex::default(),
+            gate: tokio::sync::Semaphore::new(permits),
+        })
+    }
+
+    /// The sessions whose reset holds their lock, sorted.
+    fn resets(&self) -> Vec<core_types::SessionId> {
+        let mut resets: Vec<_> = self
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, _)| *session)
+            .collect();
+        resets.sort();
+        resets
+    }
+
+    /// How many resets held their session's lock before the manager bot
+    /// posted anything.
+    fn held_before_any_post(&self) -> usize {
+        self.resets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, posts)| *posts == 0)
+            .count()
+    }
+}
+
+#[async_trait]
+impl SessionControl for FakeRunner {
+    async fn reset(
+        &self,
+        session: core_types::SessionId,
+    ) -> Result<Option<store::Session>, runner::RunnerError> {
+        let slot = Arc::clone(self.slots.lock().unwrap().entry(session).or_default());
+        let _held = slot.lock_owned().await;
+        let posts = self.mock.posts().len();
+        self.resets.lock().unwrap().push((session, posts));
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                return std::task::Poll::Ready(());
+            }
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        })
+        .await;
+        self.gate.acquire().await.unwrap().forget();
+        if self.stuck.lock().unwrap().contains(&session) {
+            return Err(sandbox::SandboxError::NotFound.into());
+        }
+        self.warm.lock().unwrap().remove(&session);
+        Ok(self.store.reset_session(session, at(10_000)).await?)
+    }
+
+    fn warm_sessions(&self) -> Vec<core_types::SessionId> {
+        self.warm.lock().unwrap().iter().copied().collect()
+    }
+}
+
+fn at(offset: i64) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(1_790_000_000 + offset).unwrap()
+}
+
+/// The sessions of alice's agent `helper`, one of each kind.
+struct Sessions {
+    agent: core_types::AgentId,
+    own_dm: store::Session,
+    thread: store::Session,
+    other_thread: store::Session,
+    elsewhere: store::Session,
+    their_dm: store::Session,
+    task: store::Session,
+    unused: store::Session,
+    first_turn: store::Session,
+}
+
+fn thread_in(room: &str, root: Option<&str>) -> core_types::ThreadKey {
+    core_types::ThreadKey {
+        conv: conv(room),
+        root: root.map(core_types::MessageId::new),
+    }
+}
+
+impl Harness {
+    /// alice's agent `helper`, and its sessions: alice's DM with it, two
+    /// threads in `GENERAL` and one in `OTHER`, bob's DM with it, a private
+    /// task posting to `GENERAL`, a session that has had no turn, and one
+    /// whose first turn is running. bob owns an agent `helper` too, with a
+    /// session in `GENERAL`.
+    async fn sessions(&self) -> Sessions {
+        let owner = self
+            .store
+            .ensure_member(&key("alice"), "alice", at(0))
+            .await
+            .unwrap();
+        let agent = self.agent(owner).await;
+        let bob = self
+            .store
+            .ensure_member(&key("bob"), "bob", at(0))
+            .await
+            .unwrap();
+        let bobs = self.agent(bob).await;
+        let channel =
+            |room: &str| core_types::ScopeKey::for_conversation(ConvKind::Channel, conv(room));
+        let session = async |thread: core_types::ThreadKey,
+                             scope: core_types::ScopeKey,
+                             created: i64,
+                             turn: Option<i64>| {
+            let session = self
+                .store
+                .session_for_thread(agent, &thread, &scope, at(created))
+                .await
+                .unwrap()
+                .session;
+            if let Some(turn) = turn {
+                self.store
+                    .record_session_turn(session.id, true, at(turn))
+                    .await
+                    .unwrap();
+            }
+            self.store.session(session.id).await.unwrap().unwrap()
+        };
+        let own_dm = session(
+            thread_in("dm-helper-alice", None),
+            core_types::ScopeKey::Private,
+            1,
+            Some(600),
+        )
+        .await;
+        let thread = session(
+            thread_in("GENERAL", Some("R1")),
+            channel("GENERAL"),
+            1,
+            Some(60),
+        )
+        .await;
+        let other_thread = session(
+            thread_in("GENERAL", Some("R2")),
+            channel("GENERAL"),
+            1,
+            Some(30),
+        )
+        .await;
+        let elsewhere = session(
+            thread_in("OTHER", Some("R3")),
+            channel("OTHER"),
+            1,
+            Some(20),
+        )
+        .await;
+        let their_dm = session(
+            thread_in("dm-helper-bob", None),
+            core_types::ScopeKey::for_conversation(ConvKind::Dm, conv("dm-helper-bob")),
+            1,
+            Some(10),
+        )
+        .await;
+        let unused = session(
+            thread_in("GENERAL", Some("R4")),
+            channel("GENERAL"),
+            5,
+            None,
+        )
+        .await;
+        let first_turn = session(
+            thread_in("GENERAL", Some("R5")),
+            channel("GENERAL"),
+            4,
+            None,
+        )
+        .await;
+        assert!(
+            self.store
+                .mark_session_turn_pending(first_turn.id)
+                .await
+                .unwrap()
+        );
+        let first_turn = self.store.session(first_turn.id).await.unwrap().unwrap();
+        let task = self
+            .store
+            .create_private_session(
+                agent,
+                core_types::ConsentId::new_v4(),
+                &thread_in("GENERAL", Some("R1")),
+                at(2),
+            )
+            .await
+            .unwrap();
+        self.store
+            .record_session_turn(task.id, true, at(3_600))
+            .await
+            .unwrap();
+        let task = self.store.session(task.id).await.unwrap().unwrap();
+        let bobs = self
+            .store
+            .session_for_thread(
+                bobs,
+                &thread_in("GENERAL", Some("R1")),
+                &channel("GENERAL"),
+                at(1),
+            )
+            .await
+            .unwrap()
+            .session;
+        self.store
+            .record_session_turn(bobs.id, true, at(1))
+            .await
+            .unwrap();
+        Sessions {
+            agent,
+            own_dm,
+            thread,
+            other_thread,
+            elsewhere,
+            their_dm,
+            task,
+            unused,
+            first_turn,
+        }
+    }
+
+    async fn agent(&self, owner: core_types::MemberId) -> core_types::AgentId {
+        let team = TeamId::new(TEAM);
+        let new = store::NewAgent {
+            owner,
+            name: "helper",
+            persona: "p",
+            visibility: store::Visibility::Public,
+            surface: SurfaceKind::RocketChat,
+            team: &team,
+        };
+        let store::AgentCreation::Created(agent, _) =
+            self.store.create_agent(&new, 10, at(0)).await.unwrap()
+        else {
+            panic!("the agent was created");
+        };
+        agent.id
+    }
+
+    /// The sessions of `agent` in use, with none warm.
+    async fn in_use(&self, agent: core_types::AgentId) -> Vec<core_types::SessionId> {
+        let mut in_use: Vec<_> = self
+            .store
+            .sessions_in_use(agent, &[], None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        in_use.sort();
+        in_use
+    }
+
+    async fn is_reset(&self, session: &store::Session) -> bool {
+        self.store
+            .session(session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .reset_at
+            .is_some()
+    }
+}
+
+fn sorted<const N: usize>(ids: [core_types::SessionId; N]) -> Vec<core_types::SessionId> {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn sessions_lists_the_sessions_in_use_most_recent_first() {
+    let h = harness().await;
+    let s = h.sessions().await;
+    let runner = FakeRunner::new(&h);
+    runner
+        .warm
+        .lock()
+        .unwrap()
+        .extend([s.thread.id, s.unused.id]);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+
+    h.dm("alice", "sessions helper").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper`'s 8 sessions, most recent first:\n\
+         - A private task, last turn 2026-09-21 15:13 UTC, cold\n\
+         - Your DM with it, last turn 2026-09-21 14:23 UTC, cold\n\
+         - A thread in a channel, last turn 2026-09-21 14:14 UTC, warm\n\
+         - A thread in a channel, last turn 2026-09-21 14:13 UTC, cold\n\
+         - A thread in a channel, last turn 2026-09-21 14:13 UTC, cold\n\
+         - Another member's DM with it, last turn 2026-09-21 14:13 UTC, cold\n\
+         - A thread in a channel, no turn finished yet, warm\n\
+         - A thread in a channel, no turn finished yet, cold\n\n\
+         Start them all over with `reset helper`, or one conversation's with \
+         `!agent reset helper here` there."
+    );
+    assert!(runner.resets().is_empty());
+}
+
+#[tokio::test]
+async fn reset_without_here_resets_every_session_in_use_of_the_senders_agent() {
+    let h = harness().await;
+    let s = h.sessions().await;
+    let runner = FakeRunner::new(&h);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+
+    h.dm("carol", "reset helper").await;
+    assert_eq!(
+        h.last_reply("carol"),
+        "You have no agent named `helper`. Only an agent's owner can change it."
+    );
+    h.dm("carol", "sessions helper").await;
+    assert_eq!(
+        h.last_reply("carol"),
+        "You have no agent named `helper`. Only an agent's owner can change it."
+    );
+    h.dm("bob", "reset helper").await;
+    assert_eq!(
+        h.last_reply("bob"),
+        "Resetting `helper`'s session: the next message in it starts a new conversation. If \
+         it is running a turn, it resets once that turn ends. If it can't be reset, I'll tell \
+         you in a direct message."
+    );
+    assert_eq!(runner.resets().len(), 1);
+    assert!(
+        !h.is_reset(&s.thread).await,
+        "bob's reset reached alice's agent"
+    );
+    runner.resets.lock().unwrap().clear();
+
+    h.channel("alice", "reset helper").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Resetting `helper`'s 7 sessions: the next message in each starts a new conversation. \
+         A session running a turn resets once that turn ends. If any can't be reset, I'll tell \
+         you in a direct message."
+    );
+    assert_eq!(
+        runner.resets(),
+        sorted([
+            s.own_dm.id,
+            s.thread.id,
+            s.other_thread.id,
+            s.elsewhere.id,
+            s.their_dm.id,
+            s.task.id,
+            s.first_turn.id,
+        ])
+    );
+    assert!(!h.is_reset(&s.unused).await);
+    for old in [&s.own_dm, &s.thread, &s.task] {
+        assert!(h.is_reset(old).await);
+    }
+    assert!(
+        h.in_use(s.agent).await.is_empty(),
+        "the replacements have had no turn"
+    );
+    h.dm("alice", "sessions helper").await;
+    assert_eq!(h.last_reply("alice"), "`helper` has no sessions yet.");
+    h.dm("alice", "reset helper").await;
+    assert_eq!(h.last_reply("alice"), "`helper` has no sessions to reset.");
+}
+
+#[tokio::test]
+async fn reset_here_resets_only_the_conversations_sessions() {
+    let h = harness().await;
+    let s = h.sessions().await;
+    let runner = FakeRunner::new(&h);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+
+    h.dm("alice", "reset helper here").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`reset helper here` resets the conversation it is sent in, and no agent answers in \
+         this one. Send `!agent reset helper here` in the conversation to reset, or \
+         `reset helper` here to reset them all."
+    );
+    assert!(runner.resets().is_empty());
+
+    h.channel("alice", "reset helper here").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Resetting `helper`'s 3 sessions here: the next message in each starts a new \
+         conversation. A session running a turn resets once that turn ends. If any can't be \
+         reset, I'll tell you in a direct message."
+    );
+    assert_eq!(
+        runner.resets(),
+        sorted([s.thread.id, s.other_thread.id, s.first_turn.id])
+    );
+    for untouched in [&s.own_dm, &s.elsewhere, &s.their_dm, &s.task, &s.unused] {
+        assert!(!h.is_reset(untouched).await);
+    }
+    h.channel("alice", "reset helper here").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` has no session here to reset."
+    );
+
+    let in_dm = Origin::RocketChatChannel {
+        room: "dm-helper-alice".into(),
+    };
+    h.commands
+        .handle_text(&key("alice"), "reset helper HERE", &in_dm, &[])
+        .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Resetting `helper`'s session here: the next message in it starts a new conversation. \
+         If it is running a turn, it resets once that turn ends. If it can't be reset, I'll \
+         tell you in a direct message."
+    );
+    assert!(h.is_reset(&s.own_dm).await);
+}
+
+#[tokio::test]
+async fn reset_here_in_a_rocketchat_room_without_a_session_opens_only_the_replys_dm() {
+    let h = harness().await;
+    h.sessions().await;
+    let opened = h.dms.0.load(Ordering::SeqCst);
+    let quiet = Origin::RocketChatChannel {
+        room: "QUIET".into(),
+    };
+    h.commands
+        .handle_text(&key("alice"), "reset helper here", &quiet, &[])
+        .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` has no session here to reset."
+    );
+    assert_eq!(
+        h.dms.0.load(Ordering::SeqCst) - opened,
+        1,
+        "the room isn't compared with the manager bot's DM"
+    );
+}
+
+#[tokio::test]
+async fn a_session_whose_sandbox_wont_stop_is_not_reset() {
+    let h = harness().await;
+    let s = h.sessions().await;
+    let runner = FakeRunner::new(&h);
+    runner
+        .stuck
+        .lock()
+        .unwrap()
+        .extend([s.thread.id, s.elsewhere.id]);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+
+    h.channel("alice", "reset helper here").await;
+    let replies = h.replies_to("alice");
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert!(replies[0].starts_with("Resetting `helper`'s 3 sessions here"));
+    assert_eq!(
+        replies[1],
+        "`!agent reset helper here` couldn't reset 1 of `helper`'s 3 sessions; the other 2 are \
+         reset. Please send it again in a minute."
+    );
+    assert!(!h.is_reset(&s.thread).await);
+    assert!(h.is_reset(&s.other_thread).await);
+
+    let other = Origin::RocketChatChannel {
+        room: "OTHER".into(),
+    };
+    h.commands
+        .handle_text(&key("alice"), "reset helper here", &other, &[])
+        .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`!agent reset helper here` couldn't reset `helper`'s session. Please send it again in \
+         a minute."
+    );
+    assert!(!h.is_reset(&s.elsewhere).await);
+
+    runner
+        .stuck
+        .lock()
+        .unwrap()
+        .extend([s.own_dm.id, s.their_dm.id, s.task.id]);
+    h.dm("alice", "reset helper").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`reset helper` couldn't reset any of `helper`'s 5 sessions. Please send it again in a \
+         minute."
+    );
+}
+
+#[tokio::test]
+async fn without_a_runner_sessions_are_reset_in_the_store_and_none_is_warm() {
+    let h = harness().await;
+    let s = h.sessions().await;
+    h.dm("alice", "sessions helper").await;
+    let listed = h.last_reply("alice");
+    assert!(listed.starts_with("`helper`'s 7 sessions"), "{listed}");
+    assert!(!listed.contains("warm"), "{listed}");
+
+    let runner = FakeRunner::new(&h);
+    runner.warm.lock().unwrap().insert(s.thread.id);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+    drop(control);
+    drop(runner);
+
+    let other = Origin::RocketChatChannel {
+        room: "OTHER".into(),
+    };
+    h.commands
+        .handle_text(&key("alice"), "reset helper here", &other, &[])
+        .await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Resetting `helper`'s session here:")
+    );
+    assert!(h.is_reset(&s.elsewhere).await);
+    h.dm("alice", "sessions helper").await;
+    let listed = h.last_reply("alice");
+    assert!(listed.starts_with("`helper`'s 6 sessions"), "{listed}");
+    assert!(!listed.contains("warm"), "{listed}");
+}
+
+#[tokio::test]
+async fn sessions_lists_at_most_the_most_recent_ones() {
+    let h = harness().await;
+    let owner = h
+        .store
+        .ensure_member(&key("alice"), "alice", at(0))
+        .await
+        .unwrap();
+    let agent = h.agent(owner).await;
+    let channel = core_types::ScopeKey::for_conversation(ConvKind::Channel, conv("GENERAL"));
+    for n in 0..=MAX_LISTED {
+        let root = format!("R{n}");
+        let session = h
+            .store
+            .session_for_thread(agent, &thread_in("GENERAL", Some(&root)), &channel, at(0))
+            .await
+            .unwrap()
+            .session;
+        let turn = i64::try_from(n).unwrap() * 60;
+        h.store
+            .record_session_turn(session.id, true, at(turn))
+            .await
+            .unwrap();
+    }
+    h.dm("alice", "sessions helper").await;
+    let listed = h.last_reply("alice");
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!(
+            "`helper`'s {MAX_LISTED} most recent sessions of {}:",
+            MAX_LISTED + 1
+        )
+    );
+    assert_eq!(
+        lines[1],
+        "- A thread in a channel, last turn 2026-09-21 14:33 UTC, cold"
+    );
+    assert_eq!(
+        lines.iter().filter(|line| line.starts_with("- ")).count(),
+        MAX_LISTED
+    );
+    assert!(
+        !listed.contains("14:13 UTC"),
+        "the oldest is left out: {listed}"
+    );
+}
+
+#[tokio::test]
+async fn every_reset_is_queued_before_the_reply_and_later_commands_dont_wait_for_them() {
+    const COUNT: usize = 200;
+    let h = harness().await;
+    let owner = h
+        .store
+        .ensure_member(&key("alice"), "alice", at(0))
+        .await
+        .unwrap();
+    let agent = h.agent(owner).await;
+    let channel = core_types::ScopeKey::for_conversation(ConvKind::Channel, conv("GENERAL"));
+    let mut sessions = Vec::new();
+    for n in 0..COUNT {
+        let root = format!("R{n}");
+        let session = h
+            .store
+            .session_for_thread(agent, &thread_in("GENERAL", Some(&root)), &channel, at(0))
+            .await
+            .unwrap()
+            .session;
+        h.store
+            .record_session_turn(session.id, true, at(i64::try_from(n).unwrap()))
+            .await
+            .unwrap();
+        sessions.push(session.id);
+    }
+    sessions.sort();
+    let runner = FakeRunner::gated(&h);
+    runner.stuck.lock().unwrap().insert(sessions[4]);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+    let (intake, submitter) = CommandIntake::new(h.commands.clone());
+    let intake = tokio::spawn(intake.run());
+    let in_dm = || Origin::RocketChatDm {
+        room: dm_room("alice").into(),
+    };
+
+    submitter
+        .submit(key("alice"), "reset helper".to_owned(), in_dm(), Vec::new())
+        .await
+        .unwrap();
+    let replies = h.wait_for_replies("alice", 1).await;
+    assert_eq!(
+        replies[0],
+        format!(
+            "Resetting `helper`'s {COUNT} sessions: the next message in each starts a new \
+             conversation. A session running a turn resets once that turn ends. If any can't be \
+             reset, I'll tell you in a direct message."
+        )
+    );
+    assert_eq!(
+        runner.held_before_any_post(),
+        COUNT,
+        "every reset held its session before the reply was posted"
+    );
+    assert_eq!(runner.resets(), sessions);
+
+    submitter
+        .submit(
+            key("alice"),
+            "sessions helper".to_owned(),
+            in_dm(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let replies = h.wait_for_replies("alice", 2).await;
+    assert!(
+        replies[1].starts_with(&format!(
+            "`helper`'s {MAX_LISTED} most recent sessions of {COUNT}:"
+        )),
+        "the owner's next command ran while the resets waited: {}",
+        replies[1]
+    );
+    for id in &sessions {
+        assert_eq!(h.store.session(*id).await.unwrap().unwrap().reset_at, None);
+    }
+
+    runner.gate.add_permits(COUNT);
+    let replies = h.wait_for_replies("alice", 3).await;
+    assert_eq!(
+        replies[2],
+        format!(
+            "`reset helper` couldn't reset 1 of `helper`'s {COUNT} sessions; the other {} are \
+             reset. Please send it again in a minute.",
+            COUNT - 1
+        )
+    );
+    for (n, id) in sessions.iter().enumerate() {
+        let reset = h.store.session(*id).await.unwrap().unwrap().reset_at;
+        assert_eq!(reset.is_some(), n != 4, "session {n}");
+    }
+    drop(submitter);
+    tokio::time::timeout(Duration::from_secs(10), intake)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_intake_waits_for_a_queued_reset_when_it_stops() {
+    let h = harness().await;
+    let s = h.sessions().await;
+    let runner = FakeRunner::gated(&h);
+    let control: Arc<dyn SessionControl> = runner.clone();
+    h.commands.use_sessions(Arc::downgrade(&control));
+    let (intake, submitter) = CommandIntake::new(h.commands.clone());
+    let intake = tokio::spawn(intake.run());
+    submitter
+        .submit(
+            key("alice"),
+            "reset helper".to_owned(),
+            Origin::RocketChatDm {
+                room: dm_room("alice").into(),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    h.wait_for_replies("alice", 1).await;
+    drop(submitter);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!intake.is_finished(), "the reset is still waiting");
+    runner.gate.add_permits(100);
+    tokio::time::timeout(Duration::from_secs(10), intake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.is_reset(&s.thread).await);
+    assert_eq!(h.replies_to("alice").len(), 1, "no reset failed");
 }

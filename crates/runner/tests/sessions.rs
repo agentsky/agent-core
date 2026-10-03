@@ -344,6 +344,20 @@ impl Harness {
         self.log.lock().unwrap().clone()
     }
 
+    /// A connection of its own to the store's database, holding its write
+    /// lock until it commits.
+    async fn lock_writes(&self) -> sqlx::SqliteConnection {
+        use sqlx::Connection;
+
+        let url = self._dir.db_url();
+        let mut writer = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        writer
+    }
+
     fn clear(&self) {
         self.log.lock().unwrap().clear();
     }
@@ -619,6 +633,7 @@ async fn the_global_cap_reaps_an_idle_container_of_another_scope() {
     assert_eq!(h.sandbox.most.load(Ordering::SeqCst), 1);
     assert!(!h.manager.is_warm(first.id));
     assert!(h.manager.is_warm(second.id));
+    assert_eq!(h.manager.warm_sessions(), [second.id]);
     let events = h.events();
     assert!(
         position(&events, &Event::ProcessStopping(first.id, 1))
@@ -754,6 +769,32 @@ async fn reset_starts_with_a_new_id() {
         Err(RunnerError::UnknownSession)
     ));
     assert_eq!(h.manager.reset(old.id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_reset_holds_its_session_while_its_store_write_waits() {
+    let h = Harness::new(&[Turn::reply("old")]).await;
+    let warm = h.thread_session("1.1").await;
+    reply(&h.run(warm.id, request("one")).await);
+    let mut writer = h.lock_writes().await;
+    let mut reset = Box::pin(h.manager.reset(warm.id));
+    assert!(futures::poll!(reset.as_mut()).is_pending());
+    eventually("the container stops while the store is locked", || {
+        h.events().contains(&Event::ContainerStopped(warm.id))
+    })
+    .await;
+    let mut turn = Box::pin(h.manager.run_turn(warm.id, request("two")));
+    assert!(
+        futures::poll!(turn.as_mut()).is_pending(),
+        "a turn sent while the reset waits for the store waits behind it"
+    );
+    assert_eq!(
+        h.store.session(warm.id).await.unwrap().unwrap().reset_at,
+        None
+    );
+    sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+    assert!(reset.await.unwrap().is_some());
+    assert!(matches!(turn.await, Err(RunnerError::SessionReset)));
 }
 
 #[tokio::test]

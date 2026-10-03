@@ -12,12 +12,32 @@ use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
 
 const TABLE: &str = "sessions";
 
+/// How many [`reset_session`](Store::reset_session) calls write at once, per
+/// [`Store`] and its clones. SQLite has one writer, so more would only
+/// hold more of the pool's connections waiting for it.
+pub const RESETS_AT_ONCE: usize = 2;
+
 /// The columns every query reads, in [`Row`]'s order.
 macro_rules! columns {
     () => {
         "id, agent_id, surface, team_id, conversation, thread_root, scope_key, kind, \
          consent_id, started, maybe_started, created_at, last_turn_at, reset_at"
     };
+}
+
+/// The condition for an agent's session in use, binding the agent id and
+/// the warm session ids as a JSON array, in that order.
+macro_rules! in_use {
+    () => {
+        "agent_id = ? AND reset_at IS NULL \
+         AND (started OR maybe_started OR last_turn_at IS NOT NULL \
+              OR id IN (SELECT value FROM json_each(?)))"
+    };
+}
+
+/// `ids` as a JSON array of strings, for `json_each`.
+fn ids_json(ids: &[SessionId]) -> sqlx::types::Json<Vec<String>> {
+    sqlx::types::Json(ids.iter().map(ToString::to_string).collect())
 }
 
 /// What kind of session a row is.
@@ -313,11 +333,63 @@ impl Store {
         row.map(Row::into_session).transpose()
     }
 
+    /// The sessions of `agent` in use, normal and private, most recently
+    /// active first (by the end of the last turn, or the creation), at most
+    /// `limit` of them, or all with `None`. A session in use is live (not
+    /// reset) and has had a turn finish, has had one go to its CLI, or is
+    /// one of `warm`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if a row doesn't parse.
+    pub async fn sessions_in_use(
+        &self,
+        agent: AgentId,
+        warm: &[SessionId],
+        limit: Option<usize>,
+    ) -> Result<Vec<Session>> {
+        let limit = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
+        let rows: Vec<Row> = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM sessions WHERE ",
+            in_use!(),
+            " ORDER BY COALESCE(last_turn_at, created_at) DESC, created_at DESC, id LIMIT ?"
+        ))
+        .bind(agent.to_string())
+        .bind(ids_json(warm))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Row::into_session).collect()
+    }
+
+    /// How many sessions of `agent` are in use, as
+    /// [`sessions_in_use`](Self::sessions_in_use) counts them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn count_sessions_in_use(&self, agent: AgentId, warm: &[SessionId]) -> Result<usize> {
+        let count: i64 =
+            sqlx::query_scalar(concat!("SELECT COUNT(*) FROM sessions WHERE ", in_use!()))
+                .bind(agent.to_string())
+                .bind(ids_json(warm))
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Resets session `id`: marks it reset and, for a normal session,
     /// inserts its replacement for the same thread and scope, unstarted and
     /// with a new v4 id, in the same transaction. Returns the replacement;
     /// `None` for a private task's session, and for a session that is
     /// unknown or already reset.
+    ///
+    /// It waits for one of [`RESETS_AT_ONCE`] permits before it takes a
+    /// connection, so a reset of thousands of sessions leaves the rest of
+    /// the pool to other work.
     ///
     /// # Errors
     ///
@@ -328,6 +400,7 @@ impl Store {
         id: SessionId,
         now: OffsetDateTime,
     ) -> Result<Option<Session>> {
+        let _permit = self.resets.acquire().await;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row: Option<Row> = sqlx::query_as(concat!(
             "SELECT ",
@@ -625,6 +698,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn at_most_a_few_resets_write_at_once() {
+        use sqlx::Connection;
+
+        let dir = TempDir::new("store-test");
+        let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
+        let agent = AgentId::new_v4();
+        let mut ids = Vec::new();
+        for n in 0..3 * RESETS_AT_ONCE {
+            let found = store
+                .session_for_thread(agent, &thread(&format!("{n}.1")), &channel(), at(1))
+                .await
+                .unwrap();
+            ids.push(found.session.id);
+        }
+        let mut writer = SqliteConnection::connect(&dir.db_url()).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        let settled = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while usize::try_from(store.pool.size()).unwrap() > store.pool.num_idle() {
+            assert!(
+                tokio::time::Instant::now() < settled,
+                "the setup's connections go back to the pool"
+            );
+            tokio::task::yield_now().await;
+        }
+        let resets: Vec<_> = ids
+            .into_iter()
+            .map(|id| {
+                let store = store.clone();
+                tokio::spawn(async move { store.reset_session(id, at(2)).await })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        let in_use = usize::try_from(store.pool.size()).unwrap() - store.pool.num_idle();
+        assert_eq!(
+            in_use, RESETS_AT_ONCE,
+            "only the resets holding a permit wait for the writer with a connection"
+        );
+        sqlx::query("COMMIT").execute(&mut writer).await.unwrap();
+        for reset in resets {
+            assert!(reset.await.unwrap().unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
     async fn a_thread_on_another_scope_replaces_its_session() {
         let store = memory_store().await;
         let agent = AgentId::new_v4();
@@ -727,6 +847,108 @@ mod tests {
         );
         store.reset_session(session.id, at(5)).await.unwrap();
         assert!(!store.mark_session_turn_pending(session.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sessions_in_use_are_the_live_ones_that_ran_or_are_warm_most_recent_first() {
+        let store = memory_store().await;
+        let agent = AgentId::new_v4();
+        let old = store
+            .session_for_thread(agent, &thread("1.1"), &channel(), at(1))
+            .await
+            .unwrap()
+            .session;
+        store
+            .record_session_turn(old.id, true, at(5))
+            .await
+            .unwrap();
+        let dm = store
+            .session_for_thread(agent, &dm(), &ScopeKey::Private, at(2))
+            .await
+            .unwrap()
+            .session;
+        store.record_session_turn(dm.id, true, at(9)).await.unwrap();
+        let unused = store
+            .session_for_thread(agent, &thread("2.2"), &channel(), at(7))
+            .await
+            .unwrap()
+            .session;
+        let warm = store
+            .session_for_thread(agent, &thread("4.4"), &channel(), at(3))
+            .await
+            .unwrap()
+            .session;
+        let pending = store
+            .session_for_thread(agent, &thread("5.5"), &channel(), at(4))
+            .await
+            .unwrap()
+            .session;
+        assert!(store.mark_session_turn_pending(pending.id).await.unwrap());
+        let task = store
+            .create_private_session(agent, ConsentId::new_v4(), &thread("1.1"), at(3))
+            .await
+            .unwrap();
+        store
+            .record_session_turn(task.id, false, at(8))
+            .await
+            .unwrap();
+        let reset = store
+            .session_for_thread(agent, &thread("3.3"), &channel(), at(4))
+            .await
+            .unwrap()
+            .session;
+        store
+            .record_session_turn(reset.id, true, at(10))
+            .await
+            .unwrap();
+        let replacement = store.reset_session(reset.id, at(6)).await.unwrap().unwrap();
+        let other = store
+            .session_for_thread(AgentId::new_v4(), &thread("1.1"), &channel(), at(8))
+            .await
+            .unwrap()
+            .session;
+        store
+            .record_session_turn(other.id, true, at(8))
+            .await
+            .unwrap();
+
+        let ids = |sessions: Vec<Session>| -> Vec<SessionId> {
+            sessions.into_iter().map(|session| session.id).collect()
+        };
+        let warm_ids = [warm.id, reset.id, other.id];
+        assert_eq!(
+            ids(store.sessions_in_use(agent, &warm_ids, None).await.unwrap()),
+            [dm.id, task.id, old.id, pending.id, warm.id]
+        );
+        assert_eq!(
+            store.count_sessions_in_use(agent, &warm_ids).await.unwrap(),
+            5
+        );
+        assert_eq!(
+            ids(store
+                .sessions_in_use(agent, &warm_ids, Some(2))
+                .await
+                .unwrap()),
+            [dm.id, task.id]
+        );
+        assert_eq!(
+            ids(store.sessions_in_use(agent, &[], None).await.unwrap()),
+            [dm.id, task.id, old.id, pending.id]
+        );
+        assert_eq!(store.count_sessions_in_use(agent, &[]).await.unwrap(), 4);
+        for left_out in [unused.id, replacement.id] {
+            assert!(
+                !ids(store.sessions_in_use(agent, &warm_ids, None).await.unwrap())
+                    .contains(&left_out)
+            );
+        }
+        assert!(
+            store
+                .sessions_in_use(AgentId::new_v4(), &warm_ids, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

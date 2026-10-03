@@ -908,6 +908,38 @@ impl RestClient {
         url.into()
     }
 
+    /// The web client's link to a room, or to a thread in it when `thread`
+    /// names its root: `<base>/channel/<name>` for a public channel,
+    /// `<base>/group/<name>` for a private group and `<base>/direct/<id>`
+    /// for a direct message, then `/thread/<root>`. `None` for another room
+    /// type, and for a channel or group without a `name`.
+    pub fn room_link(
+        &self,
+        room_type: &RoomType,
+        room: &ConversationId,
+        name: Option<&str>,
+        thread: Option<&MessageId>,
+    ) -> Option<String> {
+        let (route, key) = match room_type {
+            RoomType::Channel => ("channel", name?),
+            RoomType::Group => ("group", name?),
+            RoomType::Direct => ("direct", room.as_str()),
+            RoomType::Livechat | RoomType::Other(_) => return None,
+        };
+        if key.is_empty() {
+            return None;
+        }
+        let mut url = self.base.clone();
+        {
+            let mut segments = url.path_segments_mut().ok()?;
+            segments.pop_if_empty().extend([route, key]);
+            if let Some(root) = thread {
+                segments.extend(["thread", root.as_str()]);
+            }
+        }
+        Some(url.into())
+    }
+
     /// Downloads a message's file, `<base>/file-upload/<id>/<name>`, with
     /// this client's credentials as `X-User-Id` and `X-Auth-Token` headers,
     /// never in the URL.
@@ -1495,6 +1527,41 @@ mod tests {
 
     fn at_ms(ms: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn room_links_follow_the_web_clients_routes() {
+        let creds = Credentials {
+            user_id: UserId::new("manager"),
+            token: SecretString::from("token"),
+        };
+        let client = RestClient::new("https://chat.example/rc/", creds.clone()).unwrap();
+        let room = ConversationId::new("ROOM1");
+        let root = MessageId::new("M1");
+        let link =
+            |room_type: &RoomType, name, thread| client.room_link(room_type, &room, name, thread);
+        assert_eq!(
+            link(&RoomType::Channel, Some("general"), None).as_deref(),
+            Some("https://chat.example/rc/channel/general")
+        );
+        assert_eq!(
+            link(&RoomType::Group, Some("team a/b"), Some(&root)).as_deref(),
+            Some("https://chat.example/rc/group/team%20a%2Fb/thread/M1")
+        );
+        assert_eq!(
+            link(&RoomType::Direct, None, Some(&root)).as_deref(),
+            Some("https://chat.example/rc/direct/ROOM1/thread/M1")
+        );
+        assert_eq!(link(&RoomType::Channel, None, None), None);
+        assert_eq!(link(&RoomType::Group, Some(""), None), None);
+        assert_eq!(link(&RoomType::Livechat, Some("x"), None), None);
+        assert_eq!(link(&RoomType::Other("v".into()), Some("x"), None), None);
+        let bare = RestClient::new("http://127.0.0.1:3000", creds).unwrap();
+        assert_eq!(
+            bare.room_link(&RoomType::Direct, &room, None, None)
+                .as_deref(),
+            Some("http://127.0.0.1:3000/direct/ROOM1")
+        );
     }
 
     #[test]
