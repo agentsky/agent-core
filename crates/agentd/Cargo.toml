@@ -31,3 +31,4 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 core-types.workspace = true
+testkit.workspace = true
