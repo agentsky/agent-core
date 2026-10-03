@@ -322,7 +322,9 @@ Rules:
 - Tokens are encrypted at rest (ChaCha20-Poly1305, key from the environment or a
   KMS). Refresh is single-flight per member. A failed refresh DMs the member.
 - Endpoint URLs, client id and scopes come from configuration. They are Claude
-  Code's OAuth parameters, not a published API contract, and can change.
+  Code's OAuth parameters, not a published API contract, and can change. The
+  scopes may be only `user:profile`, `user:inference` or both: configuration
+  refuses any other (see [Cloud hand-off](#cloud-hand-off)).
 
 ## Turn routing and billing
 
@@ -333,7 +335,7 @@ So a turn always runs on the credential of the person who caused it.
 
 | Who starts the turn | Where | Runs on | What the agent can touch |
 | --- | --- | --- | --- |
-| The owner, in a DM | DM | Owner's credential | Everything the owner granted: repos, memory, cloud hand-off |
+| The owner, in a DM | DM | Owner's credential | Everything the owner granted: repos, memory. A cloud hand-off is a member's own command, never an agent's (see [Cloud hand-off](#cloud-hand-off)) |
 | The owner, in a channel | Channel thread | Owner's credential | Public side. A private task the agent requests needs a consent card, as from anyone outside the owner's own DM (see below) |
 | Another linked member | Channel thread | Requester's credential | Public side only: persona, skills, thread context |
 | A private task requested during a non-owner's turn | Owner's private sandbox | Owner's credential, after the owner approves a consent card | Owner's private resources for that one task. Only the result and attachments return to the thread |
@@ -746,6 +748,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits; `off` removes one |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
 | `/agent sessions <name>`, `/agent reset <name> [here]` | Owner | Inspect or reset sessions |
+| `/agent cloud add\|run\|list\|rm …` | Privately: `add` and `run` by a linked member, `list` and `rm` by any member | Register routines and hand work to a cloud session on one's own account (see [Cloud hand-off](#cloud-hand-off)) |
 | `/agent list [@user]` | Anyone | Agent directory |
 | `/agent admin ...` | Community admin | Community API key, bans, Slack configuration |
 
@@ -753,6 +756,379 @@ Command replies are always private: Slack ephemeral responses through
 `response_url`, and the manager bot's DM on Rocket.Chat. Slack slash commands
 arrive over HTTPS like every other Slack request and are acknowledged within
 three seconds, with the real reply sent later through `response_url`.
+
+## Cloud hand-off
+
+A member can hand long repository work, such as a pull request that takes an
+hour, to a Claude Code cloud session that runs on Anthropic's infrastructure
+on the member's own account. agentd starts the session when the member types
+a command, returns its link privately, and records that it did. It does not
+follow the session afterwards: nothing documented lets it, and the member
+watches the session where Claude Code already shows it.
+
+### What Claude Code documents
+
+What follows is what the Claude Code documentation said when this section was
+written, on 2026-10-01. None of it has been tried from agentd yet; see
+[Verified and assumed](#verified-and-assumed).
+
+| Capability | Documented interface | Credential it needs | Used |
+| --- | --- | --- | --- |
+| Create a cloud session | `claude --cloud "<task>"`. The CLI shows a live checklist while the VM starts and queues what the user types meanwhile. It clones the current directory's GitHub remote at the current branch, or uploads a bundle of the local repository, history included, when there is no remote or the Claude GitHub App isn't installed on it. `-p` rejects `--cloud` with a task description[^cc-headless] | A claude.ai sign-in; with an API key it fails[^cloud] | No |
+| Create a session headless | `claude -p "<task>" --environment ccpool_… --output-format json` prints `session_id` and exits. Only for self-hosted environments, a public beta on Team and Enterprise plans[^cc-selfhosted-test] | A claude.ai OAuth token, not an API key[^cc-selfhosted-test] | No |
+| Queue a follow-up | `claude -p "<message>" --cloud <session id>` queues the message and exits without a reply, printing `{ok, session_id, url}` with `--output-format json`[^cloud] | The same[^cc-selfhosted-test] | No |
+| Fire a routine | `POST https://api.anthropic.com/v1/claude_code/routines/<trig_…>/fire` with the routine's bearer token and an optional `text` of at most 65,536 characters. It returns `claude_code_session_id` and `claude_code_session_url` once the session exists, and doesn't stream or wait. There is no idempotency key: every success creates a session[^cc-routines-fire] | A per-routine token made at claude.ai, scoped to firing that one routine, with "no read access"[^cc-routines-fire] | Yes |
+| Read replies or status | For Anthropic-hosted sessions, only people's surfaces: the session at claude.ai/code, the Claude app, `claude --teleport`, and `/schedule`'s conversational run history[^cloud][^cc-routines]. For self-hosted runners, a Stop hook the runner's operator installs[^cc-selfhosted-test] | | No |
+
+The scope that grants control of a member's cloud sessions,
+`user:sessions:claude_code`, is capped at 30 days by the server, and
+`claude setup-token` doesn't include it[^cc-selfhosted-test].
+
+So the design uses a routine's API trigger, not `claude --cloud` as milestone
+6 first said:
+
+- Creating a session through the CLI needs an interactive terminal, a
+  checkout of the repository on agentd's host (or an upload of it), and a
+  full claude.ai login of the member on that host, outside any sandbox.
+- That login's `user:sessions:claude_code` scope would control every cloud
+  session of the member, not one task. agentd's links ask for
+  `user:profile user:inference` and nothing else, and must keep doing so:
+  the credential proxy forwards any path (T18), so a session scope on a
+  linked token would let every turn on that member's credential, channel
+  turns they ask for included, create, list and message their cloud
+  sessions. Configuration refuses any `[claude_oauth] scopes` entry other
+  than those two. Widening the scopes would also fail every linked member's
+  next refresh until they log in again, since the refresh sends the scope
+  (T09).
+- A routine's token can do exactly one thing: start that routine. The member
+  chooses its repositories, environment and connectors at claude.ai, where
+  they can see them, and can revoke the token there.
+
+### Setting it up
+
+Once per repository, the member:
+
+1. Creates a routine at claude.ai/code/routines with one repository, an
+   environment with **Trusted** network access (the default allowlist) and
+   no secrets, and no connectors: the form includes every connector by
+   default, and a run uses them without asking for approval[^cc-routines].
+2. Writes the routine's prompt so it acts on the fired text. Anthropic hands
+   that text to the session inside a `<routine-fire-payload>` block that
+   labels it untrusted, and the session ignores instructions in it unless the
+   prompt says otherwise[^cc-routines]. The README gives a prompt such as
+   "Carry out the task in the routine-fire-payload block on the attached
+   repository. It is mine, sent through agent-core. Push to a `claude/`
+   branch and open a draft pull request."
+3. Adds an API trigger, copies its URL, and generates its token, which is
+   shown once[^cc-routines].
+4. Registers both with agentd: `/agent cloud add <routine> <url> <token>`,
+   under a short label of the member's choosing, such as the repository's
+   name. The slash command is better than a DM for this on Slack: its text
+   isn't posted anywhere, while a DM keeps the token in Slack's history.
+
+Step 2 is what makes the hand-off work, and it is also what makes the token
+powerful. The routine's prompt tells the session to do what the fired text
+says, so whoever holds the token (the member, agentd, or anyone who steals
+it, or steals agentd's store together with its master key) can make the
+routine do any work its repositories, connectors and network allow, as the
+member. That is why step 1 keeps a routine to one repository, no connectors
+and the default allowlist.
+
+### Command surface
+
+| Command | What it does |
+| --- | --- |
+| `/agent cloud add <routine> <url> <token>` | Register a routine under the label `<routine>`, or replace its token. Secret-bearing |
+| `/agent cloud run <routine> <task>` | Fire the routine with the task text and reply with the session's link |
+| `/agent cloud list` | The member's routines, and their last ten hand-offs with their state, task and link |
+| `/agent cloud rm <routine>` | Forget a routine and its token |
+
+A label is 1 to 64 characters of ASCII letters, digits and `._/-`, starting
+with a letter or digit, so `agentsky/agent-core` is one. Each member holds at
+most 20 routines, and a routine once: registering a routine id already
+registered under another label is refused.
+
+Routines belong to the member, not to an agent. No agent's persona, skills,
+memory or volumes go to the cloud session, so an agent would only lend a
+name. Keyed per agent, one routine registered under two agents would hold
+two copies of its token, and **Regenerate** at claude.ai, which revokes the
+old token[^cc-routines-fire], would leave one of them failing until the
+member noticed. So `cloud` commands take no agent name, which the plan's
+example `/agent cloud <name> <repo> <task>` had.
+
+Slack delivers slash command text with `&`, `<` and `>` as entities and
+with mentions, channels and links as `<@U…|name>`, `<#C…|name>` and
+`<url|label>` tokens (`should_escape` is on for `/agent`). The Slack surface
+decodes the entities before parsing, as for every command (T08, T30). The
+`<url>` around a pasted fire URL is taken off. In a task, each token becomes
+what Slack showed the member, so the session reads what they saw:
+`<@U…|name>` becomes `@name`, `<#C…|name>` becomes `#name`, `<url>` and a
+`<url|label>` whose label is its URL become the URL, and a `<url|label>`
+with another label becomes `label (url)`, so a label can't hide where a
+link goes. Any other `<…>` token, such as a broadcast, is refused. The task
+then reaches the session as Slack delivered it, with those tokens
+rewritten. Rocket.Chat delivers what was typed, unchanged.
+
+### Who can start one, and where
+
+Only a linked member, as for `/agent create`, by typing `cloud run`, in a
+place where only they and the manager bot read the command: a Slack slash
+command (its text isn't posted), a DM with the Slack manager app, or a DM
+with the Rocket.Chat manager bot. That is the rule for login codes, and every
+`cloud` command follows it. `!agent cloud …` in a Rocket.Chat room is
+refused; `cloud add` there gets the secret-bearing refusal, which tells the
+member to revoke the token with **Regenerate** or **Revoke** at
+claude.ai/code/routines. Messages from bots are never commands (T13), so no
+agent's post can issue one. A ban refuses every `cloud` command but `rm`,
+which only takes something away.
+
+There is no `agentctl` command for it, in any turn, the owner's own DM with
+their agent included, and no consent card starts one. This is stricter than
+private tasks on purpose:
+
+- T33 lets the owner's own DM turn start a private task without a card
+  because the task gets nothing that turn doesn't already have. A cloud
+  session does get more. It pushes to GitHub and comments on pull requests as
+  the member, uses the routine's connectors as the member, runs for hours on
+  a VM whose network agentd doesn't control, and agentd can neither see nor
+  stop it.
+- A turn's text can be steered by what it reads: files, web pages, the
+  repository, and in a channel the thread. If the model could start a cloud
+  session, any such injection would become work done with the member's
+  GitHub identity.
+- A consent card would show model-written text and make approving it one
+  tap. T33's card works because what an approved task can reach is bounded
+  by agentd: the owner's private volume, the sandbox's egress, `attach` only.
+  Here agentd bounds nothing after the request.
+- Typing the command costs the member seconds, and keeps text a model wrote
+  out of it. An agent that thinks a task suits the cloud may say so in
+  words; the bundled `agentctl` skill doesn't describe `cloud run`, so no
+  agent is taught to write one out.
+
+A member can still paste text from elsewhere, an agent's reply included.
+So a `cloud run` task gets the checks a consent card's task gets (T33): the presentation selectors and joiners that only change how a
+character is drawn are dropped, and a task with control or invisible
+characters, deep indentation, wide runs of blanks, many blank lines in a row
+or stacked combining marks is refused, so what the member sees in their own
+message is what the session reads.
+
+### Credential and billing
+
+The only credential is the routine token the member registered. The session
+runs on the account that owns the routine and draws down that account's
+subscription usage, like any of its cloud sessions; the routine endpoint
+also caps fires at 30 an hour per routine and 100 an hour per
+account[^cc-routines-fire]. No requester's credential, no community key, and
+no Claude link is ever used: no turn starts a hand-off, so there is no
+requester other than the member who typed the command, and the endpoint
+takes only the token made for that routine[^cc-routines-fire].
+
+agentd can't tell whose account a token belongs to. It needs no more:
+whoever holds a routine's token can fire that routine anyway, so registering
+one grants the registering member nothing new, and the session runs on the
+routine owner's account whoever fires it.
+
+The token is sealed at rest like every secret in the store, decrypted only
+for the fire request, never logged, never written to a sandbox, and never
+pointed at by a placeholder. The request goes from agentd itself, over its
+`egress` network, not through the credential proxy.
+
+agentd keeps only the routine's id, `trig_` and ASCII letters and digits,
+from the pasted URL. The URL's path must be exactly
+`/v1/claude_code/routines/<routine id>/fire`, with no dot segments in the
+text as pasted, and its origin must be that of `[cloud] base_url`
+(`https://api.anthropic.com` by default; `http` and a port only for a
+loopback `base_url`, which is what tests use). agentd builds the URL again
+from `base_url` for each request and follows no redirects. So a member can't
+point agentd's request, token and all, at another host: Rocket.Chat and
+MongoDB share agentd's `egress` network.
+
+### Repository access
+
+The cloud session gets the routine's repositories, through the member's own
+GitHub connection at claude.ai (the Claude GitHub App or
+`/web-setup`)[^cloud]. Each run clones them, starting from the default
+branch unless the routine's prompt says otherwise, and pushes to `claude/`
+branches; a push to any other branch is refused when the branch is
+protected, has someone else's open pull request, or carries someone else's
+commits[^cc-routines]. In Anthropic-hosted environments the GitHub
+credential stays outside the VM, `git push` reaches only the session's
+working branch, and the GitHub API only the session's
+repositories[^cc-cloud-env]. Network access, environment variables and the
+setup script are the routine's environment's.
+
+agentd sends no repository, file, GitHub token or anything from a volume:
+only the task text. A repository an owner keeps in their agent's private
+`shared/` doesn't cross. agentd can't read a routine's configuration (its
+token has no read access), so `<routine>` is only the member's name for it,
+and `cloud list` shows the labels the member typed, not what the routines
+hold.
+
+### The request and the link
+
+```mermaid
+sequenceDiagram
+    participant M as Member
+    participant B as Manager bot
+    participant A as agentd
+    participant S as Store
+    participant R as Routine endpoint
+    participant C as claude.ai/code
+
+    M->>B: /agent cloud run routine task (private)
+    B->>A: command
+    A->>A: member, routine and task checks
+    A->>S: hand-off row, state sending
+    A->>R: POST fire, Bearer routine token, text
+    R-->>A: session id and URL
+    A->>S: state fired, session id and URL
+    A-->>M: private reply with the link
+    M->>C: opens the link, follows and steers the session
+```
+
+- The body is `{"text": "<task>"}`, with `Authorization: Bearer`,
+  `anthropic-version: 2023-06-01`, `Content-Type: application/json` and
+  `anthropic-beta: experimental-cc-routine-2026-04-01`. The reference makes
+  the beta header optional, but the routines page says breaking changes ship
+  behind new dated headers, while the two previous ones keep
+  working[^cc-routines][^cc-routines-fire]. Sending the dated header pins
+  the shape agentd was written for and gives a migration window when it
+  changes; the cost is that agentd's requests fail once that header is
+  retired, until `[cloud] beta` is updated. agentd adds nothing to the text.
+- A task is refused when empty, longer than 65,536 bytes of UTF-8 (which
+  keeps it under the endpoint's 65,536 characters however they are
+  counted), or holding what the checks above refuse.
+- The link comes back in the command's private reply: Slack's ephemeral
+  reply through `response_url`, or the manager bot's DM. It says agentd
+  won't follow the session, and how to: open the link, the Claude app, or
+  `claude --teleport <session id>` in a checkout of the repository.
+  agentd shows the URL only when it is `https://claude.ai/code/` followed by
+  the returned session id, which must be `session_` and ASCII letters and
+  digits; otherwise it shows the id and `https://claude.ai/code`. The link
+  is never posted to a channel or thread, nor shown to any agent's turn.
+
+### Status
+
+agentd doesn't read the session's status or replies, and doesn't pretend to.
+The routine token has no read access; reading an Anthropic-hosted session
+would need the session scope above and endpoints that aren't documented; and
+the documented read-back, a Stop hook, exists only on self-hosted runners.
+Even the routines page's green status says only that a session started and
+exited without an infrastructure error, not that the task
+succeeded[^cc-routines].
+
+So a hand-off's record ends at `fired`, with the session's id and link. The
+member follows it at that link, in the Claude app, or through the pull
+request it opens. `cloud list` shows what agentd knows, and says that is all
+it knows.
+
+### Durability and audit
+
+Two tables, both in the store:
+
+- `cloud_routines`: an id, the member, the label, the routine id (with its
+  `trig_` prefix), the sealed token, who added it (the identity) and when.
+  One label and one routine id per member. A row is deleted by `cloud rm`,
+  by the member's `logout`, and when Slack reports the member deleted, as
+  configuration tokens are; that last one sends no reply, since there is no
+  one to reply to. A deletion acts on the member, not the identity, so a
+  member Slack reports deleted loses every routine and hand-off they have,
+  those registered from Rocket.Chat included. agentd can't revoke a token at Anthropic, which has no
+  public API for it[^cc-routines-fire], so the other replies tell the member
+  to revoke it at claude.ai/code/routines.
+- `cloud_handoffs`: an id, the member, the routine's label and id (copied, so
+  the record outlives the routine's row), the identity that asked and the
+  kind of command origin, the sealed task text, the state (`sending`,
+  `fired`, `rejected` or `unknown`), the HTTP status, the error type and any
+  `Retry-After`, the session id and URL, when it was asked and answered, and
+  the notice's state. `cloud list` shows each task's first line, cut to 60
+  characters, as literal text. Rows are deleted 90 days after they were
+  asked (`[cloud] retention_days`), and with the member's routines on
+  `logout`.
+
+Sealed columns use their table, column and row as associated data, like
+every sealed column. The task is kept because a member should be able to see
+what was sent on their account in their name, as a consent keeps its task.
+
+A fire runs at most once. The row is written as `sending` before the
+request, and the request is sent once and never retried; only the member,
+with another `cloud run`, starts another session. Commands themselves run
+once: Slack's replayed slash commands are dropped by their signature, and
+Rocket.Chat edits don't run again.
+
+The member hears each outcome once:
+
+- The command's reply tells them, whatever the outcome, so recording an
+  outcome also marks its notice done.
+- If agentd stops during a request, its row stays `sending`. A pass every
+  minute marks `sending` rows older than twice `[cloud] timeout_secs`
+  `unknown`, and owes their members a notice in the manager bot's DM: the
+  hand-off may have started, so check claude.ai/code before running it
+  again. The notice is claimed and sent as the relink notice is (T13): a
+  claim counts an attempt and takes a 10-minute lease, a failed send
+  backs off from a minute, doubling up to an hour, and the notice is given
+  up 24 hours after the row became `unknown`. The pass and the purge run
+  even when `[cloud]` is absent, so a notice owed from before the section
+  was removed still goes out; they then use the defaults, 30 seconds for
+  `timeout_secs` and 90 days for `retention_days`.
+- An answer that arrives for a row already marked `unknown`, when recording
+  it was held up, is still recorded: `unknown` becomes `fired` with the
+  session's id and link, or `rejected` with its status, and a notice not
+  yet claimed is marked done. Nothing retries a record that failed: such a
+  row stays `unknown`, and the reply already said what happened.
+
+Logs carry the command's name, the member, routine and hand-off ids, the
+state, the status and the session id. Never the token, the task text, or
+the pasted URL as typed.
+
+### Failure modes
+
+| Case | State | The member is told |
+| --- | --- | --- |
+| `[cloud]` isn't configured | Nothing stored | Cloud hand-off is off on this agentd. `cloud list` and `cloud rm` still work |
+| Not linked, a public place, a ban, an unknown label, a task the checks refuse | Nothing stored | Why, privately |
+| The store fails before the request | Nothing sent | Nothing was started; try again |
+| No connection: DNS, refused, TLS, all before the request was sent | `rejected` | Nothing was started |
+| 400: the routine is paused, the text too long, or the `anthropic-version` missing or unsupported | `rejected` | The routine refused the task and may be paused |
+| 401: the token doesn't match the routine | `rejected` | Generate a new token, then `cloud add` again |
+| 403: the account or organization has no access to the endpoint | `rejected` | The account can't fire routines |
+| 404: the routine is gone | `rejected` | Use `cloud rm` |
+| 429: an hourly fire limit | `rejected` | When it resets, from `Retry-After` in seconds (an HTTP date is ignored). agentd doesn't retry |
+| 500 or 503, a timeout after sending, a reset connection, a redirect, or a 200 agentd can't read | `unknown` | It may have started; check claude.ai/code before running it again |
+| agentd stops during the request | `unknown`, by the pass | The same, once, in the manager bot's DM |
+| The store fails after a 200 | stays `sending`, then `unknown` | The link at once, from memory; the reply already carried it |
+| The reply can't be delivered | as recorded | Nothing at once; `cloud list` shows the outcome and link |
+| The account is out of usage, its GitHub connection is gone, its subscription is paused, or the task fails in the cloud | Not documented: `fired`, or a `rejected` the endpoint may give | What the endpoint answers; otherwise the session shows it |
+
+### Verified and assumed
+
+Verified, from the documentation on 2026-10-01: everything in
+[What Claude Code documents](#what-claude-code-documents), the routine
+endpoint's request, response, documented errors, limits and token scope,
+the untrusted wrapping of fired text, how routines clone and push, and the
+GitHub proxy's limits.
+
+Assumed, until the live check in the plan's implementation tasks:
+
+- That a 4xx answer from the endpoint started no session. The reference
+  lists the errors but doesn't say so.
+- That a 500 or 503 may have started one. The reference says to retry a 500;
+  without an idempotency key agentd won't.
+- What the endpoint answers when the account is out of usage, its GitHub
+  connection is gone (routines skip runs for up to 72 hours, then turn
+  off[^cc-routines]) or its subscription is paused: an error, or a session
+  that fails.
+- That a 403 means what the failure table says. The reference says only
+  that the account or organization has no access to the endpoint;
+  routines or cloud sessions turned off by an organization's Owner are a
+  likely cause, not a documented one.
+- That `claude_code_session_url` is always `https://claude.ai/code/<id>`.
+  agentd falls back to the id if not.
+- That agentd's linked tokens, with `user:profile user:inference`, are
+  refused by the routine endpoint and the session endpoints. The routine
+  reference says only the routine's token matches; neither was tried.
+- That the endpoint stays as documented. It is experimental, and routines
+  are a research preview[^cc-routines][^cc-routines-fire].
 
 ## Data model
 
@@ -773,6 +1149,8 @@ erDiagram
     AGENT ||--o{ AGENT_SKILL : has
     PENDING_LOGIN }o--|| MEMBER : for
     AGENT ||--o{ CONSENT : requests
+    MEMBER ||--o{ CLOUD_ROUTINE : registers
+    MEMBER ||--o{ CLOUD_HANDOFF : "hands off"
 
     MEMBER {
         uuid id
@@ -838,6 +1216,33 @@ erDiagram
         uuid origin_session_id
         uuid private_session_id
         timestamp expires_at
+    }
+    CLOUD_ROUTINE {
+        uuid id
+        text label
+        text routine_id
+        bytes token_enc
+        text added_by
+        timestamp added_at
+    }
+    CLOUD_HANDOFF {
+        uuid id
+        text routine_label
+        text routine_id
+        text requested_by
+        text origin
+        bytes task_enc
+        text state
+        int http_status
+        text error_type
+        int retry_after_secs
+        text session_id
+        text session_url
+        timestamp created_at
+        timestamp answered_at
+        int notice_attempts
+        timestamp notice_next_attempt_at
+        timestamp notified_at
     }
     VOLUME {
         text scope_key
@@ -924,6 +1329,11 @@ for Rocket.Chat bindings.
 | Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel and group DM messages at ingress, thread replies under another user's root included, and never logs message content. |
 | An agent's owner forges its app's events | Each agent's app is created with its owner's configuration token, so the owner can read the app's signing secret, client secret and bot token at api.slack.com. With the signing secret they can sign a `message` event with any sender, conversation, kind, thread, mentions and files: a copy of a linked member's message with a mention added, to run a turn on that member's Claude plan; a message in another member's DM with the agent, to resume that member's scope; an agent's post with a mention added, to inherit the requester recorded for it; or a message from themselves in another member's thread or DM, to resume, reset or replace that member's session. So Slack's copy is the source of truth: before agentd acts on any message it doesn't ignore (a turn, a link prompt or a refusal), whoever the event says sent it, the owner included, it reads the message back from Slack over TLS with the app's bot token (`conversations.history`, or `conversations.replies` in the thread the event names, at exactly that `ts`), takes the conversation's kind from `conversations.info` (cached per channel for an hour, and refused unless Slack's channel id is the event's exactly), normalizes Slack's copy with the ingress's own rules, and routes that copy again. It acts only if the copy is the same message in the same thread and routes to the same decision, a limit's refusal aside (the counts a limit reads can change between the two routings), and then acts on the copy. What the forged event said decides nothing. A message older than 15 minutes when its event arrived is acknowledged and dropped before it is recorded, since deduplication forgets a message after an hour and messages from before the bot joined never had one. A copy Slack doesn't have, won't show or that routes differently is dropped silently. An unreachable Slack or a rate limit drops the message and tells the thread to try again. A bot's post that was edited is refused, since agentd never edits its agents' posts. An edited message runs once, with its text when its turn comes; the edit starts no turn of its own, and a deleted message is dropped. The cost is one cached `conversations.info` per channel plus one Tier 3 read per message not ignored, on the agent's own token. Forged events slow or refuse only their owner's own agents: each agent's app has at most 32 requests in flight, from the ack until its message reaches the pipeline, one owner's agents' apps together 64, and each app gets 503 past that or past a rate of 100 at once then 8 a second, near Slack's own ceiling for one app; one owner's apps together keep 200 messages at once then 16 a second, and drop the rest after their 200, but only messages an agent's app keeps count, and outside one-to-one DMs it keeps only mentions of its bot and replies in threads its bot may have started, so busy channels and threads one owner's agents share take from that owner's bucket only what may be addressed to one of them, however many agents are there; each deduplication key is made of ids shaped like Slack's, or the body gets 400, so the rows one owner can add to the shared store are at most about a hundred bytes each, at 16 a second, kept an hour, about 60,000 rows or 20 MB at most, and only for messages; each app's messages reach the pipeline in a lane of their own, so the `bots.info` lookup of a sender known only by a made-up bot id holds up only that app's, and a message whose bot id isn't shaped like Slack's is dropped after its 200, with a throttled warning, before it is looked up or cached; an event keeps at most 160 KB of text, 10 files and 100 mentions, each id shaped like Slack's, so the 64 messages one owner's apps may have in flight hold at most about 14 MB; the lookups never wait for the token's quota or retry a 429 (past it, a bot sender stays unknown and is ignored, and the thread gets the "try again" line, posted like the busy line in a task that holds no place); one owner's agents, however many, hold at most 16 of the pipeline's 64 places and post 8 such lines at once; the warnings a flood causes, confirmations that fail included, are logged once a minute per agent; and the workspace's shared member list is read only with the manager app's token, never an agent's, which its owner could revoke or exhaust. Only several owners flooding together (four for the pipeline's places, 16 for the ingress's 1024) could take what other agents need. The owner's bot token still reads every conversation the bot is in, so confirming protects other members' sessions, scopes and bills, not what the bot can read. The manager app's secret stays with the operators, so its requests aren't read back. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
+| A cloud session acts with a member's GitHub identity, connectors and subscription, beyond agentd's sandbox and sight | Only the member's own `/agent cloud run`, typed where only they and the manager bot read it, starts one. No `agentctl` command or consent card can, and bots' messages are never commands. The task gets a consent card's checks for characters that don't show. agentd sends only the task text; the repositories, environment and connectors are the routine's, set by the member at claude.ai. |
+| A routine token leaks, or agentd's store leaks with its master key | Anthropic scopes a token to firing one routine, with no read access. But the routine's prompt tells the session to act on fired text, so a token lets its holder do any work the routine's repositories, connectors and network allow, as the member, and a stolen store and key do that for every member with a routine. The setup keeps each routine to one repository, no connectors and the default allowlist. Tokens are sealed at rest, decrypted only for agentd's own request, never logged and never in a sandbox; `cloud rm` and `logout` delete them, and the member revokes them at claude.ai. |
+| agentd's Claude links gain control of members' cloud sessions | Configuration refuses any scope but `user:profile` and `user:inference`, so no turn can reach a member's cloud sessions through the credential proxy. |
+| A member's pasted URL steers agentd's request and token to another host | Only the routine id is kept, from a URL whose path and origin must match; the URL is rebuilt from `[cloud] base_url`, and redirects aren't followed. |
+| A retried fire starts two sessions | A fire is recorded before it is sent and never retried. An outcome agentd can't know is reported as such, and the member decides. |
 
 ## Crate layout
 
@@ -988,7 +1398,9 @@ shared code. A `MockSurface` drives the shared core in tests.
    milestone doesn't wait on whether Slack delivers one app's bot user's post to
    another app; T32 checks whether it does, which only means a duplicate that
    agentd drops.
-6. Owner-initiated cloud hand-off (`claude --cloud`) for long PR work.
+6. Cloud hand-off for long PR work, started by a member on their own
+   account through a routine's API trigger rather than `claude --cloud` (see
+   [Cloud hand-off](#cloud-hand-off)).
 7. Slack Connect.
 
 ## Slack Connect
@@ -1020,7 +1432,8 @@ channel agents funded by a community API key.
 **Claude Code cloud sessions.** `claude --cloud` creates a session and
 `claude -p "msg" --cloud <id>` queues a message, but there is no documented way
 to read replies, and sessions are tied to a GitHub repository[^cloud]. Used only
-for owner-initiated PR work, not as the chat backend.
+for owner-initiated PR work, started through a routine's API trigger, not as
+the chat backend (see [Cloud hand-off](#cloud-hand-off)).
 
 **Browser automation of claude.ai.** Rejected. It violates Consumer Terms
 section 3, and one suspension would take down every agent.
@@ -1046,32 +1459,48 @@ Direct calls would also need our own agent loop.
   a requester's credit runs out.
 - Long-term transcript retention on volumes. Snapshots cover single-host
   deployments. Multi-host needs transcript mirroring.
+- The routine fire endpoint is experimental and routines are a research
+  preview, so the hand-off may need changes as they settle. Whether a 4xx
+  answer means no session was started, which the failure table assumes, is
+  to be confirmed.
+- Cloud hand-off status. agentd reads none; a documented, narrowly scoped
+  read of one session would allow a `cloud status`. Self-hosted environments
+  document a Stop-hook read-back that a Team or Enterprise deployment could
+  use later.
+- Each repository needs its own routine, made by hand at claude.ai. If a
+  documented API ever creates routines or sessions with a narrow token, the
+  setup could shrink to one command.
 - Terms interpretation for requester-pays in shared channels is a design
   judgment, not legal advice. Larger communities should confirm with Anthropic.
 
 ## References
 
 [^qm]: qm-core, the reference TypeScript implementation (`agentsky/qm-core`). Slack surface in `src/slack/`, installation store in `src/surfaces/slack-installation.ts`.
-[^qm-harness]: qm-core `src/harness/claude-harness.ts`: `tools: ["Agent"]`, `settingSources: []`, bridged tools through `createSdkMcpServer`.
-[^qm-oauth]: qm-core `src/model/subscription-oauth.ts`, `startClaudeLogin`.
-[^qm-mrkdwn]: qm-core `src/slack/mrkdwn.ts` and `src/slack/safe-cut.ts`.
-[^qm-askagent]: qm-core `src/slack/agent-requests.ts`: an approved request runs as a DM-scoped turn for the target member and the result is posted back to the thread.
 [^terms]: [Anthropic Consumer Terms](https://www.anthropic.com/legal/consumer-terms), sections 2 and 3.
-[^sdk-credit]: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
-[^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
-[^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
+[^qm-harness]: qm-core `src/harness/claude-harness.ts`: `tools: ["Agent"]`, `settingSources: []`, bridged tools through `createSdkMcpServer`.
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
+[^rc-stream]: [stream-room-messages](https://developer.rocket.chat/api/realtime-api/subscriptions/stream-room-messages).
 [^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace. Since T34, hand-off doesn't depend on it: agentd delivers an agent's post itself to the managed agents the post mentions, in the thread its turn answered, and once an agent's hop from that turn ran, any other copy, agentd's or the platform's, is dropped. T32's live check now only shows whether Slack delivers that duplicate.
-[^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
-[^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.
-[^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.
 [^slack-approval]: [Manage app approval for your workspace](https://slack.com/help/articles/222386767-Manage-app-approval-for-your-workspace).
+[^rc-create]: [Rocket.Chat Create User](https://developer.rocket.chat/reference/api/rest-api/endpoints/user-management/users-endpoints/create-user).
 [^slack-free]: [Feature limitations on the free version of Slack](https://slack.com/help/articles/27204752526611-Feature-limitations-on-the-free-version-of-Slack).
 [^slack-manifest]: [Configuring apps with app manifests](https://docs.slack.dev/app-manifests/configuring-apps-with-app-manifests/).
 [^slack-socket]: [Using Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/). App-level tokens are generated in the app settings UI.
-[^slack-connect]: [Slack Connect guide](https://slack.com/help/articles/115004151203-Slack-Connect-guide--Work-with-external-organizations).
-[^rc-stream]: [stream-room-messages](https://developer.rocket.chat/api/realtime-api/subscriptions/stream-room-messages).
-[^rc-create]: [Rocket.Chat Create User](https://developer.rocket.chat/reference/api/rest-api/endpoints/user-management/users-endpoints/create-user).
 [^rc-perms]: [Rocket.Chat permissions](https://docs.rocket.chat/docs/permissions): `api-bypass-rate-limit` defaults to the admin, bot and app roles.
 [^rc-slash]: [Rocket.Chat slash commands](https://docs.rocket.chat/docs/slash-command) are registered by Apps-Engine apps.
+[^qm-oauth]: qm-core `src/model/subscription-oauth.ts`, `startClaudeLogin`.
+[^sdk-credit]: [Use the Claude Agent SDK with your Claude plan](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+[^qm-askagent]: qm-core `src/slack/agent-requests.ts`: an approved request runs as a DM-scoped turn for the target member and the result is posted back to the thread.
+[^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.
+[^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
+[^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.
+[^qm-mrkdwn]: qm-core `src/slack/mrkdwn.ts` and `src/slack/safe-cut.ts`.
+[^cc-headless]: [Run Claude Code programmatically](https://code.claude.com/docs/en/headless): `-p` rejects `--cloud` with a task description.
+[^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web): `--cloud`, follow-ups with `-p`, `--teleport`, the GitHub connection options, and that `--cloud` needs a claude.ai sign-in.
+[^cc-selfhosted-test]: [Test self-hosted environments end to end](https://code.claude.com/docs/en/self-hosted-environments-testing): headless creation with `--environment`, the Stop-hook read-back, and the `user:sessions:claude_code` scope capped at 30 days.
+[^cc-routines-fire]: [Trigger a routine through the API](https://platform.claude.com/docs/en/api/claude-code/routines-fire): the `/fire` request, the optional beta header, the 65,536-character `text`, the response, errors, no idempotency key, rate limits, and the token scoped to one routine with no read access, which only the web UI generates, regenerates or revokes. Experimental.
+[^cc-routines]: [Automate work with routines](https://code.claude.com/docs/en/routines): API triggers, the dated beta header and its migration window, the `routine-fire-payload` wrapping of fired text, connectors included by default, cloning from the default branch unless the prompt says otherwise, `claude/` branches, skipped runs while GitHub is disconnected, the run list's status, usage and hourly limits.
+[^cc-cloud-env]: [Configure cloud environments](https://code.claude.com/docs/en/cloud-environments#github-proxy): the GitHub proxy keeps credentials outside the VM, limits `git push` to the working branch and the API to the session's repositories.
+[^slack-connect]: [Slack Connect guide](https://slack.com/help/articles/115004151203-Slack-Connect-guide--Work-with-external-organizations).
+[^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
 [^rc-7351]: [RocketChat/Rocket.Chat#7351](https://github.com/RocketChat/Rocket.Chat/issues/7351).
