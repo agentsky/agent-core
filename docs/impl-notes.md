@@ -498,6 +498,15 @@ that started late found the listener closed. The test layers the public
 routes with a hook that signals each request, and stops agentd once the
 request has reached them.
 
+`one_members_commands_run_in_order_without_holding_up_others` gave
+alice's login exchange a 300 ms delay and assumed bob's reply came while
+it was still out, and
+`a_managed_bot_set_during_a_refresh_leaves_the_result_stale` assumed the
+`users.list` answer delayed 200 ms had not landed when it changed the
+managed bots. Each now holds that response, acts once the request has
+arrived, then releases it; the command test releases it only after bob's
+reply.
+
 ## T05: store
 
 ### The key reaches the store through `open`
