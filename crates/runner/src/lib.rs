@@ -56,6 +56,13 @@
 //! the file's path from [`Container::paths`]. A persona edit takes effect
 //! when the process next starts.
 //!
+//! # Skills
+//!
+//! An agent's skills are the directories in `<data>/skills/<agent>`
+//! ([`skills_dir`]), which agentd writes. Every session of the agent mounts
+//! that directory read-only as its `$CLAUDE_CONFIG_DIR/skills`, when it
+//! exists as the session's container starts.
+//!
 //! [`Container`]: sandbox::Container
 //! [`Container::paths`]: sandbox::Container::paths
 
@@ -76,7 +83,9 @@ pub use config::{
 };
 pub use hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
 pub use launch::{LaunchSpec, SessionStart};
-pub use persona::{AGENTS_DIR, persona_dir, write_persona};
+pub use persona::{
+    AGENTS_DIR, SKILLS_DIR, persona_dir, skills_dir, write_if_changed, write_persona,
+};
 pub use process::ClaudeProcess;
 pub use sessions::{SessionConfig, SessionManager, TurnReport};
 pub use store::{Session, SessionKind};

@@ -891,9 +891,12 @@ Deliverables:
   - `Login { code: Option<SecretString> }`, `Logout`, `Me`.
   - `SlackToken { token, refresh }`, both `SecretString`.
   - `Create { name, persona }`, `Persona { name, text }`.
-  - `Skill(Add { name, source } | Rm { name, skill })`. `name` is the agent;
-    `skill rm` names the skill, since an owner may have several agents
+  - `Skill(Add { name, source } | Confirm { name, skill } | Rm { name, skill })`.
+    `name` is the agent; `skill rm` names the skill, since an owner may have
+    several agents
     ([impl-notes](impl-notes.md#skill-rm-needs-the-agent-and-the-skill)).
+    `skill confirm` came with T25
+    ([impl-notes](impl-notes.md#hosts-are-confirmed-with-a-command-of-their-own)).
   - `Allow` and `Deny { name, target }`.
   - `Limits { name, turns_per_day, hops }`.
   - `Pause`, `Resume` and `Delete { name }`.
@@ -1723,7 +1726,7 @@ Deliverables:
   launch flags:
   - `--session-id <id>` when the session has never started, `--resume <id>`
     otherwise.
-  - `--tools "Bash,Read,Edit,Write,Glob,Grep"`, `--strict-mcp-config`,
+  - `--tools "Bash,Read,Edit,Write,Glob,Grep,Skill"`, `--strict-mcp-config`,
     `--setting-sources user`, `--permission-mode bypassPermissions` and
     `--append-system-prompt-file <persona path>`.
   - `--model <m>` when the router chose one.
@@ -2256,6 +2259,27 @@ Acceptance: tests for add from a local Git fixture repo, add from an uploaded
 file, validation failures, rm, mounting (the path is visible in a
 `ProcessSandbox` session), and the allowlist extension.
 
+Notes from implementing it
+([impl-notes](impl-notes.md#t25-skills-and-the-agentctl-skill)):
+
+- A skill whose `SKILL.md` declares `allowed-hosts` waits, outside what
+  sandboxes mount, until the owner sends `skill confirm <name> <skill>`
+  within an hour; only then are its files and hosts in use. The
+  `agent_skills` table records every skill with its state, source and
+  hosts, and `SkillHosts` reads a session's agent's confirmed hosts from it.
+- The bundled `agentctl` skill is written before every turn, like the
+  persona; the name `agentctl` can't be added or removed. The runner mounts
+  `<data>/skills/<agent>` when it exists.
+- The clone refuses a Git host that isn't a DNS name or resolves to an
+  address the egress proxy never reaches, and pins `git` to the addresses
+  checked, with no redirects, `https` only and a size and time cap. The
+  agentd image moves from distroless to Debian slim for `git`.
+- An upload is a `.md` (up to 256 KB) or a `.zip` (up to 10 MB, unpacked
+  too); both surfaces' manager DMs pass their files to the handlers, so a
+  `persona.md` attached on Slack works now too.
+- The launch flags enable the `Skill` tool: without it Claude Code never
+  tells the model about the mounted skills.
+
 ## Phase 3: requester-pays (design milestone 3)
 
 ### T26
@@ -2564,7 +2588,7 @@ Notes from implementing it
   `surface_slack::normalize::unescape` before parsing.
 - Files attached to the manager DM aren't passed on yet, since `persona`
   (T14) and `skill add` (T25) aren't in place; `WebApi::download_file` is
-  the download they use.
+  the download they use. T25 passes them on, for both.
 - The manifest's tests use `serde_norway`, a dev-dependency (MIT or
   Apache-2.0).
 
@@ -2869,6 +2893,15 @@ Not scheduled. Each needs a decision before it becomes a task.
   clear of agentd's networks, the egress network's other services and the
   Docker gateway. It must never apply to `EgressExtension` rules, which
   any agent's owner can add through a skill (T25), nor to wildcards.
+- **Cloning skills in a throwaway container.** T25's `git` clone runs
+  inside agentd, whose container holds the Docker socket, so a `git` bug a
+  hostile server can reach would reach the socket too (design, Security).
+  Running each clone in a short-lived container on the egress network,
+  without the socket or agentd's data volume, writing into a volume agentd
+  then checks, would take that away.
+- **Skills of deleted agents.** T25 keeps a deleted agent's skill rows and
+  files, as the persona is kept. Deleting them with the agent, or at a
+  later purge, needs a decision on what `delete` keeps.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.

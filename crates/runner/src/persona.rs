@@ -1,4 +1,4 @@
-//! Where an agent's persona file lives, and writing it.
+//! Where an agent's persona file and skills live, and writing files there.
 
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,20 @@ use crate::{Result, RunnerError};
 /// The directory under agentd's data directory holding each agent's
 /// persona directory.
 pub const AGENTS_DIR: &str = "agents";
+
+/// The directory under agentd's data directory holding each agent's
+/// skills directory.
+pub const SKILLS_DIR: &str = "skills";
+
+/// The agent's skills directory, `<data_dir>/skills/<agent>`, with one
+/// directory per skill: what
+/// [`SessionSpec::skills_dir`](sandbox::SessionSpec::skills_dir) names, so
+/// every session of the agent sees it read-only at
+/// `$CLAUDE_CONFIG_DIR/skills`. A session mounts it only if it exists when
+/// the session's container starts.
+pub fn skills_dir(data_dir: &Path, agent: AgentId) -> PathBuf {
+    data_dir.join(SKILLS_DIR).join(agent.to_string())
+}
 
 /// The agent's persona directory, `<data_dir>/agents/<agent>`: what
 /// [`SessionSpec::persona_dir`](sandbox::SessionSpec::persona_dir) names.
@@ -33,30 +47,42 @@ pub fn persona_dir(data_dir: &Path, agent: AgentId) -> PathBuf {
 ///
 /// [`RunnerError::Io`] if the directory or the file can't be written.
 pub async fn write_persona(data_dir: &Path, agent: AgentId, persona: &str) -> Result<bool> {
+    write_if_changed(
+        &persona_dir(data_dir, agent),
+        sandbox::PERSONA_FILE,
+        persona.as_bytes(),
+    )
+    .await
+}
+
+/// Writes `bytes` to the file `name` in `dir`, creating the directory if
+/// needed, and returns whether the file changed: only when its bytes
+/// differ, and then atomically, through a new file in `dir` renamed over
+/// the old one, so a reader sees either the old bytes or the new ones.
+///
+/// # Errors
+///
+/// [`RunnerError::Io`] if the directory or the file can't be written.
+pub async fn write_if_changed(dir: &Path, name: &str, bytes: &[u8]) -> Result<bool> {
     let io = |what| move |source| RunnerError::Io { what, source };
-    let dir = persona_dir(data_dir, agent);
-    let path = dir.join(sandbox::PERSONA_FILE);
+    let path = dir.join(name);
     match tokio::fs::read(&path).await {
-        Ok(existing) if existing == persona.as_bytes() => return Ok(false),
+        Ok(existing) if existing == bytes => return Ok(false),
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(io("reading the persona file")(err)),
+        Err(err) => return Err(io("reading a file to replace")(err)),
     }
-    tokio::fs::create_dir_all(&dir)
+    tokio::fs::create_dir_all(dir)
         .await
-        .map_err(io("creating the persona directory"))?;
-    let temp = dir.join(format!(
-        ".{}.{}.tmp",
-        sandbox::PERSONA_FILE,
-        uuid::Uuid::new_v4().simple()
-    ));
+        .map_err(io("creating a file's directory"))?;
+    let temp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let written = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)
             .await?;
-        file.write_all(persona.as_bytes()).await?;
+        file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
         tokio::fs::rename(&temp, &path).await
@@ -64,7 +90,7 @@ pub async fn write_persona(data_dir: &Path, agent: AgentId, persona: &str) -> Re
     .await;
     if let Err(err) = written {
         let _ = tokio::fs::remove_file(&temp).await;
-        return Err(io("writing the persona file")(err));
+        return Err(io("writing a file")(err));
     }
     Ok(true)
 }
@@ -73,6 +99,15 @@ pub async fn write_persona(data_dir: &Path, agent: AgentId, persona: &str) -> Re
 mod tests {
     use super::*;
     use testkit::TempDir;
+
+    #[test]
+    fn the_skills_directory_is_under_skills() {
+        let agent = AgentId::new_v4();
+        assert_eq!(
+            skills_dir(Path::new("/data"), agent),
+            Path::new("/data/skills").join(agent.to_string())
+        );
+    }
 
     #[test]
     fn the_persona_directory_is_under_agents() {

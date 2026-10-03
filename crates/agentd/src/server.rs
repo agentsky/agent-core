@@ -53,6 +53,7 @@ use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::community::StoreCommunityKey;
 use crate::net::RefuseSubnet;
 use crate::pipeline::Pipeline;
+use crate::skills::SkillHosts;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -87,8 +88,9 @@ impl Routers {
     /// listener, forwarding to `proxy.upstream` with the placeholders in
     /// [`App::registry`], members' tokens from [`App::auth`] and the
     /// community API key from the store ([`StoreCommunityKey`]), and
-    /// answering `CONNECT` with the egress proxy
-    /// `[proxy]` describes; and the agentctl API on the ctl listener.
+    /// answering `CONNECT` with the egress proxy `[proxy]` describes,
+    /// extended for each session by its agent's skills' confirmed hosts
+    /// ([`SkillHosts`]); and the agentctl API on the ctl listener.
     ///
     /// # Errors
     ///
@@ -117,7 +119,11 @@ impl Routers {
             Arc::new(StoreCommunityKey::new(app.store().clone())),
         )
         .context("proxy.upstream")?
-        .with_egress(app.config().egress_proxy()?);
+        .with_egress(
+            app.config()
+                .egress_proxy()?
+                .with_extension(Arc::new(SkillHosts(app.store().clone()))),
+        );
         Ok(Self {
             public: public_router(app.clone()).merge(slack_routes),
             proxy: proxy.into_router(),
@@ -338,9 +344,10 @@ impl Server {
             });
         }
         let store = app.store().clone();
+        let skills = app.skills().clone();
         let sweeping = stopping.clone();
         tasks.spawn(async move {
-            sweeper::run(store, SWEEP_INTERVAL, sweeping).await;
+            sweeper::run(store, skills, SWEEP_INTERVAL, sweeping).await;
             "sweeper"
         });
         let notifier = RelinkNotifier::new(app.store().clone(), app.commands().replies().clone());

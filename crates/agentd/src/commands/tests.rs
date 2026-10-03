@@ -77,6 +77,7 @@ struct Harness {
     mock: Arc<MockSurface>,
     oauth: MockServer,
     manager: Binding,
+    root: std::path::PathBuf,
     dms: Arc<Dms>,
 }
 
@@ -105,12 +106,17 @@ async fn harness() -> Harness {
         mock.clone(),
         dms.clone(),
     ));
+    let root = std::env::temp_dir().join(format!("agentd-cmd-skills-{}", uuid::Uuid::new_v4()));
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()))
+        .serving_prefix_from_directory_for_tests("https://git.test/", &root.join("repos"));
+    let skills = crate::skills::Skills::new(store.clone(), root.join("data"), git);
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
         Replies::new(Some(bot)),
         None,
         None,
+        skills,
     )
     .with_admins([key(ADMIN)]);
     Harness {
@@ -120,6 +126,7 @@ async fn harness() -> Harness {
         mock,
         oauth,
         manager,
+        root,
         dms,
     }
 }
@@ -610,8 +617,6 @@ async fn a_failed_exchange_and_a_failed_store_get_generic_replies() {
 #[tokio::test]
 async fn commands_that_come_later_say_so() {
     let h = harness().await;
-    h.dm("alice", "skill rm helper tool").await;
-    assert_eq!(h.last_reply("alice"), "`skill rm` isn't available yet.");
     h.dm(ADMIN, "admin ban @alice").await;
     assert_eq!(h.last_reply(ADMIN), "`admin ban` isn't available yet.");
 }
@@ -1209,6 +1214,209 @@ async fn agent_commands_without_rocketchat_agents() {
     );
     h.dm("alice", "delete helper").await;
     assert_eq!(h.last_reply("alice"), "Deleted `helper`.");
+}
+
+/// A Git repository at `dir` holding one `SKILL.md`, committed.
+fn skill_repo(dir: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), text).unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &["add", "SKILL.md"],
+        &["commit", "--quiet", "-m", "skill"],
+    ] {
+        let status = std::process::Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.invalid"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+#[tokio::test]
+async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
+    let h = harness().await;
+    let root = h.root.clone();
+    let repos = root.join("repos");
+    skill_repo(
+        &repos.join("gh.git"),
+        "---\nname: gh\ndescription: Use GitHub.\nallowed-hosts: [api.github.com]\n---\n",
+    );
+    skill_repo(
+        &repos.join("notes.git"),
+        "---\nname: notes\ndescription: Keep notes.\n---\n",
+    );
+    let data = root.join("data");
+    let commands = h.commands.clone();
+    let (alice, _) = h.linked_member("alice", "claude_pro").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::RocketChat,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let dm = |user: &str| Origin::RocketChatDm {
+        room: dm_room(user).into(),
+    };
+    let run = |user: &'static str, text: &'static str, origin: Origin| {
+        let commands = commands.clone();
+        async move {
+            commands.handle_text(&key(user), text, &origin, &[]).await;
+        }
+    };
+
+    run(
+        "bob",
+        "skill add helper https://git.test/notes.git",
+        dm("bob"),
+    )
+    .await;
+    assert_eq!(
+        h.last_reply("bob"),
+        "You have no agent named `helper`. Only an agent's owner can change it."
+    );
+    run("bob", "skill rm helper notes", dm("bob")).await;
+    assert!(h.last_reply("bob").starts_with("You have no agent named"));
+
+    let channel = Origin::RocketChatChannel {
+        room: "GENERAL".into(),
+    };
+    run(
+        "alice",
+        "skill add helper https://git.test/notes.git",
+        channel,
+    )
+    .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Added the skill `notes` to `helper`. Its conversations use it from their next start."
+    );
+    let skills = runner::skills_dir(&data, agent.id);
+    assert!(skills.join("notes/SKILL.md").is_file());
+
+    run(
+        "alice",
+        "skill add helper https://git.test/gh.git",
+        dm("alice"),
+    )
+    .await;
+    let reply = h.last_reply("alice");
+    assert!(
+        reply.starts_with(
+            "The skill `gh` asks that `helper`'s sandboxes may reach `api.github.com`."
+        ),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("send `skill confirm helper gh` within 60 minutes"),
+        "{reply}"
+    );
+    assert!(!skills.join("gh").exists());
+    run("bob", "skill confirm helper gh", dm("bob")).await;
+    assert!(h.last_reply("bob").starts_with("You have no agent named"));
+    run("alice", "skill confirm helper gh", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Added the skill `gh` to `helper`. Its sandboxes may now reach `api.github.com`, and \
+         its conversations use it from their next start."
+    );
+    assert!(skills.join("gh/SKILL.md").is_file());
+    run("alice", "skill confirm helper gh", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` has no skill `gh` waiting for you to confirm its hosts."
+    );
+
+    run("alice", "skill rm helper agentctl", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`agentctl` is built into every agent and can't be removed."
+    );
+    run("alice", "skill rm helper nope", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` has no skill `nope`. Its skills: `gh`, `notes`."
+    );
+    run("alice", "skill rm helper gh", dm("alice")).await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Removed the skill `gh` from `helper`"),
+        "{}",
+        h.last_reply("alice")
+    );
+    assert!(!skills.join("gh").exists());
+    run("alice", "skill rm helper notes", dm("alice")).await;
+    run("alice", "skill rm helper notes", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` has no skill `notes`, and no skills besides `agentctl`."
+    );
+
+    run(
+        "alice",
+        "skill add helper https://git.test/missing.git",
+        dm("alice"),
+    )
+    .await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Git couldn't clone that.")
+    );
+    run(
+        "alice",
+        "skill add helper https://10.0.0.1/r.git",
+        dm("alice"),
+    )
+    .await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("The Git host must be a DNS name"),
+        "{}",
+        h.last_reply("alice")
+    );
+    run("alice", "skill add helper", dm("alice")).await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Give the skill's https:// Git URL"),
+        "{}",
+        h.last_reply("alice")
+    );
+    let file = core_types::InFile {
+        id: "F1".into(),
+        name: "skill.txt".into(),
+        mime_type: None,
+        size: Some(1),
+        url: "https://chat.example.org/file-upload/F1/skill.txt".into(),
+    };
+    commands
+        .handle_text(&key("alice"), "skill add helper", &dm("alice"), &[file])
+        .await;
+    assert!(
+        h.last_reply("alice")
+            .starts_with("Attach the skill as its SKILL.md"),
+        "{}",
+        h.last_reply("alice")
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A runner for the session commands: warm sessions are listed, and a

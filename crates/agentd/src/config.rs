@@ -625,10 +625,19 @@ impl Config {
             max_session_tunnels: self.proxy.max_session_tunnels,
             ..EgressLimits::default()
         };
-        Ok(
-            EgressProxy::new(egress_policy(&self.proxy, &self.server, &self.internal)?)
-                .with_limits(limits),
-        )
+        Ok(EgressProxy::new(self.egress_policy()?).with_limits(limits))
+    }
+
+    /// The egress policy from `[proxy]`: its rules, with agentd's listener
+    /// addresses and the sandbox network out of reach. Cloning a skill's
+    /// repository checks the Git host's addresses against it too.
+    ///
+    /// # Errors
+    ///
+    /// Never for a loaded `Config`, whose `[proxy]` section was checked the
+    /// same way.
+    pub fn egress_policy(&self) -> Result<EgressPolicy, ConfigError> {
+        egress_policy(&self.proxy, &self.server, &self.internal)
     }
 
     /// Builds the store's [`Sealer`] from the master key.
