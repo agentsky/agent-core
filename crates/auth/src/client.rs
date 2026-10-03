@@ -9,6 +9,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use serde_json::Value;
+
+use crate::config::ALLOWED_SCOPES;
 use crate::plan::{PlanInfo, ProfileResponse};
 use crate::{AuthError, Endpoint};
 
@@ -25,19 +28,54 @@ const MAX_EXPIRES_IN: u64 = 365 * 24 * 60 * 60;
 /// Longest OAuth `error` code kept for an error message.
 const MAX_ERROR_CODE: usize = 64;
 
-/// Builds the HTTP client. It never follows redirects: a 307 or 308 from the
-/// token endpoint would otherwise resend a body holding a code or refresh
-/// token to wherever it points.
-pub(crate) fn build_client() -> Result<Client, AuthError> {
-    Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|source| AuthError::Http {
+/// The HTTP clients: one honoring the system proxy settings and one using
+/// no proxy, each request taking the one its URL needs.
+pub(crate) struct Http {
+    proxied: Client,
+    direct: Client,
+}
+
+impl Http {
+    /// The client for `url`: without a proxy where
+    /// [`core_types::skips_proxy`] says so (plain `http`, which only tests'
+    /// fakes on a loopback IP address use and a proxy would read, codes and
+    /// tokens included, or a loopback IP address, which a proxy would reach
+    /// on its own host), and with the system's proxy settings otherwise.
+    /// Each endpoint is decided on its own.
+    fn to(&self, url: &Url) -> &Client {
+        if core_types::skips_proxy(url.scheme(), url.host_str().unwrap_or_default()) {
+            &self.direct
+        } else {
+            &self.proxied
+        }
+    }
+}
+
+/// Builds the HTTP clients. They never follow redirects: a 307 or 308 from
+/// the token endpoint would otherwise resend a body holding a code or
+/// refresh token to wherever it points. `proxy` is a proxy tests add as if
+/// the system had it.
+pub(crate) fn build_client(proxy: Option<reqwest::Proxy>) -> Result<Http, AuthError> {
+    let builder = || {
+        Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(concat!("agent-core/", env!("CARGO_PKG_VERSION")))
+    };
+    let build = |builder: reqwest::ClientBuilder| {
+        builder.build().map_err(|source| AuthError::Http {
             endpoint: Endpoint::Client,
             source: Arc::new(source.without_url()),
         })
+    };
+    let proxied = match proxy {
+        Some(proxy) => builder().proxy(proxy),
+        None => builder(),
+    };
+    Ok(Http {
+        proxied: build(proxied)?,
+        direct: build(builder().no_proxy())?,
+    })
 }
 
 /// Tokens from the token endpoint.
@@ -47,6 +85,88 @@ pub(crate) struct Tokens {
     /// the old one stays valid.
     pub(crate) refresh_token: Option<SecretString>,
     pub(crate) expires_in: Duration,
+    pub(crate) grant: Grant,
+}
+
+/// What a token response's `scope` says was granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grant {
+    /// Only scopes in [`ALLOWED_SCOPES`].
+    Allowed,
+    /// No `scope`, `null`, a blank string or an array of no scope, which
+    /// RFC 6749 (section 5.1) reads as what the request asked for: what
+    /// agentd asked for on a refresh, but on a login what the authorize URL
+    /// asked for, which the member could have changed.
+    Unstated,
+    /// A scope outside [`ALLOWED_SCOPES`], in any shape. An object's keys
+    /// count as scopes, since a label can't be told from a scope name, so
+    /// an object with any key that isn't an allowed scope, such as
+    /// `{"granted": "user:profile"}`, is wider too.
+    Wider,
+    /// Any other shape that names no scope outside [`ALLOWED_SCOPES`], in
+    /// its strings or its keys, such as a number, `true`, `[7]`, a nested
+    /// array of allowed scopes, `{}` or `{"user:profile": true}`. A login
+    /// counts it as unstated, and a refresh, which sent the scopes itself,
+    /// keeps the link and warns.
+    Unreadable,
+}
+
+impl Tokens {
+    /// Why a login can't keep these tokens: a grant wider than
+    /// [`ALLOWED_SCOPES`] ([`AuthError::ScopeRefused`]), or one that doesn't
+    /// say ([`AuthError::ScopeUnstated`]), since the member can add scopes
+    /// to the authorize URL and the code exchange doesn't send them again.
+    pub(crate) fn login_refusal(&self) -> Option<AuthError> {
+        match self.grant {
+            Grant::Allowed => None,
+            Grant::Unstated | Grant::Unreadable => Some(AuthError::ScopeUnstated),
+            Grant::Wider => Some(AuthError::ScopeRefused),
+        }
+    }
+}
+
+/// What a token answer's `scope` grants. Every string anywhere in it, an
+/// object's keys included, at any depth, is split on blanks into scopes, so
+/// no shape hides a wider one: any scope outside [`ALLOWED_SCOPES`] is
+/// [`Grant::Wider`], an object with any key that isn't an allowed scope
+/// included. Otherwise a string or an array of strings is
+/// [`Grant::Allowed`] if it names a scope and [`Grant::Unstated`] if not,
+/// and any other shape is [`Grant::Unreadable`].
+fn granted(scope: &Value) -> Grant {
+    let mut leaves = Vec::new();
+    string_leaves(scope, &mut leaves);
+    let mut scopes = leaves
+        .into_iter()
+        .flat_map(str::split_ascii_whitespace)
+        .peekable();
+    let named = scopes.peek().is_some();
+    if !scopes.all(|granted| ALLOWED_SCOPES.contains(&granted)) {
+        return Grant::Wider;
+    }
+    let well_formed = match scope {
+        Value::String(_) => true,
+        Value::Array(items) => items.iter().all(Value::is_string),
+        _ => false,
+    };
+    match (well_formed, named) {
+        (true, true) => Grant::Allowed,
+        (true, false) => Grant::Unstated,
+        (false, _) => Grant::Unreadable,
+    }
+}
+
+/// Pushes every string in `value`, at any depth, onto `leaves`, an
+/// object's keys as well as its values.
+fn string_leaves<'a>(value: &'a Value, leaves: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => leaves.push(text),
+        Value::Array(items) => items.iter().for_each(|item| string_leaves(item, leaves)),
+        Value::Object(fields) => fields.iter().for_each(|(key, field)| {
+            leaves.push(key);
+            string_leaves(field, leaves);
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 #[derive(Deserialize)]
@@ -55,14 +175,24 @@ struct TokenResponse {
     #[serde(default)]
     refresh_token: Option<SecretString>,
     expires_in: f64,
+    /// The scopes granted, space-separated, or as an array of strings. Read
+    /// as any JSON value, so another shape is judged by [`granted`] rather
+    /// than failing the whole response.
+    #[serde(default)]
+    scope: Option<Value>,
 }
 
 impl TokenResponse {
+    /// The tokens, checked, with what their `scope` says was granted
+    /// ([`Grant`]): the member can add scopes to the authorize URL, and the
+    /// server may grant its own, so what was asked for doesn't bound what
+    /// came back.
     fn into_tokens(self, endpoint: Endpoint) -> Result<Tokens, AuthError> {
         let invalid = |reason| AuthError::InvalidResponse { endpoint, reason };
         if self.access_token.expose_secret().is_empty() {
             return Err(invalid("empty access_token"));
         }
+        let grant = self.scope.as_ref().map_or(Grant::Unstated, granted);
         let refresh_token = self
             .refresh_token
             .filter(|token| !token.expose_secret().is_empty());
@@ -74,6 +204,7 @@ impl TokenResponse {
             access_token: self.access_token,
             refresh_token,
             expires_in,
+            grant,
         })
     }
 }
@@ -230,7 +361,7 @@ pub(crate) struct Exchange<'a> {
 
 /// POSTs the `authorization_code` grant as JSON.
 pub(crate) async fn exchange_code(
-    client: &Client,
+    client: &Http,
     token_url: &Url,
     exchange: Exchange<'_>,
 ) -> Result<Tokens, AuthError> {
@@ -243,6 +374,7 @@ pub(crate) async fn exchange_code(
         state: exchange.state,
     };
     let request = client
+        .to(token_url)
         .post(token_url.clone())
         .json(&body)
         .timeout(TOKEN_TIMEOUT);
@@ -263,7 +395,7 @@ pub(crate) async fn exchange_code(
 
 /// POSTs the `refresh_token` grant as JSON.
 pub(crate) async fn refresh(
-    client: &Client,
+    client: &Http,
     token_url: &Url,
     refresh_token: &SecretString,
     client_id: &str,
@@ -276,6 +408,7 @@ pub(crate) async fn refresh(
         scope,
     };
     let request = client
+        .to(token_url)
         .post(token_url.clone())
         .json(&body)
         .timeout(TOKEN_TIMEOUT);
@@ -291,11 +424,12 @@ pub(crate) async fn refresh(
 
 /// GETs the profile with the access token and reads the plan from it.
 pub(crate) async fn fetch_profile(
-    client: &Client,
+    client: &Http,
     profile_url: &Url,
     access_token: &SecretString,
 ) -> Result<PlanInfo, AuthError> {
     let request = client
+        .to(profile_url)
         .get(profile_url.clone())
         .bearer_auth(access_token.expose_secret())
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -310,7 +444,7 @@ pub(crate) async fn fetch_profile(
 
 /// POSTs a refresh token to the revocation endpoint.
 pub(crate) async fn revoke(
-    client: &Client,
+    client: &Http,
     revoke_url: &Url,
     refresh_token: &SecretString,
     client_id: &str,
@@ -321,6 +455,7 @@ pub(crate) async fn revoke(
         client_id,
     };
     let request = client
+        .to(revoke_url)
         .post(revoke_url.clone())
         .json(&body)
         .timeout(REVOKE_TIMEOUT);
@@ -335,6 +470,20 @@ pub(crate) async fn revoke(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn each_endpoint_takes_a_proxy_only_for_remote_https() {
+        testkit::proxy::assert_proxied_only_elsewhere(
+            |base, proxy| {
+                build_client(Some(proxy))
+                    .unwrap()
+                    .to(&Url::parse(base).unwrap())
+                    .clone()
+            },
+            &["https://127.0.0.1:9", "http://[::1]:9"],
+        )
+        .await;
+    }
+
     fn tokens(json: &str) -> Result<Tokens, AuthError> {
         serde_json::from_str::<TokenResponse>(json)
             .unwrap()
@@ -348,7 +497,8 @@ mod tests {
         assert_eq!(ok.refresh_token.unwrap().expose_secret(), "r");
         assert_eq!(ok.expires_in, Duration::from_secs(28_800));
 
-        let no_refresh = tokens(r#"{"access_token":"a","expires_in":60.5,"scope":"x"}"#).unwrap();
+        let no_refresh =
+            tokens(r#"{"access_token":"a","expires_in":60.5,"scope":"user:profile"}"#).unwrap();
         assert!(no_refresh.refresh_token.is_none());
         assert_eq!(no_refresh.expires_in, Duration::from_millis(60_500));
 
@@ -368,6 +518,86 @@ mod tests {
                 matches!(tokens(json), Err(AuthError::InvalidResponse { .. })),
                 "{json}"
             );
+        }
+    }
+
+    fn grant(scope: &str) -> Grant {
+        let json = format!(r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#);
+        tokens(&json).unwrap().grant
+    }
+
+    #[test]
+    fn a_grant_wider_than_the_allowed_scopes_is_refused() {
+        for scope in [
+            r#""user:profile user:inference""#,
+            r#""user:inference""#,
+            r#"" user:profile  user:inference ""#,
+            r#"["user:profile", "user:inference"]"#,
+            r#"["user:profile user:inference"]"#,
+        ] {
+            assert_eq!(grant(scope), Grant::Allowed, "{scope}");
+            let allowed = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ));
+            assert!(allowed.unwrap().login_refusal().is_none(), "{scope}");
+        }
+        for scope in ["null", r#""""#, r#""  ""#, "[]", r#"["", " "]"#] {
+            assert_eq!(grant(scope), Grant::Unstated, "{scope}");
+        }
+        let unstated = tokens(r#"{"access_token":"a","expires_in":60}"#).unwrap();
+        assert_eq!(unstated.grant, Grant::Unstated);
+        assert!(matches!(
+            unstated.login_refusal(),
+            Some(AuthError::ScopeUnstated)
+        ));
+        for scope in [
+            "7",
+            "{}",
+            "true",
+            "[7]",
+            r#"["user:profile", 7]"#,
+            r#"[["user:profile"]]"#,
+            r#"{"user:profile": true}"#,
+            r#"{"user:profile": "user:inference"}"#,
+        ] {
+            assert_eq!(grant(scope), Grant::Unreadable, "{scope}");
+            let unreadable = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ))
+            .unwrap();
+            assert!(
+                matches!(unreadable.login_refusal(), Some(AuthError::ScopeUnstated)),
+                "{scope}"
+            );
+        }
+        for scope in [
+            r#""user:profile user:inference user:sessions:claude_code""#,
+            r#""user:sessions:claude_code""#,
+            r#""user:inference org:create_api_key""#,
+            r#""User:Profile""#,
+            r#""user:profile,user:inference""#,
+            r#"["user:profile", "user:sessions:claude_code"]"#,
+            r#"["user:inference org:create_api_key"]"#,
+            r#"["user:profile", "user:sessions:claude_code", 7]"#,
+            r#"[["user:sessions:claude_code"]]"#,
+            r#"{"granted": ["user:profile", "user:sessions:claude_code"]}"#,
+            r#"{"user:profile": "user:sessions:claude_code"}"#,
+            r#"{"user:sessions:claude_code": true}"#,
+            r#"[{"user:sessions:claude_code": null}]"#,
+            r#"{"granted": "user:profile user:inference"}"#,
+            r#"{"scopes": ["user:profile"]}"#,
+        ] {
+            assert_eq!(grant(scope), Grant::Wider, "{scope}");
+            let wide = tokens(&format!(
+                r#"{{"access_token":"a","expires_in":60,"scope":{scope}}}"#
+            ))
+            .unwrap();
+            let err = wide.login_refusal().unwrap();
+            assert!(matches!(err, AuthError::ScopeRefused), "{scope}: {err:?}");
+            for allowed in ALLOWED_SCOPES {
+                assert!(err.to_string().contains(allowed), "{err}");
+            }
+            assert!(!err.to_string().contains("sessions"), "{err}");
         }
     }
 

@@ -3158,13 +3158,12 @@ types are `core_types::RoutineId`, `RoutineToken`, `CloudRoutineId` and
 `CloudHandoffId`, and the store's `CloudOrigin`, `CloudHandoffState`,
 `CloudOutcome` (`retry_after_secs` a `u32`, and
 `Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
-`unknown_reason` column. T35b's `fire` takes a `RoutineId` and a
-`&RoutineToken` and can compare the opened routine's `url_origin` with
-`base_url`'s; T35c maps `FireOutcome` onto `CloudOutcome`.
-`RoutineUrl::origin()` is a `url::Origin`. A notice's mark needs a claim
-that was made, not the latest one; its deferral needs the latest.
-`CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the task, and
-the store hands a task back only as a `SecretString`. agentd's
+`unknown_reason` column. T35b's `fire` takes the opened routine, token
+and `url_origin` included, and its `FireOutcome` is `CloudOutcome` (see
+Decided in T35b). `RoutineUrl::origin()` is a `url::Origin`. A notice's
+mark needs a claim that was made, not the latest one; its deferral needs
+the latest. `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the
+task, and the store hands a task back only as a `SecretString`. agentd's
 public-secret refusal has its `cloud add` arm already; the other `cloud`
 commands answer "isn't available yet" until T35c.
 
@@ -3239,6 +3238,25 @@ Acceptance, against `wiremock`:
   credentials, `http` off loopback, a connect timeout over the timeout,
   retention out of range).
 - `token_and_task_never_reach_the_log` (a captured log at `trace`).
+
+Decided in T35b ([impl-notes](impl-notes.md#t35b-cloud-hand-off-fire-client)):
+`fire(&CloudRoutineToken, task)` takes the row `Store::cloud_routine`
+gives and returns the outcome alone: `FireOutcome` is
+`store::CloudOutcome`, recorded as it is, and never
+`CloudUnknownReason::NoAnswer`. A routine whose `url_origin` isn't
+`FireClient::origin()` and a task `cloud::check_task` refuses (empty or
+over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
+`Rejected` with no status. Building the client fails with
+`FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
+not at most equal, so a connection that never opened is always
+`rejected`. `Retry-After` is capped at a day. Each fire is one request on
+a connection of its own, with reqwest's own retries off. This client and
+the credential proxy's, `auth`'s, Slack's and Rocket.Chat's use no proxy
+for a plain `http` base or a loopback IP address
+(`core_types::skips_proxy`), `auth` deciding per endpoint. `auth`
+refuses a token response granting a scope outside `auth::ALLOWED_SCOPES`,
+and a login's that doesn't name its scope: a login stores nothing, a
+refresh breaks the link, and the refused grant is revoked.
 
 ### T35c
 
@@ -3330,7 +3348,29 @@ Acceptance, as pipeline and command tests named after the rules:
 - `a_link_label_other_than_its_url_is_shown_with_the_url`.
 - `cloud_notifier_uses_the_defaults_without_cloud_config`.
 - `a_routine_url_on_another_origin_is_refused`.
+- `a_routine_registered_for_another_origin_is_refused_before_it_is_written`
+  (`run`, after `[cloud] base_url` changed: the actionable reply, no
+  hand-off row, nothing sent).
 - `the_link_is_never_posted_outside_the_private_reply`.
+
+Notes from T35b and its review:
+
+- `run` calls `cloud::check_task` and compares the routine's `url_origin`
+  with `FireClient::origin()` before `begin_cloud_handoff`, saying which
+  failed (for the origin, that `[cloud] base_url` changed and the routine
+  has to be added again); `fire` refuses both too, unsent, as a backstop.
+  Record whatever `fire` returns. `add` compares the pasted URL's
+  `origin().ascii_serialization()` with `FireClient::origin()`.
+- A 403 or 404 from something between agentd and the endpoint (an egress
+  proxy, a WAF, a gateway `base_url`) is `rejected` like the endpoint's
+  own, so word their lines tentatively: "the account can't fire routines,
+  or something in between refused the request", and "the routine may have
+  been deleted; if so, `cloud rm` it", so no member deletes a working
+  routine on a misleading line.
+- `error_type` is `[a-z0-9_]{1,64}` but chosen by the endpoint, and `_`
+  is emphasis in mrkdwn and Markdown. Show it, if at all, in a code span;
+  better, map statuses to the failure table's fixed lines and keep
+  `error_type` for the log and the store.
 
 Live check (manual): with a Pro or Max account, make a routine on a scratch
 repository with the design's prompt, register it, run a task, and open the
@@ -3340,7 +3380,12 @@ get from the endpoint; what it answers with the account out of usage, its
 GitHub connection removed and, if one is at hand, its subscription paused;
 and whether any of those started a session; whether tokens are still
 `sk-ant-oat01-…`, as the reference says, since `RoutineToken` requires the
-`sk-ant-` family; and whether routine ids are case-insensitive (if so,
+`sk-ant-` family; whether the OAuth token endpoint's answer to a login's
+code exchange names `scope`, since agentd refuses a login without it;
+whether revoking one refresh token ends only its grant or every grant of
+that member and client id, since agentd revokes a refused login's token
+while the member may hold a healthy link; and
+whether routine ids are case-insensitive (if so,
 normalize them, since `trig_AB` and `trig_ab` would register one routine
 under two labels; a token's associated data holds the stored routine id, so
 normalize when parsing new ones, and re-seal stored rows in Rust with the

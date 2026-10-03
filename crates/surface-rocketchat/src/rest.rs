@@ -571,11 +571,7 @@ impl RestClient {
                 "invalid Rocket.Chat URL: user info, query and fragment are not allowed".into(),
             ));
         }
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .redirect(same_origin_redirects())
-            .build()
-            .map_err(transport)?;
+        let http = http_client(&base, None)?;
         let foreign = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .redirect(Policy::none())
@@ -1182,6 +1178,25 @@ impl RestClient {
     }
 }
 
+/// Builds the client that calls the server at `base`. It honors the system
+/// proxy settings unless [`core_types::skips_proxy`] says `base` goes
+/// direct: a plain `http` base such as Compose's `http://rocketchat:3000`,
+/// whose requests a proxy would read auth token and all, or a loopback IP
+/// address, which a proxy would reach on its own host. `proxy` is a proxy
+/// tests add as if the system had it.
+fn http_client(base: &Url, proxy: Option<reqwest::Proxy>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(same_origin_redirects());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    if core_types::skips_proxy(base.scheme(), base.host_str().unwrap_or_default()) {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(transport)
+}
+
 /// Follows up to [`MAX_REDIRECTS`] redirects within the origin a request
 /// was sent to, and stops at one to another origin, so the Rocket.Chat
 /// headers never leave the server.
@@ -1447,15 +1462,7 @@ fn truncate(text: &str) -> String {
 
 /// A transport error with its causes, but without the URL.
 fn transport(err: reqwest::Error) -> SurfaceError {
-    let err = err.without_url();
-    let mut text = err.to_string();
-    let mut source = std::error::Error::source(&err);
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    SurfaceError::Transport(text)
+    SurfaceError::Transport(core_types::error_chain(&err.without_url()))
 }
 
 #[derive(Deserialize)]
@@ -1535,6 +1542,15 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[tokio::test]
+    async fn a_plain_http_or_loopback_server_is_called_without_a_proxy() {
+        testkit::proxy::assert_proxied_only_elsewhere(
+            |base, proxy| http_client(&Url::parse(base).unwrap(), Some(proxy)).unwrap(),
+            &["http://rocketchat:3000", "https://127.0.0.1:9"],
+        )
+        .await;
+    }
 
     fn at_ms(ms: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(ms)
