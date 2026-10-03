@@ -11,7 +11,7 @@ use core_types::{
 use http_body_util::BodyExt as _;
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
-use testkit::MockSurface;
+use testkit::{MockSurface, TempDir};
 use time::macros::datetime;
 use tower::ServiceExt as _;
 
@@ -30,22 +30,6 @@ const ALL_PATHS: [&str; 7] = [
     "/v1/ask-agent",
     "/v1/private",
 ];
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-ctl-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 #[derive(Debug)]
 struct Lookup(Arc<MockSurface>);
@@ -79,17 +63,17 @@ impl Fixture {
 
     async fn with(tune: impl FnOnce(&mut CtlSettings)) -> Self {
         let store = Store::open_in_memory(sealer()).await.unwrap();
-        Self::over(store, TempDir::new(), tune)
+        Self::over(store, TempDir::new("agentd-ctl"), tune)
     }
 
     fn over(store: Store, dir: TempDir, tune: impl FnOnce(&mut CtlSettings)) -> Self {
         let mut settings = CtlSettings {
-            staging_dir: dir.0.join(STAGING_DIR),
+            staging_dir: dir.join(STAGING_DIR),
             attach_max_bytes: 1024,
             lease_ttl: DEFAULT_LEASE_TTL,
             consents: ConsentSettings {
                 attach_max_bytes: 1024,
-                ..ConsentSettings::in_data_dir(&dir.0)
+                ..ConsentSettings::in_data_dir(dir.path())
             },
         };
         tune(&mut settings);
@@ -226,8 +210,8 @@ fn post(to: &str) -> Value {
 
 #[tokio::test]
 async fn tokens_are_stored_only_as_their_sha256_hash() {
-    let dir = TempDir::new();
-    let url = format!("sqlite://{}", dir.0.join("agentd.db").display());
+    let dir = TempDir::new("agentd-ctl");
+    let url = dir.db_url();
     let store = Store::open(&url, sealer()).await.unwrap();
     let fixture = Fixture::over(store, dir, |_| {});
     let (info, token) = fixture.process().await;
@@ -245,7 +229,7 @@ async fn tokens_are_stored_only_as_their_sha256_hash() {
 
     fixture.store.close().await;
     for name in ["agentd.db", "agentd.db-wal"] {
-        let path = fixture.dir.0.join(name);
+        let path = fixture.dir.join(name);
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -833,7 +817,6 @@ impl Fixture {
         self.ctl.begin_turn(&token, running).await.unwrap();
         let session_dir = self
             .dir
-            .0
             .join(sandbox::volume_rel_path(&info.volume))
             .join("sessions")
             .join(info.session.to_string());
@@ -865,12 +848,7 @@ async fn private_records_a_consent_and_stages_its_files_at_once() {
     assert_eq!(consent.thread, thread());
     assert_eq!(consent.requester.key.user.as_str(), "U1");
     assert_eq!(crate::consents::attachments(&consent), ["in.txt"]);
-    let staged = fixture
-        .dir
-        .0
-        .join("consents")
-        .join(id.to_string())
-        .join("0");
+    let staged = fixture.dir.join("consents").join(id.to_string()).join("0");
     assert_eq!(std::fs::read_to_string(staged).unwrap(), "input");
     let ttl = consent.expires_at - consent.created_at;
     assert_eq!(ttl, time::Duration::days(1));
@@ -976,7 +954,7 @@ async fn private_refuses_bad_tasks_and_files_and_records_nothing() {
             "{value}"
         );
     }
-    let staged = fixture.dir.0.join("consents");
+    let staged = fixture.dir.join("consents");
     let left = std::fs::read_dir(&staged).map_or(0, Iterator::count);
     assert_eq!(left, 0, "a refused request leaves no files");
 

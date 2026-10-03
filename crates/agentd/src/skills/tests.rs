@@ -3,26 +3,11 @@ use std::process::Command;
 use core_types::{ConvRef, ScopeKey, SurfaceKind, TeamId, ThreadKey};
 use cred_proxy::EgressPolicy;
 use store::{AgentCreation, NewAgent, Sealer, Visibility};
+use testkit::TempDir;
 
 use super::*;
 
 const PREFIX: &str = "https://git.test/";
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-skills-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn skill_md(name: &str, hosts: &[&str]) -> String {
     let mut text = format!("---\nname: {name}\ndescription: The {name} skill.\n");
@@ -83,9 +68,9 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
-    let dir = TempDir::new();
-    let data = dir.0.join("data");
-    let repos = dir.0.join("repos");
+    let dir = TempDir::new("agentd-skills");
+    let data = dir.join("data");
+    let repos = dir.join("repos");
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(&repos).unwrap();
     let store =
@@ -746,14 +731,14 @@ async fn a_clone_of_a_highly_compressible_blob_stops_at_the_cap() {
 
 #[tokio::test]
 async fn the_bundled_skill_is_written_once_and_kept_current() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skills");
     let agent = AgentId::new_v4();
-    assert!(write_bundled(&dir.0, agent).await.unwrap());
-    let file = runner::skills_dir(&dir.0, agent).join("agentctl/SKILL.md");
+    assert!(write_bundled(dir.path(), agent).await.unwrap());
+    let file = runner::skills_dir(dir.path(), agent).join("agentctl/SKILL.md");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), BUNDLED_SKILL);
-    assert!(!write_bundled(&dir.0, agent).await.unwrap());
+    assert!(!write_bundled(dir.path(), agent).await.unwrap());
     std::fs::write(&file, "stale").unwrap();
-    assert!(write_bundled(&dir.0, agent).await.unwrap());
+    assert!(write_bundled(dir.path(), agent).await.unwrap());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), BUNDLED_SKILL);
 }
 
