@@ -2247,6 +2247,258 @@ replies run out, as Slack's `conversations.replies` would. It reads at most
 50 pages. Both thread and top-level history leave out system messages, so a
 call can return fewer than `limit`.
 
+## T15: agentctl
+
+### The token needs the turn's thread and message
+
+**Issue.** The plan's `ctl_tokens` columns for the current turn are
+`turn_id`, `requester`, `hop`, `kind` and `side`. The target rules need the
+current conversation ("`post` may target only the current conversation"),
+`react` without a message id needs the message that started the turn, and
+`history` needs the thread. None of them is in those columns, and T15 can't
+read T21's `sessions` table, which doesn't exist yet.
+
+**Solution.** `begin_turn` takes a `CtlTurn` that also carries the turn's
+`ThreadKey` and its trigger message, stored as `conversation` (the
+`ConvRef` string form), `thread_root` and `trigger_message`. `requester` is
+two columns, `requester_member` and `requester_key`, as in T23's
+`message_refs`, and `kind` is `kind` plus `consent_id`. A `CHECK` makes the
+turn columns all set or all NULL. The plan's T15 bullet lists the columns.
+
+### One token per session, not only per process
+
+**Issue.** The plan says one token per `claude` process, but T21's hooks are
+keyed by session, and nothing stopped two live tokens for one session if a
+process restart issued a token before revoking the old one.
+
+**Solution.** `session_id` is unique in `ctl_tokens`, and
+`issue_process_token` deletes the session's old token (and drops its
+outbox) in the same transaction it inserts the new one. A session runs one
+process at a time, so the newest process's token is the only one that
+works.
+
+### Targets needed a grammar
+
+**Issue.** `PostRequest::to` and `ReactRequest::message` are "strings as
+the model wrote them", and the plan doesn't say how the model names a
+conversation or a thread.
+
+**Solution.** `--to` takes `here` (the turn's thread), a conversation id
+(its top level), or `<conversation id>/<message id>` (a thread in it). A
+conversation id may be written `#C123` or as Slack's `<#C123|name>`, and
+names a conversation on the turn's own surface and team. Ids start with a
+letter or digit and hold only letters, digits, `.`, `_` and `-`, so `..` or
+a path never reaches a surface's URL. `react` takes a message id, or
+`<conversation id>/<message id>`, and on either side may name only messages
+in the current conversation; the plan's `Owner` rule widens `post` only.
+Channel names (`#general`) are not resolved: a public turn is refused with a
+hint to use `here`, and an owner turn's post is refused by the surface.
+
+### Message ids are platform ids until T23
+
+**Issue.** The design shows the model short message ids from a per-session
+table (T23's `message_refs`), but T15 comes first, so `react <emoji> <id>`
+and `history --before <id>` have nothing to resolve a short id against.
+
+**Solution.** Both take platform message ids for now (a Slack `ts`, a
+Rocket.Chat `_id`). T23, which introduces short ids, resolves them in the
+ctl handlers; its bullet in the plan says so.
+
+### A refused upload lost its answer
+
+**Issue.** `attach` refused a file over the cap as soon as it saw the
+`Content-Length`, without reading the body. agentctl was still sending, so
+when agentd closed the connection reqwest reported a failed request, and the
+model saw "the request failed" instead of the limit. With an 8 MiB file and a
+1 KiB cap this happened in about one run in three.
+
+**Solution.** After any refusal inside `attach` (size, name, slots, no
+turn), agentd reads the rest of the body and throws it away before
+answering, within the same 5-minute limit as an upload. Nothing is written to
+disk while draining, and only an authenticated caller gets this far. An
+unauthenticated request is refused before its body is read.
+
+### reqwest honors `HTTP_PROXY`
+
+**Issue.** Sandboxes have `HTTP_PROXY` and `HTTPS_PROXY` pointing at the
+egress proxy (T19), and reqwest reads them even with its default features
+off, so agentctl's plain-HTTP calls to `agentctl.internal` would go through
+the egress proxy.
+
+**Solution.** agentctl builds its client with `no_proxy()`. The end-to-end
+tests run it with `HTTP_PROXY`, `http_proxy` and `ALL_PROXY` pointing at a
+closed port.
+
+### Lease times are whole seconds
+
+**Issue.** Store timestamps are Unix seconds, so a lease granted at
+`now + ttl` really lasts between `ttl - 1` and `ttl` seconds, and a
+one-second lease can end almost at once.
+
+**Solution.** The lease lasts 30 seconds (`DEFAULT_LEASE_TTL`). agentctl
+relies on it only until two seconds before its `seconds_left` (below) have
+passed: one for the rounding, and one because another command may take the
+lock at the expiry itself. It renews it when a third of that remaining time
+has passed, at least every 200 ms. A `ttl` below one second counts as one.
+agentctl needs a lease of at least three seconds: a new lease that leaves
+less than half a second before that point, enough to wait 200 ms and renew,
+is released at once, and `lock` fails with "the shared/ lock's lease is too
+short to hold". With a two-second lease the deadline came at the grant, and
+a first renewal lost the race about one run in five. Tests that renew use a
+3-second lease.
+
+### The lease is timed on agentctl's clock
+
+**Issue.** agentctl compared the lease's `expires_at`, from agentd's wall
+clock, with the sandbox's clock. Probes against the binary showed a server
+40 seconds behind made every lease look expired, so `lock` killed its
+command at once, and one 5 seconds ahead let the command run 5 seconds past
+the real expiry, under the next holder.
+
+**Solution.** `LockResponse::Held` also carries `seconds_left`, which agentd
+computes from the same clock and second it stored the lease with
+(`expires_at` minus now, in whole seconds; the lease really lasts between
+`seconds_left - 1` and `seconds_left`). agentctl times the lease on its
+monotonic clock from when it sent the request: its deadline is the send
+instant plus `seconds_left`, minus a second for rounding and a second of
+margin. agentd measured no earlier than the send, so a slow answer only
+makes the deadline earlier. `expires_at` stays in the response for logs and
+other readers.
+
+### What agentctl does when it loses the lock
+
+**Issue.** The plan says the lease is renewed while the command runs, but
+not what happens when a renewal fails: agentd refused it (the lease
+expired, or the turn ended), or agentd couldn't be reached. A first version
+also awaited each renewal on its own, bounded only by the 30-second request
+timeout, so a renewal agentd never answered let the command keep writing
+past the lease's expiry, and delayed `SIGTERM` by as long.
+
+**Solution.** The renewal runs in the same `select!` as the command's exit,
+the stop signals and the lease's deadline, and its request timeout is capped
+at the time left until that deadline. A renewal agentd refused (the lease
+expired or was released, no turn, a revoked token), or no successful
+renewal by the deadline, means another command may soon hold the lock, so
+agentctl kills its command's process group with `SIGKILL` at once and exits
+1 with "lost the shared/ lock (…); stopped the command". A renewal that
+failed in transit, or that agentd answered with its internal error ("agentd
+failed; try again", say a busy SQLite database), is retried until the
+deadline: a probe that returned one 500 during a 30-second lease had killed
+the command with 19 seconds of the lease left. The signal handlers are
+installed before the lease is acquired and kept until the release is sent,
+so a signal is never lost in between, and the release waits at most two
+seconds, after which the lease expires on its own.
+
+On `SIGTERM`, `SIGINT` or `SIGHUP` while the command runs, agentctl passes
+the same signal on to the command's process group, which being its own
+group no longer gets a terminal's signals, waits up to two seconds for the
+command to exit (never past the lease's deadline), and then kills the group
+with `SIGKILL`. A `SIGKILL` at once had left `git` no chance to remove its
+`index.lock`. The command is left unreaped while agentctl waits
+(`waitid` with `WNOWAIT`), so the group's id can't be reused before the
+kill. agentctl then releases the lease and exits with 128 plus the signal.
+
+A signal while an acquire is in flight used to drop the request, and a
+lease agentd granted for it held the lock with nobody renewing it, for up
+to 30 seconds. agentctl now lets a request already sent finish, for up to
+two seconds, releases the lease if it was granted, and exits with 128 plus
+the signal without running the command. A signal between attempts exits at
+once. agentctl waits at most 100 seconds for the lock
+by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
+a command by default, so the model sees why it failed rather than a killed
+command.
+
+### The command runs in its own process group
+
+**Issue.** Killing the command's process stopped only that process. With
+`sh -c '…'`, which the CLI help recommends, every process the shell started
+survived: it kept writing under the next holder, and it held agentctl's
+standard output and error open, so a caller reading them to the end hung.
+Tokio's `Child::kill` signals one process, and the standard library has no
+call to signal a process group.
+
+**Solution.** agentctl spawns the command with `process_group(0)` and kills
+the whole group with `SIGKILL`, through `rustix::process::kill_process_group`
+(rustix 1, the `process` feature only: safe, pure Rust, and it builds for the
+static musl target), before reaping the command. The group is signalled only
+while the command hasn't been reaped, so its id can't have been reused. A
+process that leaves the group (`setsid`, say) escapes, processes the
+command leaves running when it exits on its own are not stopped, and an
+agentctl killed with `SIGKILL` leaves its command running once the lease
+expires. So does a caller that kills agentctl alone: if Claude Code's Bash
+tool kills a command that runs past its timeout through the command's
+process group, agentctl's command is no longer in that group and survives
+it. Whether the CLI kills the group or the process, and with which signal,
+has to be checked against the real CLI; T23's live check does. Being in its own group, the command is not in the terminal's
+foreground group, so it can't read from a terminal; agentctl runs under the
+model's Bash tool, which gives it none. The lock is a guard for cooperating
+commands, as the design's "scope-level lock that `agentctl` takes for
+writes" is.
+
+### A lease outlived its turn
+
+**Issue.** Release goes through the same extractor as every command, which
+refuses a token between turns, and ending a turn or revoking a token left
+`scope_locks` alone. A lease taken in a turn that ended, or by a process
+whose token was revoked, held the lock until it expired, up to 30 seconds.
+
+**Solution.** The store deletes the session's leases in the same
+transaction that records or clears a token's turn (`set_ctl_turn`), deletes
+the token (`delete_ctl_token`), or replaces it with a new token for the
+session (`put_ctl_token`). A lease lasts no longer than the turn that took
+it, and the lock is free as soon as `end_turn` or `revoke_process_token`
+returns.
+
+That alone didn't hold when `begin_turn` replaced a turn still recorded on
+the token: an acquire authorized under the first turn could land after the
+second turn's delete, and its lease was then renewed under the second turn.
+So acquire and renew name the token's digest and the turn they were
+authorized under, and each is one statement that takes the volume and
+session from the token's row only while it still records that turn
+(`INSERT … SELECT … FROM ctl_tokens WHERE hash = ? AND turn_id = ?`, and
+`… (volume_key, holder_session) IN (SELECT …)` for renew). A request
+authorized under a replaced or ended turn grants and renews nothing. Release
+names only the token, since giving a lease back is always safe.
+
+### `lock` is refused inside private tasks
+
+**Issue.** The plan's refusal rule allows only `attach` inside a
+`TurnKind::PrivateTask` turn, which includes `lock`. An owner-requested
+private task mounts `shared/` read-write (T33), and without `lock` it can't
+take the lock that guards writes there.
+
+**Solution.** T15 follows the rule as written: every command but `attach`
+goes through the extractor that refuses private tasks, so a new command is
+refused unless it opts out. T33 should decide whether owner-requested tasks
+may take the lock.
+
+### A data directory key
+
+**Issue.** Attachments are staged "under the agentd data directory", but no
+key named one.
+
+**Solution.** `store.data_dir`, required and absolute. Attachments go in
+`ctl-outbox/<random>/` under it, one directory per turn, created with mode
+0700, holding files named by random UUIDs; the model's file name is only
+display text and is refused if it holds `/`, `\`, a control character, an
+invisible formatting character (bidirectional controls such as U+202E, which
+can make `exe.txt` read as `txt.exe`, zero-width characters, tag characters,
+or a line or paragraph separator), or is `.` or `..`. Dropping the `Outbox` that `end_turn` returns deletes the
+directory, and startup empties `ctl-outbox/`. The cap is
+`limits.attach_max_bytes` (default 50 MiB). A turn may stage at most 10
+files, queue 10 posts of up to 40,000 bytes and 20 reactions; uploads in
+flight count against the 10.
+
+### A musl build is static-pie
+
+**Issue.** None; confirming the plan. `readelf -l` on the
+`x86_64-unknown-linux-musl` release build shows `Elf file type is DYN` and a
+`DYNAMIC` segment, but no `INTERP`, and `cargo tree` for the target shows no
+`cc`, `ring`, `rustls` or `openssl`.
+
+**Solution.** The `agentctl-static` CI job checks for `INTERP` only, as the
+plan says.
+
 ## T22: router
 
 ### The plan and the design name no order for the checks
