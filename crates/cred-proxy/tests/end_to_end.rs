@@ -3,7 +3,6 @@
 //! environment.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +14,7 @@ use cred_proxy::{CredProxy, FixedKey, Placeholder, Registry};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use testkit::claude::{API_KEY_BETA, OAUTH_BETA, SCRIPT_ENV};
-use testkit::{FakeAnthropic, Turn, fake_anthropic, fake_claude_path, write_script};
+use testkit::{FakeAnthropic, TempDir, Turn, fake_anthropic, fake_claude_path, write_script};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 
@@ -35,14 +34,6 @@ impl TokenSource for OneMember {
         } else {
             Err(AuthError::NotLinked)
         }
-    }
-}
-
-struct TempDir(PathBuf);
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -87,13 +78,13 @@ impl Stack {
     /// Runs one `fake-claude` turn for `session` with `placeholder` as its
     /// only credential, and returns its `result` line.
     async fn turn(&self, session: SessionId, placeholder: &Placeholder) -> Value {
-        let dir = TempDir(std::env::temp_dir().join(format!("cred-proxy-e2e-{session}")));
+        let dir = TempDir::new("cred-proxy-e2e");
         for sub in ["claude", "work"] {
-            std::fs::create_dir_all(dir.0.join(sub)).unwrap();
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        let persona = dir.0.join("persona.md");
+        let persona = dir.join("persona.md");
         std::fs::write(&persona, "You are a test agent.\n").unwrap();
-        let script = dir.0.join("script.json");
+        let script = dir.join("script.json");
         write_script(&script, &[Turn::reply(REPLY)]).unwrap();
         let mut command = tokio::process::Command::new(fake_claude_path());
         command
@@ -116,9 +107,9 @@ impl Stack {
             .arg(&persona)
             .arg("--session-id")
             .arg(session.to_string())
-            .current_dir(dir.0.join("work"))
+            .current_dir(dir.join("work"))
             .env_clear()
-            .env("CLAUDE_CONFIG_DIR", dir.0.join("claude"))
+            .env("CLAUDE_CONFIG_DIR", dir.join("claude"))
             .env("CLAUDE_CODE_PROJECT_DIR_NAME", session.to_string())
             .env("ANTHROPIC_BASE_URL", &self.base_url)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
