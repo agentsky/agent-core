@@ -2539,6 +2539,7 @@ dependencies = [
  "core-types",
  "secrecy",
  "sqlx",
+ "testkit",
  "thiserror",
  "time",
  "tokio",

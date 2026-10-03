@@ -441,6 +441,7 @@ mod tests {
 
     use async_trait::async_trait;
     use core_types::Cidr;
+    use testkit::TempDir;
     use tokio::net::TcpStream;
 
     use super::*;
@@ -461,22 +462,6 @@ mod tests {
     fn git(answers: Vec<IpAddr>) -> Git {
         let own = vec![Cidr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 114, 7)), 32).unwrap()];
         Git::new(EgressPolicy::new(Vec::new(), own)).with_network(Arc::new(Answers(answers)))
-    }
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("agentd-clone-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     #[test]
@@ -600,15 +585,18 @@ mod tests {
             ("https://GIT.example.org.:8443/r#v1", "git.example.org:8443"),
             ("https://github.com/o/r", "github.com:443"),
         ] {
-            let dir = TempDir::new();
-            let program = stand_in(&dir.0, "printf '%s\\n' \"$@\" > \"$dest/../args\"\nexit 1");
+            let dir = TempDir::new("agentd-clone");
+            let program = stand_in(
+                dir.path(),
+                "printf '%s\\n' \"$@\" > \"$dest/../args\"\nexit 1",
+            );
             let err = git(vec![IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3))])
                 .with_limits(&program, CLONE_TIMEOUT, MAX_CLONE_BYTES)
-                .clone_into(source, &dir.0.join("work/src"))
+                .clone_into(source, &dir.join("work/src"))
                 .await
                 .unwrap_err();
             assert_eq!(err, CloneError::Failed, "{source}");
-            let args = std::fs::read_to_string(dir.0.join("work/args")).unwrap();
+            let args = std::fs::read_to_string(dir.join("work/args")).unwrap();
             let args: Vec<&str> = args.lines().collect();
             let pin = args
                 .iter()
@@ -661,8 +649,8 @@ mod tests {
 
     #[test]
     fn a_directory_is_too_large_by_bytes_or_entries() {
-        let dir = TempDir::new();
-        let dir = dir.0.join("clone");
+        let dir = TempDir::new("agentd-clone");
+        let dir = dir.join("clone");
         assert!(!too_large(&dir, 10), "a directory not made yet");
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::write(dir.join("a/b/f"), b"x").unwrap();
@@ -682,18 +670,18 @@ mod tests {
     /// 1,024 bytes. When the stand-in got as far as noting the pid of the
     /// child it starts in `work/pid`, that child must be gone too.
     async fn stopped_clone(body: &str, timeout: Duration) -> CloneError {
-        let dir = TempDir::new();
-        std::fs::create_dir_all(dir.0.join("repos")).unwrap();
+        let dir = TempDir::new("agentd-clone");
+        std::fs::create_dir_all(dir.join("repos")).unwrap();
         let git = git(Vec::new())
-            .with_limits(&stand_in(&dir.0, body), timeout, 1024)
-            .serving_prefix_from_directory_for_tests("https://git.test/", &dir.0.join("repos"));
+            .with_limits(&stand_in(dir.path(), body), timeout, 1024)
+            .serving_prefix_from_directory_for_tests("https://git.test/", &dir.join("repos"));
         let started = tokio::time::Instant::now();
         let err = git
-            .clone_into("https://git.test/r.git", &dir.0.join("work/src"))
+            .clone_into("https://git.test/r.git", &dir.join("work/src"))
             .await
             .unwrap_err();
         assert!(started.elapsed() < timeout + Duration::from_secs(10));
-        if let Ok(pid) = std::fs::read_to_string(dir.0.join("work/pid"))
+        if let Ok(pid) = std::fs::read_to_string(dir.join("work/pid"))
             && !pid.trim().is_empty()
         {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -729,22 +717,22 @@ mod tests {
 
     #[tokio::test]
     async fn no_file_a_clone_writes_passes_the_cap() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("agentd-clone");
         let body = "exec head -c 4096 /dev/zero > \"$dest/pack\"";
         assert_eq!(
             stopped_clone(body, Duration::from_secs(60)).await,
             CloneError::TooLarge
         );
         let program = stand_in(
-            &dir.0,
+            dir.path(),
             "head -c 4096 /dev/zero > \"$dest/pack\"\nwc -c < \"$dest/pack\" > \"$dest/../size\"",
         );
         let _ = git(Vec::new())
             .with_limits(&program, Duration::from_secs(60), 1024)
-            .serving_prefix_from_directory_for_tests("https://git.test/", &dir.0)
-            .clone_into("https://git.test/r.git", &dir.0.join("work/src"))
+            .serving_prefix_from_directory_for_tests("https://git.test/", dir.path())
+            .clone_into("https://git.test/r.git", &dir.join("work/src"))
             .await;
-        let size = std::fs::read_to_string(dir.0.join("work/size")).unwrap();
+        let size = std::fs::read_to_string(dir.join("work/size")).unwrap();
         assert_eq!(size.trim(), "1024");
     }
 }

@@ -30,7 +30,8 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentCreation, NewAgent, NewClaudeLink, Store, Visibility};
 use testkit::{
-    Call, FakeAnthropic, MockSurface, Op, Turn, agentctl_path, fake_anthropic, fake_claude_path,
+    Call, FakeAnthropic, MockSurface, Op, TempDir, Turn, agentctl_path, fake_anthropic,
+    fake_claude_path,
 };
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
@@ -38,7 +39,7 @@ use tokio::task::JoinHandle;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{TempDir, env};
+use common::env;
 
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
@@ -137,7 +138,7 @@ async fn link(store: &Store, user: &str, plan: Option<&str>, lifetime: Duration)
 async fn start(bobs_token_lifetime: Duration) -> Stack {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let fake = fake_anthropic().await;
     let oauth = MockServer::start().await;
     let text = format!(
@@ -149,10 +150,7 @@ async fn start(bobs_token_lifetime: Duration) -> Stack {
          revoke_url = \"{o}/v1/oauth/token/revoke\"\nprofile_url = \"{o}/api/oauth/profile\"\n",
         common::CONFIG
             .replace("/nonexistent/agentd", &dir.path().display().to_string())
-            .replace(
-                "sqlite::memory:",
-                &format!("sqlite://{}", dir.path().join("agentd.db").display())
-            ),
+            .replace("sqlite::memory:", &dir.db_url()),
         fake.uri(),
         o = oauth.uri(),
     );
@@ -207,8 +205,8 @@ async fn start(bobs_token_lifetime: Duration) -> Stack {
         .await
         .unwrap();
     let addrs = server.addrs();
-    let script = dir.path().join("script.json");
-    let pids = dir.path().join("pids");
+    let script = dir.join("script.json");
+    let pids = dir.join("pids");
     let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
     let mut vars = BTreeMap::from([
         (
