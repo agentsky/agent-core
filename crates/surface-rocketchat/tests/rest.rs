@@ -1285,3 +1285,74 @@ async fn bot_password_debug_is_redacted() {
     assert_eq!(printed, "BotPassword([REDACTED])");
     assert!(!printed.contains(&sent));
 }
+
+#[tokio::test]
+async fn subscriptions_list_the_rooms_the_user_is_in() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    let helper = bot(&client, "helper").await;
+    fake.add_room("GENERAL", "c", "general");
+    fake.add_room("SECRET", "p", "secret");
+    fake.add_room("OTHER", "c", "other");
+    fake.add_member("GENERAL", helper.user_id().as_str());
+    fake.add_member("SECRET", helper.user_id().as_str());
+    let mut rooms = helper.subscriptions().await.unwrap();
+    rooms.sort_by(|a, b| a.room.cmp(&b.room));
+    let listed: Vec<(&str, RoomType)> = rooms
+        .iter()
+        .map(|s| (s.room.as_str(), s.room_type.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [("GENERAL", RoomType::Channel), ("SECRET", RoomType::Group)]
+    );
+    assert_eq!(rooms[0].name.as_deref(), Some("general"));
+    assert_eq!(rooms[0].id, format!("GENERAL{}", helper.user_id()));
+    let requests = fake.requests("subscriptions.get").await;
+    assert_eq!(
+        header(&requests[0], "x-user-id"),
+        Some(helper.user_id().as_str())
+    );
+}
+
+#[tokio::test]
+async fn user_info_shows_roles_to_the_manager_and_to_the_user_itself() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    let helper = bot(&client, "helper").await;
+    let other = bot(&client, "other").await;
+    let seen_by_manager = client.user_info(other.user_id()).await.unwrap();
+    assert_eq!(seen_by_manager.username, "other");
+    assert_eq!(seen_by_manager.roles, ["bot"]);
+    let seen_by_itself = other.user_info(other.user_id()).await.unwrap();
+    assert_eq!(seen_by_itself.roles, ["bot"]);
+    let seen_by_a_peer = helper.user_info(other.user_id()).await.unwrap();
+    assert!(seen_by_a_peer.roles.is_empty());
+    let missing = client.user_info(&UserId::from("nobody")).await.unwrap_err();
+    assert_eq!(missing, SurfaceError::Api("User not found.".into()));
+    let requests = fake.requests("users.info").await;
+    assert_eq!(
+        requests[0].url.query(),
+        Some(format!("userId={}", other.user_id()).as_str())
+    );
+}
+
+#[tokio::test]
+async fn file_urls_sit_under_the_base_path() {
+    let creds = Credentials {
+        user_id: "u1".into(),
+        token: SecretString::from("t"),
+    };
+    let client = RestClient::new("https://chat.example.com/rc/", creds).unwrap();
+    let file = surface_rocketchat::rest::FileRef {
+        id: "f1".into(),
+        name: "a b/c.png".into(),
+        mime_type: None,
+        size: None,
+    };
+    assert_eq!(
+        client.file_url(&file),
+        "https://chat.example.com/rc/file-upload/f1/a%20b%2Fc.png"
+    );
+    assert_eq!(client.credentials().user_id.as_str(), "u1");
+}
