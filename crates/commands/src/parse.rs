@@ -19,8 +19,8 @@ use crate::names::{
     Reason, parse_agent_name, parse_skill_name, parse_skill_source, parse_target, parse_user,
 };
 use crate::{
-    AdminCommand, AgentName, ApiKeyCommand, Command, ParseError, ParseErrorKind, SkillCommand,
-    SkillName, Target, UserRef,
+    AdminCommand, AgentName, ApiKeyCommand, Command, ParseError, ParseErrorKind, Setting,
+    SkillCommand, SkillName, Target, UserRef,
 };
 
 /// Parses command text: the text after `/agent`, the whole text of a direct
@@ -453,30 +453,47 @@ impl Cmd {
 /// One `limits` setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Limit {
-    TurnsPerDay(u32),
-    Hops(u8),
+    TurnsPerDay(Setting<u32>),
+    Hops(Setting<u8>),
 }
 
-const LIMIT_RULE: Reason = Reason("A setting is turns=N/day or hops=N, with N a whole number.");
+const LIMIT_RULE: Reason =
+    Reason("A setting is turns=N/day or hops=N, with N a whole number or off.");
 
-/// Parses `turns=N/day`, `turns=N` or `hops=N`, ignoring case.
+/// Parses `turns=N/day`, `turns=N`, `hops=N`, `turns=off` or `hops=off`,
+/// ignoring case.
 fn parse_limit(s: &str) -> Result<Limit, Reason> {
     let s = s.to_ascii_lowercase();
     let (key, value) = s.split_once('=').ok_or(LIMIT_RULE)?;
     match key {
-        "turns" => number(value.strip_suffix("/day").unwrap_or(value)).map(Limit::TurnsPerDay),
-        "hops" => number(value).map(Limit::Hops),
+        "turns" => setting(
+            value.strip_suffix("/day").unwrap_or(value),
+            Reason("turns is at most 4294967295 a day."),
+        )
+        .map(Limit::TurnsPerDay),
+        "hops" => setting(value, Reason("hops is at most 255.")).map(Limit::Hops),
         _ => Err(LIMIT_RULE),
     }
 }
 
+/// `off`, or a number as [`number`] reads it, or `too_large` for a number
+/// past `T`'s largest.
+fn setting<T: std::str::FromStr>(s: &str, too_large: Reason) -> Result<Setting<T>, Reason> {
+    if s == "off" {
+        Ok(Setting::Off)
+    } else {
+        number(s, too_large).map(Setting::To)
+    }
+}
+
 /// A number written as plain ASCII digits, which `u32::from_str` alone
-/// would stretch to allow a leading `+`.
-fn number<T: std::str::FromStr>(s: &str) -> Result<T, Reason> {
+/// would stretch to allow a leading `+`, or `too_large` for one past `T`'s
+/// largest.
+fn number<T: std::str::FromStr>(s: &str, too_large: Reason) -> Result<T, Reason> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return Err(LIMIT_RULE);
     }
-    s.parse().map_err(|_| Reason("That limit is too large."))
+    s.parse().map_err(|_| too_large)
 }
 
 fn limits(name: AgentName, settings: &[Limit]) -> Result<Command, Reason> {
@@ -484,8 +501,8 @@ fn limits(name: AgentName, settings: &[Limit]) -> Result<Command, Reason> {
     let mut hops = None;
     for setting in settings {
         match *setting {
-            Limit::TurnsPerDay(n) if turns_per_day.is_none() => turns_per_day = Some(n),
-            Limit::Hops(n) if hops.is_none() => hops = Some(n),
+            Limit::TurnsPerDay(value) if turns_per_day.is_none() => turns_per_day = Some(value),
+            Limit::Hops(value) if hops.is_none() => hops = Some(value),
             _ => return Err(Reason("Give each setting once.")),
         }
     }

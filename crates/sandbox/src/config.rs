@@ -78,7 +78,11 @@ pub struct SandboxConfig {
     /// This agentd's name on the Docker host, in the `agentd.instance`
     /// label. Listing, reaping and events see only containers with the same
     /// name, so two agentd (or test runs) on one host leave each other's
-    /// sandboxes alone.
+    /// sandboxes alone. Two instances must never share one data directory:
+    /// each could run the same session, and the runner reads a resumed
+    /// session's restored cost only in a container it has just started,
+    /// which assumes no other agentd runs a process on that session's
+    /// transcript.
     #[serde(default = "default_instance")]
     pub instance: String,
 }

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agentd::commands::Origin;
+use agentd::commands::{ManagerBot, OpenDm, Origin, Replies};
 use agentd::ctl::SurfaceLookup;
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
@@ -40,6 +40,12 @@ use common::env;
 
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
+
+/// The pipeline's clock in these tests: one instant, so a test's turns and
+/// counts never fall in two hours or days.
+fn pinned_now() -> OffsetDateTime {
+    time::macros::datetime!(2030-06-15 12:30 UTC)
+}
 
 /// Every agent's bot acts through the one mock, past the [`Holds`].
 #[derive(Debug)]
@@ -236,11 +242,25 @@ impl Surface for Held {
     }
 }
 
+/// The manager bot's DM with a member is `dm-<user>`.
+struct Dms;
+
+#[async_trait::async_trait]
+impl OpenDm for Dms {
+    async fn open_dm(
+        &self,
+        member: &MemberKey,
+    ) -> Result<core_types::ConversationId, SurfaceError> {
+        Ok(format!("dm-{}", member.user.as_str()).into())
+    }
+}
+
 struct Stack {
     app: App,
     pipeline: Pipeline,
     turns: Turns,
     mock: Arc<MockSurface>,
+    manager: Arc<MockSurface>,
     holds: Arc<Holds>,
     script: PathBuf,
     agent: AgentId,
@@ -250,7 +270,7 @@ struct Stack {
     abort: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
     fake: FakeAnthropic,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 fn key(user: &str) -> MemberKey {
@@ -413,12 +433,19 @@ async fn start_with(setup: Setup) -> Stack {
     let sandbox = ProcessSandbox::new(store.clone(), dir.path()).unwrap();
     let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
     let mut pipeline_settings = PipelineSettings::from_app(&app);
+    pipeline_settings.now = pinned_now;
     (setup.pipeline)(&mut pipeline_settings);
+    let manager = Arc::new(MockSurface::new());
+    let replies = Replies::new(Some(Arc::new(ManagerBot::new(
+        key("manager"),
+        manager.clone(),
+        Arc::new(Dms),
+    ))));
     let pipeline = Pipeline::new(
         store.clone(),
         turns.clone(),
         Arc::clone(app.surfaces()),
-        app.commands().replies().clone(),
+        replies,
         pipeline_settings,
     );
     let server = server.with_pipeline(pipeline.clone());
@@ -439,6 +466,7 @@ async fn start_with(setup: Setup) -> Stack {
         pipeline,
         turns,
         mock,
+        manager,
         holds,
         script,
         agent: agent.id,
@@ -448,13 +476,42 @@ async fn start_with(setup: Setup) -> Stack {
         abort,
         task,
         fake,
-        _dir: dir,
+        dir,
     }
 }
 
 impl Stack {
     fn store(&self) -> &Store {
         self.app.store()
+    }
+
+    /// The turns billed no cost, by the reason the `usage` table records,
+    /// as an operator counts them.
+    async fn unbilled_turns(&self) -> Vec<(String, i64)> {
+        let db = self.dir.path().join("agentd.db");
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
+            .await
+            .unwrap();
+        let rows = sqlx::query_as(
+            "SELECT cost_unknown, SUM(turns) FROM usage WHERE cost_unknown != '' \
+             GROUP BY cost_unknown ORDER BY cost_unknown",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        rows
+    }
+
+    /// Every text the manager bot sent `user` in their DM.
+    fn dms_to(&self, user: &str) -> Vec<String> {
+        let dm = conv(&format!("dm-{user}"));
+        self.manager
+            .posts()
+            .into_iter()
+            .filter(|(to, _)| to.conv == dm)
+            .map(|(_, text)| text)
+            .collect()
     }
 
     /// Alice's second agent, `name`, whose bot is `bot`.
@@ -1012,6 +1069,418 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     stack.stop().await;
 }
 
+#[tokio::test]
+async fn a_turn_is_billed_to_its_requester_and_counted_in_its_thread() {
+    let stack = start().await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+
+    stack.next_turn(Turn::reply("Done."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "m1", None, &[BOT]))
+        .await;
+    let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
+    assert_eq!(
+        (billed.turns, billed.input_tokens, billed.output_tokens),
+        (1, 10, 1),
+        "fake-claude's usage for one reply"
+    );
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(
+        store
+            .member_usage(stack.alice, pinned_now())
+            .await
+            .unwrap()
+            .today
+            .turns,
+        0,
+        "the owner pays nothing for bob's turn"
+    );
+    let spend = store
+        .thread_spend(&thread("GENERAL", "m1"), pinned_now())
+        .await
+        .unwrap();
+    assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
+    assert_eq!(
+        store
+            .capped_turns_on(stack.agent, pinned_now())
+            .await
+            .unwrap(),
+        1
+    );
+
+    stack.next_turn(Turn::crash());
+    stack
+        .handle(stack.event("carol", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    assert!(
+        store
+            .member_for_identity(&key("carol"))
+            .await
+            .unwrap()
+            .is_none(),
+        "an unlinked member without the community key runs nothing and isn't billed"
+    );
+
+    stack.next_turn(Turn {
+        commands: vec![vec!["sh".into(), "-c".into(), "kill -9 $PPID".into()]],
+        ..Turn::reply("Never said.")
+    });
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "k1", None, &[BOT]))
+        .await;
+    let billed = store.member_usage(bob, pinned_now()).await.unwrap().today;
+    assert_eq!(
+        (billed.turns, billed.input_tokens, billed.output_tokens),
+        (2, 20, 2),
+        "a turn whose CLI the agent killed is billed what its messages used"
+    );
+    assert_eq!(billed.cost_usd, testkit::claude::REPLY_COST_USD);
+    assert_eq!(
+        stack.unbilled_turns().await,
+        [("no_result".to_owned(), 1)],
+        "and recorded as a turn of unknown cost"
+    );
+    let spend = store
+        .thread_spend(&thread("GENERAL", "k1"), pinned_now())
+        .await
+        .unwrap();
+    assert_eq!((spend.turns_this_hour, spend.tokens_today), (1, 11));
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn past_the_daily_cap_the_thread_is_told_once_and_the_owner_still_runs() {
+    let stack = start().await;
+    let store = stack.store();
+    store
+        .update_agent_settings(stack.agent, |settings| settings.turns_per_day = Some(1))
+        .await
+        .unwrap();
+    stack.next_turn(Turn::reply("Once."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "d1", None, &[BOT]))
+        .await;
+    assert_eq!(posts(&stack.calls_since(0))[0].1, "Once.");
+
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event(
+            "bob",
+            "GENERAL",
+            ConvKind::Channel,
+            "d2",
+            Some("d1"),
+            &[BOT],
+        ))
+        .await;
+    stack
+        .handle(stack.event(
+            "bob",
+            "GENERAL",
+            ConvKind::Channel,
+            "d3",
+            Some("d1"),
+            &[BOT],
+        ))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "one notice per thread and day: {sent:?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("d1")));
+    assert_eq!(
+        sent[0].1,
+        "helper has reached the daily limit its owner set on requests from others (1). Try \
+         again after midnight UTC."
+    );
+
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "e1", None, &[BOT]))
+        .await;
+    assert_eq!(
+        posts(&stack.calls_since(before)).len(),
+        1,
+        "another thread is told too"
+    );
+
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Still mine."));
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "d4",
+            Some("d1"),
+            &[BOT],
+        ))
+        .await;
+    assert_eq!(posts(&stack.calls_since(before))[0].1, "Still mine.");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_owners_own_turns_leave_the_daily_cap_to_others() {
+    let stack = start().await;
+    let store = stack.store();
+    store
+        .update_agent_settings(stack.agent, |settings| settings.turns_per_day = Some(1))
+        .await
+        .unwrap();
+    stack.next_turn(Turn::reply("Mine."));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "o1", None, &[BOT]))
+        .await;
+    stack.next_turn(Turn::reply("Bob's."));
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "o2", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "Bob's.");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn bans_and_deny_rules_refuse_a_requester_privately_once_a_day() {
+    let stack = start().await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    for id in ["b1", "b2"] {
+        stack
+            .handle(stack.event(
+                "bob",
+                "GENERAL",
+                ConvKind::Channel,
+                id,
+                None,
+                &[BOT, "UWRITER"],
+            ))
+            .await;
+    }
+    assert!(
+        posts(&stack.calls_since(0)).is_empty(),
+        "nothing is said in the thread"
+    );
+    assert_eq!(
+        stack.dms_to("bob"),
+        [
+            "A community admin banned you, so agents won't take your requests. Send `me` to me \
+          to see why."
+        ],
+        "one message a day, however many agents and messages"
+    );
+    store.unban_member(bob).await.unwrap();
+
+    let mut rules = agentd::policy::Rules::default();
+    rules.deny(agentd::policy::Rule::Member {
+        key: key("bob"),
+        member: Some(bob),
+        label: "@bob".into(),
+    });
+    for agent in [stack.agent, writer] {
+        store
+            .update_agent_settings(agent, |settings| rules.write(settings))
+            .await
+            .unwrap();
+    }
+    let before = stack.mock.calls().len();
+    for id in ["d1", "d2"] {
+        stack
+            .handle(stack.event(
+                "bob",
+                "GENERAL",
+                ConvKind::Channel,
+                id,
+                None,
+                &[BOT, "UWRITER"],
+            ))
+            .await;
+    }
+    assert!(posts(&stack.calls_since(before)).is_empty());
+    let mut told = stack.dms_to("bob")[1..].to_vec();
+    told.sort();
+    assert_eq!(
+        told,
+        [
+            "helper's owner hasn't allowed you to use it where you asked it.",
+            "writer's owner hasn't allowed you to use it where you asked it.",
+        ],
+        "once a day for each agent"
+    );
+
+    store
+        .update_agent_settings(stack.agent, |settings| settings.allow_json = "[oops".into())
+        .await
+        .unwrap();
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "b3", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(
+        sent[0].1, "helper can't check who may use it right now. Try again later.",
+        "rules that don't read refuse, the owner too"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_ban_never_holds_back_a_community_admin() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.admins = vec![key("bob")],
+        ..Setup::default()
+    })
+    .await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    stack.next_turn(Turn::reply("For the admin."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "adm1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "For the admin.");
+    assert!(stack.dms_to("bob").is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hop_refused_for_its_requester_tells_no_one() {
+    let stack = start().await;
+    let store = stack.store();
+    let bob = store
+        .member_for_identity(&key("bob"))
+        .await
+        .unwrap()
+        .unwrap();
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let mut rules = agentd::policy::Rules::default();
+    rules.deny(agentd::policy::Rule::Member {
+        key: key("bob"),
+        member: Some(bob),
+        label: "@bob".into(),
+    });
+    store
+        .update_agent_settings(stack.agent, |settings| rules.write(settings))
+        .await
+        .unwrap();
+    let hop = |id: &str| {
+        let mut hop = stack.event("UWRITER", "GENERAL", ConvKind::Channel, id, None, &[BOT]);
+        hop.sender_is_bot = true;
+        hop.sender_bot_user = Some(UserId::new("UWRITER"));
+        hop
+    };
+    for id in ["w1", "w2"] {
+        store
+            .record_message_ref(
+                &store::NewMessageRef {
+                    session: SessionId::new_v4(),
+                    msg: &msg("GENERAL", id),
+                    thread_root: None,
+                    agent: Some(writer),
+                    turn: None,
+                    requester: &core_types::Requester {
+                        member: Some(bob),
+                        key: key("bob"),
+                    },
+                    hop: core_types::Hop(1),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+    stack.handle(hop("w1")).await;
+    store
+        .ban_member(bob, &key("root"), None, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    stack.handle(hop("w2")).await;
+    assert!(
+        posts(&stack.calls_since(0)).is_empty(),
+        "nothing is said in the thread"
+    );
+    assert_eq!(
+        stack.dms_to("bob"),
+        Vec::<String>::new(),
+        "bob never addressed the agent that refused him"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn the_thread_turn_cap_stops_a_thread_but_not_a_dm() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.limits.thread_turns_per_hour = Some(1),
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("First."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "t1", None, &[BOT]))
+        .await;
+    let before = stack.mock.calls().len();
+    for id in ["t2", "t3"] {
+        stack
+            .handle(stack.event(
+                "alice",
+                "GENERAL",
+                ConvKind::Channel,
+                id,
+                Some("t1"),
+                &[BOT],
+            ))
+            .await;
+    }
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0].1,
+        "helper won't answer here for now: agents have reached this thread's hourly turn \
+         limit (1). Try again next hour."
+    );
+
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("In the DM."));
+    for id in ["dm1", "dm2"] {
+        stack
+            .handle(stack.event("alice", "DM-ALICE", ConvKind::Dm, id, None, &[]))
+            .await;
+    }
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(
+        sent.iter()
+            .map(|(_, text, _)| text.as_str())
+            .collect::<Vec<_>>(),
+        ["In the DM.", "In the DM."],
+        "a one-to-one DM isn't capped"
+    );
+    stack.stop().await;
+}
+
 /// Waits up to 30 seconds for `done`.
 async fn wait_until(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1096,7 +1565,7 @@ async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
         agent,
         stop,
         task,
-        _dir: dir,
+        dir,
         ..
     } = stack;
     drop(pipeline);

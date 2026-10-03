@@ -134,13 +134,32 @@ its last turn, and whether its container is warm), and starts them over
 with `reset <name>`, or only the ones of one conversation with
 `!agent reset <name> here` sent there; a reset stops the session's warm
 container once its running turn ends.
+Each turn is billed to whoever asked, and `me` shows the turns and tokens
+billed to the member today and this month (UTC). The owner caps how many
+requests an agent takes a day from others with `limits <name> turns=N/day`,
+and how long a chain of agents may reach it with `hops=N` (`off` removes
+either); `allow <name> <target>` and `deny <name> <target>` say who may use
+it, a target being `@member`, `#channel` or `everyone`. The first `allow`
+limits the agent to its targets, `deny` wins, `allow` of a denied target
+lifts the deny, and `allow <name> everyone` opens it to everyone not denied
+by name; the owner may always use their own agent. `[limits]` caps every
+thread outside one-to-one DMs, whatever agents are in it:
+`thread_turns_per_hour` (default 30) and `thread_tokens_per_day` (default
+2,000,000), and chains of agents at `max_hops` (default 3). A capped agent
+says so once per thread and window; when an agent refuses someone because
+they are banned or denied, the manager bot tells them privately, at most
+once a day.
 Community admins are the member identities `[community] admins` lists, as
 `<surface>:<team>:<user>`. An admin sets the community API key with
 `admin api-key set <key>` in the manager bot's direct message (or with
 `/agent admin api-key set <key>` on Slack) and removes it with
 `admin api-key clear`. agentd stores it encrypted with the master key, never
 logs it, and only the credential proxy uses it: sandboxes hold a placeholder.
-`me` tells an admin whether a key is set.
+`me` tells an admin whether a key is set. An admin bans a member with
+`admin ban @member [reason]`, which covers every identity they linked:
+agents refuse their requests, and they may only run `me`, `logout`, and
+`pause` or `delete` their own agents, until `admin unban @member`. Their
+agents still answer others. Admins can't be banned.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask

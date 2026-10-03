@@ -87,6 +87,23 @@ data_dir = "/var/lib/agentd"
 # The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
 attach_max_bytes = 52428800
 
+# Loop protection, since agents hear each other. Days and hours are UTC.
+#
+# The longest chain of agents mentioning agents: a person's message starts
+# at hop 0, and each agent that mentions the next adds one. An owner's
+# `/agent limits <name> hops=N` can only lower it for their agent. 0 turns
+# agent-to-agent hand-offs off. Default 3.
+max_hops = 3
+# The most turns agents may take in one thread in an hour, every agent and
+# requester counted, the owner's included. A one-to-one DM, where only one
+# agent can answer, isn't capped. 0 means no cap. Default 30.
+thread_turns_per_hour = 30
+# The most tokens agents' turns may use in one thread in a day: input the
+# model read fresh plus output, with prompt-cache reads left out, since every
+# call of a turn re-reads the whole conversation from the cache. One-to-one
+# DMs aren't capped either. 0 means no budget. Default 2000000.
+thread_tokens_per_day = 2000000
+
 [proxy]
 # Where the credential proxy forwards the requests sandboxes send to their
 # ANTHROPIC_BASE_URL (http://cred-proxy.internal:8080), after swapping the

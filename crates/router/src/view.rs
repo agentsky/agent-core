@@ -3,8 +3,9 @@
 
 use core_types::{AgentId, BindingId, ConvRef, Hop, MemberId, MemberKey, MsgRef, Requester};
 
-/// The largest hop [`AgentPolicy::default`] accepts. T27 replaces it with the
-/// configured global cap, which a per-agent `hops` limit can only lower.
+/// The largest hop [`AgentPolicy::default`] accepts, and the default of
+/// agentd's global cap (`[limits] max_hops`), which a per-agent `hops` limit
+/// can only lower.
 pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 
 /// A read-only view of what the router needs to know. agentd implements it
@@ -35,14 +36,16 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 ///    if no member was recorded.
 /// 6. [`is_banned`] for the requester.
 /// 7. [`policy`] for `agent`.
-/// 8. [`link_state`] for the requester's member (the owner's, when the
+/// 8. [`thread_budget`], unless the event is in a one-to-one DM.
+/// 9. [`link_state`] for the requester's member (the owner's, when the
 ///    requester is the owner), then, unless it is linked or broken,
 ///    [`community_key_configured`], which is never read for the owner.
 ///
 /// # Missing answers
 ///
-/// The lookups that grant or withhold permission fail closed. [`is_banned`]
-/// and [`policy`] return `None` when the view doesn't have the answer, for
+/// The lookups that grant or withhold permission fail closed. [`is_banned`],
+/// [`policy`] and [`thread_budget`] return `None` when the view doesn't have
+/// the answer, for
 /// example because the pipeline didn't preload it, and the router then
 /// refuses with [`RefuseReason::PolicyUnavailable`] instead of assuming the
 /// requester is allowed. A missing answer elsewhere withholds a turn: an
@@ -65,6 +68,7 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 /// [`message_ref`]: RouterView::message_ref
 /// [`is_banned`]: RouterView::is_banned
 /// [`policy`]: RouterView::policy
+/// [`thread_budget`]: RouterView::thread_budget
 /// [`link_state`]: RouterView::link_state
 /// [`community_key_configured`]: RouterView::community_key_configured
 /// [`RefuseReason::PolicyUnavailable`]: crate::RefuseReason::PolicyUnavailable
@@ -111,15 +115,24 @@ pub trait RouterView {
     /// reply the router asks about the thread root.
     fn is_reply_to_agent(&self, msg: &MsgRef, agent: AgentId) -> bool;
 
-    /// The agent's allow and deny rules and effective hop cap, or `None` if
-    /// the view doesn't have them. An agent with no rules set has
-    /// [`AgentPolicy::default`], which allows everyone; `None` refuses.
+    /// The agent's allow and deny rules, effective hop cap and daily turn
+    /// cap with the turns it took today, or `None` if the view doesn't have
+    /// them. An agent with no rules or limits set has
+    /// [`AgentPolicy::default`] with the global hop cap, which allows
+    /// everyone; `None` refuses.
     fn policy(&self, agent: AgentId) -> Option<AgentPolicy>;
 
     /// Whether a community admin banned the requester: the member it names,
     /// or the member its key belongs to. `None` if the view doesn't know,
-    /// which refuses.
+    /// which refuses. A view may exempt a requester by their key, as
+    /// agentd's does a community admin.
     fn is_banned(&self, requester: &Requester) -> Option<bool>;
+
+    /// What agents have spent in the thread the event is in, every agent's
+    /// turns counted, and the community's caps on it, or `None` if the view
+    /// doesn't know, which refuses. The router asks only outside one-to-one
+    /// DMs, where no other agent can answer.
+    fn thread_budget(&self) -> Option<ThreadBudget>;
 }
 
 /// A bot user agentd manages: an agent's, or the manager bot's.
@@ -203,8 +216,8 @@ impl PolicyTarget {
     }
 }
 
-/// An agent's rules: who may use it, where, and how long an agent-to-agent
-/// chain may get.
+/// An agent's rules: who may use it, where, how long an agent-to-agent
+/// chain may get, and how many turns it takes a day.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AgentPolicy {
     /// If not empty, only requesters these cover may use the agent.
@@ -212,22 +225,37 @@ pub struct AgentPolicy {
     /// Requesters these cover may not use the agent, even if `allow` covers
     /// them too.
     pub deny: Vec<PolicyTarget>,
-    /// The largest hop a turn may have. 0 turns agent-to-agent hand-off off.
+    /// The largest hop a turn may have: the global cap, lowered by the
+    /// agent's own. 0 turns agent-to-agent hand-off off.
     pub max_hops: Hop,
+    /// The most turns the agent takes a day (UTC) for anyone but its owner,
+    /// or `None` for no cap. 0 leaves it to its owner alone.
+    pub turns_per_day: Option<u32>,
+    /// The turns the agent has taken today (UTC) for anyone but its owner:
+    /// the ones [`turns_per_day`](Self::turns_per_day) caps.
+    pub turns_today: u32,
 }
 
 impl Default for AgentPolicy {
-    /// Allows everyone, with [`DEFAULT_MAX_HOPS`].
+    /// Allows everyone, with [`DEFAULT_MAX_HOPS`] and no daily cap.
     fn default() -> Self {
         Self {
             allow: Vec::new(),
             deny: Vec::new(),
             max_hops: DEFAULT_MAX_HOPS,
+            turns_per_day: None,
+            turns_today: 0,
         }
     }
 }
 
 impl AgentPolicy {
+    /// Whether the agent has taken its daily turns: false without a cap.
+    pub fn daily_cap_reached(&self) -> bool {
+        self.turns_per_day
+            .is_some_and(|cap| self.turns_today >= cap)
+    }
+
     /// Whether `requester` may use the agent in `conv`.
     ///
     /// Deny wins: a requester any deny rule covers is refused. Otherwise an
@@ -238,5 +266,44 @@ impl AgentPolicy {
     pub fn permits(&self, requester: &Requester, conv: &ConvRef) -> bool {
         let covered = |rules: &[PolicyTarget]| rules.iter().any(|r| r.covers(requester, conv));
         !covered(&self.deny) && (self.allow.is_empty() || covered(&self.allow))
+    }
+}
+
+/// What agents have spent in one thread, and the caps on it, which stop
+/// agents that keep answering each other.
+///
+/// A conversation without threads, such as a group DM on a surface without
+/// them, is one thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ThreadBudget {
+    /// Turns agents took in the thread this hour (UTC), every agent and
+    /// requester counted.
+    pub turns_this_hour: u32,
+    /// The most turns agents may take in a thread in an hour, or `None`
+    /// for no cap.
+    pub max_turns_per_hour: Option<u32>,
+    /// Tokens agents' turns used in the thread today (UTC): input and
+    /// output, cache reads left out.
+    pub tokens_today: u64,
+    /// The most tokens agents' turns may use in a thread in a day, or
+    /// `None` for no budget.
+    pub max_tokens_per_day: Option<u64>,
+}
+
+impl ThreadBudget {
+    /// The refusal the thread's caps give a new turn, if any: the turns
+    /// cap first, then the token budget.
+    pub fn exceeded(&self) -> Option<crate::RefuseReason> {
+        if let Some(max) = self.max_turns_per_hour
+            && self.turns_this_hour >= max
+        {
+            return Some(crate::RefuseReason::ThreadTurns { max });
+        }
+        if let Some(max) = self.max_tokens_per_day
+            && self.tokens_today >= max
+        {
+            return Some(crate::RefuseReason::ThreadTokens { max });
+        }
+        None
     }
 }

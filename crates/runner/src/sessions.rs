@@ -15,13 +15,14 @@ use core_types::{
 };
 use futures::{FutureExt, StreamExt};
 use sandbox::{Container, ContainerEvent, ContainerId, Sandbox, SessionSpec, SharedAccess};
-use store::{Session, SessionKind, Store};
+use store::{CostUnknown, Session, SessionKind, Store};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
+use crate::transcript::restored_cost;
 use crate::{
     ClaudeProcess, LaunchSpec, PoolConfig, ProcessConfig, Result, RunnerError, SessionStart,
     TurnOutcome, persona_dir, skills_dir,
@@ -155,6 +156,8 @@ struct Warm<H: TurnHooks> {
 /// A running container, and the process in it, if any.
 struct Held<H: TurnHooks> {
     container: Container,
+    /// The session's directory on its volume, as agentd sees it.
+    session_dir: PathBuf,
     mounts: Mounts,
     tracked: Arc<Tracked<H>>,
     process: Option<Running<H>>,
@@ -720,6 +723,13 @@ impl<H: TurnHooks> Inner<H> {
     /// running process on the turn's credential kind and model. Returns how
     /// the process was started, if it was.
     ///
+    /// A `--resume`d process counts its cost from the total the CLI will
+    /// restore only in a container started by this call, where nothing of
+    /// the agent's ran before the CLI: in a container an earlier process
+    /// ran in, a process the agent left there could rewrite the transcript
+    /// between the runner's read and the CLI's, so the first turn's cost is
+    /// unknown.
+    ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
     /// makes reading the address fail.
@@ -758,6 +768,7 @@ impl<H: TurnHooks> Inner<H> {
                 self.release_container(warm).await?;
             }
         }
+        let fresh = warm.held.is_none();
         let held = match warm.held.take() {
             Some(held) => warm.held.insert(held),
             None => {
@@ -781,6 +792,17 @@ impl<H: TurnHooks> Inner<H> {
             SessionStart::Resume
         } else {
             SessionStart::New
+        };
+        let restored = match start {
+            SessionStart::Resume if fresh => {
+                Some(restored_cost(&held.session_dir, session.id).await)
+            }
+            SessionStart::Resume => {
+                let reason = CostUnknown::ReusedContainer;
+                tracing::warn!(session = %session.id, %reason, "resuming in a container an earlier process ran in, where a process it left could change the transcript; the first turn has no cost");
+                Some(Err(reason))
+            }
+            SessionStart::New => None,
         };
         let (env, handle) = match self.process_starting(session, ip, kind).await {
             Ok(started) => started,
@@ -811,7 +833,10 @@ impl<H: TurnHooks> Inner<H> {
             Err(RunnerError::TurnTask)
         });
         match started {
-            Ok(process) => {
+            Ok(mut process) => {
+                if let Some(restored) = restored {
+                    process.count_cost_from(restored);
+                }
                 held.process = Some(Running {
                     process,
                     handle,
@@ -841,6 +866,7 @@ impl<H: TurnHooks> Inner<H> {
         let scope_permit = self.acquire(&scope_cap, Some(&volume_key)).await;
         let global_permit = self.acquire(&self.global_cap, None).await;
         let volume = self.sandbox.ensure_volume(&volume_key).await?;
+        let session_dir = volume.session_dir(session.id);
         let mut spec = SessionSpec::new(
             session.id,
             volume,
@@ -873,6 +899,7 @@ impl<H: TurnHooks> Inner<H> {
         tracing::info!(session = %session.id, container = %container.id(), "started a session container");
         Ok(Held {
             container,
+            session_dir,
             mounts,
             tracked,
             process: None,

@@ -29,10 +29,12 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use runner::{PoolConfig, ProcessConfig, SessionConfig, SessionManager};
 use sandbox::{DockerSandbox, Sandbox};
+use time::OffsetDateTime;
 
 use crate::app::App;
 use crate::commands::SessionControl;
 use crate::config::Config;
+use crate::policy::Limits;
 
 pub use billing::{
     COMMUNITY_KEY_REFUSED_TEXT, COMMUNITY_USAGE_LIMIT_TEXT, FAILURE_DM_INTERVAL,
@@ -43,7 +45,7 @@ pub use message::HISTORY_LIMIT;
 pub use run::{
     DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_OWNER, DEFAULT_QUEUE_PER_THREAD,
     DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings,
-    RESTARTING_TEXT, TIMED_OUT_TEXT, TRUNCATED_NOTE, UNCONFIRMED_TEXT,
+    REFUSAL_DM_INTERVAL, RESTARTING_TEXT, TIMED_OUT_TEXT, TRUNCATED_NOTE, UNCONFIRMED_TEXT,
 };
 pub use surfaces::StoreSurfaces;
 
@@ -146,9 +148,10 @@ impl Turns {
 }
 
 impl PipelineSettings {
-    /// The settings `app` gives: its data directory, its manager bots, and
-    /// `[runner]`'s working emoji and models, with the default queue
-    /// bounds.
+    /// The settings `app` gives: its data directory, its manager bots,
+    /// `[community]`'s admins, `[runner]`'s working emoji and models, and
+    /// `[limits]`' caps, with the default queue bounds and the system
+    /// clock.
     pub fn from_app(app: &App) -> Self {
         let managers = app
             .rocketchat()
@@ -160,11 +163,14 @@ impl PipelineSettings {
         Self {
             data_dir: app.config().store.data_dir.clone(),
             managers,
+            admins: app.config().community.admins.clone(),
             working_emoji: runner.working_emoji.clone(),
             models: runner.models.clone(),
             queue_per_thread: DEFAULT_QUEUE_PER_THREAD,
             max_pending: DEFAULT_MAX_PENDING,
             max_pending_per_owner: DEFAULT_MAX_PENDING_PER_OWNER,
+            limits: Limits::from_config(&app.config().limits),
+            now: OffsetDateTime::now_utc,
         }
     }
 }

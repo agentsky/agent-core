@@ -223,9 +223,17 @@ declares `/agent`, agent apps declare no commands, and `/agent me` shows the
 manager app's name so members can notice a hijack.
 
 Loop protection is mandatory because bots hear each other: a per-thread cap on
-agent turns, a per-thread token budget, agents ignore bot messages that do not
-mention them, and only mentions from agentd-managed agents are honored (see
-[Agent-to-agent attribution](#agent-to-agent-attribution)).
+agent turns per hour, a per-thread token budget per day, both counting every
+agent in the thread, a cap on the hops of a chain, agents ignore bot messages
+that do not mention them, and only mentions from agentd-managed agents are
+honored (see [Agent-to-agent attribution](#agent-to-agent-attribution)). A
+one-to-one DM holds one agent, so its caps don't apply there. The token
+budget and the usage meter read the CLI's own figures, which the agent can
+falsify: it runs as the CLI's user and can write to its stdout and its
+transcript. So the turn caps and the hop cap, which count turns agentd
+starts, are the hard bounds on a loop, and the token budget stops agents
+that loop by mistake. The meter also keeps each turn's cost as the CLI
+reckons it, but only as a record: no limit reads it.
 
 ### Rocket.Chat
 
@@ -426,10 +434,14 @@ mentioned in someone's DM with a different bot never answers there. The
 owner's turns run only on the owner's credential: an owner without a linked
 account gets the link prompt, never the community key. Nor does anyone whose
 link broke: they are asked to link again, and nothing runs until they do. Refusals (a paused
-agent, a banned requester, the agent's deny rules, the hop cap) apply only to
+agent, a banned requester, the agent's deny rules, the hop cap, the agent's
+daily cap and the per-thread caps) apply only to
 messages that pass the gate above, so an unaddressed message never draws a
 notice, and they come before the credential, so nobody is offered a link
-prompt or a community-key turn they would then be refused. If the router
+prompt or a community-key turn they would then be refused. A refusal of the
+requester themselves (a ban, or the agent's deny rules) is told to them
+privately by the manager bot, at most once a day per agent, and never in the
+thread; the others are one line in the thread. If the router
 can't tell whether the requester is banned, or what the agent's rules are, it
 refuses rather than assume the requester is allowed. The router's rustdoc
 gives the full order.
@@ -678,7 +690,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
 | `/agent skill add <name> [source]`, `/agent skill confirm <name> <skill>`, `/agent skill rm <name> <skill>` | Owner | Manage skills; confirm the hosts a skill asks for |
 | `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where |
-| `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits |
+| `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits; `off` removes one |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
 | `/agent sessions <name>`, `/agent reset <name> [here]` | Owner | Inspect or reset sessions |
 | `/agent list [@user]` | Anyone | Agent directory |
@@ -701,6 +713,9 @@ erDiagram
     SESSION ||--o{ MESSAGE_REF : shows
     AGENT ||--o{ VOLUME : uses
     MEMBER ||--o{ USAGE : accrues
+    MEMBER ||--o| BAN : "may have"
+    AGENT ||--o| AGENT_POLICY : "limited by"
+    AGENT ||--o{ THREAD_USAGE : counts
     MEMBER ||--o{ SLACK_CONFIG_TOKEN : registers
     AGENT ||--o{ AGENT_SKILL : has
     PENDING_LOGIN }o--|| MEMBER : for
@@ -782,6 +797,29 @@ erDiagram
     USAGE {
         date day
         int turns
+        int input_tokens
+        int output_tokens
+        real cost_usd
+        text cost_unknown
+    }
+    AGENT_POLICY {
+        int turns_per_day
+        int max_hops
+        text allow_json
+        text deny_json
+    }
+    THREAD_USAGE {
+        text thread
+        date day
+        int hour
+        int agent_turns
+        int others_turns
+        int tokens
+    }
+    BAN {
+        text banned_by
+        text reason
+        timestamp created_at
     }
     PENDING_LOGIN {
         text state
@@ -822,14 +860,14 @@ for Rocket.Chat bindings.
 | Model exfiltrates the real token | The real token never enters the sandbox. |
 | A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, name each host (no wildcards), apply to that agent only, and pass the same checks as configured rules. The `Skill` tool also loads `$CLAUDE_CONFIG_DIR/commands/*.md`, which the session may write, so an agent can plant commands for its own session; it can already write `CLAUDE.md` and `settings.json` there, so that grants nothing new. Under `--setting-sources user`, the working directory's `.claude/skills` and `CLAUDE.md` are not loaded. |
 | A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
-| Agents loop on each other | Hop cap per thread, token budget per thread, ignore unmentioned bot messages. |
+| Agents loop on each other | Hop cap per chain, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Dedicated roles (a custom role with a license, or the built-in `bot` and `app` roles on the Community Edition) instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
 | Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo, for a binding still being created, and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals, answered challenges and retried deliveries are logged at most once a minute per app. |
 | Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel and group DM messages at ingress, thread replies under another user's root included, and never logs message content. |
-| An agent's owner forges its app's events | Each agent's app is created with its owner's configuration token, so the owner can read the app's signing secret, client secret and bot token at api.slack.com. With the signing secret they can sign a `message` event with any sender, conversation, kind, thread, mentions and files: a copy of a linked member's message with a mention added, to run a turn on that member's Claude plan; a message in another member's DM with the agent, to resume that member's scope; an agent's post with a mention added, to inherit the requester recorded for it; or a message from themselves in another member's thread or DM, to resume, reset or replace that member's session. So Slack's copy is the source of truth: before agentd acts on any message it doesn't ignore (a turn, a link prompt or a refusal), whoever the event says sent it, the owner included, it reads the message back from Slack over TLS with the app's bot token (`conversations.history`, or `conversations.replies` in the thread the event names, at exactly that `ts`), takes the conversation's kind from `conversations.info` (cached per channel for an hour, and refused unless Slack's channel id is the event's exactly), normalizes Slack's copy with the ingress's own rules, and routes that copy again. It acts only if the copy is the same message in the same thread and routes to the same decision, and then acts on the copy. What the forged event said decides nothing. A message older than 15 minutes when its event arrived is acknowledged and dropped before it is recorded, since deduplication forgets a message after an hour and messages from before the bot joined never had one. A copy Slack doesn't have, won't show or that routes differently is dropped silently. An unreachable Slack or a rate limit drops the message and tells the thread to try again. A bot's post that was edited is refused, since agentd never edits its agents' posts. An edited message runs once, with its text when its turn comes; the edit starts no turn of its own, and a deleted message is dropped. The cost is one cached `conversations.info` per channel plus one Tier 3 read per message not ignored, on the agent's own token. Forged events slow or refuse only their owner's own agents: each agent's app has at most 32 requests in flight, from the ack until its message reaches the pipeline, one owner's agents' apps together 64, and each app gets 503 past that or past a rate of 100 at once then 8 a second, near Slack's own ceiling for one app; one owner's apps together keep 200 messages at once then 16 a second, and drop the rest after their 200, but only messages an agent's app keeps count, and outside one-to-one DMs it keeps only mentions of its bot and replies in threads its bot may have started, so busy channels and threads one owner's agents share take from that owner's bucket only what may be addressed to one of them, however many agents are there; each deduplication key is made of ids shaped like Slack's, or the body gets 400, so the rows one owner can add to the shared store are at most about a hundred bytes each, at 16 a second, kept an hour, about 60,000 rows or 20 MB at most, and only for messages; each app's messages reach the pipeline in a lane of their own, so the `bots.info` lookup of a sender known only by a made-up bot id holds up only that app's, and a message whose bot id isn't shaped like Slack's is dropped after its 200, with a throttled warning, before it is looked up or cached; an event keeps at most 160 KB of text, 10 files and 100 mentions, each id shaped like Slack's, so the 64 messages one owner's apps may have in flight hold at most about 14 MB; the lookups never wait for the token's quota or retry a 429 (past it, a bot sender stays unknown and is ignored, and the thread gets the "try again" line, posted like the busy line in a task that holds no place); one owner's agents, however many, hold at most 16 of the pipeline's 64 places and post 8 such lines at once; the warnings a flood causes, confirmations that fail included, are logged once a minute per agent; and the workspace's shared member list is read only with the manager app's token, never an agent's, which its owner could revoke or exhaust. Only several owners flooding together (four for the pipeline's places, 16 for the ingress's 1024) could take what other agents need. The owner's bot token still reads every conversation the bot is in, so confirming protects other members' sessions, scopes and bills, not what the bot can read. The manager app's secret stays with the operators, so its requests aren't read back. |
+| An agent's owner forges its app's events | Each agent's app is created with its owner's configuration token, so the owner can read the app's signing secret, client secret and bot token at api.slack.com. With the signing secret they can sign a `message` event with any sender, conversation, kind, thread, mentions and files: a copy of a linked member's message with a mention added, to run a turn on that member's Claude plan; a message in another member's DM with the agent, to resume that member's scope; an agent's post with a mention added, to inherit the requester recorded for it; or a message from themselves in another member's thread or DM, to resume, reset or replace that member's session. So Slack's copy is the source of truth: before agentd acts on any message it doesn't ignore (a turn, a link prompt or a refusal), whoever the event says sent it, the owner included, it reads the message back from Slack over TLS with the app's bot token (`conversations.history`, or `conversations.replies` in the thread the event names, at exactly that `ts`), takes the conversation's kind from `conversations.info` (cached per channel for an hour, and refused unless Slack's channel id is the event's exactly), normalizes Slack's copy with the ingress's own rules, and routes that copy again. It acts only if the copy is the same message in the same thread and routes to the same decision, a limit's refusal aside (the counts a limit reads can change between the two routings), and then acts on the copy. What the forged event said decides nothing. A message older than 15 minutes when its event arrived is acknowledged and dropped before it is recorded, since deduplication forgets a message after an hour and messages from before the bot joined never had one. A copy Slack doesn't have, won't show or that routes differently is dropped silently. An unreachable Slack or a rate limit drops the message and tells the thread to try again. A bot's post that was edited is refused, since agentd never edits its agents' posts. An edited message runs once, with its text when its turn comes; the edit starts no turn of its own, and a deleted message is dropped. The cost is one cached `conversations.info` per channel plus one Tier 3 read per message not ignored, on the agent's own token. Forged events slow or refuse only their owner's own agents: each agent's app has at most 32 requests in flight, from the ack until its message reaches the pipeline, one owner's agents' apps together 64, and each app gets 503 past that or past a rate of 100 at once then 8 a second, near Slack's own ceiling for one app; one owner's apps together keep 200 messages at once then 16 a second, and drop the rest after their 200, but only messages an agent's app keeps count, and outside one-to-one DMs it keeps only mentions of its bot and replies in threads its bot may have started, so busy channels and threads one owner's agents share take from that owner's bucket only what may be addressed to one of them, however many agents are there; each deduplication key is made of ids shaped like Slack's, or the body gets 400, so the rows one owner can add to the shared store are at most about a hundred bytes each, at 16 a second, kept an hour, about 60,000 rows or 20 MB at most, and only for messages; each app's messages reach the pipeline in a lane of their own, so the `bots.info` lookup of a sender known only by a made-up bot id holds up only that app's, and a message whose bot id isn't shaped like Slack's is dropped after its 200, with a throttled warning, before it is looked up or cached; an event keeps at most 160 KB of text, 10 files and 100 mentions, each id shaped like Slack's, so the 64 messages one owner's apps may have in flight hold at most about 14 MB; the lookups never wait for the token's quota or retry a 429 (past it, a bot sender stays unknown and is ignored, and the thread gets the "try again" line, posted like the busy line in a task that holds no place); one owner's agents, however many, hold at most 16 of the pipeline's 64 places and post 8 such lines at once; the warnings a flood causes, confirmations that fail included, are logged once a minute per agent; and the workspace's shared member list is read only with the manager app's token, never an agent's, which its owner could revoke or exhaust. Only several owners flooding together (four for the pipeline's places, 16 for the ingress's 1024) could take what other agents need. The owner's bot token still reads every conversation the bot is in, so confirming protects other members' sessions, scopes and bills, not what the bot can read. The manager app's secret stays with the operators, so its requests aren't read back. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 
 ## Crate layout

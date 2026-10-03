@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use core_types::{CredentialKind, SessionId};
 use sandbox::{ChildHandle, Container, ContainerId, ExitStatus, Sandbox};
+use store::CostUnknown;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 
@@ -137,7 +138,7 @@ pub struct ClaudeProcess {
     stdout: BufReader<Pin<Box<dyn AsyncRead + Send>>>,
     state: State,
     line: Vec<u8>,
-    process_total_cost_usd: f64,
+    process_total_cost_usd: Result<f64, CostUnknown>,
 }
 
 impl std::fmt::Debug for ClaudeProcess {
@@ -210,8 +211,17 @@ impl ClaudeProcess {
             child: io.child,
             state: State::Idle,
             line: Vec::new(),
-            process_total_cost_usd: 0.0,
+            process_total_cost_usd: Ok(0.0),
         })
+    }
+
+    /// Counts the process's cost from `restored`, the total the CLI
+    /// restores for a `--resume`d session, so the first result's
+    /// [`cost_usd`](crate::TurnResult::cost_usd) is the turn's own too.
+    /// Why not, when that total isn't known: the first result's cost is
+    /// then unknown for that reason. Call it before the first turn.
+    pub fn count_cost_from(&mut self, restored: Result<f64, CostUnknown>) {
+        self.process_total_cost_usd = restored;
     }
 
     /// The session the process runs.
@@ -278,9 +288,11 @@ impl ClaudeProcess {
     ///
     /// The result's [`cost_usd`](crate::TurnResult::cost_usd) is the turn's
     /// own: the CLI reports a running total for the process, and the
-    /// process keeps the previous total to take it off. On the first turn
-    /// of a process started with [`SessionStart::Resume`] it also holds
-    /// what the CLI restored (see
+    /// process keeps the previous total to take it off. A process started
+    /// with [`SessionStart::Resume`] starts that total from what the CLI
+    /// restored only once told it with
+    /// [`count_cost_from`](Self::count_cost_from); until then its first
+    /// result's cost holds the restored total too (see
     /// [`process_total_cost_usd`](crate::TurnResult::process_total_cost_usd)).
     ///
     /// Neither the message nor any line of output is logged. One log line
@@ -423,7 +435,8 @@ impl ClaudeProcess {
             exit_code,
             running = self.is_running(),
             may_be_alive = self.may_be_alive(),
-            cost_usd = result.and_then(|r| r.cost_usd),
+            cost_usd = result.and_then(|r| r.cost_usd.ok()),
+            cost_unknown = result.and_then(|r| r.cost_usd.err()).map(CostUnknown::as_str),
             init_seen = stats.init_seen,
             assistant_messages = stats.assistant_messages,
             tool_calls = ?stats.tool_calls,
@@ -539,7 +552,7 @@ mod tests {
             stdout: BufReader::new(io.stdout),
             state: State::Idle,
             line: Vec::new(),
-            process_total_cost_usd: 0.0,
+            process_total_cost_usd: Ok(0.0),
         };
         drop(process);
         assert!(

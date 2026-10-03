@@ -2341,14 +2341,18 @@ protection), [Security](design.md#security) (agents loop).
 
 Deliverables:
 
-- A migration `…_usage.sql` with four tables:
+- A migration `…_usage.sql` with five tables:
   - `usage` (`member_id`, `day`, `turns`, `input_tokens`, `output_tokens`,
-    `cost_usd`), keyed `(member_id, day)`.
+    `cost_usd`, `cost_unknown`), keyed `(member_id, day, cost_unknown)`.
   - `agent_policies` (`agent_id`, `turns_per_day`, `max_hops`, `allow_json`,
     `deny_json`).
   - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
-    `day`, `agent_turns`, `tokens`), for the per-thread caps.
+    `day`, `hour`, `agent_id`, `agent_turns`, `others_turns`, `tokens`),
+    for the per-thread caps and each agent's daily cap
+    ([impl-notes](impl-notes.md#one-table-counts-threads-and-agents)).
   - `bans` (`member_id`, `banned_by`, `reason`, `created_at`).
+  - `limit_notices`, so a capped agent tells a thread once per window
+    ([impl-notes](impl-notes.md#a-capped-agent-says-so-once-per-thread-and-window)).
 - The meter accrues per requester from each `TurnOutcome`'s usage and
   `cost_usd`, which is the turn's own, not the CLI's running total, except
   on the first turn of a process started with `--resume`: the CLI restores
@@ -2358,25 +2362,41 @@ Deliverables:
   line read without following links and with its size capped, or from a
   total the runner keeps in `sessions` when a process exits cleanly
   ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)),
-  and makes `fake-claude` restore the total as the real CLI does.
-  `/agent me` shows today's and this month's turns and tokens.
+  and makes `fake-claude` restore the total as the real CLI does. The runner
+  reads the line when it starts a `--resume`d process
+  ([impl-notes](impl-notes.md#the-runner-reads-the-restored-total-from-the-transcript)).
+  Tokens are the input the model read fresh (uncached input and cache
+  writes) plus output; cache reads aren't counted
+  ([impl-notes](impl-notes.md#cache-reads-arent-tokens-the-meter-counts)).
+  `/agent me` shows today's and this month's turns and tokens (UTC).
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
+  Either setting may be `off`. The cap limits and counts requests from
+  anyone but the owner
+  ([impl-notes](impl-notes.md#the-owner-is-never-capped-by-their-own-agents-limit)).
   `AgentPolicy::max_hops` is the effective cap, the global one lowered by the
   agent's, and allow and deny follow `AgentPolicy::permits` (T22). This task
-  extends T22's `AgentPolicy` with the daily turn cap and `RefuseReason`
-  with a variant for it, and fills `policy` and `is_banned` from these
-  tables, returning `None` only when a lookup fails, never for an agent or
-  member with no rows.
+  extends T22's `AgentPolicy` with the daily turn cap and the turns taken
+  today, and `RefuseReason` with a variant for it, and fills `policy` and
+  `is_banned` from these tables, returning `None` only when a lookup fails,
+  never for an agent or member with no rows.
 - `/agent allow|deny <name> <target>`. A target is a member (`@user`), a
   channel (`#room`), or `everyone`. A member rule stores the identity and
   the member it belongs to, as `PolicyTarget::Member { key, member }`, so it
   covers the member on every surface. Deny wins, and the default allows
-  everyone.
+  everyone. `deny` never takes a target off the allow list, so it never
+  lets anyone in, `allow` of a denied target only lifts the deny, and
+  `allow everyone` empties the allow list
+  ([impl-notes](impl-notes.md#allow-and-deny-undo-each-other)).
 - Thread caps from `[limits]`:
-  - Agent turns per thread per hour.
-  - A token budget per thread per day.
-  - A global hop cap. Per-agent `hops` can only lower it.
+  - Agent turns per thread per hour (`thread_turns_per_hour`).
+  - A token budget per thread per day (`thread_tokens_per_day`).
+  - A global hop cap (`max_hops`). Per-agent `hops` can only lower it.
+
+  The router reads the first two through a new `RouterView::thread_budget`,
+  refusing with `RefuseReason::ThreadTurns` or `ThreadTokens`, for every
+  requester and every agent in the thread, but not in a one-to-one DM
+  ([impl-notes](impl-notes.md#thread-caps-count-every-agent-and-skip-one-to-one-dms)).
 - `/agent admin ban @user [reason]` and `/agent admin unban @user`, for
   community admins (T26's `[community] admins`). The router refuses a
   banned member's turns through `RouterView::is_banned`, and a ban also
@@ -2923,6 +2943,22 @@ Not scheduled. Each needs a decision before it becomes a task.
   credential while turn N+1 runs, whoever its requester is. Only killing
   the processes a turn leaves behind in the container when it ends removes
   that.
+- **Metering at the credential proxy.** T27's meter and thread token
+  budget read tokens and cost from the CLI's output, and the agent runs as
+  the CLI's user, so it can print its own `assistant` and `result` lines
+  and write the transcript the CLI restores its cost from. The turn caps
+  and the hop cap are the hard bounds on a loop; tokens are not. [T34](#t34)'s
+  acceptance ("the thread token budget from T27 stops a chain") holds for
+  agents that loop by mistake, not for one that forges its counts. Counting
+  each turn's tokens and cost from the API responses the credential proxy
+  (T18) forwards, keyed by the turn's placeholder, would make the budget
+  and the meter hard bounds too. The same stdout lets the agent print a
+  forged `result` line, which ends its turn early with its own reply; the
+  CLI's real result is then read as the next turn's, so the next
+  requester gets this turn's reply and pays its cost. Reading turns from a
+  channel the agent can't write would close that as well. It would also
+  bill the turns T27 records with an unknown cost, such as every resumed
+  process's first turn once a long thread's transcript passes 5 MiB.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private

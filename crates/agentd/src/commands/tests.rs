@@ -37,6 +37,15 @@ const CODE: &str = "SECRETCODE-4f2a9c";
 const API_KEY: &str = "sk-ant-api03-SECRETKEY-77b1";
 /// The one community admin.
 const ADMIN: &str = "root";
+/// `me`'s usage line for someone nothing was billed to.
+const NO_USAGE: &str = "Usage billed to you today: 0 turns, 0 tokens. This month: 0 turns, \
+                        0 tokens (days start at midnight UTC).";
+
+/// What `me` answers `status`, the line on the Claude account, followed by
+/// the usage line for someone nothing was billed to.
+fn me(status: &str) -> String {
+    format!("{status}\n{NO_USAGE}")
+}
 
 fn key(user: &str) -> MemberKey {
     MemberKey {
@@ -374,7 +383,7 @@ async fn one_members_commands_run_in_order_without_holding_up_others() {
         "{texts:?}"
     );
     assert_eq!(texts[2], "Your Claude account is linked. Plan: Claude Max.");
-    assert_eq!(texts[3], "Claude account: linked. Plan: Claude Max.");
+    assert_eq!(texts[3], me("Claude account: linked. Plan: Claude Max."));
     assert_eq!(h.replies_to("bob").len(), 1);
 }
 
@@ -533,7 +542,7 @@ async fn me_reports_linked_unlinked_and_broken_members() {
     h.dm("stranger", "me").await;
     assert_eq!(
         h.last_reply("stranger"),
-        "Claude account: not linked. Send `login` to link one."
+        me("Claude account: not linked. Send `login` to link one.")
     );
     assert_eq!(h.member("stranger").await, None);
 
@@ -541,14 +550,14 @@ async fn me_reports_linked_unlinked_and_broken_members() {
     h.channel("alice", "me").await;
     assert_eq!(
         h.last_reply("alice"),
-        "Claude account: linked. Plan: Claude Pro."
+        me("Claude account: linked. Plan: Claude Pro.")
     );
 
     h.linked_member("carol", "claude_galaxy").await;
     h.dm("carol", "me").await;
     assert_eq!(
         h.last_reply("carol"),
-        "Claude account: linked. Plan: `claude_galaxy`."
+        me("Claude account: linked. Plan: `claude_galaxy`.")
     );
 
     h.store
@@ -558,7 +567,7 @@ async fn me_reports_linked_unlinked_and_broken_members() {
     h.dm("alice", "me").await;
     assert_eq!(
         h.last_reply("alice"),
-        "Claude account: linked, but it stopped working. Send `login` to link it again."
+        me("Claude account: linked, but it stopped working. Send `login` to link it again.")
     );
 }
 
@@ -617,8 +626,8 @@ async fn a_failed_exchange_and_a_failed_store_get_generic_replies() {
 #[tokio::test]
 async fn commands_that_come_later_say_so() {
     let h = harness().await;
-    h.dm(ADMIN, "admin ban @alice").await;
-    assert_eq!(h.last_reply(ADMIN), "`admin ban` isn't available yet.");
+    h.dm(ADMIN, "admin slack").await;
+    assert_eq!(h.last_reply(ADMIN), "`admin slack` isn't available yet.");
 }
 
 #[tokio::test]
@@ -2160,4 +2169,422 @@ async fn the_intake_waits_for_a_queued_reset_when_it_stops() {
         .unwrap();
     assert!(h.is_reset(&s.thread).await);
     assert_eq!(h.replies_to("alice").len(), 1, "no reset failed");
+}
+
+/// Alice's agent `helper`, and bob, a member with no link, as `BOB`, an id
+/// a `<@BOB>` token names.
+async fn helper_and_bob(h: &Harness) -> (core_types::AgentId, core_types::MemberId) {
+    let alice = h
+        .store
+        .ensure_member(&key("alice"), "alice", at(0))
+        .await
+        .unwrap();
+    let helper = h.agent(alice).await;
+    let bob = h
+        .store
+        .ensure_member(&key("BOB"), "bob", at(0))
+        .await
+        .unwrap();
+    (helper, bob)
+}
+
+#[tokio::test]
+async fn limits_are_the_owners_and_change_one_setting_at_a_time() {
+    let h = harness().await;
+    let (helper, _) = helper_and_bob(&h).await;
+    h.dm("BOB", "limits helper turns=5").await;
+    assert_eq!(
+        h.last_reply("BOB"),
+        "You have no agent named `helper`. Only an agent's owner can change it."
+    );
+    assert_eq!(
+        h.store.agent_settings(helper).await.unwrap(),
+        store::AgentSettings::default()
+    );
+
+    h.dm("alice", "limits helper turns=50/day hops=2").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` takes at most 50 requests a day from anyone but you (the day starts at \
+         midnight UTC), and agents can hand work to it along chains of at most 2 hops."
+    );
+    h.dm("alice", "limits helper hops=7").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` takes at most 50 requests a day from anyone but you (the day starts at \
+         midnight UTC), and the community's limit of 3 agent-to-agent hops applies, since \
+         hops=7 isn't lower."
+    );
+    let settings = h.store.agent_settings(helper).await.unwrap();
+    assert_eq!(
+        (settings.turns_per_day, settings.max_hops),
+        (Some(50), Some(7))
+    );
+
+    h.dm("alice", "limits helper turns=0 hops=0").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` takes requests from you only, and no other agent can hand work to it."
+    );
+    h.dm("alice", "limits helper turns=off hops=off").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "`helper` has no daily limit, and the community's limit of 3 agent-to-agent hops \
+         applies."
+    );
+    let settings = h.store.agent_settings(helper).await.unwrap();
+    assert_eq!((settings.turns_per_day, settings.max_hops), (None, None));
+}
+
+#[tokio::test]
+async fn the_community_hop_limit_comes_from_the_configuration() {
+    let h = harness().await;
+    helper_and_bob(&h).await;
+    let commands = h.commands.clone().with_limits(crate::policy::Limits {
+        max_hops: core_types::Hop(1),
+        ..crate::policy::Limits::default()
+    });
+    let origin = Origin::RocketChatDm {
+        room: dm_room("alice").into(),
+    };
+    commands
+        .handle_text(&key("alice"), "limits helper hops=2", &origin, &[])
+        .await;
+    assert!(
+        h.last_reply("alice").ends_with(
+            "the community's limit of 1 agent-to-agent hops applies, since hops=2 isn't lower."
+        ),
+        "{}",
+        h.last_reply("alice")
+    );
+}
+
+#[tokio::test]
+async fn allow_and_deny_change_the_owners_rules() {
+    let h = harness().await;
+    let (helper, bob) = helper_and_bob(&h).await;
+    let policy = async || {
+        crate::policy::agent_policy(
+            &h.store.agent_settings(helper).await.unwrap(),
+            &crate::policy::Limits::default(),
+            0,
+        )
+        .unwrap()
+    };
+
+    h.dm("alice", "deny helper <@BOB>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Everyone may use `helper`, except `@BOB`."
+    );
+    assert_eq!(
+        policy().await.deny,
+        [router::PolicyTarget::Member {
+            key: key("BOB"),
+            member: Some(bob),
+        }],
+        "the rule keeps the member, so it covers their other identities"
+    );
+    h.dm("alice", "deny helper <@BOB>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Everyone may use `helper`, except `@BOB`."
+    );
+
+    h.dm("alice", "allow helper <@BOB>").await;
+    assert_eq!(h.last_reply("alice"), "Everyone may use `helper`.");
+    h.dm("alice", "allow helper <@CAROL>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you and `@CAROL` may use `helper`."
+    );
+    assert_eq!(
+        policy().await.allow,
+        [router::PolicyTarget::Member {
+            key: key("CAROL"),
+            member: None,
+        }]
+    );
+    h.dm("alice", "allow helper <#GENERAL>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "I don't know `#GENERAL`. Name a public channel agentd can see.",
+        "on Rocket.Chat a channel token is looked up, never taken as it is"
+    );
+
+    h.dm("alice", "deny helper everyone").await;
+    assert_eq!(h.last_reply("alice"), "Only you may use `helper`.");
+    h.dm("alice", "allow helper <@DAVE>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you may use `helper`. `everyone` is denied, which wins over any allow: to let \
+         only your allowed targets use it, send `allow helper everyone` first, then allow them \
+         again."
+    );
+    h.dm("alice", "allow helper everyone").await;
+    assert_eq!(h.last_reply("alice"), "Everyone may use `helper`.");
+    assert_eq!(policy().await, router::AgentPolicy::default());
+
+    h.dm("alice", "allow helper @dave").await;
+    assert_eq!(h.last_reply("alice"), "I don't know `@dave`.");
+    h.dm("alice", "deny helper #random").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "I don't know `#random`. Name a public channel agentd can see."
+    );
+    h.dm("BOB", "deny helper everyone").await;
+    assert_eq!(
+        h.last_reply("BOB"),
+        "You have no agent named `helper`. Only an agent's owner can change it."
+    );
+    assert_eq!(policy().await, router::AgentPolicy::default());
+}
+
+#[tokio::test]
+async fn a_room_agentd_cant_find_is_found_among_the_rules_by_its_name() {
+    let h = harness().await;
+    let (helper, _) = helper_and_bob(&h).await;
+    let mut rules = crate::policy::Rules::default();
+    rules.allow(crate::policy::Rule::Room {
+        conv: conv("GENERAL"),
+        label: "#general".into(),
+    });
+    rules.deny(crate::policy::Rule::Room {
+        conv: conv("SECRET"),
+        label: "#secret".into(),
+    });
+    h.store
+        .update_agent_settings(helper, |settings| rules.write(settings))
+        .await
+        .unwrap();
+    h.dm("alice", "allow helper #secret").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you and `#general`, `#secret` may use `helper`.",
+        "a channel made private since it was denied can still be allowed by name"
+    );
+    h.dm("alice", "deny helper #secret").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Only you and `#general` may use `helper`, except `#secret`."
+    );
+    h.dm("alice", "deny helper #other").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "I don't know `#other`. Name a public channel agentd can see."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn changes_sent_at_once_are_all_kept() {
+    let h = harness().await;
+    let (helper, _) = helper_and_bob(&h).await;
+    let mut texts: Vec<String> = (0..8).map(|n| format!("allow helper <@U{n}>")).collect();
+    texts.push("limits helper turns=5".to_owned());
+    texts.push("limits helper hops=1".to_owned());
+    futures::future::join_all(texts.iter().map(|text| h.dm("alice", text))).await;
+    let settings = h.store.agent_settings(helper).await.unwrap();
+    let rules = crate::policy::Rules::read(&settings).unwrap();
+    assert_eq!(rules.allow.len(), 8, "{rules:?}");
+    assert_eq!(
+        (settings.turns_per_day, settings.max_hops),
+        (Some(5), Some(1))
+    );
+}
+
+#[tokio::test]
+async fn unreadable_rules_are_cleared_by_allow_everyone() {
+    let h = harness().await;
+    let (helper, _) = helper_and_bob(&h).await;
+    h.store
+        .update_agent_settings(helper, |settings| settings.allow_json = "not json".into())
+        .await
+        .unwrap();
+    h.dm("alice", "deny helper <@BOB>").await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "I can't read `helper`'s rules, so it refuses everyone, you too. Send `allow helper \
+         everyone` to clear them."
+    );
+    h.dm("alice", "allow helper everyone").await;
+    assert_eq!(h.last_reply("alice"), "Everyone may use `helper`.");
+    assert_eq!(
+        h.store.agent_settings(helper).await.unwrap(),
+        store::AgentSettings::default()
+    );
+}
+
+#[tokio::test]
+async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
+    let h = harness().await;
+    let (_, bob) = helper_and_bob(&h).await;
+
+    h.dm("alice", "admin ban <@BOB> spam").await;
+    assert_eq!(h.last_reply("alice"), admin::NOT_AN_ADMIN);
+    assert!(!h.store.is_banned(bob).await.unwrap());
+
+    h.dm(ADMIN, "admin ban <@BOB> posts spam\nall day").await;
+    assert_eq!(
+        h.last_reply(ADMIN),
+        "Banned `@BOB`. Agents refuse their requests, and they can only run `me`, `logout`, \
+         and `pause` or `delete` their agents. Undo it with `admin unban`."
+    );
+    let ban = h.store.ban(bob).await.unwrap().unwrap();
+    assert_eq!(ban.banned_by, key(ADMIN));
+    assert_eq!(ban.reason.as_deref(), Some("posts spam\nall day"));
+    h.dm(ADMIN, "admin ban <@BOB>").await;
+    assert_eq!(h.last_reply(ADMIN), "`@BOB` is banned already.");
+
+    h.dm("BOB", "list").await;
+    assert_eq!(h.last_reply("BOB"), BANNED);
+    h.dm("BOB", "login").await;
+    assert_eq!(h.last_reply("BOB"), BANNED);
+    h.dm("BOB", "me").await;
+    assert_eq!(
+        h.last_reply("BOB"),
+        format!(
+            "{}\nA community admin banned you: agents won't take your requests, and you can \
+             only run `me`, `logout`, and `pause` or `delete` your agents. Reason: posts spam \
+             all day",
+            me("Claude account: not linked. Send `login` to link one.")
+        )
+    );
+    h.channel("BOB", &format!("login {CODE}#state")).await;
+    assert!(
+        h.last_reply("BOB")
+            .starts_with("You posted a secret in a room others can read."),
+        "a banned member is still told a secret they posted is public"
+    );
+
+    h.dm(ADMIN, "admin unban <@BOB>").await;
+    assert_eq!(h.last_reply(ADMIN), "Unbanned `@BOB`.");
+    h.dm(ADMIN, "admin unban <@BOB>").await;
+    assert_eq!(h.last_reply(ADMIN), "`@BOB` isn't banned.");
+    h.dm(ADMIN, "admin unban <@NOBODY>").await;
+    assert_eq!(h.last_reply(ADMIN), "`@NOBODY` isn't banned.");
+    h.dm("BOB", "list").await;
+    assert_ne!(h.last_reply("BOB"), BANNED);
+}
+
+#[tokio::test]
+async fn a_ban_creates_the_member_and_admins_cant_be_banned() {
+    let h = harness().await;
+    h.dm(ADMIN, "admin ban <@NEWCOMER>").await;
+    assert!(h.last_reply(ADMIN).starts_with("Banned `@NEWCOMER`."));
+    let member = h.member("NEWCOMER").await.unwrap();
+    assert!(h.store.is_banned(member).await.unwrap());
+
+    let commands = h.commands.clone().with_admins([key(ADMIN), key("OTHER")]);
+    let origin = Origin::RocketChatDm {
+        room: dm_room(ADMIN).into(),
+    };
+    commands
+        .handle_text(&key(ADMIN), "admin ban <@OTHER>", &origin, &[])
+        .await;
+    assert_eq!(
+        h.last_reply(ADMIN),
+        "`@OTHER` is a community admin, and admins can't be banned. Take them off \
+         `[community] admins` first."
+    );
+    h.dm(ADMIN, "admin ban @someone").await;
+    assert_eq!(h.last_reply(ADMIN), "I don't know `@someone`.");
+    let long = "x".repeat(admin::MAX_BAN_REASON_CHARS + 1);
+    h.dm(ADMIN, &format!("admin ban <@LATE> {long}")).await;
+    assert_eq!(
+        h.last_reply(ADMIN),
+        "A reason is at most 500 characters. I didn't ban `@LATE`."
+    );
+    assert_eq!(h.member("LATE").await, None);
+}
+
+#[tokio::test]
+async fn a_banned_owner_may_still_take_away_and_an_admin_is_never_held_back() {
+    let h = harness().await;
+    helper_and_bob(&h).await;
+    let alice = h.member("alice").await.unwrap();
+    h.store
+        .ban_member(alice, &key(ADMIN), None, at(1))
+        .await
+        .unwrap();
+    for text in ["logout", "pause helper", "delete nothing"] {
+        h.dm("alice", text).await;
+        assert_ne!(h.last_reply("alice"), BANNED, "{text}");
+    }
+    for text in [
+        "limits helper turns=1",
+        "allow helper everyone",
+        "resume helper",
+    ] {
+        h.dm("alice", text).await;
+        assert_eq!(h.last_reply("alice"), BANNED, "{text}");
+    }
+
+    let admin = h
+        .store
+        .ensure_member(&key(ADMIN), ADMIN, at(1))
+        .await
+        .unwrap();
+    h.store
+        .ban_member(admin, &key("OTHER"), None, at(1))
+        .await
+        .unwrap();
+    h.dm(ADMIN, "list").await;
+    assert_ne!(h.last_reply(ADMIN), BANNED);
+    h.dm(ADMIN, "me").await;
+    assert!(
+        !h.last_reply(ADMIN).contains("banned"),
+        "{}",
+        h.last_reply(ADMIN)
+    );
+}
+
+#[tokio::test]
+async fn me_shows_what_was_billed_today_and_this_month() {
+    let h = harness().await;
+    let (helper, bob) = helper_and_bob(&h).await;
+    let thread = core_types::ThreadKey {
+        conv: conv("GENERAL"),
+        root: None,
+    };
+    let now = OffsetDateTime::now_utc();
+    let today = now.replace_time(time::Time::MIDNIGHT);
+    let earlier = if today.day() > 1 {
+        today - time::Duration::days(1)
+    } else {
+        today
+    };
+    for (at, input) in [
+        (now, 100),
+        (now, 20),
+        (earlier, 3),
+        (today - time::Duration::days(40), 7),
+    ] {
+        h.store
+            .record_turn_usage(
+                bob,
+                helper,
+                &thread,
+                store::TurnUsage {
+                    input_tokens: input,
+                    output_tokens: 1,
+                    cost: Ok(0.5),
+                },
+                false,
+                at,
+            )
+            .await
+            .unwrap();
+    }
+    h.dm("BOB", "me").await;
+    let reply = h.last_reply("BOB");
+    let usage = reply.lines().nth(1).unwrap();
+    let today_turns = if earlier == today { 3 } else { 2 };
+    let today_tokens = if earlier == today { 126 } else { 122 };
+    assert_eq!(
+        usage,
+        format!(
+            "Usage billed to you today: {today_turns} turns, {today_tokens} tokens. This month: \
+             3 turns, 126 tokens (days start at midnight UTC)."
+        )
+    );
 }

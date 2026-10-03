@@ -775,6 +775,17 @@ impl RestClient {
             .ok_or_else(|| SurfaceError::NotFound("room".into()))
     }
 
+    /// `GET rooms.info` by the room's name, such as `general` for
+    /// `#general`. Rocket.Chat answers for a public channel, and for a
+    /// private group only if this client's user is in it.
+    pub async fn room_by_name(&self, name: &str) -> Result<RoomInfo> {
+        let info: RoomEnvelope = self
+            .call(Call::get("rooms.info").query("roomName", name))
+            .await?;
+        info.room
+            .ok_or_else(|| SurfaceError::NotFound("room".into()))
+    }
+
     /// `GET subscriptions.get`: every room this client's user belongs to.
     pub async fn subscriptions(&self) -> Result<Vec<Subscription>> {
         let found: SubscriptionsEnvelope = self.call(Call::get("subscriptions.get")).await?;
