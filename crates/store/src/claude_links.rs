@@ -473,7 +473,7 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_puts_take_distinct_generations() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let member = store
             .ensure_member(&member_key("u1"), "Ada", at(1_000))

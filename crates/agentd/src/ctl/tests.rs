@@ -11,7 +11,7 @@ use core_types::{
 use http_body_util::BodyExt as _;
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
-use testkit::MockSurface;
+use testkit::{MockSurface, TempDir};
 use time::macros::datetime;
 use tower::ServiceExt as _;
 
@@ -28,22 +28,6 @@ const ALL_PATHS: [&str; 7] = [
     "/v1/ask-agent",
     "/v1/private",
 ];
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-ctl-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct Lookup(Arc<MockSurface>);
 
@@ -71,12 +55,12 @@ impl Fixture {
 
     async fn with(tune: impl FnOnce(&mut CtlSettings)) -> Self {
         let store = Store::open_in_memory(sealer()).await.unwrap();
-        Self::over(store, TempDir::new(), tune)
+        Self::over(store, TempDir::new("agentd-ctl"), tune)
     }
 
     fn over(store: Store, dir: TempDir, tune: impl FnOnce(&mut CtlSettings)) -> Self {
         let mut settings = CtlSettings {
-            staging_dir: dir.0.join(STAGING_DIR),
+            staging_dir: dir.join(STAGING_DIR),
             attach_max_bytes: 1024,
             lease_ttl: DEFAULT_LEASE_TTL,
         };
@@ -214,8 +198,8 @@ fn post(to: &str) -> Value {
 
 #[tokio::test]
 async fn tokens_are_stored_only_as_their_sha256_hash() {
-    let dir = TempDir::new();
-    let url = format!("sqlite://{}", dir.0.join("agentd.db").display());
+    let dir = TempDir::new("agentd-ctl");
+    let url = dir.db_url();
     let store = Store::open(&url, sealer()).await.unwrap();
     let fixture = Fixture::over(store, dir, |_| {});
     let (info, token) = fixture.process().await;
@@ -233,7 +217,7 @@ async fn tokens_are_stored_only_as_their_sha256_hash() {
 
     fixture.store.close().await;
     for name in ["agentd.db", "agentd.db-wal"] {
-        let path = fixture.dir.0.join(name);
+        let path = fixture.dir.join(name);
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
