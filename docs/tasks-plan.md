@@ -1000,9 +1000,12 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
     false` and `requirePasswordChange: false`, with a random password that is
     never stored.
   - A token for the new bot, in one of two ways. Pick the one that works with
-    the custom role on the target server version and record which in the PR:
-    - `users.createToken`. Recent servers refuse it unless the server runs
-      with `CREATE_TOKENS_FOR_USERS=true`.
+    the manager's roles from the design on the target server version and
+    record which in the PR:
+    - `users.createToken`. 7.x refuses it unless the server runs with
+      `CREATE_TOKENS_FOR_USERS=true`; 8.0 and later require a `secret` equal
+      to the server's `CREATE_TOKENS_FOR_USERS_SECRET`
+      ([impl-notes](impl-notes.md#userscreatetoken-needs-a-server-secret-and-its-token-expires)).
     - Log in once as the bot with its random password, then call
       `users.generatePersonalAccessToken`. The `bot` role needs
       `create-personal-access-tokens`, and the password is discarded
@@ -1011,11 +1014,18 @@ Deliverables in `crates/surface-rocketchat/src/rest.rs`:
   - `channels.invite` and `groups.invite`, `rooms.info`,
     `im.create`.
   - `chat.postMessage` with `tmid` for threads, `chat.update`, `chat.react`.
-  - `rooms.upload/{rid}` (multipart) with `tmid`.
+  - `rooms.media/{rid}` (multipart) then `rooms.mediaConfirm/{rid}/{fileId}`
+    with `tmid`. `rooms.upload/{rid}` was removed in Rocket.Chat 8.0
+    ([impl-notes](impl-notes.md#roomsupload-is-gone-in-rocketchat-80)).
+    Files over a configurable size (100 MiB by default, Rocket.Chat's
+    default `FileUpload_MaxFileSize`) are refused before they are read
+    ([impl-notes](impl-notes.md#uploads-are-capped-and-read-once)).
   - `channels.history`, `groups.history`, `im.history` and
     `chat.getThreadMessages` for `history`.
-- Handles the rate limiter: honor `x-ratelimit-reset` on 429, and retry at most
-  once.
+- Handles the rate limiter: honor `x-ratelimit-reset` on 429, measured
+  against the response's `Date` header rather than the local clock
+  ([impl-notes](impl-notes.md#clock-skew-defeated-the-429-retry)), and retry
+  at most once.
 - `testkit::rocketchat::FakeRest`: wiremock routes for the above.
 
 Acceptance: a wiremock test per method, including error mapping to
@@ -1023,7 +1033,9 @@ Acceptance: a wiremock test per method, including error mapping to
 
 Live check (manual): against a Rocket.Chat 7.x server (T16's Compose stack
 works once it lands; until then a local container). Using a manager with only
-the custom role from the design, create a bot user and obtain its token.
+the roles the design gives it (the built-in `bot` and `app` roles on the
+Community Edition, a custom role with a license), create a bot user and obtain
+its token.
 Record the exact permissions needed. This settles the design's open question.
 Update the Rocket.Chat section of `docs/design.md` with the result.
 
@@ -1295,8 +1307,9 @@ Deliverables:
     shortcut with a note that production should use a socket proxy.
 - `deploy/compose/README.md`:
   1. Bring the stack up.
-  2. Create the Rocket.Chat admin, then the manager user and its custom role
-     (with the permissions T11 settled).
+  2. Create the Rocket.Chat admin, then the manager user and its roles (with
+     the permissions T11 settled: a custom role with a license, otherwise
+     the built-in `bot` and `app` roles).
   3. Configure agentd.
   4. Run the live checks listed in T11, T14 and T23.
 - CI: a job that builds both images (no push) when `images/**` or the Rust code
