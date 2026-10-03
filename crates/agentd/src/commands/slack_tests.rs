@@ -1148,11 +1148,8 @@ fn a_grid_member_of_the_workspace_homed_in_a_sibling_has_left() {
 
 #[tokio::test]
 async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
-    let dir = std::env::temp_dir().join(format!("agentd-rotator-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&dir).unwrap();
-    let url = format!("sqlite://{}", dir.join("agentd.db").display());
+    let (old_key, url, _dir) = file_store().await;
     let sealer = || Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
-    let old_key = Store::open(&url, sealer()).await.unwrap();
     let start = OffsetDateTime::now_utc();
     let token = |refresh: &str, minutes: i64| NewSlackConfigToken {
         token: SecretString::from("xoxe.xoxp-1-T0"),
@@ -1205,8 +1202,6 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
             .expose_secret(),
         "xoxe-1-R1"
     );
-    store.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -1310,10 +1305,9 @@ async fn requests_from_another_workspace_are_dropped() {
 }
 
 /// A store in a new SQLite file, its URL, and the file's directory.
-async fn file_store() -> (Store, String, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("agentd-slack-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&dir).unwrap();
-    let url = format!("sqlite://{}", dir.join("agentd.db").display());
+async fn file_store() -> (Store, String, TempDir) {
+    let dir = TempDir::new();
+    let url = format!("sqlite://{}", dir.0.join("agentd.db").display());
     let store = Store::open(
         &url,
         Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap(),
@@ -1366,7 +1360,7 @@ async fn failures_left(url: &str) -> i64 {
 
 #[tokio::test]
 async fn a_renewed_pair_is_stored_although_the_first_writes_fail() {
-    let (store, url, dir) = file_store().await;
+    let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
     let alice = h.linked("U0HUMAN01").await;
     let start = OffsetDateTime::now_utc();
@@ -1400,13 +1394,11 @@ async fn a_renewed_pair_is_stored_although_the_first_writes_fail() {
         h.stored(alice).await,
         Some(("xoxe.xoxp-1-T1".to_owned(), "xoxe-1-R1".to_owned()))
     );
-    h.store.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_checked_pair_is_stored_although_the_first_write_fails() {
-    let (store, url, dir) = file_store().await;
+    let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
     let alice = h.linked("U0HUMAN01").await;
     mount_rotation(
@@ -1438,13 +1430,11 @@ async fn a_checked_pair_is_stored_although_the_first_write_fails() {
             "xoxe-1-NEW-SECRET-refresh".to_owned()
         ))
     );
-    h.store.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
-    let (store, url, dir) = file_store().await;
+    let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
     let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
@@ -1476,8 +1466,6 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     logs.snapshot()
         .assert_has("couldn't store a checked configuration token");
     global_logs().snapshot().assert_lacks("SECRET");
-    h.store.close().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A new temporary directory, removed on drop.
