@@ -539,10 +539,9 @@ fn check_exec(argv: &[String], env: &BTreeMap<String, String>) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    use std::path::PathBuf;
-
     use core_types::{AgentId, ConvRef, SurfaceKind};
     use store::{Sealer, Store};
+    pub(crate) use testkit::TempDir;
 
     use super::*;
 
@@ -565,23 +564,6 @@ pub(crate) mod test_util {
         VolumeRef {
             path: data_dir.join(volume_rel_path(&key)),
             key,
-        }
-    }
-
-    /// A directory under the system temp directory, removed on drop.
-    pub(crate) struct TempDir(pub(crate) PathBuf);
-
-    impl TempDir {
-        pub(crate) fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("sandbox-test-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 }

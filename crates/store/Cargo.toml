@@ -22,4 +22,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+testkit.workspace = true
 tokio.workspace = true
