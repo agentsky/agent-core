@@ -2443,7 +2443,7 @@ async fn an_agents_post_that_names_no_other_agent_holds_no_lane_up() {
 #[tokio::test]
 async fn an_agents_post_that_names_this_agent_waits_out_the_attribution_wait() {
     let stack = start_with(Setup {
-        pipeline: |settings| settings.attribution_wait = Duration::from_secs(1),
+        pipeline: |settings| settings.attribution_wait = Duration::from_secs(3),
         ..Setup::default()
     })
     .await;
@@ -2454,10 +2454,14 @@ async fn an_agents_post_that_names_this_agent_waits_out_the_attribution_wait() {
     hop.sender_bot_user = Some(UserId::new("UWRITER"));
     let started = Instant::now();
     stack.handle(hop).await;
+    let waited = started.elapsed();
     assert!(
-        started.elapsed() >= Duration::from_secs(1),
-        "the post was ignored only once its attribution had been waited for: {:?}",
-        started.elapsed()
+        waited >= Duration::from_secs(3),
+        "the post was ignored only once its attribution had been waited for: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(10),
+        "the post was ignored once the configured wait was over: {waited:?}"
     );
     assert!(posts(&stack.calls_since(before)).is_empty());
     stack.stop().await;
