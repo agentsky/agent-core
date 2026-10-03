@@ -115,6 +115,7 @@ pub type Result<T, E = SandboxError> = std::result::Result<T, E>;
 pub struct VolumeRef {
     key: VolumeKey,
     path: PathBuf,
+    owner: Option<(u32, u32)>,
 }
 
 impl VolumeRef {
@@ -126,6 +127,13 @@ impl VolumeRef {
     /// The volume's directory, as agentd sees it.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The uid and gid the sandbox gives what agents may write in the
+    /// volume, the user agents run as, or `None` when it leaves them to
+    /// agentd's own user.
+    pub fn owner(&self) -> Option<(u32, u32)> {
+        self.owner
     }
 
     /// `sessions/<session>/`, mounted read-write in that session only.
@@ -564,6 +572,7 @@ pub(crate) mod test_util {
         VolumeRef {
             path: data_dir.join(volume_rel_path(&key)),
             key,
+            owner: None,
         }
     }
 }

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -50,6 +51,17 @@ pub struct SessionConfig {
     /// agentd's data directory, which holds each agent's persona directory
     /// ([`persona_dir`]) and skills directory ([`skills_dir`]).
     pub data_dir: PathBuf,
+}
+
+/// A new session's working directory, as agentd sees it, from
+/// [`SessionManager::work_dir`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkDir {
+    /// The session's `work/` directory, the CLI's working directory.
+    pub work: PathBuf,
+    /// Who should own a file put there: the uid and gid agents run as, or
+    /// `None` for agentd's own user ([`sandbox::VolumeRef::owner`]).
+    pub owner: Option<(u32, u32)>,
 }
 
 /// How one turn went, as [`SessionManager::run_turn`] returns it.
@@ -407,6 +419,46 @@ impl<H: TurnHooks> SessionManager<H> {
             .await?)
     }
 
+    /// The `work/` directory of `session`, as agentd sees it, made with the
+    /// session's directory, and its volume if that is missing, so files can
+    /// be handed to a new session before its first turn, as a private
+    /// task's are, with who should own them. Directories already there are
+    /// kept as they are.
+    ///
+    /// Call it only for a session no container has run yet: nothing in a
+    /// sandbox can have touched a directory made here, and the sandbox
+    /// repairs the session's directories before starting its container.
+    ///
+    /// # Errors
+    ///
+    /// [`RunnerError::Sandbox`] if the volume couldn't be made, and
+    /// [`RunnerError::Io`] if a directory couldn't.
+    pub async fn work_dir(&self, session: &Session) -> Result<WorkDir> {
+        let volume = self.inner.sandbox.ensure_volume(&session.volume()).await?;
+        let session_dir = volume.session_dir(session.id);
+        let work = session_dir.join("work");
+        let made = work.clone();
+        tokio::task::spawn_blocking(move || {
+            for dir in [&session_dir, &made] {
+                match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+                    Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err),
+                    _ => {}
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RunnerError::TurnTask)?
+        .map_err(|source| RunnerError::Io {
+            what: "making a session's work directory",
+            source,
+        })?;
+        Ok(WorkDir {
+            work,
+            owner: volume.owner(),
+        })
+    }
+
     /// Resets `session`: once the turns queued before it have run, stops
     /// its warm process and container, marks it reset and, for a normal
     /// session, makes its replacement with a new id, which the next turn
@@ -446,6 +498,30 @@ impl<H: TurnHooks> SessionManager<H> {
             .await;
         if let Err(error) = stopped {
             tracing::warn!(%session, %error, "stopping a session failed");
+        }
+    }
+
+    /// Stops `session`'s containers now, without waiting for a turn that
+    /// holds its slot, which [`stop`](Self::stop) does: as if they died, so
+    /// a turn running in one ends as its process does, with its outcome
+    /// reported as for any crash, and the session handles the death as it
+    /// would any other. Nothing for a session that holds no container yet.
+    /// It stops them as [`Sandbox::stop`](sandbox::Sandbox::stop) does:
+    /// in the Docker sandbox that is a stop with the daemon's grace period
+    /// before the process is killed, so the turn may run that much longer.
+    pub async fn kill(&self, session: SessionId) {
+        let containers: Vec<ContainerId> = lock(&self.inner.containers)
+            .values()
+            .filter(|tracked| tracked.session.id == session)
+            .map(|tracked| tracked.container.clone())
+            .collect();
+        for container in containers {
+            match self.inner.sandbox.stop(&container).await {
+                Ok(()) => tracing::info!(%session, %container, "killed a session container"),
+                Err(error) => {
+                    tracing::warn!(%session, %container, %error, "killing a session container failed");
+                }
+            }
         }
     }
 

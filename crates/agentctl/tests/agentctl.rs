@@ -7,6 +7,7 @@ use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use agentd::consents::ConsentSettings;
 use agentd::ctl::{Ctl, CtlSettings, ProcessInfo, ProcessToken, STAGING_DIR, SurfaceLookup, Turn};
 use axum::Json;
 use axum::extract::State;
@@ -19,7 +20,7 @@ use core_types::{
 };
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
-use store::Store;
+use store::{Store, StoreError};
 use testkit::claude::SCRIPT_ENV;
 use testkit::{MockSurface, TempDir, fake_anthropic, fake_claude_path, write_script};
 use time::OffsetDateTime;
@@ -38,8 +39,12 @@ struct Lookup(Arc<MockSurface>);
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Lookup {
-    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        Some(self.0.clone())
+    async fn surface(
+        &self,
+        _agent: AgentId,
+        _conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        Ok(Some(self.0.clone()))
     }
 }
 
@@ -65,6 +70,7 @@ impl Server {
             staging_dir: dir.join(STAGING_DIR),
             attach_max_bytes: 1024,
             lease_ttl: Duration::from_secs(30),
+            consents: ConsentSettings::in_data_dir(dir.path()),
         };
         tune(&mut settings);
         let surface = Arc::new(MockSurface::new());
@@ -313,7 +319,19 @@ async fn each_subcommand_works_against_the_server() {
     server
         .run(&token, &["private", "--file", "notes.md", "check", "it"])
         .await
-        .refused("agentctl private is not available yet");
+        .refused("CLAUDE_CONFIG_DIR is not set");
+    let output = server
+        .agentctl(&token)
+        .env("CLAUDE_CONFIG_DIR", server.dir.join("claude"))
+        .args(["private", "--file", "../elsewhere.md", "check", "it"])
+        .output()
+        .await
+        .unwrap();
+    Run::from(output).refused("../elsewhere.md is not in this session's directory");
+    server
+        .run(&token, &["private", "check", "it"])
+        .await
+        .refused("the agent is paused or was deleted");
 
     let outbox = server.ctl.end_turn(&token).await.unwrap().unwrap();
     assert_eq!(outbox.attachments().len(), 1);
@@ -1055,7 +1073,7 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
         ),
         (
             true,
-            "Exit code 1\nagentctl: agentctl private is not available yet",
+            "Exit code 1\nagentctl: the agent is paused or was deleted",
         ),
     ];
     let results: Vec<(bool, &str)> = results.iter().map(|(e, c)| (*e, c.as_str())).collect();

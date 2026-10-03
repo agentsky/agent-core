@@ -128,7 +128,7 @@ impl App {
         );
         let mut replies = Replies::new(rocketchat.as_ref().map(|(_, bot)| Arc::clone(bot)));
         if let Some(slack) = &slack {
-            replies = replies.with_slack(Arc::new(slack.manager_bot()), slack.client().clone());
+            replies = replies.with_slack(slack);
         }
         let agents = rocketchat
             .as_ref()
@@ -144,7 +144,8 @@ impl App {
             skills.clone(),
         )
         .with_admins(config.community.admins.iter().cloned())
-        .with_limits(Limits::from_config(&config.limits));
+        .with_limits(Limits::from_config(&config.limits))
+        .with_consents(ctl.consents().clone());
         if let Some(slack_agents) = &slack_agents {
             commands = commands.with_slack_agents(slack_agents.clone());
         }

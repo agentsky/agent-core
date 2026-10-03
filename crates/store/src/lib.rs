@@ -28,6 +28,7 @@
 //! [retirements](Store::claim_retirement) and
 //! [Slack apps](Store::set_slack_app),
 //! [`agent_skills`](Store::put_skill),
+//! [`consents`](Store::create_consent),
 //! [`community_settings`](Store::set_community_api_key),
 //! [`failure_notices`](Store::claim_failure_notice), the usage meter
 //! ([`usage`](Store::record_turn_usage), with `thread_usage` and
@@ -48,6 +49,7 @@ use tokio::sync::Semaphore;
 mod agents;
 mod claude_links;
 mod community;
+mod consents;
 mod ctl;
 mod events;
 mod failure_notices;
@@ -70,6 +72,7 @@ pub use agents::{
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use community::CommunityKeyStatus;
+pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use message_refs::{MessageRef, NewMessageRef};
@@ -386,6 +389,7 @@ mod tests {
                 "claude_link_generations",
                 "claude_links",
                 "community_settings",
+                "consents",
                 "ctl_tokens",
                 "failure_notices",
                 "limit_notices",

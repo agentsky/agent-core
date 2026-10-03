@@ -7,9 +7,9 @@
 //!
 //! - At most [`MAX_SKILL_BYTES`] of files in all, [`MAX_FILES`] files and
 //!   directories, [`MAX_DEPTH`] levels, and paths of [`MAX_PATH_BYTES`].
-//! - Names are plain: no empty, `.` or `..` component, no `\`, and no
-//!   control or invisible formatting character, so nothing lands outside
-//!   the skill's directory or hides what it is.
+//! - Names are plain: no empty, whitespace-only, `.` or `..` component, no
+//!   `\`, and no control or invisible formatting character, so nothing
+//!   lands outside the skill's directory or hides what it is.
 //! - Only regular files and directories. A symlink in an archive is
 //!   refused rather than followed or copied; so are devices, sockets and
 //!   FIFOs. A clone has neither: `git` checks symlinks out as plain files
@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use commands::SkillName;
 use cred_proxy::HostRule;
 use serde::Deserialize;
+
+use crate::ctl::is_plain_file_name;
 
 /// The most bytes of files a skill may hold, unpacked.
 pub const MAX_SKILL_BYTES: u64 = 10 * 1024 * 1024;
@@ -129,8 +131,8 @@ pub enum Problem {
     TooLarge,
     /// A name that isn't plain.
     #[error(
-        "The skill has a file name agentd won't write: an empty, `.` or `..` part, a `\\`, \
-         or a control or invisible character."
+        "The skill has a file name agentd won't write: an empty, blank, `.` or `..` part, a \
+         `\\`, or a control or invisible character."
     )]
     BadName,
     /// Two entries with the same name, or a file where a directory goes.
@@ -268,32 +270,6 @@ pub fn parse_skill_file(text: &str) -> Result<Manifest, Problem> {
     })
 }
 
-/// Whether `name` is a plain path component.
-fn plain_component(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && name.len() <= 255
-        && !name
-            .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c))
-}
-
-/// Invisible formatting characters that could make a name read as another:
-/// bidirectional controls, zero-width characters and marks, tag
-/// characters, and line or paragraph separators.
-fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00ad}'
-        | '\u{061c}'
-        | '\u{180e}'
-        | '\u{200b}'..='\u{200f}'
-        | '\u{2028}'..='\u{202e}'
-        | '\u{2060}'..='\u{206f}'
-        | '\u{feff}'
-        | '\u{e0000}'..='\u{e007f}')
-}
-
 /// Running totals, checked against the limits.
 #[derive(Debug, Default)]
 struct Budget {
@@ -386,7 +362,7 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
             .unwrap_or(&name)
             .split('/')
             .collect();
-        if !parts.iter().all(|part| plain_component(part)) {
+        if !parts.iter().all(|part| is_plain_file_name(part)) {
             return Err(Problem::BadName.into());
         }
         if parts[0] == MACOS_METADATA {
@@ -458,7 +434,7 @@ pub fn check_tree(root: &Path) -> Result<(), CheckError> {
         for entry in fs::read_dir(&dir).map_err(io("reading a skill's directory"))? {
             let entry = entry.map_err(io("reading a skill's directory"))?;
             let name = entry.file_name();
-            if !name.to_str().is_some_and(plain_component) {
+            if !name.to_str().is_some_and(is_plain_file_name) {
                 return Err(Problem::BadName.into());
             }
             let path_bytes = dir_bytes + usize::from(depth > 0) + name.len();

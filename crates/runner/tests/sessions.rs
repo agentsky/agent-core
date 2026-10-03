@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_types::{
     AgentId, ConsentId, ConvRef, CredentialKind, CredentialRef, Hop, MemberId, MemberKey,
@@ -1111,6 +1111,58 @@ async fn a_side_change_on_the_private_volume_restarts_the_container() {
         .await
         .unwrap();
     assert_ne!(other.id, private.id);
+}
+
+#[tokio::test]
+async fn a_kill_ends_a_running_turn_without_waiting_for_it() {
+    let h = Harness::new(&[Turn::reply("never").with_command(["sleep", "30"])]).await;
+    let session = h.thread_session("k1").await;
+    let started = Instant::now();
+    let turn = h.run(session.id, request("go"));
+    tokio::pin!(turn);
+    let report = loop {
+        tokio::select! {
+            report = &mut turn => break report,
+            () = tokio::time::sleep(Duration::from_millis(200)) => h.manager.kill(session.id).await,
+        }
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the turn ended when its container was killed"
+    );
+    assert!(
+        matches!(report.outcome, TurnOutcome::Crashed { .. }),
+        "{:?}",
+        report.outcome
+    );
+    h.manager.kill(SessionId::new_v4()).await;
+}
+
+#[tokio::test]
+async fn files_put_in_a_new_sessions_work_dir_are_there_for_its_first_turn() {
+    let h = Harness::new(&[Turn::reply("done").with_command(["cp", "in.txt", "out.txt"])]).await;
+    let consent = ConsentId::new_v4();
+    let private = h
+        .manager
+        .create_private(h.agent, consent, &thread("1.1"))
+        .await
+        .unwrap();
+    let dirs = h.manager.work_dir(&private).await.unwrap();
+    let work = dirs.work.clone();
+    assert!(work.ends_with(format!("sessions/{}/work", private.id)));
+    assert_eq!(
+        dirs.owner, None,
+        "the process sandbox runs agents as agentd's user"
+    );
+    assert_eq!(h.manager.work_dir(&private).await.unwrap(), dirs);
+    std::fs::write(work.join("in.txt"), "handed over").unwrap();
+    let mut task = request("go");
+    task.kind = TurnKind::PrivateTask(consent);
+    assert_eq!(reply(&h.run(private.id, task).await), "done");
+    assert_eq!(
+        std::fs::read_to_string(work.join("out.txt")).unwrap(),
+        "handed over"
+    );
 }
 
 #[tokio::test]
