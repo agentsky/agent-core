@@ -1,32 +1,13 @@
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
+use testkit::TempDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use super::*;
 
 const SKILL: &str = "---\nname: pdf-tools\ndescription: Read and fill PDF forms.\n---\n# PDF\n";
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-skill-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn join(&self, path: &str) -> PathBuf {
-        self.0.join(path)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn problem(result: Result<impl std::fmt::Debug, CheckError>) -> Problem {
     match result {
@@ -220,7 +201,7 @@ fn alias_expansion_is_cheap_or_refused() {
 
 #[test]
 fn a_zip_unpacks_with_plain_modes_and_skips_macos_metadata() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let bytes = zip_of(&[
         ("pdf-tools/", None, 0o40755),
         ("pdf-tools/SKILL.md", Some(SKILL.as_bytes()), 0o100666),
@@ -256,20 +237,20 @@ fn zip_entries_that_leave_the_directory_or_hide_are_refused() {
         "a\u{202e}txt.exe",
         "a\nb",
     ] {
-        let dir = TempDir::new();
+        let dir = TempDir::new("agentd-skill");
         let bytes = zip_of(&[(name, Some(b"x"), 0o100644)]);
         assert_eq!(
             problem(unpack_zip(&bytes, &dir.join("out"))),
             Problem::BadName,
             "{name:?}"
         );
-        assert!(!dir.0.parent().unwrap().join("escape").exists());
+        assert!(!dir.path().parent().unwrap().join("escape").exists());
     }
 }
 
 #[test]
 fn zip_symlinks_duplicates_and_special_files_are_refused() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
     zip.add_symlink("link", "/etc/passwd", SimpleFileOptions::default())
         .unwrap();
@@ -308,7 +289,7 @@ fn zip_symlinks_duplicates_and_special_files_are_refused() {
 
 #[test]
 fn a_zip_that_inflates_past_the_limits_is_refused() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let big = vec![0u8; usize::try_from(MAX_SKILL_BYTES).unwrap() + 1];
     let bytes = zip_of(&[("big", Some(&big), 0o100644)]);
     assert!(bytes.len() < 64 * 1024, "the archive itself is small");
@@ -349,7 +330,7 @@ fn a_zip_that_inflates_past_the_limits_is_refused() {
 
 #[test]
 fn a_tree_with_a_path_past_the_limit_is_refused() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let tree = dir.join("long");
     let part = "n".repeat(250);
     let fits = tree.join(format!("{part}/{part}/{part}/{part}"));
@@ -362,7 +343,7 @@ fn a_tree_with_a_path_past_the_limit_is_refused() {
 
 #[test]
 fn a_zip_whose_declared_size_lies_is_refused() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let mut bytes = zip_of(&[("f", Some(b"hello world"), 0o100644)]);
     let central = bytes
         .windows(4)
@@ -379,7 +360,7 @@ fn a_zip_whose_declared_size_lies_is_refused() {
 
 #[test]
 fn a_tree_with_a_symlink_special_file_or_hidden_name_is_refused() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let tree = dir.join("link");
     fs::create_dir_all(tree.join("a")).unwrap();
     fs::write(tree.join("SKILL.md"), SKILL).unwrap();
@@ -406,7 +387,7 @@ fn a_tree_with_a_symlink_special_file_or_hidden_name_is_refused() {
 
 #[test]
 fn a_clones_git_directory_goes_and_modes_are_rewritten() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let tree = dir.join("clone");
     fs::create_dir_all(tree.join(".git/objects")).unwrap();
     fs::create_dir_all(tree.join("bin")).unwrap();
@@ -432,7 +413,7 @@ fn a_clones_git_directory_goes_and_modes_are_rewritten() {
 
 #[test]
 fn the_skill_is_at_the_top_or_in_the_only_directory() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     let top = dir.join("top");
     fs::create_dir_all(top.join("docs")).unwrap();
     fs::write(top.join("SKILL.md"), SKILL).unwrap();
@@ -474,7 +455,7 @@ fn the_skill_is_at_the_top_or_in_the_only_directory() {
 
 #[test]
 fn an_uploaded_skill_file_is_capped() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-skill");
     write_skill_file(SKILL.as_bytes(), &dir.join("ok")).unwrap();
     assert_eq!(fs::read_to_string(dir.join("ok/SKILL.md")).unwrap(), SKILL);
     let big = vec![b'x'; usize::try_from(MAX_SKILL_MD_BYTES).unwrap() + 1];

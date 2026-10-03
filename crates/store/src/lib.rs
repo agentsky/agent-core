@@ -283,9 +283,9 @@ fn parse_column<T: FromStr>(value: &str, table: &'static str, column: &'static s
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    use std::path::PathBuf;
-
     use core_types::{MemberKey, SurfaceKind, TeamId, UserId};
+
+    pub(crate) use testkit::TempDir;
 
     use super::*;
 
@@ -329,27 +329,6 @@ pub(crate) mod test_util {
             other => panic!("{other:?}"),
         }
     }
-
-    /// A directory under the system temp directory, removed on drop.
-    pub(crate) struct TempDir(PathBuf);
-
-    impl TempDir {
-        pub(crate) fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("store-test-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir(&dir).unwrap();
-            Self(dir)
-        }
-
-        pub(crate) fn db_url(&self) -> String {
-            format!("sqlite://{}", self.0.join("agentd.db").display())
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -384,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_sets_wal_foreign_keys_and_busy_timeout() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         assert_eq!(pragma(&store, "journal_mode").await, "wal");
         assert_eq!(pragma(&store, "foreign_keys").await, "1");
@@ -393,7 +372,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_migration_applies_to_an_empty_database() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         assert_eq!(
             table_names(&store).await,
@@ -427,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrations_are_idempotent() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let key = Sealer::generate_key().unwrap();
         let store = Store::open(&dir.db_url(), Sealer::from_base64(&key).unwrap())
             .await
@@ -535,7 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_key_fails_to_read_secrets() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let member = store
             .ensure_member(&member_key("u1"), "Ada", at(1_000))

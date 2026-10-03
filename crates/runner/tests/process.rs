@@ -71,7 +71,7 @@ async fn resuming_a_session_that_never_started_is_refused_and_ends_the_process()
 #[tokio::test]
 async fn a_result_after_a_failed_write_ends_the_process() {
     let mut h = Harness::new(&[]).await;
-    let bin = h._dir.0.join("closes-stdin");
+    let bin = h._dir.join("closes-stdin");
     let script = format!(
         "#!/bin/sh\nexec 0<&-\nprintf '%s\\n' '{}'\n: > \"$TMPDIR/stdin-closed\"\n",
         r#"{"type":"result","subtype":"success","is_error":false,"result":"early"}"#

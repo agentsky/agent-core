@@ -98,7 +98,7 @@ pub async fn write_if_changed(dir: &Path, name: &str, bytes: &[u8]) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::TempDir;
+    use testkit::TempDir;
 
     #[test]
     fn the_skills_directory_is_under_skills() {
@@ -120,11 +120,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_persona_writes_only_changes_and_leaves_no_temp_files() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let agent = AgentId::new_v4();
-        let file = persona_dir(&dir.0, agent).join("persona.md");
+        let file = persona_dir(dir.path(), agent).join("persona.md");
         assert!(
-            write_persona(&dir.0, agent, "You are Ada.\n")
+            write_persona(dir.path(), agent, "You are Ada.\n")
                 .await
                 .unwrap()
         );
@@ -132,7 +132,7 @@ mod tests {
         let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&file).unwrap());
 
         assert!(
-            !write_persona(&dir.0, agent, "You are Ada.\n")
+            !write_persona(dir.path(), agent, "You are Ada.\n")
                 .await
                 .unwrap()
         );
@@ -140,12 +140,12 @@ mod tests {
         assert_eq!(inode, same, "an unchanged persona is not rewritten");
 
         assert!(
-            write_persona(&dir.0, agent, "You are Grace.")
+            write_persona(dir.path(), agent, "You are Grace.")
                 .await
                 .unwrap()
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "You are Grace.");
-        let names: Vec<_> = std::fs::read_dir(persona_dir(&dir.0, agent))
+        let names: Vec<_> = std::fs::read_dir(persona_dir(dir.path(), agent))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
@@ -154,16 +154,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_write_is_an_io_error() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let agent = AgentId::new_v4();
-        std::fs::write(dir.0.join(AGENTS_DIR), "a file, not a directory").unwrap();
-        let err = write_persona(&dir.0, agent, "x").await.unwrap_err();
+        std::fs::write(dir.join(AGENTS_DIR), "a file, not a directory").unwrap();
+        let err = write_persona(dir.path(), agent, "x").await.unwrap_err();
         assert!(matches!(err, RunnerError::Io { .. }), "{err:?}");
 
-        let dir = TempDir::new();
-        let file = persona_dir(&dir.0, agent).join("persona.md");
+        let dir = TempDir::new("runner-test");
+        let file = persona_dir(dir.path(), agent).join("persona.md");
         std::fs::create_dir_all(&file).unwrap();
-        let err = write_persona(&dir.0, agent, "x").await.unwrap_err();
+        let err = write_persona(dir.path(), agent, "x").await.unwrap_err();
         assert!(matches!(err, RunnerError::Io { .. }), "{err:?}");
     }
 }

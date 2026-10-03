@@ -21,12 +21,14 @@ use runner::{PoolConfig, ProcessConfig, SessionStart, TurnOutcome, TurnRequest};
 use sandbox::{ProcessSandbox, Sandbox as _};
 use secrecy::SecretString;
 use store::NewClaudeLink;
-use testkit::{FakeAnthropic, Turn, agentctl_path, fake_anthropic, fake_claude_path, write_script};
+use testkit::{
+    FakeAnthropic, TempDir, Turn, agentctl_path, fake_anthropic, fake_claude_path, write_script,
+};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use common::{TempDir, env};
+use common::env;
 
 const ACCESS_TOKEN: &str = "real-access-token";
 
@@ -59,7 +61,7 @@ async fn start_with(
 ) -> Running {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let fake = fake_anthropic().await;
     let text = format!(
         "{}\n[proxy]\nupstream = \"{}\"\n",
@@ -92,7 +94,7 @@ async fn start_with(
     let server = Server::bind(app.clone(), change(Routers::new(&app).unwrap()))
         .await
         .unwrap();
-    let script = dir.path().join("script.json");
+    let script = dir.join("script.json");
     write_script(&script, turns).unwrap();
     let settings = settings(server.addrs(), claude, agentctl, &script, dir.path());
     let sandbox = Arc::new(ProcessSandbox::new(app.store().clone(), dir.path()).unwrap());
