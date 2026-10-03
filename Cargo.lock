@@ -2489,11 +2489,11 @@ dependencies = [
  "core-types",
  "secrecy",
  "sqlx",
+ "testkit",
  "thiserror",
  "time",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

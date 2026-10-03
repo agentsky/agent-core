@@ -385,7 +385,7 @@ mod tests {
     use testkit::child::NotingStdin;
 
     async fn sandbox(dir: &TempDir) -> ProcessSandbox {
-        ProcessSandbox::new(memory_store().await, dir.0.clone()).unwrap()
+        ProcessSandbox::new(memory_store().await, dir.path().to_owned()).unwrap()
     }
 
     async fn started(sandbox: &ProcessSandbox, dir: &TempDir, scope: ScopeKey) -> Container {
@@ -396,12 +396,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let spec = SessionSpec::new(
-            SessionId::new_v4(),
-            volume,
-            "unused",
-            dir.0.join("agents/a1"),
-        );
+        let spec = SessionSpec::new(SessionId::new_v4(), volume, "unused", dir.join("agents/a1"));
         sandbox.start(&spec).await.unwrap()
     }
 
@@ -438,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_agents_in_one_channel_get_two_volumes() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let scope = awkward_channel();
         let a = VolumeKey {
@@ -463,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_session_layout_and_settings() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await.with_cleanup_period_days(9);
         let volume = sandbox
             .ensure_volume(&VolumeKey {
@@ -476,7 +471,7 @@ mod tests {
             SessionId::new_v4(),
             volume.clone(),
             "unused",
-            dir.0.join("agents/a1"),
+            dir.join("agents/a1"),
         );
         sandbox.start(&spec).await.unwrap();
         let session_dir = volume.session_dir(spec.session);
@@ -489,7 +484,7 @@ mod tests {
         .unwrap();
         assert_eq!(settings, serde_json::json!({"cleanupPeriodDays": 9}));
 
-        let default = ProcessSandbox::new(memory_store().await, dir.0.clone()).unwrap();
+        let default = ProcessSandbox::new(memory_store().await, dir.path().to_owned()).unwrap();
         default.start(&spec).await.unwrap();
         let settings = std::fs::read_to_string(session_dir.join("claude/settings.json")).unwrap();
         assert!(settings.contains("3650"), "{settings}");
@@ -497,9 +492,9 @@ mod tests {
 
     #[tokio::test]
     async fn start_gives_host_paths_and_links_skills() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
-        let skills = dir.0.join("skills/a1");
+        let skills = dir.join("skills/a1");
         std::fs::create_dir_all(skills.join("s1")).unwrap();
         std::fs::write(skills.join("s1/SKILL.md"), "skill").unwrap();
         let volume = sandbox
@@ -513,7 +508,7 @@ mod tests {
             SessionId::new_v4(),
             volume.clone(),
             "unused",
-            dir.0.join("agents/a1"),
+            dir.join("agents/a1"),
         );
         spec.skills_dir = Some(skills.clone());
         spec.memory = true;
@@ -528,7 +523,7 @@ mod tests {
                 claude_config: session_dir.join("claude"),
                 home: session_dir.join("home"),
                 tmp: session_dir.join("tmp"),
-                persona_file: dir.0.join("agents/a1/persona.md"),
+                persona_file: dir.join("agents/a1/persona.md"),
                 shared: volume.shared_dir(),
                 memory: volume.memory_dir(),
             }
@@ -546,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_pipes_stdio_with_only_the_given_environment() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
         let env = BTreeMap::from([("FOO".to_string(), "bar".to_string())]);
@@ -576,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_passes_llvm_profile_file_through() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let container = started(&sandbox, &dir, awkward_channel()).await;
         let script = "echo \"${LLVM_PROFILE_FILE-unset}\"";
@@ -590,10 +585,10 @@ mod tests {
 
     #[tokio::test]
     async fn fake_claude_runs_at_the_container_paths_and_keeps_its_coverage() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
-        std::fs::create_dir_all(dir.0.join("agents/a1")).unwrap();
-        std::fs::write(dir.0.join("agents/a1/persona.md"), "persona").unwrap();
+        std::fs::create_dir_all(dir.join("agents/a1")).unwrap();
+        std::fs::write(dir.join("agents/a1/persona.md"), "persona").unwrap();
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
         let paths = container.paths();
         let session = container.session().to_string();
@@ -625,7 +620,7 @@ mod tests {
             ("CLAUDE_CODE_PROJECT_DIR_NAME".to_string(), session.clone()),
             (
                 testkit::claude::SCRIPT_ENV.to_string(),
-                dir.0.join("script.json").to_string_lossy().into_owned(),
+                dir.join("script.json").to_string_lossy().into_owned(),
             ),
         ]);
         let mut io = sandbox.exec(&container, &argv, &env).await.unwrap();
@@ -642,7 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_ends_the_process_group() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
         let mut io = sandbox
@@ -669,10 +664,10 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_child_kills_it_before_closing_its_stdin() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
-        let pid_file = dir.0.join("pid");
+        let pid_file = dir.join("pid");
         let script = format!("echo $$ > '{}'; exec cat >/dev/null", pid_file.display());
         let io = sandbox
             .exec(
@@ -713,7 +708,7 @@ mod tests {
 
     #[test]
     fn dropping_a_child_on_a_current_thread_runtime_kills_its_group() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -751,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_kills_processes_and_reports_the_death() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let mut events = sandbox.events();
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
@@ -796,7 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_end_only_after_events_missed() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let mut events = sandbox.events();
         drop(sandbox);
@@ -810,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn reap_orphans_stops_every_container() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let a = started(&sandbox, &dir, ScopeKey::Private).await;
         let b = started(&sandbox, &dir, awkward_channel()).await;
@@ -826,7 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_spawn_failure_is_an_io_error() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
         let container = started(&sandbox, &dir, ScopeKey::Private).await;
         let err = sandbox
@@ -848,7 +843,7 @@ mod tests {
                 .await
                 .unwrap(),
             "unused",
-            dir.0.join("agents/a1"),
+            dir.join("agents/a1"),
         );
         spec.memory = true;
         assert!(matches!(
