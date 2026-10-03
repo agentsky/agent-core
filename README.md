@@ -250,6 +250,13 @@ says to delete the app at <https://api.slack.com/apps>. Apps ask for
 `chat:write.public` only with `[slack] public_posting = true`. On the free
 plan a workspace allows 10 app installs, the manager app included.
 
+When a private channel an agent is in is shared with another organization,
+Slack gives it a new id and tells the agent's app; agentd moves the agent's
+`#room` rules to the new id once Slack confirms it; until then its denies
+on the old id apply to the new one too. Apps created before
+agentd listened for that are updated with their owner's configuration
+token, without a new install; `/agent me` lists the ones still waiting.
+
 ### Cloud hand-off
 
 A member can hand long repository work, such as a pull request that takes an

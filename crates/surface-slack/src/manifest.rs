@@ -8,7 +8,21 @@
 //! command, since only the manager app may own `/agent`, and hears every
 //! message in the conversations its bot user is in through the
 //! `message.*` events rather than `app_mention` (see
-//! [`normalize`](crate::normalize)).
+//! [`normalize`](crate::normalize)), and `channel_id_changed`, which says
+//! a private channel it is in got a new id when it was shared with another
+//! organization.
+//!
+//! An app keeps the manifest it was made from until agentd updates it: it
+//! reads the app's manifest with `apps.manifest.export`
+//! ([`SlackClient::export_app`](crate::SlackClient::export_app)), adds the
+//! [`ADDED_BOT_EVENTS`] it lacks ([`add_bot_events`]) and writes it back
+//! with `apps.manifest.update`
+//! ([`SlackClient::update_app`](crate::SlackClient::update_app)), so
+//! nothing else in it changes, events its owner removed included. Each new
+//! bot event an existing app should get goes into [`ADDED_BOT_EVENTS`] and
+//! raises [`MANIFEST_VERSION`], and agentd records the version each app
+//! has. A change of scopes would take a new install, which an update can't
+//! do, so a version never adds one.
 //!
 //! A member installs the app from [`install_url`]: Slack's OAuth consent
 //! page, which redirects to agentd's [`OAUTH_CALLBACK_PATH`] with a code
@@ -27,13 +41,47 @@ pub const OAUTH_AUTHORIZE_URL: &str = "https://slack.com/oauth/v2/authorize";
 pub const OAUTH_CALLBACK_PATH: &str = "/slack/oauth/callback";
 
 /// The bot events every agent app subscribes to: every message in public
-/// and private channels, DMs and group DMs its bot user is in.
-pub const BOT_EVENTS: [&str; 4] = [
+/// and private channels, DMs and group DMs its bot user is in, and a
+/// channel it is in getting a new id.
+pub const BOT_EVENTS: [&str; 5] = [
     "message.channels",
     "message.groups",
     "message.im",
     "message.mpim",
+    "channel_id_changed",
 ];
+
+/// The version of [`agent_manifest`]: 0 for the manifest without
+/// `channel_id_changed`, 1 since. An app made, or updated, from an older
+/// version doesn't have what it added.
+pub const MANIFEST_VERSION: u32 = 1;
+
+/// The bot events [`agent_manifest`] gained since version 0, which an
+/// update adds to an older app: only those, so an event its owner removed
+/// stays removed.
+pub const ADDED_BOT_EVENTS: [&str; 1] = ["channel_id_changed"];
+
+/// Adds to `manifest`, an app's manifest as `apps.manifest.export` gives
+/// it, the [`ADDED_BOT_EVENTS`] its `settings.event_subscriptions.bot_events`
+/// lacks, after the ones it has, and says whether it added any. `None`,
+/// changing nothing, when the manifest has no such list of strings: an app
+/// that subscribes to no events isn't one agentd should change.
+pub fn add_bot_events(manifest: &mut Value) -> Option<bool> {
+    let events = manifest
+        .get_mut("settings")?
+        .get_mut("event_subscriptions")?
+        .get_mut("bot_events")?
+        .as_array_mut()?;
+    if !events.iter().all(Value::is_string) {
+        return None;
+    }
+    let missing: Vec<&str> = ADDED_BOT_EVENTS
+        .into_iter()
+        .filter(|event| !events.iter().any(|known| known == event))
+        .collect();
+    events.extend(missing.iter().map(|event| json!(event)));
+    Some(!missing.is_empty())
+}
 
 /// The bot scopes every agent app asks for. `chat:write.public` is added
 /// only when [`AgentApp::public_posting`] is on. The `*:read` scopes let
@@ -218,7 +266,10 @@ mod tests {
                 "settings": {
                     "event_subscriptions": {
                         "request_url": "https://agentd.example.com/slack/b/0f6a1c9e-2d3b-4c5d-8e7f-0123456789ab/events",
-                        "bot_events": ["message.channels", "message.groups", "message.im", "message.mpim"],
+                        "bot_events": [
+                            "message.channels", "message.groups", "message.im", "message.mpim",
+                            "channel_id_changed",
+                        ],
                     },
                     "interactivity": {
                         "is_enabled": true,
@@ -271,6 +322,46 @@ mod tests {
             "",
         ] {
             assert_eq!(public_url(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_the_bot_events_added_since_are_added_and_nothing_else_changes() {
+        assert!(
+            ADDED_BOT_EVENTS
+                .iter()
+                .all(|event| BOT_EVENTS.contains(event))
+        );
+        let mut current = agent_manifest(&app(false));
+        let unchanged = current.clone();
+        assert_eq!(add_bot_events(&mut current), Some(false));
+        assert_eq!(current, unchanged);
+
+        let mut older = unchanged.clone();
+        older["settings"]["event_subscriptions"]["bot_events"] =
+            json!(["message.im", "app_mention", "message.channels"]);
+        older["display_information"]["description"] = json!("Edited by its owner.");
+        let mut expected = older.clone();
+        expected["settings"]["event_subscriptions"]["bot_events"] = json!([
+            "message.im",
+            "app_mention",
+            "message.channels",
+            "channel_id_changed",
+        ]);
+        assert_eq!(add_bot_events(&mut older), Some(true));
+        assert_eq!(older, expected);
+
+        for mut odd in [
+            json!({}),
+            json!({"settings": {}}),
+            json!({"settings": {"event_subscriptions": {"request_url": "x"}}}),
+            json!({"settings": {"event_subscriptions": {"bot_events": "message.im"}}}),
+            json!({"settings": {"event_subscriptions": {"bot_events": [7]}}}),
+            json!([]),
+        ] {
+            let before = odd.clone();
+            assert_eq!(add_bot_events(&mut odd), None, "{before}");
+            assert_eq!(odd, before);
         }
     }
 

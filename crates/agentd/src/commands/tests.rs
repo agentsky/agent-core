@@ -2374,6 +2374,7 @@ async fn allow_and_deny_change_the_owners_rules() {
             &h.store.agent_settings(helper).await.unwrap(),
             &crate::policy::Limits::default(),
             0,
+            &[],
         )
         .unwrap()
     };

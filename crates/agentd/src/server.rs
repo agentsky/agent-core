@@ -121,7 +121,7 @@ impl Routers {
         let mut message_worker = None;
         if let Some(agents) = app.slack_agents() {
             let (messages, worker) = slack::Messages::new(agents.bots().clone());
-            inbound = inbound.with_agents(messages.clone());
+            inbound = inbound.with_agents(messages.clone(), agents.clone());
             slack_messages = Some(messages);
             message_worker = Some(Worker::new("Slack agents' messages", worker));
         }

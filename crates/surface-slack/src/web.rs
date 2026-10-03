@@ -37,7 +37,7 @@ use reqwest::{StatusCode, Url, redirect};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
@@ -139,7 +139,8 @@ const NOT_FOUND_CODES: &[&str] = &[
     "users_not_found",
 ];
 
-/// Error codes with which `apps.manifest.delete` says the app is gone.
+/// Error codes with which `apps.manifest.delete`, `apps.manifest.export`
+/// and `apps.manifest.update` say the app is gone.
 const APP_GONE_CODES: &[&str] = &["app_not_found", "invalid_app_id"];
 
 /// Error codes of Slack's rate limiter.
@@ -163,6 +164,8 @@ const TRANSIENT_CODES: &[&str] = &[
 enum Method {
     AppsManifestCreate,
     AppsManifestDelete,
+    AppsManifestExport,
+    AppsManifestUpdate,
     AuthTest,
     BotsInfo,
     ChatPostEphemeral,
@@ -188,6 +191,8 @@ impl Method {
         match self {
             Self::AppsManifestCreate => "apps.manifest.create",
             Self::AppsManifestDelete => "apps.manifest.delete",
+            Self::AppsManifestExport => "apps.manifest.export",
+            Self::AppsManifestUpdate => "apps.manifest.update",
             Self::AuthTest => "auth.test",
             Self::BotsInfo => "bots.info",
             Self::ChatPostEphemeral => "chat.postEphemeral",
@@ -215,11 +220,13 @@ impl Method {
         match self {
             Self::AuthTest => Tier::AuthTest,
             Self::ChatPostMessage => Tier::PostMessage,
-            Self::AppsManifestCreate | Self::AppsManifestDelete | Self::ToolingTokensRotate => {
-                Tier::Tier1
-            }
+            Self::AppsManifestCreate
+            | Self::AppsManifestDelete
+            | Self::AppsManifestUpdate
+            | Self::ToolingTokensRotate => Tier::Tier1,
             Self::UsersList | Self::ReactionsRemove => Tier::Tier2,
-            Self::BotsInfo
+            Self::AppsManifestExport
+            | Self::BotsInfo
             | Self::ChatUpdate
             | Self::ConversationsHistory
             | Self::ConversationsInfo
@@ -238,7 +245,10 @@ impl Method {
     /// How long one request may take.
     const fn timeout(self) -> Duration {
         match self {
-            Self::AppsManifestCreate | Self::AppsManifestDelete => MANIFEST_TIMEOUT,
+            Self::AppsManifestCreate
+            | Self::AppsManifestDelete
+            | Self::AppsManifestExport
+            | Self::AppsManifestUpdate => MANIFEST_TIMEOUT,
             _ => REQUEST_TIMEOUT,
         }
     }
@@ -528,6 +538,68 @@ impl SlackClient {
             .await?
         {
             Ok(_) => Ok(()),
+            Err(failure) if APP_GONE_CODES.contains(&failure.code.as_str()) => {
+                Err(SurfaceError::NotFound(failure.code))
+            }
+            Err(failure) => Err(failure.into_error()),
+        }
+    }
+
+    /// `apps.manifest.export`: the manifest the app `app_id` has now, read
+    /// as the member whose app configuration token `config_token` is.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::NotFound`] when the app is gone (`app_not_found`,
+    /// `invalid_app_id`), [`SurfaceError::Transport`] when the answer has
+    /// no manifest object; otherwise as for [`create_app`](Self::create_app).
+    pub async fn export_app(&self, config_token: &SecretString, app_id: &str) -> Result<Value> {
+        let method = Method::AppsManifestExport;
+        let form = vec![("app_id", app_id.to_owned())];
+        match self
+            .config_api(config_token)
+            .send(method, &Body::Form(form), None)
+            .await?
+        {
+            Ok(bytes) => Ok(Value::Object(
+                decode::<ExportAppResponse>(method, &bytes)?.manifest,
+            )),
+            Err(failure) if APP_GONE_CODES.contains(&failure.code.as_str()) => {
+                Err(SurfaceError::NotFound(failure.code))
+            }
+            Err(failure) => Err(failure.into_error()),
+        }
+    }
+
+    /// `apps.manifest.update`: replaces the manifest of the app `app_id`
+    /// with `manifest`, acting as the member whose app configuration token
+    /// `config_token` is. Returns whether Slack says the app's permissions
+    /// changed, which takes a new install before they apply.
+    ///
+    /// The token goes only in `Authorization: Bearer`, and the manifest as
+    /// JSON in the form body, as for [`create_app`](Self::create_app).
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::NotFound`] when the app is gone (`app_not_found`,
+    /// `invalid_app_id`); otherwise as for [`create_app`](Self::create_app).
+    pub async fn update_app(
+        &self,
+        config_token: &SecretString,
+        app_id: &str,
+        manifest: &Value,
+    ) -> Result<bool> {
+        let method = Method::AppsManifestUpdate;
+        let form = vec![
+            ("app_id", app_id.to_owned()),
+            ("manifest", manifest.to_string()),
+        ];
+        match self
+            .config_api(config_token)
+            .send(method, &Body::Form(form), None)
+            .await?
+        {
+            Ok(bytes) => Ok(decode::<UpdateAppResponse>(method, &bytes)?.permissions_updated),
             Err(failure) if APP_GONE_CODES.contains(&failure.code.as_str()) => {
                 Err(SurfaceError::NotFound(failure.code))
             }
@@ -1176,6 +1248,17 @@ struct UsersResponse {
 struct CreateAppResponse {
     app_id: String,
     credentials: AppCredentials,
+}
+
+#[derive(Deserialize)]
+struct ExportAppResponse {
+    manifest: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct UpdateAppResponse {
+    #[serde(default)]
+    permissions_updated: bool,
 }
 
 #[derive(Deserialize)]
@@ -2131,6 +2214,8 @@ mod tests {
         let cases = [
             (Method::AppsManifestCreate, Tier::Tier1),
             (Method::AppsManifestDelete, Tier::Tier1),
+            (Method::AppsManifestExport, Tier::Tier3),
+            (Method::AppsManifestUpdate, Tier::Tier1),
             (Method::AuthTest, Tier::AuthTest),
             (Method::BotsInfo, Tier::Tier3),
             (Method::ChatPostEphemeral, Tier::Tier4),
@@ -2236,6 +2321,8 @@ mod tests {
     fn manifest_calls_may_take_longer() {
         assert_eq!(Method::AppsManifestCreate.timeout(), MANIFEST_TIMEOUT);
         assert_eq!(Method::AppsManifestDelete.timeout(), MANIFEST_TIMEOUT);
+        assert_eq!(Method::AppsManifestExport.timeout(), MANIFEST_TIMEOUT);
+        assert_eq!(Method::AppsManifestUpdate.timeout(), MANIFEST_TIMEOUT);
         assert_eq!(Method::ChatPostMessage.timeout(), REQUEST_TIMEOUT);
     }
 

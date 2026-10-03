@@ -6035,7 +6035,9 @@ whose every target is denied reads "Only you may use". `allow everyone`
 empties the allow list and takes `everyone` off the deny list; denies by
 name stay. An `allow` of a member or a channel while `everyone` is denied
 changes nothing anyone can see, so its reply says to send `allow <name>
-everyone` first. Each list holds at most 100 rules. Rules are JSON agentd
+everyone` first. The owner may put at most 100 rules in each list, but
+`deny everyone` is always taken, and the denies T36d copies from a
+channel's old id may take the deny list to 200. Rules are JSON agentd
 owns (`policy::Rule`), with the identity or conversation and how the owner
 wrote it; replies name them in code spans, which neither surface turns
 into a mention. A member is resolved as `list` does (Slack sends an id,
@@ -9535,3 +9537,482 @@ it passes.
   it was doing (a failure to record a notice that was sent says the notice
   may go again after its lease), and the pass's summary, the members told
   included, at debug, as the cloud notifier does.
+
+## T36d: Slack Connect: channel ids that change
+
+No private channel was shared with another organization from the
+environment this was built in. The event, `conversations.info`,
+`apps.manifest.export` and `apps.manifest.update` were tested against
+`wiremock`, with a `channel_id_changed` fixture written from Slack's
+documentation (`testkit` `CHANNEL_ID_CHANGED`). The plan's live check is
+still to be done. It should also record what `conversations.info` on the
+new id answers the moment the event arrives, and on the old id
+afterwards.
+
+### A change lost on the way fails open, so it is stored until settled
+
+**Issue.** The plan has the handler confirm the new id and move the rules
+when the event arrives. Slack sends the event once, and the ingress has
+already answered it 200 by then. A `conversations.info` that fails (Slack
+down, the bot token's quota used up), or an agentd that stops between the
+event and the move, would lose the change for good. The agent's
+`deny #room` would then keep naming the old id and stop denying, just as
+the channel gains outside members.
+
+**Solution.** A second migration, `…_channel_id_changes.sql`, adds a
+`channel_id_changes` table keyed by binding, old id and new id.
+
+- **Recording.** The inbound worker records the change (one store write)
+  and settles it at once in a task of its own.
+- **Claiming.** Settling claims the row by moving `next_attempt_at` past
+  the try, as T30's rotation claims a token. Two instances, or an
+  immediate try and the sweeper, never ask Slack twice.
+- **Retries.** A change still waiting is tried again by the Slack agent app
+  sweeper (`SlackAgents::pass`, every minute) once `CHANNEL_CHANGE_RETRY`
+  (five minutes) has passed, at most `CHANNEL_CHANGES_PER_PASS` (64) a
+  pass.
+- **After settling.** A settled row is kept until a day after it arrived
+  (`CHANNEL_CHANGE_TTL`), and longer while its binding has a change
+  waiting, so that change, given up, still follows its chain through it.
+  The purge spares those rows, and so does the eviction below. A replay
+  under another `event_id`, or after the ingress's dedup window, is known
+  without asking Slack again.
+- **Cap.** To keep the router's read small, a binding keeps at most
+  `MAX_CHANNEL_CHANGES` (64) changes, waiting or settled. Recording a
+  change past that forgets its earliest settled ones, never a waiting one
+  and never one a waiting change's chain runs through, the one being
+  recorded included: one from a waiting change's old id, from the new
+  change's old or new id, or from an id such a chain reaches, found with
+  a recursive CTE over the binding's rows. When none can go, the binding is
+  full. Slack confirms a real change at once unless it can't answer, so
+  the owner forging changes can fill it with waiting ones, and so can a
+  burst of more than 64 real shares during a Slack outage or while the
+  bot's `conversations.info` quota, shared with message confirmation, is
+  used up. Rounds 2 and 3 had a separate cap of 16 waiting, which such a
+  burst filled four times sooner.
+- **A full binding fails closed.** A change the binding has no room for
+  isn't recorded. Instead, the agent's denies on its old id, and on the
+  old id of any waiting change whose chain reaches it, are copied at once
+  to its new id and to every id the binding's changes say it had since,
+  through `copy_denies_onward`, the code a give-up after a day uses, with
+  a throttled warning. Its allows stay on the old id, so this only
+  narrows access; a real share that overflows the cap loses its allows
+  there (see "What can still lose a change").
+- **Copies are bounded.** `Rules::copy_denies` lets copied denies take a
+  list past `MAX_RULES`, since a deny never lets anyone in, but not past
+  `MAX_DENIES` (200). A copy that would take the list past it denies
+  everyone instead, and a list that denies everyone takes no copies. A
+  real change copies at most one deny, so only a flood of forged changes
+  gets there, and then the agent refuses everyone except its owner.
+- **The owner can always close the agent.** Copies count toward the
+  list, so past `MAX_RULES` the owner's own `deny` of a member or a
+  channel is refused until they lift some, but `deny everyone` is always
+  taken. `allow everyone` takes `everyone` off the list and drops nothing
+  else, so a copy keeps applying under the channel's new id. After a flood
+  of their own forged changes, the owner's agent keeps up to `MAX_DENIES`
+  copies, and the next copy denies everyone again; the owner can lift
+  copies one at a time only by naming a channel that doesn't resolve,
+  since `allow #name` takes the real channel's id. Only the forger's own
+  agent is affected. A stored list holds at most `MAX_DENIES` rules and
+  `everyone`.
+- **Pending denials.** The router's pending denials go through the same
+  bound, so its work per message stays bounded too. A stored list near
+  `MAX_DENIES` with enough pending copies can make the router deny
+  everyone for as long as those changes wait, up to a day, while the
+  agent's rules, which the owner sees, don't say so. Real traffic doesn't
+  get there: 100 of the owner's denies and a copy for each of 64 waiting
+  changes make 164. With one cap of 64 waiting changes instead of 16, a
+  forged chain of 64 makes up to about 4,000 pending pairs instead of
+  about 250, each scanning a list of at most `MAX_DENIES` and `everyone`:
+  up to about a million comparisons per message, bounded, on the
+  forger's own agent only.
+- **The write lock.** Whether the change is known, or the binding full,
+  is read first without `BEGIN IMMEDIATE`, then read again under it, one
+  query that also counts the rows the eviction could forget. A full
+  binding's copy reads the rules without the lock too, and takes it only
+  when they would change: once the list denies everyone, or has the
+  copies already, a forged flood takes no write lock. Until then, each
+  change that copies a deny takes it once, at most about `MAX_DENIES`
+  times.
+- **Constraints.** The table's `CHECK`s take only two different ids shaped
+  like Slack's conversation ids, as the ingress does.
+
+### Every answer but a confirmation waits
+
+**Issue.** Round 1 settled a change for good on `channel_not_found`, on a
+bot that isn't a member, and on any `Forbidden` code. Those are answers
+Slack may give for a moment while a share propagates, or under an EKM or
+Grid policy, and each left the deny on the dead old id.
+
+**Solution.** `SlackSurface::channel_now` asks `conversations.info` now,
+past the conversation cache, with the binding's bot token and without
+waiting for its quota (`WebApi::without_waiting`).
+
+- **Settled.** Only an answer with the bot in the channel, under an id
+  shaped like a channel's, settles a change.
+- **Waiting.** Everything else leaves it waiting for its next try, until
+  the day is out: the bot not a member, not found, forbidden,
+  unauthorized, rate limited, transient codes and transport failures.
+- **Cost.** A forged change that never confirms costs one lookup every
+  five minutes for a day, within the binding's cap.
+- **Chains.** Settling first follows the binding's recorded changes from
+  the new id to the last id they reach (`policy::later_ids`), so A→B and
+  B→C land on C in either order. It then takes the id Slack answers with,
+  which covers a Slack that follows an old id to the new one. B's own
+  rules move when B→C settles.
+
+### While a change waits, the old id's denies apply to the new one
+
+**Issue.** A waiting change, up to a day during a Slack outage or while the
+bot's quota is used up, left the deny on the old id not covering the new
+one.
+
+**Solution.** The router's view reads the agent's recorded changes from the
+store with its settings on every message. `policy::pending_denials` pairs
+each waiting change's old id with every id the channel had since.
+`agent_policy` copies the old id's room denies to each of those. Allows
+never move early, so a pending change only ever narrows access.
+
+The view reads the changes before the rules. A settle writes the moved
+rules and only then marks the change settled, and a give-up copies the
+denies and only then deletes it. So rules read after a change was seen
+waiting are either the old ones, which its pending denials cover, or the
+new ones, which cover themselves; a change seen settled or gone had its
+rules written earlier. Read the other way round, a settle between the two
+reads would leave a message covered by neither. No test drives that
+interleaving: the view reads through `Store` with nothing to pause it
+between statements, and adding a hook only for that would be code the
+system doesn't need.
+
+A change still waiting after `CHANNEL_CHANGE_TTL` is given up with a
+warning: its denies are copied to the new ids in the agent's rules for
+good (`Rules::copy_denies`), and the row is deleted. Its allows stay on
+the old id, which narrows access rather than widening it; the owner sees
+both in the agent's rules. A copy may take the deny list past
+`MAX_RULES`, since a deny never lets anyone in, up to `MAX_DENIES`.
+
+### The rules move in one transaction, and a deny wins
+
+**Solution.** `Rules::move_room` rewrites every `Room` rule on the old id,
+in both lists, to the new one, then keeps the first rule on each target.
+A rule the agent already had on the new id stays as it was, and the moved
+one is dropped. So a deny on either id ends up a deny on the new id, and
+it wins over an allow there as any deny does.
+
+- **One transaction.** The move runs inside `Store::update_agent_settings`,
+  one `BEGIN IMMEDIATE` transaction with the read.
+- **Rules that don't read.** They are left alone: they already refuse
+  everyone but the owner (`PolicyUnavailable`), and the warning says the
+  owner has to set them again.
+- **The cache.** The instance that settled the change forgets the old id's
+  cached `conversations.info` answer (`TeamDirectory::forget_conv`). Other
+  instances keep theirs until it expires, at most an hour. Only
+  `conv_kind` reads that cache today, and a channel's kind doesn't change
+  with its id. A future reader of `ConvInfo.sharing` on a guard path must
+  use `conv_info_fresh`, as the guards do now.
+
+**Who can forge one.** Only the binding's signer can forge a change: Slack,
+or the agent's owner, who sees the app's signing secret. A forged change
+moves only that agent's rules, which only the owner can set: `allow` and
+`deny` need `own_agent`, and `allow_and_deny_change_the_owners_rules`
+checks that another member is refused. If rules on an agent that someone
+else sets are ever added, the confirmation must check the old id too.
+
+### An old id that isn't `G…`
+
+**Solution.** It is logged as a throttled warning per binding and handled
+the same way, as the plan says. Only `old_channel_id` and `new_channel_id`
+that are shaped like channel ids and differ reach the store. Anything
+else is refused 400 at the ingress before a dedup row is written.
+
+### A manifest update changes only the events
+
+**Issue.** `apps.manifest.update` replaces the app's whole manifest. Round
+1 rebuilt it from the app's stored scopes and redirect URL. That would put
+back request URLs an operator moved by hand at api.slack.com, and it
+needed heuristics to refuse apps it couldn't rebuild exactly.
+
+**Solution.** The sweep reads the app's manifest with
+`apps.manifest.export` (`SlackClient::export_app`), adds the
+`ADDED_BOT_EVENTS` (only `channel_id_changed` so far) its
+`settings.event_subscriptions.bot_events` lacks (`add_bot_events`), and
+writes it back. Nothing else in the manifest changes, so no scope changes
+and no new install is needed, and an event its owner removed, such as
+`message.mpim`, stays removed.
+
+- **Already current.** An app that already has every event is only
+  recorded at the version, without an update call.
+- **No events.** An app whose manifest has no list of bot events is
+  blocked, since it isn't one agentd should change.
+- **Permissions.** Slack saying `permissions_updated` anyway is logged as
+  a warning, and the version is still recorded, since the event was added.
+- **Future versions.** A version only ever adds events. A future version
+  that needs a new scope would need a reinstall, which an update can't
+  do; it would need its own design, such as an install link sent to the
+  owner.
+
+### When the manifest sweep runs, and when it stops
+
+**Solution.** The migration that adds `manifest_version` also adds
+`manifest_lease_until` and `manifest_blocked_version`.
+
+- **What is due.** The sweeper takes up to `MANIFEST_UPDATES_PER_PASS` (16)
+  due bindings each minute. A binding is due when it is an active Slack
+  binding of an agent that isn't deleted, below `MANIFEST_VERSION`, not
+  blocked at it, not leased, and its owner has a usable configuration
+  token in the workspace.
+- **The lease.** Each is claimed for `MANIFEST_UPDATE_LEASE` (an hour)
+  with a conditional `UPDATE`. A transient failure is tried again an hour
+  later, with a warning throttled per binding. A success raises the
+  version, which only ever goes up, and clears the lease.
+- **Blocking.** An app Slack says is gone (`app_not_found`,
+  `invalid_app_id`, on export or update) or that has no event list is
+  blocked at the version (`block_manifest_update`). No update to it is
+  claimed again, and its single warning isn't repeated. A later version
+  tries it again.
+- **`/agent me`.** It lists the agents agentd still updates ("try again
+  every hour") apart from those it can't update ("delete the agent and
+  create it again"), so it never promises a retry that won't come.
+- **A new token.** Registering a configuration token
+  (`put_slack_config_token`) then clears the leases of that member's
+  bindings in that workspace, so their apps are updated within a minute.
+  That is a second statement after the token's write, and best effort:
+  its failure is logged and the token still counts as stored. A lease
+  left behind only delays an update by its hour. Making it part of the
+  write's transaction broke T30's write retries, which count failures
+  with a trigger the rollback undid.
+- **Refused tokens.** A token Slack refuses is marked broken, as at
+  creation, and no update is tried until a new one is registered.
+
+### A configuration token about to expire isn't used
+
+**Issue.** A sweep, creation or deletion could start with a token minutes
+from expiry. Slack's `token_expired` mid-call maps to `Unauthorized`,
+which marks the token broken, so the rotator stops renewing a token whose
+refresh token may still work.
+
+**Solution.** `SlackAgents::usable_token`, the one way the three get a
+token, only takes one still valid after `APP_CALL_TIMEOUT` (three
+minutes). A token closer to expiry is treated as missing: creation says
+it is being renewed, and an update waits for the renewal. The rotator
+renews tokens hours before they expire, so this only matters when
+renewing already fails. `token_refused` now takes the caller's clock, so
+`pass_at`'s injected clock reaches it.
+
+### A sweeper pass stays short and does every part
+
+**Issue.** One pass ran its parts one after another and stopped at the
+first store error. Against a Slack that hangs, 64 lookups of 30 seconds
+and 16 updates of three minutes could hold back abandoned creations and
+install reminders for an hour.
+
+**Solution.**
+
+- **Order.** `pass_within` runs abandoned creations, then giving up
+  channel changes, settling them, install reminders and manifest updates.
+- **Store errors.** Each part's store error is logged, and the next part
+  runs.
+- **Budget.** Each part that asks Slack starts no new call after
+  `SWEEP_PHASE_BUDGET` (20 seconds), counted from when its due list was
+  read, so a part always makes at least one call and takes at most the
+  budget plus one call's timeout. The rest waits for the next pass.
+- **Rotation.** The due changes come longest-due first
+  (`next_attempt_at`, through the partial index), and the due manifest
+  updates never-tried first, then by when their lease ended. A head that
+  keeps failing goes to the back instead of being retried every pass.
+- **Token margin.** The manifest due query asks for a token that still
+  works `APP_CALL_TIMEOUT` from now, as `usable_token` does, so an app
+  isn't leased for an hour and then skipped.
+
+### The events of an agent's app
+
+**Solution.** `channel_id_changed` is queued like a message, deduplicated
+by `event_id` under `slack:<binding>`.
+
+- **No owner bucket.** It takes no token from its owner's bucket. Round 1
+  charged it there, and other members' kept messages drain that bucket,
+  so a flood of mentions could drop a genuine change after its 200. The
+  app's own rate and in-flight places, taken before the 200, bound it,
+  with its dedup row and the binding's cap behind them.
+- **Other events.** Any other event an agent's app is sent is still
+  answered 200 without being queued.
+- **The manager app.** It doesn't subscribe to the event; one sent to it
+  anyway is dropped after the queue.
+
+### What can still lose a change
+
+- **A crash between the 200 and the record.** The ingress queue is in
+  memory, as for messages, and Slack doesn't send again after a 200. A
+  graceful shutdown drains the queue, so only a crash or a drain timeout
+  loses it. Recording before the 200 would need a store write before
+  the ingress answers, which it makes for no event. A message in the new
+  channel routed in the milliseconds before the record isn't covered
+  either.
+- **The allows of a real share past the cap.** A binding that keeps 64
+  changes, none it can forget, copies the denies of the next one, but its
+  allows stay on the old id, so that channel refuses those the allows let
+  in until the owner allows it again. This takes more than 64 shares
+  waiting at once, during an outage, on one agent's bot.
+- **A store that refuses the one write that records it**, or, for a
+  binding with no room, the write that copies its denies. This is logged
+  as a warning.
+- **A binding that isn't active when the change settles.** Its app
+  answers no one, and a deleted agent's binding never comes back.
+- **The old binary in a blue-green swap.** It drops the event, because it
+  doesn't queue it, for an app the new binary has already updated. This
+  lasts until the swap ends.
+
+None of these is visible to the owner. The first and the last are short
+windows. In every other case a change is either settled, or given up or
+refused for want of room with its denies copied, so no deny on a channel
+stops applying.
+
+### Review round 1
+
+The three reviews found nothing blocking. These items were fixed:
+
+- The confirmation now waits instead of settling for good, and chains are
+  followed.
+- Denies apply while a change waits, and are copied when it is given up.
+- The owner's bucket no longer drops changes.
+- Manifest updates read and add, not rebuild, and stop when they can't
+  succeed. `/agent me` tells the two kinds of outdated app apart.
+- Passes are bounded, with each part independent.
+- The lease clear is best effort.
+- Tokens near expiry are not used.
+- The table has `CHECK`s.
+- `token_refused` takes the injected clock.
+- Tests:
+  - A no-op wait was replaced by waiting for the settled row.
+  - A race was removed: the row is polled until settled before the rules
+    are read.
+  - The end-to-end test waits for the refusal DM instead of a 500 ms
+    sleep.
+
+These nits were taken without code:
+
+- Cache eviction is local; see above.
+- Clearing leases while another instance is mid-update can update one app
+  twice. Both send the same manifest, the version only goes up, and a
+  refusal marks only the token version it used, so it is left.
+- The blue-green window is described above.
+
+### Review round 2
+
+The two reviews found nothing blocking. These items were fixed:
+
+- Only waiting changes fill a binding's cap, with settled ones forgotten
+  past 64 (`only_waiting_changes_fill_a_binding_and_the_earliest_settled_make_room`,
+  `a_busy_day_of_shares_records_every_change`).
+- The router reads the changes before the rules; see above for why no
+  test drives it.
+- The purge spares settled rows while their binding has a change waiting
+  (round 3 extends this to the eviction), and the give-ups run before the
+  purge. A failed purge is logged and skips
+  nothing.
+- The due queues rotate, and the change queue uses its partial index.
+- The manifest due query uses the token margin.
+- Each part's budget starts after its due list is read.
+- A known change or a full binding is refused without the write lock.
+- An update adds only `ADDED_BOT_EVENTS`.
+
+Taken without code:
+
+- Forged give-ups growing an owner's deny list (round 4 bounds it at
+  `MAX_DENIES`).
+- The migrations were edited in place before merging, so a dev database
+  that applied an earlier version of them fails sqlx's checksum and needs
+  a reset before the live check.
+
+### Review round 3
+
+The light review found nothing blocking. These items were fixed:
+
+- A full binding copies the denies of the change it has no room for at
+  once, through the give-up's code, instead of dropping it
+  (`a_change_the_binding_has_no_room_for_copies_its_denies_at_once`). The
+  two lines that said only the owner can fill the cap are corrected.
+- Recording past 64 rows never forgets a settled change a waiting chain
+  runs through, and is refused as full when nothing else can go
+  (`settled_changes_a_waiting_chain_runs_through_are_never_forgotten`).
+  The two lines that said settled rows outlive a waiting link now say the
+  eviction spares them too.
+- A manifest update checks the owner's token before taking its lease
+  (`a_token_too_close_to_expiry_by_the_time_its_update_comes_burns_no_lease`).
+- `later_ids` follows a map from old id to new ids, linear in the
+  binding's changes, in the same order as before.
+- `ChannelIdChangeLimits`' rustdoc says `kept` should be well above
+  `waiting`. Nothing breaks if it isn't: a binding at `kept` with nothing
+  to forget is refused as full and fails closed.
+
+### Review round 4
+
+The light review found nothing blocking. These items were fixed:
+
+- A forged flood against a full binding grew its agent's deny list by one
+  rule an event, without bound, each under the write lock. Copies now
+  stop at `MAX_DENIES` and deny everyone instead
+  (`copies_past_the_most_denies_deny_everyone_instead`,
+  `a_flood_of_changes_a_full_binding_has_no_room_for_keeps_the_deny_list_bounded`).
+  The two sentences the review quoted are corrected above.
+- A full binding is found without the write lock
+  (`a_known_change_or_a_full_binding_is_refused_without_the_write_lock`,
+  on a database file, with another connection holding the lock).
+- A full binding's copy reads the rules without the lock first. No test
+  shows that it skips the lock: agentd's tests use the one-connection
+  in-memory store, which has no second connection to hold it.
+- B: a change with no room carries the denies a waiting change brings to
+  its old id
+  (`a_change_with_no_room_carries_the_denies_a_waiting_change_brings_to_its_old_id`).
+- C: waiting changes may use all 64 kept slots, with the separate cap of
+  16 gone, so real bursts of up to 64 keep their allows. The cost is an
+  owner's forged waiting changes: up to 64 per binding take sweeper tries
+  and pending denials, both bounded, rather than 16. The allows lost past
+  64 are listed in "What can still lose a change"; `/agent me` doesn't
+  name them, since that would take a durable record of each.
+- D: the warnings for a change the store lost are throttled per binding.
+- E: design.md names the one cause of a full binding left.
+
+### Review round 5
+
+The light review found nothing blocking. These items were fixed:
+
+- After a flood, `allow everyone` left the copies, so the owner's `deny`,
+  `deny everyone` included, was refused at `MAX_RULES`. Copies are now
+  marked and don't count toward it, `deny everyone` is always taken, and
+  `allow everyone` drops the copies past the list's first `MAX_RULES`
+  rules (`after_a_flood_of_copies_the_owner_can_open_the_agent_and_deny_again`,
+  `everyone_is_denied_past_the_most_rules`). Of the two ways the review
+  offered to clear copies, `allow everyone` dropping them past the cap is
+  the simpler: it needs no new command. The sentence that said only the
+  owner is refused now says everyone except the owner is.
+- NIT 2: the router's deny-everyone while changes wait, which the agent's
+  rules don't show, is documented under "Pending denials" rather than
+  shown: showing it would mean reading the pending changes into
+  `/agent me`, for a state real traffic doesn't reach.
+- NIT 3: the 4× growth of the router's work under a forged chain is
+  documented under "Pending denials".
+- NIT 4: recording a change keeps the settled changes from its own old
+  and new ids, so the eviction in the same transaction doesn't cut its
+  chain (`a_new_change_keeps_the_settled_ones_its_own_chain_runs_through`).
+
+### Review round 6
+
+The light review found nothing blocking. Its should-fix: round 5's
+`allow everyone` dropped copies by their place in the list, which could
+drop a real copy and reopen a channel under its new id while the reply
+still named its label. The `copied` flag behind it didn't track who set
+a rule, and an older binary, which denies unknown fields, couldn't read
+it after a rollback. Both are removed, which leaves the system simpler:
+
+- Copies count toward the list again, bounded by `MAX_DENIES` and then
+  `everyone`, and `allow everyone` drops nothing but `everyone`
+  (`a_real_copy_past_the_most_rules_survives_allow_everyone`, which fails
+  on round 5's code).
+- `deny everyone` is still always taken, so the owner can always close
+  the agent; after a flood of their own forged changes, they can't add a
+  deny by name past `MAX_RULES`
+  (`after_a_flood_of_copies_the_owner_can_deny_everyone_and_open_the_agent_again`).
+- With the flag gone, round 5's rollback hazard is gone too.
+- The 100-rule line in T27's notes and the "Pending denials" figures are
+  corrected.

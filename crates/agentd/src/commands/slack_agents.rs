@@ -3,6 +3,7 @@
 
 use core_types::{MemberKey, SurfaceKind};
 use store::{Agent, AgentBinding};
+use surface_slack::manifest::MANIFEST_VERSION;
 
 use super::agents::{default_persona, persona_problem};
 use super::{Commands, Failure, Origin};
@@ -15,6 +16,53 @@ fn shown(app_id: &str) -> String {
 }
 
 impl Commands {
+    /// The `me` lines naming `key`'s agents whose Slack apps in `key`'s
+    /// workspace are on an older manifest, which don't follow a private
+    /// channel shared later: those agentd still updates, and those it
+    /// can't; `None` when there are none.
+    pub(super) async fn outdated_apps_status(
+        &self,
+        key: &MemberKey,
+        origin: &Origin,
+    ) -> Result<Option<String>, Failure> {
+        let Some(member) = self.member(key).await? else {
+            return Ok(None);
+        };
+        let outdated = self
+            .inner
+            .store
+            .outdated_slack_apps(member, &key.team, MANIFEST_VERSION)
+            .await?;
+        let list = |blocked: bool| {
+            outdated
+                .iter()
+                .filter(|app| app.blocked == blocked)
+                .map(|app| format!("`{}`", app.agent_name.replace('`', "")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut lines = Vec::new();
+        let (waiting, blocked) = (list(false), list(true));
+        if !waiting.is_empty() {
+            lines.push(format!(
+                "Agents whose Slack apps I haven't updated yet: {waiting}. Until I do, they won't \
+                 follow a private channel that is shared with another organization: their rules \
+                 on it stop applying. I update them with your configuration token ({}) and try \
+                 again every hour.",
+                origin.command("slack-token <token> <refresh token>")
+            ));
+        }
+        if !blocked.is_empty() {
+            lines.push(format!(
+                "Agents whose Slack apps I can't update: {blocked}. Slack says the app is gone, \
+                 or it subscribes to no events. They won't follow a private channel that is \
+                 shared with another organization; to fix that, delete the agent and create it \
+                 again."
+            ));
+        }
+        Ok((!lines.is_empty()).then(|| lines.join("\n")))
+    }
+
     /// `create` on Slack: the agent and its app, and an install link in a
     /// DM.
     pub(super) async fn create_on_slack(

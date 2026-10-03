@@ -1905,19 +1905,37 @@ moment the channel gains outside members. So agent apps subscribe to
    merge: a deny on either id is kept as a deny, and duplicates are
    dropped.
 
+Slack sends the event once, so agentd stores the change before acting on it
+and settles it from the store. Only Slack answering where the channel is,
+with the bot in it, settles it; any other answer, a channel not found yet
+included, is tried again for a day. Until then the agent's denies on the
+old id also apply to the new one, and a change given up after the day
+copies them there, so a deny doesn't stop applying while agentd waits for
+Slack. A change that arrives while the binding keeps as many as it may,
+none of which it can forget, has its denies copied at once instead.
+Copies never take an agent's deny list past twice the rules its owner may
+set; the next denies everyone instead, which the owner lifts with `allow
+everyone`, and `deny everyone` is always taken. A chain of changes (A to
+B, then B to C) settles on its last id in any order.
+
 Only the receiving agent's rules move: each agent whose bot is in the channel
 gets its own event, and an owner who forges one can change only rules they
-could set anyway. Nothing else moves. Sessions, volumes, thread counts and
-message references stay under the old id, unused, and threads in the
-channel start new sessions: agentd can't confirm that the old id and the new
-are one channel, and moving another channel's sessions into this one would
-show its threads to this channel's turns. An agent whose bot isn't in the
-channel gets no event and keeps a rule naming the old id. It can't hear the
-channel until it is invited, and its owner must then set the rule again.
+could set anyway, since only an agent's owner sets its rules. Rules that
+someone else sets on an agent would need the old id checked too. Nothing else
+moves. Sessions, volumes, thread counts and message references stay under the
+old id, unused, and threads in the channel start new sessions: agentd can't
+confirm that the old id and the new are one channel, and moving another
+channel's sessions into this one would show its threads to this channel's
+turns. An agent whose bot isn't in the channel gets no event and keeps a rule
+naming the old id. It can't hear the channel until it is invited, and its
+owner must then set the rule again.
 
 Existing agents' apps get the subscription through `apps.manifest.update`
 with their owner's configuration token (T30) when it works, and keep missing
-it until then; `/agent me` says so.
+it until then; `/agent me` says so. The update reads the app's manifest and
+adds only the events it lacks, so nothing else changes and no new install
+is needed; an app Slack says is gone is not tried again, and `/agent me`
+says that too.
 
 ### Verified and assumed
 

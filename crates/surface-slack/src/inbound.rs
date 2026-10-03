@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use core_types::{BindingId, ConvRef, InboundEvent, MemberKey, TeamId};
+use core_types::{BindingId, ConvRef, ConversationId, InboundEvent, MemberKey, TeamId};
 use secrecy::SecretString;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
@@ -17,6 +17,8 @@ pub enum SlackInbound {
     /// among its binding's requests in flight. Boxed, since it is much
     /// larger than the other variants.
     Message(Box<InboundEvent>, InFlight),
+    /// A channel the app's bot is in got a new id.
+    ChannelIdChanged(ChannelIdChanged),
     /// Any other Events API event, such as `user_change` or
     /// `app_uninstalled`, as Slack sent it.
     Event(SlackEvent),
@@ -32,6 +34,7 @@ impl SlackInbound {
     pub fn binding(&self) -> BindingId {
         match self {
             Self::Message(event, _) => event.binding,
+            Self::ChannelIdChanged(changed) => changed.binding,
             Self::Event(event) => event.binding,
             Self::Command(command) => command.binding,
             Self::Interaction(interaction) => interaction.binding,
@@ -46,6 +49,7 @@ impl SlackInbound {
     pub fn team(&self) -> Option<&TeamId> {
         match self {
             Self::Message(event, _) => Some(&event.conv.team),
+            Self::ChannelIdChanged(changed) => Some(&changed.team),
             Self::Event(event) => Some(&event.team),
             Self::Command(command) => Some(&command.sender.team),
             Self::Interaction(interaction) => {
@@ -54,11 +58,12 @@ impl SlackInbound {
         }
     }
 
-    /// What kind of request this is, for logs: `message`, `event`,
-    /// `command` or `interaction`.
+    /// What kind of request this is, for logs: `message`,
+    /// `channel_id_changed`, `event`, `command` or `interaction`.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Message(..) => "message",
+            Self::ChannelIdChanged(_) => "channel_id_changed",
             Self::Event(_) => "event",
             Self::Command(_) => "command",
             Self::Interaction(_) => "interaction",
@@ -66,7 +71,27 @@ impl SlackInbound {
     }
 }
 
-/// An Events API event other than `message`.
+/// A `channel_id_changed` event: Slack gave a channel the app's bot is in
+/// a new id, as it does when a private channel (`G…`) is shared with
+/// another organization. The event says so; it proves nothing, since an
+/// agent app's owner can sign any event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelIdChanged {
+    /// The binding whose app received the event.
+    pub binding: BindingId,
+    /// The workspace the event came through, as for a [`SlackEvent`].
+    pub team: TeamId,
+    /// The envelope's `event_id`.
+    pub event_id: String,
+    /// The channel's id until now, `old_channel_id`.
+    pub old: ConversationId,
+    /// The id it says the channel has now, `new_channel_id`.
+    pub new: ConversationId,
+    /// When agentd received the request.
+    pub received_at: OffsetDateTime,
+}
+
+/// An Events API event other than `message` and `channel_id_changed`.
 #[derive(Debug, Clone)]
 pub struct SlackEvent {
     /// The binding whose app received the event.

@@ -14,7 +14,7 @@ use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
 use crate::directory::{MemberDirectory, TeamDirectory};
-use crate::normalize::{self, Context, KEPT_SUBTYPES};
+use crate::normalize::{self, Context, KEPT_SUBTYPES, is_channel_id};
 use crate::web::{Message, PageRequest, Result, WebApi};
 
 /// The page size history reads ask for.
@@ -152,6 +152,30 @@ impl SlackSurface {
     /// The workspace's caches.
     pub fn directory(&self) -> &Arc<TeamDirectory> {
         &self.directory
+    }
+
+    /// Where Slack says `channel` is now, asked now with
+    /// `conversations.info`, past every cache and
+    /// [without waiting](WebApi::without_waiting) for the token's quota:
+    /// `Some` of the id Slack answers with, which is `channel` itself unless
+    /// Slack follows it to the id it has since, when the bot is a member
+    /// and that id is shaped like a channel's; `None` when the bot isn't a
+    /// member.
+    ///
+    /// # Errors
+    ///
+    /// Any `conversations.info` error, a channel Slack can't find for the
+    /// bot ([`SurfaceError::NotFound`]) or won't show it
+    /// ([`SurfaceError::Forbidden`]) included: Slack may not have caught up
+    /// with a change it just announced, so none of them is taken as an
+    /// answer.
+    pub async fn channel_now(&self, channel: &ConversationId) -> Result<Option<ConversationId>> {
+        let info = self
+            .api
+            .without_waiting()
+            .conversation_info(channel)
+            .await?;
+        Ok((info.is_member && is_channel_id(info.id.as_str())).then_some(info.id))
     }
 
     /// Reads the workspace's members again when the cache is older than its

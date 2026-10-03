@@ -1055,6 +1055,7 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
         &store.agent_settings(helper).await.unwrap(),
         &agentd::policy::Limits::default(),
         0,
+        &[],
     )
     .unwrap();
     assert_eq!(

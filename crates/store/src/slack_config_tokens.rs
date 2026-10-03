@@ -100,6 +100,10 @@ fn attempt(value: i64) -> Result<u32> {
 impl Store {
     /// Stores `member`'s configuration token for `team` at `now`, replacing
     /// any they had there, with a new version and no lease, break or notice.
+    /// Then ends the leases of the manifest updates of `member`'s Slack apps
+    /// in `team`, so the new token updates them at once. That is best
+    /// effort: a failure there is logged, and the token still counts as
+    /// stored, since a lease left behind only delays an update by its hour.
     ///
     /// # Errors
     ///
@@ -136,6 +140,18 @@ impl Store {
         .bind(to_unix(now))
         .execute(&self.pool)
         .await?;
+        if let Err(err) = sqlx::query(
+            "UPDATE agent_bindings SET manifest_lease_until = NULL \
+             WHERE surface = 'slack' AND team_id = ? AND manifest_lease_until IS NOT NULL \
+             AND agent_id IN (SELECT id FROM agents WHERE owner_id = ?)",
+        )
+        .bind(team.as_str())
+        .bind(member.to_string())
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(%member, error = %err, "stored a configuration token but couldn't end its member's manifest update leases; their apps are updated once the leases end");
+        }
         Ok(SlackConfigTokenRef {
             member,
             team: team.clone(),
