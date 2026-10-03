@@ -9,9 +9,10 @@ use agentd::server::{Routers, Server};
 use agentd::{App, Config};
 use core_types::{AgentId, ScopeKey, SessionId, VolumeKey};
 use secrecy::ExposeSecret as _;
+use testkit::TempDir;
 use tokio::sync::oneshot;
 
-use common::{CONFIG, Response, TempDir, env};
+use common::{CONFIG, Response, env};
 
 async fn post(addr: SocketAddr, token: Option<&ProcessToken>) -> Response {
     let mut headers = vec![("Content-Type", "application/json".to_owned())];
@@ -77,23 +78,20 @@ async fn the_ctl_listener_serves_the_agentctl_api_by_source_address() {
 
 #[tokio::test]
 async fn startup_deletes_tokens_and_staged_files_from_before() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let text = CONFIG
-        .replace(
-            "sqlite::memory:",
-            &format!("sqlite://{}", dir.path().join("agentd.db").display()),
-        )
+        .replace("sqlite::memory:", &dir.db_url())
         .replace("/nonexistent/agentd", &dir.path().display().to_string());
     let config = || Config::parse(&text, env()).unwrap();
 
     let app = App::open(config()).await.unwrap();
     let token = issue(&app, "127.0.0.1").await;
-    let staged = dir.path().join(STAGING_DIR).join("left-over");
+    let staged = dir.join(STAGING_DIR).join("left-over");
     std::fs::create_dir_all(&staged).unwrap();
     app.store().close().await;
 
     let app = App::open(config()).await.unwrap();
-    assert!(!dir.path().join(STAGING_DIR).exists());
+    assert!(!dir.join(STAGING_DIR).exists());
     let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
         .await
         .unwrap();

@@ -668,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_records_in_one_session_get_distinct_short_ids() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let session = SessionId::new_v4();
         let tasks: Vec<_> = (0..16)
