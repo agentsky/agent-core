@@ -462,22 +462,35 @@ Auth tests slept 100 ms and assumed a token response delayed 300 ms was
 still on its way. `concurrent_callers_share_a_failed_refresh_of_an_expired_token`
 gave its five callers the 503's 200 ms delay to join one refresh; a caller
 that joins after it lands starts its own, since an expired token is always
-retried, and sends a second request. Adding 250 ms before callers 2 to 5
+retried, and sends a second request. Adding 300 ms before callers 2 to 5
 start failed it. The plan-after-lock test slept 1 s, then checked a profile
 that was delayed 1.5 s, so it never saw the profile land.
 
-**Solution.** `testkit::Held` is a wiremock responder that holds its
-response until the test releases it. A test waits, with a 30 s bound, for
-the request to arrive, acts, then releases it. Holding blocks the mock
-server's thread, so the `Hold` is declared after the server and released
-before anything else asks the server. The expired-token test also waits
-until all five callers have joined: the in-flight map holds the refresh's
-`watch::Sender`, and a doc-hidden `Auth::refresh_waiters(member)` returns
-its receiver count. That sender keeps the channel open, so the guard that
-removes the map entry goes into the refresh task when it is spawned, and a
-task dropped before its first poll still frees it. The plan-after-lock test
-waits for the profile request and checks 2 s after it. A sleep stays only
-as a settle before asserting that nothing more happened.
+**Solution.** A test waits for what it assumes, and a sleep stays only as a
+settle before asserting that nothing more happened.
+
+`testkit::Held` is a wiremock responder that holds its response until the
+test releases it. A test waits, with a 30 s bound, for the request to
+arrive, acts, then releases it. Holding blocks the mock server's thread, so
+the `Hold` is declared after the server and released before anything else
+asks the server. The logout test only waits for its refresh to be sent:
+logout queues behind that refresh on the member's lock, so a held response
+would deadlock, and either order ends the same.
+
+The expired-token test also waits until all five callers have joined: the
+in-flight map holds the refresh's `watch::Sender`, and a doc-hidden
+`Auth::refresh_waiters(member)` returns its receiver count. That sender
+keeps the channel open, so the guard that removes the map entry goes into
+the refresh task when it is spawned, and a task dropped before its first
+poll still frees it: its waiters get `RefreshInterrupted`, and the next
+caller starts a new refresh.
+`a_refresh_dropped_before_it_first_runs_lets_the_next_caller_refresh` joins
+a refresh on a second runtime and drops that runtime before the task runs;
+with the guard made on the task's first poll instead, the next caller waits
+forever.
+
+The plan-after-lock test waits for the profile request and checks 2 s after
+it.
 
 agentd's `a_stalled_body_does_not_hold_up_shutdown` slept 200 ms and
 assumed its client had sent its partial request by then; a client thread
