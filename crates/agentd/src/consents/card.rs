@@ -524,7 +524,11 @@ mod tests {
         Consent {
             id: ConsentId::new_v4(),
             agent: AgentId::new_v4(),
-            requester: Requester { member: None, key },
+            requester: Requester {
+                member: None,
+                key,
+                outside: None,
+            },
             hop: Hop::ZERO,
             task: task.to_owned(),
             attachments_json: "[]".to_owned(),

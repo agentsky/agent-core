@@ -36,25 +36,34 @@
 //!    [`IgnoreReason::UnattributedManagedBot`]. The turn inherits its
 //!    requester and the next hop. The requester's member is the recorded
 //!    one, or, if none was recorded, the member its key belongs to now.
-//! 6. **Paused**: [`RefuseReason::Paused`].
-//! 7. **Banned requester**: [`RefuseReason::Banned`]. For a hop that is the
+//!    A person's message makes them the requester, with the event's
+//!    [`outside`](InboundEvent::outside); a hop's requester takes
+//!    `outside` from the attribution, never from the posting bot, whose
+//!    own says nothing.
+//! 6. **Outside.** A requester from outside the workspace
+//!    ([`Requester::outside`] set): [`IgnoreReason::Outside`], until the
+//!    community can admit them. It comes after the gate, so an
+//!    unaddressed message from outside is ignored as any other is, and
+//!    before every refusal, so nothing is posted or sent for them.
+//! 7. **Paused**: [`RefuseReason::Paused`].
+//! 8. **Banned requester**: [`RefuseReason::Banned`]. For a hop that is the
 //!    inherited requester, so a ban can't be sidestepped through an agent.
 //!    If the view can't say: [`RefuseReason::PolicyUnavailable`].
-//! 8. **Allow and deny rules**, for anyone but the owner:
+//! 9. **Allow and deny rules**, for anyone but the owner:
 //!    [`RefuseReason::Denied`]. If the view has no policy for the agent:
 //!    [`RefuseReason::PolicyUnavailable`], for the owner too, since the
 //!    policy also holds the hop cap.
-//! 9. **Hop cap**: [`RefuseReason::HopCap`], also when the hop counter
-//!    would overflow.
-//! 10. **Daily cap**, for anyone but the owner: [`RefuseReason::DailyCap`]
+//! 10. **Hop cap**: [`RefuseReason::HopCap`], also when the hop counter
+//!     would overflow.
+//! 11. **Daily cap**, for anyone but the owner: [`RefuseReason::DailyCap`]
 //!     once the agent has taken [`AgentPolicy::turns_per_day`] turns today.
-//! 11. **Thread caps**, outside one-to-one DMs, for everyone, the owner
+//! 12. **Thread caps**, outside one-to-one DMs, for everyone, the owner
 //!     included: [`RefuseReason::ThreadTurns`] once agents took the hour's
 //!     turns in the thread, then [`RefuseReason::ThreadTokens`] once their
 //!     turns used the day's token budget. If the view can't say:
 //!     [`RefuseReason::PolicyUnavailable`]. A one-to-one DM has one agent
 //!     in it, so no agents can answer each other there.
-//! 12. **Credential.** The owner runs on their own credential, or gets
+//! 13. **Credential.** The owner runs on their own credential, or gets
 //!     [`Decision::LinkPrompt`] if they have none; the community key is
 //!     never used for the owner. Anyone else runs on their own credential
 //!     if linked, else on the community key if one is configured, else gets
@@ -132,6 +141,7 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
             let requester = Requester {
                 member: view.member_for(&event.sender),
                 key: event.sender.clone(),
+                outside: event.outside.clone(),
             };
             (requester, Some(Hop::ZERO))
         }
@@ -145,12 +155,24 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
             else {
                 return Decision::Ignore(IgnoreReason::UnattributedManagedBot);
             };
-            let Requester { member, key } = attribution.requester;
+            let Requester {
+                member,
+                key,
+                outside,
+            } = attribution.requester;
             let member = member.or_else(|| view.member_for(&key));
-            (Requester { member, key }, attribution.hop.next())
+            let requester = Requester {
+                member,
+                key,
+                outside,
+            };
+            (requester, attribution.hop.next())
         }
     };
 
+    if requester.outside.is_some() {
+        return Decision::Ignore(IgnoreReason::Outside);
+    }
     if state == AgentState::Paused {
         return Decision::Refuse {
             reason: RefuseReason::Paused,

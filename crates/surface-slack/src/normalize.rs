@@ -45,10 +45,33 @@
 //!   agent's post Slack delivers, with whatever blocks Slack makes of its
 //!   text, hands off to the agents agentd's own delivery did: agentd's
 //!   agents post text, and the router ignores every other bot.
-//! - The team is the envelope's `team_id`, for the sender and the
-//!   conversation alike.
+//! - The team is the workspace the event came through, its installation's
+//!   `authorizations[0].team_id` ([`Context::team`]), for the sender and
+//!   the conversation alike, whoever sent it: an outside member is keyed
+//!   by the workspace too.
+//! - Whether the sender is from outside that workspace comes from the
+//!   message's own team fields (see [Who is outside](#who-is-outside)).
 //! - A bot's message that was `edited` is dropped: agentd never edits its
 //!   agents' posts, so someone else holding the bot's token did.
+//!
+//! # Who is outside
+//!
+//! A message names its sender's team in up to four fields, read in this
+//! order by `MessageEvent::sender_teams`, the one place that lists them:
+//! `user_team`, `source_team`, `user_profile.team` and `team`. Bolt reads
+//! `user_team` before `team`, and in one of its fixtures an outside actor
+//! has the installing team in `team` and their own only in the others.
+//! One that is present and not shaped like a team id ([`is_team_id`])
+//! makes the message [`Skip::Malformed`]. When a field
+//! names neither the workspace ([`Context::team`]) nor its Enterprise Grid
+//! organization ([`Context::home_org`]), the sender is outside, with the
+//! first such field, in that order, as their organization. Otherwise
+//! [`InboundEvent::outside`] is `None`, which only the event's own first
+//! routing takes as home: the fields can make a sender outside, never
+//! home, and Slack's copy of the message is looked up before anything acts
+//! on it ([`SlackSurface::fill_sender_team`](crate::SlackSurface::fill_sender_team)).
+//! Slack's fixtures disagree on which field names an outside actor, so
+//! every field counts and none alone.
 //!
 //! [`read_back`] runs the same rules on a message read back from
 //! `conversations.history` or `conversations.replies`, which carries no
@@ -78,6 +101,8 @@
 //!   more of the message. A person's mention past the cut is still read
 //!   from `blocks`, where Slack's clients put each one too; a bot's
 //!   mentions are read from `text` alone.
+//! - The sender's team fields are kept only as the [`Outside`] they make,
+//!   each a team id [`is_team_id`] accepts.
 //! - Mentions to the first [`MAX_MENTIONS`] different users, each an id
 //!   [`is_user_id`] accepts; the router looks each one up.
 //! - Files to the first [`MAX_FILES`] the bot can download, each with an id
@@ -93,7 +118,7 @@ use std::fmt;
 
 use core_types::{
     BindingId, ConvKind, ConvRef, ConversationId, InFile, InboundEvent, MAX_MENTIONS, MemberKey,
-    MsgRef, SurfaceKind, TeamId, UserId,
+    MsgRef, Outside, SurfaceKind, TeamId, UserId,
 };
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -133,8 +158,15 @@ pub struct Context<'a> {
     /// one-to-one DMs are kept only when they reply in a thread, whoever
     /// posted its root, and bots' messages are kept whatever they mention.
     pub bot_user: Option<&'a UserId>,
-    /// The envelope's `team_id`.
+    /// The workspace the event came through: its installation's,
+    /// `authorizations[0].team_id`, never the envelope's `team_id`; for a
+    /// message read back, the binding's. The sender and the conversation
+    /// are keyed by it.
     pub team: &'a TeamId,
+    /// The workspace's Enterprise Grid organization, the `enterprise_id`
+    /// `auth.test` gave at startup, if it has one. A sender team field
+    /// naming it doesn't make the sender outside.
+    pub home_org: Option<&'a TeamId>,
     /// The envelope's `event_id`.
     pub event_id: &'a str,
     /// When agentd received the request.
@@ -182,25 +214,98 @@ struct MessageEvent {
     blocks: Option<Value>,
     files: Option<Vec<SlackFile>>,
     edited: Option<IgnoredAny>,
+    team: Option<String>,
+    user_team: Option<String>,
+    source_team: Option<String>,
+    user_profile: Option<UserProfile>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UserProfile {
+    team: Option<String>,
+}
+
+impl MessageEvent {
+    /// The sender's team fields, `user_team`, `source_team`,
+    /// `user_profile.team` and `team`, each that is present, in the order
+    /// the first that names another organization is taken as theirs.
+    fn sender_teams(&self) -> impl Iterator<Item = &str> {
+        [
+            self.user_team.as_deref(),
+            self.source_team.as_deref(),
+            self.user_profile
+                .as_ref()
+                .and_then(|profile| profile.team.as_deref()),
+            self.team.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// Whether the sender is outside the workspace, as [Who is
+    /// outside](self#who-is-outside) says, or `Err` when a field isn't
+    /// shaped like a team id.
+    fn outside(&self, context: &Context<'_>) -> Result<Option<Outside>, Skip> {
+        if !self.sender_teams().all(is_team_id) {
+            return Err(Skip::Malformed);
+        }
+        Ok(self
+            .sender_teams()
+            .find(|team| {
+                *team != context.team.as_str()
+                    && context.home_org.is_none_or(|org| *team != org.as_str())
+            })
+            .map(|team| Outside {
+                team: Some(team.into()),
+            }))
+    }
 }
 
 /// A string [`is_user_id`] accepts, or `None` for any other value, read
 /// without keeping what it skips.
 fn user_id_or_nothing<'de, D: Deserializer<'de>>(value: D) -> Result<Option<UserId>, D::Error> {
-    value.deserialize_any(UserIdOrNothing)
+    Ok(shaped_or_nothing(value, is_user_id)?.map(UserId::from))
 }
 
-struct UserIdOrNothing;
+/// A string [`is_team_id`] accepts, or `None` for any other value, read
+/// without keeping what it skips: how an Events API payload's
+/// `authorizations[0].team_id` is read, so one in another form is no
+/// installation rather than an unreadable body.
+pub(crate) fn team_id_or_nothing<'de, D: Deserializer<'de>>(
+    value: D,
+) -> Result<Option<TeamId>, D::Error> {
+    Ok(shaped_or_nothing(value, is_team_id)?.map(TeamId::from))
+}
 
-impl<'de> Visitor<'de> for UserIdOrNothing {
-    type Value = Option<UserId>;
+/// A string [`is_enterprise_id`] accepts, or `None` for any other value,
+/// read without keeping what it skips.
+pub(crate) fn enterprise_id_or_nothing<'de, D: Deserializer<'de>>(
+    value: D,
+) -> Result<Option<TeamId>, D::Error> {
+    Ok(shaped_or_nothing(value, is_enterprise_id)?.map(TeamId::from))
+}
+
+/// A string `shape` accepts, or `None` for any other value, read without
+/// keeping what it skips.
+pub(crate) fn shaped_or_nothing<'de, D: Deserializer<'de>>(
+    value: D,
+    shape: fn(&str) -> bool,
+) -> Result<Option<String>, D::Error> {
+    value.deserialize_any(ShapedOrNothing(shape))
+}
+
+struct ShapedOrNothing(fn(&str) -> bool);
+
+impl<'de> Visitor<'de> for ShapedOrNothing {
+    type Value = Option<String>;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("any value")
     }
 
     fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
-        Ok(is_user_id(text).then(|| UserId::from(text)))
+        Ok((self.0)(text).then(|| text.to_owned()))
     }
 
     fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
@@ -295,7 +400,7 @@ pub fn read_back(
 
 fn normalized(
     context: &Context<'_>,
-    event: MessageEvent,
+    mut event: MessageEvent,
     channel: ConversationId,
     conv_kind: ConvKind,
 ) -> Result<InboundEvent, Skip> {
@@ -306,7 +411,7 @@ fn normalized(
             truncated(subtype, MAX_SUBTYPE_BYTES).to_owned(),
         ));
     }
-    let Some(ts) = event.ts.filter(|ts| is_ts(ts)) else {
+    let Some(ts) = event.ts.take().filter(|ts| is_ts(ts)) else {
         return Err(Skip::Malformed);
     };
     let shaped = event.user.as_deref().is_none_or(is_user_id)
@@ -315,6 +420,7 @@ fn normalized(
     if !shaped {
         return Err(Skip::Malformed);
     }
+    let outside = event.outside(context)?;
     let is_bot = event.bot_id.is_some() || event.bot_profile.is_some();
     if is_bot && event.edited.is_some() {
         return Err(Skip::EditedByBot);
@@ -361,6 +467,7 @@ fn normalized(
             team: context.team.clone(),
             user: sender,
         },
+        outside,
         sender_is_bot: is_bot,
         sender_bot_user,
         conv: conv.clone(),
@@ -570,6 +677,18 @@ pub fn is_team_id(id: &str) -> bool {
     is_slack_id(id, &["T", "E"], MAX_ID_TAIL)
 }
 
+/// Whether `id` is shaped like a Slack workspace's id: `T`, then 1 to
+/// [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_workspace_id(id: &str) -> bool {
+    is_slack_id(id, &["T"], MAX_ID_TAIL)
+}
+
+/// Whether `id` is shaped like a Slack Enterprise Grid organization's id:
+/// `E`, then 1 to [`MAX_ID_TAIL`] uppercase letters or digits.
+pub fn is_enterprise_id(id: &str) -> bool {
+    is_slack_id(id, &["E"], MAX_ID_TAIL)
+}
+
 /// Whether `id` is shaped like a Slack conversation id: `C`, `D` or `G`,
 /// then 1 to [`MAX_ID_TAIL`] uppercase letters or digits.
 pub fn is_channel_id(id: &str) -> bool {
@@ -614,6 +733,7 @@ mod tests {
             binding: BindingId::from_uuid(uuid::Uuid::nil()),
             bot_user: Some(&bot),
             team: &team,
+            home_org: None,
             event_id: "Ev1",
             received_at: datetime!(2026-09-30 12:00 UTC),
         };
@@ -766,6 +886,7 @@ mod tests {
             binding: BindingId::new_v4(),
             bot_user: None,
             team: &team,
+            home_org: None,
             event_id: "Ev1",
             received_at: datetime!(2026-09-30 12:00 UTC),
         };
@@ -998,6 +1119,7 @@ mod tests {
             binding: BindingId::new_v4(),
             bot_user: None,
             team: &team,
+            home_org: None,
             event_id: "Ev1",
             received_at: datetime!(2026-09-30 12:00 UTC),
         };
@@ -1203,6 +1325,7 @@ mod tests {
             binding: BindingId::from_uuid(uuid::Uuid::nil()),
             bot_user: Some(&bot),
             team: &team,
+            home_org: None,
             event_id: "Ev1",
             received_at: datetime!(2026-09-30 12:00 UTC),
         };
@@ -1296,5 +1419,190 @@ mod tests {
         ] {
             assert!(!skip.to_string().is_empty());
         }
+    }
+
+    fn in_workspace(event: &Value, home_org: Option<&str>) -> Result<InboundEvent, Skip> {
+        let bot = UserId::from(testkit::slack::BOT_USER);
+        let team = TeamId::from(testkit::slack::TEAM);
+        let home_org = home_org.map(TeamId::from);
+        let context = Context {
+            binding: BindingId::from_uuid(uuid::Uuid::nil()),
+            bot_user: Some(&bot),
+            team: &team,
+            home_org: home_org.as_ref(),
+            event_id: "Ev1",
+            received_at: datetime!(2026-09-30 12:00 UTC),
+        };
+        let as_event = message(&context, event);
+        let as_read_back = read_back(
+            &context,
+            &ConversationId::from(testkit::slack::SHARED_CHANNEL),
+            ConvKind::Channel,
+            event,
+        );
+        assert_eq!(
+            as_event.as_ref().map(|event| &event.outside),
+            as_read_back.as_ref().map(|event| &event.outside),
+            "a read-back message is read alike"
+        );
+        as_event
+    }
+
+    fn connect_message(fields: Value) -> Value {
+        let mut event = channel_message(fields);
+        event["text"] = json!(format!("<@{}> hello", testkit::slack::BOT_USER));
+        event
+    }
+
+    fn fixture_event(fixture: &str) -> Value {
+        serde_json::from_str::<Value>(fixture).unwrap()["event"].clone()
+    }
+
+    fn outside(team: &str) -> Option<Outside> {
+        Some(Outside {
+            team: Some(team.into()),
+        })
+    }
+
+    #[test]
+    fn an_outside_member_is_keyed_by_the_workspace_and_marked_outside() {
+        let event = in_workspace(
+            &fixture_event(testkit::slack::MESSAGE_CONNECT_THEIR_TEAM),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            event.sender,
+            MemberKey {
+                surface: SurfaceKind::Slack,
+                team: testkit::slack::TEAM.into(),
+                user: testkit::slack::OUTSIDE_USER.into(),
+            }
+        );
+        assert_eq!(event.conv.team.as_str(), testkit::slack::TEAM);
+        assert_eq!(event.outside, outside(testkit::slack::OUTSIDE_TEAM));
+    }
+
+    #[test]
+    fn an_outside_actor_with_the_installing_team_in_team_is_outside() {
+        let event = in_workspace(
+            &fixture_event(testkit::slack::MESSAGE_CONNECT_NO_ACTOR_TEAM),
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.sender.team.as_str(), testkit::slack::TEAM);
+        assert_eq!(event.outside, outside(testkit::slack::OUTSIDE_TEAM));
+    }
+
+    #[test]
+    fn source_team_and_user_profile_team_count() {
+        let home = testkit::slack::TEAM;
+        for fields in [
+            json!({"source_team": "T0THEIRS1"}),
+            json!({"user_profile": {"team": "T0THEIRS1"}}),
+            json!({"team": home, "user_team": home, "source_team": "T0THEIRS1"}),
+            json!({"team": home, "user_team": home, "user_profile": {"team": "T0THEIRS1", "display_name": "zoe"}}),
+        ] {
+            let event = in_workspace(&connect_message(fields.clone()), None).unwrap();
+            assert_eq!(event.outside, outside("T0THEIRS1"), "{fields}");
+        }
+    }
+
+    #[test]
+    fn the_first_foreign_field_names_the_organization() {
+        let event = in_workspace(
+            &connect_message(json!({
+                "team": "T0FOURTH1",
+                "user_profile": {"team": "T0THIRD01"},
+                "source_team": "T0SECOND1",
+                "user_team": "T0FIRST01",
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.outside, outside("T0FIRST01"));
+        let event = in_workspace(
+            &connect_message(json!({
+                "team": "T0FOURTH1",
+                "user_profile": {"team": "T0THIRD01"},
+                "source_team": testkit::slack::TEAM,
+                "user_team": testkit::slack::TEAM,
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(event.outside, outside("T0THIRD01"));
+    }
+
+    #[test]
+    fn a_home_member_in_a_shared_channel_is_not_outside_by_its_fields() {
+        let event =
+            in_workspace(&fixture_event(testkit::slack::MESSAGE_CONNECT_HOME), None).unwrap();
+        assert_eq!(event.outside, None);
+        assert_eq!(event.sender.user.as_str(), testkit::slack::USER);
+        let teamless = in_workspace(&connect_message(json!({})), None).unwrap();
+        assert_eq!(teamless.outside, None, "the home check decides");
+    }
+
+    #[test]
+    fn a_home_organization_field_counts_as_home_only_with_the_organization_known() {
+        let event = fixture_event(testkit::slack::MESSAGE_HOME_ORG);
+        assert_eq!(
+            in_workspace(&event, Some(testkit::slack::HOME_ORG))
+                .unwrap()
+                .outside,
+            None
+        );
+        assert_eq!(
+            in_workspace(&event, None).unwrap().outside,
+            outside(testkit::slack::HOME_ORG),
+            "without auth.test's enterprise_id an E… field is another organization"
+        );
+        assert_eq!(
+            in_workspace(&event, Some("E0OTHERORG")).unwrap().outside,
+            outside(testkit::slack::HOME_ORG)
+        );
+    }
+
+    #[test]
+    fn another_workspace_of_the_home_organization_is_outside() {
+        let event = connect_message(json!({
+            "team": testkit::slack::TEAM,
+            "user_team": testkit::slack::HOME_ORG,
+            "source_team": "T0SIBLING",
+        }));
+        assert_eq!(
+            in_workspace(&event, Some(testkit::slack::HOME_ORG))
+                .unwrap()
+                .outside,
+            outside("T0SIBLING")
+        );
+    }
+
+    #[test]
+    fn a_sender_team_not_shaped_like_slacks_is_malformed() {
+        for fields in [
+            json!({"team": ""}),
+            json!({"user_team": "t0lower01"}),
+            json!({"source_team": "U0HUMAN01"}),
+            json!({"user_profile": {"team": "T0TEAM001 "}}),
+            json!({"team": format!("T{}", "0".repeat(MAX_ID_TAIL + 1))}),
+            json!({"user_team": 7}),
+            json!({"user_profile": {"team": ["T0TEAM001"]}}),
+        ] {
+            assert_eq!(
+                in_workspace(&connect_message(fields.clone()), None),
+                Err(Skip::Malformed),
+                "{fields}"
+            );
+        }
+        assert!(in_workspace(&connect_message(json!({"user_profile": {}})), None).is_ok());
+        assert!(
+            in_workspace(
+                &connect_message(json!({"team": format!("T{}", "0".repeat(MAX_ID_TAIL))})),
+                None
+            )
+            .is_ok()
+        );
     }
 }

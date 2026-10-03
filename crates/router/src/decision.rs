@@ -101,6 +101,10 @@ pub enum IgnoreReason {
     /// its messages, nor is a DM with it. A reply that mentions another
     /// managed agent but not this one is addressed to that agent only.
     NotAddressed,
+    /// The requester is from outside the workspace agentd serves
+    /// ([`Requester::outside`](core_types::Requester::outside)), whom
+    /// nothing admits yet.
+    Outside,
 }
 
 impl IgnoreReason {
@@ -116,6 +120,7 @@ impl IgnoreReason {
             Self::NotMentionedByAgent => "managed bot did not mention the agent",
             Self::UnattributedManagedBot => "unattributed managed bot",
             Self::NotAddressed => "not addressed",
+            Self::Outside => "requester from outside the workspace",
         }
     }
 }

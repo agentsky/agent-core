@@ -132,6 +132,7 @@ impl Row {
                     .map(|member| parse_column::<MemberId>(&member, TABLE, "requester_member"))
                     .transpose()?,
                 key: parse_column::<MemberKey>(&self.requester_key, TABLE, "requester_key")?,
+                outside: None,
             },
             hop: Hop(u8::try_from(self.hop).map_err(|_| corrupt("hop"))?),
             posted_at: from_unix(self.posted_at, TABLE, "posted_at")?,
@@ -210,6 +211,8 @@ impl Store {
     /// [`StoreError::Database`] if a query fails, including when `new`
     /// names an agent and the message is already recorded as posted in
     /// another session; [`StoreError::Corrupt`] if a row doesn't parse.
+    /// [`StoreError::Refused`] for a requester from outside the workspace,
+    /// whose `outside` no column holds yet; nothing is written.
     pub async fn record_message_ref(
         &self,
         new: &NewMessageRef<'_>,
@@ -234,6 +237,7 @@ impl Store {
         now: OffsetDateTime,
         hand_offs: &[NewHandOff<'_>],
     ) -> Result<(MessageRef, Vec<i64>)> {
+        crate::home_requester(new.requester)?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = match in_session(&mut tx, new.session, new.msg).await? {
             Some(found) => match (found.agent, new.agent) {
@@ -458,6 +462,7 @@ mod tests {
                 team: TeamId::new("T1"),
                 user: UserId::new(user),
             },
+            outside: None,
         }
     }
 
@@ -522,6 +527,30 @@ mod tests {
             Some(elsewhere)
         );
         assert_eq!(store.session_message_ref(two, &a).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_outside_requester_is_refused_until_a_column_holds_it() {
+        let store = memory_store().await;
+        let session = SessionId::new_v4();
+        let outsider = Requester {
+            outside: Some(core_types::Outside {
+                team: Some(TeamId::new("T0THEIRS1")),
+            }),
+            ..requester("U1", None)
+        };
+        let a = msg("C1", "1.1");
+        let err = store
+            .record_message_ref(&inbound(session, &a, None, &outsider), at(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Refused { .. }), "{err:?}");
+        let err = store
+            .record_post(&inbound(session, &a, None, &outsider), at(10), &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Refused { .. }), "{err:?}");
+        assert_eq!(store.session_message_ref(session, &a).await.unwrap(), None);
     }
 
     #[tokio::test]

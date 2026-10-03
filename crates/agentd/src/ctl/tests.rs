@@ -203,6 +203,7 @@ fn turn(kind: TurnKind, side: Side) -> CtlTurn {
                 team: "T1".into(),
                 user: "U1".into(),
             },
+            outside: None,
         },
         hop: Hop::ZERO,
         kind,
@@ -1568,6 +1569,7 @@ async fn short_ids_name_messages_the_session_was_shown() {
             team: "T1".into(),
             user: "U2".into(),
         },
+        outside: None,
     };
     let mut rows = Vec::new();
     for (conv_id, id) in [("C1", "100.5"), ("C9", "200.1"), ("C1", "100.7")] {

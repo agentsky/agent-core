@@ -192,6 +192,7 @@ impl Running {
             requester: Requester {
                 member: Some(self.member),
                 key: alice(),
+                outside: None,
             },
             hop: Hop::ZERO,
             side: Side::Public,

@@ -3463,8 +3463,12 @@ Deliverables:
     the design.
   - `Interaction` gains `sender_team`, the payload's `user.team_id` when it
     has one.
-- `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`, and
-  `User` keeps `team_id`, both leniently.
+- `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`
+  leniently, an `E…` id or `None`, and `is_enterprise_install`; agentd's
+  manager refuses to start when its `team_id` isn't a workspace's (`T…`),
+  saying the app must be installed in each workspace. `User` keeps
+  `team_id`, failing closed: a value not shaped like a team id names no
+  team.
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.
@@ -3489,24 +3493,36 @@ Deliverables:
   - `WebApi::conversation_info` reads the new fields leniently: a missing
     one is `false` or absent.
 - The home check:
-  - `TeamDirectory` keeps the ids of the `users.list` entries whose
-    `team_id` is the workspace, beside the names. `TeamDirectory::home_user`
-    answers from them, then from `users.info` (Tier 4) with the manager
-    app's token, as T31 reads the member list. It returns `Ok(true)` only
-    when the answer's `team_id` is the workspace, `Ok(false)` for another
-    `team_id` or `user_not_found`, and otherwise the lookup's error as it
-    came, whatever its variant, uncached. Both answers are cached for an
-    hour, at most 4,096 of them, the oldest dropped first; an answer
+  - `TeamDirectory` keeps the ids of the `users.list` entries that are
+    home, beside the names. `TeamDirectory::home_user` answers from them
+    while the list is less than an hour old, then from `users.info` (Tier
+    4) with the manager app's token, as T31 reads the member list. Either
+    answer is home only as `directory::is_home` reads it: an active
+    account, not a stranger, whose `team_id` is the workspace or whose
+    `enterprise_user` is of the home organization and lists the workspace
+    in its `teams`, and every team it names (`team_id`, `profile.team`,
+    `enterprise_user.enterprise_id`) is the workspace, the organization or
+    one of those `teams`. It returns `Ok(false)` for any other answer,
+    `user_not_found` or `user_not_visible`, and otherwise the lookup's
+    error as it came, whatever its variant, uncached, as it does for an
+    answer about another user; one that won't pass on its own (any but
+    Slack unreachable or busy, or a rate limit) is logged as a warning at
+    most once a minute. Both answers are cached for an hour, at most 4,096
+    of them, the oldest dropped first; an answer
     dropped from the cache is looked up again, never taken as home. A
     caller can ask it not to wait for a used-up quota
     (`WebApi::without_waiting`).
   - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
-    SurfaceError>` never waits for a used-up quota, and skips a sender with
-    `sender_bot_user` set, whose `outside` decides nothing. When the fields
+    SurfaceError>` never waits for a used-up quota, and skips a bot sender
+    (`sender_is_bot` or `sender_bot_user` set), whose `outside` decides
+    nothing. When the fields
     left `outside` `None` and `home_user` doesn't say home, it sets
     `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
-    `Unauthorized` error too. It returns `Transport` and `RateLimited` as
-    they came, leaving `outside` alone. Its one caller is
+    `Unauthorized` error too, and so it does for a sender keyed by another
+    surface or workspace. It returns `Transport` and `RateLimited` as they
+    came, leaving `outside` alone; Slack's `fatal_error`,
+    `internal_error`, `request_timeout` and `service_unavailable` are
+    `Transport` (`web::map_error`), as an HTTP 5xx is. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
     real user; those two errors fail the confirmation as T31's lookups do,
     and the thread gets the "try again" line.
@@ -3518,8 +3534,9 @@ Deliverables:
     made-up user id costs no lookup on the manager's token. A forged event
     that names a real message the bot can read from the last 15 minutes
     costs at most one lookup per real sender, cached an hour; most are
-    answered from the member list, and only while that list can't be read
-    does each cost a `users.info`. The ingress has already kept only what
+    answered from the member list while it is less than an hour old, and
+    only while it can't be read, or once it is older, does each cost a
+    `users.info`. The ingress has already kept only what
     may be addressed to the agent (T28), so most traffic costs no lookup
     either.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): when the event's
@@ -3539,8 +3556,9 @@ Deliverables:
     dropped with a debug line throttled per binding as the ingress throttles
     its warnings. That closes T33's open item about interactions with a
     `team` the manager doesn't serve.
-  - The manager DM's home check (`crates/agentd/src/commands/intake.rs`)
-    runs in the member's own intake task, before `answer_text`: for an
+  - The manager DM's home check (`Commands::answer_text`, which the
+    intake's task in `crates/agentd/src/commands/intake.rs` calls) runs in
+    the member's own intake task, before the text is parsed: for an
     `Origin::SlackDm`, it asks `home_user` through `SlackManager`'s surface,
     without waiting. `Inbound::send` runs inside the single `Queue::run`
     worker every app's Slack requests pass through, so no lookup happens
@@ -3674,7 +3692,29 @@ Deliverables:
   `Outside` as text: the team id, `?` for an unknown one, `NULL` for home)
   to `message_refs` and `ctl_tokens`. The pipeline writes it with the
   requester and reads it back into attributions and `CtlTurn`, so a hop
-  and an agentctl call know their requester's organization.
+  and an agentctl call know their requester's organization. Until then,
+  T36a has `record_post` (and so `record_message_ref`), `set_ctl_turn` and
+  `create_consent` refuse a requester with `outside` set
+  (`StoreError::Refused`, through `store::home_requester`). That guards
+  the rows read back as a requester, but not every row written with one:
+  `pipeline::message::record` writes `outside: None` for each thread
+  message it shows a session, whoever sent it, since `Msg` carries no
+  team fields, and for the event's own sender, whose `outside` is `None`
+  in T36a only because the router ignores outside senders. No requester
+  is read back from those rows today, since they have no agent
+  (`posted_message_ref` takes only rows with one, and `agentctl`'s short
+  ids read only the message), but T36b must fill `requester_outside`
+  there too: the event's `outside` for its sender, and for a thread
+  message what its team fields and the home check say, which `Msg` must
+  then carry, never home by default. T36b replaces the store check with
+  the columns, and keeps it for `consents`, since a consent never has an
+  outside requester.
+  Whether a listed organization can be admitted at all rests on T36e:
+  confirmation keeps the copy's own `outside`, and a copy whose fields
+  don't name the organization comes back `Outside { team: None }` from
+  the home check, which `copy_stands` tells from the event's named team,
+  so T36b admits a listed organization only if T36e finds that Slack's
+  `conversations.history`/`replies` copy names it.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,
@@ -3883,15 +3923,29 @@ Deliverables:
   5. Whether an outside member can run `/agent`, DM the manager app, or DM
      a scratch app's bot, and what agentd logged for the first two.
   6. An outside member's `<@U…>` id as both organizations see it.
-  7. What `users.info` on the manager's token answers for an outside
-     member, and for a home member, and whether the home `users.list`
-     lists any outside member.
+  7. What `users.info` and the home `users.list` on the manager's token
+     answer for an outside member and for a home member, and whether the
+     list holds any outside member. For each answer, record the fields
+     the home check reads: `team_id`, `profile.team`, `is_stranger`,
+     `deleted` and `enterprise_user` (`enterprise_id` and `teams`), and
+     whether each is present, absent or `null`. Also whether `users.info`'s
+     `user.id` is exactly the id asked for, `U…` or `W…` alike, since an
+     answer about another id is refused.
   8. Whether `app_uninstalled` and `tokens_revoked`, sent when a scratch
      app is uninstalled at the end, carry `authorizations`, for the
      deferred work on uninstalls.
 - On an Enterprise Grid workspace, if one is available, the same for a
   member of another workspace of the home organization, and for a home
-  member whose `users.info` names another workspace of the organization.
+  member whose `users.info` names another workspace of the organization,
+  with the fields of item 7 in both `users.info` and `users.list`. Above
+  all, whether `enterprise_user.teams` lists every workspace of the
+  organization the member belongs to, the home one included, and whether
+  `auth.test` gives the organization's `enterprise_id`, and what it gives
+  as `team_id` and `is_enterprise_install` for the manager app installed
+  in the workspace. Deactivate such a member whose `team_id` names another
+  workspace, and record the `user_change` the manager app gets: whether
+  its `enterprise_user.teams` still lists the home workspace, which
+  `member_who_left` needs to delete their configuration token.
 - The redacted payloads as fixture files under
   `crates/testkit/fixtures/slack/connect/`, for `testkit::slack` to load in
   place of T36a's made-up ones. Whichever of T36a and T36e lands second
