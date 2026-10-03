@@ -926,7 +926,19 @@ async fn logs_carry_the_session_and_rule_and_never_the_host_or_request() {
         )
         .await;
     drop(stream);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ended = format!("session={session}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !logs
+        .snapshot()
+        .lines()
+        .any(|line| line.contains("an egress tunnel ended") && line.contains(&ended))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the tunnel never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let logs = logs.snapshot();
     let mine = |line: &&str| line.contains("peer=127.0.0.5") || line.contains("peer=127.0.0.4");

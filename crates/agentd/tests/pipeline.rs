@@ -697,7 +697,10 @@ impl Stack {
 
     async fn stop(self) {
         self.stop.send(()).unwrap();
-        self.task.await.unwrap().unwrap();
+        bounded("the server stops", self.task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }
 
@@ -1631,7 +1634,7 @@ async fn a_bots_message_that_cant_be_checked_gets_no_ask_to_try_again() {
     gate.open();
     stack.wait_for_posts(2).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(
         stack.holds.confirm_failures_left(),
         0,
@@ -1700,6 +1703,17 @@ async fn the_thread_turn_cap_stops_a_thread_but_not_a_dm() {
         "a one-to-one DM isn't capped"
     );
     stack.stop().await;
+}
+
+/// `future`'s output, or a panic naming `what` after a minute, longer
+/// than any drain timeout here. The tests wait on the server task, on
+/// `cut_short` and on drains through it, so a shutdown that stops cutting
+/// short what a shut gate holds fails with that name; other waits rely on
+/// CI's job timeouts.
+async fn bounded<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting until {what}"))
 }
 
 /// Waits up to 30 seconds for `done`.
@@ -1791,7 +1805,7 @@ async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
     } = stack;
     drop(pipeline);
     stop.send(()).unwrap();
-    task.await.unwrap().unwrap();
+    bounded("the server stops", task).await.unwrap().unwrap();
     let sent = posts(&mock.calls());
     assert_eq!(sent.len(), 1, "{:#?}", mock.calls());
     assert_eq!(sent[0].1, "Finished anyway.");
@@ -1835,7 +1849,7 @@ async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
     drop(pipeline);
     let started = Instant::now();
     stop.send(()).unwrap();
-    task.await.unwrap().unwrap();
+    bounded("the server stops", task).await.unwrap().unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "shutdown took {:?}",
@@ -2432,7 +2446,7 @@ async fn a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its
     } = stack;
     drop(pipeline);
     stop.send(()).unwrap();
-    task.await.unwrap().unwrap();
+    bounded("the server stops", task).await.unwrap().unwrap();
     let calls = mock.calls();
     assert!(
         calls.contains(&Call::Unreact {
@@ -2798,7 +2812,7 @@ async fn a_reply_that_mentions_an_agent_hands_off_until_the_hop_cap() {
         "every turn of the chain runs on bob's account"
     );
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(stack.mock.posts().len(), 5, "nothing follows the notice");
     assert_eq!(
         stack.store().posted_message_ref(&sent[4].2).await.unwrap(),
@@ -2860,7 +2874,7 @@ async fn the_thread_token_budget_stops_a_chain() {
         ]
     );
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(stack.mock.posts().len(), 2);
     stack.stop().await;
 }
@@ -2946,7 +2960,7 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
     })
     .await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     let texts: Vec<String> = stack.mock.posts()[before..]
         .iter()
         .map(|(_, text)| text.clone())
@@ -3020,7 +3034,7 @@ async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
         "writer's app drops the platform's copy at the door: it mentions no one"
     );
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert!(
         stack.writers_hops(writer).await.is_empty(),
         "nor does the platform's copy, read as Slack's surface reads it"
@@ -3110,7 +3124,7 @@ async fn the_hop_cap_line_is_said_once_an_hour_by_each_agent_in_a_thread() {
     })
     .await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     let mut notices: Vec<String> = stack
         .mock
         .posts()
@@ -3146,7 +3160,7 @@ async fn a_turn_hands_off_to_an_agent_once_however_many_of_its_posts_mention_it(
         .await;
     let sent = stack.wait_for_posts(3).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     let texts: Vec<String> = stack
         .mock
         .posts()
@@ -3201,7 +3215,7 @@ async fn a_post_outside_the_turns_thread_hands_off_nothing() {
     copy.reply_to = None;
     stack.handle(copy).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(stack.mock.posts().len(), 2, "writer never answers");
     assert_eq!(stack.bearers().await.len(), 1);
     let posted = stack
@@ -3306,7 +3320,11 @@ async fn a_hand_off_a_shutdown_cut_is_delivered_by_the_next_instance() {
     let writer = stack.other_agent("writer", "UWRITER").await;
     let busy = Gate::closed();
     stack.hand_off_behind_a_busy_writer(writer, &busy).await;
-    stack.pipeline.cut_short().await;
+    bounded(
+        "the pipeline cuts its work short",
+        stack.pipeline.cut_short(),
+    )
+    .await;
     let next = stack.another_pipeline();
     assert_eq!(
         next.replay_hand_offs().await.unwrap(),
@@ -3315,7 +3333,7 @@ async fn a_hand_off_a_shutdown_cut_is_delivered_by_the_next_instance() {
     );
     stack.wait_for_posts(2).await;
     next.close();
-    next.drain().await;
+    bounded("the pipeline drains", next.drain()).await;
     assert_eq!(
         stack.writers_hops(writer).await,
         [1],
@@ -3331,7 +3349,11 @@ async fn a_hand_off_released_at_a_cut_is_not_released_again_from_its_next_holder
     let writer = stack.other_agent("writer", "UWRITER").await;
     let busy = Gate::closed();
     stack.hand_off_behind_a_busy_writer(writer, &busy).await;
-    stack.pipeline.cut_short().await;
+    bounded(
+        "the pipeline cuts its work short",
+        stack.pipeline.cut_short(),
+    )
+    .await;
     let checking = Gate::closed();
     stack.holds.can_posts_of(writer, &checking);
     let next = stack.another_pipeline();
@@ -3349,7 +3371,7 @@ async fn a_hand_off_released_at_a_cut_is_not_released_again_from_its_next_holder
     checking.open();
     stack.wait_for_posts(2).await;
     next.close();
-    next.drain().await;
+    bounded("the pipeline drains", next.drain()).await;
     assert_eq!(stack.writers_hops(writer).await, [1]);
     stack.stop().await;
 }
@@ -3415,7 +3437,7 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
     wait_until("the server closes the pipeline", || sink.is_closed()).await;
     looking.open();
     let Stack { task, dir, .. } = stack;
-    task.await.unwrap().unwrap();
+    bounded("the server stops", task).await.unwrap().unwrap();
     let db = dir.path().join("agentd.db");
     let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
         .await
@@ -3482,7 +3504,7 @@ async fn a_hand_off_is_taken_again_only_when_no_job_holds_it_and_its_hop_never_r
     busy.open();
     stack.wait_for_posts(2).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(
         stack.writers_hops(writer).await,
         [0],
@@ -3520,7 +3542,7 @@ async fn a_hand_off_two_instances_hold_runs_once() {
     stack.wait_for_posts(2).await;
     for pipeline in [&stack.pipeline, &other] {
         pipeline.close();
-        pipeline.drain().await;
+        bounded("the pipeline drains", pipeline.drain()).await;
     }
     assert_eq!(
         stack.writers_hops(writer).await,
@@ -3558,9 +3580,9 @@ async fn a_draining_instance_keeps_leasing_the_hand_offs_it_holds_and_takes_no_m
     );
     stack.wait_for_posts(2).await;
     busy.open();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     other.close();
-    other.drain().await;
+    bounded("the pipeline drains", other.drain()).await;
     let mut hops = stack.writers_hops(writer).await;
     hops.sort_unstable();
     assert_eq!(hops, [0, 1], "writer answered bob, and the hop once");
@@ -3578,7 +3600,7 @@ async fn a_hand_off_whose_agent_has_no_surface_there_is_kept_until_it_has() {
         .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
         .await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(stack.mock.posts().len(), 1);
     assert_eq!(
         stack.kept_hand_offs().await,
@@ -3591,7 +3613,7 @@ async fn a_hand_off_whose_agent_has_no_surface_there_is_kept_until_it_has() {
     assert_eq!(next.replay_hand_offs().await.unwrap(), 1);
     stack.wait_for_posts(2).await;
     next.close();
-    next.drain().await;
+    bounded("the pipeline drains", next.drain()).await;
     assert_eq!(stack.writers_hops(writer).await, [1]);
     assert!(stack.kept_hand_offs().await.is_empty());
     stack.stop().await;
@@ -3618,7 +3640,11 @@ async fn a_hand_off_recorded_by_a_turn_cut_mid_delivery_is_delivered_by_the_next
     })
     .await;
     assert_eq!(stack.kept_hand_offs().await, [writer]);
-    stack.pipeline.cut_short().await;
+    bounded(
+        "the pipeline cuts its work short",
+        stack.pipeline.cut_short(),
+    )
+    .await;
     stack.next_turn(Turn::reply("Done."));
     let next = stack.another_pipeline();
     assert_eq!(
@@ -3628,7 +3654,7 @@ async fn a_hand_off_recorded_by_a_turn_cut_mid_delivery_is_delivered_by_the_next
     );
     stack.wait_for_posts(3).await;
     next.close();
-    next.drain().await;
+    bounded("the pipeline drains", next.drain()).await;
     let texts: Vec<String> = stack
         .mock
         .posts()
@@ -3676,7 +3702,7 @@ async fn a_hand_off_past_a_full_queue_keeps_its_row_and_is_taken_again() {
     );
     stack.wait_for_posts(2).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(stack.writers_hops(writer).await, [1]);
     assert_eq!(
         stack.kept_hand_offs().await,
@@ -3738,7 +3764,7 @@ async fn a_hand_off_refused_because_the_rules_dont_read_is_kept_and_tried_again(
         .await;
     stack.wait_for_posts(2).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     assert_eq!(
         stack.kept_hand_offs().await,
         [writer],
@@ -3754,7 +3780,7 @@ async fn a_hand_off_refused_because_the_rules_dont_read_is_kept_and_tried_again(
     assert_eq!(next.replay_hand_offs().await.unwrap(), 1);
     stack.wait_for_posts(3).await;
     next.close();
-    next.drain().await;
+    bounded("the pipeline drains", next.drain()).await;
     let texts: Vec<String> = stack
         .mock
         .posts()
@@ -3803,7 +3829,7 @@ async fn a_hops_line_that_the_rules_dont_read_is_not_said_when_its_claim_fails()
         .await;
     stack.wait_for_posts(1).await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     let texts: Vec<String> = stack
         .mock
         .posts()
@@ -3875,7 +3901,7 @@ async fn a_failed_membership_check_answers_a_read_back_message_and_retries_a_han
         .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
         .await;
     stack.pipeline.close();
-    stack.pipeline.drain().await;
+    bounded("the pipeline drains", stack.pipeline.drain()).await;
     let texts: Vec<String> = stack
         .mock
         .posts()
@@ -3894,7 +3920,7 @@ async fn a_failed_membership_check_answers_a_read_back_message_and_retries_a_han
     assert_eq!(next.replay_hand_offs().await.unwrap(), 1);
     stack.wait_for_posts(2).await;
     next.close();
-    next.drain().await;
+    bounded("the pipeline drains", next.drain()).await;
     assert_eq!(stack.writers_hops(writer).await, [1]);
     stack.stop().await;
 }

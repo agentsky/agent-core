@@ -3393,6 +3393,30 @@ master key, never with a SQL `UPDATE`). Update the design's
 [Verified and assumed](design.md#verified-and-assumed) and failure table
 with the result and date. That completes design milestone 6.
 
+Decided in T35c ([impl-notes](impl-notes.md#t35c-cloud-hand-off-commands)):
+Slack command text reaches `Commands::answer_text` as Slack delivered it,
+which decodes the entities before parsing, so `cloud run` reads Slack's
+tokens in the delivered text and a `<` the member typed stays text; a
+mention without its name, as a manager DM's `message` event carries it, is
+refused like a broadcast. `FireClient::fires_for` is the one origin rule:
+it parses the stored `url_origin`, as T35a decided, and `fire`'s backstop
+uses it too instead of comparing strings. `consents::unshowable` is
+`pub(crate)` with reasons that read for a card and a cloud task alike.
+`cloud list` shows a task's first line as a code span, its backticks left
+out, and never the endpoint's `error_type`. `cloud rm` is named wherever a
+ban's replies list what a banned member may still run. The pass is
+`commands::cloud::CloudNotifier`, run every minute from `Server::run`.
+Review round 1 added a per-member cap, `[cloud] handoffs_per_hour` (default
+10, from 1 to 100), which `Store::begin_cloud_handoff` counts in the
+transaction that writes the row, refusing one more before anything is
+written or sent; that transaction also checks the routine is still the
+member's, so a `logout` racing a `cloud run` either comes first or deletes
+the row, and `finish_cloud_handoff` says when the row is gone. On Slack,
+replies name `/agent cloud add` even in a DM. `logout` unlinks before it
+deletes routines, so a failed `logout` sent again still says to revoke
+tokens. One row's store failure no longer ends a notifier pass or skips its
+purge; review round 2 gave the relink notifier the same shape.
+
 ## Phase 7: Slack Connect (design milestone 7)
 
 ### T36

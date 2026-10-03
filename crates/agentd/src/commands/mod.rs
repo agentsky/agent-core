@@ -24,6 +24,10 @@
 //!   `/agent slack-token` registers and a background loop renews.
 //! - [`relink`]: the notice a member gets, once, when their Claude link
 //!   breaks.
+//! - [`cloud`]: `cloud add`, `cloud run`, `cloud list` and `cloud rm`,
+//!   which hand work to a Claude Code cloud session on the member's own
+//!   account ([`Commands::with_cloud`]), and the notice a member gets for a
+//!   hand-off whose answer was never recorded.
 //! - [`reply`]: private replies through each surface's manager bot.
 //! - `sessions`: `sessions` and `reset`, which reach the runner through a
 //!   [`SessionControl`].
@@ -31,7 +35,7 @@
 //! # Secrets
 //!
 //! A secret-bearing command (`login <code>`, `admin api-key set`,
-//! `slack-token`) is refused when it comes from a room others can read
+//! `slack-token`, `cloud add`) is refused when it comes from a room others can read
 //! ([`Origin::is_private`] is false), and the member is told privately that
 //! the secret is now public: a login code cancels the member's pending
 //! logins and the one its `state` names, whoever started it; an API key or
@@ -58,6 +62,7 @@
 
 mod admin;
 mod agents;
+pub mod cloud;
 pub mod intake;
 mod limits;
 pub mod relink;
@@ -84,10 +89,11 @@ use core_types::{
     ConsentId, ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceError, SurfaceKind,
 };
 use secrecy::SecretString;
-use store::{ConsentState, MemberUsage, Store, StoreError, UsageTotals};
+use store::{CloudDeleted, ConsentState, MemberUsage, Store, StoreError, UsageTotals};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::cloud::FireClient;
 use crate::consents::{Consents, Decided};
 use crate::pipeline::UNCONFIRMED_TEXT;
 use crate::policy::Limits;
@@ -172,6 +178,25 @@ impl Origin {
         }
     }
 
+    /// Whether the surface delivered the command's text with `&`, `<` and
+    /// `>` as entities and mentions, channels and links as `<…>` tokens,
+    /// as Slack does.
+    fn is_slack(&self) -> bool {
+        matches!(self, Self::SlackSlash { .. } | Self::SlackDm { .. })
+    }
+
+    /// Command `text` as the member typed it: Slack's entities decoded
+    /// ([`unescape`](surface_slack::normalize::unescape)), so a persona
+    /// reads as typed, and other surfaces' text as it is. Mention and link
+    /// tokens parse the same either way.
+    fn decoded<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.is_slack() {
+            std::borrow::Cow::Owned(surface_slack::normalize::unescape(text))
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        }
+    }
+
     /// A short name for logs.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -237,7 +262,8 @@ const FAILED: &str = "Something went wrong on my side. Please try again in a min
 /// The reply to a banned member's commands, those that only take
 /// something away aside.
 const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
-                      can still run `me`, `logout`, and `pause` or `delete` your agents.";
+                      can still run `me`, `logout`, `cloud rm`, and `pause` or `delete` your \
+                      agents.";
 
 /// Runs `/agent` commands and sends their replies. Agents are created on
 /// Rocket.Chat through [`RocketChatAgents`], and on Slack, as apps, through
@@ -251,6 +277,7 @@ pub struct Commands {
     slack_agents: Option<SlackAgents>,
     limits: Limits,
     consents: Option<Consents>,
+    cloud: Option<FireClient>,
 }
 
 #[derive(Debug)]
@@ -308,7 +335,18 @@ impl Commands {
             slack_agents: None,
             limits: Limits::default(),
             consents: None,
+            cloud: None,
         }
+    }
+
+    /// These commands, firing members' routines with `fire` for `cloud
+    /// run`, as with `[cloud]`. Without it cloud hand-off is off: `cloud
+    /// add` and `cloud run` are refused, and `cloud list` and `cloud rm`
+    /// still work.
+    #[must_use]
+    pub fn with_cloud(mut self, fire: FireClient) -> Self {
+        self.cloud = Some(fire);
+        self
     }
 
     /// These commands, deciding private tasks' consents in `consents` with
@@ -364,7 +402,8 @@ impl Commands {
 
     /// Parses `text` from `member`, sent with `files` attached, and runs
     /// it to the end, replying privately. Text that doesn't parse gets the
-    /// parser's message (help or usage).
+    /// parser's message (help or usage). `text` is as the surface delivered
+    /// it: Slack's entities are decoded here, before it is parsed.
     pub async fn handle_text(
         &self,
         member: &MemberKey,
@@ -392,8 +431,8 @@ impl Commands {
         if !self.admits(member, origin).await {
             return FollowUp::default();
         }
-        match commands::parse(text) {
-            Ok(command) => self.answer(member, command, origin, files).await,
+        match commands::parse(&origin.decoded(text)) {
+            Ok(command) => self.answer(member, command, origin, files, text).await,
             Err(err) => {
                 tracing::info!(
                     %member,
@@ -451,20 +490,22 @@ impl Commands {
         origin: &Origin,
         files: &[InFile],
     ) {
-        self.answer(member, command, origin, files)
+        self.answer(member, command, origin, files, "")
             .await
             .run()
             .await;
     }
 
     /// Runs `command` until its reply is sent, and returns what it still
-    /// has to do.
+    /// has to do. `delivered` is the command's text as the surface
+    /// delivered it, which `cloud run` reads its task from on Slack.
     async fn answer(
         &self,
         member: &MemberKey,
         command: Command,
         origin: &Origin,
         files: &[InFile],
+        delivered: &str,
     ) -> FollowUp {
         tracing::info!(
             %member,
@@ -473,7 +514,7 @@ impl Commands {
             files = files.len(),
             "running a command"
         );
-        let (reply, follow_up) = self.run(member, command, origin, files).await;
+        let (reply, follow_up) = self.run(member, command, origin, files, delivered).await;
         self.reply(member, origin, &reply).await;
         follow_up
     }
@@ -491,6 +532,7 @@ impl Commands {
         command: Command,
         origin: &Origin,
         files: &[InFile],
+        delivered: &str,
     ) -> (String, FollowUp) {
         let name = command.name();
         match self.banned(member, &command, origin).await {
@@ -507,7 +549,7 @@ impl Commands {
         let result = match command {
             Command::Reset { name, here } => self.reset(member, name.as_str(), here, origin).await,
             command => self
-                .reply_to(member, command, origin, files)
+                .reply_to(member, command, origin, files, delivered)
                 .await
                 .map(|reply| (reply, FollowUp::default())),
         };
@@ -519,10 +561,10 @@ impl Commands {
 
     /// Whether `command` from `key` is refused because a community admin
     /// banned them. An admin never is, nor are the commands that only take
-    /// something away from the member (`me`, `logout`, and `pause` and
-    /// `delete` of their own agents), nor a secret-bearing command sent
-    /// where others can read it, whose refusal tells them to revoke the
-    /// secret.
+    /// something away from the member (`me`, `logout`, `cloud rm`, and
+    /// `pause` and `delete` of their own agents), nor a secret-bearing
+    /// command sent where others can read it, whose refusal tells them to
+    /// revoke the secret.
     async fn banned(
         &self,
         key: &MemberKey,
@@ -531,7 +573,11 @@ impl Commands {
     ) -> Result<bool, Failure> {
         let reduces = matches!(
             command,
-            Command::Me | Command::Logout | Command::Pause { .. } | Command::Delete { .. }
+            Command::Me
+                | Command::Logout
+                | Command::Pause { .. }
+                | Command::Delete { .. }
+                | Command::Cloud(CloudCommand::Rm { .. })
         );
         if reduces || self.is_admin(key) || (command.is_secret_bearing() && !origin.is_private()) {
             return Ok(false);
@@ -549,6 +595,7 @@ impl Commands {
         command: Command,
         origin: &Origin,
         files: &[InFile],
+        delivered: &str,
     ) -> Result<String, Failure> {
         let name = command.name();
         if command.is_secret_bearing() && !origin.is_private() {
@@ -606,6 +653,7 @@ impl Commands {
                 }
                 Command::Approve { consent } => self.decide(member, consent, true).await,
                 Command::Decline { consent } => self.decide(member, consent, false).await,
+                Command::Cloud(command) => self.cloud(member, command, origin, delivered).await,
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         }
@@ -714,16 +762,26 @@ impl Commands {
     }
 
     async fn logout(&self, key: &MemberKey, origin: &Origin) -> Result<String, Failure> {
-        let (unlinked, tokens) = match self.member(key).await? {
+        let (unlinked, tokens, cloud) = match self.member(key).await? {
             Some(member) => {
                 self.inner.store.invalidate_pending_logins(member).await?;
+                let unlinked = self.inner.auth.logout(member).await?;
                 let tokens = self.inner.store.delete_slack_config_tokens(member).await?;
                 if tokens > 0 {
                     tracing::info!(%member, tokens, "deleted Slack configuration tokens at logout");
                 }
-                (self.inner.auth.logout(member).await?, tokens)
+                let cloud = self.inner.store.delete_cloud_routines_of(member).await?;
+                if cloud != CloudDeleted::default() {
+                    tracing::info!(
+                        %member,
+                        routines = cloud.routines,
+                        handoffs = cloud.handoffs,
+                        "deleted cloud routines and hand-offs at logout"
+                    );
+                }
+                (unlinked, tokens, cloud)
             }
-            None => (false, 0),
+            None => (false, 0, CloudDeleted::default()),
         };
         let mut reply = if unlinked {
             format!(
@@ -737,6 +795,22 @@ impl Commands {
             reply.push_str(
                 " I also deleted your Slack configuration token, so I can no longer create or \
                  change apps as you.",
+            );
+        }
+        let forgot: Vec<String> = [
+            (cloud.routines > 0).then(|| cloud::routines_counted(cloud.routines)),
+            (cloud.handoffs > 0).then(|| cloud::handoffs_counted(cloud.handoffs)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !forgot.is_empty() {
+            reply.push_str(&format!(" I also forgot your {}.", forgot.join(" and ")));
+        }
+        if cloud.routines > 0 {
+            reply.push_str(
+                " I can't revoke a routine's token: revoke each with **Revoke** on the \
+                 routine's API trigger at claude.ai/code/routines.",
             );
         }
         Ok(reply)
@@ -766,7 +840,7 @@ impl Commands {
         if let Some(member) = member.filter(|_| !self.is_admin(key))
             && let Some(ban) = self.inner.store.ban(member).await?
         {
-            reply.push_str("\nA community admin banned you: agents won't take your requests, and you can only run `me`, `logout`, and `pause` or `delete` your agents.");
+            reply.push_str("\nA community admin banned you: agents won't take your requests, and you can only run `me`, `logout`, `cloud rm`, and `pause` or `delete` your agents.");
             if let Some(reason) = ban.reason.filter(|reason| !reason.trim().is_empty()) {
                 let reason: String = reason
                     .chars()

@@ -48,6 +48,7 @@ use tower::Service as _;
 
 use crate::agents::{Acknowledge, Supervisor};
 use crate::app::App;
+use crate::commands::cloud::{CLOUD_SWEEP_INTERVAL, CloudNotifier};
 use crate::commands::intake::{CommandIntake, CommandSubmitter};
 use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
@@ -327,6 +328,8 @@ impl Server {
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
+    /// the cloud hand-off pass ([`CloudNotifier`]), with or without
+    /// `[cloud]`,
     /// with a pipeline the consents' worker
     /// ([`Consents::run`](crate::consents::Consents::run)), whose private
     /// tasks the pipeline drains like its turns, and the hand-off worker
@@ -395,6 +398,16 @@ impl Server {
         tasks.spawn(async move {
             sweeper::run(store, skills, SWEEP_INTERVAL, sweeping).await;
             "sweeper"
+        });
+        let cloud = CloudNotifier::new(
+            app.store().clone(),
+            app.commands().replies().clone(),
+            app.config().cloud.as_ref(),
+        );
+        let passing = stopping.clone();
+        tasks.spawn(async move {
+            cloud.run(CLOUD_SWEEP_INTERVAL, passing).await;
+            "cloud hand-off notifier"
         });
         let notifier = RelinkNotifier::new(app.store().clone(), app.commands().replies().clone());
         let wake = app.auth().take_relink_notices();

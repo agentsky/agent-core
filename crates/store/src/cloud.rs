@@ -39,6 +39,10 @@ const HANDOFFS: &str = "cloud_handoffs";
 /// The most routines one member may hold.
 pub const MAX_CLOUD_ROUTINES: u32 = 20;
 
+/// The window [`Store::begin_cloud_handoff`] counts a member's hand-offs
+/// over for its hourly cap.
+pub const CLOUD_HANDOFF_WINDOW: Duration = Duration::from_secs(60 * 60);
+
 /// How long a claim on a hand-off's notice keeps others from claiming it.
 pub const CLOUD_NOTICE_LEASE: Duration = Duration::from_secs(10 * 60);
 
@@ -153,6 +157,31 @@ pub enum CloudRoutinePut {
     /// Nothing was stored: the label is new and the member holds
     /// [`MAX_CLOUD_ROUTINES`] routines already.
     Full,
+}
+
+/// What [`Store::begin_cloud_handoff`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudBegun {
+    /// The hand-off is recorded as `sending`, as this row.
+    Begun(CloudHandoffId),
+    /// Nothing was recorded: the member has no routine under the label with
+    /// the routine id any more, since it was removed or replaced.
+    RoutineGone,
+    /// Nothing was recorded: the member asked for the cap's worth of
+    /// hand-offs within [`CLOUD_HANDOFF_WINDOW`] already.
+    TooMany,
+}
+
+/// What [`Store::finish_cloud_handoff`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudFinished {
+    /// The outcome is recorded.
+    Recorded,
+    /// The hand-off had its outcome already, which is kept.
+    Kept,
+    /// There is no such hand-off: it was deleted, with the member's
+    /// routines, while its request was out.
+    Gone,
 }
 
 /// What [`Store::delete_cloud_routines_of`] deleted.
@@ -728,20 +757,49 @@ impl Store {
     }
 
     /// Records `handoff`, asked at `now`, as `sending`, with its task sealed
-    /// to its row, and returns its id. Write it before the request is sent.
+    /// to its row, unless the member's routine is gone or they asked for
+    /// `per_hour` hand-offs or more within [`CLOUD_HANDOFF_WINDOW`] before
+    /// `now`. Write it before the request is sent. The checks and the write
+    /// are one transaction, so a deletion of the member's routines either
+    /// comes first and nothing is recorded, or comes after and deletes the
+    /// row, and concurrent hand-offs never pass the cap together.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails, as when the member
+    /// [`StoreError::Database`] if a query fails, as when the member
     /// doesn't exist, [`StoreError::Seal`] if the task can't be sealed.
     pub async fn begin_cloud_handoff(
         &self,
         handoff: &NewCloudHandoff<'_>,
+        per_hour: u32,
         now: OffsetDateTime,
-    ) -> Result<CloudHandoffId> {
+    ) -> Result<CloudBegun> {
         let id = CloudHandoffId::new_v4();
         let key = task_key(handoff.member, &id.to_string());
         let task = self.seal(task_aad(&key), &SecretString::from(handoff.task))?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let routine: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM cloud_routines WHERE member_id = ? AND label = ? AND routine_id = ?",
+        )
+        .bind(handoff.member.to_string())
+        .bind(handoff.routine_label)
+        .bind(handoff.routine_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if routine.is_none() {
+            return Ok(CloudBegun::RoutineGone);
+        }
+        let window = i64::try_from(CLOUD_HANDOFF_WINDOW.as_secs()).unwrap_or(i64::MAX);
+        let asked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM cloud_handoffs WHERE member_id = ? AND created_at > ?",
+        )
+        .bind(handoff.member.to_string())
+        .bind(to_unix(now).saturating_sub(window))
+        .fetch_one(&mut *tx)
+        .await?;
+        if asked >= i64::from(per_hour) {
+            return Ok(CloudBegun::TooMany);
+        }
         sqlx::query(
             "INSERT INTO cloud_handoffs (id, member_id, routine_label, routine_id, \
              requested_by, origin, task_enc, state, created_at) \
@@ -755,17 +813,19 @@ impl Store {
         .bind(handoff.origin.as_str())
         .bind(task)
         .bind(to_unix(now))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(id)
+        tx.commit().await?;
+        Ok(CloudBegun::Begun(id))
     }
 
     /// Records `outcome` for hand-off `id` at `now`, and marks its notice
     /// done if it hasn't gone out yet, since the command's reply tells the
-    /// member the outcome. False, changing nothing, unless the hand-off is
-    /// `sending`, or `unknown` because a pass gave up waiting for its answer
-    /// ([`CloudUnknownReason::NoAnswer`]), whether or not its notice went
-    /// out. Such a late `fired` or `rejected` replaces `unknown`; a late
+    /// member the outcome. [`CloudFinished::Kept`], changing nothing, unless
+    /// the hand-off is `sending`, or `unknown` because a pass gave up
+    /// waiting for its answer ([`CloudUnknownReason::NoAnswer`]), whether or
+    /// not its notice went out; [`CloudFinished::Gone`] if there is no such
+    /// hand-off. Such a late `fired` or `rejected` replaces `unknown`; a late
     /// `unknown` keeps the row's time, fills in a status it lacked and gives
     /// its own reason, so a row takes one late answer. A notice a claim is
     /// sending at that moment may still reach the member besides the reply;
@@ -784,7 +844,7 @@ impl Store {
         id: CloudHandoffId,
         outcome: &CloudOutcome,
         now: OffsetDateTime,
-    ) -> Result<bool> {
+    ) -> Result<CloudFinished> {
         let (status, error_type, retry_after, session_id, session_url) = match outcome {
             CloudOutcome::Fired {
                 session_id,
@@ -845,7 +905,18 @@ impl Store {
         .bind(unknown_reason)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() > 0 {
+            return Ok(CloudFinished::Recorded);
+        }
+        let kept: Option<i64> = sqlx::query_scalar("SELECT 1 FROM cloud_handoffs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(if kept.is_some() {
+            CloudFinished::Kept
+        } else {
+            CloudFinished::Gone
+        })
     }
 
     /// `member`'s `limit` most recent hand-offs, newest first, each with its

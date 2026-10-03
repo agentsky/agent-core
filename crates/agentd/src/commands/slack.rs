@@ -11,12 +11,15 @@
 //!   `block_actions` interaction), as `approve <id>` or `decline <id>` from
 //!   whoever clicked. Its reply goes back through its `response_url`.
 //! - A `user_change` event whose user is `deleted`: the member left the
-//!   workspace, and their configuration token for it is deleted.
+//!   workspace, and their configuration token for it is deleted, and so
+//!   are their cloud routines and hand-offs.
 //!
-//! Slack writes `&`, `<` and `>` in text as entities; command text is
-//! decoded with [`unescape`] before it is parsed, so a persona reads as the
-//! member typed it. Messages from bots, the manager's own replies included,
-//! are never commands.
+//! Slack writes `&`, `<` and `>` in text as entities. Command text goes
+//! on as Slack delivered it, and [`Commands::answer_text`](super::Commands::answer_text)
+//! decodes it before it is parsed, so a persona reads as the member typed
+//! it, while `cloud run` can still tell Slack's own mention and link tokens
+//! from brackets the member typed. Messages from bots, the manager's own
+//! replies included, are never commands.
 
 use core_types::{
     ConsentId, ConvKind, ConvRef, InFile, InboundEvent, MemberKey, SurfaceKind, TeamId,
@@ -24,7 +27,6 @@ use core_types::{
 use serde::Deserialize as _;
 use serde_json::Value;
 use surface_slack::directory::is_member;
-use surface_slack::normalize::unescape;
 use surface_slack::web::User;
 use surface_slack::{Interaction, SlackEvent, SlashCommand};
 
@@ -35,23 +37,22 @@ use crate::slack::manager::ManagerIdentity;
 /// The slash command the manager app declares.
 pub const SLASH_COMMAND: &str = "/agent";
 
-/// The member, command text and origin of an `/agent` slash command; `None`
-/// for any other command.
+/// The member, command text as Slack delivered it, and origin of an
+/// `/agent` slash command; `None` for any other command.
 pub fn slash_command(command: SlashCommand) -> Option<(MemberKey, String, Origin)> {
     if command.command != SLASH_COMMAND {
         tracing::debug!(sender = %command.sender, "ignored a slash command other than /agent");
         return None;
     }
-    let text = unescape(&command.text);
     let origin = Origin::SlackSlash {
         response_url: command.response_url,
         conv: command.conv,
     };
-    Some((command.sender, text, origin))
+    Some((command.sender, command.text, origin))
 }
 
-/// The member, command text, origin and attached files of a direct message
-/// to the manager app, which `manager` is; `None` for a message from a bot
+/// The member, command text as Slack delivered it, origin and attached
+/// files of a direct message to the manager app, which `manager` is; `None` for a message from a bot
 /// or the manager itself, or one that isn't in a one-to-one DM. The files
 /// feed `persona` and `skill add`.
 pub fn dm_command(
@@ -65,8 +66,7 @@ pub fn dm_command(
     {
         return None;
     }
-    let text = unescape(&event.text);
-    let text = commands::strip_prefix(&text, ConvKind::Dm)?.to_owned();
+    let text = commands::strip_prefix(&event.text, ConvKind::Dm)?.to_owned();
     let origin = Origin::SlackDm {
         channel: event.conv.conversation.clone(),
     };

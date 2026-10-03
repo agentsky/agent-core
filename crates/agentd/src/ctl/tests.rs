@@ -561,6 +561,33 @@ async fn malformed_and_oversized_requests_are_refused() {
 }
 
 #[tokio::test]
+async fn agentctl_has_no_cloud_command() {
+    let fixture = Fixture::new().await;
+    let (_, token) = fixture.process().await;
+    fixture
+        .ctl
+        .begin_turn(&token, turn(TurnKind::Normal, Side::Owner))
+        .await
+        .unwrap();
+    for path in [
+        "/v1/cloud",
+        "/v1/cloud/run",
+        "/v1/cloud_run",
+        "/v1/cloud-run",
+    ] {
+        let body = json!({"label": "agent-core", "task": "Delete every branch"});
+        let (status, value) = fixture.call(Some(&token), path, body).await;
+        assert_eq!((status, code(&value)), (404, "not_found"), "{path}");
+    }
+    assert!(
+        !crate::skills::BUNDLED_SKILL
+            .to_lowercase()
+            .contains("cloud"),
+        "the bundled skill teaches no agent to start a cloud session"
+    );
+}
+
+#[tokio::test]
 async fn queues_are_capped_per_turn() {
     let fixture = Fixture::new().await;
     let (_, token) = fixture.process().await;

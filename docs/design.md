@@ -863,14 +863,18 @@ example `/agent cloud <name> <repo> <task>` had.
 
 Slack delivers slash command text with `&`, `<` and `>` as entities and
 with mentions, channels and links as `<@U…|name>`, `<#C…|name>` and
-`<url|label>` tokens (`should_escape` is on for `/agent`). The Slack surface
-decodes the entities before parsing, as for every command (T08, T30). The
+`<url|label>` tokens (`should_escape` is on for `/agent`). agentd decodes the
+entities before parsing, as for every command (T08, T30), but reads a task's
+tokens in the text as Slack delivered it, where every `<` the member typed is
+still an entity, so only Slack's own tokens are read as tokens. The
 `<url>` around a pasted fire URL is taken off. In a task, each token becomes
 what Slack showed the member, so the session reads what they saw:
 `<@U…|name>` becomes `@name`, `<#C…|name>` becomes `#name`, `<url>` and a
 `<url|label>` whose label is its URL become the URL, and a `<url|label>`
 with another label becomes `label (url)`, so a label can't hide where a
-link goes. Any other `<…>` token, such as a broadcast, is refused. The task
+link goes. Any other `<…>` token, such as a broadcast, is refused, and so is
+a mention without its name, which is how a DM's `message` event carries
+one. The task
 then reaches the session as Slack delivered it, with those tokens
 rewritten. Rocket.Chat delivers what was typed, unchanged.
 
@@ -923,7 +927,12 @@ The only credential is the routine token the member registered. The session
 runs on the account that owns the routine and draws down that account's
 subscription usage, like any of its cloud sessions; the routine endpoint
 also caps fires at 30 an hour per routine and 100 an hour per
-account[^cc-routines-fire]. No requester's credential, no community key, and
+account[^cc-routines-fire]. Those caps don't keep a request from leaving or
+its row from being written, so agentd caps each member too: at most
+`[cloud] handoffs_per_hour` hand-offs (default 10, at most 100) asked in the
+hour before, whatever came of them, counted in the same transaction that
+writes the row, and one more is refused before anything is written or sent.
+No requester's credential, no community key, and
 no Claude link is ever used: no turn starts a hand-off, so there is no
 requester other than the member who typed the command, and the endpoint
 takes only the token made for that routine[^cc-routines-fire].
@@ -1062,7 +1071,10 @@ a member should be able to see what was sent on their account in their
 name, as a consent keeps its task.
 
 A fire runs at most once. The row is written as `sending` before the
-request, and the request is sent once and never retried; only the member,
+request, in a transaction that also checks the routine is still the
+member's, so a `logout` or deletion that comes first leaves nothing to fire,
+and one that comes after deletes the row; an outcome then finds no row and
+is only logged. The request is sent once and never retried; only the member,
 with another `cloud run`, starts another session. Commands themselves run
 once: Slack's replayed slash commands are dropped by their signature, and
 Rocket.Chat edits don't run again.
@@ -1104,6 +1116,8 @@ the pasted URL as typed.
 | --- | --- | --- |
 | `[cloud]` isn't configured | Nothing stored | Cloud hand-off is off on this agentd. `cloud list` and `cloud rm` still work |
 | Not linked, a public place, a ban, an unknown label, a task the checks refuse | Nothing stored | Why, privately |
+| The member asked for `[cloud] handoffs_per_hour` hand-offs in the last hour | Nothing stored | Nothing was started; try again later |
+| The routine was removed or replaced, or the member logged out, after the command read it | Nothing stored | Nothing was started |
 | The store fails before the request | Nothing sent | Nothing was started; try again |
 | No connection: DNS, refused, TLS, all before the request was sent | `rejected` | Nothing was started |
 | 400: the routine is paused, the text too long, or the `anthropic-version` missing or unsupported | `rejected` | The routine refused the task and may be paused |
@@ -1370,6 +1384,7 @@ for members of other organizations too, whose own organization is kept as
 | A cloud session acts with a member's GitHub identity, connectors and subscription, beyond agentd's sandbox and sight | Only the member's own `/agent cloud run`, typed where only they and the manager bot read it, starts one. No `agentctl` command or consent card can, and bots' messages are never commands. The task gets a consent card's checks for characters that don't show. agentd sends only the task text; the repositories, environment and connectors are the routine's, set by the member at claude.ai. |
 | A routine token leaks, or agentd's store leaks with its master key | Anthropic scopes a token to firing one routine, with no read access. But the routine's prompt tells the session to act on fired text, so a token lets its holder do any work the routine's repositories, connectors and network allow, as the member, and a stolen store and key do that for every member with a routine. The setup keeps each routine to one repository, no connectors and the default allowlist. Tokens are sealed at rest, decrypted only for agentd's own request, never logged and never in a sandbox; `cloud rm` and `logout` delete them, and the member revokes them at claude.ai. |
 | agentd's Claude links gain control of members' cloud sessions | Configuration refuses any scope but `user:profile` and `user:inference`, so no turn can reach a member's cloud sessions through the credential proxy. |
+| A member loops `cloud run`, filling the store with sealed tasks or sending a flood of requests with bad tokens from agentd's address | Each member may ask for `[cloud] handoffs_per_hour` hand-offs an hour (default 10), whatever came of them, counted durably in the transaction that writes the row; one more is refused before anything is written or sent. A `logout` deletes the rows the count reads, but the member must link a Claude account again through OAuth before the next run. |
 | A member's pasted URL steers agentd's request and token to another host | Only the routine id is kept, from a URL whose path and origin must match; the URL is rebuilt from `[cloud] base_url`, and redirects aren't followed. |
 | A retried fire starts two sessions | A fire is recorded before it is sent and never retried. An outcome agentd can't know is reported as such, and the member decides. |
 | Members of another organization in a Slack Connect channel use agents, spend the community key or bill a member | Closed by default. agentd hears them only when `[slack_connect] teams` lists their organization, and an agent answers them only when its owner allows `outside` or the member by name; `everyone` and room allows don't, and an `outside` allow changes nothing for home members. Their turns run on the community key or not at all, never on a link or the owner's credential, and bans, deny rules and every cap apply. Hops on their behalf need a switch of their own, and they can never ask for a private task, which would run on the owner's credential. |

@@ -1335,7 +1335,12 @@ async fn a_panicked_turn_wakes_a_session_waiting_for_its_container() {
     let second = h.thread_session("2.2").await;
     h.faults.panic_turn_finished.store(true, Ordering::SeqCst);
     let waiting = async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        eventually("the first session holds the one container", || {
+            h.events()
+                .iter()
+                .any(|event| matches!(event, Event::TurnStarting(id, ..) if *id == first.id))
+        })
+        .await;
         h.manager.run_turn(second.id, request("b")).await
     };
     let (panicked, waited) = tokio::time::timeout(Duration::from_secs(20), async {

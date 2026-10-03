@@ -9251,3 +9251,287 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   shared constant, rather than by type: a typed marker would mean a new
   `SurfaceError` variant that every caller matching `Transport` must
   handle, and the prefix is pinned by a test that asserts the warning.
+
+## T35c: Cloud hand-off: commands
+
+No request reached claude.ai from the environment this was built in: the
+commands were tested against `wiremock` routine endpoints, a `MockSurface`
+manager bot and a `wiremock` Slack. The plan's live check, and the design's
+[Verified and assumed](design.md#verified-and-assumed) list, are still to be
+done.
+
+### Slack's tokens have to be read before its entities are decoded
+
+**Issue.** Slack delivers command text with `&`, `<` and `>` as entities and
+mentions, channels and links as `<…>` tokens, and `slash_command` and
+`dm_command` decoded the entities before anything else read the text. After
+that a `<div>` or `<T>` the member typed, which Slack sent as `&lt;div&gt;`,
+can't be told from a token Slack made: rewriting tokens then would refuse
+every task that mentions HTML or generics, and would read a typed
+`<https://a|b>` as a link.
+
+**Solution.** The Slack side hands on the text as Slack delivered it, and
+`Commands::answer_text`, the one place every command passes through, decodes
+it for Slack origins (`Origin::decoded`) before parsing, so every other
+command reads as before. A `cloud run` from Slack parses the delivered text
+again for its task: the command words and the label can't hold an entity or
+a token, so it is the same command. Its tokens are rewritten there
+(`slack_task`): `<@U…|name>` to `@name`, `<#C…|name>` to `#name`, `<url>`
+and a `<url|label>` labelled with its URL to the URL, any other
+`<url|label>` to `label (url)`, and the entities in the rest and inside the
+tokens decoded. A link is a scheme, `:` and something without blanks, as
+`https:`, `mailto:` and `tel:` links are. Anything else in brackets is
+refused with one fixed line: broadcasts, user groups, dates, an unclosed
+`<`, and a mention or channel without its name. Slack's `message` events,
+which a DM with the manager app is, carry mentions as `<@U…>` without the
+name, so a task with a mention is refused there and the member types the
+name as plain text, or uses the slash command, whose tokens carry it.
+
+### A routine's origin is compared parsed, in the fire client too
+
+**Issue.** T35a decided that a routine's stored `url_origin` is parsed and
+compared as an origin with `base_url`'s, so a change in how the `url` crate
+writes an origin can't lock members out. T35b's backstop in
+`FireClient::fire` compared the strings, and its test refused
+`http://127.0.0.1:<port>/`, the same origin with a slash. With both rules
+in place, a routine T35c's check let through would be written `sending`
+and then refused unsent by the client.
+
+**Solution.** One rule: `FireClient::fires_for(url_origin)` parses the
+stored origin and compares it with `base_url`'s. `fire`, `cloud add`, `cloud
+run` and `cloud list` (which marks a routine registered for another
+endpoint) all use it. T35b's test now checks that a written-otherwise origin
+is the same one and that other hosts, ports, schemes and unparsable text are
+not.
+
+### The checks on a task read for a card and for a cloud task
+
+**Issue.** `consents::unshowable` gave its reasons in terms of "the owner's
+card", which a `cloud run` member would have read in their refusal.
+
+**Solution.** It is `pub(crate)`, and its reasons say what the characters do
+wherever the task is shown ("which don't show where it is read", "which can
+push the rest of a line out of view"). The agentctl error and the card's
+tests match on the parts that stayed. `cloud run` drops joiners and
+presentation selectors first, as `agentctl private` does, so an emoji such
+as 👨‍💻 reaches the session as its parts.
+
+### What `cloud list` shows of a task
+
+**Issue.** The plan asks for each task's first line, cut to 60 characters,
+as literal text, escaped on Slack. Command replies are Markdown rendered for
+each surface, and Slack's renderer already escapes `&`, `<` and `>`
+everywhere, so escaping the line again would show `&amp;lt;`, while plain
+text would let the task's own Markdown, links and mentions format the reply.
+
+**Solution.** The line is a code span, as agent listings show members'
+names: nothing in it formats, links, mentions or broadcasts on either
+surface, and the renderer escapes it on Slack. Slack can't show a backtick
+in inline code, so backticks are left out; a line with nothing else shows
+as "(nothing to show)". The cut is by characters and ends in `…`.
+
+### Smaller choices
+
+- `cloud rm` joins the commands a ban leaves, so the ban replies (`me`,
+  the refusal and `admin ban`'s) now name it.
+- A routine whose stored token no longer opens or parses
+  (`StoreError::Seal` or `Corrupt` on `cloud_routines`) is answered by
+  asking the member to `cloud add` it again, which replaces the row without
+  reading the old token; other store failures are the usual "something went
+  wrong".
+- The reply never shows `error_type`, which the endpoint chooses: each
+  status gets the failure table's fixed line, worded tentatively for 403
+  and 404 as T35b's review asked. A 429 says when the limit resets, from
+  `Retry-After`, in whole minutes rounded up to two hours, and in hours,
+  to the nearest, past that.
+- `cloud add` replies with the routine id, also when it replaces a label,
+  and says which label already holds a routine registered twice.
+- `logout` names what it forgot, routines and hand-offs each only when
+  there were some, and says to revoke the tokens only when it deleted
+  routines.
+- The notifier sends a hand-off's notice to each of the member's identities
+  a manager bot reaches, as the relink notice does, and leaves a member
+  none reaches owed without a claim, so another instance or a later
+  configuration can send it. It logs each row it marks `unknown` as a
+  warning, with the hand-off, member and routine ids.
+- `a_replayed_slack_command_fires_once` sends the same signed request
+  twice, timestamp included, which is what a replay is; the ingress drops
+  the second by its signature before the intake sees it.
+
+### Review round 1: a per-member cap on hand-offs
+
+**Issue.** Nothing bounded how many hand-offs a linked member could ask
+for. Each writes a row holding up to 64 KiB of sealed task, kept 90 days
+whatever its outcome, and sends a request from agentd's address; the
+endpoint's own caps don't stop either. A member looping `cloud run`
+against a routine with a made-up token could grow the store by gigabytes a
+day and send a flood of bad tokens to api.anthropic.com, risking a block
+that would break every member's hand-offs.
+
+**Solution.** `Store::begin_cloud_handoff` takes a cap and counts the
+member's hand-offs asked within `CLOUD_HANDOFF_WINDOW` (an hour), every
+state, in the `BEGIN IMMEDIATE` transaction that writes the row, so two
+instances can't both pass it; one past the cap is `CloudBegun::TooMany`
+and nothing is written or sent. The cap is `[cloud] handoffs_per_hour`,
+default 10, from 1 to 100 (the endpoint's per-account cap), carried by
+`FireClient`. The count uses the existing `(member_id, created_at)` index.
+`logout` deletes the rows the cap counts, but a member must link again
+through OAuth to run again, which costs more than waiting the hour.
+
+### Review round 1: `cloud run` racing `logout` or a member's deletion
+
+**Issue.** Commands are ordered per identity, not per member, and Slack's
+deletion of a member doesn't go through the intake, so a `cloud run` from
+one surface could read its routine, then lose the race to a `logout` on
+another, then write a hand-off row after the member was told everything
+was forgotten. The row could also be deleted while the request was out,
+and recording the answer then logged "had its outcome already", which
+wasn't so.
+
+**Solution.** The same transaction checks the member still holds a
+routine under the label with that routine id (`CloudBegun::RoutineGone`
+otherwise, answered "was removed or replaced while I was starting it").
+A deletion either comes first, and nothing is written or sent, or comes
+after and deletes the row with the rest; the request already out still
+runs, as the member asked for it. `finish_cloud_handoff` returns
+`CloudFinished::{Recorded, Kept, Gone}`, and `Gone` logs that the row was
+deleted with the member's routines while its request was out.
+
+### Review round 1: smaller fixes
+
+- On Slack every reply that names `cloud add` names the slash command,
+  even in a DM, since the design keeps the token out of DM history; the
+  README says a mention in a Slack DM task is refused, since `message`
+  events carry mentions without names.
+- `logout` unlinks before it deletes configuration tokens and routines, so
+  a `logout` that fails before deleting anything still says to revoke the
+  tokens when sent again; one that fails after unlinking is sent again as
+  "No Claude account is linked" and deletes them then, with the advice.
+- One row's store failure no longer ends a notifier pass: each step and
+  each notice runs whatever another met, the failure is logged with the
+  hand-off, and the purge still runs. The pass returns the first failure
+  after doing the rest. Review round 2 gave the relink notifier the same
+  shape.
+- A test now runs `persona` with entities through a slash command and a
+  manager DM, so removing the decoding in `answer_text` fails it, and one
+  renders a hostile task line in Slack's `cloud list`.
+- Not fixed: the Slack `user_change` deletion is lost if the store fails
+  then. The ingress acknowledges and deduplicates an event before agentd
+  handles it, so nothing would deliver it again; retrying it needs a
+  durable inbound queue, which no Slack event has yet. Configuration
+  tokens have the same gap.
+- Noted (security N3): a token posted with `cloud add` in a Rocket.Chat
+  room is refused and the member told to revoke it, but the message stays
+  in the room, and a later turn's history read gives it to the model, as
+  with `login` codes and other secrets posted in rooms.
+- Noted (spend NIT5): instances whose clocks differ by more than twice
+  `timeout_secs`, or whose `timeout_secs` differ during a blue-green
+  deploy, can mark another's in-flight row `unknown`; the member then gets
+  a "may have started" notice as well as the link, and nothing fires
+  twice.
+
+### Review round 1: the pipeline test that raced
+
+**Issue.** `a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_ref`
+predates T35c and failed under load (correctness review S1): it reset the
+first session on seeing the hourglass and the second a fixed time after the
+first history read, so under contention a reset could land before the
+attempt it was aimed at looked its session up, and the turn ran.
+
+**Solution.** The test file's `Holds` gained a queue of gates for history
+reads. The test waits until each attempt is held reading the thread,
+which is after it looked its session up and before it runs, resets that
+session, then opens the gate; the sleeps are gone. The same gates replace
+the 1 s history delay in
+`messages_in_a_thread_are_answered_once_each_in_arrival_order`, a gate on
+the post replaces the 20 s post delay and 500 ms sleep in
+`a_reply_still_being_delivered_at_the_drain_timeout_is_cut_short_and_its_thread_told`,
+and the two hand-off drain tests wait for the pipeline to close rather than
+sleeping 500 ms. The remaining fixed sleeps in agentd's tests wait for
+nothing to happen, poll, simulate slow work, or stand in for "a moment
+later" well inside an attribution window (300 ms of 2 s, and 200 ms of
+30 s in two tests whose assertions hold in either order), which no hook
+marks; `tests/slack.rs`'s
+half-sent-request shutdown test sleeps for the server to read the request,
+which nothing the test can see marks.
+
+### Review round 2: a gate never opened hangs instead of failing
+
+**Issue.** The drain-timeout post test holds "Posted too late." at a gate
+it never opens, and awaited the server task without a bound. A regression
+that made shutdown wait for in-flight work instead of cutting it short
+would hang the test, and CI's job has no timeout short of GitHub's six
+hours. Three hand-off tests cut short work held at gates they never open
+in the same way.
+
+**Solution.** `tests/pipeline.rs` has a `bounded(what, future)` helper that
+panics after a minute, longer than any drain timeout there. Every wait on
+the server task, on `cut_short` and on a pipeline drain goes through it,
+`Stack::stop` included. With `cut_short` changed to join its tasks instead
+of shutting them down, the drain-timeout test now fails in about 66 s with
+"timed out waiting until the server stops"; without the bound it was still
+running when killed at 240 s. The history gates are now kept per thread,
+and `Gate::pass` counts its waiter down when it is dropped as well as when
+it passes.
+
+### Review round 2: barrier sleeps outside agentd
+
+- `runner`'s `a_panicked_turn_wakes_a_session_waiting_for_its_container`
+  started the second turn 200 ms after the first. It now starts it once
+  the first turn has started, and so holds the one container. Nothing marks
+  the second turn waiting for the container, but if it arrived after the
+  first let go, it would take the container without waiting and the test
+  would still pass, rather than flake.
+- `cred-proxy`'s refusal-log test slept 100 ms before reading the logs.
+  The lines it looks for are written before the responses it awaits, but
+  the sleep also gave late lines a chance to show a secret. It now waits
+  for the tunnel's "an egress tunnel ended" line instead, the last line the
+  test causes.
+- `tests/slack.rs`'s half-sent-request shutdown test keeps its 200 ms
+  sleep. Nothing marks the server having read the request: agentd logs no
+  request start, and the integration tests capture no logs. Marking it
+  would mean a log line in the server for a test's sake.
+
+### Review round 2: smaller fixes
+
+- design.md's threat row says a `logout` deletes the rows the cap counts,
+  and that the member must link through OAuth again before the next run.
+- The relink notifier carries on past one notice's store failure and
+  returns the first failure after the rest, as the cloud notifier does.
+- A test covers a `logout` that fails after unlinking: the member is
+  unlinked with their routines kept, and sending `logout` again says "No
+  Claude account is linked", deletes them and says to revoke the tokens.
+- Unlinking first widens, by the revoke call's latency, the window in which
+  a `cloud run` that passed its link check before the unlink still records
+  and fires; its row is then deleted with the rest. The run's own reply
+  has the link, so nothing is lost but the record.
+- A `Retry-After` up to two hours reads in minutes (61 minutes, not 2
+  hours) and past that in hours to the nearest.
+- A test races eight hand-offs at one under the cap on a database file
+  and expects exactly one through. SQLite never lets two through here: in
+  WAL mode a deferred transaction whose snapshot went stale fails its write
+  with a busy error, so dropping `BEGIN IMMEDIATE` would fail runs with
+  busy errors, which the test catches when two transactions overlap.
+- A refusal past the cap logs at debug, so a looping member stays out of
+  the logs. Its reply names the configured cap, not the count, which
+  differs only when the cap was lowered within the hour.
+- The example config and `CloudConfig`'s rustdoc say "hand-offs", the runs
+  that passed their checks and were recorded, rather than "`cloud run`s".
+
+### Review round 3
+
+- The relink regression test breaks alice's link a minute before grace's,
+  so alice's failing notice always comes first; with ties in the same
+  second the random member ids decided the order, and the old
+  abort-on-error loop passed about half the time. With the loop restored
+  it now fails 20 runs in 20, and passes 20 in 20 with the fix.
+- CI's `rust` and `coverage` jobs (about 7 and 6 minutes in recent runs),
+  `docker-tests` (about 5), `msrv` (about 2) and `docs` (doctests) now have
+  `timeout-minutes` of 30, 30, 30, 15 and 20, so a test hung behind a shut
+  gate fails its job instead of holding a runner for six hours. `bounded`
+  stays for its named failures on the server task, `cut_short` and
+  drains, and its rustdoc now says only that.
+- The relink notifier logs each store failure where it happens, with what
+  it was doing (a failure to record a notice that was sent says the notice
+  may go again after its lease), and the pass's summary, the members told
+  included, at debug, as the cloud notifier does.

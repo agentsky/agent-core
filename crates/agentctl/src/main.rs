@@ -270,6 +270,26 @@ mod tests {
     }
 
     #[test]
+    fn agentctl_has_no_cloud_command() {
+        let cli = Cli::command();
+        let names: Vec<&str> = cli.get_subcommands().map(clap::Command::get_name).collect();
+        assert!(
+            names.iter().all(|name| !name.contains("cloud")),
+            "{names:?}"
+        );
+        for args in [
+            ["cloud", "run", "agent-core", "fix it"].as_slice(),
+            ["cloud", "add", "agent-core", "https://x", "sk-ant-oat01-x"].as_slice(),
+            ["cloud-run", "agent-core", "fix it"].as_slice(),
+        ] {
+            let err = parse(args).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidSubcommand, "{args:?}");
+        }
+        let help = cli.clone().render_long_help().to_string();
+        assert!(!help.to_lowercase().contains("cloud"), "{help}");
+    }
+
+    #[test]
     fn prints_version() {
         let err = Cli::try_parse_from(["agentctl", "--version"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);

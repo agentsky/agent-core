@@ -692,22 +692,27 @@ const MAX_BLANK_LINES: usize = 2;
 /// The most combining diacritical marks a task may stack on a character.
 const MAX_MARK_RUN: usize = 4;
 
-/// Why the owner's card couldn't show `task` as the model reads it, if it
-/// couldn't: a control character other than a newline or tab, or an
-/// invisible one ([`is_invisible`]), which shows as nothing; a line
-/// indented more than [`MAX_INDENT`] columns, or a run of blanks wider than
-/// [`MAX_BLANK_RUN`] columns after a line's first visible character, which
-/// can push the rest of the line out of a code block's view; more than
-/// [`MAX_BLANK_LINES`] blank lines in a row, which can push the rest below
-/// the fold, a blank line counting only as that however wide it is; or more than [`MAX_MARK_RUN`] combining diacritical marks in
-/// a row, which can draw over the card's own text.
-fn unshowable(task: &str) -> Option<&'static str> {
+/// Why `task` might not read the same to whoever is shown it as to the
+/// model or session that runs it, if it might not: a control character
+/// other than a newline or tab, or an invisible one ([`is_invisible`]),
+/// which shows as nothing; a line indented more than [`MAX_INDENT`]
+/// columns, or a run of blanks wider than [`MAX_BLANK_RUN`] columns after a
+/// line's first visible character, which can push the rest of the line out
+/// of a code block's view; more than [`MAX_BLANK_LINES`] blank lines in a
+/// row, which can push the rest below the fold, a blank line counting only
+/// as that however wide it is; or more than [`MAX_MARK_RUN`] combining
+/// diacritical marks in a row, which can draw over the text around them.
+///
+/// A private task's card shows the task to its owner (T33), and a `cloud
+/// run` task is what its member saw in their own message, so both are
+/// refused for the same reasons, worded to read for either.
+pub(crate) fn unshowable(task: &str) -> Option<&'static str> {
     if task
         .chars()
         .any(|c| (c.is_control() && c != '\n' && c != '\t') || is_invisible(c))
     {
         return Some(
-            "the task has control or invisible characters, which the owner's card wouldn't show",
+            "the task has control or invisible characters, which don't show where it is read",
         );
     }
     let mut marks = 0;
@@ -715,8 +720,8 @@ fn unshowable(task: &str) -> Option<&'static str> {
         marks = if is_diacritical_mark(c) { marks + 1 } else { 0 };
         if marks > MAX_MARK_RUN {
             return Some(
-                "the task stacks more than 4 combining marks on a character, which could draw \
-                 over the owner's card",
+                "the task stacks more than 4 combining marks on a character, which can draw \
+                 over the text around it",
             );
         }
     }
@@ -726,8 +731,8 @@ fn unshowable(task: &str) -> Option<&'static str> {
             blank_lines += 1;
             if blank_lines > MAX_BLANK_LINES {
                 return Some(
-                    "the task has more than 2 blank lines in a row, which could hide what \
-                     follows from the owner's card",
+                    "the task has more than 2 blank lines in a row, which can push what \
+                     follows out of view",
                 );
             }
             continue;
@@ -740,8 +745,8 @@ fn unshowable(task: &str) -> Option<&'static str> {
             .sum();
         if indent > MAX_INDENT {
             return Some(
-                "the task has a line indented more than 32 columns, which could hide it from \
-                 the owner's card",
+                "the task has a line indented more than 32 columns, which can push it out of \
+                 view",
             );
         }
         let mut blanks = 0;
@@ -753,8 +758,8 @@ fn unshowable(task: &str) -> Option<&'static str> {
             };
             if blanks > MAX_BLANK_RUN {
                 return Some(
-                    "the task has a run of more than 16 columns of spaces or tabs, which could \
-                     hide the rest of a line from the owner's card",
+                    "the task has a run of more than 16 columns of spaces or tabs, which can \
+                     push the rest of a line out of view",
                 );
             }
         }
