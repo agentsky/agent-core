@@ -20,12 +20,15 @@
 //! [`SlackClient::with_max_retry_wait`]; otherwise it fails with
 //! [`SurfaceError::RateLimited`]. Each method is also tagged with its rate
 //! limit tier, and calls wait client-side before they would exceed it (see
-//! the `limit` module).
+//! the `limit` module). A client made with [`WebApi::without_waiting`]
+//! does neither: it fails with [`SurfaceError::RateLimited`] instead.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use core_types::{ConversationId, InFile, MessageId, OutFile, SurfaceError, TeamId, UserId};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{StatusCode, Url, redirect};
@@ -37,7 +40,7 @@ use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use crate::limit::{Bucket, Limiter, Tier, TokenKey};
-use crate::normalize::{SlackFile, in_file};
+use crate::normalize::{SlackFile, in_files};
 
 /// The result type of the Web API client.
 pub type Result<T, E = SurfaceError> = std::result::Result<T, E>;
@@ -50,6 +53,12 @@ pub const MAX_RETRIES: u32 = 3;
 
 /// How long a call may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an `apps.manifest.*` call may take. Slack sends the new app's
+/// `url_verification` challenge while `apps.manifest.create` runs, so it
+/// can take longer than other calls, and giving up on one Slack goes on
+/// with leaves an app agentd never hears of.
+pub const MANIFEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 /// How long a file upload may take.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -126,12 +135,17 @@ const NOT_FOUND_CODES: &[&str] = &[
     "users_not_found",
 ];
 
+/// Error codes with which `apps.manifest.delete` says the app is gone.
+const APP_GONE_CODES: &[&str] = &["app_not_found", "invalid_app_id"];
+
 /// Error codes of Slack's rate limiter.
 const RATE_LIMITED_CODES: &[&str] = &["ratelimited", "rate_limited"];
 
 /// A Web API method this client calls, with its rate-limit tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Method {
+    AppsManifestCreate,
+    AppsManifestDelete,
     AuthTest,
     BotsInfo,
     ChatPostEphemeral,
@@ -144,6 +158,7 @@ enum Method {
     ConversationsReplies,
     FilesCompleteUploadExternal,
     FilesGetUploadUrlExternal,
+    OauthV2Access,
     ReactionsAdd,
     ReactionsRemove,
     ToolingTokensRotate,
@@ -154,6 +169,8 @@ enum Method {
 impl Method {
     const fn name(self) -> &'static str {
         match self {
+            Self::AppsManifestCreate => "apps.manifest.create",
+            Self::AppsManifestDelete => "apps.manifest.delete",
             Self::AuthTest => "auth.test",
             Self::BotsInfo => "bots.info",
             Self::ChatPostEphemeral => "chat.postEphemeral",
@@ -166,6 +183,7 @@ impl Method {
             Self::ConversationsReplies => "conversations.replies",
             Self::FilesCompleteUploadExternal => "files.completeUploadExternal",
             Self::FilesGetUploadUrlExternal => "files.getUploadURLExternal",
+            Self::OauthV2Access => "oauth.v2.access",
             Self::ReactionsAdd => "reactions.add",
             Self::ReactionsRemove => "reactions.remove",
             Self::ToolingTokensRotate => "tooling.tokens.rotate",
@@ -180,7 +198,9 @@ impl Method {
         match self {
             Self::AuthTest => Tier::AuthTest,
             Self::ChatPostMessage => Tier::PostMessage,
-            Self::ToolingTokensRotate => Tier::Tier1,
+            Self::AppsManifestCreate | Self::AppsManifestDelete | Self::ToolingTokensRotate => {
+                Tier::Tier1
+            }
             Self::UsersList | Self::ReactionsRemove => Tier::Tier2,
             Self::BotsInfo
             | Self::ChatUpdate
@@ -193,7 +213,16 @@ impl Method {
             Self::ChatPostEphemeral
             | Self::FilesCompleteUploadExternal
             | Self::FilesGetUploadUrlExternal
+            | Self::OauthV2Access
             | Self::UsersInfo => Tier::Tier4,
+        }
+    }
+
+    /// How long one request may take.
+    const fn timeout(self) -> Duration {
+        match self {
+            Self::AppsManifestCreate | Self::AppsManifestDelete => MANIFEST_TIMEOUT,
+            _ => REQUEST_TIMEOUT,
         }
     }
 }
@@ -214,10 +243,12 @@ enum Reply {
     RateLimited(Duration),
 }
 
-/// An `ok: false` answer's code, and the scope a `missing_scope` names.
+/// An `ok: false` answer's code, the scope a `missing_scope` names, and
+/// what an `apps.manifest.*` answer's `errors` say, sanitized.
 struct Failure {
     code: String,
     needed: Option<String>,
+    problems: Vec<String>,
 }
 
 impl Failure {
@@ -234,6 +265,49 @@ struct Envelope {
     error: Option<String>,
     #[serde(default)]
     needed: Option<String>,
+    #[serde(default)]
+    errors: Option<Value>,
+}
+
+/// The most entries of an `errors` list kept.
+const MAX_PROBLEMS: usize = 5;
+
+/// The most characters of one `errors` entry kept.
+const MAX_PROBLEM_CHARS: usize = 200;
+
+/// What the `errors` of an `apps.manifest.*` answer say, such as
+/// `/settings/event_subscriptions/request_url: URL didn't respond with the
+/// value of the challenge parameter.` for each `{"message", "pointer"}`
+/// entry: at most [`MAX_PROBLEMS`] entries of at most
+/// [`MAX_PROBLEM_CHARS`] printable ASCII characters each, without
+/// backticks or angle brackets, so they can be logged and shown safely.
+fn problems(errors: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(errors)) = errors else {
+        return Vec::new();
+    };
+    let text = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| (c.is_ascii_graphic() || *c == ' ') && !matches!(c, '`' | '<' | '>'))
+            .collect::<String>()
+    };
+    errors
+        .iter()
+        .take(MAX_PROBLEMS)
+        .filter_map(|error| {
+            let message = text(error.get("message"));
+            let pointer = text(error.get("pointer"));
+            let problem = match (pointer.trim(), message.trim()) {
+                ("", "") => return None,
+                ("", message) => message.to_owned(),
+                (pointer, "") => pointer.to_owned(),
+                (pointer, message) => format!("{pointer}: {message}"),
+            };
+            Some(problem.chars().take(MAX_PROBLEM_CHARS).collect())
+        })
+        .collect()
 }
 
 /// The connection pool, base URL and rate limiter shared by every bot token.
@@ -312,7 +386,8 @@ impl SlackClient {
         WebApi {
             client: self.clone(),
             key: TokenKey::of(&token),
-            token: Some(token),
+            auth: Auth::Bearer(token),
+            waits: true,
         }
     }
 
@@ -333,7 +408,8 @@ impl SlackClient {
         let api = WebApi {
             client: self.clone(),
             key: TokenKey::of(refresh_token),
-            token: None,
+            auth: Auth::None,
+            waits: true,
         };
         let form = vec![("refresh_token", refresh_token.expose_secret().to_owned())];
         let rotated: RotateResponse = api
@@ -349,6 +425,170 @@ impl SlackClient {
             user: rotated.user_id,
             expires_at,
         })
+    }
+
+    /// `apps.manifest.create`: creates an app from `manifest`, acting as the
+    /// member whose app configuration token `config_token` is. Slack
+    /// verifies the manifest's events URL with a `url_verification`
+    /// challenge while the call runs, so the request may take
+    /// [`MANIFEST_TIMEOUT`].
+    ///
+    /// The token goes only in `Authorization: Bearer`, and the manifest as
+    /// JSON in the form body. An `ok: true` answer that names an app but
+    /// can't be read in full has the app deleted again with the same token,
+    /// since nothing could use it.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Unauthorized`] when Slack refuses the token (it
+    /// expired, or was revoked); [`SurfaceError::Api`] with Slack's code,
+    /// such as `invalid_manifest`, for a manifest it refuses (what its
+    /// `errors` say is logged); [`SurfaceError::Transport`] for an answer
+    /// that can't be read; otherwise see [`map_error`].
+    pub async fn create_app(
+        &self,
+        config_token: &SecretString,
+        manifest: &Value,
+    ) -> Result<CreatedApp> {
+        let method = Method::AppsManifestCreate;
+        let form = vec![("manifest", manifest.to_string())];
+        let bytes = self
+            .config_api(config_token)
+            .send(method, &Body::Form(form), None)
+            .await?
+            .map_err(Failure::into_error)?;
+        let created = decode::<CreateAppResponse>(method, &bytes).and_then(|created| {
+            if created.app_id.is_empty() || created.credentials.client_id.is_empty() {
+                Err(SurfaceError::Transport(
+                    "apps.manifest.create returned no app id or client id".into(),
+                ))
+            } else {
+                Ok(created)
+            }
+        });
+        match created {
+            Ok(created) => Ok(CreatedApp {
+                app_id: created.app_id,
+                client_id: created.credentials.client_id,
+                client_secret: created.credentials.client_secret,
+                signing_secret: created.credentials.signing_secret,
+            }),
+            Err(err) => {
+                let app_id = serde_json::from_slice::<AppIdResponse>(&bytes)
+                    .ok()
+                    .and_then(|named| named.app_id)
+                    .filter(|app_id| {
+                        !app_id.is_empty() && app_id.bytes().all(|b| b.is_ascii_alphanumeric())
+                    });
+                if let Some(app_id) = app_id {
+                    match self.delete_app(config_token, &app_id).await {
+                        Ok(()) | Err(SurfaceError::NotFound(_)) => {
+                            tracing::warn!(
+                                app_id,
+                                "deleted an app Slack created but answered for unreadably"
+                            );
+                        }
+                        Err(delete) => {
+                            tracing::warn!(app_id, error = %delete, "couldn't delete an app Slack created but answered for unreadably");
+                        }
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// `apps.manifest.delete`: deletes the app `app_id`, its bot user and
+    /// its installations, acting as the member whose app configuration
+    /// token `config_token` is.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::NotFound`] when the app is gone already
+    /// (`app_not_found`, `invalid_app_id`); otherwise as for
+    /// [`create_app`](Self::create_app).
+    pub async fn delete_app(&self, config_token: &SecretString, app_id: &str) -> Result<()> {
+        let form = vec![("app_id", app_id.to_owned())];
+        match self
+            .config_api(config_token)
+            .send(Method::AppsManifestDelete, &Body::Form(form), None)
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(failure) if APP_GONE_CODES.contains(&failure.code.as_str()) => {
+                Err(SurfaceError::NotFound(failure.code))
+            }
+            Err(failure) => Err(failure.into_error()),
+        }
+    }
+
+    /// `oauth.v2.access`: exchanges the `code` an install's OAuth redirect
+    /// carried for the app's bot token. `client_id` and `client_secret` are
+    /// the app's, sent in `Authorization: Basic`; `redirect_url` must be the
+    /// one the install link named.
+    ///
+    /// # Errors
+    ///
+    /// [`SurfaceError::Api`] with Slack's code (`invalid_code`,
+    /// `bad_redirect_uri`, …) for a refused exchange, and
+    /// [`SurfaceError::Transport`] when the answer carries no bot token.
+    pub async fn install_app(
+        &self,
+        client_id: &str,
+        client_secret: &SecretString,
+        code: &SecretString,
+        redirect_url: &str,
+    ) -> Result<Installation> {
+        let api = WebApi {
+            client: self.clone(),
+            key: TokenKey::of(client_secret),
+            auth: Auth::Basic {
+                client_id: client_id.to_owned(),
+                client_secret: client_secret.clone(),
+            },
+            waits: true,
+        };
+        let form = vec![
+            ("code", code.expose_secret().to_owned()),
+            ("redirect_uri", redirect_url.to_owned()),
+        ];
+        let installed: InstallResponse = api
+            .call(Method::OauthV2Access, Body::Form(form), None)
+            .await?;
+        if installed
+            .token_type
+            .as_deref()
+            .is_some_and(|kind| kind != "bot")
+            || installed.access_token.expose_secret().is_empty()
+            || installed.bot_user_id.as_str().is_empty()
+        {
+            return Err(SurfaceError::Transport(
+                "oauth.v2.access returned no bot token".into(),
+            ));
+        }
+        Ok(Installation {
+            app_id: installed.app_id,
+            team: installed.team.id,
+            bot_user: installed.bot_user_id,
+            bot_token: installed.access_token,
+            scopes: installed
+                .scope
+                .split(',')
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        })
+    }
+
+    /// A client acting with a member's app configuration token.
+    fn config_api(&self, config_token: &SecretString) -> WebApi {
+        WebApi {
+            client: self.clone(),
+            key: TokenKey::of(config_token),
+            auth: Auth::Bearer(config_token.clone()),
+            waits: true,
+        }
     }
 
     /// Replies privately to a slash command or an interaction through its
@@ -388,6 +628,9 @@ impl SlackClient {
                 retry_after: wait.unwrap_or(DEFAULT_RETRY_WAIT),
             });
         }
+        if status.is_server_error() {
+            return Err(SurfaceError::Transport(format!("HTTP {}", status.as_u16())));
+        }
         let code = match serde_json::from_slice::<Envelope>(&bytes) {
             Ok(envelope) if envelope.ok => None,
             Ok(envelope) => Some(envelope.error.unwrap_or_default()),
@@ -417,14 +660,32 @@ impl SlackClient {
 #[derive(Clone)]
 pub struct WebApi {
     client: SlackClient,
-    token: Option<SecretString>,
+    auth: Auth,
     key: TokenKey,
+    waits: bool,
+}
+
+/// How a [`WebApi`] authenticates its calls.
+#[derive(Clone)]
+enum Auth {
+    /// Not at all, as `tooling.tokens.rotate` does.
+    None,
+    /// With a token in `Authorization: Bearer`: a bot token, or a member's
+    /// configuration token.
+    Bearer(SecretString),
+    /// With an app's client id and secret in `Authorization: Basic`, as
+    /// `oauth.v2.access` does.
+    Basic {
+        client_id: String,
+        client_secret: SecretString,
+    },
 }
 
 impl fmt::Debug for WebApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebApi")
             .field("client", &self.client)
+            .field("waits", &self.waits)
             .field("token", &"[REDACTED]")
             .finish()
     }
@@ -464,6 +725,36 @@ pub struct ConfigToken {
     pub user: UserId,
     /// When `token` stops working. Configuration tokens last 12 hours.
     pub expires_at: OffsetDateTime,
+}
+
+/// An app `apps.manifest.create` created, from
+/// [`SlackClient::create_app`]. `Debug` redacts both secrets.
+#[derive(Debug)]
+pub struct CreatedApp {
+    /// The app's id (`A…`).
+    pub app_id: String,
+    /// The app's OAuth client id.
+    pub client_id: String,
+    /// The app's OAuth client secret, which `oauth.v2.access` needs.
+    pub client_secret: SecretString,
+    /// The secret the app's requests are signed with.
+    pub signing_secret: SecretString,
+}
+
+/// An app's installation in a workspace, from `oauth.v2.access`
+/// ([`SlackClient::install_app`]). `Debug` redacts the token.
+#[derive(Debug)]
+pub struct Installation {
+    /// The app that was installed.
+    pub app_id: String,
+    /// The workspace it was installed in.
+    pub team: TeamId,
+    /// The app's bot user.
+    pub bot_user: UserId,
+    /// The bot token (`xoxb-…`).
+    pub bot_token: SecretString,
+    /// The bot scopes the install granted.
+    pub scopes: Vec<String>,
 }
 
 /// A conversation, from `conversations.info`, `conversations.join` or
@@ -607,7 +898,7 @@ impl From<RawMessage> for Message {
             subtype: raw.subtype,
             text: raw.text.unwrap_or_default(),
             thread_ts: raw.thread_ts.map(Into::into),
-            files: raw.files.into_iter().filter_map(in_file).collect(),
+            files: in_files(raw.files),
         }
     }
 }
@@ -663,11 +954,53 @@ struct MessagesResponse {
 }
 
 #[derive(Deserialize)]
+struct RawMessagesResponse {
+    #[serde(default)]
+    messages: Vec<Value>,
+}
+
+#[derive(Deserialize)]
 struct UsersResponse {
     #[serde(default)]
     members: Vec<User>,
     #[serde(default)]
     response_metadata: ResponseMetadata,
+}
+
+#[derive(Deserialize)]
+struct CreateAppResponse {
+    app_id: String,
+    credentials: AppCredentials,
+}
+
+#[derive(Deserialize)]
+struct AppIdResponse {
+    #[serde(default)]
+    app_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AppCredentials {
+    client_id: String,
+    client_secret: SecretString,
+    signing_secret: SecretString,
+}
+
+#[derive(Deserialize)]
+struct InstallResponse {
+    app_id: String,
+    #[serde(default)]
+    token_type: Option<String>,
+    access_token: SecretString,
+    bot_user_id: UserId,
+    team: IdObject<TeamId>,
+    #[serde(default)]
+    scope: String,
+}
+
+#[derive(Deserialize)]
+struct IdObject<T> {
+    id: T,
 }
 
 #[derive(Deserialize)]
@@ -869,6 +1202,45 @@ impl WebApi {
             page,
         );
         self.messages(Method::ConversationsReplies, form).await
+    }
+
+    /// The message `ts` in `channel`, as Slack stores it, in the thread
+    /// rooted at `root` when it is a thread reply, read with
+    /// `conversations.replies` there or `conversations.history` at the top
+    /// level, between `ts` and `ts` inclusive. `None` if Slack has no
+    /// message with exactly that `ts`.
+    ///
+    /// The message is returned whole, `blocks`, `files`, `thread_ts`,
+    /// `edited` and all, for [`normalize::read_back`](crate::normalize::read_back).
+    ///
+    /// # Errors
+    ///
+    /// See [`map_error`]; `thread_not_found` is [`SurfaceError::NotFound`].
+    pub async fn message(
+        &self,
+        channel: &ConversationId,
+        root: Option<&MessageId>,
+        ts: &MessageId,
+    ) -> Result<Option<Value>> {
+        let mut form = vec![("channel", channel.to_string())];
+        let method = match root {
+            Some(root) => {
+                form.push(("ts", root.to_string()));
+                Method::ConversationsReplies
+            }
+            None => Method::ConversationsHistory,
+        };
+        form.extend([
+            ("oldest", ts.to_string()),
+            ("latest", ts.to_string()),
+            ("inclusive", "true".to_owned()),
+            ("limit", "2".to_owned()),
+        ]);
+        let page: RawMessagesResponse = self.call(method, Body::Form(form), None).await?;
+        Ok(page
+            .messages
+            .into_iter()
+            .find(|message| message.get("ts").and_then(Value::as_str) == Some(ts.as_str())))
     }
 
     async fn messages(
@@ -1115,6 +1487,11 @@ impl WebApi {
         let status = response.status();
         if status.is_success() {
             Ok(())
+        } else if status.is_server_error() {
+            Err(SurfaceError::Transport(format!(
+                "the file upload failed (HTTP {})",
+                status.as_u16()
+            )))
         } else {
             Err(SurfaceError::Api(format!(
                 "the file upload was refused (HTTP {})",
@@ -1142,20 +1519,13 @@ impl WebApi {
             .send(method, &body, channel)
             .await?
             .map_err(Failure::into_error)?;
-        serde_json::from_slice(&bytes).map_err(|err| {
-            SurfaceError::Transport(format!(
-                "unexpected response from {} ({:?} error at line {} column {})",
-                method.name(),
-                err.classify(),
-                err.line(),
-                err.column()
-            ))
-        })
+        decode(method, &bytes)
     }
 
     /// Sends a call, waiting for the limiter first and retrying a rate
-    /// limit that clears soon enough. Returns the body of an `ok: true`
-    /// answer, or the failure of an `ok: false` one.
+    /// limit that clears soon enough, unless this client
+    /// [doesn't wait](Self::without_waiting). Returns the body of an
+    /// `ok: true` answer, or the failure of an `ok: false` one.
     async fn send(
         &self,
         method: Method,
@@ -1166,12 +1536,13 @@ impl WebApi {
         let mut retries = 0;
         loop {
             let max_wait = self.client.max_retry_wait;
-            if let Err(retry_after) = self
-                .client
-                .limiter
-                .acquire(&bucket, method.tier(), max_wait)
-                .await
-            {
+            let limiter = &self.client.limiter;
+            let acquired = if self.waits {
+                limiter.acquire(&bucket, method.tier(), max_wait).await
+            } else {
+                limiter.try_now(&bucket, method.tier())
+            };
+            if let Err(retry_after) = acquired {
                 return Err(SurfaceError::RateLimited { retry_after });
             }
             let response = self
@@ -1182,7 +1553,7 @@ impl WebApi {
             match reply(response).await? {
                 Reply::RateLimited(wait) => {
                     self.client.limiter.block(&bucket, Instant::now() + wait);
-                    if retries >= MAX_RETRIES || wait > self.client.max_retry_wait {
+                    if !self.waits || retries >= MAX_RETRIES || wait > self.client.max_retry_wait {
                         tracing::warn!(
                             method = method.name(),
                             retry_after_s = wait.as_secs(),
@@ -1199,7 +1570,17 @@ impl WebApi {
                     );
                 }
                 Reply::Ok(bytes) => return Ok(Ok(bytes)),
-                Reply::Failed(failure) => return Ok(Err(failure)),
+                Reply::Failed(failure) => {
+                    if !failure.problems.is_empty() {
+                        tracing::warn!(
+                            method = method.name(),
+                            code = failure.code,
+                            problems = ?failure.problems,
+                            "Slack refused a call and said why"
+                        );
+                    }
+                    return Ok(Err(failure));
+                }
             }
         }
     }
@@ -1212,7 +1593,7 @@ impl WebApi {
             .map_err(|err| SurfaceError::Api(format!("invalid Slack API URL: {err}")))?;
         let request = self
             .authorized(self.client.http.post(url))?
-            .timeout(REQUEST_TIMEOUT);
+            .timeout(method.timeout());
         Ok(match body {
             Body::Form(form) => request.form(form),
             Body::Json(json) => request
@@ -1223,14 +1604,35 @@ impl WebApi {
 }
 
 impl WebApi {
+    /// This client, but never waiting on the rate limit: a call over its
+    /// tier's quota, or in a bucket a 429 holds, fails at once with
+    /// [`SurfaceError::RateLimited`] without being sent, and a 429 isn't
+    /// retried. For lookups a flood of forged events could otherwise queue
+    /// behind the token's quota.
+    pub fn without_waiting(&self) -> Self {
+        Self {
+            waits: false,
+            ..self.clone()
+        }
+    }
+
     /// `request` with the bot token in `Authorization`, if this client has
     /// one.
     fn authorized(&self, request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        let Some(token) = &self.token else {
-            return Ok(request);
+        let value = match &self.auth {
+            Auth::None => return Ok(request),
+            Auth::Bearer(token) => format!("Bearer {}", token.expose_secret()),
+            Auth::Basic {
+                client_id,
+                client_secret,
+            } => format!(
+                "Basic {}",
+                BASE64.encode(format!("{client_id}:{}", client_secret.expose_secret()))
+            ),
         };
-        let mut auth = HeaderValue::try_from(format!("Bearer {}", token.expose_secret()))
-            .map_err(|_| SurfaceError::Api("the bot token has invalid header characters".into()))?;
+        let mut auth = HeaderValue::try_from(value).map_err(|_| {
+            SurfaceError::Api("the credential has invalid header characters".into())
+        })?;
         auth.set_sensitive(true);
         Ok(request.header(AUTHORIZATION, auth))
     }
@@ -1286,6 +1688,20 @@ async fn read_file(file: &OutFile) -> Result<Vec<u8>> {
         })
 }
 
+/// Decodes the successful answer of `method` as `T`. The error names where
+/// the answer stopped making sense, never what it held.
+fn decode<T: DeserializeOwned>(method: Method, bytes: &[u8]) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|err| {
+        SurfaceError::Transport(format!(
+            "unexpected response from {} ({:?} error at line {} column {})",
+            method.name(),
+            err.classify(),
+            err.line(),
+            err.column()
+        ))
+    })
+}
+
 /// Reads a Web API answer.
 async fn reply(response: reqwest::Response) -> Result<Reply> {
     let status = response.status();
@@ -1293,6 +1709,9 @@ async fn reply(response: reqwest::Response) -> Result<Reply> {
     let bytes = response.bytes().await.map_err(transport)?;
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Ok(Reply::RateLimited(wait.unwrap_or(DEFAULT_RETRY_WAIT)));
+    }
+    if status.is_server_error() {
+        return Err(SurfaceError::Transport(format!("HTTP {}", status.as_u16())));
     }
     if !status.is_success() {
         return Err(SurfaceError::Api(format!("HTTP {}", status.as_u16())));
@@ -1319,6 +1738,7 @@ async fn reply(response: reqwest::Response) -> Result<Reply> {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b".:_-,".contains(&b))
         }),
+        problems: problems(envelope.errors.as_ref()),
     }))
 }
 
@@ -1414,6 +1834,8 @@ mod tests {
     #[test]
     fn every_method_has_a_tier() {
         let cases = [
+            (Method::AppsManifestCreate, Tier::Tier1),
+            (Method::AppsManifestDelete, Tier::Tier1),
             (Method::AuthTest, Tier::AuthTest),
             (Method::BotsInfo, Tier::Tier3),
             (Method::ChatPostEphemeral, Tier::Tier4),
@@ -1426,6 +1848,7 @@ mod tests {
             (Method::ConversationsReplies, Tier::Tier3),
             (Method::FilesCompleteUploadExternal, Tier::Tier4),
             (Method::FilesGetUploadUrlExternal, Tier::Tier4),
+            (Method::OauthV2Access, Tier::Tier4),
             (Method::ReactionsAdd, Tier::Tier3),
             (Method::ReactionsRemove, Tier::Tier2),
             (Method::ToolingTokensRotate, Tier::Tier1),
@@ -1479,6 +1902,46 @@ mod tests {
             sanitize_code("channel_not_found"),
             Some("channel_not_found")
         );
+    }
+
+    #[test]
+    fn manifest_problems_are_sanitized_and_bounded() {
+        let errors = json!([
+            {
+                "code": "failed_to_verify",
+                "message": "URL didn't respond with the value of the challenge parameter.",
+                "pointer": "/settings/event_subscriptions/request_url",
+            },
+            {"message": "`<b>` bad\n"},
+            {"code": "no_text"},
+            "not an object",
+            {"pointer": "/display_information/name"},
+        ]);
+        assert_eq!(
+            problems(Some(&errors)),
+            [
+                "/settings/event_subscriptions/request_url: URL didn't respond with the value of \
+                 the challenge parameter.",
+                "b bad",
+                "/display_information/name",
+            ]
+        );
+        let many = Value::Array(vec![json!({"message": "x".repeat(500)}); 9]);
+        let kept = problems(Some(&many));
+        assert_eq!(kept.len(), MAX_PROBLEMS);
+        assert!(
+            kept.iter()
+                .all(|problem| problem.len() == MAX_PROBLEM_CHARS)
+        );
+        assert!(problems(Some(&json!("errors"))).is_empty());
+        assert!(problems(None).is_empty());
+    }
+
+    #[test]
+    fn manifest_calls_may_take_longer() {
+        assert_eq!(Method::AppsManifestCreate.timeout(), MANIFEST_TIMEOUT);
+        assert_eq!(Method::AppsManifestDelete.timeout(), MANIFEST_TIMEOUT);
+        assert_eq!(Method::ChatPostMessage.timeout(), REQUEST_TIMEOUT);
     }
 
     #[test]

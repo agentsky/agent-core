@@ -14,7 +14,7 @@ use agentd::commands::Origin;
 use agentd::ctl::SurfaceLookup;
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
-    Turns, USAGE_LIMIT_TEXT,
+    Turns, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
 };
 use agentd::server::{Routers, Server};
 use agentd::skills::{Added, Confirmed, Source};
@@ -50,10 +50,11 @@ struct Mocks {
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Mocks {
-    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
+    async fn surface(&self, agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
         Some(Arc::new(Held {
             mock: self.mock.clone(),
             holds: self.holds.clone(),
+            agent,
         }))
     }
 }
@@ -105,14 +106,26 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// What the agents' surfaces hold up, besides the mock's own delays.
+/// What the agents' surfaces hold up or fail, besides the mock's own.
 #[derive(Debug, Default)]
 struct Holds {
+    confirms: Mutex<HashMap<AgentId, Gate>>,
+    failing_confirms: Mutex<VecDeque<SurfaceError>>,
     posts: Mutex<HashMap<String, Gate>>,
     histories: Mutex<HashMap<ThreadKey, VecDeque<Gate>>>,
 }
 
 impl Holds {
+    /// Holds `agent`'s confirmations at `gate`.
+    fn confirms_of(&self, agent: AgentId, gate: &Gate) {
+        self.confirms.lock().unwrap().insert(agent, gate.clone());
+    }
+
+    /// Makes the next confirmation fail with `error`.
+    fn fail_next_confirm(&self, error: SurfaceError) {
+        self.failing_confirms.lock().unwrap().push_back(error);
+    }
+
     /// Holds the next read of `thread`'s history, by any agent, at `gate`,
     /// after those queued before it for that thread.
     fn history_at(&self, thread: ThreadKey, gate: &Gate) {
@@ -137,6 +150,7 @@ impl Holds {
 struct Held {
     mock: Arc<MockSurface>,
     holds: Arc<Holds>,
+    agent: AgentId,
 }
 
 #[async_trait::async_trait]
@@ -194,6 +208,23 @@ impl Surface for Held {
             gate.pass().await;
         }
         self.mock.history(thread, before, limit).await
+    }
+
+    async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>, SurfaceError> {
+        if let Some(error) = self.holds.failing_confirms.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        let gate = self
+            .holds
+            .confirms
+            .lock()
+            .unwrap()
+            .get(&self.agent)
+            .cloned();
+        if let Some(gate) = gate {
+            gate.pass().await;
+        }
+        self.mock.confirm(event).await
     }
 
     fn render(&self, markdown: &str) -> Vec<String> {
@@ -428,12 +459,17 @@ impl Stack {
 
     /// Alice's second agent, `name`, whose bot is `bot`.
     async fn other_agent(&self, name: &str, bot: &str) -> AgentId {
+        self.agent_of(self.alice, name, bot).await
+    }
+
+    /// `owner`'s agent `name`, whose bot is `bot`.
+    async fn agent_of(&self, owner: MemberId, name: &str, bot: &str) -> AgentId {
         let store = self.store();
         let team = TEAM.into();
         let AgentCreation::Created(agent, binding) = store
             .create_agent(
                 &NewAgent {
-                    owner: self.alice,
+                    owner,
                     name,
                     persona: "You write.",
                     visibility: Visibility::Public,
@@ -1434,11 +1470,21 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
     sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b4", None, &[BOT]))
         .await
         .unwrap();
-    let busy: Vec<_> = posts(&stack.mock.calls())
+    let line = "helper is busy with other requests. Ask again in a few minutes.".to_owned();
+    wait_until("the busy lines are posted", || {
+        posts(&stack.mock.calls())
+            .iter()
+            .filter(|(_, text, _)| *text == line)
+            .count()
+            == 2
+    })
+    .await;
+    let mut busy: Vec<_> = posts(&stack.mock.calls())
         .into_iter()
         .map(|(to, text, _)| (to, text))
+        .filter(|(_, text)| *text == line)
         .collect();
-    let line = "helper is busy with other requests. Ask again in a few minutes.".to_owned();
+    busy.sort_by_key(|(to, _)| to.thread_root.clone());
     assert_eq!(
         busy,
         [
@@ -1457,6 +1503,146 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
             == 2
     })
     .await;
+    stack.stop().await;
+}
+
+impl Stack {
+    async fn bob(&self) -> MemberId {
+        self.store()
+            .member_for_identity(&key("bob"))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Sends bob's message `id` in GENERAL, starting a thread, mentioning
+    /// `bot`, without waiting for it.
+    async fn bob_asks(&self, id: &str, bot: &str) {
+        self.pipeline
+            .sink(MockSurface::DEFAULT_CAPS)
+            .send(self.event("bob", "GENERAL", ConvKind::Channel, id, None, &[bot]))
+            .await
+            .unwrap();
+    }
+
+    /// Waits until `text` was posted in the thread of `root` in GENERAL.
+    async fn wait_for_post(&self, root: &str, text: &str) {
+        wait_until(&format!("{text:?} is posted in {root}"), || {
+            self.mock
+                .posts()
+                .contains(&(in_thread("GENERAL", Some(root)), text.to_owned()))
+        })
+        .await;
+    }
+
+    fn busy_lines(&self, name: &str) -> usize {
+        let line = format!("{name} is busy with other requests. Ask again in a few minutes.");
+        self.mock
+            .posts()
+            .iter()
+            .filter(|(_, text)| *text == line)
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn one_agents_flood_leaves_the_other_owners_agents_their_places() {
+    let stack = start_with(Setup {
+        pipeline: |settings| {
+            settings.max_pending = 4;
+            settings.max_pending_per_owner = 2;
+        },
+        ..Setup::default()
+    })
+    .await;
+    let bob = stack.bob().await;
+    stack.agent_of(bob, "writer", "UWRITER").await;
+    stack.next_turn(Turn::reply("Done."));
+    let held = Gate::closed();
+    stack.holds.confirms_of(stack.agent, &held);
+    for id in ["f1", "f2", "f3", "f4", "f5"] {
+        stack.bob_asks(id, BOT).await;
+    }
+    stack.bob_asks("w1", "UWRITER").await;
+    stack.wait_for_post("w1", "Done.").await;
+    wait_until("the flood's busy lines are posted", || {
+        stack.busy_lines("helper") == 3
+    })
+    .await;
+    wait_until("helper holds its owner's two places", || {
+        held.waiting() == 2
+    })
+    .await;
+    assert_eq!(stack.busy_lines("writer"), 0);
+    held.open();
+    stack.wait_for_post("f1", "Done.").await;
+    stack.wait_for_post("f2", "Done.").await;
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn one_owners_agents_together_leave_the_other_owners_agents_their_places() {
+    let stack = start_with(Setup {
+        pipeline: |settings| {
+            settings.max_pending = 4;
+            settings.max_pending_per_owner = 2;
+        },
+        ..Setup::default()
+    })
+    .await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let scribe = stack.other_agent("scribe", "USCRIBE").await;
+    let bob = stack.bob().await;
+    stack.agent_of(bob, "reader", "UREADER").await;
+    stack.next_turn(Turn::reply("Done."));
+    let held = Gate::closed();
+    for agent in [stack.agent, writer, scribe] {
+        stack.holds.confirms_of(agent, &held);
+    }
+    stack.bob_asks("f1", BOT).await;
+    stack.bob_asks("f2", BOT).await;
+    stack.bob_asks("w1", "UWRITER").await;
+    stack.bob_asks("s1", "USCRIBE").await;
+    stack.bob_asks("r1", "UREADER").await;
+    stack.wait_for_post("r1", "Done.").await;
+    wait_until("the busy lines of alice's other agents are posted", || {
+        stack.busy_lines("writer") == 1 && stack.busy_lines("scribe") == 1
+    })
+    .await;
+    wait_until("alice's first two messages are held", || {
+        held.waiting() == 2
+    })
+    .await;
+    assert_eq!(stack.busy_lines("reader"), 0);
+    held.open();
+    stack.wait_for_post("f1", "Done.").await;
+    stack.wait_for_post("f2", "Done.").await;
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn asking_to_try_again_holds_no_place() {
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.max_pending_per_owner = 1,
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Done."));
+    let held = Gate::closed();
+    stack.holds.posts_of(UNCONFIRMED_TEXT, &held);
+    stack.holds.fail_next_confirm(SurfaceError::RateLimited {
+        retry_after: Duration::from_secs(30),
+    });
+    stack.bob_asks("u1", BOT).await;
+    wait_until("the ask to try again is being posted", || {
+        held.waiting() == 1
+    })
+    .await;
+    stack.bob_asks("u2", BOT).await;
+    stack.wait_for_post("u2", "Done.").await;
+    assert_eq!(stack.busy_lines("helper"), 0);
+    held.open();
+    stack.wait_for_post("u1", UNCONFIRMED_TEXT).await;
     stack.stop().await;
 }
 

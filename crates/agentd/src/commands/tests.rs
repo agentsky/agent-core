@@ -268,7 +268,7 @@ fn serve(
 fn state_of(reply: &str) -> String {
     let at = reply.find("state=").expect("no state in the link") + "state=".len();
     reply[at..]
-        .split(|c: char| c == '&' || c.is_whitespace())
+        .split(|c: char| c == '&' || c == ')' || c == '|' || c == '>' || c.is_whitespace())
         .next()
         .unwrap()
         .to_owned()
@@ -1196,7 +1196,7 @@ async fn agent_commands_without_rocketchat_agents() {
     h.dm("alice", "list").await;
     assert_eq!(
         h.last_reply("alice"),
-        "Agents:\n- `helper` (no bot here), owned by alice"
+        "Agents:\n- `helper` (no bot here), owned by `alice`"
     );
     h.channel("alice", "persona helper").await;
     assert!(

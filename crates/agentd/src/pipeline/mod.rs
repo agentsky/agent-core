@@ -41,8 +41,9 @@ pub use billing::{
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
 pub use message::HISTORY_LIMIT;
 pub use run::{
-    DEFAULT_MAX_PENDING, DEFAULT_QUEUE_PER_THREAD, DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT,
-    FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TIMED_OUT_TEXT, TRUNCATED_NOTE,
+    DEFAULT_MAX_PENDING, DEFAULT_MAX_PENDING_PER_OWNER, DEFAULT_QUEUE_PER_THREAD,
+    DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings,
+    RESTARTING_TEXT, TIMED_OUT_TEXT, TRUNCATED_NOTE, UNCONFIRMED_TEXT,
 };
 pub use surfaces::StoreSurfaces;
 
@@ -163,6 +164,7 @@ impl PipelineSettings {
             models: runner.models.clone(),
             queue_per_thread: DEFAULT_QUEUE_PER_THREAD,
             max_pending: DEFAULT_MAX_PENDING,
+            max_pending_per_owner: DEFAULT_MAX_PENDING_PER_OWNER,
         }
     }
 }

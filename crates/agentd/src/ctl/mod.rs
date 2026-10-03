@@ -59,6 +59,7 @@ pub use outbox::{MAX_ATTACHMENTS, MAX_POSTS, MAX_REACTIONS, Outbox, QueuedPost, 
 pub use store::CtlTurn as Turn;
 pub use token::ProcessToken;
 
+pub(crate) use api::is_invisible;
 use api::{ApiError, Authorized, no_turn};
 
 /// The longest message `agentctl post` accepts, in bytes.

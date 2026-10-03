@@ -360,7 +360,7 @@ fn attachment_name(name: &str) -> Result<String, ApiError> {
 /// bidirectional controls, which can make `exe.txt` read as `txt.exe`,
 /// zero-width and other invisible format characters, tag characters, and the
 /// line and paragraph separators.
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

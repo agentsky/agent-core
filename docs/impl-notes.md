@@ -507,6 +507,13 @@ managed bots. Each now holds that response, acts once the request has
 arrived, then releases it; the command test releases it only after bob's
 reply.
 
+`a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again`
+and `an_install_that_finishes_after_the_agent_was_deleted_is_refused`
+counted on the mocked `apps.manifest.create` answering after 300 ms and
+`oauth.v2.access` after 500 ms, and acted before the answer landed. Each
+now holds that response, acts once the request has arrived, then releases
+it.
+
 ## T05: store
 
 ### The key reaches the store through `open`
@@ -4536,8 +4543,8 @@ placeholder, and the test asserts the read-only root, the transcript at
 `$CLAUDE_CONFIG_DIR/projects/<id>/<id>.jsonl` holding both turns, a
 `--resume` start for the second, and that every request the fake saw came
 through the proxy with the swapped key. On CI the sandbox runs as the test
-process's own uid, which has no entry in the image's `/etc/passwd`;
-locally, as root, it ran as 10001.
+process's own uid, which has no entry in the image's `/etc/passwd`, and the
+CLI ran there all the same; locally, as root, it ran as 10001.
 
 ### The native CLI honors `NO_PROXY`
 
@@ -6175,3 +6182,855 @@ tokens that T08's parser reads. agentd's image build context leaves out
 `include_str!` and parse it with `serde_norway` (MIT OR Apache-2.0, a
 maintained fork of the deprecated `serde_yaml`; with `unsafe-libyaml-norway`,
 MIT, it is a dev-dependency of agentd only).
+
+## T31: Slack agent apps from manifests
+
+Slack's documentation site wasn't reachable, so the API shapes below were
+read from Slack's SDKs: `apps.manifest.create` and `apps.manifest.delete`
+from `slackapi/python-slack-sdk` (`slack_sdk/web/client.py`, whose
+`params` end up in the form body, per `base_client.py`) and
+`slackapi/java-slack-sdk` (`AppsManifestCreateResponse`, `AppCredentials`,
+`MethodsRateLimits`), and `oauth.v2.access` from the same two
+(`OAuthV2AccessResponse`, and the Python client's Basic authentication).
+None of it has run against real Slack yet.
+
+### What the app calls send
+
+**Issue.** The plan names the methods but not how they authenticate or what
+they return.
+
+**Solution.** `SlackClient::create_app` and `delete_app` send a form, the
+manifest as a JSON string in `manifest`, with the member's configuration
+token only in `Authorization: Bearer`. `create_app` returns the `app_id`
+and the `credentials` object's `client_id`, `client_secret` and
+`signing_secret` (the legacy `verification_token` is ignored), with both
+secrets as `SecretString`. An `ok: true` answer that names an app but can't
+be read in full has the app deleted again with the same token, since
+nothing could use it. `install_app` (`oauth.v2.access`) sends `code`
+and `redirect_uri` in the form and the app's `client_id:client_secret` in
+`Authorization: Basic`, as the Python SDK does, never in the body; it
+refuses an answer whose `token_type` isn't `bot` or that lacks the token or
+the bot user, and returns the granted scopes from its comma-separated
+`scope`. `WebApi` now holds an `Auth` (none, bearer or basic) instead
+of an optional bearer token. The Java SDK tags both manifest methods Tier 1
+and `oauth.v2.access` Tier 4. `apps.manifest.delete` answers
+`app_not_found` or `invalid_app_id` for an app that is already gone; for
+that method both are `NotFound`, which counts as deleted.
+
+Slack explains an `invalid_manifest` in an `errors` list of `message` and
+`pointer` entries. Any failure that carries one has at most five entries,
+each cut to 200 printable ASCII characters without backticks or angle
+brackets, logged as a warning. An HTTP 5xx from Slack, on any call, is now
+`SurfaceError::Transport`, which callers retry or report as "try again",
+rather than `Api`, which read as Slack refusing the request.
+
+### The install link's `state` is sealed, and used once through the binding
+
+**Issue.** The plan asks for a signed `state` naming the binding, and for a
+forged or replayed one to be refused, without saying with which key or how
+a replay is noticed.
+
+**Solution.** `Store::install_state` is `<binding id>.<base64url>`, where the
+second part is a constant sealed with the master key (ChaCha20-Poly1305)
+with the binding id in the associated data, so it can't be made without the
+key or moved to another binding. The store already owns the key, so there
+is no new key material. A replay is refused by the binding's state: the
+callback acts only on a `pending_install` binding and makes it `active`,
+conditionally, so a second callback, or two at once, installs once (409).
+The answer of `oauth.v2.access` must also name the binding's app and the
+workspace agentd serves. The state doesn't expire: the link stays good for
+as long as the app waits, which an approval can make days. Anyone in the
+workspace who has the link can complete the install, which gives agentd the
+same bot token the owner's click would; the owner is told either way. The
+installer (`authed_user`) isn't compared with the owner, since an admin may
+install the app after approving it.
+
+The link is posted as a Markdown link, `[Install <name>](<url>)`, which the
+renderer turns into `<url|Install name>`, and `state` is its first query
+parameter, with `redirect_uri` last. A bare link ending in `state` broke
+about once in 64 installs: base64url ends in `_` or `-` that often, and the
+renderer trims trailing punctuation off a bare URL, as qm-core does. The
+link now ends in the letters of `/slack/oauth/callback`.
+
+### The install link asks for the scopes and redirect URL the app was made with
+
+**Issue.** `[slack] public_posting` adds `chat:write.public` to new apps. A
+reminder built from the current configuration would ask for a scope the
+app's manifest lacks once the switch changed; likewise a changed
+`[slack] public_url` would break every pending install, since the redirect
+URL must be one the manifest names.
+
+**Solution.** A migration (`20260930230000`, after T26's two) adds
+`agent_bindings.app_scopes` and `app_redirect_url`, the scopes and redirect
+URL the manifest asked for, stored when the app is. Every link for the app
+(the first and the reminder) asks for exactly those, and the callback's
+`oauth.v2.access` repeats that redirect URL. The callback also refuses an
+install whose granted scopes aren't all among `app_scopes`, storing
+nothing. `public_url` is thus baked into each app at creation, which the
+configuration example and the README say.
+
+### A creation that stops halfway
+
+**Issue.** Creating an agent app is a store write, a call to Slack, then
+another store write; any of them can fail, or agentd can die in between.
+
+**Solution.** As on Rocket.Chat (T14), the agent and its `creating` binding
+are stored first, which reserves the name and lets the ingress answer
+Slack's challenge. If `apps.manifest.create` fails, the creation is
+abandoned: the binding is disabled and the agent deleted, which frees the
+name, rather than deleting the rows. If the app was created but can't be
+stored, because the store failed or the creation was abandoned meanwhile
+(`/agent delete`, or the sweeper), the app is deleted again with the same
+token. One `apps.manifest.*` request may take `MANIFEST_TIMEOUT` (2
+minutes, where other calls get 30 seconds), since Slack sends the challenge
+while it runs; the whole call, rate-limit waits included, gets
+`APP_CALL_TIMEOUT` (3 minutes), well within `CREATION_LEASE` (10 minutes),
+after which a new Slack sweeper abandons a `creating` Slack binding.
+
+Two cases leave an app at Slack that agentd doesn't know: a crash after
+Slack created the app and before it was stored, and a request that timed out
+while Slack went on to create the app. Both are listed under the member's
+apps at api.slack.com, and a retry of `/agent create` makes another app
+([Deferred work](tasks-plan.md#deferred-work)).
+
+### Deleting a Slack agent keeps its binding row
+
+**Issue.** The plan says `/agent delete` deletes the binding. T23's router
+recognizes every bot user agentd ever made through the bindings
+(`Store::agent_of_bot_user`), so deleting the row would make the deleted
+agent's old posts look like a stranger's.
+
+**Solution.** `delete_agent` disables the binding, as for Rocket.Chat, and
+now also forgets its Slack client and signing secrets with its bot token,
+so the ingress no longer knows it (404). Then `apps.manifest.delete` runs
+with the owner's configuration token, and the binding is marked retired.
+Without a token that works (none, refused or expired), the app is left at
+Slack and the owner is told to delete it at
+`https://api.slack.com/apps/<app id>`; nothing retries it later
+([Deferred work](tasks-plan.md#deferred-work)). A token Slack refuses is
+marked broken, which also tells its owner to register a new one, as the
+rotator does; so does one `apps.manifest.create` refuses.
+
+Once `delete_agent` committed, nothing may fail the reply, or the owner
+would lose the app id with nothing left to retry. The bindings are read
+before the agent is deleted, and every later store error or Slack failure
+is logged per binding and reported as `AppDeletion::Failed` with the app id
+(when the store could read it), so the reply always says which app to
+delete by hand. The bot token isn't revoked with `auth.revoke` first:
+`apps.manifest.delete` revokes it with the app, and without a configuration
+token the owner, who holds that token anyway, is told to delete the app.
+
+### Agents' messages reach the pipeline built after the queue
+
+**Issue.** `Routers::new` builds the Slack queue and its `slack::Inbound`
+sink, but the pipeline is built later, from `Turns` (which needs the bound
+listeners), and handed to `Server::with_pipeline`.
+
+**Solution.** `Inbound` sends agents' messages to `slack::Messages`, which
+`Routers` holds and `Server::with_pipeline` connects to the pipeline's sink
+(with Slack's `Caps`, so `per_binding_delivery` makes the receiving
+binding's agent the one candidate). Until then, and in an agentd without
+`[sandbox]`, they are dropped with a debug line.
+
+The Slack queue handles the manager's commands too, one request at a time,
+so `Inbound` hands an agent's message to `Messages` without waiting. A
+worker of its own, among the routers' workers, runs a lane for each binding
+that has messages waiting: the lane looks the binding up, fills in a bot
+sender with the binding's `SlackSurface::fill_bot_sender` (`bots.info`),
+and hands the message to the pipeline, one message at a time in the order
+they came, which keeps each thread's messages in order for the pipeline's
+lanes. A message to a binding that isn't active (still waiting for its
+install, or deleted) is dropped. The command intake likewise runs apart
+from the queue. How many messages may wait is the ingress's business (see
+"One agent's traffic denies no other agent service" below), so `Messages`
+has no bound or drop of its own.
+
+### One workspace for agent apps too
+
+**Issue.** T30 serves the manager's workspace only. An agent binding's URL
+is reachable from anywhere, and apps can be installed in other workspaces
+when someone has the link.
+
+**Solution.** `StoreSigningSecrets` knows an agent binding only in the
+manager's workspace, `Inbound` drops a request to any binding whose
+workspace isn't the manager's (the check T30 made for the manager), and the
+OAuth callback refuses an install whose `team` isn't it, storing nothing.
+
+### When a binding's first reply reads the member list
+
+**Issue.** The plan has agentd await `refresh_members` when a binding
+starts. The Slack queue handles requests one at a time, and a large
+workspace's `users.list` can take minutes (T29).
+
+**Solution.** `SlackBots` builds each binding's surface once, and nothing
+waits for the member list. Every binding shares the workspace's one
+`TeamDirectory`, so there is nothing to track per binding: each lookup of a
+surface calls `SlackSurface::refresh_in_background`, which starts
+`users.list` when the directory has no list or a stale one and no read is
+running. A turn's reply renders with what the directory has then; the read
+starts when the lane looks the surface up, before the turn, which takes
+longer than `users.list` in all but the largest workspaces, so the first
+reply after a restart normally resolves names. The busy line, which the
+pipeline posts in a task of its own, and the refusals never wait for it.
+`StoreSurfaces` takes Slack surfaces from `SlackBots`, each with its
+binding's bot user, and still gives the directory the workspace's agents' bot
+users on every lookup (`Store::active_bot_users`, which reads no token),
+which also picks up agents another instance installed; an install and a
+deletion do it too.
+
+Whichever binding's lookup or render starts it, `users.list` is read with
+the manager app's token (`SlackSurface::with_members_api`, which
+`SlackBots` gives every agent's surface), never the agent's. The read
+holds the directory's one refresh lock, and a failure sets the shared
+retry wait and, before the first list, the error every caller gets; an
+agent's owner holds its token and could revoke it or use up its Tier 2
+quota, and so keep the list stale, or missing, for every agent. The
+operators hold the manager's token.
+
+### Owners can forge their agents' events
+
+**Issue.** An agent's app is created with its owner's configuration token,
+so the owner can read the app's signing secret at api.slack.com and sign a
+`message` event with any content. The signature proves only that the event
+came from someone holding the secret. A first fix read the message back and
+compared its `ts`, sender and text, but the router decides on more than
+that, so an owner could still bill any member V for a message V posted
+where the bot can read it: add a `blocks` mention of the bot (V's real
+message, unaddressed, was dropped at ingress before deduplication, so
+nothing stopped the copy); claim `channel_type: im`; send the copy to a
+second agent of theirs, which never deduplicated it; take another agent's
+real post and add a mention, inheriting its recorded requester; attach
+files; or point `thread_ts` at an agent's reply, since
+`conversations.replies` with a reply's `ts` returns the whole thread.
+
+**Solution.** Slack's copy is the source of truth, not the event.
+`Surface::confirm` returns the platform's own copy of the message as an
+`InboundEvent`, or `None`. `SlackSurface::confirm` reads it back with the
+binding's bot token (`conversations.history` with `oldest` and `latest` at
+its `ts`, `inclusive`, or `conversations.replies` in the thread the event
+named), gets the conversation's kind from `conversations.info` (`is_im`,
+`is_mpim`, else a channel; an id's prefix can't tell a group DM or a
+private channel from a public one), and normalizes the raw message with
+`normalize::read_back`, the same code the ingress runs on events: subtypes,
+sender, mentions from `text` and `blocks`, `thread_ts`, files and the
+addressing rule, with the binding's bot user, which `SlackSurface` now
+carries. Only the binding, event id and arrival time come from the event.
+A bot known by its bot id is named by `bots.info` as at ingress.
+Rocket.Chat returns the event itself: its messages come over agentd's own
+realtime login.
+
+All of it happens in one place, `Pipeline::candidate`. It routes the
+candidate's message once as it arrived. An ignore ends there. Anything
+else, whoever the event names as its sender, waits for the copy. The copy
+must have the event's conversation and `ts`, and be in the thread the
+event's lane is for, which keeps each lane to one thread. Unless it equals
+the event, as Rocket.Chat's always does, it is routed again with a view of
+the store loaded for it, and the message is acted on only if that decision
+is the one the event got, and then on the copy: its text and files are
+what the turn sees. Anything else, a copy Slack doesn't have, one the
+ingress wouldn't keep, one in another thread, or one that routes
+differently (no longer addressed, another requester, another scope), is
+dropped with a warning and no word to the thread. So the forged payload's
+sender, conversation kind, thread, mentions and files decide nothing.
+Confirming comes before link prompts and refusals too, so a made-up
+message can't make the manager DM anyone or the agent post refusals.
+
+A first version skipped the copy for what it judged only the owner could
+gain from: a turn the owner asked for and paid for, a link prompt to the
+owner, a refusal of the owner's own message. But that judgement was made
+on the forged event, so the owner's turn then ran on the forged
+conversation and thread, where other members' sessions live. Signing an
+event from themselves with `thread_ts` at member V's thread root and a
+mention resumed V's started channel session, its Claude transcript and
+scope volume, and replied in V's thread. Claiming V's DM channel with
+`channel_type: im` ran on the owner's `Private` scope there, so the lookup
+reset V's DM session and replaced it with the owner's, and the owner's
+turn saw V's DM history; a forged `channel_type: mpim` reset V's
+thread session the same way. An unlinked owner could flood forged
+messages that each made the shared manager bot open a DM and post a link
+prompt, and an owner could claim the requester of an agent's recorded hop
+was themselves. Confirming everything but an ignore closes all of them,
+for one Tier 3 read on the owner's own bot token per message of theirs.
+
+The router's rule that only the owner's own message in a one-to-one DM
+with the agent runs on `Private` needs no extra check that the DM is the
+owner's: with every decision confirmed, the conversation's kind comes from
+`conversations.info` and the sender from Slack's copy, and an `im` the
+agent's bot token can read is the bot's DM with one member, so a message
+the owner sent there is in the owner's DM with the agent.
+
+`TeamDirectory::conv_kind` also requires the `channel.id`
+`conversations.info` answers with to be the event's channel exactly, and
+refuses it otherwise (`SurfaceError::NotFound`, dropped without a word),
+so a channel id spelled another way can't give V's message a second
+deduplication key. An Enterprise Grid migration, if Slack then answered
+for a channel with an id other than the one its events carry, would make
+the check drop that channel's messages without a word until the two agree;
+this fails closed, and hasn't been seen against real Slack.
+
+The confirmation window, `CONFIRM_WINDOW` (15 minutes), refuses without a
+lookup a message whose `ts` is older than that when its event arrived.
+Slack retries a failed delivery three times, the last about five minutes
+after the first, so a real event is always well inside it. Deduplication
+keeps a message for an hour, and a message older than the bot's
+membership never had one, so without the window either could be replayed.
+The ingress now applies the window too, before it records anything (see
+"What one owner can make agentd keep").
+
+A lookup that fails without saying anything about the message (a Slack
+5xx or an unreachable Slack, `SurfaceError::Transport`, or a rate limit,
+`SurfaceError::RateLimited`) drops the message and tells the thread
+"Sorry, I couldn't check this message. Try again in a moment."
+(`UNCONFIRMED_TEXT`, worded for any surface, since the pipeline is), so a
+real member isn't left without an answer. A refusal that is about the
+message, such as `channel_not_found`, `thread_not_found` or
+`not_in_channel` for a made-up conversation or thread, stays silent like
+a mismatch.
+
+The copy is read when the lane reaches the message, which may be minutes
+after it arrived. An edit in between runs the turn once on the text as it
+is then: the `message_changed` event is dropped at ingress, as before, and
+the message's first event holds its place in the lane. A message deleted
+meanwhile is gone from Slack, or a `tombstone`, and is dropped. A bot's
+post that was edited isn't confirmed at all (`Skip::EditedByBot`, in the
+normalization the ingress shares, where no plain event has `edited`):
+agentd never edits its
+agents' posts, so the edit came from someone else holding the bot's token,
+such as the owner, who holds their agents' tokens and could otherwise edit
+a mention into another agent's recorded post and inherit its requester.
+That Slack marks a bot's `chat.update` with `edited` is read from the
+SDKs' message shape, like the rest, and not yet seen against real Slack.
+
+Forged events must not starve other agents while they wait for the copy,
+since the lookups use the owner's own token, whose quota the owner can use
+up at no cost:
+
+- `SlackSurface::confirm` makes its lookups with
+  `WebApi::without_waiting`: past the tier's quota in the client's limiter,
+  or while a 429 holds the bucket, a call fails at once with
+  `SurfaceError::RateLimited` without being sent, and a 429 is not
+  retried. Before, a lane waited out the quota, and a 429 up to three
+  times a minute, while its message held one of the pipeline's
+  `max_pending` places. Now it gets the "try again" line at once, posted
+  apart from the lane (below).
+- A message also takes one of its agent's owner's `max_pending_per_owner`
+  places (`DEFAULT_MAX_PENDING_PER_OWNER`, 16) besides one of the 64 shared
+  `max_pending`. Before, about 50 forged addressed events a minute to one
+  agent, spread over its threads, kept all 64 taken while they waited in
+  the owner token's Tier 3 queue, and every other agent answered only with
+  the busy line. A first fix gave each agent 16 places, but an owner with
+  four agents still held all 64. Now one owner's agents together hold at
+  most 16, and a message past its owner's places gets the busy line like
+  one past the others.
+- Notices, the busy line and the "try again" line, are posted in a task of
+  their own, which holds none of the message's places, at most
+  `MAX_NOTICES` (8) at once for one owner's agents; one more is dropped.
+  The "try again" line used to be posted in the lane, through the waiting
+  `chat.postMessage` client (a message a second per channel), so once the
+  owner had used up the history quota, every forged event held its place
+  for as long as that post waited. The post itself still waits for the
+  quota; making it fail fast would need a way for the pipeline to post
+  without waiting on every surface, and with the task holding no place
+  and eight at most per owner, waiting costs no other agent anything.
+- `SlackSurface::fill_bot_sender` looks the bot up without waiting too.
+  Events with a made-up `bot_id` and no `user` each miss the cache and
+  call `bots.info` (Tier 3) on the owner's token; past the quota the event
+  goes on as it came, from a bot known only by its bot id, which the router
+  ignores as an unmanaged bot. Within the quota each call is real and may
+  take a while; it runs in its binding's lane in `slack::Messages`, so it
+  holds up only that binding's messages. It used to run in one worker for
+  every agent's messages: 50 forged events with a 300 ms `bots.info`
+  delayed another agent's real message by 15 seconds.
+
+Costs and limits:
+
+- One `conversations.history` or `conversations.replies` call per message
+  that isn't ignored, the owner's included, and one `conversations.info`
+  per channel per `CONV_KIND_TTL` (an hour), cached in the workspace's
+  `TeamDirectory` for every binding. All three are Tier 3 (about 50 a
+  minute per app), and so is the thread's `conversations.replies` that
+  `message::build` reads for a turn in a thread, from the same bucket. So
+  an agent answers about 50 top-level messages a minute, but only about 25
+  in threads, which cost two reads each. Past that, the thread gets the
+  "try again" line at once, so an agent that really is asked more than
+  that tells some of them to ask again. Agent apps need
+  `channels:read`, `groups:read`, `im:read` and `mpim:read` for
+  `conversations.info`, so the manifest asks for them beyond the plan's
+  list. Slack lowered the history limits in 2025 for commercially
+  distributed apps outside the Marketplace; agent apps are internal apps of
+  their own workspace, which that change doesn't cover, but the live check
+  should confirm the lookups aren't throttled.
+- A group DM converted to a private channel keeps its cached kind for up
+  to `CONV_KIND_TTL`, so its turns run on the group DM's scope for up to
+  an hour after the conversion. It is the same conversation and the same
+  members, so no one else's scope is reached.
+- The event and the copy are routed with two separate reads of the store.
+  A change in between (a link, a pause, a rule) makes the two decisions
+  differ, and the message is dropped without a word, as a mismatch is.
+- A real, addressed message that Slack never delivered (posted in a public
+  channel before the bot joined, or during an outage past Slack's retries)
+  can be delivered by the owner within the window. So can an edit that
+  added a mention to a message that had none, since the ingress drops
+  `message_changed` and the edited message was never delivered as
+  addressed. Either runs as its sender asked, on their account, with its
+  text as Slack has it.
+- A lookup failure can't tell a real message from a forged one, so an
+  owner who exhausts the app's rate limit can make the agent post the
+  "try again" line in threads it can post in, at `chat.postMessage`'s pace
+  and at most eight at once for the owner's agents. No turn runs and no one
+  is billed.
+- The owner holds the bot token, which reads every conversation the bot
+  is in, other members' DMs with the agent included. Confirming doesn't
+  hide those from the owner; what it guarantees is that no forged event
+  runs a turn in another member's session, resets it, reaches their scope
+  volume or bills them.
+- The manager app isn't involved: its secret is the operators', and it
+  starts no turns.
+- Deduplication records a message's `<channel>:<ts>` at the ingress,
+  before it is confirmed. A forged event carrying member V's real channel
+  and `ts` that arrives before Slack's own delivery of V's message takes
+  its place, and Slack's is dropped as a duplicate; the forged one is then
+  confirmed and runs as V asked, with V's text, or is dropped if it routes
+  differently from Slack's copy, and V's message goes unanswered.
+  Deduplication is per binding, so this reaches only the owner's own
+  agent, never another agent's delivery of the same message.
+- `TeamDirectory` remembers which bot ids have no bot user apart from
+  those that have one, each set bounded at 10,000 ids shaped like Slack's.
+  Made-up bot ids are remembered as having none, so they only churn that
+  set, never pushing out a real bot's user, which would cost other agents'
+  `bots.info` calls.
+
+The busy line, which a message past the queue bounds gets without being
+confirmed, is posted in a task of its own, among the pipeline's tasks so a
+shutdown drains it, and so is the "try again" line; the messages still
+reach their lanes in the order they came. `Pipeline::handle` still waits
+for both: a message's `done` is shared with the notices it starts. A
+message past the bounds while its owner's agents have `MAX_NOTICES` being
+posted gets none, which also caps what forged events can make the agents
+say this way.
+
+### One agent's traffic denies no other agent service
+
+**Issue.** Confirming stops forged events from billing, resuming or
+prompting anyone, but an owner can still sign as many events as they like
+for each of their agents (up to 10), and a review found shared places
+they could take from every other agent. Probed end to end: 3,000
+concurrent signed events to one agent got 1,829 answers of 503, and
+another agent's real message got 503 too and was never answered. The
+ingress had one queue of 1,024 for every binding, the manager's included,
+drained by one worker writing a deduplication row per event, and behind
+it `slack::Messages` had one queue of 256, dropping silently after Slack
+had its 200, and one worker; see also the `bots.info` and pipeline notes
+above.
+
+**Solution.** Each bound is on the unit an attacker controls:
+
+- The ingress counts each binding's requests in flight, from the ack
+  until they are handed on, in one place (`ingress::Places`). An agent's
+  app may have `MAX_IN_FLIGHT_PER_AGENT` (32), agents' apps together
+  `QUEUE_CAPACITY` (1,024), and the manager app `QUEUE_CAPACITY` of its
+  own. The place is taken before the request is queued, so before its
+  deduplication write, and a request past its binding's gets 503, which
+  Slack retries, so nothing is dropped after Slack was told it arrived.
+  The queue behind is unbounded, since the places bound it. A message
+  keeps its place (`InFlight`, in `SlackInbound::Message`) through
+  `slack::Messages` until its lane hands it to the pipeline; any other
+  request gives it back once the queue has handed it on. The queue still
+  handles requests one at a time, so the manager's may wait behind up to
+  1,024 of agents', each one store write.
+- `slack::Messages` runs a lane for each binding, so what holds one up
+  (`bots.info`, the store) holds up that binding's messages only, which
+  its places bound.
+- The pipeline's shares are per owner, and notices hold no place (above).
+- `core_types::MAX_MENTIONS` (100): each surface keeps an event's first 100
+  different mentions. The router's view looks each one up in the store,
+  and a signed body of up to a megabyte held 60,000 of them, 11 seconds of
+  lookups in one lane. Slack's 40,000-character limit allows about 3,000
+  mention tokens, so a real message mentioning the bot after 100 others
+  isn't addressed to it; Rocket.Chat's are capped the same way.
+- Places bound concurrency, not rate: a review signed 100 events with a
+  900 KB `event_id` each in 1.6 seconds, which grew the shared SQLite file
+  by 184 MB, kept for the seven days deduplication remembers a key, and
+  each took about 16 ms of the one queue worker the manager's requests
+  wait behind. Now the ids a key is made of must be shaped like Slack's,
+  or the body gets 400 before the ack and writes nothing: `event_id` is
+  `Ev` and 1 to 32 uppercase letters or digits, `team_id` `T` or `E` and
+  1 to 20, a `message` event's `channel` `C`, `D` or `G` and 1 to 20, and
+  its `ts` and `thread_ts` 10 digits, a dot and 6 digits. Every fixture,
+  taken from Slack's SDK test suites, fits, and so do the ids in Slack's
+  documentation. Only a message's `channel` is checked: other events'
+  `channel` can be an object, and isn't a key. The manager app's requests
+  are checked the same way, which costs it nothing. A signed slash command
+  or interaction is keyed by its signature, whose shape verification
+  already fixes.
+- Each agent's app also has a token bucket (`ingress::Places`, beside its
+  count): `AGENT_BURST` (100) requests at once, refilled at
+  `AGENT_REQUESTS_PER_SECOND` (8), about Slack's own ceiling of 30,000
+  events an hour for one app. Past it, 503, before the deduplication
+  write; a request refused for its places takes no token. The bucket is in
+  memory, since a restart only gives each app one more burst; the manager
+  app has none. One owner's agents' apps together have a second bucket of
+  twice that (see "What one owner can make agentd keep").
+- One owner's agents' apps together have `MAX_IN_FLIGHT_PER_OWNER` (64)
+  places, twice one app's, rather than 32 for each of up to
+  `agents.max_per_owner` agents: with its default of 10, one owner held
+  320 of the 1,024, and with 32 agents all of them. `slack_app_keys`
+  returns the binding's owner with its secret, joined from `agents`, for
+  the ingress to count by.
+- The queue holds each request's body as it arrived (`Bytes`, at most a
+  megabyte), not the parsed event: a `serde_json::Map` of a megabyte of
+  `[0,0,…]` took 16 to 32 MB, about 5 to 10 GB for one owner's 320 places
+  then. The handler still verifies the raw body, and parses only what it
+  checks (the envelope's type and ids, and a message's ids, skipping the
+  rest), then `Queue::run` parses the body again. Slash commands and
+  interactions are queued the same way.
+- The warnings a flood causes are logged at most once a minute for each
+  binding or agent, the next one saying how many went quiet
+  (`core_types::Throttle`, which the ingress's refusals moved to, now kept
+  per binding too, so one app's flood hides no other's refusals): the
+  ingress's 400s and `app_rate_limited` notices, the pipeline's "too many
+  messages waiting" and "too many notices being posted", and the lanes'
+  "couldn't look a bot sender up". The next section adds the rest.
+- The pipeline reaps finished tasks when it spawns a notice, as it does
+  when it spawns a lane; a flood of notices on an otherwise quiet
+  pipeline kept every finished one until the next lane. A lane in
+  `slack::Messages` checks whether the pipeline has closed
+  (`Sink::is_closed`) before it looks the binding up or calls
+  `bots.info`.
+- The attribution wait (`ATTRIBUTION_WAIT`, 2 seconds) for a message
+  claiming to be from another agent's bot and mentioning this one is taken
+  on the event as it arrived, before confirming, so a forged event holds
+  its place for up to 2 seconds for free. Its place is one of its owner's,
+  so that stalls only their own agents.
+
+Several owners flooding together could still take what other agents need:
+four owners the pipeline's 64 places, 16 the ingress's 1,024. The queue
+worker is still one, so the manager's requests may wait behind up to 1,024
+of agents', each now one small store write.
+End-to-end tests hold each bound with a gate or a held Slack call, not a
+sleep: an agent's flood past its 32 places is refused while another
+agent's message is answered; another agent is answered while a
+`bots.info` of the first is held; one owner's three agents together leave
+another owner's agent its place; and a message whose "try again" line is
+held leaves its place to the next. Each of these failed before the
+change. So did the ingress tests that an id not shaped like Slack's
+(among them 900 KB ones) gets 400 with nothing recorded, and that an
+agent's burst past its bucket gets 503 while another agent's app and the
+manager's are answered.
+
+### What one owner can make agentd keep
+
+**Issue.** A sixth review found no way past the places, buckets or shapes,
+but found what one owner could still make agentd hold in memory, in its
+logs and on disk. A signed DM with no `user` and a 900 KB `bot_id` got 200:
+`fill_bot_sender` called `bots.info` with it on the agent's token, and a
+`bot_not_found` was cached in the workspace's shared set of bots without a
+user, 10,000 ids but no bound in bytes, about 10 GB. `files` had no bound:
+a 999 KB DM with 34,000 files became a 9.9 MB `InboundEvent`, and one
+owner's apps may have 64 in flight. A body that passed the handler's
+`IgnoredAny` check but not the queue's full parse (`"\ud800"`, `1e400`,
+deep nesting) logged an unthrottled warning, and so did the pipeline's
+warnings a forged message reaches when confirmed, Slack's retry header
+(which isn't signed) at info, and a failed notice. Agents' apps' other
+events, commands and interactions, which agentd drops, still wrote a
+deduplication row each, and every row was kept seven days, 8 a second for
+each of an owner's agents. The unsigned challenge probe parsed a
+`challenge` of any JSON, so a megabyte of `[0,0,…]` took 16 to 32 MB before
+verification.
+
+**Solution.** One place bounds what is kept, and the ingress refuses what
+it would refuse, before the ack:
+
+- `normalize` holds every shape check (`is_user_id`, `is_bot_id`,
+  `is_file_id`, `is_channel_id`, `is_team_id`, `is_event_id`, `is_ts`),
+  each at most 20 characters after its prefix (32 for an `event_id`), and
+  the ingress's pre-parse uses them. A message whose `channel`, `ts`,
+  `thread_ts`, `user` or `bot_id` isn't shaped like Slack's is
+  `Skip::Malformed`, whether it came as an event or was read back; the
+  ingress answers such an event with 400 before the ack. Mentions are
+  `U…`/`W…` ids of at most 21 characters, from `text` and `blocks` alike.
+- A kept message is cut to Slack's limits: `text` to its first 40,000
+  characters (`MAX_TEXT_CHARS`), files to the first 10 the bot can
+  download (`MAX_FILES`), each with an `F…` id, a URL of at most 4 KB, a
+  name cut to 255 characters and a MIME type of at most 255 bytes, and
+  mentions to 100 as before. So an `InboundEvent` is at most about 220 KB,
+  whatever the body held, and the 64 an owner's apps may have in flight
+  at most about 14 MB. Files in history read back are cut the same way.
+  An ignored subtype is carried, and logged, cut to 64 bytes.
+- `TeamDirectory::bot_user` answers `None` for an id not shaped like a
+  bot id, without calling `bots.info` or caching it, however it is
+  reached (`fill_bot_sender`, `confirm` and history), so its caches hold
+  only short ids.
+- The ingress acknowledges and drops, without a deduplication row or a
+  place, what an agent's app doesn't need: its events other than
+  messages, its slash commands, its interactions, and a message whose
+  `ts` is more than `CONFIRM_WINDOW` before it arrived, which `confirm`
+  refuses anyway (`surface::within_window`, shared by both). The manager
+  app's requests are handled as before.
+- Slack's deduplication keys are kept an hour (`DEDUP_RETENTION`), not
+  seven days: longer than Slack retries (about five minutes), than a
+  signature is accepted (five minutes) and than the confirmation window
+  (15 minutes), so a replay after it expires is refused by the window for
+  an agent and by the signature for the manager. `processed_events` gains
+  an `expires_at` column, set from the retention each caller passes to
+  `mark_event_processed`, which the sweeper deletes by; Rocket.Chat keeps
+  its week (`PROCESSED_EVENT_RETENTION`). The column, its backfill for
+  existing rows and its index replacing `seen_at`'s are in T31's own
+  migration.
+- One owner's agents' apps together have a token bucket too, `OWNER_BURST`
+  (200) then `OWNER_REQUESTS_PER_SECOND` (16), twice one app's like their
+  places. So one owner adds at most 16 rows a second, each a few dozen
+  bytes and kept an hour: about 60,000 rows, some 15 MB with the indexes,
+  where before one owner's ten agents could add 80 a second for a week.
+  A bucket that is full while its app or owner has nothing in flight is
+  forgotten, being the same as none. The owner is no longer optional for
+  an agent's seat: an agent's app whose lookup names no owner (the store
+  always names one) gets 503 rather than be counted apart.
+- Every log line the ingress writes for what a forger can repeat goes
+  through one per-binding throttle, keyed by kind: refusals, including
+  400s for a malformed signed body, which take no token since they write
+  nothing; `app_rate_limited`; answered challenges, now counted per
+  binding rather than all together; Slack's retry headers; and a queued
+  body that no longer parses, which only a signed, crafted body can be.
+  The pipeline's warnings for a message confirming dropped or couldn't
+  check (older than the window, not at Slack, routing differently,
+  refused, or Slack unreachable) share a new `Flood::Unconfirmed` kind, and
+  a notice that fails to post shares `Flood::Notice`; `confirm`'s own line
+  for a message older than the window is at debug level.
+- The challenge probe reads `type` and `challenge` as strings only
+  (`Cow<str>`), in two parses that skip everything else, so a non-string
+  challenge is refused as malformed without being built, and the
+  interactivity check reads the payload with `IgnoredAny` once it starts
+  with `{`, allocating no keys.
+- The pipeline reaps finished tasks through one helper that logs a task
+  that panicked, as `drain` does, where it used to drop the error.
+
+The ingress's burst test still runs on the clock, with bounds that allow
+for the refill while it runs; the buckets' own tests take the time as an
+argument, and one checks an owner's bucket at a fixed time.
+
+### Real traffic meets no refusal of its own
+
+**Issue.** Slack turns off an app's event subscriptions when its request
+URL keeps failing, so a 400 or 503 for a real delivery costs far more than
+a 200 that drops it: only forged bodies should meet a refusal the ingress
+adds. A seventh review found three that real traffic could meet:
+
+- The owner's bucket (`OWNER_BURST`, `OWNER_REQUESTS_PER_SECOND`) was
+  charged at admission, for every request. Each agent's app gets every
+  message in every channel it is in, so ten agents in busy channels at 1.6
+  messages a second each make 16 deliveries a second; past the burst of
+  200, a real mention got 503, and so did Slack's retries of it, and it
+  was lost. Yet the bucket exists to bound deduplication rows, and only a
+  kept message writes one. A new test, one owner's ten agents taking 40
+  unaddressed channel messages each and then a mention, got 503 at round
+  20 of 40 before the change.
+- The ingress refused with 400 a message whose `user` or `bot_id` wasn't
+  shaped like Slack's, the manager app's included. That bounded nothing,
+  since `normalize` drops such a message as `Skip::Malformed` before any
+  row, cache or lookup, and Slack says its ids "could grow longer in the
+  future", so a longer real id would have turned the app off. The ids that
+  make up a deduplication key had the same risk, at 20 characters after
+  the prefix (32 for an `event_id`).
+- A message to an agent's app older than the confirmation window was
+  dropped with a debug line. While agentd's clock runs more than 15
+  minutes fast, or Slack delivers a backlog late, every message is, and
+  nothing said so.
+
+**Solution.**
+
+- The owner's bucket is charged where the row is written: in
+  `process_event`, once `normalize` has kept a message and before its
+  deduplication write (`InFlight::keep`, which knows the place's owner).
+  A message past it is dropped after its 200, with no row, and a warning
+  once a minute per binding (`Note::OwnerRate`). Admission keeps only each
+  app's own bucket: Slack itself delivers at most 30,000 events an hour to
+  one app, about 8.3 a second, and that bucket allows a burst of 100 then
+  8 a second, so real traffic to one app meets it only in a burst of more
+  than 100 events within a few seconds, which Slack's retries then
+  deliver; moving it too would leave a forger's flood bound only by
+  places, each request costing an HMAC and a parse before the ack. One
+  owner's agents' apps together can now take `AGENT_REQUESTS_PER_SECOND`
+  for each agent at admission, all of it CPU, since unaddressed messages
+  write nothing and their places are given back as soon as the queue
+  reaches them.
+- The ingress no longer checks a message's sender, and `MessageIds` no
+  longer reads it; `normalize` drops one not shaped like Slack's after the
+  200. The shapes that make up a key, and `normalize`'s, allow up to 64
+  uppercase letters or digits after the prefix (`normalize::MAX_ID_TAIL`,
+  now for `event_id` too), and a `ts` of 10 to 20 digits, the first not a
+  zero, a dot and 6 digits, so a message still has one spelling: a key is
+  at most about a hundred bytes, and a mention at most 65. Rows are about
+  twice as large as the 20-character bound allowed, so one owner's hour of
+  rows is about 20 MB rather than 15.
+- A message dropped for its age goes through the ingress's throttle as
+  `Note::Stale`: a warning once a minute per binding, counting those
+  dropped since, that asks whether agentd's clock is right. `confirm`'s
+  own check stays at debug: an event reaches it only through the ingress,
+  which has applied the same check to the same `ts` and arrival time.
+- `text` is cut to 160,000 bytes (`MAX_TEXT_BYTES`) at a character
+  boundary rather than to 40,000 characters. Slack sends text escaped, `&`
+  as `&amp;`, so a character cap cut real messages of mostly `&` or `<` to
+  a fifth of their length, while the byte cap is the same bound on memory.
+  A mention past the cut is still read from `blocks`, where Slack's
+  clients put each one too.
+- `SigningSecrets` has a method for each kind of binding, `manager` and
+  `agent`, and an agent's app (`AgentApp`) always carries its owner, so
+  the seat of a request follows from the lookup and `Busy::Ownerless`,
+  which guarded a case the store never produced, is gone.
+- The test that a full bucket with nothing in flight is forgotten gives
+  each place back at a time it chooses, not when the place is dropped, so
+  it no longer reads the clock.
+
+T31's migration (`20260930230000_slack_agent_apps.sql`) was edited in
+place during review to add `processed_events.expires_at`. A database that
+already ran an earlier version of it must be recreated: sqlx refuses a
+migration whose checksum changed. `expires_at` keeps its `DEFAULT 0`,
+backfilled at once from `seen_at`: SQLite refuses to add a `NOT NULL`
+column without a default to a table that has rows, and rebuilding
+`processed_events` for it isn't worth it, since every writer goes through
+`mark_event_processed`, which always sets it.
+
+### Thread replies under someone else's root aren't kept
+
+**Issue.** An eighth review found that busy threads still drained the
+owner's bucket. `normalize` kept every channel thread reply, whether or
+not it could address the bot, so each of one owner's agents' apps kept,
+and charged, every reply in every thread of every channel it was in; the
+router then ignored nearly all of them, since it answers a person there
+only for a mention of the agent or a reply under one of the agent's own
+messages. A new test, one owner's ten agents taking a thread reply each
+in 40 rounds and then a mention, kept 210 replies before the change and
+dropped the mention after its 200. Group DMs were kept whole, though the
+router applies the channel rule to them too (only a one-to-one DM is
+addressed by being one), and a message `normalize` found malformed was
+logged at debug only, so a change in Slack's ids would drop messages
+without a word.
+
+**Solution.**
+
+- Outside a one-to-one DM, `normalize` drops a thread reply that doesn't
+  mention the bot when its `parent_user_id`, which Slack sends on every
+  thread reply, names a user other than the binding's bot user. A reply
+  is kept when either is missing, and a `parent_user_id` that isn't a
+  string shaped like a user id counts as missing rather than making the
+  message malformed, since it is only compared, never kept. The router
+  stays the judge of whether the root is the agent's own: `parent_user_id`
+  drops only replies under a root the bot can't have posted, which the
+  router would ignore, while hops need a mention and `reply_to` is still
+  the thread root. `read_back` runs the same rule on Slack's copy, whose
+  `conversations.replies` messages carry `parent_user_id` too.
+- Group DMs follow the same rule as channels, top-level messages included.
+- A kept message's owner's token is taken before deduplication, as before,
+  and the module docs now say why: finding a retry a duplicate is a store
+  write too.
+- `Skip::Malformed` goes through the ingress's throttle as
+  `Note::Malformed`: a warning once a minute per binding.
+- The owner-rate test no longer needs its 270 messages sent within about
+  4.3 seconds: it sends rounds until one of the owner's messages is
+  dropped, and bounds what was kept by the burst plus what the measured
+  time refilled.
+- An agent whose app is replaced by one with another bot user would keep
+  replies in the threads its old bot started only when they mention it.
+  No flow replaces an agent's app today: a binding gets its bot user once,
+  at install.
+
+### Own posts and quiet bots aren't kept either
+
+**Issue.** A ninth review found that `normalize` still kept, and charged
+to the owner's bucket, two kinds of message the router always ignores,
+in every kind of conversation: the agent's own posts (`OwnMessage`, and
+the pipeline drops the sending agent from the candidates as well), and
+bots' messages that don't mention the agent (`UnmanagedBot`, or
+`NotMentionedByAgent` for another agent). Nothing else reads them at
+ingress: `message_refs` rows for the agent's posts are written from
+`chat.postMessage`'s answer, a read-back confirms only inbound messages
+the router didn't ignore, and the manager app acts only on people's DMs.
+
+**Solution.**
+
+- `normalize` drops, as `Skip::NotAddressed`, a message whose sender is
+  the binding's bot user, and a bot's message (`bot_id` or `bot_profile`)
+  that doesn't mention the bot user, in DMs too. A bot's message is kept
+  when the bot user isn't known. `read_back` inherits both.
+- `parent_user_id` is read by a visitor that keeps a string only if
+  `is_user_id` accepts it and skips anything else without copying it, so
+  every other value still counts as missing.
+- The owner-rate test gives up after 10 seconds of wall clock rather than
+  2,000 rounds.
+- New agentd tests run a turn for a member's reply under the agent's own
+  root, with `parent_user_id` the agent's bot, and neither look up nor
+  answer a reply under a member's root.
+
+**Open.** Keeping a reply with no `parent_user_id` assumes Slack sends it
+on every reply under a root with a user, and leaves it out only under
+roots with none, such as incoming webhooks', Workflow Builder's and
+`bot_message` posts. That hasn't been checked against live Slack; it
+belongs in T32's live pass.
+
+Two more gaps are left open, since the router ignores what they let
+through or nothing makes them happen today:
+
+- An own post that carries a `bot_id` and no `user` isn't recognized as
+  the bot's own, since `normalize` compares the sender with the bot user,
+  and is kept if it mentions the bot user. The router ignores it anyway.
+- `normalize` matches only the current binding's bot user, while the
+  router's `agent_of_bot_user` knows the bot users of an agent's bindings
+  in any state. If an agent ever got a second Slack binding in the same
+  team, mentions of its old bot user would be dropped at ingress.
+
+### Bots don't join channels by posting
+
+Slack refuses a post to a conversation the bot isn't in (T23b), and the
+`message.*` events come only from conversations the bot is in, so a reply
+always goes where the bot heard the message. `chat:write.public`, which
+would let a bot post in any public channel, is off unless
+`[slack] public_posting` is set. The manifest has the plan's
+`channels:join`, but agentd never calls `conversations.join` for an agent.
+
+### Smaller choices
+
+- The app's name and its bot user's display name are the agent's name
+  (names are 2 to 32 characters, within Slack's limits); the description is
+  fixed. The messages tab is on and not read-only, so members can DM the
+  agent. A name Slack refuses is reported with Slack's code.
+- `[slack] public_url` must be `https`, since Slack takes nothing else as a
+  request URL; its trailing slashes are dropped. Without it, `/agent create`
+  on Slack says to set it.
+- The install link carries `redirect_uri`, and `oauth.v2.access` repeats it.
+- The owner's display name, for the default persona and `list`, comes from
+  `users.info` through the manager app. `list` shows owners' names as code
+  spans, so a display name like `[Admin](https://evil)` stays text, less
+  backticks, control characters and what `ctl::is_invisible` (the check on
+  agentctl's file names) lists: bidirectional overrides and isolates
+  (U+202A to U+202E, U+2066 to U+2069), zero-width characters and the like,
+  which could make a name read as another or reorder the line around it;
+  and on Slack names each agent's bot by its user id, which the directory
+  resolves to a mention for managed bots only (`MemberDirectory::lookup`): names are
+  unique per owner only, so `@helper` can be ambiguous. The installed DM
+  names the bot the same way, and the create reply, which comes before the
+  bot exists, says that DM will.
+- Agent names Slack reads as broadcasts (`here`, `channel`, `everyone`,
+  `render::slack::BROADCASTS`) are refused on Slack. Rocket.Chat's list
+  moved to `render::rocketchat::BROADCASTS` too, replacing agentd's copy.
+- An expired configuration token that isn't broken is one the rotator will
+  renew, as after downtime, so `/agent create` says to try again in a minute
+  rather than to generate a new one.
+- `invalid_manifest` usually means Slack couldn't reach the events URL during
+  creation, so the reply asks the member to have `[slack] public_url`
+  checked.
+- The unsigned `url_verification` echo is answered only for a binding with no
+  signing secret yet, one still being created; the manager app's and
+  installed apps' challenges must verify, as Slack signs them.
+- The callback's pages name the manager app when Slack gave it a name, and
+  `agent-core` otherwise.
+- The callback answers in plain text with `nosniff`, `no-store` and
+  `no-referrer`, and never repeats what the query held. A cancelled install
+  (`error=access_denied`) changes nothing, and the link still works.
+- The reminder is claimed with a 10-minute lease, like the relink notice, and
+  tried at most five times (the relink notice allows 20); an owner no
+  manager DM reaches waits. Its link is built before the claim, so an
+  attempt is never spent on a link that can't be made.
+- Client and signing secrets, bot tokens, configuration tokens and OAuth
+  codes are `SecretString`s; a captured-log test at `trace` through a whole
+  create, install and delete finds none of them.

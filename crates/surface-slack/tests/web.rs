@@ -509,7 +509,7 @@ async fn a_refused_upload_shares_nothing() {
         .unwrap_err();
     assert_eq!(
         err,
-        SurfaceError::Api("the file upload was refused (HTTP 500)".into())
+        SurfaceError::Transport("the file upload failed (HTTP 500)".into())
     );
     let sent = requests(&server).await;
     assert!(
@@ -680,7 +680,7 @@ async fn http_failures_and_unreadable_bodies_are_errors() {
 
     assert_eq!(
         api.auth_test().await.unwrap_err(),
-        SurfaceError::Api("HTTP 503".into())
+        SurfaceError::Transport("HTTP 503".into())
     );
     assert!(matches!(
         api.user_info(&"U1".into()).await.unwrap_err(),
@@ -785,11 +785,11 @@ mod response_url {
             ),
             (
                 ResponseTemplate::new(500).set_body_string("Internal <b>error</b>"),
-                SurfaceError::Api("unknown_error".into()),
+                SurfaceError::Transport("HTTP 500".into()),
             ),
             (
                 ResponseTemplate::new(502),
-                SurfaceError::Api("HTTP 502".into()),
+                SurfaceError::Transport("HTTP 502".into()),
             ),
             (
                 ResponseTemplate::new(200).set_body_json(json!({"ok": false})),
@@ -1077,4 +1077,318 @@ fn tempdir() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("surface-slack-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+mod apps {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use secrecy::ExposeSecret as _;
+    use surface_slack::manifest::{AgentApp, agent_manifest};
+
+    use super::*;
+
+    const CONFIG_TOKEN: &str = "xoxe.xoxp-1-config-SECRET";
+    const CLIENT_SECRET: &str = "client-SECRET-0001";
+    const SIGNING_SECRET: &str = "signing-SECRET-0001";
+    const BOT_TOKEN: &str = "xoxb-agent-SECRET";
+    const CODE: &str = "oauth-code-SECRET";
+
+    async fn client(server: &MockServer) -> SlackClient {
+        SlackClient::new(&format!("{}/api/", server.uri()))
+            .unwrap()
+            .with_max_retry_wait(Duration::from_secs(5))
+    }
+
+    fn manifest() -> Value {
+        agent_manifest(&AgentApp {
+            name: "helper",
+            public_url: "https://agentd.example.com",
+            binding: core_types::BindingId::new_v4(),
+            public_posting: false,
+        })
+    }
+
+    fn assert_no_secret(text: &str) {
+        for secret in [CONFIG_TOKEN, CLIENT_SECRET, SIGNING_SECRET, BOT_TOKEN, CODE] {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_app_sends_the_manifest_as_the_member_and_keeps_the_secrets_secret() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.create"))
+            .and(header(
+                "authorization",
+                format!("Bearer {CONFIG_TOKEN}").as_str(),
+            ))
+            .respond_with(ok(json!({
+                "app_id": "A0AGENT01",
+                "team_id": "T0TEAM001",
+                "credentials": {
+                    "client_id": "1111.2222",
+                    "client_secret": CLIENT_SECRET,
+                    "verification_token": "legacy",
+                    "signing_secret": SIGNING_SECRET,
+                },
+                "oauth_authorize_url": "https://slack.com/oauth/v2/authorize?client_id=1111.2222",
+            })))
+            .mount(&server)
+            .await;
+        let manifest = manifest();
+        let created = client(&server)
+            .await
+            .create_app(&SecretString::from(CONFIG_TOKEN), &manifest)
+            .await
+            .unwrap();
+        assert_eq!(created.app_id, "A0AGENT01");
+        assert_eq!(created.client_id, "1111.2222");
+        assert_eq!(created.client_secret.expose_secret(), CLIENT_SECRET);
+        assert_eq!(created.signing_secret.expose_secret(), SIGNING_SECRET);
+        assert_no_secret(&format!("{created:?}"));
+
+        let sent = requests(&server).await;
+        assert_eq!(sent.len(), 1);
+        let form = form(&sent[0]);
+        let sent_manifest: Value = serde_json::from_str(&form["manifest"]).unwrap();
+        assert_eq!(sent_manifest, manifest);
+        assert!(!sent[0].url.as_str().contains(CONFIG_TOKEN));
+        assert!(!String::from_utf8_lossy(&sent[0].body).contains(CONFIG_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn create_app_failures_are_mapped_without_secrets() {
+        for (code, expected) in [
+            ("token_expired", SurfaceError::Unauthorized),
+            ("invalid_auth", SurfaceError::Unauthorized),
+            (
+                "invalid_manifest",
+                SurfaceError::Api("invalid_manifest".into()),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "ok": false,
+                    "error": code,
+                    "errors": [{"code": "x", "message": "bad", "pointer": "/settings"}],
+                })))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .await
+                .create_app(&SecretString::from(CONFIG_TOKEN), &manifest())
+                .await
+                .unwrap_err();
+            assert_eq!(err, expected, "{code}");
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok(json!({
+                "app_id": "",
+                "credentials": {"client_id": "", "client_secret": CLIENT_SECRET, "signing_secret": SIGNING_SECRET},
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .create_app(&SecretString::from(CONFIG_TOKEN), &manifest())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+        assert_no_secret(&format!("{err} {err:?}"));
+    }
+
+    #[tokio::test]
+    async fn delete_app_names_the_app_and_acts_as_the_member() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.delete"))
+            .and(header(
+                "authorization",
+                format!("Bearer {CONFIG_TOKEN}").as_str(),
+            ))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        client(&server)
+            .await
+            .delete_app(&SecretString::from(CONFIG_TOKEN), "A0AGENT01")
+            .await
+            .unwrap();
+        let sent = requests(&server).await;
+        assert_eq!(form(&sent[0])["app_id"], "A0AGENT01");
+
+        let refused = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(failed("token_revoked"))
+            .mount(&refused)
+            .await;
+        let err = client(&refused)
+            .await
+            .delete_app(&SecretString::from(CONFIG_TOKEN), "A0AGENT01")
+            .await
+            .unwrap_err();
+        assert_eq!(err, SurfaceError::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn an_app_that_is_gone_already_is_not_found() {
+        for code in ["app_not_found", "invalid_app_id"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/apps.manifest.delete"))
+                .respond_with(failed(code))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .await
+                .delete_app(&SecretString::from(CONFIG_TOKEN), "A0AGENT01")
+                .await
+                .unwrap_err();
+            assert_eq!(err, SurfaceError::NotFound(code.to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_created_app_whose_answer_does_not_read_is_deleted_again() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.create"))
+            .respond_with(ok(json!({
+                "app_id": "A0AGENT01",
+                "credentials": {"client_id": "1111.2222"},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.delete"))
+            .respond_with(ok(json!({})))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .create_app(&SecretString::from(CONFIG_TOKEN), &manifest())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+        let deleted: Vec<_> = requests(&server)
+            .await
+            .into_iter()
+            .filter(|request| request.url.path() == "/api/apps.manifest.delete")
+            .collect();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(form(&deleted[0])["app_id"], "A0AGENT01");
+    }
+
+    #[tokio::test]
+    async fn a_server_error_creating_an_app_can_be_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .create_app(&SecretString::from(CONFIG_TOKEN), &manifest())
+            .await
+            .unwrap_err();
+        assert_eq!(err, SurfaceError::Transport("HTTP 503".into()));
+    }
+
+    #[tokio::test]
+    async fn install_app_exchanges_the_code_with_the_apps_own_credentials() {
+        let server = MockServer::start().await;
+        let basic = format!(
+            "Basic {}",
+            STANDARD.encode(format!("1111.2222:{CLIENT_SECRET}"))
+        );
+        Mock::given(method("POST"))
+            .and(path("/api/oauth.v2.access"))
+            .and(header("authorization", basic.as_str()))
+            .respond_with(ok(json!({
+                "app_id": "A0AGENT01",
+                "authed_user": {"id": "U0ADA0001"},
+                "scope": "chat:write,im:history",
+                "token_type": "bot",
+                "access_token": BOT_TOKEN,
+                "bot_user_id": "U0HELPER1",
+                "team": {"id": "T0TEAM001", "name": "Example"},
+                "enterprise": null,
+                "is_enterprise_install": false,
+            })))
+            .mount(&server)
+            .await;
+        let installed = client(&server)
+            .await
+            .install_app(
+                "1111.2222",
+                &SecretString::from(CLIENT_SECRET),
+                &SecretString::from(CODE),
+                "https://agentd.example.com/slack/oauth/callback",
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed.app_id, "A0AGENT01");
+        assert_eq!(installed.team.as_str(), "T0TEAM001");
+        assert_eq!(installed.bot_user.as_str(), "U0HELPER1");
+        assert_eq!(installed.bot_token.expose_secret(), BOT_TOKEN);
+        assert_eq!(installed.scopes, ["chat:write", "im:history"]);
+        assert_no_secret(&format!("{installed:?}"));
+
+        let sent = requests(&server).await;
+        let form = form(&sent[0]);
+        assert_eq!(form["code"], CODE);
+        assert_eq!(
+            form["redirect_uri"],
+            "https://agentd.example.com/slack/oauth/callback"
+        );
+        assert!(!form.contains_key("client_secret"));
+        assert!(!sent[0].url.as_str().contains(CODE));
+    }
+
+    #[tokio::test]
+    async fn an_install_without_a_bot_token_or_a_refused_code_fails() {
+        for body in [
+            json!({"ok": true, "app_id": "A1", "token_type": "user", "access_token": "xoxp-SECRET",
+                   "bot_user_id": "U1", "team": {"id": "T1"}}),
+            json!({"ok": true, "app_id": "A1", "access_token": "", "bot_user_id": "U1", "team": {"id": "T1"}}),
+            json!({"ok": true, "app_id": "A1", "access_token": BOT_TOKEN, "team": {"id": "T1"}}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .await
+                .install_app(
+                    "1",
+                    &SecretString::from(CLIENT_SECRET),
+                    &SecretString::from(CODE),
+                    "https://x",
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SurfaceError::Transport(_)), "{body}: {err:?}");
+            assert_no_secret(&format!("{err} {err:?}"));
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(failed("invalid_code"))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .install_app(
+                "1",
+                &SecretString::from(CLIENT_SECRET),
+                &SecretString::from(CODE),
+                "https://x",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, SurfaceError::Api("invalid_code".into()));
+    }
 }

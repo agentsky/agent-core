@@ -2663,6 +2663,43 @@ Deliverables:
 - Mention delivery goes through T28 to the pipeline from T23. The agent must be
   invited to a channel to hear mentions; the reply to create says so.
 
+Notes from implementing it
+([impl-notes](impl-notes.md#t31-slack-agent-apps-from-manifests)):
+
+- `[slack]` gains `public_url` (required to create agent apps, `https`
+  only), `public_posting` (the `chat:write.public` switch, off by default)
+  and `install_reminder_secs` (default 3600).
+- The install link's `state` is the binding id and a value sealed with the
+  master key for it, and the link's first parameter; a replay is refused
+  because the binding is no longer `pending_install`. The link asks for the
+  scopes and names the redirect URL the app was created with
+  (`agent_bindings.app_scopes` and `app_redirect_url`), so `public_url` is
+  baked into each app. An install in another workspace, of another app, or
+  granting scopes the app doesn't ask for is refused.
+- `/agent delete` disables the binding (forgetting its secrets) and marks it
+  retired once `apps.manifest.delete` succeeded, rather than deleting the
+  row, which the router needs to recognize the deleted agent's bot.
+- A creation that fails is abandoned as on Rocket.Chat (T14), and an app
+  created for a creation that can't be stored, or whose answer can't be
+  read, is deleted again. A sweeper abandons `creating` Slack bindings after
+  `CREATION_LEASE` and sends the install reminder. A configuration token
+  Slack refuses is marked broken; `/agent delete` always names an app it
+  couldn't delete.
+- Before acting on any message it doesn't ignore (a turn, a link prompt, a
+  refusal), whoever sent it, the pipeline takes the platform's copy of it
+  (`Surface::confirm`) and routes that instead: the owner holds their
+  app's signing secret, so on Slack
+  the message is read back with the bot token, its conversation's kind
+  taken from `conversations.info`, and it is normalized as the ingress
+  normalizes events. It is acted on only if the copy routes as the event
+  did; a message older than 15 minutes when its event arrived is refused.
+- `slack::Inbound` drops requests to any binding from another workspace,
+  and queues agents' messages without waiting in `slack::Messages`, whose
+  worker looks bot senders up and hands them to the pipeline once
+  `Server::with_pipeline` connects it. `SlackBots` holds each binding's
+  surface and starts reading the member list in the background; nothing
+  waits for it.
+
 Acceptance: wiremock tests for the full create, install and callback
 sequence (including a challenge answered while the binding is `creating`),
 the pending-install reminder, delete with and without a configuration token,
@@ -2914,6 +2951,14 @@ Not scheduled. Each needs a decision before it becomes a task.
   [Alternatives considered](design.md#alternatives-considered)).
 - **Managed Agents backend** for channel agents funded by a community API key
   (design, same section).
+- **Slack apps agentd loses track of.** An agent's app deleted while its
+  owner had no working configuration token stays at Slack until the owner
+  deletes it (T31); it could be deleted once they register a new token. An
+  app created just before a crash, or by an `apps.manifest.create` request
+  that timed out while Slack went on, is never recorded, and retrying the
+  create makes a second app. And an uninstall at
+  Slack (`app_uninstalled`, `tokens_revoked`) isn't handled yet: the
+  binding stays active with a dead token until the agent is deleted.
 - **Backfill after a Rocket.Chat reconnect.** A realtime connection that
   drops misses what was posted until it is back (T12). Every bot in a room
   would need to miss it for a message to be lost, but a lone agent in a room,
