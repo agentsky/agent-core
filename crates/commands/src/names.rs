@@ -308,7 +308,7 @@ fn is_git_ref(git_ref: &str) -> bool {
 /// Unwraps a Slack link token, `<url>` or `<url|label>`, to its URL. Slack
 /// wraps links this way in message text and in slash command text. Other
 /// text is returned unchanged.
-fn unwrap_slack_link(s: &str) -> &str {
+pub(crate) fn unwrap_slack_link(s: &str) -> &str {
     match s.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         Some(body) if !body.starts_with(['@', '#', '!']) => {
             body.split_once('|').map_or(body, |(url, _label)| url)

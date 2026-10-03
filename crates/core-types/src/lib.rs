@@ -4,6 +4,8 @@
 //! This crate does no I/O. It holds the types every other crate agrees on:
 //!
 //! - [`ids`]: UUID newtypes such as [`AgentId`] and [`SessionId`].
+//! - [`cloud`]: [`RoutineId`] and [`RoutineToken`], a member's cloud hand-off
+//!   routine and its API trigger token.
 //! - [`surface`]: chat-platform identifiers and references such as
 //!   [`MemberKey`], [`ConvRef`] and [`MsgRef`].
 //! - [`scope`]: [`ScopeKey`] and [`VolumeKey`], with stable string forms.
@@ -20,6 +22,7 @@
 
 #![warn(missing_docs)]
 
+pub mod cloud;
 pub mod ctl;
 pub mod event;
 pub mod ids;
@@ -30,6 +33,7 @@ pub mod surface_trait;
 pub mod throttle;
 pub mod turn;
 
+pub use cloud::*;
 pub use ctl::*;
 pub use event::*;
 pub use ids::*;
