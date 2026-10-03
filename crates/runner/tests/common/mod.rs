@@ -6,25 +6,9 @@ use runner::{LaunchSpec, ProcessConfig, SessionStart};
 use sandbox::{Container, ProcessSandbox, Sandbox, SessionSpec};
 use secrecy::SecretString;
 use store::{Sealer, Store};
-use testkit::{FakeAnthropic, Turn};
+use testkit::{FakeAnthropic, TempDir, Turn};
 
 pub const PLACEHOLDER: &str = "agentd-placeholder-7f3a";
-
-pub struct TempDir(pub PathBuf);
-
-impl TempDir {
-    pub fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("runner-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 pub struct Harness {
     pub _dir: TempDir,
@@ -38,13 +22,13 @@ pub struct Harness {
 impl Harness {
     pub async fn new(turns: &[Turn]) -> Self {
         let bin = testkit::fake_claude_path();
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
         let store = Store::open_in_memory(sealer).await.unwrap();
-        let sandbox = ProcessSandbox::new(store, dir.0.clone()).unwrap();
+        let sandbox = ProcessSandbox::new(store, dir.path().to_owned()).unwrap();
         let agent = AgentId::new_v4();
         assert!(
-            runner::write_persona(&dir.0, agent, "You are a test agent.\n")
+            runner::write_persona(dir.path(), agent, "You are a test agent.\n")
                 .await
                 .unwrap()
         );
@@ -59,10 +43,10 @@ impl Harness {
             SessionId::new_v4(),
             volume,
             "unused",
-            runner::persona_dir(&dir.0, agent),
+            runner::persona_dir(dir.path(), agent),
         );
         let container = sandbox.start(&spec).await.unwrap();
-        let script = dir.0.join("script.json");
+        let script = dir.join("script.json");
         testkit::write_script(&script, turns).unwrap();
         let anthropic = testkit::fake_anthropic().await;
         let config = ProcessConfig {
