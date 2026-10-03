@@ -462,28 +462,48 @@ Auth tests slept 100 ms and assumed a token response delayed 300 ms was
 still on its way. `concurrent_callers_share_a_failed_refresh_of_an_expired_token`
 gave its five callers the 503's 200 ms delay to join one refresh; a caller
 that joins after it lands starts its own, since an expired token is always
-retried, and sends a second request. Adding 250 ms before callers 2 to 5
+retried, and sends a second request. Adding 300 ms before callers 2 to 5
 start failed it. The plan-after-lock test slept 1 s, then checked a profile
 that was delayed 1.5 s, so it never saw the profile land.
 
-**Solution.** `testkit::Held` is a wiremock responder that holds its
-response until the test releases it. A test waits, with a 30 s bound, for
-the request to arrive, acts, then releases it. Holding blocks the mock
-server's thread, so the `Hold` is declared after the server and released
-before anything else asks the server. The expired-token test also waits
-until all five callers have joined: the in-flight map holds the refresh's
-`watch::Sender`, and a doc-hidden `Auth::refresh_waiters(member)` returns
-its receiver count. That sender keeps the channel open, so the guard that
-removes the map entry goes into the refresh task when it is spawned, and a
-task dropped before its first poll still frees it. The plan-after-lock test
-waits for the profile request and checks 2 s after it. A sleep stays only
-as a settle before asserting that nothing more happened.
+**Solution.** A test waits for what it assumes, and a sleep stays only as a
+settle before asserting that nothing more happened.
+
+`testkit::Held` is a wiremock responder that holds its response until the
+test releases it. A test waits, with a 30 s bound, for the request to
+arrive, acts, then releases it. Holding blocks the mock server's thread, so
+the `Hold` is declared after the server and released before anything else
+asks the server. The logout test only waits for its refresh to be sent:
+logout queues behind that refresh on the member's lock, so a held response
+would deadlock, and either order ends the same.
+
+The expired-token test also waits until all five callers have joined: the
+in-flight map holds the refresh's `watch::Sender`, and a doc-hidden
+`Auth::refresh_waiters(member)` returns its receiver count. That sender
+keeps the channel open, so the guard that removes the map entry goes into
+the refresh task when it is spawned, and a task dropped before its first
+poll still frees it: its waiters get `RefreshInterrupted`, and the next
+caller starts a new refresh.
+`a_refresh_dropped_before_it_first_runs_lets_the_next_caller_refresh` joins
+a refresh on a second runtime and drops that runtime before the task runs;
+with the guard made on the task's first poll instead, the next caller waits
+forever.
+
+The plan-after-lock test waits for the profile request and checks 2 s after
+it.
 
 agentd's `a_stalled_body_does_not_hold_up_shutdown` slept 200 ms and
 assumed its client had sent its partial request by then; a client thread
 that started late found the listener closed. The test layers the public
 routes with a hook that signals each request, and stops agentd once the
 request has reached them.
+
+`a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again`
+and `an_install_that_finishes_after_the_agent_was_deleted_is_refused`
+counted on the mocked `apps.manifest.create` answering after 300 ms and
+`oauth.v2.access` after 500 ms, and acted before the answer landed. Each
+now holds that response, acts once the request has arrived, then releases
+it.
 
 `a_shutdown_kills_and_meters_the_turn_it_cuts` killed the private turn
 once its session was warm, which is also true while the turn is still
@@ -2561,34 +2581,8 @@ failed it 10 of 10 runs. Its `users.create` response is now held until the
 test has abandoned the creation, so the abandonment always lands while the
 request is in flight; it passes 10 of 10 with the 150 ms added.
 
-The hold is `testkit::Held`, and the other tests that slept and assumed a
-delayed response was still on its way now use it too: the auth tests that
-act during a refresh, the command test that expects a second member's reply
-while the first member's login is out, and the Slack test that changes the
-managed bots during a member refresh. Each waits for its request to arrive,
-acts, then releases the response, and fails after 30 seconds rather than
-hanging when the request never comes. The logout test only waits for its
-refresh to arrive: logout queues behind that refresh on the member's lock,
-so holding the response would deadlock, and either order ends the same.
-
-`concurrent_callers_share_a_failed_refresh_of_an_expired_token` needed more
-than a hold. Its five callers must all join the refresh before the 503
-lands; one that joins later finds no refresh in flight and starts its own,
-which sends a second request. That is the intended behaviour, not a
-bug: T09's notes say an expired token is always retried because there is
-nothing to hand out instead, and the backoff only covers a still-valid
-token. `Auth` had no observable point where every caller had joined, so the
-200 ms response delay was the only margin, and 300 ms added before callers
-2 to 5 start failed the test 10 of 10 runs. The in-flight map now holds the
-refresh's `watch::Sender` rather than a receiver, and a doc-hidden
-`Auth::refresh_waiters(member)` returns its receiver count, which is the
-number of callers waiting. The test holds the 503, waits until that count
-reaches 5, then releases it. It passes 10 of 10 runs with the 300 ms added
-and 200 of 200 with 8 busy loops. The map's sender would keep the channel
-open if the refresh task were dropped before it first ran, so the guard that
-removes the map entry now goes into the task when it is spawned, not on its
-first poll. Waiters of such a task get `RefreshInterrupted`, and the next
-caller starts a new refresh.
+The hold is `testkit::Held`, described in T04's notes with the auth tests
+that use it, the expired-token test's wait for its callers included.
 
 ### Before turns, a bot reacts instead of replying
 
