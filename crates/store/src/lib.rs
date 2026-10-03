@@ -22,6 +22,7 @@
 //! [`ctl_tokens`](Store::put_ctl_token),
 //! [`scope_locks`](Store::acquire_scope_lock),
 //! [`volumes`](Store::put_volume), [`sessions`](Store::session_for_thread),
+//! [`message_refs`](Store::record_message_ref),
 //! [`slack_config_tokens`](Store::put_slack_config_token), and
 //! [`agents`](Store::create_agent) with their bindings and
 //! [retirements](Store::claim_retirement).
@@ -41,6 +42,7 @@ mod claude_links;
 mod ctl;
 mod events;
 mod members;
+mod message_refs;
 mod pending_logins;
 mod relink_notices;
 mod seal;
@@ -55,6 +57,7 @@ pub use agents::{
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
+pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
@@ -336,6 +339,7 @@ mod tests {
                 "claude_links",
                 "ctl_tokens",
                 "members",
+                "message_refs",
                 "pending_logins",
                 "processed_events",
                 "scope_locks",

@@ -137,8 +137,8 @@ description, and must pass T02's policy.
   There is one source, so there is no precedence question.
 - `agentd gen-key` prints a new master key.
 - The file's sections, each added by the task that first needs it: `[server]`,
-  `[internal]`, `[store]`, `[claude_oauth]`, `[sandbox]`, `[proxy]`,
-  `[rocketchat]`, `[slack]`, `[limits]`. `config/agentd.example.toml` documents
+  `[internal]`, `[store]`, `[claude_oauth]`, `[sandbox]`, `[runner]`,
+  `[proxy]`, `[rocketchat]`, `[slack]`, `[limits]`. `config/agentd.example.toml` documents
   every key and is kept current by each task.
 - Claude OAuth defaults, observed in the Claude Code 2.1.285 binary on
   2026-09-30. Configuration, not constants, per the design's
@@ -364,7 +364,8 @@ Every PR, in addition to its task's acceptance criteria:
 | [T20](#t20) | `runner`: stream-json process driver | `runner-process` | T04, T17 | M2 |
 | [T21](#t21) | `runner`: sessions, queue, warm pool | `runner-sessions` | T20 | M2 |
 | [T22](#t22) | `router`: gating and credential policy | `router-policy` | T03, T04 | M2 |
-| [T23](#t23) | Turn pipeline end to end | `turn-pipeline` | T07, T14, T15, T16, T18, T19, T21, T22 | M2 |
+| [T23](#t23) | Turn pipeline end to end (T23a: runner wiring) | `turn-pipeline` | T07, T14, T15, T16, T18, T19, T21, T22 | M2 |
+| [T23b](#t23b) | Turn pipeline: routing and delivery | `turn-pipeline-delivery` | T23 | M2 |
 | [T24](#t24) | Session commands | `session-commands` | T23 | M2 |
 | [T25](#t25) | Skills and the `agentctl` skill | `skills` | T23 | M2 |
 | [T26](#t26) | Requester-pays routing | `requester-pays` | T23 | M3 |
@@ -404,6 +405,7 @@ Progress:
 - [ ] T21 `runner`: sessions, queue, warm pool
 - [ ] T22 `router`: gating and credential policy
 - [ ] T23 Turn pipeline end to end
+- [ ] T23b Turn pipeline: routing and delivery
 - [ ] T24 Session commands
 - [ ] T25 Skills and the `agentctl` skill
 - [ ] T26 Requester-pays routing
@@ -1979,6 +1981,17 @@ No I/O in the crate.
 **Turn pipeline end to end.** Branch `turn-pipeline`. Depends on T07,
 T14, T15, T16, T18, T19, T21 and T22.
 
+Split in two PRs, since the whole passes the size this plan allows. This
+one, T23a, wires the runner into agentd: the `message_refs` migration and
+its store methods, the `[sandbox]`, `[runner]` and `[proxy] upstream`
+configuration, the `DockerSandbox` with `reap_orphans` at startup, agentd's
+`TurnHooks`, the credential proxy on `Routers.proxy`, and
+`docker_real_claude_starts` with the CI step that builds the sandbox image.
+[T23b](#t23b) is the pipeline itself: `crates/agentd/src/pipeline/`'s steps
+1 to 5, the turn message builder, the working indicator, error delivery,
+the `SurfaceLookup` and short ids for agentctl, and the full pipeline test.
+Tasks that depend on T23 depend on T23b too.
+
 Design: [Architecture](design.md#architecture),
 [Rendering and delivery](design.md#rendering-and-delivery),
 [Persistence](design.md#persistence) (per-turn message),
@@ -1991,8 +2004,12 @@ Deliverables:
   `thread_root` not null (`''` for DMs, as in `sessions`), `platform_ref`,
   `agent_id` nullable, `turn_id` nullable, `requester_member`,
   `requester_key`, `hop`, `posted_at`).
-  - Unique on `(surface, team_id, conversation, platform_ref)`, since a Slack
-    `ts` is unique only within a channel.
+  - A message is named by `(surface, team_id, conversation, platform_ref)`,
+    since a Slack `ts` is unique only within a channel. It has one row per
+    session it was shown to, each with that session's short id, and one row
+    with `agent_id` set (a partial unique index) when agentd posted it, which
+    is the one attribution reads
+    ([impl-notes](impl-notes.md#one-row-per-session-and-one-attribution-per-post)).
   - Indexed on `(agent_id, surface, team_id, conversation, thread_root)` for
     the thread lookups below.
   - Rows exist for every message agentd posts, and for inbound messages shown
@@ -2016,17 +2033,22 @@ Deliverables:
   `SessionManager::run_turn` returns in `TurnReport::finished`. It sets the egress proxy variables from
   T19 (`cred_proxy::EGRESS_ENV`), and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
-  turn's outbox, and `revoke_process_token`). It builds `App` with a
+  turn's outbox, and `revoke_process_token`). `process_stopping` revokes
+  the process's own placeholder with `Registry::revoke`, not the whole
+  session's, so a late call for an old process leaves the session's new
+  one alone
+  ([impl-notes](impl-notes.md#process_stopping-revokes-the-process-not-the-session)).
+  It builds `App` with a
   `SurfaceLookup` for `agentctl history`, and resolves the short message ids
   it shows the model where agentctl takes a message id
   ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
 - agentd serves T18's `CredProxy` on `Routers.proxy`, with the `Registry`
   shared with its `TurnHooks`, and with
   `CredProxy::with_egress(config.egress_proxy()?)`, so the same listener
-  answers `CONNECT` (T19). The `Registry::revoke_session` that
-  `process_stopping` calls also closes the session's egress tunnels: the
-  egress proxy watches each tunnel's session through the shared `Registry`,
-  so no other call is needed. A `[proxy] upstream` key, default
+  answers `CONNECT` (T19). Revoking the session's last placeholder in
+  `process_stopping` also closes the session's egress tunnels: the egress
+  proxy watches each tunnel's session through the shared `Registry`, so no
+  other call is needed. A `[proxy] upstream` key, default
   `https://api.anthropic.com`, sets the upstream, and
   `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
@@ -2112,19 +2134,23 @@ Acceptance:
 - A Docker test (`docker_real_claude_starts`) with T16's image and T17's
   container configuration: the real `claude` starts on a read-only root,
   resumes a session through the proxy, and writes its transcript where
-  [Claude Code CLI](#claude-code-cli) says. It uses a test network that is
-  not internal, and `host-gateway` to reach the proxy and `fake_anthropic()`
-  in the test process, so it needs no account. It asserts that the fake saw
-  every request the CLI made, through the proxy. Blocking direct side traffic
-  is T17's and T16's network tests' job, since this network isn't internal.
+  [Claude Code CLI](#claude-code-cli) says. It uses a test network that
+  is internal but lets the host's gateway address through (it doesn't set
+  `inhibit_ipv4`), where the test process serves the proxy, forwarding to
+  `fake_anthropic()`, so it needs no account
+  ([impl-notes](impl-notes.md#the-real-claude-test-serves-the-proxy-on-the-networks-gateway)).
+  It asserts that the fake saw every request the CLI made, through the
+  proxy, and that the resumed process's first result reports the session's
+  restored total cost.
 
 Live check (manual, recorded in the PR): with the Compose stack from T16, its
 `isolate-sandbox.sh` rules in place, and a real linked account, mention an agent in a channel on Rocket.Chat, run a turn
 that uses Bash and returns a file, restart agentd, and continue the thread with
-`--resume`. Check that the first result of the `--resume`d process reports a
-`total_cost_usd` counted from 0, not the session's total so far: the runner's
-per-turn `cost_usd` assumes it
-([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
+`--resume`. The first result of a `--resume`d process reports the session's total so
+far, not a total counted from 0: `docker_real_claude_starts` showed it with
+the native 2.1.285 build against `fake_anthropic()`, and T27 corrects for it
+([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)).
+The live run confirms it with a real account.
 Also run `agentctl lock -- sh -c 'sleep 600'` with a short Bash
 tool timeout, and record whether the CLI kills a timed-out command through
 its process group or its process, and with which signal: `agentctl lock`
@@ -2132,6 +2158,28 @@ runs its command in a group of its own, so a group kill would leave the
 command running after agentctl dies
 ([impl-notes](impl-notes.md#the-command-runs-in-its-own-process-group)).
 That completes design milestone 2.
+
+### T23b
+
+**Turn pipeline: routing and delivery.** Branch `turn-pipeline-delivery`.
+Depends on T23 (its first part, T23a).
+
+The rest of [T23](#t23), whose text holds the details:
+
+- `crates/agentd/src/pipeline/`'s steps 1 to 5: receiving every surface's
+  events in place of T14's `Acknowledge`, routing each candidate with a
+  store-backed `RouterView`, running the turn on
+  `SessionManager::run_turn` (T23a's `Turns`) with the retry on
+  `SessionReset`, delivering the reply, and the link prompt.
+- The turn message builder, the working indicator and error delivery.
+- The persona file written from the store before a turn, byte-identical
+  across restarts.
+- `App` built with a `SurfaceLookup` for `agentctl history`, and the short
+  message ids resolved where agentctl takes a message id.
+- `TeamDirectory::set_managed_bots` fed with each team's managed agents.
+- The design's Persistence bullet on the per-turn message fixed.
+
+Acceptance: T23's full pipeline test, and its live check.
 
 ### T24
 
@@ -2244,7 +2292,14 @@ Deliverables:
     `day`, `agent_turns`, `tokens`), for the per-thread caps.
   - `bans` (`member_id`, `banned_by`, `reason`, `created_at`).
 - The meter accrues per requester from each `TurnOutcome`'s usage and
-  `cost_usd`, which is the turn's own, not the CLI's running total.
+  `cost_usd`, which is the turn's own, not the CLI's running total, except
+  on the first turn of a process started with `--resume`: the CLI restores
+  the session's total from the transcript's last `cost-state` line, which it
+  writes when a process exits and not when one is killed, so that turn's
+  `cost_usd` holds the restored total too. This task takes it off, from that
+  line read without following links and with its size capped, or from a
+  total the runner keeps in `sessions` when a process exits cleanly
+  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)).
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.

@@ -6,7 +6,7 @@
 //! | Listener | Key | Serves |
 //! | --- | --- | --- |
 //! | public | `server.listen` | `/healthz`, the Slack request URLs, and later OAuth callbacks |
-//! | proxy | `internal.proxy_listen` | the credential proxy (placeholder) |
+//! | proxy | `internal.proxy_listen` | the credential proxy and the egress proxy ([`cred_proxy`]) |
 //! | ctl | `internal.ctl_listen` | the agentctl API ([`ctl`](crate::ctl)) |
 //!
 //! The public listener also refuses connections from
@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
+use auth::TokenSource;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, State};
@@ -32,6 +33,7 @@ use axum::http::{Request, StatusCode};
 use axum::routing::get;
 use axum::serve::Listener;
 use core_types::Sender;
+use cred_proxy::CredProxy;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -49,6 +51,7 @@ use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::net::RefuseSubnet;
+use crate::pipeline::{NoCommunityKey, Turns};
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
@@ -79,10 +82,15 @@ pub struct Routers {
 impl Routers {
     /// The routes agentd serves: `/healthz` and the Slack request URLs on
     /// the public listener, with the Slack queue as a worker handing
-    /// commands to the command intake, and the agentctl API on the ctl
-    /// listener. The proxy listener answers everything with 404 until the
-    /// credential proxy is added.
-    pub fn new(app: &App) -> Self {
+    /// commands to the command intake; the credential proxy on the proxy
+    /// listener, forwarding to `proxy.upstream` with the placeholders in
+    /// [`App::registry`] and answering `CONNECT` with the egress proxy
+    /// `[proxy]` describes; and the agentctl API on the ctl listener.
+    ///
+    /// # Errors
+    ///
+    /// If the credential proxy can't be built.
+    pub fn new(app: &App) -> anyhow::Result<Self> {
         let (slack_routes, slack_queue) = slack::routes(app);
         let (intake, commands) = CommandIntake::new(app.commands().clone());
         let inbound = slack::Inbound::new(
@@ -90,9 +98,26 @@ impl Routers {
             app.slack().map(|slack| slack.identity().clone()),
             commands.clone(),
         );
-        Self {
+        let tokens: Arc<dyn TokenSource> = app.auth().clone();
+        let upstream = &app.config().proxy.upstream;
+        if upstream != cred_proxy::DEFAULT_UPSTREAM {
+            tracing::warn!(
+                %upstream,
+                default = cred_proxy::DEFAULT_UPSTREAM,
+                "the credential proxy forwards real credentials to proxy.upstream, not the default"
+            );
+        }
+        let proxy = CredProxy::new(
+            upstream,
+            app.registry().clone(),
+            tokens,
+            Arc::new(NoCommunityKey),
+        )
+        .context("proxy.upstream")?
+        .with_egress(app.config().egress_proxy()?);
+        Ok(Self {
             public: public_router(app.clone()).merge(slack_routes),
-            proxy: Router::new(),
+            proxy: proxy.into_router(),
             ctl: app.ctl().router(),
             workers: vec![Worker::new(
                 "Slack queue",
@@ -100,7 +125,7 @@ impl Routers {
             )],
             intake,
             commands,
-        }
+        })
     }
 }
 
@@ -180,6 +205,7 @@ pub struct Server {
     proxy: TcpListener,
     ctl: TcpListener,
     addrs: Addrs,
+    turns: Option<Turns>,
 }
 
 impl Server {
@@ -207,12 +233,19 @@ impl Server {
             proxy,
             ctl,
             addrs,
+            turns: None,
         })
     }
 
     /// The bound addresses.
     pub fn addrs(&self) -> Addrs {
         self.addrs
+    }
+
+    /// Runs turns with `turns` while serving. Without it agentd runs none.
+    pub fn with_turns(mut self, turns: Turns) -> Self {
+        self.turns = Some(turns);
+        self
     }
 
     /// Serves until `shutdown` completes, then shuts down gracefully:
@@ -222,7 +255,17 @@ impl Server {
     ///    `server.drain_timeout_secs` to finish. Whatever is still running
     ///    then is dropped. If `abort` completes first, as a second shutdown
     ///    signal does, it is dropped at once instead.
-    /// 3. The store is closed.
+    /// 3. With turns, every warm session's process and container is
+    ///    stopped, within what is left of the drain timeout. A drain that
+    ///    was cut short, by the timeout or by `abort`, skips it, and the
+    ///    next start reaps what is left. A stop that runs out of time or
+    ///    is cut short by `abort` leaves the sessions it already began
+    ///    stopping to finish in the background: their agentctl token
+    ///    revocations fail once the store is closed, which the runner logs
+    ///    as giving up, and the idle reaper they keep alive runs until the
+    ///    process exits. The next start purges the tokens and reaps the
+    ///    containers.
+    /// 4. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
@@ -249,9 +292,11 @@ impl Server {
             proxy,
             ctl,
             addrs,
+            turns,
         } = self;
         let drain_timeout = app.config().server.drain_timeout();
         let (stop, stopping) = watch::channel(false);
+        tokio::pin!(abort);
 
         let mut tasks = JoinSet::new();
         tasks.spawn(serve_listener(
@@ -351,6 +396,7 @@ impl Server {
             public = %addrs.public,
             proxy = %addrs.proxy,
             ctl = %addrs.ctl,
+            turns = turns.is_some(),
             "listening"
         );
 
@@ -363,6 +409,7 @@ impl Server {
             "shutting down: no longer accepting connections"
         );
         stop.send_replace(true);
+        let deadline = tokio::time::Instant::now() + drain_timeout;
 
         let drain = async {
             while let Some(joined) = tasks.join_next().await {
@@ -372,15 +419,29 @@ impl Server {
             }
         };
         let cut_short = tokio::select! {
-            drained = tokio::time::timeout(drain_timeout, drain) => {
+            drained = tokio::time::timeout_at(deadline, drain) => {
                 drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
             }
-            () = abort => Some("shutdown forced; dropping in-flight work"),
+            () = &mut abort => Some("shutdown forced; dropping in-flight work"),
         };
         if let Some(reason) = cut_short {
             tracing::warn!(unfinished = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
+        if cut_short.is_some() && turns.is_some() {
+            tracing::warn!("leaving warm sandboxes for the next start to reap");
+        } else if let Some(turns) = &turns {
+            let left = tokio::select! {
+                stopped = tokio::time::timeout_at(deadline, turns.sessions().stop_all()) => {
+                    stopped.is_err().then_some("drain timeout elapsed")
+                }
+                () = &mut abort => Some("shutdown forced"),
+            };
+            if let Some(reason) = left {
+                tracing::warn!("{reason}; leaving warm sandboxes for the next start to reap");
+            }
+        }
+        drop(turns);
         app.store().close().await;
         tracing::info!("stopped");
         failure.map_or(Ok(()), Err)
@@ -462,6 +523,50 @@ fn panicked(err: JoinError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::config::tests::{MINIMAL, env};
+    use crate::telemetry::tests::global_logs;
+
+    async fn build_routers(upstream: Option<&str>) {
+        let text = match upstream {
+            Some(upstream) => format!("{MINIMAL}\n[proxy]\nupstream = \"{upstream}\"\n"),
+            None => MINIMAL.to_owned(),
+        };
+        let config = Config::parse(&text, env()).unwrap();
+        let store = store::Store::open_in_memory(config.sealer().unwrap())
+            .await
+            .unwrap();
+        let app = App::new(config, store, None).unwrap();
+        Routers::new(&app).unwrap();
+    }
+
+    #[tokio::test]
+    async fn another_upstream_than_the_default_is_logged_as_a_warning() {
+        let upstream = "https://llm-gateway.example.com";
+        let logs = global_logs().tag();
+        build_routers(Some(upstream)).await;
+        let out = logs.snapshot();
+        let warnings: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| matches!(line["level"].as_str(), Some("WARN" | "ERROR")))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{out}");
+        assert_eq!(warnings[0]["level"], "WARN");
+        assert_eq!(warnings[0]["fields"]["upstream"], upstream);
+
+        for quiet in [None, Some(cred_proxy::DEFAULT_UPSTREAM)] {
+            build_routers(quiet).await;
+        }
+        global_logs()
+            .snapshot()
+            .matching("forwards real credentials to proxy.upstream")
+            .assert_has(&format!("\"upstream\":\"{upstream}\""))
+            .assert_lacks(&format!(
+                "\"upstream\":\"{}\"",
+                cred_proxy::DEFAULT_UPSTREAM
+            ));
+    }
 
     #[test]
     fn a_task_that_stops_early_is_an_error() {

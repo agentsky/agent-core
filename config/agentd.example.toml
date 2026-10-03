@@ -55,11 +55,13 @@ log_filter = "info"
 
 [internal]
 # The credential proxy listener that sandboxes use as ANTHROPIC_BASE_URL and
-# HTTPS_PROXY (cred-proxy.internal). Must be inside sandbox_subnet.
+# HTTPS_PROXY (cred-proxy.internal). Must be inside sandbox_subnet. With
+# [sandbox], the port must be 8080, where sandboxes reach it.
 proxy_listen = "172.30.0.2:8080"
 
 # The agentctl API listener (agentctl.internal). Must be inside
-# sandbox_subnet.
+# sandbox_subnet. With [sandbox], the port must be 8081, where sandboxes
+# reach it.
 ctl_listen = "172.30.0.2:8081"
 
 # The sandbox network, in CIDR form. The public listener refuses connections
@@ -82,6 +84,14 @@ data_dir = "/var/lib/agentd"
 attach_max_bytes = 52428800
 
 [proxy]
+# Where the credential proxy forwards the requests sandboxes send to their
+# ANTHROPIC_BASE_URL (http://cred-proxy.internal:8080), after swapping the
+# placeholder they hold for the real credential. Change it only to point
+# tests at a fake. It must be https://, or http:// to a loopback IP address,
+# so real credentials never cross a network unencrypted; agentd logs a
+# warning at startup when it isn't the default.
+upstream = "https://api.anthropic.com"
+
 # The hosts sandboxes may open HTTPS tunnels to, through the egress proxy on
 # proxy_listen (HTTPS_PROXY=http://cred-proxy.internal:8080). An exact host,
 # or *. and a suffix for every name below it (not the suffix itself), with
@@ -100,6 +110,79 @@ allow = []
 # case, and when their session's container stops.
 max_tunnels = 256
 max_session_tunnels = 32
+
+# The containers turns run in: one per active session, started from `image`
+# with the scope's volume mounted, on the sandbox network only. agentd runs
+# turns only with this section; without it, messages to agents start no
+# turn. At startup agentd connects to the Docker daemon (DOCKER_HOST, the
+# local socket by default) and stops every container a previous run of this
+# instance left.
+[sandbox]
+# The pinned sandbox image (images/sandbox/Dockerfile).
+image = "agent-core/sandbox:dev"
+
+# Docker's name for the sandbox network, which must be an existing
+# `internal` network, named exactly (not by its ID; Compose prefixes the
+# project name unless the network sets `name:`). agentd checks both each
+# time it starts a container, and refuses host, none, default and bridge.
+# Sandboxes must not reach each other on it, and an internal network alone
+# doesn't stop that: turn inter-container traffic off and let only agentd's
+# ports 8080 and 8081 through, as deploy/compose/compose.yaml and
+# isolate-sandbox.sh do. A channel's sandbox runs whatever the channel's
+# members prompt, and a private task's sandbox holds its owner's files.
+network = "sandbox"
+
+# agentd's data directory as the Docker daemon sees it, when agentd runs in
+# a container that mounts it elsewhere: bind mounts name host paths. Unset,
+# store.data_dir is used as it is.
+# host_data_dir = "/srv/agentd/data"
+
+# The uid and gid sessions run as, never 0. The image's `agent` user.
+uid = 10001
+gid = 10001
+
+# Limits per sandbox: memory in MiB (no swap on top), CPUs, processes, and
+# the size of its /tmp in MiB (which counts toward the memory).
+memory_mb = 4096
+cpus = 2.0
+pids_limit = 1024
+tmp_size_mb = 512
+
+# How long stopping a container waits after SIGTERM before killing it, in
+# seconds, at most 60.
+stop_timeout_secs = 10
+
+# cleanupPeriodDays in each session's settings.json, so idle threads keep
+# their transcripts. Claude Code's own default is 30.
+cleanup_period_days = 3650
+
+# This agentd's name in its containers' agentd.instance label. Two agentd on
+# one Docker host need different names, or they stop each other's sandboxes.
+instance = "agentd"
+
+# The `claude` processes turns run in. A process reaches the credential proxy
+# as http://cred-proxy.internal:8080 and the agentctl API as
+# http://agentctl.internal:8081, agentd's names on the sandbox network, so
+# internal.proxy_listen and internal.ctl_listen use those ports.
+[runner]
+# The claude executable in the sandbox image: a name on its PATH or an
+# absolute path.
+claude_bin = "claude"
+
+# How long one turn may take, in seconds, before its process is killed and
+# the turn fails (1 to 86400).
+turn_timeout_secs = 1800
+
+# How long a session's container and process stay warm after its last turn,
+# in seconds (1 to 86400). The next turn after that resumes the transcript in
+# a new container.
+idle_timeout_secs = 900
+
+# How many containers one agent may run in one scope (a channel, a DM, its
+# private side) at once, and in all. A turn past either cap waits, after an
+# idle container is stopped for it if there is one (1 to 4096).
+scope_container_cap = 4
+global_container_cap = 32
 
 [agents]
 # How many agents one member may have (deleted ones don't count). `create`
