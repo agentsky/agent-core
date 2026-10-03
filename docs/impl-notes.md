@@ -510,10 +510,12 @@ once its session was warm, which is also true while the turn is still
 starting its process; a kill there ends the turn before anything is
 billed. The test also waits for the turn's upstream model request.
 
-Pipeline tests slept and assumed the platform's copy of an agent's post
-was already waiting for its attribution. Nothing marks that wait, so the
-tests order their steps: the copy is sent before the turn that posts the
-reply starts, and is checked to be still waiting before the reply goes.
+Pipeline tests slept and assumed an agent's post was already waiting for
+its attribution. Nothing marks that wait, so the tests order their steps:
+the post is sent before another turn starts, and is checked to be still
+waiting before its attribution can exist. Where that turn posts the reply
+the post is a copy of, the reply is held until the check; where the turn
+crashes, the test records the attribution itself, after the check.
 A separate test pins the wait itself: another agent's unattributed post
 that names this agent is ignored after the configured 3 s, longer than
 the 2 s default, and within 10 s.
