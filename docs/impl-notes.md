@@ -490,6 +490,14 @@ once its session was warm, which is also true while the turn is still
 starting its process; a kill there ends the turn before anything is
 billed. The test also waits for the turn's upstream model request.
 
+Pipeline tests slept and assumed the platform's copy of an agent's post
+was already waiting for its attribution. Nothing marks that wait, so the
+tests order their steps: the copy is sent before the turn that posts the
+reply starts, and is checked to be still waiting before the reply goes.
+A separate test pins the wait itself: another agent's unattributed post
+that names this agent is ignored after the configured 3 s, longer than
+the 2 s default, and within 10 s.
+
 ## T05: store
 
 ### The key reaches the store through `open`
