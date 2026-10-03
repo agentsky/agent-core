@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use agentd::server::{Routers, Worker};
 use secrecy::ExposeSecret;
 
 pub const CONFIG: &str = r#"
@@ -87,4 +88,13 @@ pub fn read_response(stream: &mut TcpStream) -> Option<Response> {
         .map_or("", |(_, body)| body)
         .to_owned();
     Some(Response { status, body })
+}
+
+/// `routers` with a worker that never ends, so the drain takes all of
+/// `server.drain_timeout_secs`.
+pub fn with_a_hung_worker(mut routers: Routers) -> Routers {
+    routers
+        .workers
+        .push(Worker::new("hung worker", std::future::pending::<()>()));
+    routers
 }

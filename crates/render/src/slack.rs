@@ -879,12 +879,27 @@ fn looks_like_domain(host: &str) -> bool {
         && (named || tld.starts_with("xn--") || ipv4)
 }
 
+/// `mrkdwn` with everything Slack might show as code left out, whatever
+/// rule it pairs backticks by: all from the first backtick to the last.
+/// Code, fenced or inline, has a backtick on each side of what it holds,
+/// so a `<@U…>` token left here is one Slack shows as a mention, wherever
+/// [`to_mrkdwn`] or [`split`](crate::split) left a backtick. A token Slack
+/// shows as text between two backticks, as in `` `a` <@U1> `b` ``, is left
+/// out too: a mention missed hands off to no one, which is safe, while one
+/// counted that the thread sees as code would hand off unseen.
+pub fn without_code(mrkdwn: &str) -> String {
+    match (mrkdwn.find('`'), mrkdwn.rfind('`')) {
+        (Some(first), Some(last)) => format!("{} {}", &mrkdwn[..first], &mrkdwn[last + 1..]),
+        _ => mrkdwn.to_owned(),
+    }
+}
+
 /// Writes `<url>` or `<url|label>`. `label` must already be escaped.
 fn push_slack_link(url: &str, label: &str, out: &mut String) {
     out.push('<');
     for (i, c) in url.char_indices() {
         match c {
-            '|' | ' ' => out.push_str(&percent(c)),
+            '|' | ' ' | '`' => out.push_str(&percent(c)),
             '@' | '#' | '!' if i == 0 => out.push_str(&percent(c)),
             _ => push_escaped(c, out),
         }

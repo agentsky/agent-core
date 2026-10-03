@@ -116,6 +116,7 @@ struct Recording {
     inner: ProcessSandbox,
     started: Mutex<Vec<Started>>,
     stop_delay: Mutex<Duration>,
+    stops: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -149,6 +150,7 @@ impl Sandbox for Recording {
     }
 
     async fn stop(&self, container: &ContainerId) -> sandbox::Result<()> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
         let delay = *self.stop_delay.lock().unwrap();
         tokio::time::sleep(delay).await;
         self.inner.stop(container).await
@@ -177,6 +179,7 @@ struct Stack {
     alice: MemberId,
     failing: Arc<AtomicUsize>,
     stop: oneshot::Sender<()>,
+    abort: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
     fake: FakeAnthropic,
     _dir: TempDir,
@@ -257,6 +260,11 @@ const SEEN: &str = "sleep 1; cat in.txt > seen.txt && agentctl attach seen.txt";
 /// sandbox running `fake-claude`, alice and bob linked, and alice's agent
 /// `helper`, whose bot is `UBOT`. `limits` goes in `[limits]`.
 async fn start(limits: &str) -> Stack {
+    start_with_drain(limits, 5).await
+}
+
+/// [`start`], with a drain timeout of `drain_timeout_secs`.
+async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
     let dir = TempDir::new("agentd-test");
@@ -265,7 +273,11 @@ async fn start(limits: &str) -> Stack {
         "{}\n[proxy]\nupstream = \"{}\"\n[limits]\n{limits}\n",
         common::CONFIG
             .replace("/nonexistent/agentd", &dir.path().display().to_string())
-            .replace("sqlite::memory:", &dir.db_url()),
+            .replace("sqlite::memory:", &dir.db_url())
+            .replace(
+                "drain_timeout_secs = 5",
+                &format!("drain_timeout_secs = {drain_timeout_secs}")
+            ),
         fake.uri()
     );
     let config = Config::parse(&text, env()).unwrap();
@@ -346,6 +358,7 @@ async fn start(limits: &str) -> Stack {
         inner: ProcessSandbox::new(store.clone(), dir.path()).unwrap(),
         started: Mutex::default(),
         stop_delay: Mutex::default(),
+        stops: AtomicUsize::default(),
     });
     let turns = Turns::start(&app, sandbox.clone(), settings).unwrap();
     let manager = Arc::new(MockSurface::new());
@@ -363,11 +376,16 @@ async fn start(limits: &str) -> Stack {
     );
     let server = server.with_pipeline(pipeline.clone());
     let (stop, stopped) = oneshot::channel::<()>();
+    let (abort, aborted) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
         async {
             let _ = stopped.await;
         },
-        std::future::pending(),
+        async {
+            if aborted.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        },
     ));
     Stack {
         app,
@@ -383,6 +401,7 @@ async fn start(limits: &str) -> Stack {
         alice,
         failing,
         stop,
+        abort,
         task,
         fake,
         _dir: dir,
@@ -499,6 +518,34 @@ impl Stack {
         }
     }
 
+    /// Approves consent `id`, waits until its task's turn reached the
+    /// model, and returns its session. A turn cut before then ends in an
+    /// error, not a crash, and isn't billed.
+    async fn run_task(&self, id: ConsentId) -> SessionId {
+        let upstream = self.fake.message_requests().await.len();
+        self.approve(id).await;
+        let started = Instant::now();
+        loop {
+            if let Some(session) = self
+                .store()
+                .consent(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .private_session
+                && self.turns.sessions().is_warm(session)
+                && self.fake.message_requests().await.len() > upstream
+            {
+                return session;
+            }
+            assert!(
+                started.elapsed() < WAIT,
+                "consent {id}'s task never reached the model"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Waits until consent `id`'s work is done.
     async fn finished(&self, id: ConsentId) -> store::Consent {
         let started = Instant::now();
@@ -577,6 +624,38 @@ impl Stack {
     async fn stop(self) {
         self.stop.send(()).unwrap();
         self.task.await.unwrap().unwrap();
+    }
+
+    /// Shuts agentd down and, while the shutdown is still under way,
+    /// forces it with a second signal: at once, or, `once_killing`, once
+    /// the shutdown has started stopping a container, so it is past the
+    /// turn drain and waits for its kills. Returns how long the shutdown
+    /// took once forced. Then kills `session`, whose turn the forced
+    /// shutdown left to its kills, at once, and stops every session, so no
+    /// turn outlives the test.
+    async fn force(self, once_killing: bool, session: SessionId) -> Duration {
+        let stops = self.sandbox.stops.load(Ordering::SeqCst);
+        self.stop.send(()).unwrap();
+        let started = Instant::now();
+        while once_killing
+            && self.sandbox.stops.load(Ordering::SeqCst) == stops
+            && !self.task.is_finished()
+        {
+            assert!(started.elapsed() < WAIT, "the shutdown never killed a turn");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !self.task.is_finished(),
+            "the shutdown ended before it was forced"
+        );
+        let forced = Instant::now();
+        self.abort.send(()).unwrap();
+        self.task.await.unwrap().unwrap();
+        let took = forced.elapsed();
+        *self.sandbox.stop_delay.lock().unwrap() = Duration::ZERO;
+        self.turns.sessions().kill(session).await;
+        self.turns.sessions().stop_all().await;
+        took
     }
 }
 
@@ -1188,13 +1267,14 @@ async fn owner_requester_at_hop_one_needs_a_card() {
                 msg: &by_writer,
                 thread_root: None,
                 agent: Some(writer.id),
-                turn: None,
+                turn: Some(core_types::TurnId::new_v4()),
                 requester: &core_types::Requester {
                     member: Some(stack.alice),
                     key: key("alice"),
                 },
                 hop: core_types::Hop::ZERO,
                 consent: None,
+                hands_off: true,
             },
             OffsetDateTime::now_utc(),
         )
@@ -1442,20 +1522,8 @@ async fn a_stale_claim_leaves_the_newer_claims_session_alone() {
         )
         .await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
+    stack.run_task(consent).await;
     let store = stack.store();
-    let started = Instant::now();
-    while !store
-        .consent(consent)
-        .await
-        .unwrap()
-        .unwrap()
-        .private_session
-        .is_some_and(|session| stack.turns.sessions().is_warm(session))
-    {
-        assert!(started.elapsed() < WAIT, "the task never started");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     let lapsed = OffsetDateTime::now_utc() + agentd::pipeline::WORK_LEASE + Duration::from_secs(1);
     let newer = store
         .claim_consent_work(consent, lapsed, lapsed + agentd::pipeline::WORK_LEASE)
@@ -1564,25 +1632,7 @@ async fn a_shutdown_kills_and_meters_the_turn_it_cuts() {
         )
         .await;
     stack.card_to("alice").await;
-    let upstream = stack.fake.message_requests().await.len();
-    stack.approve(consent).await;
-    let started = Instant::now();
-    let session = loop {
-        if let Some(session) = stack
-            .store()
-            .consent(consent)
-            .await
-            .unwrap()
-            .unwrap()
-            .private_session
-            && stack.turns.sessions().is_warm(session)
-            && stack.fake.message_requests().await.len() > upstream
-        {
-            break session;
-        }
-        assert!(started.elapsed() < WAIT, "the task never reached the model");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let session = stack.run_task(consent).await;
     let (store, alice) = (stack.store(), stack.alice);
     let billed = || async move {
         store
@@ -1631,23 +1681,7 @@ async fn a_shutdown_tells_cut_threads_before_its_kills_end() {
     let stack = start("").await;
     let consent = stack.ask("bob", "t1", "sleep 90").await;
     stack.card_to("alice").await;
-    stack.approve(consent).await;
-    let store = stack.store();
-    let started = Instant::now();
-    let session = loop {
-        if let Some(session) = store
-            .consent(consent)
-            .await
-            .unwrap()
-            .unwrap()
-            .private_session
-            && stack.turns.sessions().is_warm(session)
-        {
-            break session;
-        }
-        assert!(started.elapsed() < WAIT, "the task never started");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+    let session = stack.run_task(consent).await;
     let before = stack.mock.calls().len();
     let again = stack.mention("bob", "t1-again", Some("t1"));
     let pipeline = stack.pipeline.clone();
@@ -1687,6 +1721,34 @@ async fn a_shutdown_tells_cut_threads_before_its_kills_end() {
     channel.abort();
     *stack.sandbox.stop_delay.lock().unwrap() = Duration::ZERO;
     stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_signal_leaves_the_kills_of_the_turns_it_cuts_short() {
+    let stack = start("").await;
+    let consent = stack.ask("bob", "t1", "sleep 90").await;
+    stack.card_to("alice").await;
+    let session = stack.run_task(consent).await;
+    *stack.sandbox.stop_delay.lock().unwrap() = Duration::from_secs(20);
+    let took = stack.force(false, session).await;
+    assert!(
+        took < Duration::from_secs(10),
+        "the forced shutdown waited {took:?} for the kills"
+    );
+}
+
+#[tokio::test]
+async fn a_second_signal_while_a_shutdown_waits_for_its_kills_stops_the_wait() {
+    let stack = start_with_drain("", 1).await;
+    let consent = stack.ask("bob", "t1", "sleep 90").await;
+    stack.card_to("alice").await;
+    let session = stack.run_task(consent).await;
+    *stack.sandbox.stop_delay.lock().unwrap() = Duration::from_secs(20);
+    let took = stack.force(true, session).await;
+    assert!(
+        took < Duration::from_secs(10),
+        "the second signal still waited {took:?} for the kills"
+    );
 }
 
 #[tokio::test]

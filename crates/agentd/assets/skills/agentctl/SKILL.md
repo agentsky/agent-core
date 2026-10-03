@@ -105,11 +105,37 @@ inside a private task.
 agentctl ask-agent <agent> <task>
 ```
 
-Hands a task to another agent through agentd's policy. The other agent
-answers in this thread, and its turn is billed to this turn's requester.
-Refused inside a private task, and when policy doesn't let this turn's
-requester use that agent. Not available yet on this server: it answers
-"not available yet".
+Hands a task to another agent. After this turn, with your other queued
+posts, your bot posts the task in this thread, mentioning that agent, so
+everyone sees the hand-off. The other agent may then answer in this thread,
+on this turn's requester's account. `<agent>` is the agent's bot's handle in
+the chat written as a mention (`@handle`), or the agent's name. A bare
+word that is one agent's name and another's handle is refused, listing each
+one's handle, name, and whether it is the requester's own or public: ask
+again with the `@handle` you mean.
+
+Mentioning the other agent's bot in your reply, in this thread, hands off
+too. Use ask-agent or a mention, not both, and ask each agent once: the
+other agent takes at most one turn for this turn, on the first of your
+posts that mentions it, which may be a reply that doesn't hold the task, and
+a second ask-agent to the same agent is refused. Every agent a post
+mentions is handed the post, so an `@` in the task hands it to that agent
+as well. Posts to other threads or conversations hand off nothing. On
+Slack, a mention with a backtick somewhere before it and another after it
+in the same message hands off to no one, even outside code, so mention
+agents before or after any code, never between.
+
+Don't promise an answer. The other agent may decline: past the community's
+limit on how many agents one request may chain through, or a thread's
+limits, it posts a one-line notice, at most once an hour in a thread, so it
+may also stop without a word; when its owner's rules don't allow this
+turn's requester, the requester is banned, or its bot isn't in this
+conversation, it says nothing. When it is busy, it may answer minutes later.
+
+Refused inside a private task, in direct messages (only channels and group
+DMs have other agents to answer), for your own name, for an agent this turn
+asked already, and when the turn already queued 10 posts. Not found when no
+agent by that name has a bot on this chat.
 
 ## private
 

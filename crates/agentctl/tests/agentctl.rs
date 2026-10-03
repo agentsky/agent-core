@@ -15,8 +15,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse as _;
 use core_types::{
     AgentId, ConsentId, ConvRef, CtlError, CtlErrorCode, Hop, LeaseId, LockRequest, LockResponse,
-    MemberKey, MessageId, Msg, Requester, ScopeKey, SessionId, Side, Surface, SurfaceKind,
-    ThreadKey, TurnId, TurnKind, VolumeKey,
+    MemberKey, MessageId, Msg, ReplyTarget, Requester, ScopeKey, SessionId, Side, Surface,
+    SurfaceKind, ThreadKey, TurnId, TurnKind, VolumeKey,
 };
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
@@ -48,6 +48,48 @@ impl SurfaceLookup for Lookup {
     }
 }
 
+/// What `ask-agent` prints, without its newline.
+const ASKED: &str = "Queued. The task is posted in this thread after this turn, and the other agent may answer there.";
+
+/// Stores the agent `reviewer`, whose active Slack bot in `T1` is
+/// `U0REVIEW`, for `ask-agent` to name.
+async fn reviewer(store: &Store) {
+    let now = OffsetDateTime::now_utc();
+    let owner_key = MemberKey {
+        surface: SurfaceKind::Slack,
+        team: "T1".into(),
+        user: "U0OWNER".into(),
+    };
+    let owner = store.ensure_member(&owner_key, "owner", now).await.unwrap();
+    let team = "T1".into();
+    let store::AgentCreation::Created(_, binding) = store
+        .create_agent(
+            &store::NewAgent {
+                owner,
+                name: "reviewer",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            now,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    store
+        .set_binding_bot_user(binding, &"U0REVIEW".into(), "reviewer")
+        .await
+        .unwrap();
+    store
+        .activate_binding(binding, &secrecy::SecretString::from("t"), now)
+        .await
+        .unwrap();
+}
+
 struct Server {
     ctl: Ctl,
     url: String,
@@ -73,6 +115,7 @@ impl Server {
             consents: ConsentSettings::in_data_dir(dir.path()),
         };
         tune(&mut settings);
+        reviewer(&store).await;
         let surface = Arc::new(MockSurface::new());
         let ctl = Ctl::new(store, settings, Arc::new(Lookup(surface.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -312,10 +355,10 @@ async fn each_subcommand_works_against_the_server() {
         .run(&token, &["lock", "--", "sh", "-c", "echo inside the lock"])
         .await;
     assert_eq!(out.ok(), "inside the lock\n");
-    server
+    let out = server
         .run(&token, &["ask-agent", "reviewer", "look", "at", "this"])
-        .await
-        .refused("agentctl ask-agent is not available yet");
+        .await;
+    assert_eq!(out.ok(), format!("{ASKED}\n"));
     server
         .run(&token, &["private", "--file", "notes.md", "check", "it"])
         .await
@@ -340,9 +383,18 @@ async fn each_subcommand_works_against_the_server() {
         std::fs::read_to_string(&outbox.attachments()[0].path).unwrap(),
         "# notes\n"
     );
-    assert_eq!(outbox.posts().len(), 1);
-    assert_eq!(outbox.posts()[0].text, "all done");
-    assert_eq!(outbox.posts()[0].to, thread().into());
+    let posts: Vec<(&str, ReplyTarget)> = outbox
+        .posts()
+        .iter()
+        .map(|post| (post.text.as_str(), post.to.clone()))
+        .collect();
+    assert_eq!(
+        posts,
+        [
+            ("all done", thread().into()),
+            ("@U0REVIEW:\n\nlook at this", thread().into()),
+        ]
+    );
     assert_eq!(outbox.reactions().len(), 1);
     assert_eq!(outbox.reactions()[0].emoji, "tada");
     assert_eq!(outbox.reactions()[0].msg.id, MessageId::new("100.2"));
@@ -1067,10 +1119,7 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
             "Exit code 1\nagentctl: on the public side, agentctl post may only target this \
              conversation; use --to here",
         ),
-        (
-            true,
-            "Exit code 1\nagentctl: agentctl ask-agent is not available yet",
-        ),
+        (false, ASKED),
         (
             true,
             "Exit code 1\nagentctl: the agent is paused or was deleted",
@@ -1081,8 +1130,12 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
 
     let outbox = server.ctl.end_turn(&token).await.unwrap().unwrap();
     assert_eq!(outbox.attachments().len(), 1);
-    assert_eq!(outbox.posts().len(), 1);
-    assert_eq!(outbox.posts()[0].text, "see the plot");
+    let texts: Vec<&str> = outbox
+        .posts()
+        .iter()
+        .map(|post| post.text.as_str())
+        .collect();
+    assert_eq!(texts, ["see the plot", "@U0REVIEW:\n\nreview"]);
     assert_eq!(outbox.reactions()[0].msg.id, MessageId::new("99.9"));
 }
 

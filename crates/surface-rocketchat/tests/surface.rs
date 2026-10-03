@@ -103,12 +103,33 @@ async fn post_replies_in_the_thread_as_the_bot() {
         .surface
         .post(&target("GENERAL", Some(&root)), "answer")
         .await
-        .unwrap();
+        .unwrap()
+        .msg;
     assert_eq!(posted.conv, conv("GENERAL"));
     let stored = s.fake.message(posted.id.as_str()).unwrap();
     assert_eq!(stored.text, "answer");
     assert_eq!(stored.tmid.as_deref(), Some(root.as_str()));
     assert_eq!(stored.user_id, s.bot);
+}
+
+#[tokio::test]
+async fn post_reports_whom_the_server_reads_the_message_as_mentioning() {
+    let s = setup().await;
+    let posted = s
+        .surface
+        .post(
+            &target("GENERAL", None),
+            "@alice look, @alice and @all and @nobody",
+        )
+        .await
+        .unwrap();
+    assert_eq!(posted.mentions, [UserId::from(s.alice.as_str())]);
+    let plain = s
+        .surface
+        .post(&target("GENERAL", None), "no one")
+        .await
+        .unwrap();
+    assert!(plain.mentions.is_empty());
 }
 
 #[tokio::test]
@@ -118,7 +139,8 @@ async fn edit_and_react_act_on_the_posted_message() {
         .surface
         .post(&target("GENERAL", None), "draft")
         .await
-        .unwrap();
+        .unwrap()
+        .msg;
     s.surface.edit(&posted, "final").await.unwrap();
     s.surface.react(&posted, "eyes").await.unwrap();
     s.surface.react(&posted, "eyes").await.unwrap();

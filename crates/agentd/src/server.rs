@@ -34,6 +34,8 @@ use axum::routing::get;
 use axum::serve::Listener;
 use core_types::{Sender, Surface as _};
 use cred_proxy::CredProxy;
+use futures::FutureExt as _;
+use futures::future::FusedFuture as _;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -61,6 +63,11 @@ use crate::sweeper::{self, SWEEP_INTERVAL};
 
 /// How long `/healthz` waits for the store before reporting it unavailable.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a forced shutdown still gives the last release of the
+/// hand-offs let go ([`Pipeline::release_cut_hand_offs`]), so a store
+/// write that hangs can't hold the process.
+const FORCED_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The routes each listener serves, and the workers behind them.
 #[derive(Debug)]
@@ -295,17 +302,25 @@ impl Server {
     ///    requests, the workers and the sweeper get what is left of the
     ///    same timeout to finish. Whatever is still running then is
     ///    dropped.
-    /// 4. With turns, every warm session's process and container is
-    ///    stopped, within what is left of the same timeout
-    ///    ([`Pipeline::stop_sessions`]). A drain that was cut short, by the
-    ///    timeout or by `abort`, or that left no time, skips it, and the
-    ///    next start reaps what is left. A stop that runs out of time or is
-    ///    cut short by `abort` leaves the sessions it already began stopping
-    ///    to finish in the background: their agentctl token revocations
-    ///    fail once the store is closed, which the runner logs as giving up,
-    ///    and the idle reaper they keep alive runs until the process exits.
-    ///    The next start purges the tokens and reaps the containers.
-    /// 5. The pipeline is dropped, and the store is closed.
+    /// 4. The hand-offs let go since the drain began, by the hand-off
+    ///    worker's last pass included, are made due at once
+    ///    ([`Pipeline::release_cut_hand_offs`]), within a second if the
+    ///    shutdown was forced and until a second signal otherwise.
+    /// 5. With turns, every warm session's process and container is
+    ///    stopped, after that release, which writes the same store and
+    ///    matters more, and within what is left of the same timeout
+    ///    ([`Pipeline::stop_sessions`]). It is skipped once `abort` has
+    ///    completed or the deadline has passed, whether in the drain or
+    ///    during the release, and the next start reaps what is left. A
+    ///    release that hangs on a graceful shutdown holds the process until
+    ///    a second signal, which skips the stop. A stop that runs out of
+    ///    time or is cut short by `abort` leaves the sessions it already
+    ///    began stopping to finish in the background: their agentctl token
+    ///    revocations fail once the store is closed, which the runner logs
+    ///    as giving up, and the idle reaper they keep alive runs until the
+    ///    process exits. The next start purges the tokens and reaps the
+    ///    containers.
+    /// 6. The pipeline is dropped, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -314,7 +329,9 @@ impl Server {
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
     /// with a pipeline the consents' worker
     /// ([`Consents::run`](crate::consents::Consents::run)), whose private
-    /// tasks the pipeline drains like its turns,
+    /// tasks the pipeline drains like its turns, and the hand-off worker
+    /// ([`Pipeline::run_hand_offs`]), which runs until the pipeline is
+    /// drained or cut short, so the rows its jobs hold stay leased,
     /// with the Slack manager app the configuration token rotator and the
     /// sweeper of agents' apps (install reminders, stale creations), and with
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
@@ -364,7 +381,7 @@ impl Server {
             "ctl listener",
             ctl,
             routers.ctl,
-            internal_stopping,
+            internal_stopping.clone(),
         ));
         for worker in routers.workers {
             tasks.spawn(async move {
@@ -395,6 +412,14 @@ impl Server {
                     .run(pipeline, CONSENT_SWEEP_INTERVAL, settling)
                     .await;
                 "consent worker"
+            });
+        }
+        if let Some(pipeline) = &pipeline {
+            let pipeline = pipeline.clone();
+            let replaying = internal_stopping.clone();
+            tasks.spawn(async move {
+                pipeline.run_hand_offs(replaying).await;
+                "hand-off worker"
             });
         }
         let intake = routers.intake;
@@ -472,7 +497,7 @@ impl Server {
             "listening"
         );
 
-        let mut abort = std::pin::pin!(abort);
+        let mut abort = std::pin::pin!(abort.fuse());
         let mut failure = tokio::select! {
             () = shutdown => None,
             Some(joined) = tasks.join_next() => Some(stopped_early(joined)),
@@ -484,30 +509,26 @@ impl Server {
         let deadline = tokio::time::Instant::now() + drain_timeout;
         stop.send_replace(true);
 
-        let mut forced = false;
         if let Some(pipeline) = &pipeline {
             pipeline.close();
             let drained = tokio::select! {
                 drained = tokio::time::timeout_at(deadline, pipeline.drain()) => drained.is_ok(),
-                () = abort.as_mut() => {
-                    forced = true;
-                    false
-                }
+                () = abort.as_mut() => false,
             };
             if !drained {
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
-                if !forced {
+                if !abort.is_terminated() {
                     tokio::select! {
                         () = pipeline.wait_for_kills() => {}
-                        () = abort.as_mut() => forced = true,
+                        () = abort.as_mut() => {}
                     }
                 }
             }
         }
         stop_internal.send_replace(true);
 
-        let cut_short = if forced {
+        let cut_short = if abort.is_terminated() {
             Some("shutdown forced; dropping in-flight work")
         } else {
             let drain = async {
@@ -521,10 +542,7 @@ impl Server {
                 drained = tokio::time::timeout_at(deadline, drain) => {
                     drained.is_err().then_some("drain timeout elapsed; dropping in-flight work")
                 }
-                () = abort.as_mut() => {
-                    forced = true;
-                    Some("shutdown forced; dropping in-flight work")
-                }
+                () = abort.as_mut() => Some("shutdown forced; dropping in-flight work"),
             }
         };
         if let Some(reason) = cut_short {
@@ -532,7 +550,22 @@ impl Server {
             tasks.shutdown().await;
         }
         if let Some(pipeline) = &pipeline {
-            if forced || tokio::time::Instant::now() >= deadline {
+            let released = if abort.is_terminated() {
+                tokio::time::timeout(FORCED_RELEASE_TIMEOUT, pipeline.release_cut_hand_offs())
+                    .await
+                    .is_ok()
+            } else {
+                tokio::select! {
+                    () = pipeline.release_cut_hand_offs() => true,
+                    () = abort.as_mut() => false,
+                }
+            };
+            if !released {
+                tracing::warn!(
+                    "shutdown forced; the hand-offs let go last are taken after their lease"
+                );
+            }
+            if abort.is_terminated() || tokio::time::Instant::now() >= deadline {
                 tracing::warn!("leaving warm sandboxes for the next start to reap");
             } else {
                 let left = tokio::select! {

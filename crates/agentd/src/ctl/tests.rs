@@ -746,20 +746,330 @@ async fn history_reads_the_turns_thread_through_the_surface() {
     assert_eq!((status, code(&value)), (501, "not_available"));
 }
 
+impl Fixture {
+    /// An agent of `owner` named `name`, whose active Slack bot in `T1` is
+    /// the user `bot`.
+    async fn bot_agent(
+        &self,
+        owner: &str,
+        name: &str,
+        bot: &str,
+        visibility: store::Visibility,
+    ) -> AgentId {
+        self.bot_agent_on(SurfaceKind::Slack, owner, name, bot, visibility)
+            .await
+    }
+
+    /// An agent of `owner` named `name`, whose active bot on `surface` in
+    /// `T1` is the user `bot`; on Rocket.Chat, `bot` is its username too.
+    async fn bot_agent_on(
+        &self,
+        surface: SurfaceKind,
+        owner: &str,
+        name: &str,
+        bot: &str,
+        visibility: store::Visibility,
+    ) -> AgentId {
+        let now = OffsetDateTime::now_utc();
+        let owner_key = MemberKey {
+            surface,
+            team: "T1".into(),
+            user: owner.into(),
+        };
+        let owner = self
+            .store
+            .ensure_member(&owner_key, owner, now)
+            .await
+            .unwrap();
+        let team = "T1".into();
+        let store::AgentCreation::Created(agent, binding) = self
+            .store
+            .create_agent(
+                &store::NewAgent {
+                    owner,
+                    name,
+                    persona: "p",
+                    visibility,
+                    surface,
+                    team: &team,
+                },
+                10,
+                now,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("created");
+        };
+        let username = match surface {
+            SurfaceKind::Slack => name,
+            SurfaceKind::RocketChat => bot,
+        };
+        self.store
+            .set_binding_bot_user(binding, &bot.into(), username)
+            .await
+            .unwrap();
+        self.store
+            .activate_binding(binding, &secrecy::SecretString::from("t"), now)
+            .await
+            .unwrap();
+        agent.id
+    }
+
+    /// A process of `agent` in `scope`, with a public turn running.
+    async fn running(&self, agent: AgentId, scope: ScopeKey) -> ProcessToken {
+        let info = ProcessInfo {
+            session: SessionId::new_v4(),
+            agent,
+            volume: VolumeKey { agent, scope },
+            container_ip: CONTAINER.parse().unwrap(),
+        };
+        let token = self.ctl.issue_process_token(info).await.unwrap();
+        self.ctl.begin_turn(&token, public()).await.unwrap();
+        token
+    }
+
+    async fn ask(&self, token: &ProcessToken, agent: &str, task: &str) -> (u16, Value) {
+        self.call(
+            Some(token),
+            "/v1/ask-agent",
+            json!({"agent": agent, "task": task}),
+        )
+        .await
+    }
+}
+
 #[tokio::test]
-async fn ask_agent_is_not_available_yet() {
+async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
     let fixture = Fixture::new().await;
-    let (_, token) = fixture.process().await;
-    fixture.ctl.begin_turn(&token, public()).await.unwrap();
-    let (status, value) = fixture.call(Some(&token), "/v1/ask-agent", json!({})).await;
-    assert_eq!(status, 501);
-    assert_eq!(code(&value), "not_available");
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    fixture
+        .bot_agent("U0OWNER", "reviewer", "U0REVIEW", public)
+        .await;
+    fixture
+        .bot_agent("U0OWNER", "scout", "U0SCOUT", public)
+        .await;
+    for (named, task) in [
+        ("reviewer", " look at this "),
+        ("@U0REVIEW", "and this"),
+        ("<@U0REVIEW|reviewer>", "and that"),
+        ("REVIEWER", "a | b\n---|---"),
+    ] {
+        let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+        let (status, value) = fixture.ask(&token, named, task).await;
+        assert_eq!(status, 200, "{named}: {value}");
+        let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+        let [post] = outbox.posts() else {
+            panic!("{named}: one post");
+        };
+        assert_eq!(post.to, ReplyTarget::from(thread()));
+        assert_eq!(
+            post.text,
+            format!("@U0REVIEW:\n\n{}", task.trim()),
+            "the mention is a paragraph of its own, whatever the task holds"
+        );
+    }
+
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    for (named, status) in [("reviewer", 200), ("@U0REVIEW", 403), ("scout", 200)] {
+        let (got, value) = fixture.ask(&token, named, "t").await;
+        assert_eq!(got, status, "{named}: {value}");
+        if got == 403 {
+            assert_eq!(code(&value), "refused");
+            assert!(
+                value["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already asked @U0REVIEW")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn ask_agent_reads_a_mention_as_a_handle_and_refuses_a_bare_word_two_agents_fit() {
+    let fixture = Fixture::new().await;
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    fixture
+        .bot_agent("U0OWNER", "reviewer", "U0REVIEW", public)
+        .await;
+    fixture
+        .bot_agent("U0SQUAT", "u0review", "U0SQUATBOT", public)
+        .await;
+    let asked = async |named: &str| {
+        let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+        let (status, value) = fixture.ask(&token, named, "Look").await;
+        let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+        let texts: Vec<String> = outbox
+            .posts()
+            .iter()
+            .map(|post| post.text.clone())
+            .collect();
+        (status, value, texts)
+    };
+    for (named, to) in [
+        ("@U0REVIEW", "@U0REVIEW"),
+        ("<@U0REVIEW|u0review>", "@U0REVIEW"),
+        ("reviewer", "@U0REVIEW"),
+        ("@U0SQUATBOT", "@U0SQUATBOT"),
+    ] {
+        let (status, value, texts) = asked(named).await;
+        assert_eq!(status, 200, "{named}: {value}");
+        assert_eq!(texts, [format!("{to}:\n\nLook")], "{named}");
+    }
+    let (status, value, texts) = asked("U0REVIEW").await;
+    assert_eq!((status, code(&value)), (400, "bad_request"), "{value}");
     assert!(
         value["message"]
             .as_str()
             .unwrap()
-            .contains("not available yet")
+            .contains("@U0REVIEW (reviewer, public), @U0SQUATBOT (u0review, public)"),
+        "{value}"
     );
+    assert!(texts.is_empty());
+
+    let rocket = |id: &str| ConvRef {
+        surface: SurfaceKind::RocketChat,
+        team: "T1".into(),
+        conversation: id.into(),
+    };
+    let rc_helper = fixture
+        .bot_agent_on(SurfaceKind::RocketChat, "carol", "helper", "helper", public)
+        .await;
+    fixture
+        .bot_agent_on(
+            SurfaceKind::RocketChat,
+            "mallory",
+            "reviewer",
+            "reviewer",
+            public,
+        )
+        .await;
+    fixture
+        .bot_agent_on(
+            SurfaceKind::RocketChat,
+            "bob",
+            "reviewer",
+            "bob.reviewer",
+            public,
+        )
+        .await;
+    let bob = fixture
+        .store
+        .member_for_identity(&MemberKey {
+            surface: SurfaceKind::RocketChat,
+            team: "T1".into(),
+            user: "bob".into(),
+        })
+        .await
+        .unwrap();
+    let rc_asked = async |named: &str| {
+        let token = fixture
+            .running(rc_helper, ScopeKey::Channel(rocket("GENERAL")))
+            .await;
+        let mut turn = turn(TurnKind::Normal, Side::Public);
+        turn.thread.conv = rocket("GENERAL");
+        turn.requester.member = bob;
+        fixture.ctl.begin_turn(&token, turn).await.unwrap();
+        let (status, value) = fixture.ask(&token, named, "Look").await;
+        let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+        let texts: Vec<String> = outbox
+            .posts()
+            .iter()
+            .map(|post| post.text.clone())
+            .collect();
+        (status, value, texts)
+    };
+    let (status, value, texts) = rc_asked("reviewer").await;
+    assert_eq!(
+        (status, code(&value)),
+        (400, "bad_request"),
+        "mallory's bot took the username reviewer, the name of bob's agent: {value}"
+    );
+    let message = value["message"].as_str().unwrap();
+    assert!(
+        message.contains("@reviewer (reviewer, public)")
+            && message.contains("@bob.reviewer (reviewer, yours)"),
+        "{message}"
+    );
+    assert!(texts.is_empty());
+    for (named, to) in [
+        ("@bob.reviewer", "@bob.reviewer"),
+        ("@reviewer", "@reviewer"),
+    ] {
+        let (status, value, texts) = rc_asked(named).await;
+        assert_eq!(status, 200, "{named}: {value}");
+        assert_eq!(texts, [format!("{to}:\n\nLook")], "{named}");
+    }
+}
+
+#[tokio::test]
+async fn ask_agent_refuses_what_could_not_hand_off() {
+    let fixture = Fixture::new().await;
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    fixture.bot_agent("U0A", "twin", "U0TWINA", public).await;
+    fixture.bot_agent("U0B", "twin", "U0TWINB", public).await;
+    fixture
+        .bot_agent("U0B", "secret", "U0SECRET", store::Visibility::Private)
+        .await;
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    let cases = [
+        ("helper", "t", 403, "refused", "itself"),
+        ("@U0HELPER", "t", 403, "refused", "itself"),
+        ("nobody", "t", 404, "not_found", "no agent called nobody"),
+        ("secret", "t", 404, "not_found", "no agent called secret"),
+        (
+            "twin",
+            "t",
+            400,
+            "bad_request",
+            "@U0TWINA (twin, public), @U0TWINB (twin, public)",
+        ),
+        ("reviewer", "  ", 400, "bad_request", "the task is empty"),
+        ("@", "t", 400, "bad_request", "name the agent"),
+    ];
+    for (named, task, status, error, says) in cases {
+        let (got, value) = fixture.ask(&token, named, task).await;
+        assert_eq!((got, code(&value)), (status, error), "{named}: {value}");
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains(says), "{named}: {message}");
+    }
+    let (status, value) = fixture
+        .ask(&token, "@U0TWINA", &"x".repeat(MAX_POST_BYTES))
+        .await;
+    assert_eq!((status, code(&value)), (413, "too_large"), "{value}");
+    for _ in 0..super::outbox::MAX_POSTS {
+        let (status, value) = fixture.call(Some(&token), "/v1/post", post("here")).await;
+        assert_eq!(status, 200, "{value}");
+    }
+    let (status, value) = fixture.ask(&token, "@U0TWINA", "t").await;
+    assert_eq!((status, code(&value)), (403, "refused"), "{value}");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("already queued"),
+        "{value}"
+    );
+
+    for scope in [ScopeKey::Private, ScopeKey::Dm(conv("D1"))] {
+        let dm = fixture.running(helper, scope).await;
+        let (status, value) = fixture.ask(&dm, "@U0TWINA", "t").await;
+        assert_eq!((status, code(&value)), (403, "refused"), "{value}");
+        assert!(value["message"].as_str().unwrap().contains("channel"));
+    }
+    let group = fixture.running(helper, ScopeKey::GroupDm(conv("G1"))).await;
+    let (status, value) = fixture.ask(&group, "@U0TWINA", "t").await;
+    assert_eq!(status, 200, "{value}");
 }
 
 impl Fixture {
@@ -1255,6 +1565,7 @@ async fn short_ids_name_messages_the_session_was_shown() {
                     requester: &sender,
                     hop: Hop::ZERO,
                     consent: None,
+                    hands_off: false,
                 },
                 time::OffsetDateTime::now_utc(),
             )
