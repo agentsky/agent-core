@@ -216,7 +216,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_ensure_member_creates_one_member() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = crate::Store::open(&dir.db_url(), sealer()).await.unwrap();
         let key = member_key("u1");
         let (a, b, c, d) = tokio::join!(

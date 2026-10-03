@@ -1,8 +1,6 @@
 //! agentd's turn hooks against the real credential proxy and agentctl API:
 //! what a process gets, and what each hook points, clears and revokes.
 
-mod common;
-
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -24,11 +22,9 @@ use http_body_util::BodyExt as _;
 use runner::{ProcessEnv, Session, TurnHooks, TurnRequest};
 use secrecy::{ExposeSecret as _, SecretString};
 use store::{NewClaudeLink, Sealer, Store};
-use testkit::{FakeAnthropic, fake_anthropic};
+use testkit::{FakeAnthropic, TempDir, fake_anthropic};
 use time::OffsetDateTime;
 use tower::ServiceExt as _;
-
-use common::TempDir;
 
 const ACCESS_TOKEN: &str = "real-access-token";
 const CONTAINER: &str = "127.0.0.1";
@@ -46,7 +42,7 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
     let store = Store::open_in_memory(sealer).await.unwrap();
     let now = OffsetDateTime::now_utc();
@@ -75,7 +71,7 @@ async fn rig() -> Rig {
     let ctl = Ctl::new(
         store.clone(),
         CtlSettings {
-            staging_dir: dir.path().join("ctl-outbox"),
+            staging_dir: dir.join("ctl-outbox"),
             attach_max_bytes: 1024,
             lease_ttl: Duration::from_secs(30),
         },

@@ -14,6 +14,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
 use surface_slack::{BindingRef, SlackClient, SlackEvent, SlackInbound, SlashCommand};
+use testkit::TempDir;
 use time::OffsetDateTime;
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -1224,8 +1225,8 @@ async fn requests_from_another_workspace_are_dropped() {
 
 /// A store in a new SQLite file, its URL, and the file's directory.
 async fn file_store() -> (Store, String, TempDir) {
-    let dir = TempDir::new();
-    let url = format!("sqlite://{}", dir.0.join("agentd.db").display());
+    let dir = TempDir::new("agentd-slack");
+    let url = dir.db_url();
     let store = Store::open(
         &url,
         Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap(),
@@ -1384,23 +1385,6 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     logs.snapshot()
         .assert_has("couldn't store a checked configuration token");
     global_logs().snapshot().assert_lacks("SECRET");
-}
-
-/// A new temporary directory, removed on drop.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-slack-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 #[tokio::test]
