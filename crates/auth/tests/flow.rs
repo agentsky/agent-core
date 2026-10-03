@@ -31,6 +31,26 @@ struct Harness {
     member: MemberId,
 }
 
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("auth-test-{}", MemberId::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn db_url(&self) -> String {
+        format!("sqlite://{}", self.0.join("agentd.db").display())
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn member_key(user: &str) -> MemberKey {
     MemberKey {
         surface: SurfaceKind::RocketChat,
@@ -1285,10 +1305,9 @@ async fn concurrent_callers_share_a_failed_refresh_of_an_expired_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refresh_dropped_before_it_first_runs_lets_the_next_caller_refresh() {
-    let db = std::env::temp_dir().join(format!("auth-dropped-{}.db", MemberId::new_v4()));
-    let url = format!("sqlite://{}", db.display());
+    let dir = TempDir::new();
     let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
-    let h = harness_on(Store::open(&url, sealer).await.unwrap()).await;
+    let h = harness_on(Store::open(&dir.db_url(), sealer).await.unwrap()).await;
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
         .respond_with(token_response("access-2", Some("refresh-2")))
@@ -1326,10 +1345,6 @@ async fn a_refresh_dropped_before_it_first_runs_lets_the_next_caller_refresh() {
         .unwrap();
     assert_eq!(token.expose_secret(), "access-2");
     wait_for_plan(&h.store, h.member, "claude_pro").await;
-    drop(h);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
-    }
 }
 
 #[tokio::test]
@@ -1526,8 +1541,8 @@ async fn status_reports_the_link_the_plan_and_a_break() {
 
 #[tokio::test]
 async fn status_reads_no_token() {
-    let path = std::env::temp_dir().join(format!("auth-status-{}.db", MemberId::new_v4()));
-    let url = format!("sqlite://{}", path.display());
+    let dir = TempDir::new();
+    let url = dir.db_url();
     let key = || Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
     let store = Store::open(&url, key()).await.unwrap();
     let member = store
@@ -1543,10 +1558,6 @@ async fn status_reads_no_token() {
     let status = auth.status(member).await.unwrap();
     assert!(status.linked && !status.broken);
     assert_eq!(status.plan.plan, Some(Plan::Max));
-    drop((auth, store));
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 }
 
 #[tokio::test]
