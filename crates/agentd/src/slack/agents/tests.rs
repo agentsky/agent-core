@@ -85,6 +85,17 @@ fn app_created() -> ResponseTemplate {
     }))
 }
 
+fn bearer() -> String {
+    format!("Bearer {CONFIG_TOKEN}")
+}
+
+fn basic() -> String {
+    format!(
+        "Basic {}",
+        STANDARD.encode(format!("1111.2222:{CLIENT_SECRET}"))
+    )
+}
+
 fn app_installed() -> ResponseTemplate {
     ok(json!({
         "app_id": "A0HELPER1",
@@ -117,13 +128,9 @@ async fn harness() -> Harness {
     }
     mount(&slack, "apps.manifest.create", CONFIG_TOKEN, app_created()).await;
     mount(&slack, "apps.manifest.delete", CONFIG_TOKEN, ok(json!({}))).await;
-    let basic = format!(
-        "Basic {}",
-        STANDARD.encode(format!("1111.2222:{CLIENT_SECRET}"))
-    );
     Mock::given(method("POST"))
         .and(path("/api/oauth.v2.access"))
-        .and(header("authorization", basic.as_str()))
+        .and(header("authorization", basic().as_str()))
         .respond_with(app_installed())
         .mount(&slack)
         .await;
@@ -208,15 +215,19 @@ impl Harness {
         Some(self.store.bindings_of(agent.id).await.unwrap()[0].id)
     }
 
-    async fn calls(&self, name: &str) -> usize {
+    async fn requests(&self, name: &str) -> Vec<wiremock::Request> {
         let wanted = format!("/api/{name}");
         self.slack
             .received_requests()
             .await
             .unwrap_or_default()
-            .iter()
+            .into_iter()
             .filter(|request| request.url.path() == wanted)
-            .count()
+            .collect()
+    }
+
+    async fn calls(&self, name: &str) -> usize {
+        self.requests(name).await.len()
     }
 }
 
@@ -285,10 +296,9 @@ async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
 async fn a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again() {
     let h = harness().await;
     let (held, mut hold) = Held::new(app_created());
-    let bearer = format!("Bearer {CONFIG_TOKEN}");
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.create"))
-        .and(header("authorization", bearer.as_str()))
+        .and(header("authorization", bearer().as_str()))
         .respond_with(held)
         .up_to_n_times(1)
         .with_priority(1)
@@ -310,7 +320,14 @@ async fn a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again(
     assert!(h.store.abandon_creation(binding, now, now).await.unwrap());
     hold.release();
     assert_eq!(creating.await.unwrap(), Creation::Failed);
-    assert_eq!(h.calls("apps.manifest.delete").await, 1);
+    let deletes = h.requests("apps.manifest.delete").await;
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(
+        deletes[0].headers.get("authorization").unwrap(),
+        bearer().as_str()
+    );
+    let form: Vec<(String, String)> = serde_urlencoded::from_bytes(&deletes[0].body).unwrap();
+    assert_eq!(form, [("app_id".to_owned(), "A0HELPER1".to_owned())]);
     assert_eq!(h.calls("chat.postMessage").await, 0, "no install link");
 }
 
@@ -544,15 +561,7 @@ async fn a_closed_pipeline_gets_no_lookups_for_the_messages_left() {
         .await
         .expect("the worker ends with its queue")
         .unwrap();
-    let lookups = h
-        .slack
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|request| request.url.path() == "/api/bots.info")
-        .count();
-    assert_eq!(lookups, 0);
+    assert_eq!(h.calls("bots.info").await, 0);
 }
 
 async fn installed(h: &Harness) -> BindingId {
@@ -606,6 +615,7 @@ async fn an_app_slack_says_is_gone_counts_as_deleted() {
     let binding = installed(&h).await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.delete"))
+        .and(header("authorization", bearer().as_str()))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"ok": false, "error": "app_not_found"})),
@@ -628,6 +638,7 @@ async fn a_configuration_token_slack_refuses_is_marked_broken() {
     let binding = installed(&h).await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.delete"))
+        .and(header("authorization", bearer().as_str()))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(json!({"ok": false, "error": "token_revoked"})),
@@ -656,6 +667,7 @@ async fn a_refused_token_at_creation_is_marked_broken_and_an_expired_one_waits_f
     let h = harness().await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.create"))
+        .and(header("authorization", bearer().as_str()))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
         )
@@ -691,6 +703,7 @@ async fn an_install_granting_a_scope_the_app_does_not_ask_for_is_refused() {
     };
     Mock::given(method("POST"))
         .and(path("/api/oauth.v2.access"))
+        .and(header("authorization", basic().as_str()))
         .respond_with(ok(json!({
             "app_id": "A0HELPER1",
             "token_type": "bot",
@@ -718,6 +731,7 @@ async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
     let (held, mut hold) = Held::new(app_installed());
     Mock::given(method("POST"))
         .and(path("/api/oauth.v2.access"))
+        .and(header("authorization", basic().as_str()))
         .respond_with(held)
         .with_priority(1)
         .mount(&h.slack)
