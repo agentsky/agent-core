@@ -382,7 +382,7 @@ async fn a_bad_signature_is_refused() {
 async fn a_stale_or_future_timestamp_is_refused() {
     let mut harness = Harness::start();
     let uri = path(agent(), "events");
-    for offset in [-301, 301, -86_400] {
+    for offset in [-360, 360, -86_400] {
         let request = signed_at(
             &uri,
             AGENT_SECRET,

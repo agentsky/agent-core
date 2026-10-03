@@ -1,6 +1,7 @@
 //! The login, refresh and logout flows against wiremock peers.
 
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use auth::{Auth, AuthError, Endpoint, LinkStatus, OAuthConfig, Plan, PlanInfo, TokenSource};
@@ -39,11 +40,15 @@ fn member_key(user: &str) -> MemberKey {
 }
 
 async fn harness() -> Harness {
-    let server = MockServer::start().await;
     let store =
         Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
             .await
             .unwrap();
+    harness_on(store).await
+}
+
+async fn harness_on(store: Store) -> Harness {
+    let server = MockServer::start().await;
     let member = store
         .ensure_member(&member_key("ada"), "Ada", now())
         .await
@@ -180,6 +185,7 @@ async fn start_login_builds_the_authorize_url_and_stores_a_pending_login() {
     let h = harness().await;
     let before = now();
     let start = h.auth.start_login(h.member).await.unwrap();
+    let after = now();
     let url = Url::parse(&start.url).unwrap();
     assert_eq!(url.scheme(), "https");
     assert_eq!(url.host_str(), Some("claude.com"));
@@ -205,8 +211,8 @@ async fn start_login_builds_the_authorize_url_and_stores_a_pending_login() {
     assert_eq!(query(&url, "scope"), "user:profile user:inference");
     assert_eq!(query(&url, "code_challenge_method"), "S256");
 
-    let ttl = start.expires_at - before;
-    assert!(ttl > time::Duration::seconds(598) && ttl <= time::Duration::seconds(601));
+    assert!(start.expires_at > before + time::Duration::seconds(598));
+    assert!(start.expires_at <= after + time::Duration::seconds(600));
 
     let pending = h
         .store
@@ -310,6 +316,7 @@ async fn complete_login_exchanges_the_code_and_stores_the_link() {
         .complete_login(h.member, &paste("the-code", &state))
         .await
         .unwrap();
+    let after = now();
     assert_eq!(
         linked.plan,
         Some(PlanInfo {
@@ -343,10 +350,8 @@ async fn complete_login_exchanges_the_code_and_stores_the_link() {
         stored.rate_limit_tier.as_deref(),
         Some("default_claude_max")
     );
-    let lifetime = stored.expires_at - before;
-    assert!(
-        lifetime > time::Duration::seconds(28_790) && lifetime <= time::Duration::seconds(28_801)
-    );
+    assert!(stored.expires_at > before + time::Duration::seconds(28_790));
+    assert!(stored.expires_at <= after + time::Duration::seconds(28_800));
     assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
 }
 
@@ -1520,6 +1525,55 @@ async fn concurrent_callers_share_a_failed_refresh_of_an_expired_token() {
             ),
             "{err:?}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_dropped_before_it_first_runs_lets_the_next_caller_refresh() {
+    let db = std::env::temp_dir().join(format!("auth-dropped-{}.db", MemberId::new_v4()));
+    let url = format!("sqlite://{}", db.display());
+    let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
+    let h = harness_on(Store::open(&url, sealer).await.unwrap()).await;
+    Mock::given(method("POST"))
+        .and(path(TOKEN_PATH))
+        .respond_with(token_response("access-2", Some("refresh-2")))
+        .expect(1)
+        .mount(&h.server)
+        .await;
+    mount_profile(&h.server, "access-2", "claude_pro").await;
+    link(&h.store, h.member, "access-1", "refresh-1", -1).await;
+
+    let (auth, member) = (h.auth.clone(), h.member);
+    let joined = tokio::task::spawn_blocking(move || {
+        let side = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let joined = side.block_on(async {
+            let mut call = std::pin::pin!(auth.access_token(member));
+            std::future::poll_fn(|cx| match call.as_mut().poll(cx) {
+                Poll::Pending if auth.refresh_waiters(member) > 0 => Poll::Ready(true),
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(_) => Poll::Ready(false),
+            })
+            .await
+        });
+        drop(side);
+        joined
+    })
+    .await
+    .unwrap();
+    assert!(joined, "the call returned before joining a refresh");
+
+    let token = tokio::time::timeout(Duration::from_secs(5), h.auth.access_token(h.member))
+        .await
+        .expect("the next caller doesn't wait for the dropped refresh")
+        .unwrap();
+    assert_eq!(token.expose_secret(), "access-2");
+    wait_for_plan(&h.store, h.member, "claude_pro").await;
+    drop(h);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
 }
 
