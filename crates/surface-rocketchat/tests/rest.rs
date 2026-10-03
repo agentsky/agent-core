@@ -1541,6 +1541,32 @@ async fn subscriptions_list_the_rooms_the_user_is_in() {
 }
 
 #[tokio::test]
+async fn one_subscription_is_the_users_own_or_none() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    let helper = bot(&client, "helper").await;
+    fake.add_room("GENERAL", "c", "general");
+    fake.add_room("OTHER", "c", "other");
+    fake.add_member("GENERAL", helper.user_id().as_str());
+    let found = helper
+        .subscription(&"GENERAL".into())
+        .await
+        .unwrap()
+        .expect("the helper is in GENERAL");
+    assert_eq!(found.room.as_str(), "GENERAL");
+    assert_eq!(found.room_type, RoomType::Channel);
+    assert_eq!(found.id, format!("GENERAL{}", helper.user_id()));
+    assert_eq!(helper.subscription(&"OTHER".into()).await.unwrap(), None);
+    assert_eq!(helper.subscription(&"MISSING".into()).await.unwrap(), None);
+    let requests = fake.requests("subscriptions.getOne").await;
+    assert_eq!(requests[0].url.query(), Some("roomId=GENERAL"));
+    assert_eq!(
+        header(&requests[0], "x-user-id"),
+        Some(helper.user_id().as_str())
+    );
+}
+
+#[tokio::test]
 async fn user_info_shows_roles_to_the_manager_and_to_the_user_itself() {
     let fake = FakeRest::start().await;
     let client = manager(&fake);

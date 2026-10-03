@@ -1254,7 +1254,8 @@ Deliverables:
   and retries deactivations that failed
   ([impl-notes](impl-notes.md#connections-follow-the-store),
   [impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
-- Until T23, what isn't a command goes to `Acknowledge`: each active agent a
+- Until T23, and from then on when agentd runs no turns (no `[sandbox]`),
+  what isn't a command goes to `Acknowledge`: each active agent a
   person's message addresses reacts with `:eyes:`
   ([impl-notes](impl-notes.md#before-turns-a-bot-reacts-instead-of-replying)).
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
@@ -2299,7 +2300,8 @@ Deliverables:
   `cost_usd` holds the restored total too. This task takes it off, from that
   line read without following links and with its size capped, or from a
   total the runner keeps in `sessions` when a process exits cleanly
-  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)).
+  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)),
+  and makes `fake-claude` restore the total as the real CLI does.
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.

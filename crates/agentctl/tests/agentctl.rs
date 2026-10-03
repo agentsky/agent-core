@@ -33,10 +33,12 @@ fn uuid() -> String {
     TurnId::new_v4().to_string()
 }
 
+#[derive(Debug)]
 struct Lookup(Arc<MockSurface>);
 
+#[async_trait::async_trait]
 impl SurfaceLookup for Lookup {
-    fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
+    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
         Some(self.0.clone())
     }
 }

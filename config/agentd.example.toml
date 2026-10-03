@@ -43,9 +43,10 @@
 # callbacks. agentd terminates no TLS; put a TLS terminator in front of it.
 listen = "172.31.0.2:8443"
 
-# On SIGTERM or SIGINT agentd stops accepting connections, then waits this
-# many seconds (at most 3600) for in-flight requests before dropping them. A
-# second SIGTERM or SIGINT drops them at once.
+# On SIGTERM or SIGINT agentd stops accepting connections and messages, then
+# waits this many seconds (at most 3600) for running turns and in-flight
+# requests before dropping them; the thread of a dropped turn is told to ask
+# again. A second SIGTERM or SIGINT drops them at once.
 drain_timeout_secs = 30
 
 # Which log lines to write, in tracing-subscriber's EnvFilter syntax, for
@@ -183,6 +184,18 @@ idle_timeout_secs = 900
 # idle container is stopped for it if there is one (1 to 4096).
 scope_container_cap = 4
 global_container_cap = 32
+
+# The reaction an agent's bot puts on the message it is answering while the
+# turn runs, and takes off after: a short emoji name without colons.
+working_emoji = "hourglass_flowing_sand"
+
+# Which model a turn runs on, from the plan of the member whose account it
+# runs on (claude_max, claude_pro, claude_team, claude_enterprise, as the
+# account's profile names it). Optional: without it, the CLI picks its
+# default model.
+# [runner.models]
+# default = "claude-sonnet-5-5"
+# plans = { claude_max = "claude-opus-5-5" }
 
 [agents]
 # How many agents one member may have (deleted ones don't count). `create`

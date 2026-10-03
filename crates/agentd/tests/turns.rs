@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentd::pipeline::{TurnSettings, Turns};
+use agentd::pipeline::{Pipeline, TurnSettings, Turns};
 use agentd::server::{Addrs, Routers, Server, Worker};
 use agentd::{App, Config};
 use core_types::{
@@ -100,7 +100,7 @@ async fn start_with(
     let sandbox = Arc::new(ProcessSandbox::new(app.store().clone(), dir.path()).unwrap());
     let turns = Turns::start(&app, Arc::clone(&sandbox) as _, settings).unwrap();
     let addrs = server.addrs();
-    let server = server.with_turns(turns.clone());
+    let server = server.with_pipeline(Pipeline::for_app(&app, turns.clone()));
     let (stop, stopped) = oneshot::channel::<()>();
     let (abort, aborted) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
@@ -209,8 +209,9 @@ impl Running {
     }
 
     /// Shuts agentd down, then forces it with a second signal once the
-    /// drain is under way: once the ctl listener, which closes as the
-    /// drain begins, refuses connections.
+    /// listeners' and workers' drain is under way: once the ctl listener,
+    /// which closes as that drain begins, after the turns', refuses
+    /// connections.
     async fn force_during_the_drain(self) {
         self.stop.send(()).unwrap();
         refused(self.addrs.ctl).await;

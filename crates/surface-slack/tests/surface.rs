@@ -423,6 +423,7 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
     let (server, surface) = setup().await;
     mount(&server, "chat.update", ok(json!({}))).await;
     mount(&server, "reactions.add", ok(json!({}))).await;
+    mount(&server, "reactions.remove", ok(json!({}))).await;
     mount(
         &server,
         "chat.postEphemeral",
@@ -439,6 +440,8 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
         .post_ephemeral(&thread("1.1"), &UserId::from(USER), "psst")
         .await
         .unwrap();
+    surface.unreact(&msg, "eyes").await.unwrap();
+    assert!(surface.can_post(&conv()).await.unwrap());
     let sent = requests(&server).await;
     let update: Value = serde_json::from_slice(&sent[0].body).unwrap();
     assert_eq!(
@@ -448,6 +451,8 @@ async fn edit_react_and_ephemeral_use_the_message_conversation() {
     let reaction = form(&sent[1]);
     assert_eq!(reaction["name"], "eyes");
     assert_eq!(reaction["timestamp"], "1.2");
+    assert!(sent[3].url.path().ends_with("reactions.remove"));
+    assert_eq!(form(&sent[3])["name"], "eyes");
     let ephemeral: Value = serde_json::from_slice(&sent[2].body).unwrap();
     assert_eq!(ephemeral["user"], USER);
     assert_eq!(ephemeral["thread_ts"], "1.1");
@@ -520,6 +525,14 @@ async fn a_conversation_in_another_workspace_is_refused_before_sending() {
         ));
         assert!(matches!(
             surface.react(&msg, "x").await,
+            Err(SurfaceError::Api(_))
+        ));
+        assert!(matches!(
+            surface.unreact(&msg, "x").await,
+            Err(SurfaceError::Api(_))
+        ));
+        assert!(matches!(
+            surface.can_post(&conv).await,
             Err(SurfaceError::Api(_))
         ));
         assert!(matches!(
