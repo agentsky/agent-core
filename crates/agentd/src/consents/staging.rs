@@ -188,30 +188,16 @@ pub(super) fn hand_over(
 mod tests {
     use std::os::unix::fs::symlink;
 
+    use testkit::TempDir;
+
     use super::*;
 
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("agentd-stage-{}", uuid::Uuid::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
     fn session() -> (TempDir, TempDir) {
-        let session = TempDir::new();
-        std::fs::create_dir_all(session.0.join("work/sub")).unwrap();
-        std::fs::write(session.0.join("work/in.txt"), "input").unwrap();
-        std::fs::write(session.0.join("work/sub/data.csv"), "a,b").unwrap();
-        (session, TempDir::new())
+        let session = TempDir::new("agentd-stage");
+        std::fs::create_dir_all(session.join("work/sub")).unwrap();
+        std::fs::write(session.join("work/in.txt"), "input").unwrap();
+        std::fs::write(session.join("work/sub/data.csv"), "a,b").unwrap();
+        (session, TempDir::new("agentd-stage"))
     }
 
     fn files(paths: &[&str]) -> Vec<String> {
@@ -222,36 +208,36 @@ mod tests {
     fn staged_files_are_copied_out_and_handed_over_by_name() {
         let (session, staged) = session();
         let both = files(&["work/in.txt", "work/sub/data.csv"]);
-        let err = stage(&session.0, &both, &staged.0, 7).unwrap_err();
+        let err = stage(session.path(), &both, staged.path(), 7).unwrap_err();
         assert!(
             matches!(&err, StageError::TooLarge(file, 7) if file == "work/sub/data.csv"),
             "the cap counts the files together: {err}"
         );
-        for entry in std::fs::read_dir(&staged.0).unwrap() {
+        for entry in std::fs::read_dir(staged.path()).unwrap() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
-        let names = stage(&session.0, &both, &staged.0, 8).unwrap();
+        let names = stage(session.path(), &both, staged.path(), 8).unwrap();
         assert_eq!(names, ["in.txt", "data.csv"]);
-        std::fs::write(session.0.join("work/in.txt"), "changed later").unwrap();
-        let work = TempDir::new();
-        let me = std::fs::metadata(&work.0).unwrap();
+        std::fs::write(session.join("work/in.txt"), "changed later").unwrap();
+        let work = TempDir::new("agentd-stage");
+        let me = std::fs::metadata(work.path()).unwrap();
         let owner = (me.uid(), me.gid());
-        hand_over(&staged.0, &names, &work.0, Some(owner)).unwrap();
-        let handed = std::fs::metadata(work.0.join("in.txt")).unwrap();
+        hand_over(staged.path(), &names, work.path(), Some(owner)).unwrap();
+        let handed = std::fs::metadata(work.join("in.txt")).unwrap();
         assert_eq!((handed.uid(), handed.gid()), owner);
         assert_eq!(
-            std::fs::read_to_string(work.0.join("in.txt")).unwrap(),
+            std::fs::read_to_string(work.join("in.txt")).unwrap(),
             "input"
         );
         assert_eq!(
-            std::fs::read_to_string(work.0.join("data.csv")).unwrap(),
+            std::fs::read_to_string(work.join("data.csv")).unwrap(),
             "a,b"
         );
-        assert!(hand_over(&staged.0, &names, &work.0, None).is_err());
-        let unowned = TempDir::new();
-        hand_over(&staged.0, &names, &unowned.0, None).unwrap();
+        assert!(hand_over(staged.path(), &names, work.path(), None).is_err());
+        let unowned = TempDir::new("agentd-stage");
+        hand_over(staged.path(), &names, unowned.path(), None).unwrap();
         assert_eq!(
-            std::fs::read_to_string(unowned.0.join("data.csv")).unwrap(),
+            std::fs::read_to_string(unowned.join("data.csv")).unwrap(),
             "a,b"
         );
     }
@@ -259,14 +245,14 @@ mod tests {
     #[test]
     fn paths_outside_symlinks_and_odd_files_are_refused() {
         let (session, staged) = session();
-        let outside = TempDir::new();
-        std::fs::write(outside.0.join("secret"), "private").unwrap();
-        symlink(outside.0.join("secret"), session.0.join("work/link")).unwrap();
-        symlink(&outside.0, session.0.join("work/dirlink")).unwrap();
-        std::fs::write(session.0.join("work/big"), "123456").unwrap();
-        std::fs::write(session.0.join("work/bad\u{202E}name"), "x").unwrap();
-        std::fs::write(session.0.join("work/.mcp.json"), "{}").unwrap();
-        std::fs::write(session.0.join("work/claude.MD"), "x").unwrap();
+        let outside = TempDir::new("agentd-stage");
+        std::fs::write(outside.join("secret"), "private").unwrap();
+        symlink(outside.join("secret"), session.join("work/link")).unwrap();
+        symlink(outside.path(), session.join("work/dirlink")).unwrap();
+        std::fs::write(session.join("work/big"), "123456").unwrap();
+        std::fs::write(session.join("work/bad\u{202E}name"), "x").unwrap();
+        std::fs::write(session.join("work/.mcp.json"), "{}").unwrap();
+        std::fs::write(session.join("work/claude.MD"), "x").unwrap();
         let cases = [
             ("/etc/passwd", "is not a path"),
             ("../other/work/x", "is not a path"),
@@ -284,16 +270,16 @@ mod tests {
             ("work/claude.MD", "dotfile or CLAUDE.md"),
         ];
         for (path, reason) in cases {
-            let err = stage(&session.0, &files(&[path]), &staged.0, 5).unwrap_err();
+            let err = stage(session.path(), &files(&[path]), staged.path(), 5).unwrap_err();
             assert!(err.to_string().contains(reason), "{path}: {err}");
-            for entry in std::fs::read_dir(&staged.0).unwrap() {
+            for entry in std::fs::read_dir(staged.path()).unwrap() {
                 std::fs::remove_file(entry.unwrap().path()).unwrap();
             }
         }
         let err = stage(
-            &session.0,
+            session.path(),
             &files(&["work/in.txt", "work/in.txt"]),
-            &staged.0,
+            staged.path(),
             5,
         )
         .unwrap_err();
@@ -305,13 +291,13 @@ mod tests {
         let (session, staged) = session();
         rustix::fs::mknodat(
             rustix::fs::CWD,
-            session.0.join("work/fifo"),
+            session.join("work/fifo"),
             FileType::Fifo,
             Mode::from_raw_mode(0o644),
             0,
         )
         .unwrap();
-        let err = stage(&session.0, &files(&["work/fifo"]), &staged.0, 5).unwrap_err();
+        let err = stage(session.path(), &files(&["work/fifo"]), staged.path(), 5).unwrap_err();
         assert!(matches!(err, StageError::NotAFile(_)), "{err}");
     }
 }
