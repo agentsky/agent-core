@@ -185,6 +185,7 @@ async fn start_login_builds_the_authorize_url_and_stores_a_pending_login() {
     let h = harness().await;
     let before = now();
     let start = h.auth.start_login(h.member).await.unwrap();
+    let after = now();
     let url = Url::parse(&start.url).unwrap();
     assert_eq!(url.scheme(), "https");
     assert_eq!(url.host_str(), Some("claude.com"));
@@ -210,8 +211,8 @@ async fn start_login_builds_the_authorize_url_and_stores_a_pending_login() {
     assert_eq!(query(&url, "scope"), "user:profile user:inference");
     assert_eq!(query(&url, "code_challenge_method"), "S256");
 
-    let ttl = start.expires_at - before;
-    assert!(ttl > time::Duration::seconds(598) && ttl <= time::Duration::seconds(601));
+    assert!(start.expires_at > before + time::Duration::seconds(598));
+    assert!(start.expires_at <= after + time::Duration::seconds(600));
 
     let pending = h
         .store
@@ -315,6 +316,7 @@ async fn complete_login_exchanges_the_code_and_stores_the_link() {
         .complete_login(h.member, &paste("the-code", &state))
         .await
         .unwrap();
+    let after = now();
     assert_eq!(
         linked.plan,
         Some(PlanInfo {
@@ -348,10 +350,8 @@ async fn complete_login_exchanges_the_code_and_stores_the_link() {
         stored.rate_limit_tier.as_deref(),
         Some("default_claude_max")
     );
-    let lifetime = stored.expires_at - before;
-    assert!(
-        lifetime > time::Duration::seconds(28_790) && lifetime <= time::Duration::seconds(28_801)
-    );
+    assert!(stored.expires_at > before + time::Duration::seconds(28_790));
+    assert!(stored.expires_at <= after + time::Duration::seconds(28_800));
     assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
 }
 
