@@ -485,6 +485,11 @@ that started late found the listener closed. The test layers the public
 routes with a hook that signals each request, and stops agentd once the
 request has reached them.
 
+`a_shutdown_kills_and_meters_the_turn_it_cuts` killed the private turn
+once its session was warm, which is also true while the turn is still
+starting its process; a kill there ends the turn before anything is
+billed. The test also waits for the turn's upstream model request.
+
 ## T05: store
 
 ### The key reaches the store through `open`
