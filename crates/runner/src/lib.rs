@@ -1,5 +1,12 @@
 //! Claude Code stream-json driver and session runner for agent-core.
 //!
+//! [`SessionManager`] runs turns on sessions: it looks sessions up or makes
+//! them (the store's `sessions` table), queues each session's turns, and
+//! keeps a warm container and `claude` process per active session, with a
+//! per-scope and a global container cap and an idle reaper. It never calls
+//! agentd: placeholders and agentctl tokens reach it through the
+//! [`TurnHooks`] agentd implements, around every process and every turn.
+//!
 //! [`ClaudeProcess`] drives one `claude` process in a sandbox container, in
 //! the design's stream-json mode:
 //!
@@ -53,18 +60,24 @@
 #![warn(missing_docs)]
 
 mod config;
+mod hooks;
 mod launch;
 mod persona;
 mod process;
+mod sessions;
 mod stream;
 
 pub use config::{
-    ConfigError, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_CLAUDE_BIN, DEFAULT_TURN_TIMEOUT_SECS,
+    ConfigError, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP,
+    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_SCOPE_CONTAINER_CAP, DEFAULT_TURN_TIMEOUT_SECS, PoolConfig,
     ProcessConfig,
 };
+pub use hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
 pub use launch::{LaunchSpec, SessionStart};
 pub use persona::{AGENTS_DIR, persona_dir, write_persona};
 pub use process::ClaudeProcess;
+pub use sessions::{SessionConfig, SessionManager, TurnReport};
+pub use store::{Session, SessionKind};
 pub use stream::{ErrorKind, MAX_LINE_BYTES, TurnOutcome, TurnResult, TurnStats, Usage};
 
 /// The error returned by [`ClaudeProcess`] and the other runner functions.
@@ -94,6 +107,29 @@ pub enum RunnerError {
         /// The error.
         source: std::io::Error,
     },
+    /// The store failed.
+    #[error(transparent)]
+    Store(#[from] store::StoreError),
+    /// A [`TurnHooks`] call failed.
+    #[error("the {hook} hook failed: {source}")]
+    Hook {
+        /// The hook, such as `process_starting`.
+        hook: &'static str,
+        /// What it returned.
+        source: HookError,
+    },
+    /// No session has this id.
+    #[error("no such session")]
+    UnknownSession,
+    /// The session was reset, and takes no more turns.
+    #[error("the session was reset")]
+    SessionReset,
+    /// A [`TurnRequest`] doesn't fit its session.
+    #[error("invalid turn request: {0}")]
+    InvalidRequest(&'static str),
+    /// The task running the turn panicked.
+    #[error("the turn's task failed")]
+    TurnTask,
 }
 
 /// A `Result` whose error is [`RunnerError`].
@@ -120,5 +156,20 @@ mod tests {
         assert_eq!(io.to_string(), "writing the persona: disk full");
         let sandbox: RunnerError = sandbox::SandboxError::NotFound.into();
         assert_eq!(sandbox.to_string(), "no such container");
+        let hook = RunnerError::Hook {
+            hook: "turn_starting",
+            source: "refused".into(),
+        };
+        assert_eq!(hook.to_string(), "the turn_starting hook failed: refused");
+        assert_eq!(RunnerError::UnknownSession.to_string(), "no such session");
+        assert_eq!(
+            RunnerError::SessionReset.to_string(),
+            "the session was reset"
+        );
+        assert_eq!(
+            RunnerError::InvalidRequest("x").to_string(),
+            "invalid turn request: x"
+        );
+        assert_eq!(RunnerError::TurnTask.to_string(), "the turn's task failed");
     }
 }
