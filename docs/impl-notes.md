@@ -498,6 +498,13 @@ that started late found the listener closed. The test layers the public
 routes with a hook that signals each request, and stops agentd once the
 request has reached them.
 
+`a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again`
+and `an_install_that_finishes_after_the_agent_was_deleted_is_refused`
+counted on the mocked `apps.manifest.create` answering after 300 ms and
+`oauth.v2.access` after 500 ms, and acted before the answer landed. Each
+now holds that response, acts once the request has arrived, then releases
+it.
+
 ## T05: store
 
 ### The key reaches the store through `open`
