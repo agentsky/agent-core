@@ -288,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_key_sealed_under_another_master_key_fails_to_open_without_leaking() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         store
             .set_community_api_key(&SecretString::from(KEY), &member_key("root"), at(1_000))
