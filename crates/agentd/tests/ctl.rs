@@ -15,12 +15,16 @@ use tokio::sync::oneshot;
 use common::{CONFIG, Response, env};
 
 async fn post(addr: SocketAddr, token: Option<&ProcessToken>) -> Response {
-    let token = token.map(|token| token.secret().expose_secret().to_owned());
-    tokio::task::spawn_blocking(move || {
-        common::post(addr, "/v1/history", token.as_deref(), "{}").unwrap()
-    })
-    .await
-    .unwrap()
+    let mut headers = vec![("Content-Type", "application/json".to_owned())];
+    if let Some(token) = token {
+        headers.push((
+            "Authorization",
+            format!("Bearer {}", token.secret().expose_secret()),
+        ));
+    }
+    tokio::task::spawn_blocking(move || common::post(addr, "/v1/history", &headers, "{}").unwrap())
+        .await
+        .unwrap()
 }
 
 async fn issue(app: &App, ip: &str) -> ProcessToken {
