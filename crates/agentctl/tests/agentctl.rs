@@ -226,12 +226,13 @@ async fn wait_for(path: &Path) {
     }
 }
 
-/// A shell script that touches `marker` and then runs a background
-/// subshell, a grandchild of agentctl, that appends to `log` until it is
-/// killed.
+/// A shell script that runs a background subshell, a grandchild of
+/// agentctl, that touches `marker` and appends to `log` until it is killed
+/// or `marker` is gone.
 fn writer(marker: &Path, log: &Path) -> String {
     format!(
-        "(while :; do echo x >> {log}; sleep 0.05; done) & touch {marker}; wait",
+        "(echo x >> {log}; touch {marker}; \
+         while [ -e {marker} ]; do echo x >> {log}; sleep 0.05; done) & wait",
         log = log.display(),
         marker = marker.display()
     )
@@ -619,9 +620,9 @@ async fn the_lock_renews_while_the_command_runs() {
             "sh",
             "-c",
             &format!(
-                "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
-                marker.display(),
-                release.display()
+                "touch {marker}; while [ -e {marker} ] && [ ! -e {release} ]; do sleep 0.05; done",
+                marker = marker.display(),
+                release = release.display()
             ),
         ])
         .spawn()
@@ -1201,7 +1202,7 @@ async fn a_stop_signal_reaches_the_command_before_its_group_is_killed() {
             "-c",
             &format!(
                 "trap 'echo cleaned > {cleaned}; exit 0' TERM; touch {marker}; \
-                 while :; do sleep 0.1; done",
+                 while [ -e {marker} ]; do sleep 0.1; done",
                 cleaned = cleaned.display(),
                 marker = marker.display()
             ),
