@@ -284,8 +284,10 @@ async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
 async fn a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again() {
     let h = harness().await;
     let (held, mut hold) = Held::new(app_created());
+    let bearer = format!("Bearer {CONFIG_TOKEN}");
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.create"))
+        .and(header("authorization", bearer.as_str()))
         .respond_with(held)
         .up_to_n_times(1)
         .with_priority(1)
