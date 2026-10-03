@@ -16,6 +16,8 @@ axum.workspace = true
 core-types.workspace = true
 hmac.workspace = true
 http-body-util.workspace = true
+render.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -30,4 +32,6 @@ uuid.workspace = true
 [dev-dependencies]
 futures.workspace = true
 testkit.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
+wiremock.workspace = true
