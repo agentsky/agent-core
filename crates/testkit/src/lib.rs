@@ -14,6 +14,7 @@
 //!   subscriber.
 //! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 //! - [`slack`]: Slack request signing and payload fixtures.
+//! - [`TempDir`]: a directory for one test, removed when the test ends.
 
 #![warn(missing_docs)]
 
@@ -26,9 +27,11 @@ pub mod logs;
 pub mod rocketchat;
 pub mod slack;
 pub mod surface;
+mod temp_dir;
 
 pub use anthropic::{FakeAnthropic, fake_anthropic};
 pub use claude::{Turn, fake_claude_path, write_script};
 pub use held::{Held, Hold};
 pub use logs::{Logged, Logs};
 pub use surface::{Call, MockSurface, Op, UploadedFile};
+pub use temp_dir::TempDir;

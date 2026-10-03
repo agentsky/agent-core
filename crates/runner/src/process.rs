@@ -496,10 +496,10 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_a_process_kills_it_before_closing_its_stdin() {
-        let dir = crate::test_util::TempDir::new();
+        let dir = testkit::TempDir::new("runner-test");
         let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
         let store = store::Store::open_in_memory(sealer).await.unwrap();
-        let sandbox = sandbox::ProcessSandbox::new(store, dir.0.clone()).unwrap();
+        let sandbox = sandbox::ProcessSandbox::new(store, dir.path().to_owned()).unwrap();
         let volume = sandbox
             .ensure_volume(&core_types::VolumeKey {
                 agent: core_types::AgentId::new_v4(),
@@ -507,9 +507,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let spec = sandbox::SessionSpec::new(session(), volume, "unused", dir.0.join("persona"));
+        let spec = sandbox::SessionSpec::new(session(), volume, "unused", dir.join("persona"));
         let container = sandbox.start(&spec).await.unwrap();
-        let pid_file = dir.0.join("pid");
+        let pid_file = dir.join("pid");
         let script = format!("echo $$ > '{}'; exec cat >/dev/null", pid_file.display());
         let argv = ["/bin/sh", "-c", &script].map(str::to_owned);
         let io = sandbox

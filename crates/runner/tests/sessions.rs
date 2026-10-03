@@ -23,15 +23,8 @@ use sandbox::{
 use secrecy::SecretString;
 use sqlx::Connection as _;
 use store::{Sealer, Store};
-use testkit::{FakeAnthropic, Logs, Turn};
+use testkit::{FakeAnthropic, Logs, TempDir, Turn};
 use tokio::sync::Notify;
-
-use common::temp_dir::TempDir;
-
-/// The one helper of `tests/common` these tests use, without its harness.
-mod common {
-    pub mod temp_dir;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Event {
@@ -285,24 +278,19 @@ impl Harness {
     ) -> Self {
         let logs = Logs::global();
         let bin = testkit::fake_claude_path();
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let sealer = Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap();
-        let store = Store::open(
-            &format!("sqlite://{}", dir.0.join("agentd.db").display()),
-            sealer,
-        )
-        .await
-        .unwrap();
+        let store = Store::open(&dir.db_url(), sealer).await.unwrap();
         let agent = AgentId::new_v4();
-        runner::write_persona(&dir.0, agent, "You are a test agent.\n")
+        runner::write_persona(dir.path(), agent, "You are a test agent.\n")
             .await
             .unwrap();
-        let script = dir.0.join("script.json");
+        let script = dir.join("script.json");
         testkit::write_script(&script, turns).unwrap();
         let anthropic = testkit::fake_anthropic().await;
         let log: Log = Arc::default();
         let sandbox = Arc::new(TestSandbox {
-            inner: ProcessSandbox::new(store.clone(), dir.0.clone()).unwrap(),
+            inner: ProcessSandbox::new(store.clone(), dir.path().to_owned()).unwrap(),
             log: Arc::clone(&log),
             running: Mutex::default(),
             most: AtomicU32::new(0),
@@ -335,7 +323,7 @@ impl Harness {
                 process,
                 pool,
                 image: "unused".into(),
-                data_dir: dir.0.clone(),
+                data_dir: dir.path().to_owned(),
             },
         )
         .unwrap();
@@ -385,7 +373,6 @@ impl Harness {
         };
         let path = self
             ._dir
-            .0
             .join(sandbox::volume_rel_path(&volume))
             .join("sessions")
             .join(session.id.to_string())
@@ -464,7 +451,6 @@ fn projects_dir(h: &Harness, session: &Session) -> PathBuf {
         scope: session.scope.clone(),
     };
     h._dir
-        .0
         .join(sandbox::volume_rel_path(&volume))
         .join("sessions")
         .join(session.id.to_string())
@@ -1230,8 +1216,8 @@ async fn a_container_that_fails_to_stop_keeps_its_places_until_the_reaper_stops_
 
 #[tokio::test]
 async fn a_refusal_shaped_result_from_a_new_process_is_not_a_refused_resume() {
-    let dir = TempDir::new();
-    let refusing = dir.0.join("refusing-claude");
+    let dir = TempDir::new("runner-test");
+    let refusing = dir.join("refusing-claude");
     std::fs::write(
         &refusing,
         "#!/bin/sh\nread -r line\necho '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\nexit 1\n",
@@ -1461,12 +1447,9 @@ async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn_instead_of_reru
     reply(&h.run(session.id, request("one")).await);
     h.manager.stop(session.id).await;
     std::fs::remove_dir_all(projects_dir(&h, &session)).unwrap();
-    let mut db = sqlx::SqliteConnection::connect(&format!(
-        "sqlite://{}",
-        h._dir.0.join("agentd.db").display()
-    ))
-    .await
-    .unwrap();
+    let mut db = sqlx::SqliteConnection::connect(&h._dir.db_url())
+        .await
+        .unwrap();
     sqlx::query(
         "CREATE TRIGGER unstarting_fails BEFORE UPDATE OF started ON sessions \
          WHEN OLD.started = 1 AND NEW.started = 0 \

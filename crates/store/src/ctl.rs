@@ -899,7 +899,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_acquires_grant_one_lease() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let key = volume(AgentId::new_v4());
         let now = OffsetDateTime::now_utc();
