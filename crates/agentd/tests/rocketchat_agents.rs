@@ -4,7 +4,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use agentd::server::{Routers, Server};
@@ -13,6 +12,7 @@ use core_types::{ConvKind, ConvRef, MemberId, MemberKey, ScopeKey, SurfaceKind, 
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentState, BindingState, NewClaudeLink};
+use testkit::TempDir;
 use testkit::rocketchat::{FakeDdp, FakeRest, realtime_message, subscription_doc};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
@@ -310,27 +310,6 @@ fn mention(users: &[&str]) -> Value {
     json!({ "mentions": mentions })
 }
 
-/// A directory for a database file, removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-agents-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn db_url(&self) -> String {
-        format!("sqlite://{}", self.0.join("agentd.db").display())
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test]
 async fn create_makes_a_bot_user_and_starts_its_connection() {
     let chat = Chat::start().await;
@@ -508,7 +487,7 @@ async fn only_the_owner_changes_the_persona() {
 #[tokio::test]
 async fn skills_are_added_from_files_attached_in_the_managers_dm() {
     let chat = Chat::start().await;
-    let data = common::TempDir::new();
+    let data = TempDir::new("agentd-test");
     let config = Config::parse(
         &format!(
             "{}\n[rocketchat]\nbase_url = \"{}\"\nwebsocket_url = \"{}\"\nteam = \"{TEAM}\"\n\
@@ -724,7 +703,7 @@ async fn a_failed_deactivation_is_retried_until_it_works() {
 
 #[tokio::test]
 async fn a_restart_restores_every_agent_connection() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-agents");
     let chat = Chat::start().await;
     let running = Running::start(&chat, &dir.db_url()).await;
     running.link(&chat.alice).await;
