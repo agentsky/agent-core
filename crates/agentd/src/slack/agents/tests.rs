@@ -14,6 +14,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
 use surface_slack::{InFlight, SlackClient, SlackInbound};
+use testkit::Held;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use wiremock::matchers::{header, method, path};
@@ -73,6 +74,27 @@ async fn mount(slack: &MockServer, name: &str, token: &str, response: ResponseTe
         .await;
 }
 
+fn app_created() -> ResponseTemplate {
+    ok(json!({
+        "app_id": "A0HELPER1",
+        "credentials": {
+            "client_id": "1111.2222",
+            "client_secret": CLIENT_SECRET,
+            "signing_secret": SIGNING_SECRET,
+        },
+    }))
+}
+
+fn app_installed() -> ResponseTemplate {
+    ok(json!({
+        "app_id": "A0HELPER1",
+        "token_type": "bot",
+        "access_token": AGENT_TOKEN,
+        "bot_user_id": "U0HELPER1",
+        "team": {"id": TEAM},
+    }))
+}
+
 async fn harness() -> Harness {
     let store =
         Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
@@ -93,21 +115,7 @@ async fn harness() -> Harness {
     ] {
         mount(&slack, name, MANAGER_TOKEN, ok(body)).await;
     }
-    mount(
-        &slack,
-        "apps.manifest.create",
-        CONFIG_TOKEN,
-        ok(json!({
-            "app_id": "A0HELPER1",
-            "credentials": {
-                "client_id": "1111.2222",
-                "client_secret": CLIENT_SECRET,
-                "signing_secret": SIGNING_SECRET,
-            },
-        }))
-        .set_delay(Duration::from_millis(300)),
-    )
-    .await;
+    mount(&slack, "apps.manifest.create", CONFIG_TOKEN, app_created()).await;
     mount(&slack, "apps.manifest.delete", CONFIG_TOKEN, ok(json!({}))).await;
     let basic = format!(
         "Basic {}",
@@ -116,13 +124,7 @@ async fn harness() -> Harness {
     Mock::given(method("POST"))
         .and(path("/api/oauth.v2.access"))
         .and(header("authorization", basic.as_str()))
-        .respond_with(ok(json!({
-            "app_id": "A0HELPER1",
-            "token_type": "bot",
-            "access_token": AGENT_TOKEN,
-            "bot_user_id": "U0HELPER1",
-            "team": {"id": TEAM},
-        })))
+        .respond_with(app_installed())
         .mount(&slack)
         .await;
     let client = SlackClient::new(&format!("{}/api/", slack.uri()))
@@ -282,6 +284,14 @@ async fn creating_installing_and_deleting_an_app_never_logs_a_secret() {
 #[tokio::test]
 async fn a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again() {
     let h = harness().await;
+    let (held, mut hold) = Held::new(app_created());
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.create"))
+        .respond_with(held)
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
     let creating = {
         let agents = h.agents.clone();
         let owner = h.owner;
@@ -292,14 +302,11 @@ async fn a_creation_abandoned_while_slack_creates_the_app_deletes_the_app_again(
                 .unwrap()
         })
     };
-    let binding = loop {
-        if let Some(binding) = h.binding().await {
-            break binding;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    hold.arrived().await;
+    let binding = h.binding().await.unwrap();
     let now = OffsetDateTime::now_utc();
     assert!(h.store.abandon_creation(binding, now, now).await.unwrap());
+    hold.release();
     assert_eq!(creating.await.unwrap(), Creation::Failed);
     assert_eq!(h.calls("apps.manifest.delete").await, 1);
     assert_eq!(h.calls("chat.postMessage").await, 0, "no install link");
@@ -706,18 +713,10 @@ async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
     let Creation::Created { install_url, .. } = h.create().await else {
         panic!("created");
     };
+    let (held, mut hold) = Held::new(app_installed());
     Mock::given(method("POST"))
         .and(path("/api/oauth.v2.access"))
-        .respond_with(
-            ok(json!({
-                "app_id": "A0HELPER1",
-                "token_type": "bot",
-                "access_token": AGENT_TOKEN,
-                "bot_user_id": "U0HELPER1",
-                "team": {"id": TEAM},
-            }))
-            .set_delay(Duration::from_millis(500)),
-        )
+        .respond_with(held)
         .with_priority(1)
         .mount(&h.slack)
         .await;
@@ -727,10 +726,9 @@ async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
         let query = format!("code={CODE}&state={}", state_of(&install_url));
         tokio::spawn(async move { agents.callback(Some(&query)).await.status() })
     };
-    while h.calls("oauth.v2.access").await == 0 {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    hold.arrived().await;
     deleted_bindings(&h).await;
+    hold.release();
     assert_eq!(installing.await.unwrap(), StatusCode::CONFLICT);
     assert!(h.store.bot_token(binding).await.unwrap().is_none());
 }
