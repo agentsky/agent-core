@@ -1076,9 +1076,7 @@ async fn a_refresh_in_flight_during_logout_does_not_relink() {
     let h = harness().await;
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(token_response("access-2", Some("refresh-2")))
         .expect(1)
         .mount(&h.server)
         .await;

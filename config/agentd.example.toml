@@ -76,6 +76,11 @@ data_dir = "/var/lib/agentd"
 # The largest file `agentctl attach` may stage, in bytes. Default 50 MiB.
 attach_max_bytes = 52428800
 
+[agents]
+# How many agents one member may have (deleted ones don't count). `create`
+# refuses more. Default 10.
+max_per_owner = 10
+
 [claude_oauth]
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every
@@ -109,3 +114,8 @@ team = "chat.example.com"
 # The manager account's user _id (Administration > Users, or `me` in the
 # REST API with its token).
 manager_user_id = "aBcD1234eFgH5678"
+
+# An image URL every new agent's bot sets as its avatar. Optional: without
+# it, bots keep Rocket.Chat's default avatar. Rocket.Chat fetches it itself
+# and refuses private addresses, redirects and anything not image/*.
+# avatar_url = "https://chat.example.com/assets/agent.png"

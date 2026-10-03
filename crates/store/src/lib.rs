@@ -20,8 +20,9 @@
 //! [`pending_logins`](Store::put_pending_login),
 //! [`processed_events`](Store::mark_event_processed),
 //! [`ctl_tokens`](Store::put_ctl_token),
-//! [`scope_locks`](Store::acquire_scope_lock) and
-//! [`volumes`](Store::put_volume).
+//! [`scope_locks`](Store::acquire_scope_lock),
+//! [`volumes`](Store::put_volume), and [`agents`](Store::create_agent) with
+//! their bindings and [retirements](Store::claim_retirement).
 
 #![warn(missing_docs)]
 
@@ -33,6 +34,7 @@ use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use time::OffsetDateTime;
 
+mod agents;
 mod claude_links;
 mod ctl;
 mod events;
@@ -42,6 +44,10 @@ mod relink_notices;
 mod seal;
 mod volumes;
 
+pub use agents::{
+    ActiveBot, Agent, AgentBinding, AgentCreation, AgentState, BindingState, DirectoryEntry,
+    NewAgent, PendingRetirement, Visibility,
+};
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
@@ -316,6 +322,8 @@ mod tests {
             table_names(&store).await,
             [
                 "_sqlx_migrations",
+                "agent_bindings",
+                "agents",
                 "claude_link_generations",
                 "claude_links",
                 "ctl_tokens",

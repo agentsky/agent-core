@@ -1,6 +1,7 @@
-//! `/agent` command dispatch, and the account commands.
+//! `/agent` command dispatch, the account commands, and the agent commands
+//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`).
 //!
-//! Every surface turns a command into `(MemberKey, text, Origin)` and hands
+//! Every surface turns a command into `(MemberKey, text, Origin, files)` and hands
 //! it to [`Commands::handle_text`], which parses it with
 //! [`commands::parse`] and runs it. The reply always goes privately to the
 //! member through [`Replies::reply_private`], wherever the command came from.
@@ -23,6 +24,7 @@
 //! secret-bearing gets the same treatment. Commands are logged by name only,
 //! never with their text or arguments.
 
+mod agents;
 pub mod relink;
 pub mod reply;
 pub mod rocketchat;
@@ -35,11 +37,13 @@ use std::sync::Arc;
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
 use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
-use core_types::{ConversationId, MemberId, MemberKey, SurfaceKind};
+use core_types::{ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
 use store::{Store, StoreError};
 use time::OffsetDateTime;
 
+use crate::agents::RocketChatAgents;
+pub use agents::PERSONA_MAX_BYTES;
 pub use reply::{ManagerBot, OpenDm, Replies, ReplyError};
 
 /// Where a command came from. It decides where the reply goes and whether
@@ -131,6 +135,7 @@ struct Inner {
     store: Store,
     auth: Arc<Auth>,
     replies: Replies,
+    rocketchat: Option<RocketChatAgents>,
 }
 
 /// Why a handler couldn't produce its reply. Logged, never shown.
@@ -140,6 +145,8 @@ enum Failure {
     Store(#[from] StoreError),
     #[error(transparent)]
     Auth(#[from] AuthError),
+    #[error(transparent)]
+    Surface(#[from] core_types::SurfaceError),
 }
 
 fn now() -> OffsetDateTime {
@@ -147,13 +154,21 @@ fn now() -> OffsetDateTime {
 }
 
 impl Commands {
-    /// Commands over `store` and `auth`, replying through `replies`.
-    pub fn new(store: Store, auth: Arc<Auth>, replies: Replies) -> Self {
+    /// Commands over `store` and `auth`, replying through `replies`, and
+    /// managing agents on Rocket.Chat through `rocketchat`, if agentd
+    /// serves Rocket.Chat.
+    pub fn new(
+        store: Store,
+        auth: Arc<Auth>,
+        replies: Replies,
+        rocketchat: Option<RocketChatAgents>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 auth,
                 replies,
+                rocketchat,
             }),
         }
     }
@@ -163,11 +178,18 @@ impl Commands {
         &self.inner.replies
     }
 
-    /// Parses `text` from `member` and runs it, replying privately. Text
-    /// that doesn't parse gets the parser's message (help or usage).
-    pub async fn handle_text(&self, member: &MemberKey, text: &str, origin: &Origin) {
+    /// Parses `text` from `member`, sent with `files` attached, and runs
+    /// it, replying privately. Text that doesn't parse gets the parser's
+    /// message (help or usage).
+    pub async fn handle_text(
+        &self,
+        member: &MemberKey,
+        text: &str,
+        origin: &Origin,
+        files: &[InFile],
+    ) {
         match commands::parse(text) {
-            Ok(command) => self.dispatch(member, command, origin).await,
+            Ok(command) => self.dispatch(member, command, origin, files).await,
             Err(err) => {
                 tracing::info!(
                     %member,
@@ -182,15 +204,23 @@ impl Commands {
         }
     }
 
-    /// Runs `command` from `member` and replies privately.
-    pub async fn dispatch(&self, member: &MemberKey, command: Command, origin: &Origin) {
+    /// Runs `command` from `member`, sent with `files` attached, and
+    /// replies privately.
+    pub async fn dispatch(
+        &self,
+        member: &MemberKey,
+        command: Command,
+        origin: &Origin,
+        files: &[InFile],
+    ) {
         tracing::info!(
             %member,
             origin = origin.kind(),
             command = command.name(),
+            files = files.len(),
             "running a command"
         );
-        let reply = self.run(member, command, origin).await;
+        let reply = self.run(member, command, origin, files).await;
         self.reply(member, origin, &reply).await;
     }
 
@@ -201,7 +231,13 @@ impl Commands {
     }
 
     /// The reply to `command`.
-    async fn run(&self, member: &MemberKey, command: Command, origin: &Origin) -> String {
+    async fn run(
+        &self,
+        member: &MemberKey,
+        command: Command,
+        origin: &Origin,
+        files: &[InFile],
+    ) -> String {
         let name = command.name();
         let result = if command.is_secret_bearing() && !origin.is_private() {
             self.refuse_public_secret(member, &command, origin).await
@@ -213,6 +249,21 @@ impl Commands {
                 }
                 Command::Logout => self.logout(member, origin).await,
                 Command::Me => self.me(member, origin).await,
+                Command::Create { name, persona } => {
+                    self.create(member, name.as_str(), persona, origin).await
+                }
+                Command::Persona { name, text } => {
+                    self.persona(member, name.as_str(), text, origin, files)
+                        .await
+                }
+                Command::List { user } => self.list(member, user.as_ref(), origin).await,
+                Command::Pause { name } => {
+                    self.set_paused(member, name.as_str(), true, origin).await
+                }
+                Command::Resume { name } => {
+                    self.set_paused(member, name.as_str(), false, origin).await
+                }
+                Command::Delete { name } => self.delete(member, name.as_str()).await,
                 _ => Ok(format!("`{name}` isn't available yet.")),
             }
         };
