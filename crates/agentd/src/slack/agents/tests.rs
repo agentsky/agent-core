@@ -1348,12 +1348,9 @@ fn exported(binding: BindingId) -> Value {
 }
 
 async fn sent_manifests(h: &Harness) -> Vec<(String, Value)> {
-    h.slack
-        .received_requests()
+    h.requests("apps.manifest.update")
         .await
-        .unwrap_or_default()
         .into_iter()
-        .filter(|request| request.url.path() == "/api/apps.manifest.update")
         .map(|request| {
             let form: std::collections::HashMap<String, String> =
                 serde_urlencoded::from_bytes(&request.body).unwrap();
@@ -1438,12 +1435,14 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
     let refusing = installed_as(&h, "refusing", "xoxb-refusing", 0).await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.export"))
+        .and(header("authorization", bearer().as_str()))
         .and(wiremock::matchers::body_string_contains("app_id=A0GONE"))
         .respond_with(refused("app_not_found"))
         .mount(&h.slack)
         .await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.export"))
+        .and(header("authorization", bearer().as_str()))
         .and(wiremock::matchers::body_string_contains(
             "app_id=A0EVENTLESS",
         ))
@@ -1452,6 +1451,7 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
         .await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.export"))
+        .and(header("authorization", bearer().as_str()))
         .and(wiremock::matchers::body_string_contains(
             "app_id=A0REFUSING",
         ))
