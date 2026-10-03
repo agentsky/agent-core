@@ -234,7 +234,9 @@ description, and must pass T02's policy.
     turn.
   - A final `{"type":"result",…}` line with `subtype`, `is_error`, `result`,
     `session_id`, `total_cost_usd`, `usage`, `terminal_reason` and
-    `api_error_status`.
+    `api_error_status`. `usage` is the turn's own, but `total_cost_usd` is
+    the process's running total
+    ([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
     `is_error` decides failure, not `subtype`. An unreachable upstream produced
     `subtype: "success"` with `is_error: true` and
     `terminal_reason: "api_error"`.
@@ -1636,8 +1638,10 @@ Design: [Lifecycle](design.md#lifecycle),
 
 Deliverables:
 
-- `ClaudeProcess::start(sandbox, container, LaunchSpec) -> ClaudeProcess`. It
-  builds argv from the design's launch flags:
+- `ClaudeProcess::start(sandbox, container, &ProcessConfig, LaunchSpec) ->
+  ClaudeProcess`. `ProcessConfig` holds the `claude` binary, the proxy's
+  `ANTHROPIC_BASE_URL` and the turn timeout. It builds argv from the design's
+  launch flags:
   - `--session-id <id>` when the session has never started, `--resume <id>`
     otherwise.
   - `--tools "Bash,Read,Edit,Write,Glob,Grep"`, `--strict-mcp-config`,
@@ -1647,11 +1651,18 @@ Deliverables:
   - The environment from the design's credential proxy block, plus
     `HOME` and `TMPDIR` from `Container::paths()`. The placeholder, the
     process's `AGENTCTL_TOKEN` and the egress proxy variables come from the
-    caller in `LaunchSpec.env`. The runner doesn't know how they are made.
+    caller: the placeholder in `LaunchSpec.placeholder`, with
+    `LaunchSpec.credential` choosing its variable, and the rest in
+    `LaunchSpec.env`, which may not set the runner's own variables or any
+    `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` one
+    ([impl-notes](impl-notes.md#the-placeholder-is-not-an-environment-entry)).
+    The runner doesn't know how they are made.
 - `send_turn(user_message) -> TurnOutcome`. It writes one stream-json user line
   and reads lines until `type == "result"`. The outcome carries:
   - `is_error`, `result` text, `terminal_reason`, `api_error_status`.
-  - `usage`, `total_cost_usd`, `session_id`.
+  - `usage`, `session_id`, and the turn's `cost_usd`: the rise in the
+    CLI's running `total_cost_usd` since the process's previous result
+    ([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
   - Structural metadata for diagnostics: the number of `assistant` messages
     and the names of the tools called. Message bodies, tool inputs and tool
     output are never kept or logged: they can hold file contents and secrets
@@ -1662,8 +1673,14 @@ Deliverables:
   is killed and the turn fails. If the kill fails, the container is stopped
   instead, since nothing was signalled
   ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
-- Process death mid-turn becomes `TurnOutcome::Crashed`. The next turn starts a
-  new process with `--resume`.
+  `ClaudeProcess::may_be_alive` says whether a killed process was seen to
+  exit: a kill can fail, and under Docker signal nothing
+  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+- Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
+  `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
+  starts a new process with `--resume`. `TurnStats::init_seen` says whether
+  the CLI read the turn's message, which is when its transcript starts
+  ([impl-notes](impl-notes.md#when-a-session-has-started)).
 - Classification of `is_error` results: `usage_limit` (rate limit or credit
   exhausted, when `api_error_status` is 429 or the text says so), `auth` (401
   or 403), `other`. T26 turns these into member-facing messages.
@@ -1706,8 +1723,9 @@ Deliverables:
     doesn't collide with its replacement.
 - The `TurnHooks` trait, the runner's only way out:
   - `process_starting(session, container_ip, kind) -> ProcessEnv`, which
-    returns the placeholder, the agentctl token and the proxy variables for
-    `LaunchSpec.env`.
+    returns the placeholder, the agentctl token and the proxy variables, all
+    as `SecretString`, for `LaunchSpec.placeholder` and `LaunchSpec.env`
+    (`BTreeMap<String, SecretString>`).
   - `turn_starting(session, &TurnRequest)`, which points the placeholder at
     the turn's credential and records the turn on the agentctl token.
   - `turn_finished(session, turn)`, which clears the turn from the token and
@@ -1722,6 +1740,14 @@ Deliverables:
     sandbox reports the container died.
 - `SessionManager`:
   - `lookup_or_create(agent, thread_key) -> Session`. A new session id is a v4.
+  - A session is marked `started` after a turn whose `TurnStats::init_seen`
+    is true, whatever its outcome, not when its process starts
+    ([impl-notes](impl-notes.md#when-a-session-has-started)).
+  - A turn whose outcome is `TurnOutcome::resume_refused()` (a `--resume`
+    of a session with no transcript) resets the session to `--session-id`:
+    the row is marked not started and the turn runs again, once, on a new
+    process with `SessionStart::New` and the same id, since the CLI never
+    read the message.
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
   - `run_turn(session, TurnRequest) -> TurnOutcome`, serialized per session
@@ -1739,6 +1765,11 @@ Deliverables:
   - A global cap.
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
+- After a turn that leaves `ClaudeProcess::is_running()` false, or after
+  `stop`, a process whose `may_be_alive()` is still true was killed without
+  its exit being confirmed. Call `process_stopping` and stop the container
+  before starting another process for the session, so two processes never
+  share a transcript.
 - Private sessions: `create_private(agent, consent) -> Session` on the
   agent's `Private` volume, always a fresh id. T33 uses it.
 
@@ -1753,6 +1784,8 @@ Acceptance:
   - A credential-kind change restarts the process.
   - A model change restarts the process.
   - Reset starts with a new id.
+  - A `--resume` the CLI refuses for want of a transcript reruns the turn
+    with `--session-id`.
   - A recording `TurnHooks` double sees the calls in order for each turn:
     `process_starting` once per process, `turn_starting` and `turn_finished`
     per turn, and `process_stopping` before every stop and after a killed
@@ -1971,7 +2004,11 @@ Acceptance:
 Live check (manual, recorded in the PR): with the Compose stack from T16 and a
 real linked account, mention an agent in a channel on Rocket.Chat, run a turn
 that uses Bash and returns a file, restart agentd, and continue the thread with
-`--resume`. Also run `agentctl lock -- sh -c 'sleep 600'` with a short Bash
+`--resume`. Check that the first result of the `--resume`d process reports a
+`total_cost_usd` counted from 0, not the session's total so far: the runner's
+per-turn `cost_usd` assumes it
+([impl-notes](impl-notes.md#total_cost_usd-is-the-processs-running-total)).
+Also run `agentctl lock -- sh -c 'sleep 600'` with a short Bash
 tool timeout, and record whether the CLI kills a timed-out command through
 its process group or its process, and with which signal: `agentctl lock`
 runs its command in a group of its own, so a group kill would leave the
@@ -2082,7 +2119,8 @@ Deliverables:
   - `thread_usage` (`surface`, `team_id`, `conversation`, `thread_root`,
     `day`, `agent_turns`, `tokens`), for the per-thread caps.
   - `bans` (`member_id`, `banned_by`, `reason`, `created_at`).
-- The meter accrues per requester from each `TurnOutcome`'s usage.
+- The meter accrues per requester from each `TurnOutcome`'s usage and
+  `cost_usd`, which is the turn's own, not the CLI's running total.
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.

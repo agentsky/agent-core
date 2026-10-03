@@ -3117,6 +3117,210 @@ whatever the sandbox wants written into agentd's logs. "forwarded a
 request" names the session, method and status only, and the log test sends
 a secret-bearing path and query and finds neither in the log.
 
+## T20: runner process driver
+
+### The placeholder is not an environment entry
+
+**Issue.** The plan passes the placeholder in `LaunchSpec.env`, next to
+`AGENTCTL_TOKEN` and the proxy variables, and also says the runner sets
+exactly one of `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_KEY`. With the
+placeholder as a map entry under a name the caller picks, the runner can't
+guarantee that, and nothing would stop a caller from passing a real key,
+or `ANTHROPIC_AUTH_TOKEN` (which the CLI also sends as a bearer token), or
+its own `ANTHROPIC_BASE_URL` that bypasses the proxy.
+
+**Solution.** `LaunchSpec` has `credential: CredentialKind` and
+`placeholder: SecretString`, and the runner puts the placeholder in the one
+variable the kind uses. `LaunchSpec.env` is refused if it sets any variable
+the runner sets (`HOME`, `TMPDIR`, the design's credential proxy block) or
+any `ANTHROPIC_*` or `CLAUDE_CODE_OAUTH_*` variable. The placeholder must be
+non-empty printable ASCII. `LaunchSpec`'s `Debug` shows the environment's
+names only, and its values are `SecretString`s, as the plan's secrets rule
+asks for the agentctl token: they are exposed only in the map built for
+`Sandbox::exec`, which is dropped once the process has started.
+`ClaudeProcess::start` also takes a `ProcessConfig` (the
+`claude` binary, `ANTHROPIC_BASE_URL`, the turn timeout), which the plan's
+three-argument signature had no place for. The plan's T20 bullet says so.
+
+### When a session has started
+
+**Issue.** The plan uses `--session-id` for a session that "has never
+started" and `--resume` otherwise, and T04 found that the transcript
+appears with the first user message. The caller can't look for the
+transcript itself: `Container::paths()` are the paths the CLI sees, which
+under Docker aren't agentd's. And a turn can end without anyone knowing
+whether the CLI read the message: a crash before it read stdin leaves no
+transcript, a crash after it leaves one. Guessing wrong either way fails the
+next start: `--session-id` on an existing transcript exits 1 without a
+result, and `--resume` without one prints an `error_during_execution`
+result and exits.
+
+**Solution.** `TurnStats::init_seen` records whether the CLI printed its
+`system`/`init` line for the turn, which it does once it has read the
+message. The plan's T21 now marks a session started after a turn with
+`init_seen`, whatever the outcome. The two refusals are tested: a
+`--session-id` start on a started session gives `Crashed` with exit code 1
+and `init_seen` false, and a `--resume` of a session that never started gives
+a `Finished` error result with subtype `error_during_execution`.
+
+That refusal also left the session looking unstarted forever: every
+`--resume` gives it again, with `init_seen` false. `TurnOutcome::resume_refused()`
+names it (an error result with that subtype and no `init` line), the
+process is reaped since the CLI exits after it, and the plan's T21 resets
+the session to `--session-id` under the same id and runs the turn again.
+
+### A failed write can follow the CLI's answer
+
+**Issue.** For a `--resume` without a transcript the CLI prints its result
+and exits without reading stdin. Writing the turn's line then races the
+exit: when the write lost, with `EPIPE`, the driver reported a crash and
+dropped the result line waiting in the pipe.
+
+**Solution.** A failed write is logged and the driver still reads stdout to
+its end, so a result printed before the process went is returned. Review
+found the process then still counted as running, and the next turn crashed
+on it. Now a result after a failed write, or a resume refusal (where the
+write can win the race), reaps the process before `Finished` is returned,
+so `is_running()` is false and the next turn gets `NotRunning`.
+
+### A spawn on another thread can hold the pipe open
+
+**Issue.** The test for that, `a_result_after_a_failed_write_ends_the_process`,
+failed once in CI's Coverage job with the process still running: the write
+to a script that had closed its stdin succeeded. Locally it failed in 2 of
+100 runs of the test binary, 5 of 150 with four busy loops on the CPUs, 1 of
+150 under `cargo llvm-cov`, and never alone or with `--test-threads=1`. The
+tests run in parallel and each spawns processes through `ProcessSandbox`. A
+child starts with a copy of every descriptor open in the test process and
+holds it until its exec closes it (`O_CLOEXEC`). A child forked on another
+thread while this test's spawn had the stdin pipe open, and not scheduled
+until after the script had closed its end, was still a reader when the
+driver wrote. The same leak failed the test once with `ETXTBSY`: a child
+forked while `std::fs::write` had the script open for writing still held it
+when the script was exec'd. The driver was right; the test process broke
+the precondition.
+
+**Solution.** `ProcessSandbox::exec` holds a process-wide lock around the
+spawn. A spawn returns only once its child has exec'd, so with one spawn at
+a time no child is left holding another's pipes, or a file written before
+the spawn. After the change: 0 failures in 300 runs with the busy loops,
+and 0 in 150 under `cargo llvm-cov` with them. testkit's `fake_claude` test
+binary spawns `fake-claude` directly, and one test writes a script for it
+to run, so it holds its own lock, for the same reason, around its spawns
+and that write.
+
+### Codes and tool names can carry text
+
+**Issue.** The first version logged the `type` of a skipped line, and kept
+line codes (`subtype`, `terminal_reason`, the assistant line's `error`) and
+tool names that matched `[A-Za-z0-9_.:-]`. The captured-log test put a fake
+API key (`sk-ant-api03-…`) in a line's `type` and it reached the log: key
+formats fit that pattern. Tool names are written by the model, so a
+prompt-injected model could choose one.
+
+**Solution.** A skipped line is logged with its length only. Codes are kept
+only in the form the CLI's codes take, at most 64 bytes of lowercase ASCII
+letters, digits and `_`, and dropped otherwise. A tool name is kept only if
+it is one of the six tools the process was given, and as `<other>`
+otherwise. The test covers a secret in each of these places, in the
+reply, in the user message and in tool output, and checks the placeholder
+and `AGENTCTL_TOKEN` too.
+
+### Lines are parsed as values, then read field by field
+
+**Issue.** A malformed line may be logged with its parse error only, but
+serde's typed errors quote the value that failed (`invalid type: string
+"…"`), so deserializing a line straight into structs would log whatever a
+mistyped field held.
+
+**Solution.** Each line is parsed into a `serde_json::Value`, whose errors
+are syntax errors that name a position, not content, and fields are read
+with `as_str`, `as_u64` and so on, so a field of the wrong type is absent
+rather than an error. A result line without `is_error` counts as an error
+unless its subtype is `success`. Lines are read with a 16 MiB cap
+(`MAX_LINE_BYTES`): a longer line is skipped, and logged with its length, so
+a huge tool result can't grow the buffer without bound. Result lines hold
+only the final reply and stay far below it. The line buffer is cleared and
+shrunk back to 64 KiB after each turn, so a warm process doesn't keep a
+large line's capacity, or its bytes, between turns.
+
+### Classifying errors by the assistant line's code
+
+**Issue.** The plan classifies `is_error` results by `api_error_status` and
+the text. The captures show the CLI's synthetic `assistant` line for an API
+error carries an `error` code too (`authentication_failed` next to the 401,
+`server_error` for an unreachable proxy), and `api_error_status` is null
+when there was no HTTP answer.
+
+**Solution.** `ErrorKind::classify` takes the status first (429 is
+`UsageLimit`, 401 and 403 `Auth`), then the code (`rate_limit` and
+`billing_error` are `UsageLimit`, `authentication_failed` is `Auth`), then
+phrases in the text ("usage limit", "rate limit", "hit your limit",
+"credit balance", "out of credits", "insufficient credit", "quota"). The
+code is kept in `TurnStats::api_error`. The phrase list is a guess at the
+CLI's messages; only the 401 path was seen live (T04's capture).
+
+### A cancelled turn leaves the stream mid-turn
+
+**Issue.** `send_turn` reads the turn's lines as it goes. If the caller
+drops its future (a cancelled request, a `select!`), the process is left in
+the middle of a turn, and the next turn would read the old turn's lines,
+result included, as its own.
+
+**Solution.** The process records that a turn is in progress, and a
+`send_turn` that finds one still in progress kills the process and returns
+`RunnerError::NotRunning`, as after a crash, so the caller resumes on a new
+process. A timeout ends the turn the same way, with the process killed
+before `TimedOut` is returned. The timeout counts from the call, so it
+includes writing the message.
+
+### A kill is not an exit
+
+**Issue.** The timeout and cancelled-turn paths said the process was killed
+and reaped, but a failed kill was only logged, a wait that didn't return
+within the five-second grace was dropped, and the process was marked dead
+either way. Under Docker a kill can signal nothing: the sandbox's kill
+finds the process by a pid it may never have learned (T17's review fix
+makes that an error that says to stop the container instead). A process marked dead might still be writing
+the transcript the next process resumes.
+
+**Solution.** The process records whether a wait returned after the kill
+(or after stdin closed, for `stop`), and `ClaudeProcess::may_be_alive()`
+reports it: false only once the exit was seen. It covers every way a
+process ends, crash, timeout, cancelled turn, refused resume and `stop`
+(which now takes `&mut self` so the answer can be read afterwards), rather
+than a flag on each outcome. The plan's T21 stops the container when a
+dead process may still be alive. `ChildHandle` is a concrete type, so the
+kill-and-wait logic is written against a private two-method trait, and
+unit tests drive it with a double whose kill fails or is ignored.
+
+### `total_cost_usd` is the process's running total
+
+**Issue.** The result line's `total_cost_usd` was passed on as the turn's
+cost. T04's `tool-turns.jsonl` shows it is the process's running total:
+the first turn reports usage 20/10 and 0.00014, the second usage 10/5 and
+0.00021, which is 1.5 times the first, the cost of 30/15. `usage` is the
+turn's own. T27 would have billed a member again for every earlier turn
+on the process, including other members' turns on a shared warm process.
+
+**Solution.** `ClaudeProcess` keeps the last total it saw, 0 on each new
+process, and `TurnResult::cost_usd` is the rise since then, never below 0;
+the raw value stays as `process_total_cost_usd`. The fixture test checks
+that the second turn costs about 0.00007, and `fake-claude` now reports a
+running total (`testkit::claude::REPLY_COST_USD` per reply, a power of two
+so the sums are exact) for the integration tests. Whether the real CLI
+starts a `--resume`d process's total from 0, as `fake-claude` does, or
+restores the session's total, is unverified: no kept capture holds a
+result from a `--resume`d process. A restored total would make
+the first turn of every resumed process count the session's earlier turns
+again. The plan's T23 live check now covers it.
+
+serde_json's default float parser is not correctly rounded (its
+`float_roundtrip` feature is off), so the fixture's
+`0.00014000000000000001` parses one unit in the last place away from the
+literal, and the differences carry such errors too. That stays far below
+a cent in T27's daily sums; the fixture test compares with a tolerance.
+
 ## T22: router
 
 ### The plan and the design name no order for the checks
