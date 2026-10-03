@@ -11,8 +11,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use testkit::TempDir;
 
-use common::{CONFIG, TempDir, master_key};
+use common::{CONFIG, master_key};
 
 fn agentd() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_agentd"));
@@ -47,8 +48,8 @@ fn wait(child: &mut Child, limit: Duration) -> ExitStatus {
 #[cfg(unix)]
 #[test]
 fn serve_answers_healthz_and_exits_cleanly_on_sigterm() {
-    let dir = TempDir::new();
-    let db = dir.path().join("agentd.db");
+    let dir = TempDir::new("agentd-test");
+    let db = dir.join("agentd.db");
     let text = CONFIG.replace("sqlite::memory:", &format!("sqlite://{}", db.display()));
     let config = write_config(dir.path(), &text);
     let mut child = agentd()
@@ -109,7 +110,7 @@ fn serve_answers_healthz_and_exits_cleanly_on_sigterm() {
 
 #[test]
 fn serve_refuses_a_bad_config_and_names_the_key() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let config = write_config(
         dir.path(),
         &CONFIG.replacen("127.0.0.1:0", "0.0.0.0:8443", 1),
@@ -127,8 +128,8 @@ fn serve_refuses_a_bad_config_and_names_the_key() {
 
 #[test]
 fn migrate_creates_and_migrates_the_database() {
-    let dir = TempDir::new();
-    let db = dir.path().join("agentd.db");
+    let dir = TempDir::new("agentd-test");
+    let db = dir.join("agentd.db");
     let text = CONFIG.replace("sqlite::memory:", &format!("sqlite://{}", db.display()));
     let config = write_config(dir.path(), &text);
     let key = master_key();
@@ -158,7 +159,7 @@ fn migrate_creates_and_migrates_the_database() {
 
 #[test]
 fn migrate_needs_the_master_key() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let config = write_config(dir.path(), CONFIG);
     let output = agentd()
         .args(["migrate", "--config"])
