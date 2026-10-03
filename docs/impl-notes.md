@@ -458,17 +458,45 @@ passed.
 
 **Issue.** A fixed sleep before a step that assumes something has happened
 passes on an idle machine, then fails or stops testing anything under load.
-A warm private session is not yet a running turn, so a kill sent once the
-session was warm went unbilled; a Slack test slept 200 ms and assumed its
-client had connected before agentd stopped; and pipeline tests slept 200 ms
-and assumed the platform's copy of an agent's post was already waiting for
-its attribution.
+Auth tests slept 100 ms and assumed a token response delayed 300 ms was
+still on its way. `concurrent_callers_share_a_failed_refresh_of_an_expired_token`
+gave its five callers the 503's 200 ms delay to join one refresh; a caller
+that joins after it lands starts its own, since an expired token is always
+retried, and sends a second request. Adding 250 ms before callers 2 to 5
+start failed it. The plan-after-lock test slept 1 s, then checked a profile
+that was delayed 1.5 s, so it never saw the profile land.
 
-**Solution.** A test waits, with a bound, for a state it can observe: the
-upstream model request, the request reaching agentd's routes. Where nothing
-marks the state, the steps are ordered so that it holds by construction:
-the platform's copy is sent before the turn that posts it starts. A sleep
-stays only as a settle before asserting that nothing more happened.
+**Solution.** `testkit::Held` is a wiremock responder that holds its
+response until the test releases it. A test waits, with a 30 s bound, for
+the request to arrive, acts, then releases it. Holding blocks the mock
+server's thread, so the `Hold` is declared after the server and released
+before anything else asks the server. The expired-token test also waits
+until all five callers have joined: the in-flight map holds the refresh's
+`watch::Sender`, and a doc-hidden `Auth::refresh_waiters(member)` returns
+its receiver count. That sender keeps the channel open, so the guard that
+removes the map entry goes into the refresh task when it is spawned, and a
+task dropped before its first poll still frees it. The plan-after-lock test
+waits for the profile request and checks 2 s after it. A sleep stays only
+as a settle before asserting that nothing more happened.
+
+agentd's `a_stalled_body_does_not_hold_up_shutdown` slept 200 ms and
+assumed its client had sent its partial request by then; a client thread
+that started late found the listener closed. The test layers the public
+routes with a hook that signals each request, and stops agentd once the
+request has reached them.
+
+`a_shutdown_kills_and_meters_the_turn_it_cuts` killed the private turn
+once its session was warm, which is also true while the turn is still
+starting its process; a kill there ends the turn before anything is
+billed. The test also waits for the turn's upstream model request.
+
+Pipeline tests slept and assumed the platform's copy of an agent's post
+was already waiting for its attribution. Nothing marks that wait, so the
+tests order their steps: the copy is sent before the turn that posts the
+reply starts, and is checked to be still waiting before the reply goes.
+A separate test pins the wait itself: another agent's unattributed post
+that names this agent is ignored after the configured 3 s, longer than
+the 2 s default, and within 10 s.
 
 ## T05: store
 
