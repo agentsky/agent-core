@@ -17,8 +17,8 @@ use crate::cloud::FireClient;
 use crate::commands::rocketchat::command_in;
 use crate::commands::slack::dm_command;
 use crate::commands::slack_tests::{
-    Running, SlackHarness, dm_event, file_store, identity, json_body, slack_channel, slack_harness,
-    slack_harness_on, slack_key, sql,
+    Running, SlackHarness, TempDir, dm_event, file_store, identity, json_body, slack_channel,
+    slack_harness, slack_harness_on, slack_key, sql,
 };
 use crate::commands::tests::{Harness, conv, dm_room, harness, key, serve};
 use crate::config::CloudConfig;
@@ -785,7 +785,7 @@ async fn logout_drops_routines_and_handoffs() {
 #[tokio::test]
 async fn a_logout_that_failed_still_says_to_revoke_when_sent_again() {
     let endpoint = MockServer::start().await;
-    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let (h, url, _dir) = slack_cloud_on_file(&endpoint).await;
     let alice = h
         .store
         .member_for_identity(&slack_key("U0HUMAN01"))
@@ -816,7 +816,6 @@ async fn a_logout_that_failed_still_says_to_revoke_when_sent_again() {
         "{reply}"
     );
     assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -1387,7 +1386,7 @@ fn a_session_without_its_link_is_shown_by_id() {
 /// A Slack harness on a database file, whose commands fire routines at
 /// `endpoint`, with `U0HUMAN01` linked and the routine registered; the
 /// database's URL and directory.
-async fn slack_cloud_on_file(endpoint: &MockServer) -> (SlackHarness, String, std::path::PathBuf) {
+async fn slack_cloud_on_file(endpoint: &MockServer) -> (SlackHarness, String, TempDir) {
     let (store, url, dir) = file_store().await;
     let mut h = slack_harness_on(store).await;
     h.commands = h.commands.clone().with_cloud(fire_client(endpoint));
@@ -1405,7 +1404,7 @@ async fn slack_cloud_on_file(endpoint: &MockServer) -> (SlackHarness, String, st
 #[tokio::test]
 async fn a_stored_token_that_no_longer_opens_asks_for_cloud_add_again() {
     let endpoint = MockServer::start().await;
-    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let (h, url, _dir) = slack_cloud_on_file(&endpoint).await;
     sql(
         &url,
         "UPDATE cloud_routines SET url_origin = 'https://moved.example'",
@@ -1435,13 +1434,12 @@ async fn a_stored_token_that_no_longer_opens_asks_for_cloud_add_again() {
         .slash("U0HUMAN01", "cloud run agent-core Fix the flaky test")
         .await;
     assert!(reply[0].starts_with("Started"), "{reply:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn a_store_failing_around_the_request_never_hides_the_link() {
     let endpoint = MockServer::start().await;
-    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let (h, url, _dir) = slack_cloud_on_file(&endpoint).await;
     let alice = h
         .store
         .member_for_identity(&slack_key("U0HUMAN01"))
@@ -1486,13 +1484,12 @@ async fn a_store_failing_around_the_request_never_hides_the_link() {
     assert_eq!((pass.marked, pass.told), (1, 1));
     let posts = h.posts().await;
     assert!(posts[0].1.contains("`/agent cloud list`"), "{posts:?}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn a_notice_the_store_fails_on_leaves_the_others_and_the_purge() {
     let endpoint = MockServer::start().await;
-    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let (h, url, _dir) = slack_cloud_on_file(&endpoint).await;
     let alice = h
         .store
         .member_for_identity(&slack_key("U0HUMAN01"))
@@ -1558,7 +1555,6 @@ async fn a_notice_the_store_fails_on_leaves_the_others_and_the_purge() {
             .notified_at
             .is_some()
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
@@ -1622,7 +1618,7 @@ async fn a_slack_dm_points_to_the_slash_command_to_add_a_routine() {
 #[tokio::test]
 async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_again() {
     let endpoint = MockServer::start().await;
-    let (h, url, dir) = slack_cloud_on_file(&endpoint).await;
+    let (h, url, _dir) = slack_cloud_on_file(&endpoint).await;
     let alice = h
         .store
         .member_for_identity(&slack_key("U0HUMAN01"))
@@ -1647,5 +1643,4 @@ async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_aga
         "{reply}"
     );
     assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
