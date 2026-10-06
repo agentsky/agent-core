@@ -14,7 +14,7 @@ use core_types::{
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::json;
 use store::{NewClaudeLink, Sealer, Store};
-use testkit::{Held, MockSurface, Op};
+use testkit::{Held, MockSurface, Op, TempDir};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use wiremock::matchers::{body_partial_json, method, path};
@@ -86,7 +86,7 @@ struct Harness {
     mock: Arc<MockSurface>,
     oauth: MockServer,
     manager: Binding,
-    root: std::path::PathBuf,
+    root: TempDir,
     dms: Arc<Dms>,
 }
 
@@ -115,7 +115,7 @@ async fn harness() -> Harness {
         mock.clone(),
         dms.clone(),
     ));
-    let root = std::env::temp_dir().join(format!("agentd-cmd-skills-{}", uuid::Uuid::new_v4()));
+    let root = TempDir::new("agentd-cmd-skills");
     let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()))
         .serving_prefix_from_directory_for_tests("https://git.test/", &root.join("repos"));
     let skills = crate::skills::Skills::new(store.clone(), root.join("data"), git);
@@ -1286,8 +1286,7 @@ fn skill_repo(dir: &std::path::Path, text: &str) {
 #[tokio::test]
 async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     let h = harness().await;
-    let root = h.root.clone();
-    let repos = root.join("repos");
+    let repos = h.root.join("repos");
     skill_repo(
         &repos.join("gh.git"),
         "---\nname: gh\ndescription: Use GitHub.\nallowed-hosts: [api.github.com]\n---\n",
@@ -1296,7 +1295,7 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         &repos.join("notes.git"),
         "---\nname: notes\ndescription: Keep notes.\n---\n",
     );
-    let data = root.join("data");
+    let data = h.root.join("data");
     let commands = h.commands.clone();
     let (alice, _) = h.linked_member("alice", "claude_pro").await;
     let team = TeamId::new(TEAM);
@@ -1461,7 +1460,6 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         "{}",
         h.last_reply("alice")
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A runner for the session commands: warm sessions are listed, and a
