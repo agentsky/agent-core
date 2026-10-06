@@ -2,7 +2,7 @@
 //! directly, then through a `fake-claude` script as the model would run it.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -22,33 +22,13 @@ use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use store::{Store, StoreError};
 use testkit::claude::SCRIPT_ENV;
-use testkit::{MockSurface, fake_anthropic, fake_claude_path, write_script};
+use testkit::{MockSurface, TempDir, fake_anthropic, fake_claude_path, write_script};
 use time::OffsetDateTime;
 use time::macros::datetime;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::Notify;
 
 const WAIT: Duration = Duration::from_secs(60);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentctl-test-{}", uuid()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn uuid() -> String {
     TurnId::new_v4().to_string()
@@ -123,16 +103,16 @@ impl Server {
     }
 
     async fn with(tune: impl FnOnce(&mut CtlSettings)) -> Self {
-        let dir = TempDir::new();
+        let dir = TempDir::new("agentctl-test");
         let key = store::Sealer::generate_key().unwrap();
         let store = Store::open_in_memory(store::Sealer::from_base64(&key).unwrap())
             .await
             .unwrap();
         let mut settings = CtlSettings {
-            staging_dir: dir.path(STAGING_DIR),
+            staging_dir: dir.join(STAGING_DIR),
             attach_max_bytes: 1024,
             lease_ttl: Duration::from_secs(30),
-            consents: ConsentSettings::in_data_dir(&dir.0),
+            consents: ConsentSettings::in_data_dir(dir.path()),
         };
         tune(&mut settings);
         reviewer(&store).await;
@@ -179,7 +159,7 @@ impl Server {
     }
 
     fn agentctl(&self, token: &ProcessToken) -> tokio::process::Command {
-        agentctl(&self.url, token.secret().expose_secret(), &self.dir.0)
+        agentctl(&self.url, token.secret().expose_secret(), self.dir.path())
     }
 
     async fn run(&self, token: &ProcessToken, args: &[&str]) -> Run {
@@ -353,7 +333,7 @@ async fn each_subcommand_works_against_the_server() {
         .surface
         .set_history(thread(), vec![msg("1", "first"), msg("2", "second")]);
     let (_, token) = server.turn().await;
-    std::fs::write(server.dir.path("notes.md"), "# notes\n").unwrap();
+    std::fs::write(server.dir.join("notes.md"), "# notes\n").unwrap();
 
     let out = server.run(&token, &["attach", "notes.md"]).await;
     assert_eq!(
@@ -385,7 +365,7 @@ async fn each_subcommand_works_against_the_server() {
         .refused("CLAUDE_CONFIG_DIR is not set");
     let output = server
         .agentctl(&token)
-        .env("CLAUDE_CONFIG_DIR", server.dir.path("claude"))
+        .env("CLAUDE_CONFIG_DIR", server.dir.join("claude"))
         .args(["private", "--file", "../elsewhere.md", "check", "it"])
         .output()
         .await
@@ -453,7 +433,7 @@ async fn refusals_exit_non_zero_with_one_line() {
         .run(&token, &["attach", "."])
         .await
         .refused("names no file");
-    std::fs::write(server.dir.path("big.bin"), vec![b'x'; 8 << 20]).unwrap();
+    std::fs::write(server.dir.join("big.bin"), vec![b'x'; 8 << 20]).unwrap();
     server
         .run(&token, &["attach", "big.bin"])
         .await
@@ -467,7 +447,7 @@ async fn refusals_exit_non_zero_with_one_line() {
         .run(&private, &["history"])
         .await
         .refused("only `agentctl attach`");
-    std::fs::write(server.dir.path("result.txt"), "42").unwrap();
+    std::fs::write(server.dir.join("result.txt"), "42").unwrap();
     server.run(&private, &["attach", "result.txt"]).await.ok();
 
     server.ctl.revoke_process_token(&token).await.unwrap();
@@ -522,7 +502,7 @@ async fn lock_passes_on_the_command_status() {
 /// around a sleep, and returns the log. The second starts once the first
 /// holds the lock, however long the first takes to start.
 async fn two_locks(server: &Server, a: &ProcessToken, b: &ProcessToken) -> Vec<String> {
-    let log = server.dir.path(&format!("log-{}", uuid()));
+    let log = server.dir.join(format!("log-{}", uuid()));
     let script = |tag: &str| {
         format!(
             "echo start-{tag} >> {log}; sleep 1; echo end-{tag} >> {log}",
@@ -581,7 +561,7 @@ async fn a_second_session_waits_for_the_lock() {
 async fn lock_gives_up_after_its_timeout() {
     let server = Server::start().await;
     let (_, token) = server.turn().await;
-    let marker = server.dir.path("holding");
+    let marker = server.dir.join("holding");
     let holder = server
         .agentctl(&token)
         .args([
@@ -610,7 +590,7 @@ async fn lock_gives_up_after_its_timeout() {
 async fn the_lock_renews_while_the_command_runs() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
     let (_, token) = server.turn().await;
-    let (marker, release) = (server.dir.path("holding"), server.dir.path("release"));
+    let (marker, release) = (server.dir.join("holding"), server.dir.join("release"));
     let holder = server
         .agentctl(&token)
         .args([
@@ -641,7 +621,7 @@ async fn the_lock_renews_while_the_command_runs() {
 async fn the_lock_expires_when_its_holder_dies() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
     let (_, token) = server.turn().await;
-    let marker = server.dir.path("holding");
+    let marker = server.dir.join("holding");
     let mut holder = server
         .agentctl(&token)
         .args([
@@ -690,7 +670,7 @@ async fn losing_the_lease_stops_the_command_and_frees_the_lock_at_once() {
             .unwrap()
     };
 
-    let marker = server.dir.path("ended");
+    let marker = server.dir.join("ended");
     let holder = hold(&marker);
     wait_for(&marker).await;
     let started = Instant::now();
@@ -713,7 +693,7 @@ async fn losing_the_lease_stops_the_command_and_frees_the_lock_at_once() {
         .begin_turn(&token, turn(Side::Public))
         .await
         .unwrap();
-    let marker = server.dir.path("revoked");
+    let marker = server.dir.join("revoked");
     let holder = hold(&marker);
     wait_for(&marker).await;
     server.ctl.revoke_process_token(&token).await.unwrap();
@@ -874,11 +854,11 @@ async fn fake_lock(
 #[tokio::test]
 async fn a_stalled_renewal_stops_the_command_and_its_children_before_the_lease_runs_out() {
     let fake = FakeLock::start(3, 5, Renewals::Stall).await;
-    let dir = TempDir::new();
-    let (marker, log) = (dir.path("started"), dir.path("log"));
+    let dir = TempDir::new("agentctl-test");
+    let (marker, log) = (dir.join("started"), dir.join("log"));
     let output = tokio::time::timeout(
         WAIT,
-        agentctl(&fake.url, "tok", &dir.0)
+        agentctl(&fake.url, "tok", dir.path())
             .args(["lock", "--", "sh", "-c", &writer(&marker, &log)])
             .output(),
     )
@@ -895,11 +875,11 @@ async fn a_stalled_renewal_stops_the_command_and_its_children_before_the_lease_r
 #[tokio::test]
 async fn a_transient_agentd_error_is_retried_under_a_clock_behind_agentctls() {
     let fake = FakeLock::start(3, -40, Renewals::FailOnce).await;
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentctl-test");
     let out = Run::from(
         tokio::time::timeout(
             WAIT,
-            agentctl(&fake.url, "tok", &dir.0)
+            agentctl(&fake.url, "tok", dir.path())
                 .args(["lock", "--", "sleep", "2"])
                 .output(),
         )
@@ -916,12 +896,12 @@ async fn a_transient_agentd_error_is_retried_under_a_clock_behind_agentctls() {
 #[tokio::test]
 async fn a_lease_too_short_to_renew_is_given_back() {
     let fake = FakeLock::start(2, 0, Renewals::FailOnce).await;
-    let dir = TempDir::new();
-    let marker = dir.path("ran");
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
     let out = Run::from(
         tokio::time::timeout(
             WAIT,
-            agentctl(&fake.url, "tok", &dir.0)
+            agentctl(&fake.url, "tok", dir.path())
                 .args(["lock", "--", "touch", marker.to_str().unwrap()])
                 .output(),
         )
@@ -939,9 +919,9 @@ async fn a_lease_too_short_to_renew_is_given_back() {
 #[tokio::test]
 async fn a_signal_during_acquire_gives_back_the_lease_it_was_granted() {
     let fake = FakeLock::delayed(30, 0, Renewals::FailOnce, Duration::from_millis(1_500)).await;
-    let dir = TempDir::new();
-    let marker = dir.path("ran");
-    let holder = agentctl(&fake.url, "tok", &dir.0)
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
+    let holder = agentctl(&fake.url, "tok", dir.path())
         .args(["lock", "--", "touch", marker.to_str().unwrap()])
         .spawn()
         .unwrap();
@@ -965,8 +945,8 @@ async fn a_signal_during_acquire_gives_back_the_lease_it_was_granted() {
 #[tokio::test]
 async fn a_signal_during_a_stalled_renewal_stops_the_lock_at_once() {
     let fake = FakeLock::start(6, 0, Renewals::Stall).await;
-    let dir = TempDir::new();
-    let holder = agentctl(&fake.url, "tok", &dir.0)
+    let dir = TempDir::new("agentctl-test");
+    let holder = agentctl(&fake.url, "tok", dir.path())
         .args(["lock", "--", "sleep", "30"])
         .spawn()
         .unwrap();
@@ -1071,11 +1051,11 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
         .set_history(thread(), vec![msg("1", "earlier in the thread")]);
     let (_, token) = server.turn().await;
     let anthropic = fake_anthropic().await;
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentctl-test");
     for sub in ["claude", "work"] {
-        std::fs::create_dir_all(dir.path(sub)).unwrap();
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
-    std::fs::write(dir.path("work").join("plot.txt"), "a plot").unwrap();
+    std::fs::write(dir.join("work").join("plot.txt"), "a plot").unwrap();
     let commands: [&[&str]; 8] = [
         &["agentctl", "attach", "plot.txt"],
         &["agentctl", "post", "--to", "here", "see", "the", "plot"],
@@ -1091,10 +1071,10 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
         .fold(testkit::Turn::reply("Done."), |turn, argv| {
             turn.with_command(argv.iter().copied())
         });
-    write_script(&dir.path("script.json"), &[script]).unwrap();
+    write_script(&dir.join("script.json"), &[script]).unwrap();
 
     let session = uuid();
-    let mut child = fake_claude(&server, &token, &dir.0, &anthropic.uri(), &session)
+    let mut child = fake_claude(&server, &token, dir.path(), &anthropic.uri(), &session)
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -1164,7 +1144,7 @@ async fn the_model_runs_agentctl_through_its_bash_tool() {
 async fn a_terminated_lock_stops_its_command_and_releases_the_lease() {
     let server = Server::start().await;
     let (_, token) = server.turn().await;
-    let (marker, log) = (server.dir.path("holding"), server.dir.path("log"));
+    let (marker, log) = (server.dir.join("holding"), server.dir.join("log"));
     let holder = server
         .agentctl(&token)
         .args(["lock", "--", "sh", "-c", &writer(&marker, &log)])
@@ -1191,7 +1171,7 @@ async fn a_terminated_lock_stops_its_command_and_releases_the_lease() {
 async fn a_stop_signal_reaches_the_command_before_its_group_is_killed() {
     let server = Server::start().await;
     let (_, token) = server.turn().await;
-    let (marker, cleaned) = (server.dir.path("trapping"), server.dir.path("cleaned"));
+    let (marker, cleaned) = (server.dir.join("trapping"), server.dir.join("cleaned"));
     let holder = server
         .agentctl(&token)
         .args([
@@ -1223,7 +1203,7 @@ async fn a_stop_signal_reaches_the_command_before_its_group_is_killed() {
         .await
         .ok();
 
-    let marker = server.dir.path("ignoring");
+    let marker = server.dir.join("ignoring");
     let holder = server
         .agentctl(&token)
         .args([

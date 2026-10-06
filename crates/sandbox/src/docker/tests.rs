@@ -548,20 +548,20 @@ async fn the_network_must_be_internal_and_named_by_its_name() {
 
 #[tokio::test]
 async fn start_refuses_an_open_network_before_touching_the_disk() {
-    let dir = crate::test_util::TempDir::new();
+    let dir = crate::test_util::TempDir::new("sandbox-test");
     let open = serde_json::json!({"Name": "sandbox", "Internal": false});
-    let sandbox = sandbox_seeing_network(open, &dir.0).await;
+    let sandbox = sandbox_seeing_network(open, dir.path()).await;
     let spec = SessionSpec::new(
         SessionId::new_v4(),
-        volume(&dir.0, AgentId::new_v4(), ScopeKey::Private),
+        volume(dir.path(), AgentId::new_v4(), ScopeKey::Private),
         "img",
-        dir.0.join("agents/a1"),
+        dir.join("agents/a1"),
     );
     assert!(matches!(
         sandbox.start(&spec).await,
         Err(SandboxError::Config(ConfigError { key: "network", .. }))
     ));
-    assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
 
 #[tokio::test]
