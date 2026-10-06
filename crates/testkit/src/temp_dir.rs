@@ -12,11 +12,14 @@ pub struct TempDir(PathBuf);
 impl TempDir {
     /// Creates `<temp>/<prefix>-<uuid>`. The prefix names the crate or
     /// test, so a directory left behind by a killed run says where it came
-    /// from.
-    #[must_use]
+    /// from. Bind the result to a name: a `TempDir` dropped at once, as
+    /// `let _ =` or a temporary does, removes its directory at once.
+    #[must_use = "dropping a TempDir removes its directory"]
     pub fn new(prefix: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("creating {}: {e}", dir.display()));
+        std::fs::create_dir_all(std::env::temp_dir())
+            .and_then(|()| std::fs::create_dir(&dir))
+            .unwrap_or_else(|e| panic!("creating {}: {e}", dir.display()));
         Self(dir)
     }
 
