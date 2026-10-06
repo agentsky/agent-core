@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use surface_slack::normalize::{self, Context};
 use surface_slack::surface::CAPS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
-use testkit::Held;
 use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
+use testkit::{Held, TempDir};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -473,8 +473,7 @@ async fn upload_shares_into_the_thread() {
         ok(json!({"files": []})),
     )
     .await;
-    let dir = std::env::temp_dir().join(format!("surface-slack-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("surface-slack");
     std::fs::write(dir.join("out.txt"), "data").unwrap();
     let file = OutFile {
         name: "out.txt".into(),
