@@ -2,9 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use agentd::server::{Routers, Worker};
 use secrecy::ExposeSecret;
@@ -90,36 +88,6 @@ pub fn read_response(stream: &mut TcpStream) -> Option<Response> {
         .map_or("", |(_, body)| body)
         .to_owned();
     Some(Response { status, body })
-}
-
-/// A directory under the system temp directory, removed on drop.
-pub struct TempDir(PathBuf);
-
-impl TempDir {
-    pub fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "agentd-test-{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 /// `routers` with a worker that never ends, so the drain takes all of

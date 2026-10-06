@@ -30,14 +30,14 @@ use store::{
     NewSlackConfigToken, Store, Visibility,
 };
 use testkit::slack as fixtures;
-use testkit::{Turn, agentctl_path, fake_anthropic, fake_claude_path};
+use testkit::{TempDir, Turn, agentctl_path, fake_anthropic, fake_claude_path};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use common::{Response, TempDir, env};
+use common::{Response, env};
 
 const PUBLIC_URL: &str = "https://agentd.example.com";
 const MANAGER_SECRET: &str = "manager-signing-SECRET";
@@ -849,7 +849,7 @@ impl Turned {
     async fn start(agents: &[AgentSpec]) -> Self {
         let claude = fake_claude_path();
         let agentctl = agentctl_path();
-        let dir = TempDir::new();
+        let dir = TempDir::new("agentd-test");
         let fake = fake_anthropic().await;
         let slack = fake_slack().await;
         for agent in agents.iter().skip(1) {
@@ -868,10 +868,7 @@ impl Turned {
             "{}\n[proxy]\nupstream = \"{}\"\n",
             config_text(&slack, "")
                 .replace("/nonexistent/agentd", &dir.path().display().to_string())
-                .replace(
-                    "sqlite::memory:",
-                    &format!("sqlite://{}", dir.path().join("agentd.db").display())
-                ),
+                .replace("sqlite::memory:", &dir.db_url()),
             fake.uri()
         );
         let config = Config::parse(&text, slack_env()).unwrap();
@@ -937,7 +934,7 @@ impl Turned {
             .await
             .unwrap();
         let addrs = server.addrs();
-        let script = dir.path().join("script.json");
+        let script = dir.join("script.json");
         testkit::write_script(&script, &vec![Turn::reply("Hello from helper."); 4]).unwrap();
         let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
         let mut vars = BTreeMap::from([
@@ -2083,7 +2080,7 @@ async fn one_agents_flood_is_refused_past_its_places_and_other_agents_are_not() 
 impl Turned {
     /// Makes the turns from now on play `turn`, whichever session they run in.
     fn every_turn(&self, turn: Turn) {
-        let script = self._dir.path().join("script.json");
+        let script = self._dir.join("script.json");
         testkit::write_script(&script, &vec![turn; 4]).unwrap();
     }
 }

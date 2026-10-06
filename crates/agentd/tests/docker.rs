@@ -54,7 +54,7 @@ use sandbox::{DockerSandbox, Sandbox, SandboxConfig};
 use secrecy::SecretString;
 use store::{Sealer, Store};
 use testkit::anthropic::DEFAULT_REPLY;
-use testkit::fake_anthropic;
+use testkit::{TempDir, fake_anthropic};
 use tokio::net::TcpListener;
 
 const DEFAULT_IMAGE: &str = "agent-core/sandbox:dev";
@@ -260,7 +260,7 @@ async fn docker_startup_reaps_only_this_instances_sandboxes() {
     let stranger = planted.plant(&docker, HashMap::new()).await;
     assert_eq!(containers(&docker, &instance).await, vec![left.clone()]);
 
-    let dir = common::TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let text = format!(
         "{}\n[sandbox]\nimage = \"{PLANTED_IMAGE}\"\ninstance = \"{instance}\"\nstop_timeout_secs = 1\n",
         common::CONFIG
