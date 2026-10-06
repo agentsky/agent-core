@@ -436,7 +436,7 @@ mod fs_tests {
     async fn layout(dir: &TempDir, owner: Option<(u32, u32)>) -> Layout {
         Layout {
             store: memory_store().await,
-            data_dir: dir.0.clone(),
+            data_dir: dir.path().to_owned(),
             owner,
             cleanup_period_days: 42,
         }
@@ -449,18 +449,18 @@ mod fs_tests {
 
     #[tokio::test]
     async fn ensure_volume_creates_the_directories_and_the_row() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
         let key = VolumeKey {
             agent: AgentId::new_v4(),
             scope: awkward_channel(),
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
-        assert_eq!(volume.path(), dir.0.join(volume_rel_path(&key)));
+        assert_eq!(volume.path(), dir.join(volume_rel_path(&key)));
         assert!(volume.path().join("sessions").is_dir());
         assert!(volume.shared_dir().is_dir());
         assert!(!volume.path().join("memory").exists());
-        let mode = fs::metadata(dir.0.join(VOLUMES_DIR)).unwrap().mode();
+        let mode = fs::metadata(dir.join(VOLUMES_DIR)).unwrap().mode();
         assert_eq!(mode & 0o777, 0o700);
         let row = layout.store.volume(&key).await.unwrap().unwrap();
         assert_eq!(Path::new(&row.path), volume_rel_path(&key));
@@ -479,7 +479,7 @@ mod fs_tests {
 
     #[tokio::test]
     async fn a_lost_row_is_recorded_again_with_the_same_path() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
         let key = VolumeKey {
             agent: AgentId::new_v4(),
@@ -499,7 +499,7 @@ mod fs_tests {
 
     #[tokio::test]
     async fn prepare_creates_the_session_layout_and_settings() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
         let key = VolumeKey {
             agent: AgentId::new_v4(),
@@ -534,8 +534,8 @@ mod fs_tests {
 
     #[tokio::test]
     async fn symlinks_the_agent_left_are_replaced_not_followed() {
-        let dir = TempDir::new();
-        let outside = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
+        let outside = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
         let key = VolumeKey {
             agent: AgentId::new_v4(),
@@ -549,7 +549,7 @@ mod fs_tests {
             .unwrap();
 
         fs::remove_dir_all(session_dir.join("claude")).unwrap();
-        symlink(&outside.0, session_dir.join("claude")).unwrap();
+        symlink(outside.path(), session_dir.join("claude")).unwrap();
         fs::remove_dir_all(session_dir.join("work")).unwrap();
         fs::write(session_dir.join("work"), "not a dir").unwrap();
         layout
@@ -562,9 +562,9 @@ mod fs_tests {
                 .is_dir()
         );
         assert!(session_dir.join("work").is_dir());
-        assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 
-        let target = outside.0.join("victim");
+        let target = outside.join("victim");
         fs::write(&target, "keep").unwrap();
         let settings = session_dir.join("claude/settings.json");
         fs::remove_file(&settings).unwrap();
@@ -592,8 +592,8 @@ mod fs_tests {
 
     #[tokio::test]
     async fn settings_are_written_through_the_claude_handle_not_its_path() {
-        let dir = TempDir::new();
-        let outside = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
+        let outside = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
         let key = VolumeKey {
             agent: AgentId::new_v4(),
@@ -609,12 +609,12 @@ mod fs_tests {
         fs::remove_file(claude.join("settings.json")).unwrap();
         fs::create_dir_all(claude.join("settings.json/nested")).unwrap();
         fs::rename(&claude, session_dir.join("claude-old")).unwrap();
-        symlink(&outside.0, &claude).unwrap();
+        symlink(outside.path(), &claude).unwrap();
         layout.write_settings(&handle).unwrap();
         layout
             .place_skills(&handle, &SkillsEntry::MountPoint)
             .unwrap();
-        assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         let old = session_dir.join("claude-old");
         let mut names: Vec<_> = fs::read_dir(&old)
             .unwrap()
@@ -633,9 +633,9 @@ mod fs_tests {
 
     #[tokio::test]
     async fn skills_mount_points_and_links_replace_what_the_agent_left() {
-        let dir = TempDir::new();
-        let outside = TempDir::new();
-        let skills = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
+        let outside = TempDir::new("sandbox-test");
+        let skills = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
         let key = VolumeKey {
             agent: AgentId::new_v4(),
@@ -648,7 +648,7 @@ mod fs_tests {
             .await
             .unwrap();
         let entry = session_dir.join("claude/skills");
-        symlink(&outside.0, &entry).unwrap();
+        symlink(outside.path(), &entry).unwrap();
         layout
             .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
             .await
@@ -661,23 +661,27 @@ mod fs_tests {
             .unwrap();
         assert!(entry.join("left").is_file());
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Link(Some(skills.0.clone())))
+            .prepare_session_dirs(
+                &volume,
+                session,
+                SkillsEntry::Link(Some(skills.path().to_owned())),
+            )
             .await
             .unwrap();
-        assert_eq!(fs::read_link(&entry).unwrap(), skills.0);
+        assert_eq!(fs::read_link(&entry).unwrap(), skills.path());
         layout
             .prepare_session_dirs(&volume, session, SkillsEntry::Link(None))
             .await
             .unwrap();
         assert!(fs::symlink_metadata(&entry).is_err());
-        assert_eq!(fs::read_dir(&outside.0).unwrap().count(), 0);
-        assert!(skills.0.is_dir());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(skills.path().is_dir());
     }
 
     #[tokio::test]
     async fn modes_the_agent_set_are_reset() {
-        let dir = TempDir::new();
-        let me = fs::metadata(&dir.0).unwrap();
+        let dir = TempDir::new("sandbox-test");
+        let me = fs::metadata(dir.path()).unwrap();
         let owner = if me.uid() == 0 {
             (54321, 54322)
         } else {
@@ -729,9 +733,9 @@ mod fs_tests {
 
     #[tokio::test]
     async fn a_file_where_a_volume_directory_belongs_is_an_error() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("sandbox-test");
         let layout = layout(&dir, None).await;
-        fs::write(dir.0.join(VOLUMES_DIR), "x").unwrap();
+        fs::write(dir.join(VOLUMES_DIR), "x").unwrap();
         let key = VolumeKey {
             agent: AgentId::new_v4(),
             scope: ScopeKey::Private,
@@ -742,8 +746,8 @@ mod fs_tests {
 
     #[tokio::test]
     async fn agent_writable_directories_are_given_to_the_sandbox_user() {
-        let dir = TempDir::new();
-        let me = fs::metadata(&dir.0).unwrap();
+        let dir = TempDir::new("sandbox-test");
+        let me = fs::metadata(dir.path()).unwrap();
         let owner = if me.uid() == 0 {
             (54321, 54322)
         } else {
@@ -777,8 +781,8 @@ mod fs_tests {
 
     #[tokio::test]
     async fn giving_directories_away_without_permission_fails() {
-        let dir = TempDir::new();
-        if fs::metadata(&dir.0).unwrap().uid() == 0 {
+        let dir = TempDir::new("sandbox-test");
+        if fs::metadata(dir.path()).unwrap().uid() == 0 {
             return;
         }
         let layout = layout(&dir, Some((1, 1))).await;
