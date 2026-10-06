@@ -3433,6 +3433,33 @@ whatever that filter enables; a test feeds `log` records with target
 environment is kept out of logs only with that cap, and the plan's T23
 says any other subscriber setup must keep it.
 
+### tokio reaps a dropped child on any runtime
+
+**Issue.** `dropping_a_child_kills_it_before_closing_its_stdin` sometimes
+failed in CI with "the child's stdin closed before it was killed", though
+the kill had been sent. `testkit::child::killed` read `/proc/<pid>/stat`
+for a zombie or `PF_EXITING`, then `/proc/<pid>/status` for SIGKILL in
+`SigPnd` or `ShdPnd`, and took an unreadable `status` as nothing pending.
+A `Child` dropped with `kill_on_drop` goes on tokio's process-wide orphan
+queue, and every runtime in the process drains that queue after each park
+(tokio 1.53, `runtime/process.rs`). Under load the child read as running
+in `stat`, then exited and was reaped by another test's runtime before the
+`status` read, which failed with `ENOENT`. A captured failure showed `cat`
+running in `stat`, without `PF_EXITING` and with SIGKILL already in its
+pending field. It didn't fail in 3,000 runs of the test alone, whose
+runtime is blocked in the drop, and a 50 ms sleep between the two reads
+failed 59 of 100 runs of the sandbox's process tests.
+
+**Solution.** `killed` reads `status` alone, once. A kill of a process or
+its group leaves SIGKILL in `ShdPnd` until `release_task` flushes it at the
+reap; only the per-thread bit is cleared before the exit. So a killed
+process reads as SIGKILL pending until the file can't be read, or until it
+reads `Threads: 0` because the reap landed during the read. An exiting or
+zombie process with no SIGKILL now reads as not killed, which a test
+checks. 3,000 runs of the process tests under CPU stress passed, and
+declaring `ChildIo`'s `stdin` before `child` still fails the drop test
+every time.
+
 ## T18: credential proxy
 
 ### Placeholders are looked up by digest and handled by id
