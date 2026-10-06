@@ -7,6 +7,7 @@ use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType};
+use testkit::TempDir;
 use testkit::rocketchat::FakeRest;
 use wiremock::matchers::path;
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
@@ -645,15 +646,15 @@ async fn create_dm_fails_to_decode_an_answer_without_usernames() {
     );
 }
 
-fn temp_file(name: &str, contents: &[u8]) -> OutFile {
-    let dir = std::env::temp_dir().join(format!("rc-rest-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+fn temp_file(name: &str, contents: &[u8]) -> (TempDir, OutFile) {
+    let dir = TempDir::new("rc-rest");
     let path = dir.join(name);
     std::fs::write(&path, contents).unwrap();
-    OutFile {
+    let file = OutFile {
         name: name.into(),
         path,
-    }
+    };
+    (dir, file)
 }
 
 #[tokio::test]
@@ -665,7 +666,7 @@ async fn upload_sends_multipart_then_confirms_in_the_thread() {
         .post_message(&conv("C1"), "root", None)
         .await
         .unwrap();
-    let file = temp_file("report.png", b"\x89PNG data");
+    let (_dir, file) = temp_file("report.png", b"\x89PNG data");
     let message = client
         .upload(&conv("C1"), Some(&root.id), &file)
         .await
@@ -706,7 +707,7 @@ async fn upload_sends_multipart_then_confirms_in_the_thread() {
 async fn upload_top_level_has_no_tmid() {
     let fake = FakeRest::start().await;
     fake.add_room("C1", "c", "general");
-    let file = temp_file("notes.bin", b"\x00\x01");
+    let (_dir, file) = temp_file("notes.bin", b"\x00\x01");
     let message = manager(&fake)
         .upload(&conv("C1"), None, &file)
         .await
@@ -740,7 +741,7 @@ async fn upload_errors_map_at_each_step() {
     let fake = FakeRest::start().await;
     fake.add_room("G1", "p", "secret");
     let client = manager(&fake);
-    let file = temp_file("a.txt", b"a");
+    let (_dir, file) = temp_file("a.txt", b"a");
     let as_bot = bot(&client, "helper").await;
     assert_eq!(
         as_bot.upload(&conv("G1"), None, &file).await,
@@ -764,7 +765,7 @@ async fn upload_larger_than_the_limit_fails_and_sends_nothing() {
     let fake = FakeRest::start().await;
     fake.add_room("C1", "c", "general");
     let client = manager(&fake).with_max_upload_size(4);
-    let file = temp_file("five.txt", b"12345");
+    let (_dir, file) = temp_file("five.txt", b"12345");
     assert_eq!(
         client.upload(&conv("C1"), None, &file).await,
         Err(SurfaceError::Api(
@@ -772,7 +773,7 @@ async fn upload_larger_than_the_limit_fails_and_sends_nothing() {
         ))
     );
     assert!(fake.requests("rooms.media").await.is_empty());
-    let file = temp_file("four.txt", b"1234");
+    let (_dir, file) = temp_file("four.txt", b"1234");
     assert!(client.upload(&conv("C1"), None, &file).await.is_ok());
 }
 
@@ -780,7 +781,7 @@ async fn upload_larger_than_the_limit_fails_and_sends_nothing() {
 async fn upload_limit_defaults_to_100_mib_and_is_checked_before_reading() {
     let fake = FakeRest::start().await;
     fake.add_room("C1", "c", "general");
-    let file = temp_file("sparse.bin", b"");
+    let (_dir, file) = temp_file("sparse.bin", b"");
     std::fs::File::options()
         .write(true)
         .open(&file.path)
@@ -794,7 +795,6 @@ async fn upload_limit_defaults_to_100_mib_and_is_checked_before_reading() {
         ))
     );
     assert!(fake.requests("rooms.media").await.is_empty());
-    std::fs::remove_file(&file.path).unwrap();
 }
 
 #[tokio::test]
@@ -831,7 +831,7 @@ impl Respond for DeleteThenRateLimit {
 async fn a_429_on_upload_resends_the_bytes_read_the_first_time() {
     let fake = FakeRest::start().await;
     fake.add_room("C1", "c", "general");
-    let file = temp_file("once.txt", b"read once");
+    let (_dir, file) = temp_file("once.txt", b"read once");
     Mock::given(path("/api/v1/rooms.media/C1"))
         .respond_with(DeleteThenRateLimit(file.path.clone()))
         .up_to_n_times(1)
@@ -1063,7 +1063,7 @@ async fn a_429_on_upload_resends_the_file() {
     fake.add_room("C1", "c", "general");
     fake.rate_limit("rooms.media", 1, Duration::from_millis(10))
         .await;
-    let file = temp_file("retry.txt", b"payload");
+    let (_dir, file) = temp_file("retry.txt", b"payload");
     manager(&fake)
         .upload(&conv("C1"), None, &file)
         .await
