@@ -360,7 +360,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::test_util::TempDir;
+    use testkit::TempDir;
 
     const ID: &str = "3b0f5c2e-8d41-4a6b-9c1e-2f7a5d9e0b13";
     const OTHER: &str = "99999999-9999-4999-8999-999999999999";
@@ -371,7 +371,7 @@ mod tests {
     /// made.
     fn transcript_in(dir: &TempDir, session: SessionId) -> PathBuf {
         let id = session.to_string();
-        let dir = dir.0.join("claude").join("projects").join(&id);
+        let dir = dir.join("claude").join("projects").join(&id);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(format!("{id}.jsonl"))
     }
@@ -516,9 +516,9 @@ mod tests {
     }
 
     fn restored_or_why(lines: &[String]) -> Result<f64, CostUnknown> {
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         write(&transcript_in(&dir, session()), lines);
-        restored_total(&dir.0, session())
+        restored_total(dir.path(), session())
     }
 
     /// `lines` padded with [`note`]s after the first, so the file is `len`
@@ -543,28 +543,28 @@ mod tests {
 
     #[test]
     fn without_a_cost_line_the_total_is_zero_and_without_a_transcript_unknown() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let session = session();
         let unreadable = Err(CostUnknown::TranscriptUnreadable);
-        assert_eq!(restored_total(&dir.0, session), unreadable);
-        assert_eq!(restored_total(&dir.0.join("missing"), session), unreadable);
+        assert_eq!(restored_total(dir.path(), session), unreadable);
+        assert_eq!(restored_total(&dir.join("missing"), session), unreadable);
         let path = transcript_in(&dir, session);
         assert_eq!(
-            restored_total(&dir.0, session),
+            restored_total(dir.path(), session),
             unreadable,
             "the CLI refuses to resume without a transcript"
         );
         write(&path, &exchange(ID));
-        assert_eq!(restored_total(&dir.0, session), Ok(0.0));
+        assert_eq!(restored_total(dir.path(), session), Ok(0.0));
         std::fs::write(&path, b"").unwrap();
-        assert_eq!(restored_total(&dir.0, session), Ok(0.0));
+        assert_eq!(restored_total(dir.path(), session), Ok(0.0));
         std::fs::write(&path, b"\n\n").unwrap();
-        assert_eq!(restored_total(&dir.0, session), Ok(0.0));
+        assert_eq!(restored_total(dir.path(), session), Ok(0.0));
     }
 
     #[test]
     fn the_last_cost_line_wins_even_with_other_lines_after_it() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let session = session();
         let path = transcript_in(&dir, session);
         let mut lines = exchange(ID);
@@ -581,7 +581,7 @@ mod tests {
             ),
         ]);
         write(&path, &lines);
-        assert_eq!(restored_total(&dir.0, session), Ok(0.75));
+        assert_eq!(restored_total(dir.path(), session), Ok(0.75));
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
@@ -589,7 +589,7 @@ mod tests {
             .write_all(cost_line(1.5).as_bytes())
             .unwrap();
         assert_eq!(
-            restored_total(&dir.0, session),
+            restored_total(dir.path(), session),
             Err(CostUnknown::TranscriptUnrecognized),
             "the CLI ends every line it writes, so a last line without its newline is unknown"
         );
@@ -839,27 +839,27 @@ mod tests {
 
     #[test]
     fn nothing_is_followed_through_a_symlink_and_only_a_file_is_read() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("runner-test");
         let session = session();
-        let elsewhere = TempDir::new();
+        let elsewhere = TempDir::new("runner-test");
         let target = transcript_in(&elsewhere, session);
         write(&target, &[cost_line(4.0)]);
 
         let path = transcript_in(&dir, session);
         std::os::unix::fs::symlink(&target, &path).unwrap();
         let unreadable = Err(CostUnknown::TranscriptUnreadable);
-        assert_eq!(restored_total(&dir.0, session), unreadable);
+        assert_eq!(restored_total(dir.path(), session), unreadable);
 
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir_all(dir.0.join("claude")).unwrap();
-        std::os::unix::fs::symlink(elsewhere.0.join("claude"), dir.0.join("claude")).unwrap();
-        assert_eq!(restored_total(&dir.0, session), unreadable);
+        std::fs::remove_dir_all(dir.join("claude")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("claude"), dir.join("claude")).unwrap();
+        assert_eq!(restored_total(dir.path(), session), unreadable);
 
-        std::fs::remove_file(dir.0.join("claude")).unwrap();
+        std::fs::remove_file(dir.join("claude")).unwrap();
         let path = transcript_in(&dir, session);
         std::fs::create_dir(&path).unwrap();
         assert_eq!(
-            restored_total(&dir.0, session),
+            restored_total(dir.path(), session),
             unreadable,
             "a directory isn't a transcript"
         );
@@ -1147,8 +1147,8 @@ mod tests {
         let port = stub_api(Api::Refuse);
         let mut read = Vec::new();
 
-        let tool_turn = TempDir::new();
-        let reported = cli_tool_turn(&image, &tool_turn.0, stub_api(Api::WriteANote));
+        let tool_turn = TempDir::new("runner-test");
+        let reported = cli_tool_turn(&image, tool_turn.path(), stub_api(Api::WriteANote));
         let transcript = std::fs::read_to_string(transcript_in(&tool_turn, session())).unwrap();
         eprintln!("the CLI's own tool turn, reporting {reported:?}:\n{transcript}");
         assert!(
@@ -1156,17 +1156,17 @@ mod tests {
             "the CLI ran the tool"
         );
         assert!(reported.is_some_and(|total| total > 0.0));
-        let runner = restored_total(&tool_turn.0, session()).ok();
-        let cli = cli_restored(&image, &tool_turn.0, port);
+        let runner = restored_total(tool_turn.path(), session()).ok();
+        let cli = cli_restored(&image, tool_turn.path(), port);
         eprintln!("tool turn: the runner reads {runner:?}, the CLI restored {cli:?}");
         assert_eq!(runner, reported, "the runner reads the CLI's own tool turn");
         read.push(("tool turn", runner, cli));
 
         for (case, lines) in cli_cases() {
-            let dir = TempDir::new();
+            let dir = TempDir::new("runner-test");
             write(&transcript_in(&dir, session()), &lines);
-            let runner = restored_total(&dir.0, session()).ok();
-            let cli = cli_restored(&image, &dir.0, port);
+            let runner = restored_total(dir.path(), session()).ok();
+            let cli = cli_restored(&image, dir.path(), port);
             eprintln!("{case}: the runner reads {runner:?}, the CLI restored {cli:?}");
             read.push((case, runner, cli));
         }

@@ -303,7 +303,7 @@ async fn a_new_change_keeps_the_settled_ones_its_own_chain_runs_through() {
 
 #[tokio::test]
 async fn a_known_change_or_a_full_binding_is_refused_without_the_write_lock() {
-    let dir = crate::test_util::TempDir::new();
+    let dir = crate::test_util::TempDir::new("store-test");
     let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
     let helper = binding(&store, "helper").await;
     let waiting = change(helper, "G0LOCKED1", "C0LOCKED1", 1_000);

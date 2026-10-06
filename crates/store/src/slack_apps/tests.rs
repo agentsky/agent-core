@@ -705,7 +705,7 @@ async fn existing_bindings_start_at_manifest_version_zero() {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     const MANIFEST_MIGRATION: i64 = 20_260_930_300_000;
-    let dir = TempDir::new();
+    let dir = TempDir::new("store-test");
     let options = SqliteConnectOptions::from_str(&dir.db_url())
         .unwrap()
         .create_if_missing(true)

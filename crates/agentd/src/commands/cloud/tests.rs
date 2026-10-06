@@ -6,7 +6,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{CloudHandoffState, CloudUnknownReason, NewCloudHandoff, RecentCloudHandoff, Store};
 use surface_slack::{BindingRef, InFlight, SlackEvent, SlackInbound};
-use testkit::Held;
+use testkit::{Held, TempDir};
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use wiremock::matchers::{body_json, header, method, path};
@@ -17,8 +17,8 @@ use crate::cloud::FireClient;
 use crate::commands::rocketchat::command_in;
 use crate::commands::slack::dm_command;
 use crate::commands::slack_tests::{
-    Running, SlackHarness, TempDir, dm_event, file_store, identity, json_body, slack_channel,
-    slack_harness, slack_harness_on, slack_key, sql,
+    Running, SlackHarness, dm_event, file_store, identity, json_body, slack_channel, slack_harness,
+    slack_harness_on, slack_key, sql,
 };
 use crate::commands::tests::{Harness, conv, dm_room, harness, key, serve};
 use crate::config::CloudConfig;

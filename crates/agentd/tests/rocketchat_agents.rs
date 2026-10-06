@@ -5,7 +5,6 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentState, BindingState, NewClaudeLink};
 use testkit::rocketchat::{FakeDdp, FakeRest, realtime_message, subscription_doc};
-use testkit::{FakeAnthropic, Turn, agentctl_path, fake_anthropic, fake_claude_path};
+use testkit::{FakeAnthropic, TempDir, Turn, agentctl_path, fake_anthropic, fake_claude_path};
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -251,7 +250,7 @@ impl Running {
                 &dir.db_url(),
                 &format!("\n[proxy]\nupstream = \"{}\"\n", fake.uri()),
             )
-            .replace("/nonexistent/agentd", &dir.0.display().to_string());
+            .replace("/nonexistent/agentd", &dir.path().display().to_string());
         let app = App::open(Config::parse(&text, chat.env()).unwrap())
             .await
             .unwrap();
@@ -259,7 +258,7 @@ impl Running {
             .await
             .unwrap();
         let addrs = server.addrs();
-        let script = dir.0.join("script.json");
+        let script = dir.join("script.json");
         testkit::write_script(&script, &vec![turn; 8]).unwrap();
         let agentctl = agentctl_path();
         let vars = BTreeMap::from([
@@ -285,11 +284,11 @@ impl Running {
                 ..PoolConfig::default()
             },
             image: "unused".to_owned(),
-            data_dir: dir.0.clone(),
+            data_dir: dir.path().to_owned(),
             agentctl_url: format!("http://{}", addrs.ctl),
             env: vars,
         };
-        let sandbox = ProcessSandbox::new(app.store().clone(), &dir.0).unwrap();
+        let sandbox = ProcessSandbox::new(app.store().clone(), dir.path()).unwrap();
         let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
         let server = server.with_pipeline(Pipeline::for_app(&app, turns));
         Self::serve(chat, app, server).await
@@ -377,27 +376,6 @@ fn key(user: &str) -> MemberKey {
 fn mention(users: &[&str]) -> Value {
     let mentions: Vec<Value> = users.iter().map(|u| json!({ "_id": u })).collect();
     json!({ "mentions": mentions })
-}
-
-/// A directory for a database file, removed on drop.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-agents-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn db_url(&self) -> String {
-        format!("sqlite://{}", self.0.join("agentd.db").display())
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 #[tokio::test]
@@ -577,7 +555,7 @@ async fn only_the_owner_changes_the_persona() {
 #[tokio::test]
 async fn skills_are_added_from_files_attached_in_the_managers_dm() {
     let chat = Chat::start().await;
-    let data = common::TempDir::new();
+    let data = TempDir::new("agentd-test");
     let config = Config::parse(
         &format!(
             "{}\n[rocketchat]\nbase_url = \"{}\"\nwebsocket_url = \"{}\"\nteam = \"{TEAM}\"\n\
@@ -793,7 +771,7 @@ async fn a_failed_deactivation_is_retried_until_it_works() {
 
 #[tokio::test]
 async fn a_restart_restores_every_agent_connection() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-agents");
     let chat = Chat::start().await;
     let running = Running::start(&chat, &dir.db_url()).await;
     running.link(&chat.alice).await;
@@ -1130,7 +1108,7 @@ async fn an_unmanaged_bots_mention_starts_no_turn() {
 #[tokio::test]
 async fn a_hop_runs_once_when_rocketchat_delivers_the_post_too() {
     let chat = Chat::start().await;
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-agents");
     let fake = fake_anthropic().await;
     let running =
         Running::start_turning(&chat, &dir, &fake, Turn::reply("@writer over to you.")).await;
