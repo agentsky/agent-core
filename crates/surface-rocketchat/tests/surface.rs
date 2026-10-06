@@ -11,6 +11,7 @@ use core_types::{
 use secrecy::{ExposeSecret, SecretString};
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
 use surface_rocketchat::{BotRoles, Dedup, RocketChatConfig, RocketChatSurface};
+use testkit::TempDir;
 use testkit::rocketchat::FakeRest;
 
 const TEAM: &str = "chat.example";
@@ -131,8 +132,7 @@ async fn edit_and_react_act_on_the_posted_message() {
 #[tokio::test]
 async fn upload_posts_each_file_in_the_thread() {
     let s = setup().await;
-    let dir = std::env::temp_dir().join(format!("rc-upload-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("rc-upload");
     let path: PathBuf = dir.join("report.txt");
     std::fs::write(&path, "done").unwrap();
     let root = s
@@ -168,7 +168,6 @@ async fn upload_posts_each_file_in_the_thread() {
         .flat_map(|m| m.files.iter().map(|f| f.name.as_str()))
         .collect();
     assert_eq!(names, ["report.txt", "copy.txt"]);
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
