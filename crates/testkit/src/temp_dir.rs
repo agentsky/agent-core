@@ -13,9 +13,10 @@ impl TempDir {
     /// Creates `<temp>/<prefix>-<uuid>`. The prefix names the crate or
     /// test, so a directory left behind by a killed run says where it came
     /// from.
+    #[must_use]
     pub fn new(prefix: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("creating {}: {e}", dir.display()));
         Self(dir)
     }
 
@@ -64,7 +65,7 @@ mod tests {
             let dir = TempDir::new("testkit-temp-dir");
             std::fs::write(dir.join("file"), "x").unwrap();
             path = Some(dir.path().to_owned());
-            panic!("test failed");
+            panic!("panic injected to check cleanup");
         }));
         assert!(result.is_err());
         assert!(!path.unwrap().exists());
