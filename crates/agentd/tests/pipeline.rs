@@ -29,13 +29,14 @@ use sandbox::ProcessSandbox;
 use secrecy::SecretString;
 use store::{AgentCreation, NewAgent, NewClaudeLink, Store, StoreError, Visibility};
 use testkit::{
-    Call, FakeAnthropic, MockSurface, Op, Turn, agentctl_path, fake_anthropic, fake_claude_path,
+    Call, FakeAnthropic, MockSurface, Op, TempDir, Turn, agentctl_path, fake_anthropic,
+    fake_claude_path,
 };
 use time::OffsetDateTime;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
-use common::{TempDir, env, with_a_hung_worker};
+use common::{env, with_a_hung_worker};
 
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
@@ -415,16 +416,13 @@ async fn start() -> Stack {
 async fn start_with(setup: Setup) -> Stack {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let fake = fake_anthropic().await;
     let text = format!(
         "{}\n[proxy]\nupstream = \"{}\"\n[runner]\nworking_emoji = \"hourglass\"\n",
         common::CONFIG
             .replace("/nonexistent/agentd", &dir.path().display().to_string())
-            .replace(
-                "sqlite::memory:",
-                &format!("sqlite://{}", dir.path().join("agentd.db").display())
-            )
+            .replace("sqlite::memory:", &dir.db_url())
             .replace(
                 "drain_timeout_secs = 5",
                 &format!("drain_timeout_secs = {}", setup.drain_timeout_secs)
@@ -483,7 +481,7 @@ async fn start_with(setup: Setup) -> Stack {
         .await
         .unwrap();
     let addrs = server.addrs();
-    let script = dir.path().join("script.json");
+    let script = dir.join("script.json");
     let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
     let mut vars = BTreeMap::from([
         (
@@ -568,7 +566,7 @@ impl Stack {
     /// The turns billed no cost, by the reason the `usage` table records,
     /// as an operator counts them.
     async fn unbilled_turns(&self) -> Vec<(String, i64)> {
-        let db = self.dir.path().join("agentd.db");
+        let db = self.dir.join("agentd.db");
         let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
             .await
             .unwrap();
@@ -3416,7 +3414,7 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
     looking.open();
     let Stack { task, dir, .. } = stack;
     task.await.unwrap().unwrap();
-    let db = dir.path().join("agentd.db");
+    let db = dir.join("agentd.db");
     let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
         .await
         .unwrap();
@@ -3689,7 +3687,7 @@ async fn a_hand_off_past_a_full_queue_keeps_its_row_and_is_taken_again() {
 impl Stack {
     /// When each `hand_offs` row kept is due, read without taking them.
     async fn kept_due_at(&self) -> Vec<OffsetDateTime> {
-        let db = self.dir.path().join("agentd.db");
+        let db = self.dir.join("agentd.db");
         let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
             .await
             .unwrap();
@@ -3705,7 +3703,7 @@ impl Stack {
 
     /// The agents of the `hand_offs` rows kept, read without taking them.
     async fn kept_hand_offs(&self) -> Vec<AgentId> {
-        let db = self.dir.path().join("agentd.db");
+        let db = self.dir.join("agentd.db");
         let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", db.display()))
             .await
             .unwrap();
@@ -3777,7 +3775,7 @@ async fn a_hand_off_refused_because_the_rules_dont_read_is_kept_and_tried_again(
 impl Stack {
     /// Runs `sql` on the store's database behind the store's back.
     async fn run_sql(&self, sql: &'static str) {
-        let db = self.dir.path().join("agentd.db");
+        let db = self.dir.join("agentd.db");
         let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db.display()))
             .await
             .unwrap();

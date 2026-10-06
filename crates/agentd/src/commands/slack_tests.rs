@@ -17,6 +17,7 @@ use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
 use surface_slack::{
     BindingRef, InFlight, Interaction, SlackClient, SlackEvent, SlackInbound, SlashCommand,
 };
+use testkit::TempDir;
 use time::OffsetDateTime;
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -133,10 +134,10 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         identity(),
     );
     let replies = Replies::new(None).with_slack(&manager);
-    let data = TempDir::new();
+    let data = TempDir::new("agentd-slack");
     let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
-    let skills = crate::skills::Skills::new(store.clone(), data.0.clone(), git);
-    let consents = Consents::new(store.clone(), ConsentSettings::in_data_dir(&data.0));
+    let skills = crate::skills::Skills::new(store.clone(), data.path().to_owned(), git);
+    let consents = Consents::new(store.clone(), ConsentSettings::in_data_dir(data.path()));
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
@@ -1306,8 +1307,8 @@ async fn requests_from_another_workspace_are_dropped() {
 
 /// A store in a new SQLite file, its URL, and the file's directory.
 async fn file_store() -> (Store, String, TempDir) {
-    let dir = TempDir::new();
-    let url = format!("sqlite://{}", dir.0.join("agentd.db").display());
+    let dir = TempDir::new("agentd-slack");
+    let url = dir.db_url();
     let store = Store::open(
         &url,
         Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap(),
@@ -1468,23 +1469,6 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     global_logs().snapshot().assert_lacks("SECRET");
 }
 
-/// A new temporary directory, removed on drop.
-struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("agentd-slack-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test]
 async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
     let h = slack_harness().await;
@@ -1548,7 +1532,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
         reply,
         "Added the skill `notes` to `helper`. Its conversations use it from their next start."
     );
-    let installed = runner::skills_dir(&data.0, agent.id).join("notes/SKILL.md");
+    let installed = runner::skills_dir(data.path(), agent.id).join("notes/SKILL.md");
     assert_eq!(std::fs::read_to_string(installed).unwrap(), skill);
 
     let too_big = file("F3", "SKILL.md", 10 * 1024 * 1024);
