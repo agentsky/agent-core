@@ -36,13 +36,14 @@ use store::{
     Visibility,
 };
 use testkit::{
-    Call, FakeAnthropic, MockSurface, Turn, agentctl_path, fake_anthropic, fake_claude_path,
+    Call, FakeAnthropic, MockSurface, TempDir, Turn, agentctl_path, fake_anthropic,
+    fake_claude_path,
 };
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use common::{TempDir, env};
+use common::env;
 
 const TEAM: &str = "chat.example";
 const BOT: &str = "UBOT";
@@ -266,16 +267,13 @@ async fn start(limits: &str) -> Stack {
 async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
     let claude = fake_claude_path();
     let agentctl = agentctl_path();
-    let dir = TempDir::new();
+    let dir = TempDir::new("agentd-test");
     let fake = fake_anthropic().await;
     let text = format!(
         "{}\n[proxy]\nupstream = \"{}\"\n[limits]\n{limits}\n",
         common::CONFIG
             .replace("/nonexistent/agentd", &dir.path().display().to_string())
-            .replace(
-                "sqlite::memory:",
-                &format!("sqlite://{}", dir.path().join("agentd.db").display())
-            )
+            .replace("sqlite::memory:", &dir.db_url())
             .replace(
                 "drain_timeout_secs = 5",
                 &format!("drain_timeout_secs = {drain_timeout_secs}")
@@ -329,7 +327,7 @@ async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
         .await
         .unwrap();
     let addrs = server.addrs();
-    let script = dir.path().join("script.json");
+    let script = dir.join("script.json");
     let path = format!("{}:/usr/bin:/bin", agentctl.parent().unwrap().display());
     let mut vars = BTreeMap::from([
         (
