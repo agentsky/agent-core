@@ -314,7 +314,7 @@ async fn the_twenty_first_routine_is_refused() {
 
 #[tokio::test]
 async fn concurrent_registrations_never_pass_the_cap_together() {
-    let dir = TempDir::new();
+    let dir = TempDir::new("store-test");
     let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
     let ada = member(&store, "ada").await;
     let mut tasks = tokio::task::JoinSet::new();

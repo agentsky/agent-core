@@ -635,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_dm_lookups_create_one_session() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let agent = AgentId::new_v4();
         let scope = ScopeKey::Private;
@@ -720,7 +720,7 @@ mod tests {
     async fn at_most_a_few_resets_write_at_once() {
         use sqlx::Connection;
 
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let agent = AgentId::new_v4();
         let mut ids = Vec::new();
