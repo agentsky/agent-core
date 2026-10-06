@@ -8,6 +8,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use surface_slack::web::{EnterpriseUser, MAX_GRID_TEAMS, PageRequest, map_error};
 use surface_slack::{SlackClient, WebApi};
+use testkit::TempDir;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -673,7 +674,7 @@ async fn bots_info_reads_the_bot_user() {
     assert_eq!(form(&requests(&server).await[0])["bot"], "B0OTHER01");
 }
 
-fn staged(dir: &std::path::Path, name: &str, contents: &str) -> OutFile {
+fn staged(dir: &TempDir, name: &str, contents: &str) -> OutFile {
     let path = dir.join(name);
     std::fs::write(&path, contents).unwrap();
     OutFile {
@@ -712,7 +713,7 @@ async fn upload_runs_the_external_flow_in_order() {
         .respond_with(ResponseTemplate::new(200).set_body_string("OK - 5"))
         .mount(&server)
         .await;
-    let dir = tempdir();
+    let dir = TempDir::new("surface-slack");
     let files = [
         staged(&dir, "report.txt", "hello"),
         staged(&dir, "data.csv", "a,b\n1,2\n"),
@@ -774,7 +775,7 @@ async fn a_refused_upload_shares_nothing() {
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
-    let dir = tempdir();
+    let dir = TempDir::new("surface-slack");
     let err = api
         .upload_files(&channel(), None, &[staged(&dir, "a.txt", "x")])
         .await
@@ -797,9 +798,10 @@ async fn an_upload_of_nothing_or_of_a_missing_file_sends_nothing() {
         api.upload_files(&channel(), None, &[]).await.unwrap(),
         Vec::<String>::new()
     );
+    let dir = TempDir::new("surface-slack");
     let missing = OutFile {
         name: "gone.txt".into(),
-        path: tempdir().join("gone.txt"),
+        path: dir.join("gone.txt"),
     };
     let err = api
         .upload_files(&channel(), None, &[missing])
@@ -1342,13 +1344,6 @@ mod downloads {
         }
         assert!(requests(&server).await.is_empty());
     }
-}
-
-/// A fresh directory under the target directory's temp space.
-fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("surface-slack-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 mod apps {
