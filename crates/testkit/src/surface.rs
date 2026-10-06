@@ -677,8 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_call_is_logged_in_order() {
-        let dir = std::env::temp_dir().join(format!("testkit-upload-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::TempDir::new("testkit-upload");
         let path = dir.join("a.txt");
         std::fs::write(&path, b"attached").unwrap();
         let file = OutFile {
@@ -689,7 +688,7 @@ mod tests {
         let mock = MockSurface::new();
         let to = target("C1", Some("1.0"));
         mock.upload(&to, std::slice::from_ref(&file)).await.unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        drop(dir);
         let first = mock.post(&to, "hello").await.unwrap().msg;
         let second = mock.post(&target("C2", None), "other").await.unwrap().msg;
         mock.edit(&first, "hello again").await.unwrap();
