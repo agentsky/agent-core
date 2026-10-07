@@ -863,6 +863,7 @@ async fn a_renewal_too_long_for_the_clock_stops_the_command_and_says_so() {
         "lost the shared/ lock (agentd granted a lease longer than the clock can hold); \
          stopped the command",
     );
+    assert_eq!(fake.released(), fake.granted());
 }
 
 #[tokio::test]
