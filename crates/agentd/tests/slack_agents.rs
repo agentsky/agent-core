@@ -675,7 +675,7 @@ async fn an_owner_is_reminded_once_when_the_app_waits_for_its_install() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reminder_for_an_owner_unreachable_here_stops_after_its_attempts() {
-    let mut harness = Harness::start("install_reminder_secs = 60\n").await;
+    let harness = Harness::start("install_reminder_secs = 60\n").await;
     let store = harness.store().clone();
     let start = OffsetDateTime::now_utc();
     let elsewhere = MemberKey {
