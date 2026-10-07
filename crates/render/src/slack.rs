@@ -10,7 +10,8 @@ use std::ops::Range;
 use core_types::{LengthUnit, Limit};
 use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag};
 
-use crate::{MentionDirectory, mention, url::bare_url};
+use crate::url::{bare_url, ends_url, trim_url_tail};
+use crate::{MentionDirectory, mention};
 
 /// The most text one Slack message chunk holds: 3,000 characters, under
 /// Slack's 4,000-character limit for a message's `text`.
@@ -143,6 +144,9 @@ fn parse(md: &str) -> Vec<Node<'_>> {
     let mut flattened = 0usize;
     let mut urls: Vec<Range<usize>> = Vec::new();
     for (event, span) in Parser::new_ext(md, options).into_offset_iter() {
+        if ends_bare_url(md, &span, &event) {
+            cut_bare_url(md, span.start, &mut urls);
+        }
         let node = match event {
             Event::Start(_) if open.len() >= MAX_DEPTH => {
                 flattened += 1;
@@ -230,18 +234,39 @@ fn note_bare_urls(md: &str, span: &Range<usize>, urls: &mut Vec<Range<usize>>) {
     }
 }
 
-/// Whether `tag` is emphasis or strikethrough with a delimiter inside a bare
-/// URL. Such markup is part of the URL's path, as in
+/// Whether an event ends the rendered text of a bare URL that the source
+/// would carry on past it: a character reference or escape that renders as
+/// a character no URL holds, as `&lt;` does, or anything but text and
+/// emphasis, such as inline code.
+fn ends_bare_url(md: &str, span: &Range<usize>, event: &Event<'_>) -> bool {
+    match event {
+        Event::Text(text) => md[span.clone()] != **text && text.contains(ends_url),
+        Event::Start(Tag::Strong | Tag::Emphasis | Tag::Strikethrough) | Event::End(_) => false,
+        _ => true,
+    }
+}
+
+/// Ends the last bare URL at `at` if it runs past it, then trims its tail as
+/// [`bare_url`] would.
+fn cut_bare_url(md: &str, at: usize, urls: &mut [Range<usize>]) {
+    if let Some(url) = urls.last_mut()
+        && url.contains(&at)
+    {
+        url.end = url.start + trim_url_tail(&md[url.start..at]).len();
+    }
+}
+
+/// Whether `tag` is emphasis or strikethrough that opens inside a bare URL
+/// as rendered. Such markup is part of the URL's path, as in
 /// `https://docs.python.org/3/library/__main__.html`, so it is kept as the
-/// source wrote it and the URL is linked whole.
+/// source wrote it and the URL is linked whole. Markup that opens before a
+/// URL wraps it, as in `**https://x.io/a**'s`, and its closing delimiter ends
+/// the URL.
 fn splits_bare_url(tag: &Tag<'_>, span: &Range<usize>, urls: &[Range<usize>]) -> bool {
-    let inside = |at: usize| {
-        let after = urls.partition_point(|url| url.start <= at);
-        after > 0 && at < urls[after - 1].end
-    };
+    let after = urls.partition_point(|url| url.start <= span.start);
     matches!(tag, Tag::Strong | Tag::Emphasis | Tag::Strikethrough)
-        && !span.is_empty()
-        && (inside(span.start) || inside(span.end - 1))
+        && after > 0
+        && span.start < urls[after - 1].end
 }
 
 /// Puts the children of an element in its place, with its delimiters as
