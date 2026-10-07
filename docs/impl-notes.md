@@ -5633,10 +5633,14 @@ the message to its lane and starts a new lane's task all under the lanes'
 lock, and `close` sets the flag under the same lock, so a message is either
 queued before the close, in a lane whose task the drain waits for, or
 dropped as one sent after closing is, even one that passed `dispatch`'s
-check just before. Messages accepted before a shutdown, including those
-waiting behind a running turn, are answered within the drain: Rocket.Chat
-has marked them processed and Slack has acknowledged them, so dropping them
-would lose them silently. `drain` polls the set
+check just before. Messages queued in a lane before the close, including
+those waiting behind a running turn, are answered within the drain:
+Rocket.Chat has marked them processed and Slack has acknowledged them, so
+dropping them would lose them silently. A message that reaches `dispatch`
+only after the close is still dropped, with the same loss: a Slack event
+acknowledged and deduplicated but still in the ingress queue, which
+`Server::run` drains after closing the pipeline, or a Rocket.Chat message
+a connection was still delivering when it stopped. `drain` polls the set
 under the lock without holding it across a wait, so a drain cut off by its
 timeout leaves the tasks for `cut_short`, which takes the set and shuts it
 down. On shutdown `Server::run` stops the public listener and the chat
