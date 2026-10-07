@@ -8073,7 +8073,10 @@ maps the identity to its member and refuses anyone but the agent's owner
 with the same answer as for an unknown id. Nothing else in the payload is
 trusted: which message was clicked doesn't matter. Once decided or expired,
 the card is updated once (`chat.update` with the outcome in place of the
-buttons); on Rocket.Chat its one message is edited to the outcome.
+buttons); on Rocket.Chat its one message is edited to the outcome. An
+update that fails on the way (a rate limit or a transport error) releases
+its claim and is tried on a later pass; one the platform refuses is not
+tried again, and the card's buttons answer that the task was settled.
 
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a

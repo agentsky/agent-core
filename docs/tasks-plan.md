@@ -2931,6 +2931,13 @@ Acceptance, as tests named after the design's rules:
 - `a_shutdown_kills_and_meters_the_turn_it_cuts`.
 - `a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind`.
 
+Live check (manual, with Docker): approve a non-owner's private task that
+was handed a file, and check that the task can write a new file in `work/`
+beside it. `work_dir` creates `sessions/<id>/work` as agentd's user and
+`hand_over` gives the sandbox user only the handed files, so this relies on
+the sandbox's directory repair covering `work/` before the container
+starts.
+
 ### T34
 
 **Agent-to-agent hand-off.** Branch `agent-to-agent`. Depends on T27,
