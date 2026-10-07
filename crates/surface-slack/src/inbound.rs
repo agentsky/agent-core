@@ -186,7 +186,7 @@ mod tests {
     fn an_events_debug_leaves_out_the_event_object() {
         let event = SlackEvent {
             binding: BindingId::new_v4(),
-            team: Some("T1".into()),
+            team: "T1".into(),
             event_id: "Ev1".into(),
             event_type: "app_mention".into(),
             event: json!({ "type": "app_mention", "text": "the launch code is 1234" }),

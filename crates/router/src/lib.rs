@@ -127,7 +127,7 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
         return Decision::Ignore(IgnoreReason::NotThisAgentsDm);
     }
 
-    let (key, member, hop) = match sender {
+    let (key, member, outside, hop) = match sender {
         Sender::Person => {
             let mentions = mentions(event, agent, view);
             let addressed = mentions == Mentions::ThisAgent
@@ -166,7 +166,7 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
         }
     };
 
-    if requester.outside.is_some() {
+    if outside.is_some() {
         return Decision::Ignore(IgnoreReason::Outside);
     }
     if state == AgentState::Paused {
@@ -175,16 +175,25 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
             requester: Requester {
                 member: member.flatten(),
                 key,
+                outside,
             },
         };
     }
     let Some(member) = member else {
         return Decision::Refuse {
             reason: RefuseReason::PolicyUnavailable,
-            requester: Requester { member: None, key },
+            requester: Requester {
+                member: None,
+                key,
+                outside,
+            },
         };
     };
-    let requester = Requester { member, key };
+    let requester = Requester {
+        member,
+        key,
+        outside,
+    };
     match view.is_banned(&requester) {
         Some(false) => {}
         Some(true) => {

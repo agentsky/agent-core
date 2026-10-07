@@ -1919,6 +1919,7 @@ async fn approved_with_a_card(h: &SlackHarness) -> core_types::ConsentId {
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: slack_key("U0BOB"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 task: "Read my notes",

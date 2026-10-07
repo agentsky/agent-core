@@ -1564,6 +1564,7 @@ fn hop_with_an_unrecorded_member_refuses_when_the_member_is_unanswered() {
     let unrecorded = Requester {
         member: None,
         key: w.owner_key.clone(),
+        outside: None,
     };
     let event = w.b_mentions_a(unrecorded, Hop::ZERO);
     w.view.members_unavailable = true;
@@ -1572,6 +1573,7 @@ fn hop_with_an_unrecorded_member_refuses_when_the_member_is_unanswered() {
     let recorded = Requester {
         member: Some(w.linked),
         key: w.linked_key.clone(),
+        outside: None,
     };
     let event = w.b_mentions_a(recorded.clone(), Hop::ZERO);
     assert_eq!(
