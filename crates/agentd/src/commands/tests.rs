@@ -455,10 +455,31 @@ async fn a_login_code_posted_publicly_by_someone_else_cancels_the_login_it_names
 
     h.channel("bob", &format!("login {CODE}#{state}")).await;
 
-    assert!(h.last_reply("bob").contains("cancelled your pending login"));
+    let reply = h.last_reply("bob");
+    assert!(
+        reply.contains("cancelled your pending login and the one it belongs to"),
+        "{reply}"
+    );
     assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
     assert!(h.store.take_pending_login(&bobs).await.unwrap().is_none());
     assert_eq!(h.oauth_requests().await, 0);
+}
+
+#[tokio::test]
+async fn a_public_login_code_of_someone_else_cancels_theirs_not_the_senders() {
+    let h = harness().await;
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+
+    h.channel("bob", &format!("login {CODE}#{state}")).await;
+
+    let reply = h.last_reply("bob");
+    assert!(
+        reply.contains("so I didn't use it and cancelled the pending login it belongs to."),
+        "{reply}"
+    );
+    assert!(!reply.contains("your pending login"), "{reply}");
+    assert!(h.store.take_pending_login(&state).await.unwrap().is_none());
 }
 
 #[tokio::test]
