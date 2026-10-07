@@ -8529,6 +8529,12 @@ message was read back with the bot's own access, a `can_post` that fails
 that way is taken as a yes, so a rate-limited membership check doesn't
 drop a person's message without a word; a refusal answers nothing. A
 message the platform doesn't confirm from another bot gets no notice.
+An unknown Slack code is `Api` and is taken as a yes too, and that now
+includes `org_login_required`, which T29 no longer maps to `Forbidden`
+(see [Error codes Slack answers with HTTP
+200](#error-codes-slack-answers-with-http-200)). The impact is low: the
+read-back that `confirmed` has just made with the bot token usually fails
+with the same code first, and the message is then dropped.
 
 ### Hand-offs are kept until settled
 
