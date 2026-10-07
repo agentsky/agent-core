@@ -661,9 +661,13 @@ renders as a space, `<`, `>` or `|` (`&lt;`), and at anything other than
 text and emphasis, such as inline code. Each run is scanned once, so the
 pass stays linear; measuring from every text node to the next source
 terminator instead took 19 s on ``"`c`https://a"`` repeated 10,000 times,
-since each cut made the next URL scan the rest of the run again. Emphasis or strikethrough whose opening
-delimiter is inside such a range is replaced by its children, with its
-delimiters as text, so the URL is one text run again and is linked whole.
+since each cut made the next URL scan the rest of the run again. Emphasis
+or strikethrough whose opening delimiter is inside such a range is replaced
+by its children, with its delimiters as text, so the URL is one text run
+again and is linked whole. A URL right after a character reference or
+escape that renders as a letter or digit isn't measured, as `&#97;` before
+`https://` makes it part of a word, which neither Slack nor the renderer
+links; its emphasis still formats.
 Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
