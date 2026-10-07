@@ -159,7 +159,8 @@ description, and must pass T02's policy.
   and the request shapes, against the 2.1.285 binary
   ([impl-notes](impl-notes.md#t09-auth)). Claude Code's own claude.ai login
   asks for more scopes; `user:profile user:inference` is the least agentd
-  needs. A live login is still to be done.
+  needs. The live login T09 couldn't run is on
+  [T13's live-check list](#t13).
 
 ### Network and deployment shape
 
@@ -975,7 +976,9 @@ Acceptance:
 
 Live check (manual, recorded in the PR): one real login against the default
 endpoints. Say which endpoints worked. If any default is wrong, fix it here and
-in [Configuration](#configuration).
+in [Configuration](#configuration). T09's environment had no browser or
+Claude account, so this login moved to [T13's live check](#t13), where
+`login` first exists end to end.
 
 ### T10
 
@@ -1162,6 +1165,18 @@ Deliverables:
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
 the channel refusal and invalidation path, logout, and `me` for linked and
 unlinked members.
+
+Live check (manual, recorded in the PR), the real login T09 couldn't run:
+with the default `[claude_oauth]` endpoints and a real Claude account, run
+`login`, open the link, and paste the `code#state` back. Confirm the
+authorization server accepts the narrowed scopes `user:profile
+user:inference`, that the token works for a model request and `me` shows the
+plan from the profile, and that a refresh succeeds. Then `logout` and confirm
+the revocation at `revoke_url`
+(`https://platform.claude.com/v1/oauth/token/revoke`, read from the binary,
+never called live) succeeds and a refresh with the revoked token is refused.
+Say which endpoints worked; fix any wrong default here, in
+[Configuration](#configuration) and in impl-notes.
 
 ### T14
 
@@ -2028,6 +2043,12 @@ Deliverables:
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
+- Slack sends `&`, `<` and `>` in message and slash command text as
+  `&amp;`, `&lt;` and `&gt;`. The ingress passes that text on as Slack sent
+  it, and the Slack surface decodes the three entities before any of it
+  reaches `commands::parse` (T30), which works on plain text: otherwise a
+  persona typed as `You & me` arrives as `You &amp; me`. Mention and link
+  tokens parse either way.
 - `testkit::slack`: request signing helpers and payload fixtures.
 
 Acceptance:
@@ -2085,6 +2106,11 @@ handling, and that `render` converts and splits through `render`, so that
 nor `parse: full`. Slack returns HTTP 200 with `ok: false` on errors; test
 that mapping.
 
+Live check (manual, recorded in the PR): post a reply whose Markdown has `|`
+inside a link label, such as `[a | b](https://x.io)`, which `render` sends
+as `<https://x.io|a | b>`, and confirm Slack shows the whole label `a | b`
+linking to `https://x.io`.
+
 ### T30
 
 **Slack manager app and configuration token.** Branch
@@ -2111,6 +2137,10 @@ Deliverables:
 - Manager DMs on Slack work as on Rocket.Chat: the whole text is parsed as a
   command. Files attached there feed `persona` (T14's upload rule) and
   `skill add` (T25), downloaded with the manager's bot token.
+- The `&amp;`, `&lt;` and `&gt;` entities in slash command and manager-DM
+  text are decoded before `commands::parse` sees it (the contract in the
+  `commands` crate docs), with a test that `persona <name> You & me` sets
+  the persona `You & me`.
 - `/agent slack-token <token> <refresh>`, for linked members on Slack.
   - Validate the token with `auth.test` on the tooling API, or by calling
     `tooling.tokens.rotate` at once, which also proves the refresh token works.
