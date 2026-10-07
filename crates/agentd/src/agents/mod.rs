@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use core_types::{BindingId, ConversationId, SurfaceError, SurfaceKind, TeamId, UserId};
-use store::{BindingState, Store, StoreError};
+use store::{Store, StoreError};
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType, User};
 use time::OffsetDateTime;
 use tokio::sync::Notify;
