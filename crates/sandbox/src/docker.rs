@@ -705,8 +705,9 @@ pub(crate) struct DockerChild {
 
 impl DockerChild {
     pub(crate) async fn wait(&mut self) -> Result<ExitStatus> {
-        if let Some(pump) = self.pump.take() {
+        if let Some(pump) = &mut self.pump {
             let _ = pump.await;
+            self.pump = None;
         }
         let deadline = tokio::time::Instant::now() + EXIT_POLL;
         loop {
@@ -726,7 +727,11 @@ impl DockerChild {
                 return Err(SandboxError::Docker {
                     op: "inspect exec",
                     status: None,
-                    message: Some("the process still runs after its output ended".into()),
+                    message: Some(
+                        "the process still runs ten seconds after its output ended or it was \
+                         killed"
+                            .into(),
+                    ),
                 });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

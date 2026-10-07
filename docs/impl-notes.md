@@ -2295,8 +2295,15 @@ in the socket were lost.
 
 **Solution.** Silence is measured from the last frame read or the end of
 handling one, whichever is later, so time spent waiting for the consumer
-does not count. A test holds a channel of one for five heartbeats and
-checks that the connection is not replaced and the next message arrives.
+does not count. A test holds a channel of one for three heartbeats of
+500 ms and checks that the connection is not replaced and the next message
+arrives. The heartbeat is that long so a ping and its pong fit in one
+heartbeat on a loaded CI runner.
+
+While the loop waits for the consumer it reads no frames, so it also
+answers no server ping. The streamer closes a socket about 30 seconds
+after a ping goes unanswered, so a consumer stalled for that long still
+ends the connection; the client then reconnects as after any other drop.
 
 ### tokio-tungstenite uses rustls's default provider
 
@@ -2635,8 +2642,11 @@ straight to polling `inspect_exec`, and stdout ends after what was already
 copied. Both sandboxes now return from `wait` after `kill` whether stdout
 was read or not, with a unit test for each (the Docker one against a fake
 daemon) and `docker_kill_then_wait_returns_with_stdout_unread` against a
-real daemon. A process still running ten seconds after its output ended is
-now a `SandboxError::Docker` for `inspect exec`.
+real daemon. A process still running ten seconds after its output ended or
+it was killed is now a `SandboxError::Docker` for `inspect exec`. `wait`
+awaits the copying task where it is stored rather than taking it out first,
+so a `wait` that is cancelled, for example by a timeout, leaves the task for
+a later `kill` to abort; a unit test cancels a `wait` and then kills.
 
 ### Agent-writable directories are given to the sandbox user
 
