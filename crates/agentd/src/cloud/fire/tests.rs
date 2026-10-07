@@ -224,6 +224,33 @@ async fn fire_reads_the_session_id_and_url() {
 }
 
 #[tokio::test]
+async fn a_cse_session_id_is_read_with_its_link() {
+    let cse = "cse_01HJKmNpQrStUv";
+    let url = format!("https://claude.ai/code/{cse}");
+    let outcome =
+        answered(ResponseTemplate::new(200).set_body_json(session_body(cse, Some(&url)))).await;
+    assert_eq!(
+        outcome,
+        FireOutcome::Fired {
+            session_id: cse.to_owned(),
+            session_url: Some(url),
+        }
+    );
+    let longest = format!("cse_{}", "a".repeat(128));
+    assert_eq!(
+        classify(answer(
+            200,
+            None,
+            Ok(session_body(&longest, None).to_string().into_bytes()),
+        )),
+        FireOutcome::Fired {
+            session_id: longest,
+            session_url: None,
+        }
+    );
+}
+
+#[tokio::test]
 async fn a_session_url_elsewhere_falls_back_to_the_id() {
     for url in [
         json!(format!("https://evil.example/code/{SESSION}")),
@@ -602,6 +629,9 @@ async fn an_unreadable_success_is_unknown() {
         br#"{"claude_code_session_id": 7}"#.to_vec(),
         br#"{"claude_code_session_id": "sess_01HJK"}"#.to_vec(),
         br#"{"claude_code_session_id": "session_"}"#.to_vec(),
+        br#"{"claude_code_session_id": "cse_"}"#.to_vec(),
+        br#"{"claude_code_session_id": "cse-01HJK"}"#.to_vec(),
+        br#"{"claude_code_session_id": "CSE_01HJK"}"#.to_vec(),
         br#"{"claude_code_session_id": "session_01-HJK"}"#.to_vec(),
         br#"{"claude_code_session_id": "session_01HJK/../x"}"#.to_vec(),
         "{\"claude_code_session_id\": \"session_01é\"}"
@@ -610,6 +640,9 @@ async fn an_unreadable_success_is_unknown() {
         br#"{"claude_code_session_id": " session_01HJK"}"#.to_vec(),
         br#"{"session_id": "session_01HJK"}"#.to_vec(),
         session_body(&format!("session_{}", "a".repeat(129)), None)
+            .to_string()
+            .into_bytes(),
+        session_body(&format!("cse_{}", "a".repeat(129)), None)
             .to_string()
             .into_bytes(),
     ];

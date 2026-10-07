@@ -9034,8 +9034,9 @@ the edges to the implementation.
   `unknown` with reason `other_status`, and so is every status but 200,
   400, 401, 403, 404, 429, a 3xx (`redirect`) and a 5xx (`server_error`),
   a 413 from a proxy in front of the endpoint among them.
-- `claude_code_session_id` must be `session_` and 1 to 128 ASCII letters
-  and digits exactly, with nothing trimmed. `claude_code_session_url` is
+- `claude_code_session_id` must be `session_` or `cse_`, the two forms the
+  cloud documentation shows, and 1 to 128 ASCII letters and digits exactly,
+  with nothing trimmed. `claude_code_session_url` is
   kept only when it is byte for byte `https://claude.ai/code/` and that
   id, so a query, an extra segment or another host's look-alike loses the
   URL and keeps the id.
