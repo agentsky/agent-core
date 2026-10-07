@@ -42,7 +42,9 @@ pub const LOGIN_EXPIRED_TEXT: &str = "Sorry, I can't answer that: the Claude log
 /// What any other failed turn tells the thread, including one that failed
 /// before it reached the model.
 pub const FAILED_TEXT: &str = "Sorry, that turn failed. Try again in a moment.";
-/// What a turn that ran out of time tells the thread.
+/// What a turn that ran out of time after the CLI read its message tells
+/// the thread. One that ran out of time before tells [`FAILED_TEXT`], as a
+/// turn that never reached the model does.
 pub const TIMED_OUT_TEXT: &str = "Sorry, that took too long, and the turn was stopped.";
 /// What the thread is told when part of a turn's reply, its files or its
 /// queued posts couldn't be posted.
@@ -127,7 +129,10 @@ pub struct PipelineSettings {
 ///    with agentctl. Each goes out even when another failed, and then the
 ///    thread is told part of the reply was lost. A failed turn posts a
 ///    short message that says why when the runner could tell: a usage
-///    limit, or a login that expired.
+///    limit, or a login that expired. A turn that ran out of time after
+///    the CLI read its message posts [`TIMED_OUT_TEXT`]; any other
+///    failure, including a crash or a timeout before the CLI read the
+///    message, posts [`FAILED_TEXT`].
 /// 6. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, when the agent's bot may post in
 ///    the conversation; [`Decision::Refuse`] posts one line in the thread,
