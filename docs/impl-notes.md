@@ -372,10 +372,15 @@ scan of one text node linked only the part before:
 kept such URLs whole.
 
 **Solution.** While parsing, the renderer measures each bare URL in the source
-from where a text node starts it. Emphasis or strikethrough with a delimiter
-inside such a range is replaced by its children, with its delimiters as
-text, so the URL is one text run again and is linked whole. Markup that only
-wraps a URL, as in `*https://x.io/#/y*`, is not touched.
+from where a text node starts it, and ends it early where the rendered text
+stops being a URL: at a character reference or escape that renders as a
+space, `<`, `>` or `|` (`&lt;`), and at anything other than text and
+emphasis, such as inline code. Emphasis or strikethrough whose opening
+delimiter is inside such a range is replaced by its children, with its
+delimiters as text, so the URL is one text run again and is linked whole.
+Markup that opens before a URL wraps it and is not touched, even when the
+source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
+as `*<https://x.io/a>*'s`.
 
 ### CommonMark disagrees with some qm-core regex cases
 
