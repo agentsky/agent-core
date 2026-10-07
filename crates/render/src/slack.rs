@@ -1068,7 +1068,8 @@ fn wire_broadcast(text: &str, at: usize) -> Option<(usize, &str)> {
 }
 
 /// Finds a bare `http://` or `https://` URL at byte offset `at`, trimmed of
-/// trailing punctuation the way qm-core's `trimUrlTail` does.
+/// trailing punctuation the way qm-core's `trimUrlTail` does, except that
+/// `*`, `_` and `~` stay.
 fn bare_url(text: &str, at: usize) -> Option<&str> {
     let rest = &text[at..];
     let scheme = ["https://", "http://"]
@@ -1093,6 +1094,9 @@ fn ends_url(c: char) -> bool {
 
 /// Drops trailing punctuation, and closing brackets that have no opening
 /// partner inside the URL, so `(see https://x.io/a).` keeps `)` and `.` out.
+/// Formatting marks are kept: the Markdown parser has already taken every
+/// one that formats, so one still in the text is part of the URL, as in
+/// `…#object.__init__`.
 fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let mut unmatched = PAIRS.map(|(open, close)| {
@@ -1106,10 +1110,7 @@ fn trim_url_tail(url: &str) -> &str {
                 true
             }
             Some(_) => false,
-            None => matches!(
-                c,
-                '*' | '_' | '~' | '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"'
-            ),
+            None => matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"'),
         };
         if !drop {
             break;
