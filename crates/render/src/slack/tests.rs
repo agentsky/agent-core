@@ -628,6 +628,31 @@ fn bare_urls() {
                 "https://x.io/~a~)~",
                 "<https://x.io/~a~>)~",
             ),
+            (
+                "an escaped underscore after a letter",
+                "see https://x.io/my_page\\_",
+                "see <https://x.io/my_page>\u{200b}_\u{200b}",
+            ),
+            (
+                "an underscore entity after a letter",
+                "https://x.io/a_b&#95;",
+                "<https://x.io/a_b>\u{200b}_\u{200b}",
+            ),
+            (
+                "an escaped star after a letter",
+                "https://x.io/a_b\\*",
+                "<https://x.io/a_b>\u{200b}*\u{200b}",
+            ),
+            (
+                "an escaped tilde after a letter",
+                "https://x.io/a~b\\~",
+                "<https://x.io/a~b>\u{200b}~\u{200b}",
+            ),
+            (
+                "an escaped underscore inside a URL path",
+                "https://x.io/a\\_b",
+                "<https://x.io/a_b>",
+            ),
             ("a host of only an underscore", "https://_", "https://_"),
             ("a host of only stars", "https://***", "https://***"),
             ("a host of only tildes", "https://~~~", "https://~~~"),
