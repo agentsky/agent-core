@@ -1277,7 +1277,8 @@ around `grant_type:"authorization_code"`:
   `user:inference` alone, so the authorization server accepts a subset for
   this client. agentd keeps the plan's `user:profile user:inference`: the
   profile needs the first, the proxy the second. Whether the server accepts
-  exactly this pair is part of the live check still to be done.
+  exactly this pair is part of the live login, which T13's live check
+  carries, together with the revoke path below.
 
 ### Claude Code revokes the refresh token on logout
 

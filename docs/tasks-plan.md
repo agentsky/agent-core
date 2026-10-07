@@ -159,7 +159,8 @@ description, and must pass T02's policy.
   and the request shapes, against the 2.1.285 binary
   ([impl-notes](impl-notes.md#t09-auth)). Claude Code's own claude.ai login
   asks for more scopes; `user:profile user:inference` is the least agentd
-  needs. A live login is still to be done.
+  needs. The live login T09 couldn't run is on
+  [T13's live-check list](#t13).
 
 ### Network and deployment shape
 
@@ -973,7 +974,9 @@ Acceptance:
 
 Live check (manual, recorded in the PR): one real login against the default
 endpoints. Say which endpoints worked. If any default is wrong, fix it here and
-in [Configuration](#configuration).
+in [Configuration](#configuration). T09's environment had no browser or
+Claude account, so this login moved to [T13's live check](#t13), where
+`login` first exists end to end.
 
 ### T10
 
@@ -1160,6 +1163,18 @@ Deliverables:
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
 the channel refusal and invalidation path, logout, and `me` for linked and
 unlinked members.
+
+Live check (manual, recorded in the PR), the real login T09 couldn't run:
+with the default `[claude_oauth]` endpoints and a real Claude account, run
+`login`, open the link, and paste the `code#state` back. Confirm the
+authorization server accepts the narrowed scopes `user:profile
+user:inference`, that the token works for a model request and `me` shows the
+plan from the profile, and that a refresh succeeds. Then `logout` and confirm
+the revocation at `revoke_url`
+(`https://platform.claude.com/v1/oauth/token/revoke`, read from the binary,
+never called live) succeeds and a refresh with the revoked token is refused.
+Say which endpoints worked; fix any wrong default here, in
+[Configuration](#configuration) and in impl-notes.
 
 ### T14
 
