@@ -3421,8 +3421,10 @@ whole upload, which shared nothing.
 it while a workspace is being migrated into an Enterprise Grid
 organization, which passes on its own, so it is not a refusal of the bot
 and now falls to `Api` with the code. No caller needs it to be
-`Forbidden`: those that treat `Forbidden` as a no or a refusal answer
-`Api` the same way or fail closed on it.
+`Forbidden`, but one answers differently: `SlackSurface::member` took the
+code as "the bot may not post" and now returns it as an error, so a
+can-post check made during a migration fails instead of saying no. App
+creation answers `Refused` for either variant.
 
 ### Names two members share
 
