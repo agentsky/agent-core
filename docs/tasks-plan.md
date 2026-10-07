@@ -2311,8 +2311,8 @@ Notes from implementing it
   checked, with no redirects, `https` only and a size and time cap. The
   agentd image moves from distroless to Debian slim for `git`.
 - An upload is a `.md` (up to 256 KB) or a `.zip` (up to 10 MB, unpacked
-  too); both surfaces' manager DMs pass their files to the handlers, so a
-  `persona.md` attached on Slack works now too.
+  too), read from either manager DM through T30's `Commands::download`
+  ([impl-notes](impl-notes.md#files-in-the-manager-dm)).
 - The launch flags enable the `Skill` tool: without it Claude Code never
   tells the model about the mounted skills.
 

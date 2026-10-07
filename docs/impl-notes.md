@@ -5573,19 +5573,20 @@ sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
 directory exists as the container starts. A skill added, replaced or removed
 reaches a conversation when its process next starts, as a persona does.
 
-### Files from both manager DMs reach the handlers
+### `skill add` reads its attachment like `persona`
 
-**Issue.** T30 left the Slack DM's files unpassed and T14 read attachments
-only in the Rocket.Chat DM, and `WebApi::download_file` reported a file over
-the limit as `SurfaceError::Api`, where Rocket.Chat's download says
-`TooLarge`.
+**Issue.** The plan has `skill add` take a `SKILL.md` or `.zip` attached in
+a manager DM, and the file passing it needs is T30's: `dm_command` returns
+the DM's files, the Slack inbound submits them with the command,
+`Commands::download` reads an attachment from either manager's DM, and
+`download_file` answers `TooLarge` past its limit
+([Files in the manager DM](#files-in-the-manager-dm)).
 
-**Solution.** `commands::slack::dm_command` returns the event's files and
-the Slack inbound submits them with the command. `Commands::download` reads
-an attachment from either manager's DM (and nowhere else), and both
-`persona` and `skill add` use it, so `persona <name>` with a `persona.md`
-attached works on Slack too. `download_file` answers `TooLarge` past its
-limit.
+**Solution.** `skill add` with no Git URL takes exactly one attachment
+through `Commands::download`, with its own caps (256 KB for a `.md`, 10 MB
+for a `.zip`), so it works in either manager DM as `persona` does. A file
+over the cap is refused with the limit, and a command without exactly one
+attachment, or one sent outside a manager DM, is told how to add a skill.
 
 ### Skills reach the model only with the Skill tool
 
