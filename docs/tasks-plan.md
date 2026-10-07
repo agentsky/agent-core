@@ -27,7 +27,9 @@ orders the work. If a task has to deviate from the design, the same PR updates
    another task. If you find the task needs something that no task owns, add it
    to [Deferred work](#deferred-work) in the same PR rather than widening the
    change.
-5. Tick the task's box in [Task index](#task-index) in the same PR.
+5. Leave the task's box in [Task index](#task-index) unticked. It is ticked
+   when the PR merges, so a PR stacked on unmerged work never marks its task
+   done before its base lands.
 
 A task that grows past about 1,500 changed lines (lockfile and fixtures
 excluded) should be split. Say where you split it in the PR description, and
@@ -316,7 +318,7 @@ Every PR, in addition to its task's acceptance criteria:
   the rule they check.
 - `config/agentd.example.toml` and `README.md` are updated when the task adds
   configuration or an operator-visible step.
-- The task's box is ticked in the [Task index](#task-index).
+- The task's box in the [Task index](#task-index) is ticked when the PR merges.
 - The PR description links the task (`docs/tasks-plan.md#t07`), lists any
   deviation from the design or this plan, and lists what was verified live, if
   anything.
