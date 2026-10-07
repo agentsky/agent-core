@@ -362,6 +362,21 @@ trailing punctuation and unmatched closing brackets left outside, as qm-core's
 `trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
 still left to Slack. The T06 bullet in the plan now says so.
 
+### Emphasis inside a bare URL cut the link
+
+**Issue.** CommonMark reads `_…_`, `__…__`, `*…*` and `~~…~~` inside a URL's
+path as emphasis, so pulldown-cmark splits the URL's text around it, and a
+scan of one text node linked only the part before:
+`see https://docs.python.org/3/library/__main__.html` became
+`see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
+kept such URLs whole.
+
+**Solution.** While parsing, the renderer measures each bare URL in the source
+from where a text node starts it. Emphasis or strikethrough with a delimiter
+inside such a range is replaced by its children, with its delimiters as
+text, so the URL is one text run again and is linked whole. Markup that only
+wraps a URL, as in `*https://x.io/#/y*`, is not touched.
+
 ### CommonMark disagrees with some qm-core regex cases
 
 **Issue.** qm-core converts with regexes; this renderer walks the
