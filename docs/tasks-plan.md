@@ -1291,7 +1291,13 @@ each in a channel. Before T23 the reply can be a fixed acknowledgement; record
 that mentions arrive per bot. To check avatars, set `avatar_url` to a public
 image URL: `users.setAvatar` refuses private addresses, redirects and
 anything not `image/*`
-([impl-notes](impl-notes.md#the-live-check-against-7139)).
+([impl-notes](impl-notes.md#the-live-check-against-7139)). Also record whether 7.x answers
+`users.create` for an email already in use with `error-field-unavailable`,
+the code read as "username taken". If it does, a creation whose email is
+already taken, by a first `users.create` that succeeded unrecorded, moves
+on to the prefixed username, and the orphan lookup then searches that name
+instead of the one the bot user got
+([impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
 
 ## Phase 2: sessions, sandboxes, credential proxy (design milestone 2)
 
