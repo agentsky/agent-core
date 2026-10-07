@@ -472,6 +472,16 @@ mod tests {
                 "@nobody https://x.io/@allow",
                 "@nobody https://x.io/@allow",
             ),
+            (
+                "a URL ending in underscores before a name",
+                "see https://docs.python.org/3/reference/datamodel.html#object.__init__ @Ada",
+                "see https://docs.python.org/3/reference/datamodel.html#object.__init__ @ada.l",
+            ),
+            (
+                "a name inside a URL ending in underscores",
+                "https://x.io/@Ada/#object.__init__",
+                "https://x.io/@Ada/#object.__init__",
+            ),
             ("a username that is a broadcast", "@Sneaky", "@Sneaky"),
             ("a username with a space", "@Spacey", "@Spacey"),
         ]);

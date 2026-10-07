@@ -155,7 +155,9 @@ pub enum Removed {
     /// confirmed.
     Active,
     /// It removed a skill still waiting for its owner to confirm its
-    /// hosts, or files no row recorded: no host had been granted.
+    /// hosts, or files no row records, such as those a removal that failed
+    /// on the disk left after deleting the rows: no host is granted for it
+    /// now, though one may have been before.
     Unconfirmed,
     /// The agent has no skill of that name.
     NotFound,

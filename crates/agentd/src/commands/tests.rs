@@ -1467,9 +1467,19 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     run("alice", "skill rm helper gh", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
-        "Removed the skill `gh` from `helper`. None of the hosts it asks for had been \
-         confirmed, so its sandboxes never got to reach them."
+        "Removed the skill `gh` from `helper`. None of the hosts it asks for is confirmed, so \
+         its sandboxes can't open new connections to them."
     );
+
+    std::fs::create_dir_all(skills.join("left")).unwrap();
+    std::fs::write(skills.join("left/SKILL.md"), "left over").unwrap();
+    run("alice", "skill rm helper left", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Removed the skill `left` from `helper`. None of the hosts it asks for is confirmed, so \
+         its sandboxes can't open new connections to them."
+    );
+    assert!(!skills.join("left").exists());
 
     run(
         "alice",
