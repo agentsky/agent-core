@@ -558,17 +558,22 @@ mark was wrong too: a mark left in a text node is literal, but it can be a
 footnote star, an escaped mark or a stray closer as easily as part of the
 path, and since the trim stops at the first character it keeps, a kept star
 also shielded the `)` or `.` before it, so `(https://x.io/pricing).*` was
-linked as `<https://x.io/pricing).*>`. The trim now keeps a trailing run
-of one mark only when it follows a letter or digit and the same mark
-appears earlier in the URL after the scheme (`#object.__init__`, `/_a_`,
-`/~~a~~`, and `/_a_` in `https://x.io/_a_)`). Otherwise the run is dropped
-and trimming goes on, so a mark after punctuation or a closing bracket,
-as in `(https://x.io/_a)_` or `https://x.io/my*page.*`, never shields the
-characters before it. A URL that is only a scheme and marks, such as
-`https://_`, is left as text. Dropping the run only after punctuation or
-an unmatched closer was tried too: on a corpus of generated inputs it
-linked past the original trim in about three times as many inputs, escaped marks
-included, and still linked `https://x.io/a.*__*` whole.
+linked as `<https://x.io/pricing).*>`. The trim now keeps a trailing run of
+one mark only when it follows an alphanumeric character (Unicode's) and the
+same mark appears earlier in the URL after the scheme (`#object.__init__`,
+`/_a_`, `/~~a~~`, and `/_a_` in `https://x.io/_a_)`). Otherwise the run is
+dropped and trimming goes on, so a mark after punctuation or a closing
+bracket, as in `(https://x.io/_a)_` or `https://x.io/my*page.*`, never
+shields the characters before it. The trim sees decoded text, so the Slack
+renderer, which knows the offsets of the marks the source escaped (`\_`,
+`&#95;`, `&lowbar;`), ends a URL before the first escaped mark in that
+trailing run: `https://x.io/my_page\_` keeps its `_` out of the link, while
+an escaped mark inside the path, as in `https://x.io/a\_b`, stays part of
+it. A URL that is only a scheme and marks, such as `https://_`, is left as
+text. Dropping the run only after punctuation or an unmatched closer was
+tried too: on a corpus of generated inputs it linked past the original trim
+in about three times as many inputs, and still linked `https://x.io/a.*__*`
+whole.
 
 ### CommonMark disagrees with some qm-core regex cases
 

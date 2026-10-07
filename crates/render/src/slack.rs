@@ -777,7 +777,7 @@ impl Renderer<'_> {
                     continue;
                 }
             }
-            if arm && let Some(url) = bare_url(text, i) {
+            if arm && let Some(url) = unescaped_url(text, i, literal) {
                 push_slack_link(url, "", out);
                 i += url.len();
                 continue;
@@ -790,6 +790,19 @@ impl Renderer<'_> {
             push_escaped(c, out);
             i += c.len_utf8();
         }
+    }
+}
+
+/// The bare URL at byte offset `at` of `text`, as [`bare_url`] finds it,
+/// but ending before the first mark in its trailing run of `*`, `_` and `~`
+/// that the source escaped, whose byte offset is in `literal`: an escaped
+/// mark is never part of a URL's tail, so `my_page\_` keeps its `_` out.
+fn unescaped_url<'t>(text: &'t str, at: usize, literal: &[usize]) -> Option<&'t str> {
+    let url = bare_url(text, at)?;
+    let run = at + url.trim_end_matches(['*', '_', '~']).len();
+    match literal.get(literal.partition_point(|&offset| offset < run)) {
+        Some(&cap) if cap < at + url.len() => bare_url(&text[..cap], at),
+        _ => Some(url),
     }
 }
 
@@ -1069,8 +1082,8 @@ fn wire_broadcast(text: &str, at: usize) -> Option<(usize, &str)> {
 
 /// Finds a bare `http://` or `https://` URL at byte offset `at`, trimmed of
 /// trailing punctuation the way qm-core's `trimUrlTail` does, except that
-/// a run of `*`, `_` or `~` right after a letter or digit stays when the URL
-/// holds the same mark earlier.
+/// a run of `*`, `_` or `~` right after an alphanumeric character stays when
+/// the URL holds the same mark earlier, after its scheme.
 fn bare_url(text: &str, at: usize) -> Option<&str> {
     let rest = &text[at..];
     let scheme = ["https://", "http://"]
@@ -1095,12 +1108,13 @@ fn ends_url(c: char) -> bool {
 
 /// Drops trailing punctuation, and closing brackets that have no opening
 /// partner inside the URL, so `(see https://x.io/a).` keeps `)` and `.` out.
-/// A trailing run of `*`, `_` or `~` stays only when it follows a letter or
-/// digit and the same mark appears earlier in the URL after its scheme, as
-/// in `…#object.__init__` or `/~~a~~`. Otherwise it is dropped, as a
-/// footnote star, an escaped mark or a stray closer is, and trimming goes
-/// on, so `(https://x.io/a).*` keeps `).*` out and `(https://x.io/_a)_`
-/// keeps `)_` out.
+/// A trailing run of `*`, `_` or `~` stays only when it follows an
+/// alphanumeric character (Unicode's) and the same mark appears earlier in
+/// the URL after its scheme, as in `…#object.__init__` or `/~~a~~`.
+/// Otherwise it is dropped, as a footnote star or a stray closer is, and
+/// trimming goes on, so `(https://x.io/a).*` keeps `).*` out and
+/// `(https://x.io/_a)_` keeps `)_` out. The text it gets is decoded, so it
+/// can't tell an escaped mark; the Slack renderer ends a URL before one.
 fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let body = url.find("://").map_or(0, |at| at + 3);
