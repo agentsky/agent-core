@@ -38,7 +38,7 @@ use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Thrott
 use render::MentionDirectory;
 use tokio::time::Instant;
 
-use crate::normalize::{is_bot_id, is_enterprise_id, is_user_id};
+use crate::normalize::{is_bot_id, is_enterprise_id, is_user_id, is_workspace_id};
 use crate::web::{Result, User, WebApi, is_unreadable};
 
 /// How long a member list is used before `users.list` is read again.
@@ -104,13 +104,25 @@ pub struct TeamDirectory {
     grid_noticed: AtomicBool,
 }
 
+/// What Slack says of a user's place in the workspace: one of its own
+/// accounts, or from outside it, with the organization `users.info` named
+/// for them when it named one that isn't home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Membership {
+    /// One of the workspace's own accounts ([`is_home`]).
+    Home,
+    /// From outside the workspace, of the organization given, if Slack
+    /// named one ([`organization`]).
+    Outside(Option<TeamId>),
+}
+
 /// The answers `users.info` gave to whether a user is home, each kept for
 /// [`HOME_ANSWER_TTL`] from when it was given, at most `capacity` of them,
 /// the oldest dropped first. Each answer is numbered as it is kept, so
 /// `order` tells an answer from an older one for the same user.
 struct HomeAnswers {
     capacity: usize,
-    answers: HashMap<UserId, (bool, Instant, u64)>,
+    answers: HashMap<UserId, (Membership, Instant, u64)>,
     order: VecDeque<(UserId, u64)>,
     next: u64,
 }
@@ -126,21 +138,21 @@ impl HomeAnswers {
     }
 
     /// The answer for `user` still kept at `now`.
-    fn get(&mut self, user: &UserId, now: Instant) -> Option<bool> {
-        let (home, given, _) = *self.answers.get(user)?;
-        if now.saturating_duration_since(given) < HOME_ANSWER_TTL {
-            return Some(home);
+    fn get(&mut self, user: &UserId, now: Instant) -> Option<Membership> {
+        let (membership, given, _) = self.answers.get(user)?;
+        if now.saturating_duration_since(*given) < HOME_ANSWER_TTL {
+            return Some(membership.clone());
         }
         self.answers.remove(user);
         None
     }
 
-    /// Keeps `home` for `user`, given at `now`, dropping the oldest answers
-    /// past the capacity.
-    fn insert(&mut self, user: UserId, home: bool, now: Instant) {
+    /// Keeps `membership` for `user`, given at `now`, dropping the oldest
+    /// answers past the capacity.
+    fn insert(&mut self, user: UserId, membership: Membership, now: Instant) {
         let number = self.next;
         self.next += 1;
-        self.answers.insert(user.clone(), (home, now, number));
+        self.answers.insert(user.clone(), (membership, now, number));
         self.order.push_back((user, number));
         while self.answers.len() > self.capacity {
             let Some((oldest, number)) = self.order.pop_front() else {
@@ -451,14 +463,26 @@ impl TeamDirectory {
     /// is any but Slack unreachable or busy and a rate limit, is logged as a
     /// warning at most once per [`LOOKUP_WARNING_INTERVAL`].
     pub async fn home_user(&self, api: &WebApi, user: &UserId) -> Result<bool> {
+        Ok(self.membership(api, user).await? == Membership::Home)
+    }
+
+    /// What [`home_user`](Self::home_user) decides, with the organization
+    /// `users.info` named for a user who isn't home ([`organization`]):
+    /// [`Membership::Outside`] with none when Slack named none that isn't
+    /// home, or answered `user_not_found` or `user_not_visible`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`home_user`](Self::home_user).
+    pub async fn membership(&self, api: &WebApi, user: &UserId) -> Result<Membership> {
         let now = Instant::now();
         if self.listed_home(user, now) {
-            return Ok(true);
+            return Ok(Membership::Home);
         }
-        if let Some(home) = self.lock_home_answers().get(user, now) {
-            return Ok(home);
+        if let Some(membership) = self.lock_home_answers().get(user, now) {
+            return Ok(membership);
         }
-        let home = match api.user_info(user).await {
+        let membership = match api.user_info(user).await {
             Ok(info) if info.id != *user => {
                 let err = SurfaceError::Api("users.info answered for another user".into());
                 self.lookup_failed(&err);
@@ -466,7 +490,11 @@ impl TeamDirectory {
             }
             Ok(info) => {
                 self.notice_grid(&info);
-                is_home(&info, &self.team, self.home_org.as_ref())
+                if is_home(&info, &self.team, self.home_org.as_ref()) {
+                    Membership::Home
+                } else {
+                    Membership::Outside(organization(&info, &self.team, self.home_org.as_ref()))
+                }
             }
             Err(SurfaceError::NotFound(code) | SurfaceError::Api(code))
                 if NOT_HOME_CODES.contains(&code.as_str()) =>
@@ -474,7 +502,7 @@ impl TeamDirectory {
                 if code == "user_not_visible" {
                     self.not_visible();
                 }
-                false
+                Membership::Outside(None)
             }
             Err(err) => {
                 self.lookup_failed(&err);
@@ -482,8 +510,8 @@ impl TeamDirectory {
             }
         };
         self.lock_home_answers()
-            .insert(user.clone(), home, Instant::now());
-        Ok(home)
+            .insert(user.clone(), membership.clone(), Instant::now());
+        Ok(membership)
     }
 
     /// Whether the member list, read less than [`HOME_ANSWER_TTL`] before
@@ -845,6 +873,25 @@ pub fn is_home(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> bool {
             .is_none_or(names_home)
 }
 
+/// The organization Slack's `user` belongs to when it isn't home: their
+/// `team_id`, else their `enterprise_user.enterprise_id`, the first that is
+/// shaped like a workspace's or an organization's id and is neither `team`
+/// nor `home_org`. `None` when there is none.
+pub fn organization(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> Option<TeamId> {
+    let foreign = |id: &str| id != team.as_str() && home_org.is_none_or(|org| id != org.as_str());
+    user.team_id
+        .as_ref()
+        .filter(|id| is_workspace_id(id.as_str()) && foreign(id.as_str()))
+        .cloned()
+        .or_else(|| {
+            user.enterprise_user
+                .as_ref()
+                .and_then(|grid| grid.enterprise_id.as_deref())
+                .filter(|id| is_enterprise_id(id) && foreign(id))
+                .map(TeamId::from)
+        })
+}
+
 /// Lowercases and collapses white space.
 fn fold(name: &str) -> String {
     name.split_whitespace()
@@ -1019,41 +1066,61 @@ mod tests {
     fn the_home_answer_cache_is_bounded_and_looks_up_an_evicted_no_again() {
         let start = Instant::now();
         let mut answers = HomeAnswers::new(2);
-        answers.insert("U0NO".into(), false, start);
-        answers.insert("U0YES".into(), true, start);
-        assert_eq!(answers.get(&"U0NO".into(), start), Some(false));
-        answers.insert("U0LATER".into(), true, start);
+        answers.insert("U0NO".into(), Membership::Outside(None), start);
+        answers.insert("U0YES".into(), Membership::Home, start);
+        assert_eq!(
+            answers.get(&"U0NO".into(), start),
+            Some(Membership::Outside(None))
+        );
+        answers.insert("U0LATER".into(), Membership::Home, start);
         assert_eq!(answers.len(), 2);
         assert_eq!(
             answers.get(&"U0NO".into(), start),
             None,
             "the oldest answer, a no, was dropped and is asked again"
         );
-        assert_eq!(answers.get(&"U0YES".into(), start), Some(true));
-        assert_eq!(answers.get(&"U0LATER".into(), start), Some(true));
+        assert_eq!(answers.get(&"U0YES".into(), start), Some(Membership::Home));
+        assert_eq!(
+            answers.get(&"U0LATER".into(), start),
+            Some(Membership::Home)
+        );
 
         let later = start + HOME_ANSWER_TTL;
         assert_eq!(answers.get(&"U0YES".into(), later), None, "kept an hour");
         assert_eq!(answers.len(), 1);
-        answers.insert("U0YES".into(), false, later);
-        answers.insert("U0LAST".into(), false, later);
+        answers.insert("U0YES".into(), Membership::Outside(None), later);
+        answers.insert("U0LAST".into(), Membership::Outside(None), later);
         assert_eq!(
             answers.get(&"U0LATER".into(), later),
             None,
             "an answer given again is as new as its last"
         );
-        assert_eq!(answers.get(&"U0YES".into(), later), Some(false));
-        assert_eq!(answers.get(&"U0LAST".into(), later), Some(false));
+        assert_eq!(
+            answers.get(&"U0YES".into(), later),
+            Some(Membership::Outside(None))
+        );
+        assert_eq!(
+            answers.get(&"U0LAST".into(), later),
+            Some(Membership::Outside(None))
+        );
 
         let mut many = HomeAnswers::new(MAX_HOME_ANSWERS);
         for n in 0..=MAX_HOME_ANSWERS {
-            many.insert(format!("U{n}").into(), n % 2 == 0, start);
+            let membership = if n % 2 == 0 {
+                Membership::Home
+            } else {
+                Membership::Outside(None)
+            };
+            many.insert(format!("U{n}").into(), membership, start);
         }
         assert_eq!(many.len(), MAX_HOME_ANSWERS);
         assert_eq!(many.get(&"U0".into(), start), None);
-        assert_eq!(many.get(&"U1".into(), start), Some(false));
+        assert_eq!(
+            many.get(&"U1".into(), start),
+            Some(Membership::Outside(None))
+        );
         for _ in 0..3 * MAX_HOME_ANSWERS {
-            many.insert("U1".into(), false, start);
+            many.insert("U1".into(), Membership::Outside(None), start);
         }
         assert!(many.order.len() <= 2 * MAX_HOME_ANSWERS);
         assert_eq!(

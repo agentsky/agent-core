@@ -9355,6 +9355,25 @@ manager DM's "try again" line when Slack can't answer. That can't be
 avoided without knowing home first; the design says so, and that none of
 them says more than that the agent is busy or Slack failed.
 
+### The copy's organization is Slack's, and a disagreement drops the message
+
+**Issue.** Confirmation copied the event's `outside` onto a copy that had
+none (`outside_kept`), so the organization `[slack_connect] teams` will
+judge at T36b came from the event, which an agent's owner can sign. Fail
+closed for T36a, which ignores outside requesters, but a forged
+organization could later move a home member's mention to the community
+key or pass an unlisted organization's member off as a listed one.
+
+**Solution.** The copy's `outside` comes from Slack's data only: its own
+team fields, else the home lookup, whose answer now carries the
+organization `users.info` names (`directory::Membership`, from `team_id`,
+else `enterprise_user.enterprise_id`, whichever is not home). The pipeline
+drops a message whose event and copy disagree on `outside`, organization
+included (`agreeing_copy`), with the throttled "routes differently"
+warning. At T36a the event of an outside sender is ignored before
+confirmation, so the drop only replaces what `copy_stands` already did; it
+is there for T36b.
+
 ### The store refuses outside requesters until T36b
 
 **Issue.** `message_refs`, `consents` and `ctl_tokens` have no column for
@@ -9369,10 +9388,10 @@ writes `outside: None` for every thread message it shows a session.
 `create_consent` and `set_ctl_turn` refuse a requester with `outside` set
 with `StoreError::Refused`, through one helper, `store::home_requester`.
 The T36b plan says so, and that admitting a listed organization rests on
-T36e: confirmation keeps the copy's own `outside`, which is `Outside { team:
-None }` when the copy's fields don't name the organization, so
-`copy_stands` drops an admitted outside message unless Slack's copy names
-it.
+T36e: confirmation keeps the copy's own `outside`, from its fields or
+else the organization `users.info` names, and drops a message whose event
+and copy disagree on it, so an admitted outside message runs only when
+Slack's data and the event name the same organization.
 
 Review round 2 found that the earlier wording here and in the plan, "no
 row reads back as home", was wrong: `record` writes a home requester for
