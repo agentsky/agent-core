@@ -14,6 +14,7 @@ workspace = true
 clap.workspace = true
 core-types.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
@@ -26,6 +27,5 @@ rustix.workspace = true
 agentd.workspace = true
 async-trait.workspace = true
 axum.workspace = true
-secrecy.workspace = true
 store.workspace = true
 testkit.workspace = true

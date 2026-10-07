@@ -500,6 +500,7 @@ async fn owner_turns_post_to_any_conversation_and_react_only_in_this_one() {
                 thread_root: None
             },
             text: "hello".into(),
+            asks: None,
         }]
     );
 }
@@ -887,6 +888,39 @@ async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn only_ask_agent_counts_as_having_asked_an_agent() {
+    let fixture = Fixture::new().await;
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    fixture
+        .bot_agent("U0OWNER", "reviewer", "U0REVIEW", public)
+        .await;
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    let (status, value) = fixture
+        .call(
+            Some(&token),
+            "/v1/post",
+            json!({"to": "here", "text": "@U0REVIEW:\n\nlooks like an ask"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let (status, value) = fixture.ask(&token, "reviewer", "the real ask").await;
+    assert_eq!(
+        status, 200,
+        "a post that looks like an ask isn't one: {value}"
+    );
+    let (status, value) = fixture.ask(&token, "reviewer", "again").await;
+    assert_eq!(status, 403, "{value}");
+    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+    let asks: Vec<_> = outbox.posts().iter().map(|post| post.asks).collect();
+    assert_eq!(asks.len(), 2);
+    assert_eq!(asks[0], None);
+    assert!(asks[1].is_some());
 }
 
 #[tokio::test]

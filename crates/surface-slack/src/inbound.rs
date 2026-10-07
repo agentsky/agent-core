@@ -65,7 +65,10 @@ impl SlackInbound {
 }
 
 /// An Events API event other than `message`.
-#[derive(Debug, Clone)]
+///
+/// Its `Debug` output leaves out the event object, which can hold message
+/// text, such as an `app_mention`'s or a `message_changed`'s.
+#[derive(Clone)]
 pub struct SlackEvent {
     /// The binding whose app received the event.
     pub binding: BindingId,
@@ -79,6 +82,18 @@ pub struct SlackEvent {
     pub event: Value,
     /// When agentd received the request.
     pub received_at: OffsetDateTime,
+}
+
+impl fmt::Debug for SlackEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlackEvent")
+            .field("binding", &self.binding)
+            .field("team", &self.team)
+            .field("event_id", &self.event_id)
+            .field("event_type", &self.event_type)
+            .field("received_at", &self.received_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A slash command.
@@ -149,5 +164,30 @@ impl fmt::Debug for Interaction {
             .field("sender", &self.sender)
             .field("received_at", &self.received_at)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn an_events_debug_leaves_out_the_event_object() {
+        let event = SlackEvent {
+            binding: BindingId::new_v4(),
+            team: Some("T1".into()),
+            event_id: "Ev1".into(),
+            event_type: "app_mention".into(),
+            event: json!({ "type": "app_mention", "text": "the launch code is 1234" }),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("launch code"), "{debug}");
+        assert!(
+            debug.contains("app_mention") && debug.contains("Ev1"),
+            "{debug}"
+        );
     }
 }

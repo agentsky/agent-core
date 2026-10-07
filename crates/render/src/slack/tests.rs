@@ -508,6 +508,76 @@ fn bare_urls() {
                 "www.example.com",
                 "www.example.com",
             ),
+            (
+                "underscore emphasis inside a URL path",
+                "https://example.com/_next_/x",
+                "<https://example.com/_next_/x>",
+            ),
+            (
+                "star emphasis inside a URL path",
+                "https://x.io/a*b*c",
+                "<https://x.io/a*b*c>",
+            ),
+            (
+                "underscore bold inside a URL path",
+                "see https://docs.python.org/3/library/__main__.html",
+                "see <https://docs.python.org/3/library/__main__.html>",
+            ),
+            (
+                "strikethrough inside a URL path",
+                "https://x.io/~~a~~/b",
+                "<https://x.io/~~a~~/b>",
+            ),
+            (
+                "emphasis closing where the source URL goes on",
+                "*see https://x.io/a*b",
+                "*see <https://x.io/a>*b",
+            ),
+            (
+                "bold wrapping a URL before a suffix",
+                "**https://x.io/a**'s",
+                "*<https://x.io/a>*'s",
+            ),
+            (
+                "an entity that ends a URL ends it before emphasis",
+                "https://x.io/a&lt;*b*",
+                "<https://x.io/a>&lt;_b_",
+            ),
+            (
+                "a space entity ends a URL before emphasis",
+                "https://x.io/a&#32;*b*",
+                "<https://x.io/a> _b_",
+            ),
+            (
+                "inline code ends a URL before emphasis",
+                "https://x.io/a`c`*b*",
+                "<https://x.io/a>`c`_b_",
+            ),
+            (
+                "a URL in a link label ends with the label",
+                "[https://x.io/a](https://y.io)*b*",
+                "https://x.io/a (<https://y.io>)_b_",
+            ),
+            (
+                "an entity that stays in a URL keeps emphasis in it",
+                "https://x.io/?a&amp;_b_/c",
+                "<https://x.io/?a&amp;_b_/c>",
+            ),
+            (
+                "emphasis after a URL still formats",
+                "https://x.io/a *b*",
+                "<https://x.io/a> _b_",
+            ),
+            (
+                "markup inside emphasis that starts in a URL is kept",
+                "https://x.io/_a [b](https://y.io)_",
+                "<https://x.io/_a> <https://y.io|b>_",
+            ),
+            (
+                "a broadcast after such a URL stays neutralized",
+                "https://x.io/_a_/b @here",
+                "<https://x.io/_a_/b> @\u{200B}here",
+            ),
         ],
     );
 }
@@ -1019,6 +1089,25 @@ fn long_bracket_runs_stay_linear() {
     let out = to_mrkdwn(&md, &NOBODY);
     assert!(out.starts_with("<https://x.io/>)"));
     assert_eq!(out.len(), md.len() + 2);
+}
+
+#[test]
+fn many_cut_bare_urls_stay_linear() {
+    let count = 10_000;
+    for (unit, link) in [
+        ("`c`https://a", "<https://a>"),
+        ("&lt;https://a", "<https://a>"),
+        ("&#32;https://a/", "<https://a/>"),
+    ] {
+        let md = unit.repeat(count);
+        let started = std::time::Instant::now();
+        let out = to_mrkdwn(&md, &NOBODY);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{unit:?}"
+        );
+        assert_eq!(out.matches(link).count(), count, "{unit:?}");
+    }
 }
 
 #[test]
