@@ -281,8 +281,9 @@ pub struct FileRef {
 /// A message, from the REST API or a realtime stream.
 ///
 /// `ts` is read both as an ISO 8601 string (REST) and as EJSON
-/// `{"$date": <ms>}` (realtime).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// `{"$date": <ms>}` (realtime). `Debug` prints the text's length, not the
+/// text.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "RawMessage")]
 pub struct Message {
     /// The message's `_id`.
@@ -313,6 +314,24 @@ pub struct Message {
     pub mentions: Vec<UserId>,
     /// Attached files (`files`, or `file` on older messages).
     pub files: Vec<FileRef>,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message")
+            .field("id", &self.id)
+            .field("room", &self.room)
+            .field("text_len", &self.text.len())
+            .field("sender", &self.sender)
+            .field("sent_at", &self.sent_at)
+            .field("thread_root", &self.thread_root)
+            .field("kind", &self.kind)
+            .field("bot", &self.bot)
+            .field("edited", &self.edited)
+            .field("mentions", &self.mentions)
+            .field("files", &self.files)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
