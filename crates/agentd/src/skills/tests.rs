@@ -838,3 +838,22 @@ async fn a_failed_replacement_of_a_waiting_skill_leaves_no_new_hosts_to_confirm(
     assert!(h.hosts().await.is_empty());
     assert!(h.work_is_empty());
 }
+
+#[test]
+fn debug_shows_the_upload_and_description_lengths_not_their_content() {
+    let upload = Source::Upload {
+        name: "SKILL.md",
+        bytes: b"the secret plan",
+    };
+    let manifest =
+        package::parse_skill_file("---\nname: pdf-tools\ndescription: the secret plan\n---\n")
+            .unwrap();
+    for debug in [
+        format!("{upload:?}"),
+        format!("{:?}", Added::Active(manifest.clone())),
+        format!("{:?}", Added::Pending(manifest)),
+    ] {
+        assert!(!debug.contains("secret plan"), "{debug}");
+        assert!(debug.contains("_len: 15"), "{debug}");
+    }
+}
