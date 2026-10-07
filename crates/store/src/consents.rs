@@ -664,7 +664,8 @@ impl Store {
     }
 
     /// Claims updating consent `id`'s card with its outcome, at `now`.
-    /// True only for the one call that claims it: the update is tried once.
+    /// True only for the one call that claims it, until the claim is
+    /// released ([`release_consent_card_close`](Self::release_consent_card_close)).
     ///
     /// # Errors
     ///
@@ -680,6 +681,28 @@ impl Store {
         )
         .bind(to_unix(now))
         .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Releases the claim on closing consent `id`'s card made at
+    /// `claimed_at`, so a later pass tries the update again. False if that
+    /// claim no longer holds.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn release_consent_card_close(
+        &self,
+        id: ConsentId,
+        claimed_at: OffsetDateTime,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE consents SET card_closed_at = NULL WHERE id = ? AND card_closed_at = ?",
+        )
+        .bind(id.to_string())
+        .bind(to_unix(claimed_at))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -1223,6 +1246,28 @@ mod tests {
                 .unwrap()
         );
         assert!(fx.store.consent_cards_to_close().await.unwrap().is_empty());
+
+        assert!(
+            !fx.store
+                .release_consent_card_close(consent.id, at(161))
+                .await
+                .unwrap(),
+            "only the claim that holds is released"
+        );
+        assert!(
+            fx.store
+                .release_consent_card_close(consent.id, at(160))
+                .await
+                .unwrap()
+        );
+        assert_eq!(fx.store.consent_cards_to_close().await.unwrap().len(), 1);
+        assert!(
+            fx.store
+                .claim_consent_card_close(consent.id, at(200))
+                .await
+                .unwrap(),
+            "claimed again once released"
+        );
     }
 
     #[tokio::test]

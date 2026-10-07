@@ -412,6 +412,7 @@ async fn post_message(
         QueuedPost {
             to,
             text: request.text,
+            asks: None,
         },
         |_| Ok(()),
     )?;
@@ -653,7 +654,8 @@ async fn lock(
 /// read as part of the mention, and the renderers resolve a managed bot's
 /// handle before anyone's name. A turn asks each agent once: the other
 /// agent takes one turn for this turn however many of its posts mention
-/// it.
+/// it. Only an earlier `ask-agent` counts as asking, never an
+/// `agentctl post` whose text looks like one.
 async fn ask_agent(
     State(ctl): State<Ctl>,
     Caller(caller): Caller,
@@ -703,7 +705,7 @@ async fn ask_agent(
             handle.eq_ignore_ascii_case(wanted) || (!mention && name.eq_ignore_ascii_case(wanted))
         })
         .collect();
-    let handle = match found.as_slice() {
+    let (asked, handle) = match found.as_slice() {
         [] => {
             return Err(error(
                 CtlErrorCode::NotFound,
@@ -713,7 +715,7 @@ async fn ask_agent(
         [(agent, _, _, _)] if *agent == caller.token.agent => {
             return Err(error(CtlErrorCode::Refused, "an agent can't ask itself"));
         }
-        [(_, handle, _, _)] => handle,
+        [(agent, handle, _, _)] => (*agent, handle),
         several => {
             let handles: Vec<String> = several
                 .iter()
@@ -731,8 +733,7 @@ async fn ask_agent(
             ));
         }
     };
-    let asking = format!("@{handle}:\n\n");
-    let text = format!("{asking}{task}");
+    let text = format!("@{handle}:\n\n{task}");
     if text.len() > MAX_POST_BYTES {
         return Err(error(
             CtlErrorCode::TooLarge,
@@ -740,12 +741,13 @@ async fn ask_agent(
         ));
     }
     let to = ReplyTarget::from(caller.turn.thread.clone());
-    queue_post(&ctl, &caller, QueuedPost { to, text }, |outbox| {
-        if outbox
-            .posts()
-            .iter()
-            .any(|post| post.text.starts_with(&asking))
-        {
+    let post = QueuedPost {
+        to,
+        text,
+        asks: Some(asked),
+    };
+    queue_post(&ctl, &caller, post, |outbox| {
+        if outbox.posts().iter().any(|post| post.asks == Some(asked)) {
             return Err(error(
                 CtlErrorCode::Refused,
                 format!(

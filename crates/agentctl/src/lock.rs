@@ -42,6 +42,9 @@ use tokio::time::Instant;
 
 use crate::client::{Client, Failure};
 
+/// The longest `lock` waits for the lock, whatever `--timeout` says, so a
+/// huge timeout can't overflow the deadline.
+const MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// The first wait between acquire attempts.
 const FIRST_RETRY: Duration = Duration::from_millis(100);
 /// The longest wait between acquire attempts.
@@ -75,8 +78,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// # Errors
 ///
-/// If the lock can't be had within `timeout`, its lease is too short to
-/// hold, the command can't be started, or the lease is lost while it runs.
+/// If the lock can't be had within `timeout` (at most [`MAX_WAIT`]), its
+/// lease is too short to hold, the command can't be started, or the lease is
+/// lost while it runs.
 pub async fn run(
     client: &Client,
     timeout: Duration,
@@ -122,6 +126,7 @@ enum Acquired {
 }
 
 async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<Acquired, String> {
+    let timeout = timeout.min(MAX_WAIT);
     let give_up = Instant::now() + timeout;
     let mut wait = FIRST_RETRY;
     let mut told = false;
@@ -365,9 +370,11 @@ impl Stop {
 /// request sent at `sent`, has `seconds_left`: [`ROUNDING`] and
 /// [`SAFETY_MARGIN`] before `seconds_left` have passed since `sent`.
 /// agentd measured it no earlier than `sent`, so the time the answer took
-/// only makes this earlier.
+/// only makes this earlier. A `seconds_left` past what the clock can hold
+/// is not relied on at all: it gives `sent`.
 fn reliable_until(sent: Instant, seconds_left: u64) -> Instant {
-    sent + Duration::from_secs(seconds_left).saturating_sub(ROUNDING + SAFETY_MARGIN)
+    sent.checked_add(Duration::from_secs(seconds_left).saturating_sub(ROUNDING + SAFETY_MARGIN))
+        .unwrap_or(sent)
 }
 
 /// How long to wait before renewing a lease that can be relied on for
@@ -405,6 +412,12 @@ mod tests {
         assert_eq!(reliable_until(sent, 3), sent + Duration::from_secs(1));
         assert_eq!(reliable_until(sent, 2), sent);
         assert_eq!(reliable_until(sent, 0), sent);
+    }
+
+    #[test]
+    fn a_lease_too_long_for_the_clock_is_not_relied_on() {
+        let sent = Instant::now();
+        assert_eq!(reliable_until(sent, u64::MAX), sent);
     }
 
     #[test]

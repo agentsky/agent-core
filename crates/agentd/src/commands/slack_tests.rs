@@ -1064,6 +1064,100 @@ fn a_manager_dm_is_parsed_whole_or_after_a_prefix() {
     assert_eq!(text, "me");
 }
 
+async fn slack_agent(h: &SlackHarness, owner: MemberId) -> store::Agent {
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    agent
+}
+
+#[tokio::test]
+async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let agent = slack_agent(&h, alice).await;
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F9/download/persona.md"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {BOT_TOKEN}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Via the DM.\n"))
+        .mount(&h.slack)
+        .await;
+    let file = |size: u64| core_types::InFile {
+        id: "F9".into(),
+        name: "persona.md".into(),
+        mime_type: None,
+        size: Some(size),
+        url: format!(
+            "{}/files-pri/T0TEAM001-F9/download/persona.md",
+            h.slack.uri()
+        ),
+    };
+    let running = Running::start(&h);
+    let mut too_big = dm_event("U0HUMAN01", "persona helper");
+    too_big.files = vec![file(64 * 1024 + 1)];
+    running
+        .send(SlackInbound::Message(
+            Box::new(too_big),
+            InFlight::untracked(),
+        ))
+        .await;
+    let mut event = dm_event("U0HUMAN01", "persona helper");
+    event.files = vec![file(12)];
+    running
+        .send(SlackInbound::Message(
+            Box::new(event),
+            InFlight::untracked(),
+        ))
+        .await;
+    running.stop().await;
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "Via the DM.\n");
+    let posts: Vec<String> = h.posts().await.into_iter().map(|(_, text)| text).collect();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert_eq!(posts[0], "That file is over the 64 KB limit.");
+    assert!(
+        posts[1].starts_with("Replaced `helper`'s persona."),
+        "{posts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_persona_sent_in_a_manager_dm_arrives_decoded() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let agent = slack_agent(&h, alice).await;
+    let running = Running::start(&h);
+    running
+        .send(SlackInbound::Message(
+            Box::new(dm_event("U0HUMAN01", "persona helper You &amp; me &lt;3")),
+            InFlight::untracked(),
+        ))
+        .await;
+    running.stop().await;
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "You & me <3");
+}
+
 #[test]
 fn only_a_deleted_user_in_a_user_change_has_left() {
     let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
@@ -1539,65 +1633,6 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
 }
 
 #[tokio::test]
-async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
-    let h = slack_harness().await;
-    let alice = h.linked("U0HUMAN01").await;
-    let team = TeamId::new(TEAM);
-    let store::AgentCreation::Created(agent, _) = h
-        .store
-        .create_agent(
-            &store::NewAgent {
-                owner: alice,
-                name: "helper",
-                persona: "p",
-                visibility: store::Visibility::Public,
-                surface: SurfaceKind::Slack,
-                team: &team,
-            },
-            10,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("created");
-    };
-    Mock::given(method("GET"))
-        .and(path("/files-pri/T0TEAM001-F9/download/persona.md"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("Via the DM.\n"))
-        .mount(&h.slack)
-        .await;
-    let (intake, submitter) = CommandIntake::new(h.commands.clone());
-    let inbound = Sender::new(Inbound::new(h.store.clone(), Some(identity()), submitter));
-    let running = tokio::spawn(intake.run());
-    let mut event = dm_event("U0HUMAN01", "persona helper");
-    event.files = vec![core_types::InFile {
-        id: "F9".into(),
-        name: "persona.md".into(),
-        mime_type: None,
-        size: Some(12),
-        url: format!(
-            "{}/files-pri/T0TEAM001-F9/download/persona.md",
-            h.slack.uri()
-        ),
-    }];
-    inbound
-        .send(SlackInbound::Message(
-            Box::new(event),
-            InFlight::untracked(),
-        ))
-        .await
-        .unwrap();
-    drop(inbound);
-    tokio::time::timeout(Duration::from_secs(10), running)
-        .await
-        .unwrap()
-        .unwrap();
-    let row = h.store.agent(agent.id).await.unwrap().unwrap();
-    assert_eq!(row.persona, "Via the DM.\n");
-}
-
-#[tokio::test]
 async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channel() {
     let h = slack_harness().await;
     let alice = h.linked("U0HUMAN01").await;
@@ -1808,6 +1843,118 @@ fn click(user: &str, action: &str, value: &str, response_url: SecretString) -> I
         payload,
         received_at: OffsetDateTime::now_utc(),
     }
+}
+
+/// A consent of `helper`, owned by U0OWNER, asked for by U0BOB, whose card
+/// was sent and which the owner then approved.
+async fn approved_with_a_card(h: &SlackHarness) -> core_types::ConsentId {
+    let owner = h.linked("U0OWNER").await;
+    let bob = h.linked("U0BOB").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let id = core_types::ConsentId::new_v4();
+    let now = OffsetDateTime::now_utc();
+    h.store
+        .create_consent(
+            &store::NewConsent {
+                id,
+                agent: agent.id,
+                requester: &core_types::Requester {
+                    member: Some(bob),
+                    key: slack_key("U0BOB"),
+                },
+                hop: core_types::Hop::ZERO,
+                task: "Read my notes",
+                attachments_json: "[]",
+                thread: &core_types::ThreadKey {
+                    conv: slack_channel("C0CHAN001"),
+                    root: Some("1727697600.000100".into()),
+                },
+                origin_session: core_types::SessionId::new_v4(),
+                expires_at: now + time::Duration::hours(1),
+                approved_by_owner: None,
+            },
+            store::OpenLimits {
+                per_requester: 1,
+                per_agent: 1,
+            },
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.consents.send_cards(h.commands.replies()).await.unwrap(),
+        1
+    );
+    h.store
+        .decide_consent(id, true, &slack_key("U0OWNER"), now)
+        .await
+        .unwrap()
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_card_update_that_fails_on_the_way_is_tried_again() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ok(json!({"ts": "1727700000.000100"})))
+        .mount(&h.slack)
+        .await;
+    approved_with_a_card(&h).await;
+    let close = async || h.consents.close_cards(h.commands.replies()).await.unwrap();
+    assert_eq!(close().await, 0, "the first update fails");
+    assert_eq!(close().await, 1, "and the next pass closes the card");
+    assert_eq!(close().await, 0, "once");
+    assert_eq!(h.calls("chat.update").await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_card_the_platform_refuses_to_update_is_not_tried_again() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "cant_update_message"})),
+        )
+        .mount(&h.slack)
+        .await;
+    approved_with_a_card(&h).await;
+    for _ in 0..2 {
+        assert_eq!(
+            h.consents.close_cards(h.commands.replies()).await.unwrap(),
+            0
+        );
+    }
+    assert_eq!(h.calls("chat.update").await.len(), 1);
 }
 
 #[test]

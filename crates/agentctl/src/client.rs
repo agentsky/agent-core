@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use core_types::{AttachRequest, AttachResponse, CtlError, CtlRequest};
 use reqwest::header::CONTENT_LENGTH;
+use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 
 use crate::DEFAULT_URL;
@@ -39,7 +40,7 @@ impl fmt::Display for Failure {
 pub struct Client {
     http: reqwest::Client,
     base: String,
-    token: String,
+    token: SecretString,
 }
 
 impl Client {
@@ -52,6 +53,7 @@ impl Client {
         let token = env("AGENTCTL_TOKEN")
             .map(|token| token.trim().to_owned())
             .filter(|token| !token.is_empty())
+            .map(SecretString::from)
             .ok_or("AGENTCTL_TOKEN is not set")?;
         let base = env("AGENTCTL_URL")
             .filter(|url| !url.trim().is_empty())
@@ -95,7 +97,7 @@ impl Client {
         let response = self
             .http
             .post(self.url(R::PATH))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose_secret())
             .json(request)
             .timeout(limit.min(REQUEST_TIMEOUT))
             .send()
@@ -132,7 +134,7 @@ impl Client {
         let response = self
             .http
             .post(self.url(AttachRequest::PATH))
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose_secret())
             .query(&AttachRequest { name })
             .header(CONTENT_LENGTH, metadata.len())
             .body(reqwest::Body::from(file))
@@ -193,7 +195,7 @@ mod tests {
     fn the_url_defaults_to_agentctl_internal() {
         let client = Client::from_env(&env(&[("AGENTCTL_TOKEN", " tok\n")])).unwrap();
         assert_eq!(client.base, DEFAULT_URL);
-        assert_eq!(client.token, "tok");
+        assert_eq!(client.token.expose_secret(), "tok");
         assert_eq!(
             client.url("/v1/post"),
             "http://agentctl.internal:8081/v1/post"
