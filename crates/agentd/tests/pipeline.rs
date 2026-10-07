@@ -891,6 +891,15 @@ async fn an_owners_dm_whose_member_lookup_fails_is_refused_not_run() {
             .is_err(),
         "the owner's member lookup fails"
     );
+    stack
+        .store()
+        .set_community_api_key(
+            &SecretString::from("sk-ant-api03-community-key"),
+            &key("bob"),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
 
     stack.next_turn(Turn::reply("Ran anyway."));
     let requests = stack.fake.message_requests().await.len();
@@ -1160,9 +1169,9 @@ async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
 }
 
 #[tokio::test]
-async fn a_message_waiting_behind_a_turn_is_dropped_once_the_pipeline_closes() {
+async fn a_message_waiting_behind_a_turn_at_shutdown_is_answered_within_the_drain() {
     let stack = start().await;
-    stack.next_turn(Turn::reply("First.").with_delay(Duration::from_millis(1500)));
+    stack.next_turn(Turn::reply("Answered.").with_delay(Duration::from_millis(1500)));
     let upstream = stack.fake.message_requests().await.len();
     let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
     sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "q1", None, &[BOT]))
@@ -1186,13 +1195,13 @@ async fn a_message_waiting_behind_a_turn_is_dropped_once_the_pipeline_closes() {
     stack.pipeline.drain().await;
     let calls = stack.mock.calls();
     let sent = posts(&calls);
-    assert_eq!(sent.len(), 1, "{calls:#?}");
-    assert_eq!(sent[0].1, "First.");
-    assert!(!calls.contains(&working_on("q2")), "{calls:#?}");
+    assert_eq!(sent.len(), 2, "{calls:#?}");
+    assert!(sent.iter().all(|post| post.1 == "Answered."), "{sent:#?}");
+    assert!(calls.contains(&working_on("q2")), "{calls:#?}");
     assert_eq!(
         stack.fake.message_requests().await.len(),
-        upstream + 1,
-        "the waiting message never ran"
+        upstream + 2,
+        "the waiting message ran its turn"
     );
     stack.stop().await;
 }

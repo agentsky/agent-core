@@ -2,8 +2,9 @@
 //!
 //! An agent is created together with one binding in state
 //! [`creating`](BindingState::Creating). The caller then notes the username
-//! it asks for ([`set_binding_bot_username`](Store::set_binding_bot_username)),
-//! creates the bot user on the platform, [records it](Store::set_binding_bot_user),
+//! it asks for
+//! ([`set_binding_bot_username`](Store::set_binding_bot_username)), creates
+//! the bot user on the platform, [records it](Store::set_binding_bot_user),
 //! obtains its token and [activates](Store::activate_binding) the binding. A
 //! creation that never finishes, because the caller failed or died, is
 //! [abandoned](Store::abandon_creation): the binding is disabled and the
@@ -14,12 +15,14 @@
 //! a creation that died after `users.create` may have made a bot user under
 //! it: the retirement looks it up first, and
 //! [forgets the username](Store::forget_binding_bot_username) once it is
-//! known to be no bot user of the binding. It follows the relink notices' pattern. A
-//! caller [claims](Store::claim_retirement) it with a conditional `UPDATE`,
-//! which counts an attempt and holds a lease, so one caller at a time
-//! retires it across processes and restarts, then
+//! known to be no bot user of the binding. It follows the relink notices'
+//! pattern. A caller [claims](Store::claim_retirement) it with a conditional
+//! `UPDATE`, which counts an attempt and holds a lease, so one caller at a
+//! time retires it across processes and restarts, then
 //! [marks it retired](Store::mark_retired) or
 //! [defers](Store::defer_retirement) the next attempt.
+
+use std::fmt;
 
 use core_types::{AgentId, BindingId, MemberId, MemberKey, SurfaceKind, TeamId, UserId};
 use secrecy::SecretString;
@@ -126,8 +129,8 @@ impl BindingState {
     }
 }
 
-/// An agent row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An agent row. Its `Debug` shows the persona's length, not the persona.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Agent {
     /// Its id.
     pub id: AgentId,
@@ -145,8 +148,9 @@ pub struct Agent {
     pub created_at: OffsetDateTime,
 }
 
-/// What [`Store::create_agent`] needs.
-#[derive(Debug, Clone, Copy)]
+/// What [`Store::create_agent`] needs. Its `Debug` shows the persona's
+/// length, not the persona.
+#[derive(Clone, Copy)]
 pub struct NewAgent<'a> {
     /// The owner.
     pub owner: MemberId,
@@ -160,6 +164,33 @@ pub struct NewAgent<'a> {
     pub surface: SurfaceKind,
     /// The team of its first binding.
     pub team: &'a TeamId,
+}
+
+impl fmt::Debug for Agent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Agent")
+            .field("id", &self.id)
+            .field("owner", &self.owner)
+            .field("name", &self.name)
+            .field("persona_len", &self.persona.len())
+            .field("visibility", &self.visibility)
+            .field("state", &self.state)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+impl fmt::Debug for NewAgent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewAgent")
+            .field("owner", &self.owner)
+            .field("name", &self.name)
+            .field("persona_len", &self.persona.len())
+            .field("visibility", &self.visibility)
+            .field("surface", &self.surface)
+            .field("team", &self.team)
+            .finish()
+    }
 }
 
 /// A binding row, without its secrets.
@@ -884,8 +915,8 @@ impl Store {
 
     /// Every retirement on `surface` and `team` that may be claimed at
     /// `now`, oldest first: the binding is disabled, has a bot user, or a
-    /// noted username, that isn't retired, no lease or backoff runs past `now`, and it was
-    /// claimed fewer than `max_attempts` times.
+    /// noted username, that isn't retired, no lease or backoff runs past
+    /// `now`, and it was claimed fewer than `max_attempts` times.
     ///
     /// # Errors
     ///

@@ -721,9 +721,13 @@ renders as a space, `<`, `>` or `|` (`&lt;`), and at anything other than
 text and emphasis, such as inline code. Each run is scanned once, so the
 pass stays linear; measuring from every text node to the next source
 terminator instead took 19 s on ``"`c`https://a"`` repeated 10,000 times,
-since each cut made the next URL scan the rest of the run again. Emphasis or strikethrough whose opening
-delimiter is inside such a range is replaced by its children, with its
-delimiters as text, so the URL is one text run again and is linked whole.
+since each cut made the next URL scan the rest of the run again. Emphasis
+or strikethrough whose opening delimiter is inside such a range is replaced
+by its children, with its delimiters as text, so the URL is one text run
+again and is linked whole. A URL right after a character reference or
+escape that renders as a letter or digit isn't measured, as `&#97;` before
+`https://` makes it part of a word, which neither Slack nor the renderer
+links; its emphasis still formats.
 Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
@@ -2600,10 +2604,12 @@ is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
 Rocket.Chat doesn't answer is an attempt that failed, deferred with the
 retirement's backoff, so a creation that died because Rocket.Chat was
 unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
-answers an unknown username without an error code, so a creation that
-never got as far as `users.create` is indistinguishable from an outage and
-spends the retirement's attempts (about three days of `users.info` calls)
-before it is given up. The adoption needs the manager's
+answers an unknown username with HTTP 400 and the error `User not found.`,
+without an error code, and older servers with `error-user-not-found` or
+`error-invalid-user`; `user_by_username` reads those answers as no user, so
+the username of a creation that never got as far as `users.create` is
+forgotten at the first lookup, like another's email, while a transport
+error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
 out. A bot user still missed has no token and no password anyone knows, so
 it can't be used, but it keeps its username until an admin removes it.
@@ -5043,12 +5049,19 @@ pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
 panicking message doesn't stop its lane. The set is behind a
 `std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
 a Rocket.Chat connection's is on every reconnect, can't leave a lane
-created without its task. Queueing checks that the pipeline is open under
-that lock and never starts a task once it is closed, and a lane starts none
-of its waiting messages once it is closed: a message that passed
-`dispatch`'s check just before a shutdown, or waited behind a running
-turn, is dropped as one sent after closing is, so the drain waits only for
-the turns already running. `drain` polls the set
+created without its task. Queueing checks that the pipeline is open, adds
+the message to its lane and starts a new lane's task all under the lanes'
+lock, and `close` sets the flag under the same lock, so a message is either
+queued before the close, in a lane whose task the drain waits for, or
+dropped as one sent after closing is, even one that passed `dispatch`'s
+check just before. Messages queued in a lane before the close, including
+those waiting behind a running turn, are answered within the drain:
+Rocket.Chat has marked them processed and Slack has acknowledged them, so
+dropping them would lose them silently. A message that reaches `dispatch`
+only after the close is still dropped, with the same loss: a Slack event
+acknowledged and deduplicated but still in the ingress queue, which
+`Server::run` drains after closing the pipeline, or a Rocket.Chat message
+a connection was still delivering when it stopped. `drain` polls the set
 under the lock without holding it across a wait, so a drain cut off by its
 timeout leaves the tasks for `cut_short`, which takes the set and shuts it
 down. On shutdown `Server::run` stops the public listener and the chat
@@ -5062,8 +5075,8 @@ turn's working emoji is kept until its reply, or its failure notice, has
 gone out, so a reply stuck on a slow post isn't lost without a word. That
 is the simplest option that tells people: the turns and their queue stay in
 memory rather than the store, so a crash, unlike a shutdown, still loses
-them silently, and messages still waiting in a lane when the pipeline
-closes are dropped without a word, since no decision was made about them. The working
+them silently, and messages still waiting in a lane at the timeout are
+dropped without a word, since no decision was made about them. The working
 emoji is held by a guard, so a panicking turn takes it off too.
 
 ### An agent's post can arrive before its attribution
@@ -5335,9 +5348,10 @@ write, for no gain. The follow-up itself holds a strong `SessionControl`
 handle until its resets end, so on shutdown the `SessionManager`'s inner
 state, whose drop aborts the reaper and the container event follower, can
 outlive the `Turns` handle while a reset waits behind a long turn; that is
-bounded by the drain, which drops a follow-up still waiting when it ends. The follow-up lives only in memory: if the instance
-dies, the queued resets die with it and nothing is reset, which the owner
-sees in `sessions` and can send again.
+bounded by the drain, which drops a follow-up still waiting when it ends.
+The follow-up lives only in memory: if the instance dies, the queued resets
+die with it and nothing is reset, which the owner sees in `sessions` and can
+send again.
 
 The follow-up isn't polled while the reply is being sent. A reset queued on
 a busy session whose turn ends in that window is handed the session's lock,
@@ -5876,16 +5890,21 @@ doesn't say what a full queue does.
 lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
 bounded queue. A full or closed queue answers 503; Slack retries an event
 that gets one, but not a slash command or an interaction, whose user sees
-Slack's error. The handler never waits for the queue. `Queue::run` then deduplicates through the
-`Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
-and sends `SlackInbound` items, one at a time and in order, to a
-`core_types::Sender`. A failed dedup write drops the request rather than risk
-a duplicate turn. Until T29 and T30 consume it, agentd's sink (`Unrouted`)
-logs each item's binding and kind and drops it. agentd runs the queue as a
-`server::Worker` next to the listeners: `Routers` gained a `workers` field,
-and the queue ends once the public listener's router is dropped, so every
-acknowledged request is handled within the drain timeout. An acknowledged
-request is lost if agentd dies before handling it; Slack won't retry it.
+Slack's error. The handler never waits for the queue. `Queue::run` then
+deduplicates through the `Dedup` trait (agentd's `StoreDedup` over
+`mark_event_processed`), normalizes, and sends `SlackInbound` items, one at
+a time and in order, to a `core_types::Sender`. A failed dedup write drops
+the request rather than risk a duplicate turn. Until T29 and T30 consume
+it, agentd's sink (`Unrouted`) logs each item's binding and kind and drops
+it. agentd runs the queue as a `server::Worker` next to the listeners:
+`Routers` gained a `workers` field, and the queue ends once the public
+listener's router is dropped, so every acknowledged request still queued
+at shutdown is passed to the sink within the drain timeout, unless the
+timeout runs out first. That doesn't make it answered: a sink that has
+stopped taking work by then drops it, as the turn pipeline does once it is
+closed (T23). An acknowledged request is lost if agentd dies before
+handling it, or if it reaches a sink that no longer takes it; Slack won't
+retry it.
 
 ### Replays inside the five-minute window
 
