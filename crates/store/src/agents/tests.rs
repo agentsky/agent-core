@@ -837,3 +837,27 @@ fn states_round_trip_through_their_column_values() {
         assert_eq!(BindingState::parse(state.as_str()).unwrap(), state);
     }
 }
+
+#[tokio::test]
+async fn debug_shows_the_persona_length_not_the_persona() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    let team = team();
+    let new = NewAgent {
+        owner: ada,
+        name: "helper",
+        persona: "the secret plan",
+        visibility: Visibility::Public,
+        surface: SurfaceKind::RocketChat,
+        team: &team,
+    };
+    let AgentCreation::Created(agent, _) = store.create_agent(&new, MAX, at(1_000)).await.unwrap()
+    else {
+        panic!("the name is free");
+    };
+    for debug in [format!("{new:?}"), format!("{agent:?}")] {
+        assert!(!debug.contains("secret plan"), "{debug}");
+        assert!(debug.contains("persona_len: 15"), "{debug}");
+        assert!(debug.contains("helper"), "{debug}");
+    }
+}
