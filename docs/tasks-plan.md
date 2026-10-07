@@ -1299,7 +1299,10 @@ the code read as "username taken". If it does, a creation whose email is
 already taken, by a first `users.create` that succeeded unrecorded, moves
 on to the prefixed username, and the orphan lookup then searches that name
 instead of the one the bot user got
-([impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
+([impl-notes](impl-notes.md#a-creation-can-stop-halfway)). Confirm the exact
+error the server answers `users.info?username=` with for a username no user
+has: `user_by_username` matches the codeless `User not found.` word for word,
+and different wording falls back to the retirement's 20 attempts.
 
 ## Phase 2: sessions, sandboxes, credential proxy (design milestone 2)
 
