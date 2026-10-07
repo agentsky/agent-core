@@ -716,6 +716,13 @@ Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
 
+qm-core's `trimUrlTail` also drops a trailing `*`, `_` or `~`, since its
+regexes could hand formatting marks to the URL scan. Here that cut a URL the
+pass had kept whole: `…/datamodel.html#object.__init__` was linked as
+`<…#object.__init>__`, landing on the wrong anchor. The parser has already
+taken every delimiter that formats, and the ones left in a text node are
+literal or were put back above, so the trim keeps those three characters.
+
 ### CommonMark disagrees with some qm-core regex cases
 
 **Issue.** qm-core converts with regexes; this renderer walks the
@@ -963,6 +970,16 @@ Broadcasts are neutralized everywhere, code and URLs included (see [Code
 doesn't protect a broadcast on
 Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
 scanner moved from `slack.rs` to `render::url` to be shared.
+
+The shared trim keeps a trailing `*`, `_` or `~` for both surfaces (see
+[Emphasis inside a bare URL cut the link](#emphasis-inside-a-bare-url-cut-the-link)).
+On Rocket.Chat the URL only bounds the text name resolution skips: the
+renderer copies the source through either way, and what the trim drops is
+never an `@`, so trimming those marks there would change no output. What
+the server's own Markdown makes of `…#object.__init__` depends on the text
+it receives, which is the same either way, so Rocket.Chat has no reason for
+a trim of its own. A Rocket.Chat test pins that such a URL passes through
+whole, with a name after it resolved and a name inside it left alone.
 
 ### Code doesn't protect a broadcast on Rocket.Chat
 
