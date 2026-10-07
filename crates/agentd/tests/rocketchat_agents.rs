@@ -592,7 +592,8 @@ async fn skills_are_added_from_files_attached_in_the_managers_dm() {
     let replies = chat.wait_for_posts("DM-ALICE", before + 1).await;
     assert_eq!(
         replies[before],
-        "Added the skill `notes` to `helper`. Its conversations use it from their next start."
+        "Added the skill `notes` to `helper`. Its files are in its sandboxes now, though a \
+         conversation already running may not use it until it next starts."
     );
     assert_eq!(std::fs::read(skills.join("notes/SKILL.md")).unwrap(), skill);
 
