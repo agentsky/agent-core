@@ -9443,8 +9443,8 @@ organization `users.info` names (`directory::Membership`, from `team_id`,
 else `enterprise_user.enterprise_id`, whichever is not home). The pipeline
 drops a message whose event and copy disagree on `outside`, organization
 included (`agreeing_copy`), with a throttled warning that the platform's
-copy doesn't agree on whether the sender is from outside, or that the
-sender couldn't be looked up: a home member whose `users.info` lookup was
+copy doesn't agree on whether the sender is from outside or of which
+organization, or that the sender couldn't be looked up: a home member whose `users.info` lookup was
 refused (`Api`, `Unauthorized`, `Forbidden`) gets a copy with
 `Outside { team: None }`, and is dropped under the same warning. Only a
 person's copy is compared (07 Oct review): a bot's own `outside` decides
