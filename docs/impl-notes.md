@@ -389,6 +389,13 @@ Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
 
+qm-core's `trimUrlTail` also drops a trailing `*`, `_` or `~`, since its
+regexes could hand formatting marks to the URL scan. Here that cut a URL the
+pass had kept whole: `…/datamodel.html#object.__init__` was linked as
+`<…#object.__init>__`, landing on the wrong anchor. The parser has already
+taken every delimiter that formats, and the ones left in a text node are
+literal or were put back above, so the trim keeps those three characters.
+
 ### CommonMark disagrees with some qm-core regex cases
 
 **Issue.** qm-core converts with regexes; this renderer walks the
