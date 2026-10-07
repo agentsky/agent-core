@@ -50,6 +50,8 @@
 //!
 //! The crate does no I/O.
 
+use std::fmt;
+
 use core_types::{ConsentId, ConvKind};
 use secrecy::SecretString;
 
@@ -62,7 +64,11 @@ pub use names::{AgentName, RoomRef, SkillName, Target, UserRef};
 pub use parse::parse;
 
 /// A parsed `/agent` command. Handlers live in agentd.
-#[derive(Debug, Clone)]
+///
+/// Handlers log only [`name`](Self::name). `Debug` prints the name and
+/// nothing else, so neither a secret nor free text such as a persona or a
+/// ban reason can reach a log through it.
+#[derive(Clone)]
 pub enum Command {
     /// `login [code]`: start linking a Claude account, or finish with the
     /// code the login page shows. Secret-bearing with a code.
@@ -218,7 +224,9 @@ pub enum SkillCommand {
 }
 
 /// `admin …` commands.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the variant only, since a ban reason is free text.
+#[derive(Clone)]
 pub enum AdminCommand {
     /// `admin api-key set <key>` and `admin api-key clear`.
     ApiKey(ApiKeyCommand),
@@ -249,6 +257,26 @@ pub enum ApiKeyCommand {
     },
     /// `admin api-key clear`.
     Clear,
+}
+
+impl fmt::Debug for AdminCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            AdminCommand::ApiKey(_) => "ApiKey",
+            AdminCommand::Ban { .. } => "Ban",
+            AdminCommand::Unban { .. } => "Unban",
+            AdminCommand::Slack => "Slack",
+        };
+        f.debug_struct(variant).finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command")
+            .field("name", &self.name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Command {
@@ -388,8 +416,10 @@ impl ParseError {
     /// secret-bearing command with extra or missing words, or with a
     /// misspelt or missing command word such as `api-key set <key>` without
     /// `admin`. It is also the case when any word holds a known token prefix
-    /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`), and for
-    /// unknown commands and help requests too.
+    /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`) or has the
+    /// shape of a pasted login code, `<code>#<state>` (`logn abc123#state`)
+    /// or a `code=` query parameter, and for unknown commands and help
+    /// requests too. Any `word#word` counts, so `PR#42` does.
     ///
     /// The secret may still be in the text, so callers apply the same
     /// channel rules as for [`Command::is_secret_bearing`]. The heuristic
