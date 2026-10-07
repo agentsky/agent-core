@@ -2861,12 +2861,12 @@ its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
 `/usr/local/bin/claude`, with `--chown=0:0`, since BuildKit keeps a
 stage-to-stage copy's ownership and the file would otherwise belong to
 `nobody` (harmless at mode 0755 on a read-only root, but `agentctl` is
-root's). The images job checks that both belong to root. The checksums are `platforms.<platform>.checksum`
-in the release's `manifest.json`; for 2.1.285 the manifest was read from
-the release bucket, and the `linux-x64` binary downloaded from it hashed to
-the manifest's value and printed `2.1.285 (Claude Code)`. The CI build
-downloads it from `downloads.claude.ai` and `sha256sum` reports it OK.
-A copy outside
+root's). The images job checks that both belong to root. The checksums are
+`platforms.<platform>.checksum` in the release's `manifest.json`; for
+2.1.285 the manifest was read from the release bucket, and the `linux-x64`
+binary downloaded from it hashed to the manifest's value and printed
+`2.1.285 (Claude Code)`. The CI build downloads it from
+`downloads.claude.ai` and `sha256sum` reports it OK. A copy outside
 `~/.local/bin` is left alone by the auto-updater, which
 `DISABLE_AUTOUPDATER=1` also turns off. `CLAUDE_CODE_VERSION` is still the
 only place the version is written: the CI check reads it from there.
