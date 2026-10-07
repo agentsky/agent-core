@@ -42,7 +42,9 @@ const MAX_LABEL: usize = 999;
 /// start with a mention that wasn't one in the text. It avoids cutting
 /// inside a code span or between a pair of `*`, `_` or `~` markers on one
 /// line when it can. These rules give way only when a single construct is
-/// longer than a chunk.
+/// longer than a chunk, and even then the cut avoids the inside of an `@`
+/// name and the position just before such an `@` when another position
+/// fits, inside a `<…>` token too.
 ///
 /// When a cut falls inside a fenced code block, the chunk ends with a
 /// closing fence and the next chunk starts by repeating the opening fence
@@ -367,11 +369,7 @@ impl<'a> Doc<'a> {
                         .unwrap_or(n);
                     if end < n && chars[end] == '>' {
                         marks.block(k, end + 1);
-                        k = end + 1;
-                    } else {
-                        k = end;
                     }
-                    continue;
                 }
                 '&' => {
                     let name = chars[k + 1..]
