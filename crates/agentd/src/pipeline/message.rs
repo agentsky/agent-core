@@ -14,8 +14,8 @@ use time::OffsetDateTime;
 /// the transcript lacks.
 pub const HISTORY_LIMIT: usize = 50;
 
-/// A turn message, and the short ids it recorded in its session.
-#[derive(Debug)]
+/// A turn message, and the short ids it recorded in its session. It has
+/// no `Debug`, since the message is chat text.
 pub(crate) struct Built {
     /// The message.
     pub(crate) text: String,
