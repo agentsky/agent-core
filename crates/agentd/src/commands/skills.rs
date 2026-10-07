@@ -83,17 +83,18 @@ impl Commands {
                 match skills.remove(agent.id, skill.as_str()).await? {
                     Removed::Active => {
                         return Ok(format!(
-                            "Removed the skill `{skill}` from `{name}`. Its sandboxes can't open \
-                             new connections to the hosts it let them reach, and connections \
-                             already open close within the hour. Conversations running now keep \
-                             the skill until they next start."
+                            "Removed the skill `{skill}` from `{name}`. It no longer lets its \
+                             sandboxes reach the hosts it asked for: a host the configuration or \
+                             another skill still allows stays reachable, new connections to the \
+                             others are refused, and connections open to them close within the \
+                             hour. Conversations running now keep the skill until they next start."
                         ));
                     }
                     Removed::Unconfirmed => {
                         return Ok(format!(
-                            "Removed the skill `{skill}` from `{name}`. None of the hosts it asks \
-                             for is confirmed, so its sandboxes can't open new connections to \
-                             them."
+                            "Removed the skill `{skill}` from `{name}`. It holds no confirmed \
+                             hosts now, so removing it doesn't change which hosts its sandboxes \
+                             may reach."
                         ));
                     }
                     Removed::Bundled => {
