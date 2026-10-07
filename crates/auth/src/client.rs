@@ -199,17 +199,30 @@ struct Response {
 
 /// Sends `request` and reads the whole response, refusing a body longer
 /// than [`MAX_RESPONSE_BODY`] by its `Content-Length` or as it streams in.
+/// Such a body is an [`AuthError::InvalidResponse`] on success and an
+/// [`AuthError::Status`] without an OAuth code otherwise, so a failure
+/// keeps its status.
 async fn send(request: reqwest::RequestBuilder, endpoint: Endpoint) -> Result<Response, AuthError> {
     let http = |source: reqwest::Error| AuthError::Http {
         endpoint,
         source: Arc::new(source.without_url()),
     };
-    let too_large = || AuthError::InvalidResponse {
-        endpoint,
-        reason: "response body too large",
-    };
     let mut response = request.send().await.map_err(http)?;
     let status = response.status();
+    let too_large = || {
+        if status.is_success() {
+            AuthError::InvalidResponse {
+                endpoint,
+                reason: "response body too large",
+            }
+        } else {
+            AuthError::Status {
+                endpoint,
+                status: status.as_u16(),
+                error: None,
+            }
+        }
+    };
     if response
         .content_length()
         .is_some_and(|len| len > MAX_RESPONSE_BODY as u64)
@@ -392,21 +405,21 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_chunked_body_over_the_cap_is_refused_as_it_streams() {
+    async fn serve_chunked(status: u16, len: usize) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 4096];
             let _ = stream.read(&mut request).await;
-            let chunk = vec![b'a'; 16 * 1024];
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await;
-            for _ in 0..(MAX_RESPONSE_BODY / chunk.len() + 2) {
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let mut left = len;
+            while left > 0 {
+                let chunk = vec![b'a'; left.min(16 * 1024)];
+                left -= chunk.len();
                 let _ = stream
                     .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
                     .await;
@@ -415,8 +428,88 @@ mod tests {
             }
             let _ = stream.write_all(b"0\r\n\r\n").await;
         });
-        assert!(is_too_large(&send_to(&url).await));
-        server.await.unwrap();
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_refused_as_it_streams() {
+        for (len, refused) in [(MAX_RESPONSE_BODY, false), (MAX_RESPONSE_BODY + 1, true)] {
+            let (url, server) = serve_chunked(200, len).await;
+            let result = send_to(&url).await;
+            assert_eq!(is_too_large(&result), refused, "{len}");
+            if !refused {
+                assert_eq!(result.unwrap().body.len(), len);
+            }
+            server.await.unwrap();
+        }
+    }
+
+    fn is_bare_status(result: &Result<Response, AuthError>, expected: u16) -> bool {
+        matches!(
+            result,
+            Err(AuthError::Status {
+                endpoint: Endpoint::Token,
+                status,
+                error: None,
+            }) if *status == expected
+        )
+    }
+
+    #[tokio::test]
+    async fn an_oversized_failure_keeps_its_status() {
+        let server = MockServer::start().await;
+        for status in [400, 401, 403, 500] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_bytes(vec![
+                    b'a';
+                    MAX_RESPONSE_BODY
+                        + 1
+                ]))
+                .mount(&server)
+                .await;
+            assert!(
+                is_bare_status(&send_to(&server.uri()).await, status),
+                "{status}"
+            );
+            let (url, chunked) = serve_chunked(status, MAX_RESPONSE_BODY + 1).await;
+            assert!(is_bare_status(&send_to(&url).await, status), "{status}");
+            chunked.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_refresh_failure_is_not_a_dead_token() {
+        let server = MockServer::start().await;
+        let body = format!(
+            r#"{{"error":"invalid_grant"}}{}"#,
+            " ".repeat(MAX_RESPONSE_BODY)
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .mount(&server)
+            .await;
+        let url = Url::parse(&server.uri()).unwrap();
+        let result = refresh(
+            &Client::new(),
+            &url,
+            &SecretString::from("r"),
+            "client",
+            "scope",
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("an oversized 400 refreshed");
+        };
+        assert!(!failure.dead);
+        assert!(matches!(
+            failure.error,
+            AuthError::Status {
+                endpoint: Endpoint::Token,
+                status: 400,
+                error: None,
+            }
+        ));
     }
 
     fn tokens(json: &str) -> Result<Tokens, AuthError> {

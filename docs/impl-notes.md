@@ -1456,6 +1456,13 @@ log in again rather than retrying forever; and the plan's wording ("HTTP
 400, 401 or 403") is narrowed to these codes. Tests cover each code, the
 account-on-hold body, and 4xx responses that must not break the link.
 
+OAuth response bodies are read up to 64 KiB, by `Content-Length` and as
+they stream in. An oversized failure keeps its status, as
+`AuthError::Status` without an OAuth code, so an oversized 400, 401 or 403
+to the code exchange is still `CodeRejected`, and an oversized refresh
+failure is transient: its body isn't read, so it can't say the token is
+dead. Only an oversized success is `InvalidResponse`.
+
 ### The plan was read while holding the member's lock
 
 **Issue.** After a refresh, the profile request (10 s timeout) ran while the
