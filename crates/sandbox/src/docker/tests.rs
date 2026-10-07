@@ -661,6 +661,31 @@ async fn wait_after_kill_returns_although_stdout_is_unread() {
 }
 
 #[tokio::test]
+async fn kill_after_a_cancelled_wait_stops_copying_output() {
+    let docker = fake_docker(r#"{"Id":"k1","Running":false,"ExitCode":137}"#.into()).await;
+    let (mut stdout, mut writer) = tokio::io::duplex(64 * 1024);
+    let pump = tokio::spawn(async move { while writer.write_all(&[b'x'; 1024]).await.is_ok() {} });
+    let (_pid_tx, pid) = watch::channel(Some(42));
+    let mut child = DockerChild {
+        pump: Some(pump),
+        docker,
+        ..child_waiting_for(pid)
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), child.wait())
+            .await
+            .is_err()
+    );
+    child.kill().await.unwrap();
+    let mut copied = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_to_end(&mut copied))
+        .await
+        .expect("the output kept coming after the kill")
+        .unwrap();
+    assert_eq!(child.wait().await.unwrap().code, Some(137));
+}
+
+#[tokio::test]
 async fn wait_is_an_error_while_docker_says_the_process_still_runs() {
     let docker = fake_docker(r#"{"Running":true}"#.into()).await;
     let (_pid_tx, pid) = watch::channel(Some(42));
