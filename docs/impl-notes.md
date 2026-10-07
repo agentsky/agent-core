@@ -928,19 +928,24 @@ directory entry resolving to `allé` all broadcast.
 **Solution.** After rendering, `to_markdown` makes one last pass over the
 whole output, code and link targets included, with the server's grammar: it
 inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
-`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
-precedes the `@`. The server reads no name after the zero-width space. A
-URL or a code sample containing `/@all` or `@here` gets the zero-width space
-too; that is the price of the server not knowing about code. `@allison` and
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, unless a `/`
+precedes the `@`. The server reads no name after the zero-width space, and
+it never reads one after `/`, which is not in `(^|\s|>)`; link removal can't
+put anything else before such an `@` either, since a removed link ends in
+`)`. So `https://x.io/@all` stays a working link, while a code sample
+containing ` @here` still gets the zero-width space, because the server
+doesn't know about code. `split` never cuts just before an `@` that follows
+anything but whitespace or `>`, even when a construct longer than a chunk
+forces a cut, so a chunk can't start with the `@all` of such a URL. `@allison` and
 `@all.hands` stay untouched. The pass is the only place that inserts the
 space; name resolution just skips broadcasts so they are never offered to
 the directory. Usernames from the directory must match the server's ASCII
 class. The tests port the server's regex (`rocketchat::server`, checked
 against the JavaScript regex under Node on 30,000 generated strings while
 writing it) and assert that no output, and no chunk `split` makes from it,
-yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
-pattern; a server configured with a narrower name pattern could read `@all`
-out of `@all.hands`.
+yields `all` or `here`. The rule assumes the default
+`UTF8_User_Names_Validation` pattern; a server configured with a narrower
+name pattern could read `@all` out of `@all.hands`.
 
 ### A cut can create or shorten a mention
 
@@ -954,9 +959,12 @@ cut inside an oversized construct could shorten `@herectic` to `@here`.
 whatever precedes the `@`, and never cuts right before an `@` that follows
 anything but whitespace or `>`. When a single construct is longer than the
 chunk and a cut has to fall inside it, the cut still avoids the inside of a
-name: it falls right after the `@` instead, so neither chunk holds a
-shortened name. Together with the final pass above, every `@` run in a chunk
-is a run of the rendered text, and those are already neutralized.
+name and the position just before an `@` that follows anything but
+whitespace or `>`: it falls right after the `@` instead, so neither chunk
+holds a shortened name or starts with a new one. Together with the final
+pass above, every `@` run in a chunk is a run of the rendered text, and
+those are already neutralized or follow a `/`, where the server reads no
+mention.
 
 ### Grapheme clusters need a mark table
 
