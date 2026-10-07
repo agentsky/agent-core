@@ -34,8 +34,9 @@ pub(crate) fn ends_url(c: char) -> bool {
 /// the URL after its scheme, as in `…#object.__init__` or `/~~a~~`.
 /// Otherwise it is dropped, as a footnote star or a stray closer is, and
 /// trimming goes on, so `(https://x.io/a).*` keeps `).*` out and
-/// `(https://x.io/_a)_` keeps `)_` out. The text it gets is decoded, so it
-/// can't tell an escaped mark; the Slack renderer ends a URL before one.
+/// `(https://x.io/_a)_` keeps `)_` out. In decoded text it can't tell an
+/// escaped mark; the Slack renderer ends a URL before an escaped mark in
+/// that trailing run.
 fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let body = url.find("://").map_or(0, |at| at + 3);
