@@ -3214,18 +3214,20 @@ Deliverables:
   `{"text": task}`. It never retries.
 - A pure `classify` over what came back, returning `FireOutcome`:
   - `Fired { session_id, session_url }` for a 200 whose body holds
-    `claude_code_session_id` shaped `session_` and 1 to 128 ASCII letters
-    and digits. `session_url` is kept only when it equals
+    `claude_code_session_id` shaped `session_` or `cse_` and 1 to 128
+    ASCII letters and digits. `session_url` is kept only when it equals
     `https://claude.ai/code/<session_id>`; otherwise it is `None` and the
     reply falls back to the id.
   - `Rejected { status, error_type, retry_after }` for 400, 401, 403, 404
     and 429, reading `error.type` leniently from the error envelope and
     `Retry-After` only as whole seconds (an HTTP date is ignored), and for
     a connection that failed before the request was sent
-    (`reqwest::Error::is_connect`).
+    (`reqwest::Error::is_connect`), a connect timeout included: with
+    `connect_timeout_secs` below `timeout_secs`, a connection that doesn't
+    open in time is a connect error, which wins over its being a timeout.
   - `Unknown { status, reason }` for everything else: 5xx, another status,
-    a timeout, a connection lost after sending, a redirect, or a 200 it
-    can't read.
+    a timeout once the request was sent, a connection lost after sending, a
+    redirect, or a 200 it can't read.
   - Bodies are read up to 64 KiB.
 - Nothing logs the token, the task text or a response body; logs carry the
   routine id, the status and the outcome's kind.
