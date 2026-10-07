@@ -556,7 +556,9 @@ pub struct Bot {
 }
 
 /// A message read with `conversations.history` or `conversations.replies`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` prints the text's length and the number of files, not the text.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Message {
     /// The message's `ts`, its id in the conversation.
     pub ts: MessageId,
@@ -575,6 +577,21 @@ pub struct Message {
     pub thread_ts: Option<MessageId>,
     /// The files the bot can download.
     pub files: Vec<InFile>,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message")
+            .field("ts", &self.ts)
+            .field("user", &self.user)
+            .field("bot_id", &self.bot_id)
+            .field("is_bot", &self.is_bot)
+            .field("subtype", &self.subtype)
+            .field("text_len", &self.text.len())
+            .field("thread_ts", &self.thread_ts)
+            .field("files_len", &self.files.len())
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
