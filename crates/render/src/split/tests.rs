@@ -924,6 +924,9 @@ fn property_rocketchat_chunks_hold_no_broadcast() {
         "(",
         ">",
         "@",
+        "<",
+        "<https://x.io/",
+        "aaaaaaaaaaaaaaaa/",
     ];
     for seed in 1..=1500u64 {
         let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407));
@@ -937,6 +940,26 @@ fn property_rocketchat_chunks_hold_no_broadcast() {
             assert!(
                 server::broadcasts(&chunk).is_empty(),
                 "seed {seed}, {limit:?}: {chunk:?} from {md:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_cut_after_an_open_angle_bracket_never_arms_a_broadcast() {
+    let cases = [
+        ("<aaaaaaaa/@all", 10),
+        ("<aaaaaaaa/@all", 5),
+        ("see <https://x.io/aaaaaaaaaaaa/@here>", 9),
+        ("<aaaaaaaa\u{A0}@herectic", 5),
+        ("<aaaaaaaa\u{3000}@allison", 4),
+    ];
+    for (md, max) in cases {
+        let rendered = rocketchat::to_markdown(md, &Team);
+        for chunk in split_checked(&rendered, chars(max)) {
+            assert!(
+                server::broadcasts(&chunk).is_empty(),
+                "{chunk:?} from {md:?} at {max}"
             );
         }
     }
