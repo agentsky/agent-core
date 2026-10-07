@@ -8,15 +8,17 @@ use core_types::{
     AgentId, Binding, BindingId, ConvKind, InboundEvent, MemberKey, SendError, Sender, Sink,
     Surface, SurfaceError, SurfaceKind, UserId,
 };
+use futures::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use store::{Sealer, Store};
-use surface_rocketchat::realtime::RealtimeOptions;
+use surface_rocketchat::realtime::{RealtimeClient, RealtimeOptions};
 use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient};
 use surface_rocketchat::{BotRoles, DEDUP_SOURCE, Dedup, RocketChatConfig, RocketChatSurface};
 use testkit::rocketchat::{FakeDdp, FakeRest, NOTIFY_USER, realtime_message, subscription_doc};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::Message as Frame;
 use wiremock::matchers::path;
 use wiremock::{Mock, ResponseTemplate};
 
@@ -570,6 +572,51 @@ async fn a_silent_server_is_pinged_then_replaced() {
 }
 
 #[tokio::test]
+async fn a_slow_consumer_is_not_taken_for_a_silent_server() {
+    let h = harness().await;
+    let bot = h.bot("helper").await;
+    let alice = h.rest.add_user("alice");
+    h.room("GENERAL", &[&bot.id, &alice]);
+    let rest = RestClient::new(
+        &h.rest.uri(),
+        Credentials {
+            user_id: bot.id.as_str().into(),
+            token: bot.token.clone(),
+        },
+    )
+    .unwrap();
+    let heartbeat = Duration::from_millis(100);
+    let quick = RealtimeOptions {
+        heartbeat,
+        ..options()
+    };
+    let client = RealtimeClient::new(&h.ddp.url(), rest, quick).unwrap();
+    let (tx, mut rx) = mpsc::channel(1);
+    let _run = tokio::spawn(async move { client.run(tx).await });
+    ready(&h, &bot, "GENERAL").await;
+
+    for id in ["m-1", "m-2"] {
+        h.ddp
+            .send_message(&realtime_message(id, "GENERAL", (&alice, "alice"), "hi"));
+    }
+    tokio::time::sleep(heartbeat * 5).await;
+    for _ in 0..2 {
+        tokio::time::timeout(WAIT, rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    h.ddp
+        .send_message(&realtime_message("m-3", "GENERAL", (&alice, "alice"), "hi"));
+    tokio::time::timeout(WAIT, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(heartbeat * 3).await;
+    assert_eq!(h.ddp.logins().len(), 1, "the connection was replaced");
+}
+
+#[tokio::test]
 async fn closing_the_receiver_ends_events_with_closed() {
     let mut h = harness().await;
     let bot = h.bot("helper").await;
@@ -763,7 +810,7 @@ async fn a_tls_endpoint_that_fails_the_handshake_is_retried() {
     .unwrap();
     let url =
         surface_rocketchat::realtime::websocket_url(&format!("https://127.0.0.1:{port}")).unwrap();
-    let client = surface_rocketchat::realtime::RealtimeClient::new(&url, rest, options()).unwrap();
+    let client = RealtimeClient::new(&url, rest, options()).unwrap();
     let (tx, rx) = mpsc::channel(1);
     let run = tokio::spawn(async move { client.run(tx).await });
     for _ in 0..2 {
@@ -775,6 +822,79 @@ async fn a_tls_endpoint_that_fails_the_handshake_is_retried() {
     drop(rx);
     let result = tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
     assert_eq!(result, Ok(()));
+}
+
+/// A realtime endpoint that accepts any `connect` and answers every method
+/// call with `result`. It reports each call it answers.
+async fn answering_login_with(result: Value) -> (String, mpsc::UnboundedReceiver<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/websocket", listener.local_addr().unwrap());
+    let (called_tx, called) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let (called_tx, result) = (called_tx.clone(), result.clone());
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                    return;
+                };
+                while let Some(Ok(frame)) = ws.next().await {
+                    let Ok(sent) = serde_json::from_slice::<Value>(&frame.into_data()) else {
+                        continue;
+                    };
+                    let reply = match sent["msg"].as_str() {
+                        Some("connect") => json!({ "msg": "connected", "session": "s1" }),
+                        Some("method") => {
+                            let _ = called_tx.send(());
+                            json!({ "msg": "result", "id": sent["id"], "result": result })
+                        }
+                        _ => continue,
+                    };
+                    if ws.send(Frame::text(reply.to_string())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, called)
+}
+
+fn client_for(url: &str) -> RealtimeClient {
+    let rest = RestClient::new(
+        "http://127.0.0.1:9",
+        Credentials {
+            user_id: "u1".into(),
+            token: SecretString::from("t"),
+        },
+    )
+    .unwrap();
+    RealtimeClient::new(url, rest, options()).unwrap()
+}
+
+#[tokio::test]
+async fn a_login_result_without_an_id_is_retried() {
+    let (url, mut logins) = answering_login_with(json!({ "token": "t" })).await;
+    let client = client_for(&url);
+    let (tx, rx) = mpsc::channel(1);
+    let run = tokio::spawn(async move { client.run(tx).await });
+    for _ in 0..2 {
+        tokio::time::timeout(WAIT, logins.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    drop(rx);
+    let result = tokio::time::timeout(WAIT, run).await.unwrap().unwrap();
+    assert_eq!(result, Ok(()));
+}
+
+#[tokio::test]
+async fn a_login_result_for_another_user_is_fatal() {
+    let (url, _logins) = answering_login_with(json!({ "id": "u2", "token": "t" })).await;
+    let client = client_for(&url);
+    let (tx, _rx) = mpsc::channel(1);
+    let result = tokio::time::timeout(WAIT, client.run(tx)).await.unwrap();
+    assert!(matches!(result, Err(SurfaceError::Api(_))), "{result:?}");
 }
 
 #[tokio::test]

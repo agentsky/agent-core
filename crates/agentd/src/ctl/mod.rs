@@ -302,6 +302,12 @@ impl Ctl {
     /// staged is deleted. The session's `shared/` leases are deleted with
     /// the turn, so the lock is free at once.
     ///
+    /// It ends whichever turn the token holds now, not a particular one, so
+    /// the caller must not call it after another `begin_turn` on the same
+    /// token replaced its turn: that would end the newer turn and take its
+    /// outbox. The runner runs one turn per session at a time, which keeps
+    /// each `begin_turn` and its `end_turn` together.
+    ///
     /// # Errors
     ///
     /// If the store fails. The turn is still recorded then.
