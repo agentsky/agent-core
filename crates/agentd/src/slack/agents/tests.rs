@@ -1587,6 +1587,45 @@ async fn a_manifest_update_refused_but_not_forbidden_is_tried_again() {
 }
 
 #[tokio::test]
+async fn a_manifest_update_slack_forbids_is_blocked() {
+    let h = harness().await;
+    let denied = installed_as(&h, "denied", WRITER_TOKEN, 0).await;
+    mount(
+        &h.slack,
+        "apps.manifest.export",
+        CONFIG_TOKEN,
+        ok(json!({"manifest": exported(denied)})),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.update"))
+        .and(header("authorization", bearer().as_str()))
+        .respond_with(refused("access_denied"))
+        .mount(&h.slack)
+        .await;
+    let start = OffsetDateTime::now_utc();
+    register_token(&h, start).await;
+    assert_eq!(h.agents.pass_at(|| start).await.updated, 0);
+    assert_eq!(h.calls("apps.manifest.update").await, 1);
+    let blocked: Vec<_> = h
+        .store
+        .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|app| (app.agent_name, app.blocked))
+        .collect();
+    assert_eq!(blocked, [("denied".to_owned(), true)]);
+    let later = start + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.update").await,
+        1,
+        "a forbidden update is not tried again"
+    );
+}
+
+#[tokio::test]
 async fn registering_a_new_token_tries_a_refused_app_again() {
     let h = harness().await;
     let writer = installed_as(&h, "writer", WRITER_TOKEN, 0).await;

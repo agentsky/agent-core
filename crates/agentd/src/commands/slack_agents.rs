@@ -55,8 +55,9 @@ impl Commands {
         if !blocked.is_empty() {
             lines.push(format!(
                 "Agents whose Slack apps I can't update: {blocked}. Slack says the app is gone, \
-                 or won't let your configuration token change it, or it subscribes to no events. They won't follow a private \
-                 channel that is shared with another organization. Registering a new \
+                 or won't let your configuration token change it, or it subscribes to no \
+                 events. They won't follow a private channel that is shared with another \
+                 organization. Registering a new \
                  configuration token ({}) tries again, which helps if Slack refused your old one; \
                  otherwise, delete the agent and create it again.",
                 origin.command("slack-token <token> <refresh token>")
