@@ -5889,7 +5889,11 @@ transaction in progress, and one begun after it fails at once, leaving the
 session unreset with its container stopped, as any failed reset does, and
 the process's exit ends the task anyway. Stopping the task with its caller
 would cancel a container stop part way or thread a cancellation into the
-write, for no gain. The follow-up lives only in memory: if the instance
+write, for no gain. The follow-up itself holds a strong `SessionControl`
+handle until its resets end, so on shutdown the `SessionManager`'s inner
+state, whose drop aborts the reaper and the container event follower, can
+outlive the `Turns` handle while a reset waits behind a long turn; that is
+bounded by the drain, which drops a follow-up still waiting when it ends. The follow-up lives only in memory: if the instance
 dies, the queued resets die with it and nothing is reset, which the owner
 sees in `sessions` and can send again.
 
