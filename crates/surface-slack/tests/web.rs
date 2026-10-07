@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::web::{PageRequest, map_error};
+use surface_slack::web::{Message, MessagesPage, PageRequest, map_error};
 use surface_slack::{SlackClient, WebApi};
 use testkit::TempDir;
 use wiremock::matchers::{header, method, path};
@@ -1133,5 +1133,28 @@ mod downloads {
             );
         }
         assert!(requests(&server).await.is_empty());
+    }
+}
+
+#[test]
+fn message_debug_shows_the_text_length_not_the_text() {
+    let message = Message {
+        ts: MessageId::from("1.2"),
+        user: Some(UserId::from("U1")),
+        bot_id: None,
+        is_bot: false,
+        subtype: None,
+        text: "MESSAGE-TEXT".into(),
+        thread_ts: None,
+        files: Vec::new(),
+    };
+    let page = MessagesPage {
+        messages: vec![message],
+        next_cursor: None,
+    };
+    let debug = format!("{page:?} {page:#?}");
+    assert!(!debug.contains("MESSAGE-TEXT"), "{debug}");
+    for shown in ["1.2", "U1", "text_len: 12", "files_len: 0", "is_bot: false"] {
+        assert!(debug.contains(shown), "{shown}: {debug}");
     }
 }
