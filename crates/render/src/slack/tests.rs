@@ -524,9 +524,34 @@ fn bare_urls() {
                 "<https://x.io/~~a~~/b>",
             ),
             (
-                "emphasis closing inside a URL",
+                "emphasis closing where the source URL goes on",
                 "*see https://x.io/a*b",
-                "*see <https://x.io/a*b>",
+                "*see <https://x.io/a>*b",
+            ),
+            (
+                "bold wrapping a URL before a suffix",
+                "**https://x.io/a**'s",
+                "*<https://x.io/a>*'s",
+            ),
+            (
+                "an entity that ends a URL ends it before emphasis",
+                "https://x.io/a&lt;*b*",
+                "<https://x.io/a>&lt;_b_",
+            ),
+            (
+                "a space entity ends a URL before emphasis",
+                "https://x.io/a&#32;*b*",
+                "<https://x.io/a> _b_",
+            ),
+            (
+                "inline code ends a URL before emphasis",
+                "https://x.io/a`c`*b*",
+                "<https://x.io/a>`c`_b_",
+            ),
+            (
+                "an entity that stays in a URL keeps emphasis in it",
+                "https://x.io/?a&amp;_b_/c",
+                "<https://x.io/?a&amp;_b_/c>",
             ),
             (
                 "emphasis after a URL still formats",

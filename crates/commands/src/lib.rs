@@ -206,7 +206,9 @@ pub enum SkillCommand {
 }
 
 /// `admin …` commands.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the variant only, since a ban reason is free text.
+#[derive(Clone)]
 pub enum AdminCommand {
     /// `admin api-key set <key>` and `admin api-key clear`.
     ApiKey(ApiKeyCommand),
@@ -237,6 +239,18 @@ pub enum ApiKeyCommand {
     },
     /// `admin api-key clear`.
     Clear,
+}
+
+impl fmt::Debug for AdminCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            AdminCommand::ApiKey(_) => "ApiKey",
+            AdminCommand::Ban { .. } => "Ban",
+            AdminCommand::Unban { .. } => "Unban",
+            AdminCommand::Slack => "Slack",
+        };
+        f.debug_struct(variant).finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for Command {
@@ -384,8 +398,9 @@ impl ParseError {
     /// misspelt or missing command word such as `api-key set <key>` without
     /// `admin`. It is also the case when any word holds a known token prefix
     /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`) or has the
-    /// shape of a pasted login code, `<code>#<state>` (`logn abc123#state`),
-    /// and for unknown commands and help requests too.
+    /// shape of a pasted login code, `<code>#<state>` (`logn abc123#state`)
+    /// or a `code=` query parameter, and for unknown commands and help
+    /// requests too. Any `word#word` counts, so `PR#42` does.
     ///
     /// The secret may still be in the text, so callers apply the same
     /// channel rules as for [`Command::is_secret_bearing`]. The heuristic
