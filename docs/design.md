@@ -1548,12 +1548,23 @@ member they name. The person's own organization is a separate field,
      home workspace or the home workspace's own Enterprise Grid
      organization (the `enterprise_id` `auth.test` gives at startup, T30):
      `user_team`, `source_team`, `user_profile.team` and `team`, in the
-     event and in Slack's copy ([below](#confirmation)). A field that names
-     anything else makes the sender outside, with that team as their
+     event and in Slack's copy ([below](#confirmation)). A field that
+     names anything else makes the sender outside, with that team as their
      organization: the first of `user_team`, `source_team`,
      `user_profile.team` and `team` that isn't home. A team not shaped like
      Slack's (`T` or `E` and up to 64 letters or digits) makes the message
      malformed, and it is dropped.
+
+     When `team` and `user_team` differ, `user_team` is the sender's, as
+     Bolt's `extract_actor_team_id` takes it[^bolt-actor]: `team` may name
+     the organization that hosts the channel. T36a keeps the stricter rule
+     above, under which a `team` naming another organization makes even a
+     home member outside; that can only refuse a home member, never admit
+     an outside one. T36b, which first admits outside members, decides the
+     sender's team from `user_team` (then `source_team`,
+     `user_profile.team`, and `team` only when none of those is given),
+     once T36e has captured what `team` holds for a home member's message
+     in a channel the other organization hosts.
   2. An independent source says the user belongs to the home workspace: the
      home member list agentd already reads (`users.list`, whose entries
      carry `team_id`; only entries whose `team_id` is the home workspace
@@ -1648,16 +1659,17 @@ another workspace too gets events whose `authorizations[0]` may name that
 installation. agentd drops those, so the agent may miss messages in channels
 both installations see. That only fails closed, and only for that owner's
 agent. `apps.event.authorizations.list` would show every installation, but it
-takes an app-level token[^slack-event-authorizations], which no API creates,
-as for Socket Mode[^slack-socket], so agentd doesn't call it.
+needs the `authorizations:read` scope[^slack-event-authorizations], which
+agentd's apps don't ask for, so agentd doesn't call it.
 
 ### Confirmation
 
 Nothing an event says decides anything (T31): the owner of an agent's app
 holds its signing secret and can sign any body, an envelope's
 `is_ext_shared_channel`, `context_team_id` and `user_team` included. agentd
-never reads the first two, and the event can only make a sender outside,
-never home:
+never reads the first two, and what the event says about the sender's
+organization decides nothing: Slack's copy decides it, and an event that
+disagrees with the copy is dropped:
 
 - `Surface::confirm` reads the message back with the binding's bot token, as
   today, and normalizes the copy with the ingress's rules, now including
@@ -1670,15 +1682,20 @@ never home:
   owner-side post.
 - The sender is looked up as above, never taken as home from the fields
   alone.
-- The sender is outside if the event or the copy says so. The pipeline's
+- Whether the sender is outside, and their organization, come from Slack's
+  data only: the copy's own team fields, else the lookup's answer,
+  `users.info`'s `team_id` or `enterprise_user.enterprise_id`. Nothing of
+  the event's `outside` is carried into the copy. The pipeline's
   `copy_stands` lets a copy stand when only a limit's refusal differs and
   the requesters' keys match, and an outside member's key names the home
-  workspace like a home member's; so the copy takes the event's `outside`
-  when the event's says outside and the copy's doesn't, and `copy_stands`
-  compares the requester's key and `outside`. It still ignores the member
-  a key belongs to, which may be made between the two routings (T27). An
-  owner who forges `outside` onto a home member's message only keeps
-  their own agent from answering it.
+  workspace like a home member's; so `copy_stands` also compares
+  `outside`, organization included, and the message is dropped when the
+  event and the copy disagree on it, in either direction, as T31 drops any
+  other difference. It still ignores the member a key belongs to, which
+  may be made between the two routings (T27). So an owner who forges
+  `outside`, or another organization, onto a home member's message only
+  gets it dropped: it can't move a home member's turn to the community
+  key, or pass an unlisted organization's member off as a listed one.
 
 ### Audience
 
@@ -1874,7 +1891,8 @@ one on which team sent a message, which is assumed below. Read from Slack's
 SDK sources: the field names agentd reads, that Bolt takes an event's
 installation from `authorizations[0]` and the actor's team from
 `user_team`, then `team`, and that Bolt's fixtures disagree on what `team`
-holds for an outside actor.
+holds for an outside actor, and for a home member's `app_mention` in a
+shared channel.
 
 Assumed, until T36e's live check. T36e gates admission: T36b, which first
 lets an outside member's message run a turn, and T36c after it, depend on
@@ -1894,8 +1912,13 @@ T36d only close things, and may land first.
 - That every event to an agent's app has the home workspace in
   `authorizations[0].team_id`.
 - That a home member's message in a shared channel names the home workspace
-  or the home organization. If it named another, home members would be
-  refused there.
+  or the home organization in every team field. Bolt's fixtures don't show
+  this for every event: in one, a home member's `app_mention` has `team` set
+  to the other organization while `user_team`, `source_team` and
+  `user_profile.team` name home[^bolt-actor]; its `message` fixtures name
+  home in `team`. Under T36a's rule such a member is refused there, and
+  T36e captures `team` for a home member's `message` in a channel the other
+  side hosts.
 - That an outside member's user id is the same in both organizations, in
   `<@U…>` mentions too.
 - That `conversations.info` gives a bot token `is_ext_shared` and
@@ -2020,7 +2043,7 @@ Direct calls would also need our own agent loop.
 [^slack-events]: [The Events API](https://docs.slack.dev/apis/events-api/): the event wrapper's `event_id` ("globally unique across all workspaces"), `event_context`, `authorizations`, `is_ext_shared_channel` and `context_team_id`. Read through search excerpts on 2026-10-01.
 [^slack-api-specs]: Slack's event wrapper schema, [`slackapi/slack-api-specs` `events-api/slack_common_event_wrapper_schema.json`](https://github.com/slackapi/slack-api-specs/blob/master/events-api/slack_common_event_wrapper_schema.json): `team_id` is "the unique identifier of the workspace where the event occurred", `event_id` "globally unique across all workspaces". Read on 2026-10-01. The schema predates `authorizations`.
 [^slack-authed]: [Events API truncate authed users](https://docs.slack.dev/changelog/2020-09-15-events-api-truncate-authed-users/): `authed_users` and `authed_teams` deprecated for one `authorizations` entry, from 2021-02-24. Read through search excerpts on 2026-10-01.
-[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with an app-level token holding `authorizations:read`. Read through search excerpts on 2026-10-01.
+[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with a token holding the `authorizations:read` scope, the only requirement the method's reference states. Read through search excerpts on 2026-10-01.
 [^slack-enterprise]: [Developing apps for Enterprise orgs](https://docs.slack.dev/enterprise/developing-for-enterprise-orgs/): one event per shared-channel event whatever the number of installations, `is_enterprise_install`, one global `U…` or `W…` user id per person. Read through search excerpts on 2026-10-01.
 [^slack-conversation]: [Conversation object](https://docs.slack.dev/reference/objects/conversation-object/) and [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/): `is_shared`, `is_ext_shared`, `is_org_shared`, `connected_team_ids`, `shared_team_ids` and `context_team_id`. Read through search excerpts on 2026-10-01; the field names match the Java SDK's `Conversation`.
 [^slack-users-identity]: [`users.identity`](https://docs.slack.dev/reference/methods/users.identity/): user ids are globally unique, and the same user on two unrelated workspaces has two. Read through search excerpts on 2026-10-01.

@@ -3501,11 +3501,14 @@ Deliverables:
     does each cost a `users.info`. The ingress has already kept only what
     may be addressed to the agent (T28), so most traffic costs no lookup
     either.
-- Confirmation (`crates/agentd/src/pipeline/run.rs`): when the event's
-  `outside` is set and the copy's isn't, the copy takes the event's before
-  it is routed. `copy_stands`, which lets a copy stand when only a limit's
-  refusal differs, compares the requester's `MemberKey` and `outside`. It
-  keeps ignoring the requester's `member`, which may be made for the
+- Confirmation (`crates/agentd/src/pipeline/run.rs`): the copy's `outside`
+  and organization come from Slack's data only, the copy's own team fields,
+  else the home lookup's `team_id` or `enterprise_user.enterprise_id`;
+  nothing of the event's is carried into the copy. `copy_stands`, which
+  lets a copy stand when only a limit's refusal differs, compares the
+  requester's `MemberKey` and `outside`, organization included, so an
+  event and a copy that disagree on it are dropped, in either direction.
+  It keeps ignoring the requester's `member`, which may be made for the
   identity between the two routings, as its rustdoc says (T27).
 - agentd (`crates/agentd/src/slack/mod.rs`):
   - The other-workspace checks of T30 and T31 compare the workspace above.
@@ -3580,7 +3583,8 @@ Acceptance:
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
 - `a_home_lookup_slack_refuses_is_outside`.
-- `an_event_saying_outside_keeps_the_copy_outside`.
+- `an_event_and_its_copy_disagreeing_on_outside_is_dropped`.
+- `a_forged_organization_on_an_event_cannot_change_the_stored_team`.
 - `copy_stands_compares_key_and_outside`.
 - `copy_stands_still_lets_a_member_be_made_between_routings`.
 - `confirm_drops_an_event_that_claims_home_for_an_outside_copy`.
@@ -3850,7 +3854,11 @@ Deliverables:
      `context_team_id`, `is_ext_shared_channel` and `authorizations`, and
      the event's `team`, `user_team`, `source_team` and
      `user_profile.team`. Above all, whether any of them names an outside
-     member with the home workspace's team.
+     member with the home workspace's team. Also capture `team` for a home
+     member's `message` in a channel the other organization hosts: Bolt's
+     fixtures show a home member's `app_mention` whose `team` names the
+     other organization while `user_team` names home, and the design takes
+     `user_team` as the sender's when the two differ.
   2. The same message read back with `conversations.history` and
      `conversations.replies` on a scratch app's token: the same fields,
      and whether the first field that names another organization is the
