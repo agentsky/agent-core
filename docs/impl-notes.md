@@ -33,7 +33,9 @@ Consequences:
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception.
+  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
+  use that license; see
+  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -48,3 +50,125 @@ reported only the root package's files. The gate would have measured
 `.cargo/config.toml`, and to the CI step that prints the summary
 (`cargo llvm-cov report --workspace --summary-only`). The report now lists
 every crate.
+
+## T02: dependency policy
+
+### cargo-deny checks only the root package by default
+
+**Issue.** The root `Cargo.toml` is a package as well as the workspace, not a
+virtual manifest. For such a manifest cargo-deny makes the root package the
+only root of the crate graph, so the member crates' dependencies are never
+checked. The action's default arguments (`--all-features`) have this gap: a
+throwaway commit adding `native-tls` to `agentd` passed `cargo deny check
+bans`.
+
+**Solution.** Pass `--workspace`, which makes every workspace member a root.
+With it the same commit fails. cargo-deny has no configuration key for this,
+so the CI job passes it through the action's `arguments`, and the README and
+the header of `deny.toml` give the full local command. `all-features = true`
+lives in `deny.toml`'s `[graph]` table, so local runs match CI without
+repeating it. The job also passes `--locked`, so it checks the committed
+`Cargo.lock` instead of silently re-resolving it.
+
+### aws-lc-sys no longer needs an OpenSSL exception
+
+**Issue.** The plan, following the T01 note, expected `aws-lc-sys` to need an
+`OpenSSL` license exception. That was true up to `aws-lc-sys` 0.38. Since
+0.39 its expression is `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND
+BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)`,
+and `aws-lc-rs` 1.18, which reqwest 0.13.5 resolves to, requires
+`aws-lc-sys` 0.45. An `OpenSSL` exception would never match, and cargo-deny
+warns about unmatched exceptions.
+
+**Solution.** No exception. The allowlist was derived from a scratch copy of
+the workspace in which `agentd` depends on every crate in
+`[workspace.dependencies]`, with reqwest's `rustls` feature, and each license
+was kept only if removing it made `cargo deny --workspace check licenses`
+fail. That gives MIT, Apache-2.0, BSD-3-Clause (`aws-lc-sys`, `matchit`,
+`subtle`), ISC (`aws-lc-rs`, `aws-lc-sys`, `rustls-webpki`, `untrusted`),
+Unicode-3.0 (the ICU crates and `unicode-ident`), Zlib (`foldhash`) and
+CDLA-Permissive-2.0 (`webpki-root-certs`, pulled in by
+`rustls-platform-verifier` through reqwest's `rustls` feature; `webpki-roots`
+is not in the graph). BSD-2-Clause, which the plan listed, is not needed.
+Today's lockfile uses only a few of these licenses, so `deny.toml` sets
+`unused-allowed-license = "allow"` to keep CI free of warnings about the
+rest.
+
+### cargo-deny 0.20 has no warning level for unmaintained crates
+
+**Issue.** The plan says `[advisories]` warns on unmaintained crates and that
+`[licenses]` denies GPL, LGPL and AGPL. In cargo-deny 0.20 (the version the
+action's `v2` tag ships) every advisory that applies is an error:
+`unmaintained` only chooses the scope (`all`, `workspace`, `transitive`,
+`none`) in which unmaintained advisories are reported at all. The
+`[licenses] deny` list is deprecated and ignored: any license not in `allow`
+or an exception is rejected.
+
+**Solution.** `deny.toml` keeps `unmaintained = "all"`, and the CI job passes
+`-W unmaintained` to `cargo deny check`, which lowers that one lint to a
+warning. A scratch check with `paste` (RUSTSEC-2024-0436) passes with a
+warning; one with `smallvec` 1.6.0 (RUSTSEC-2021-0003) still fails. GPL,
+LGPL, AGPL and MPL-2.0 are rejected by being absent from `allow`; a scratch
+path dependency carrying each of them failed `check licenses`, while
+`MIT OR GPL-3.0-only` passed.
+
+### The action's image ships Rust 1.85
+
+**Issue.** `EmbarkStudios/cargo-deny-action@v2` runs in a `rust:1.85.0`
+image, and cargo-deny runs that image's `cargo metadata`. Cargo 1.85 reads
+today's manifests and lockfile, including the full dependency set, but it
+predates the workspace's `rust-version` (1.98.1) and could fail on a
+dependency that uses a newer manifest feature or edition.
+
+**Solution.** The job sets the action's `rust-version: stable`, so the action
+switches to the current stable toolchain before running cargo-deny, like the
+other jobs.
+
+### `[licenses.private]` exempts any unpublished crate
+
+**Issue.** `[licenses.private] ignore = true` is meant to exempt our own
+crates, which carry only `license-file`. cargo-deny applies it to every crate
+with `publish = false`, wherever it comes from. A scratch copy of the
+workspace in which `agentd` depends on `vendor/gpl`, a path crate with
+`license = "GPL-3.0-only"` and `publish = false`, printed `licenses ok`.
+cargo-deny has no setting that limits the exemption to workspace members:
+`[licenses.private]` only adds private registries, `[sources]` does not see
+path dependencies, and a `[[licenses.clarify]]` entry per workspace crate
+would have to be added for every new crate and pinned to the hash of
+`LICENSE`.
+
+**Solution.** Keep `private.ignore` and add `scripts/ci/check-path-deps.sh`,
+which the `deny` job runs before cargo-deny. It reads
+`cargo metadata --locked --all-features --format-version 1` and fails when a
+package with no source (a path package) has a manifest other than the root
+`Cargo.toml` or `crates/<name>/Cargo.toml`. Matching the manifest path, not
+the `workspace_members` list, also rejects a vendored crate added to
+`[workspace] members` outside `crates/`. The same scratch case fails the
+script, as do a path dependency outside the repository, an optional one
+behind a feature, a Windows-only one, one nested under
+`crates/agentd/vendor/`, and a `[patch.crates-io]` entry pointing at a local
+copy; with a stale lockfile, `--locked` makes it fail too. A crate placed
+directly in `crates/` is a workspace crate by the layout rules in
+`AGENTS.md`, so it is reviewed as our code.
+
+### The `deny` job ran only when code changed
+
+**Issue.** The `deny` job runs only when the `changes` job classifies a
+change as code. An advisory published against a crate already in
+`Cargo.lock` therefore surfaced on the next code pull request, unrelated to
+it, rather than when it was published.
+
+**Solution.** The workflow gains a weekly `schedule` trigger (Mondays at
+04:23 UTC). The `changes` job sets a base commit only for `pull_request` and
+`push` events, so a scheduled run is classified as code and runs every job,
+which also catches breakage from a new stable toolchain. `publish-badges`
+still runs only on pushes to `main` and manual dispatches, and the `docs`
+job's badge check only on pushes to `main`. Scheduled runs take a
+concurrency group of their own: in `main`'s group, where
+`cancel-in-progress` is false, a scheduled run arriving while a push run is
+pending would cancel that pending run, and its badges would not be
+published. GitHub runs schedules on the default branch only, so the trigger
+takes effect once this workflow is on `main`. GitHub also disables
+`schedule` triggers in a public repository after 60 days without repository
+activity, so on a quiet repository the weekly advisory run can stop and has
+to be re-enabled from the Actions tab.
