@@ -6364,7 +6364,7 @@ does. `dm_command` passes the DM's files with the command, and
 `Commands::download` reads a file attached in either manager DM with that
 surface's manager credentials, so `persona` takes a `persona.md` on Slack
 under the same 64 KB cap. A slash command carries no files. `skill add`
-(T25) isn't in this stack yet; it can use the same download.
+(T25) reads its attachment with the same download.
 
 ### The manager's events URL before its secret is set
 

@@ -1371,6 +1371,27 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         "`helper` has no skill `gh` waiting for you to confirm its hosts."
     );
 
+    let attached = InFile {
+        id: "F1".into(),
+        name: "SKILL.md".into(),
+        mime_type: None,
+        size: Some(10),
+        url: "https://chat.example/file-upload/F1/SKILL.md".into(),
+    };
+    commands
+        .handle_text(
+            &key("alice"),
+            "skill add helper https://git.test/notes.git",
+            &dm("alice"),
+            &[attached],
+        )
+        .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Added the skill `notes` to `helper`. Its conversations use it from their next start.\n\
+         You gave a Git URL, so I ignored the attached file."
+    );
+
     run("alice", "skill rm helper agentctl", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
@@ -1394,6 +1415,20 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     assert_eq!(
         h.last_reply("alice"),
         "`helper` has no skill `notes`, and no skills besides `agentctl`."
+    );
+
+    run(
+        "alice",
+        "skill add helper https://git.test/gh.git",
+        dm("alice"),
+    )
+    .await;
+    assert!(h.last_reply("alice").starts_with("The skill `gh` asks"));
+    run("alice", "skill rm helper gh", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Removed the skill `gh` from `helper`. It was still waiting for you to confirm its \
+         hosts, so its sandboxes never got to reach them."
     );
 
     run(

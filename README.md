@@ -129,6 +129,10 @@ read-only into the agent's sandboxes. A skill whose `SKILL.md` lists
 `allowed-hosts` waits until the owner confirms them with
 `skill confirm <name> <skill>`; those hosts, each named in full (no
 wildcards), then extend `[proxy] allow` for that agent's sandboxes only.
+At startup agentd deletes the files of every skill the store has no row
+for, once they are a few minutes old, so restoring an older backup of the
+store also drops the files of skills added since that backup: add those
+skills again afterwards.
 The owner lists an agent's sessions with `sessions <name>` (where each is,
 its last turn, and whether its container is warm), and starts them over
 with `reset <name>`, or only the ones of one conversation with
