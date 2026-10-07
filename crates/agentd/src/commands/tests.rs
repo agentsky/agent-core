@@ -1446,8 +1446,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     run("alice", "skill rm helper gh", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
-        "Removed the skill `gh` from `helper`. It was still waiting for you to confirm its \
-         hosts, so its sandboxes never got to reach them."
+        "Removed the skill `gh` from `helper`. None of the hosts it asks for had been \
+         confirmed, so its sandboxes never got to reach them."
     );
 
     run(
