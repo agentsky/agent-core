@@ -1497,16 +1497,128 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
         ]
     );
 
-    register_token(&h, start).await;
     let later = start + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
     assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
     assert_eq!(
         h.calls("apps.manifest.export").await,
-        5,
-        "only the app whose token was refused is tried again"
+        4,
+        "nothing is tried again before a new token"
+    );
+    register_token(&h, later).await;
+    assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.export").await,
+        8,
+        "a new token tries every app again"
     );
     assert_eq!(h.calls("apps.manifest.update").await, 0);
     let _ = (gone, eventless, refusing, forbidden);
+}
+
+#[tokio::test]
+async fn a_manifest_update_refused_without_a_known_code_is_tried_again() {
+    let h = harness().await;
+    let codeless = installed_as(&h, "codeless", WRITER_TOKEN, 0).await;
+    installed_as(&h, "unknown", "xoxb-unknown", 0).await;
+    installed_as(&h, "invalid", "xoxb-invalid", 0).await;
+    mount(
+        &h.slack,
+        "apps.manifest.export",
+        CONFIG_TOKEN,
+        ok(json!({"manifest": exported(codeless)})),
+    )
+    .await;
+    for (app_id, response) in [
+        (
+            "A0CODELESS",
+            ResponseTemplate::new(403).set_body_string("Forbidden by proxy"),
+        ),
+        ("A0UNKNOWN", refused("some_new_code")),
+        ("A0INVALID", refused("invalid_manifest")),
+    ] {
+        Mock::given(method("POST"))
+            .and(path("/api/apps.manifest.update"))
+            .and(header("authorization", bearer().as_str()))
+            .and(wiremock::matchers::body_string_contains(
+                format!("app_id={app_id}").as_str(),
+            ))
+            .respond_with(response)
+            .mount(&h.slack)
+            .await;
+    }
+    let start = OffsetDateTime::now_utc();
+    register_token(&h, start).await;
+    assert_eq!(h.agents.pass_at(|| start).await.updated, 0);
+    assert_eq!(h.calls("apps.manifest.update").await, 3);
+    let blocked: Vec<_> = h
+        .store
+        .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|app| (app.agent_name, app.blocked))
+        .collect();
+    assert_eq!(
+        blocked,
+        [
+            ("codeless".to_owned(), false),
+            ("invalid".to_owned(), true),
+            ("unknown".to_owned(), false)
+        ]
+    );
+    let later = start + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.update").await,
+        5,
+        "only the invalid manifest isn't tried again"
+    );
+}
+
+#[tokio::test]
+async fn registering_a_new_token_tries_a_refused_app_again() {
+    let h = harness().await;
+    let writer = installed_as(&h, "writer", WRITER_TOKEN, 0).await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .respond_with(refused("access_denied"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    mount(
+        &h.slack,
+        "apps.manifest.export",
+        CONFIG_TOKEN,
+        ok(json!({"manifest": exported(writer)})),
+    )
+    .await;
+    mount(
+        &h.slack,
+        "apps.manifest.update",
+        CONFIG_TOKEN,
+        ok(json!({"app_id": "A0WRITER", "permissions_updated": false})),
+    )
+    .await;
+    let start = OffsetDateTime::now_utc();
+    register_token(&h, start).await;
+    assert_eq!(h.agents.pass_at(|| start).await.updated, 0);
+    let later = start + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
+    assert_eq!(
+        h.calls("apps.manifest.export").await,
+        1,
+        "a refusal blocks the app at this version"
+    );
+    register_token(&h, later).await;
+    assert_eq!(h.agents.pass_at(|| later).await.updated, 1);
+    assert!(
+        h.store
+            .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

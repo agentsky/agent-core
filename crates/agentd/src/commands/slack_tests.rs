@@ -2888,6 +2888,10 @@ async fn a_failed_manifest_update_is_retried_and_me_says_so() {
         reply.contains("delete the agent and create it again"),
         "{reply}"
     );
+    assert!(
+        reply.contains("Registering a new configuration token (`/agent slack-token"),
+        "{reply}"
+    );
     assert!(!reply.contains("haven't updated yet"), "{reply}");
     let much_later = later + crate::slack::agents::MANIFEST_UPDATE_LEASE;
     assert_eq!(agents.pass_at(|| much_later).await.updated, 0);

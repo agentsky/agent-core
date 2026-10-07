@@ -145,6 +145,11 @@ const NOT_FOUND_CODES: &[&str] = &[
 /// and `apps.manifest.update` say the app is gone.
 const APP_GONE_CODES: &[&str] = &["app_not_found", "invalid_app_id"];
 
+/// Error codes with which `apps.manifest.update` refuses a manifest for
+/// good: sending the same manifest again gets the same answer. Any other
+/// code, one Slack doesn't document included, may pass on a later try.
+pub const MANIFEST_REFUSED_CODES: &[&str] = &["invalid_manifest"];
+
 /// Error codes of Slack's rate limiter.
 const RATE_LIMITED_CODES: &[&str] = &["ratelimited", "rate_limited"];
 
