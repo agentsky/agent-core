@@ -344,6 +344,15 @@ pub fn check_upstream(upstream: &str) -> Result<(), ProxyError> {
     Upstream::parse(upstream).map(drop)
 }
 
+/// Whether `upstream` names [`DEFAULT_UPSTREAM`], however it is spelled:
+/// with a trailing slash, the scheme's default port, or another case.
+pub fn is_default_upstream(upstream: &str) -> bool {
+    match (Url::parse(upstream), Url::parse(DEFAULT_UPSTREAM)) {
+        (Ok(upstream), Ok(default)) => upstream == default,
+        _ => false,
+    }
+}
+
 impl Upstream {
     fn parse(text: &str) -> Result<Self, ProxyError> {
         let base = Url::parse(text).map_err(|_| ProxyError::Upstream("not a URL"))?;
@@ -759,6 +768,25 @@ mod tests {
             "http://[::ffff:127.0.0.1]:9",
         ] {
             check_upstream(good).unwrap_or_else(|err| panic!("{good}: {err}"));
+        }
+    }
+
+    #[test]
+    fn the_default_upstream_is_recognized_however_it_is_spelled() {
+        for default in [
+            DEFAULT_UPSTREAM,
+            "https://api.anthropic.com/",
+            "HTTPS://API.Anthropic.com:443",
+        ] {
+            assert!(is_default_upstream(default), "{default}");
+        }
+        for other in [
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com:8443",
+            "https://llm-gateway.example.com",
+            "not a url",
+        ] {
+            assert!(!is_default_upstream(other), "{other}");
         }
     }
 

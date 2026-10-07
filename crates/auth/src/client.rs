@@ -27,6 +27,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EXPIRES_IN: u64 = 365 * 24 * 60 * 60;
 /// Longest OAuth `error` code kept for an error message.
 const MAX_ERROR_CODE: usize = 64;
+/// The most of a response body [`send`] reads. Token, profile and
+/// revocation answers are a few hundred bytes, so a longer one is refused
+/// rather than buffered, whatever the endpoint sends.
+const MAX_RESPONSE_BODY: usize = 64 * 1024;
 
 /// The HTTP clients: one honoring the system proxy settings and one using
 /// no proxy, each request taking the one its URL needs.
@@ -324,14 +328,45 @@ struct Response {
     body: Vec<u8>,
 }
 
+/// Sends `request` and reads the whole response, refusing a body longer
+/// than [`MAX_RESPONSE_BODY`] by its `Content-Length` or as it streams in.
+/// Such a body is an [`AuthError::InvalidResponse`] on success and an
+/// [`AuthError::Status`] without an OAuth code otherwise, so a failure
+/// keeps its status.
 async fn send(request: reqwest::RequestBuilder, endpoint: Endpoint) -> Result<Response, AuthError> {
     let http = |source: reqwest::Error| AuthError::Http {
         endpoint,
         source: Arc::new(source.without_url()),
     };
-    let response = request.send().await.map_err(http)?;
+    let mut response = request.send().await.map_err(http)?;
     let status = response.status();
-    let body = response.bytes().await.map_err(http)?.to_vec();
+    let too_large = || {
+        if status.is_success() {
+            AuthError::InvalidResponse {
+                endpoint,
+                reason: "response body too large",
+            }
+        } else {
+            AuthError::Status {
+                endpoint,
+                status: status.as_u16(),
+                error: None,
+            }
+        }
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BODY as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(http)? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
     Ok(Response { status, body })
 }
 
@@ -468,6 +503,10 @@ pub(crate) async fn revoke(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
 
     #[tokio::test]
@@ -482,6 +521,144 @@ mod tests {
             &["https://127.0.0.1:9", "http://[::1]:9"],
         )
         .await;
+    }
+
+    async fn send_to(url: &str) -> Result<Response, AuthError> {
+        send(Client::new().post(url), Endpoint::Token).await
+    }
+
+    fn is_too_large(result: &Result<Response, AuthError>) -> bool {
+        matches!(
+            result,
+            Err(AuthError::InvalidResponse {
+                endpoint: Endpoint::Token,
+                reason: "response body too large",
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_by_its_content_length() {
+        let server = MockServer::start().await;
+        for (len, refused) in [(MAX_RESPONSE_BODY, false), (MAX_RESPONSE_BODY + 1, true)] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; len]))
+                .mount(&server)
+                .await;
+            let result = send_to(&server.uri()).await;
+            assert_eq!(is_too_large(&result), refused, "{len}");
+            if !refused {
+                assert_eq!(result.unwrap().body.len(), len);
+            }
+        }
+    }
+
+    async fn serve_chunked(status: u16, len: usize) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 {status} X\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let mut left = len;
+            while left > 0 {
+                let chunk = vec![b'a'; left.min(16 * 1024)];
+                left -= chunk.len();
+                let _ = stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = stream.write_all(&chunk).await;
+                let _ = stream.write_all(b"\r\n").await;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_refused_as_it_streams() {
+        for (len, refused) in [(MAX_RESPONSE_BODY, false), (MAX_RESPONSE_BODY + 1, true)] {
+            let (url, server) = serve_chunked(200, len).await;
+            let result = send_to(&url).await;
+            assert_eq!(is_too_large(&result), refused, "{len}");
+            if !refused {
+                assert_eq!(result.unwrap().body.len(), len);
+            }
+            server.await.unwrap();
+        }
+    }
+
+    fn is_bare_status(result: &Result<Response, AuthError>, expected: u16) -> bool {
+        matches!(
+            result,
+            Err(AuthError::Status {
+                endpoint: Endpoint::Token,
+                status,
+                error: None,
+            }) if *status == expected
+        )
+    }
+
+    #[tokio::test]
+    async fn an_oversized_failure_keeps_its_status() {
+        let server = MockServer::start().await;
+        for status in [400, 401, 403, 500] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_bytes(vec![
+                    b'a';
+                    MAX_RESPONSE_BODY
+                        + 1
+                ]))
+                .mount(&server)
+                .await;
+            assert!(
+                is_bare_status(&send_to(&server.uri()).await, status),
+                "{status}"
+            );
+            let (url, chunked) = serve_chunked(status, MAX_RESPONSE_BODY + 1).await;
+            assert!(is_bare_status(&send_to(&url).await, status), "{status}");
+            chunked.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_refresh_failure_is_not_a_dead_token() {
+        let server = MockServer::start().await;
+        let body = format!(
+            r#"{{"error":"invalid_grant"}}{}"#,
+            " ".repeat(MAX_RESPONSE_BODY)
+        );
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .mount(&server)
+            .await;
+        let url = Url::parse(&server.uri()).unwrap();
+        let result = refresh(
+            &Client::new(),
+            &url,
+            &SecretString::from("r"),
+            "client",
+            "scope",
+        )
+        .await;
+        let Err(failure) = result else {
+            panic!("an oversized 400 refreshed");
+        };
+        assert!(!failure.dead);
+        assert!(matches!(
+            failure.error,
+            AuthError::Status {
+                endpoint: Endpoint::Token,
+                status: 400,
+                error: None,
+            }
+        ));
     }
 
     fn tokens(json: &str) -> Result<Tokens, AuthError> {

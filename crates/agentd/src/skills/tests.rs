@@ -352,13 +352,45 @@ async fn declared_hosts_wait_for_confirmation_then_extend_the_allowlist() {
         "confirmed once"
     );
 
-    assert!(h.skills.remove(h.agent, "gh").await.unwrap());
+    assert_eq!(
+        h.skills.remove(h.agent, "gh").await.unwrap(),
+        Removed::Active
+    );
     assert!(!h.live("gh").exists());
     assert!(
         h.hosts().await.is_empty(),
         "removing it takes its hosts away"
     );
-    assert!(!h.skills.remove(h.agent, "gh").await.unwrap());
+    assert_eq!(
+        h.skills.remove(h.agent, "gh").await.unwrap(),
+        Removed::NotFound
+    );
+}
+
+#[tokio::test]
+async fn a_skill_still_waiting_is_removed_as_unconfirmed() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    assert!(h.pending("gh").join("SKILL.md").is_file());
+    assert_eq!(
+        h.skills.remove(h.agent, "gh").await.unwrap(),
+        Removed::Unconfirmed
+    );
+    assert!(!h.pending("gh").exists());
+    assert!(h.store.agent_skills(h.agent).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_bundled_skill_is_never_removed() {
+    let h = harness().await;
+    write_bundled(&h.data, h.agent).await.unwrap();
+    assert_eq!(
+        h.skills.remove(h.agent, BUNDLED_NAME).await.unwrap(),
+        Removed::Bundled
+    );
+    assert!(h.live(BUNDLED_NAME).join("SKILL.md").is_file());
 }
 
 #[tokio::test]
