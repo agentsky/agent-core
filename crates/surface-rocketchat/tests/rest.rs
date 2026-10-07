@@ -9,7 +9,7 @@ use serde_json::Value;
 use surface_rocketchat::rest::{Credentials, Message, NewBotUser, RestClient, RoomType};
 use testkit::TempDir;
 use testkit::rocketchat::FakeRest;
-use wiremock::matchers::path;
+use wiremock::matchers::{path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn manager(fake: &FakeRest) -> RestClient {
@@ -453,6 +453,25 @@ async fn user_by_username_finds_the_user_or_fails() {
     let requests = fake.requests("users.info").await;
     assert_eq!(requests[0].url.query(), Some("username=alice"));
     assert_eq!(client.user_by_username("nobody").await, Ok(None));
+}
+
+#[tokio::test]
+async fn user_by_username_reads_an_older_servers_user_codes_as_no_user() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    for code in ["error-user-not-found", "error-invalid-user"] {
+        Mock::given(path("/api/v1/users.info"))
+            .and(query_param("username", code))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "success": false,
+                "error": format!("User not found [{code}]"),
+                "errorType": code,
+            })))
+            .with_priority(1)
+            .mount(fake.server())
+            .await;
+        assert_eq!(client.user_by_username(code).await, Ok(None), "{code}");
+    }
 }
 
 #[tokio::test]

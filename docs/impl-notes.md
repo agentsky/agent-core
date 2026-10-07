@@ -714,9 +714,13 @@ renders as a space, `<`, `>` or `|` (`&lt;`), and at anything other than
 text and emphasis, such as inline code. Each run is scanned once, so the
 pass stays linear; measuring from every text node to the next source
 terminator instead took 19 s on ``"`c`https://a"`` repeated 10,000 times,
-since each cut made the next URL scan the rest of the run again. Emphasis or strikethrough whose opening
-delimiter is inside such a range is replaced by its children, with its
-delimiters as text, so the URL is one text run again and is linked whole.
+since each cut made the next URL scan the rest of the run again. Emphasis
+or strikethrough whose opening delimiter is inside such a range is replaced
+by its children, with its delimiters as text, so the URL is one text run
+again and is linked whole. A URL right after a character reference or
+escape that renders as a letter or digit isn't measured, as `&#97;` before
+`https://` makes it part of a word, which neither Slack nor the renderer
+links; its emphasis still formats.
 Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
@@ -2594,7 +2598,8 @@ Rocket.Chat doesn't answer is an attempt that failed, deferred with the
 retirement's backoff, so a creation that died because Rocket.Chat was
 unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
 answers an unknown username with HTTP 400 and the error `User not found.`,
-without an error code; `user_by_username` reads that answer as no user, so
+without an error code, and older servers with `error-user-not-found` or
+`error-invalid-user`; `user_by_username` reads those answers as no user, so
 the username of a creation that never got as far as `users.create` is
 forgotten at the first lookup, like another's email, while a transport
 error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
@@ -4406,16 +4411,21 @@ doesn't say what a full queue does.
 lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
 bounded queue. A full or closed queue answers 503; Slack retries an event
 that gets one, but not a slash command or an interaction, whose user sees
-Slack's error. The handler never waits for the queue. `Queue::run` then deduplicates through the
-`Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
-and sends `SlackInbound` items, one at a time and in order, to a
-`core_types::Sender`. A failed dedup write drops the request rather than risk
-a duplicate turn. Until T29 and T30 consume it, agentd's sink (`Unrouted`)
-logs each item's binding and kind and drops it. agentd runs the queue as a
-`server::Worker` next to the listeners: `Routers` gained a `workers` field,
-and the queue ends once the public listener's router is dropped, so every
-acknowledged request is handled within the drain timeout. An acknowledged
-request is lost if agentd dies before handling it; Slack won't retry it.
+Slack's error. The handler never waits for the queue. `Queue::run` then
+deduplicates through the `Dedup` trait (agentd's `StoreDedup` over
+`mark_event_processed`), normalizes, and sends `SlackInbound` items, one at
+a time and in order, to a `core_types::Sender`. A failed dedup write drops
+the request rather than risk a duplicate turn. Until T29 and T30 consume
+it, agentd's sink (`Unrouted`) logs each item's binding and kind and drops
+it. agentd runs the queue as a `server::Worker` next to the listeners:
+`Routers` gained a `workers` field, and the queue ends once the public
+listener's router is dropped, so every acknowledged request still queued
+at shutdown is passed to the sink within the drain timeout, unless the
+timeout runs out first. That doesn't make it answered: a sink that has
+stopped taking work by then drops it, as the turn pipeline does once it is
+closed (T30). An acknowledged request is lost if agentd dies before
+handling it, or if it reaches a sink that no longer takes it; Slack won't
+retry it.
 
 ### Replays inside the five-minute window
 
