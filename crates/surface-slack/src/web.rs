@@ -102,7 +102,6 @@ const FORBIDDEN_CODES: &[&str] = &[
     "not_allowed_token_type",
     "not_in_channel",
     "not_reactable",
-    "org_login_required",
     "restricted_action",
     "restricted_action_non_threadable_channel",
     "restricted_action_read_only_channel",
@@ -1331,6 +1330,10 @@ mod tests {
         assert_eq!(
             map_error("invalid_blocks", None),
             SurfaceError::Api("invalid_blocks".into())
+        );
+        assert_eq!(
+            map_error("org_login_required", None),
+            SurfaceError::Api("org_login_required".into())
         );
     }
 

@@ -725,6 +725,13 @@ Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
 
+qm-core's `trimUrlTail` also drops a trailing `*`, `_` or `~`, since its
+regexes could hand formatting marks to the URL scan. Here that cut a URL the
+pass had kept whole: `…/datamodel.html#object.__init__` was linked as
+`<…#object.__init>__`, landing on the wrong anchor. The parser has already
+taken every delimiter that formats, and the ones left in a text node are
+literal or were put back above, so the trim keeps those three characters.
+
 ### CommonMark disagrees with some qm-core regex cases
 
 **Issue.** qm-core converts with regexes; this renderer walks the
@@ -972,6 +979,16 @@ Broadcasts are neutralized everywhere, code and URLs included (see [Code
 doesn't protect a broadcast on
 Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
 scanner moved from `slack.rs` to `render::url` to be shared.
+
+The shared trim keeps a trailing `*`, `_` or `~` for both surfaces (see
+[Emphasis inside a bare URL cut the link](#emphasis-inside-a-bare-url-cut-the-link)).
+On Rocket.Chat the URL only bounds the text name resolution skips: the
+renderer copies the source through either way, and what the trim drops is
+never an `@`, so trimming those marks there would change no output. What
+the server's own Markdown makes of `…#object.__init__` depends on the text
+it receives, which is the same either way, so Rocket.Chat has no reason for
+a trim of its own. A Rocket.Chat test pins that such a URL passes through
+whole, with a name after it resolved and a name inside it left alone.
 
 ### Code doesn't protect a broadcast on Rocket.Chat
 
@@ -2606,6 +2623,12 @@ error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
 out. A bot user still missed has no token and no password anyone knows, so
 it can't be used, but it keeps its username until an admin removes it.
+Review asked for both quiet paths to be visible: a found user with no
+email at all is logged as a warning (binding and username only) before the
+username is forgotten, since that is what every user looks like to a
+manager without `view-full-other-user-info`, and a lookup that fails is a
+warning like a failed deactivation, bounded by the retirement's backoff,
+instead of a debug line that hid a long outage until "giving up".
 
 ### Deactivating a deleted agent's bot is owed until it happens
 
@@ -4672,6 +4695,13 @@ sanitizing and `map_error`; only a non-2xx answer without one is
 its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
 is not a Web API method, so it has no bucket, and the caller can retry the
 whole upload, which shared nothing.
+
+`org_login_required` was first among the `Forbidden` codes. Slack answers
+it while a workspace is being migrated into an Enterprise Grid
+organization, which passes on its own, so it is not a refusal of the bot
+and now falls to `Api` with the code. No caller needs it to be
+`Forbidden`: those that treat `Forbidden` as a no or a refusal answer
+`Api` the same way or fail closed on it.
 
 ### Names two members share
 
