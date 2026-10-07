@@ -1985,11 +1985,12 @@ Deliverables:
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
-- Slash command text and manager-DM text that will reach `commands::parse`
-  is decoded first: Slack sends `&`, `<` and `>` in message text as
-  `&amp;`, `&lt;` and `&gt;`, and the parser works on plain text, so
-  without decoding a persona typed as `You & me` arrives as `You &amp; me`.
-  Mention and link tokens parse either way.
+- Slack sends `&`, `<` and `>` in message and slash command text as
+  `&amp;`, `&lt;` and `&gt;`. The ingress passes that text on as Slack sent
+  it, and the Slack surface decodes the three entities before any of it
+  reaches `commands::parse` (T30), which works on plain text: otherwise a
+  persona typed as `You & me` arrives as `You &amp; me`. Mention and link
+  tokens parse either way.
 - `testkit::slack`: request signing helpers and payload fixtures.
 
 Acceptance:
