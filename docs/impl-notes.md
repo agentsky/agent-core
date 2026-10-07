@@ -4291,14 +4291,23 @@ that races a slow creation, the creation's own `activate_binding` fails and
 it gives up.
 
 A crash, or a store failure, between `users.create` answering and the bot
-user being recorded leaves a bot user no binding records. Abandoning a
-creation therefore looks the noted username up with `users.info` and, if
-that user's email is the binding's (`agent-<binding id>@agent-core.invalid`),
-records it, so it is retired. That needs the manager's
+user being recorded leaves a bot user no binding records. A disabled
+binding that noted a username but records no bot user therefore owes
+retirement too, and its retirement first looks the noted username up with
+`users.info`: if that user's email is the binding's
+(`agent-<binding id>@agent-core.invalid`), it is recorded and deactivated
+in the same attempt; if the email is another's, or missing, the username
+is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
+Rocket.Chat doesn't answer is an attempt that failed, deferred with the
+retirement's backoff, so a creation that died because Rocket.Chat was
+unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
+answers an unknown username without an error code, so a creation that
+never got as far as `users.create` is indistinguishable from an outage and
+spends the retirement's attempts (about three days of `users.info` calls)
+before it is given up. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
-out, and it is tried once, when the creation is abandoned. A bot user
-still missed has no token and no password anyone knows, so it can't be
-used, but it keeps its username until an admin removes it.
+out. A bot user still missed has no token and no password anyone knows, so
+it can't be used, but it keeps its username until an admin removes it.
 
 ### Deactivating a deleted agent's bot is owed until it happens
 
@@ -4432,6 +4441,11 @@ their user id as display name.
   for good: creating an agent of the same name again gets the prefixed
   username, and once that one is deleted too, the name can't be created
   again by that owner until an admin removes the old bot users.
+- So does the bot user of a creation that failed after `users.create`, for
+  example because the `bot` role lacks `create-personal-access-tokens`: it
+  is deactivated, not deleted, so a retry after the failure gets the
+  prefixed username. Deleting it would need `delete-user` on the manager's
+  role, a broader grant than the username is worth.
 
 ### Agent names are the owner's
 

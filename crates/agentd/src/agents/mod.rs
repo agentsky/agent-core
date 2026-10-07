@@ -21,8 +21,9 @@
 //! exists, even once the creation was abandoned, so an abandoned creation's
 //! bot user is found and owes retirement. A disabled binding's bot user
 //! owes retirement until it is deactivated: each attempt claims it with a
-//! lease, a failure is retried after a backoff, and a crash mid-attempt
-//! leaves it to the next claim once the lease ends. Connections are derived
+//! lease, first looks the bot user up by the noted username if none is
+//! recorded, a failure of either call is retried after a backoff, and a
+//! crash mid-attempt leaves it to the next claim once the lease ends. Connections are derived
 //! from the active bindings, so a restart, or another instance creating or
 //! deleting an agent, is picked up by the next pass.
 
@@ -35,7 +36,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use core_types::{BindingId, ConversationId, SurfaceError, SurfaceKind, TeamId, UserId};
 use store::{BindingState, Store, StoreError};
-use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType};
+use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType, User};
 use time::OffsetDateTime;
 use tokio::sync::Notify;
 
@@ -366,45 +367,31 @@ impl RocketChatAgents {
             tracing::warn!(%binding, error = %err, "couldn't abandon a failed creation");
             return;
         }
-        let retired = async {
-            self.adopt_orphan(binding).await?;
-            self.retire(binding).await
-        };
-        if let Err(err) = retired.await {
+        if let Err(err) = self.retire(binding).await {
             tracing::warn!(%binding, error = %err, "couldn't retire an abandoned bot user");
         }
     }
 
-    /// Records the bot user an abandoned creation of `binding` may have
-    /// made without recording it, for a crash or failure between
-    /// `users.create` and [`Store::set_binding_bot_user`]: the user with
-    /// the username the binding noted last, if its email is the binding's.
-    /// It then owes retirement. Nothing happens if Rocket.Chat doesn't
-    /// answer, or the manager may not see emails.
-    async fn adopt_orphan(&self, binding: BindingId) -> Result<(), StoreError> {
+    /// Records `user`, found by the username the abandoned creation of
+    /// `binding` noted, as its bot user if its email is the binding's, for
+    /// a crash or failure between `users.create` and
+    /// [`Store::set_binding_bot_user`], and returns the bot user the
+    /// binding then records. Otherwise, also when the manager may not see
+    /// emails, the username is forgotten and nothing is owed.
+    async fn adopt_orphan(
+        &self,
+        binding: BindingId,
+        user: User,
+    ) -> Result<Option<UserId>, StoreError> {
         let store = &self.inner.store;
-        let Some(row) = store.binding(binding).await? else {
-            return Ok(());
-        };
-        let (BindingState::Disabled, None, Some(username)) =
-            (row.state, &row.bot_user, &row.bot_username)
-        else {
-            return Ok(());
-        };
-        let user = match self.inner.rest.user_by_username(username).await {
-            Ok(user) => user,
-            Err(err) => {
-                tracing::debug!(%binding, error = %err, "found no bot user of an abandoned creation");
-                return Ok(());
-            }
-        };
         let email = bot_email(binding);
         if !user
             .emails
             .iter()
             .any(|e| e.address.eq_ignore_ascii_case(&email))
         {
-            return Ok(());
+            store.forget_binding_bot_username(binding).await?;
+            return Ok(None);
         }
         if store
             .set_binding_bot_user(binding, &user.id, &user.username)
@@ -412,14 +399,15 @@ impl RocketChatAgents {
             .is_some()
         {
             tracing::warn!(%binding, bot = %user.id, "found the bot user of an abandoned creation");
+            return Ok(Some(user.id));
         }
-        Ok(())
+        Ok(store.binding(binding).await?.and_then(|row| row.bot_user))
     }
 
     /// Abandons every creation on this server that started more than
     /// [`CREATION_LEASE`] ago, and returns how many. A bot user such a
-    /// creation made is recorded if it can be found, and then owes
-    /// retirement.
+    /// creation made, or may have made under the username it noted, then
+    /// owes retirement.
     ///
     /// # Errors
     ///
@@ -436,7 +424,6 @@ impl RocketChatAgents {
             if store.abandon_creation(binding, before, now).await? {
                 tracing::warn!(%binding, "abandoned an agent creation that never finished");
                 abandoned += 1;
-                self.adopt_orphan(binding).await?;
             }
         }
         Ok(abandoned)
@@ -444,25 +431,45 @@ impl RocketChatAgents {
 
     /// Retires the bot user of the disabled `binding`: claims the
     /// retirement, deactivates the bot user, and marks it retired, or
-    /// defers the next attempt if Rocket.Chat refused. A bot user that
-    /// Rocket.Chat says doesn't exist (`error-invalid-user` or
-    /// `error-user-not-found`) counts as retired. Returns whether it is
-    /// retired now; false also when there is nothing to claim.
+    /// defers the next attempt if Rocket.Chat refused. A binding that only
+    /// noted a username first looks its bot user up by it, adopting it if
+    /// its email is the binding's, and a lookup Rocket.Chat
+    /// doesn't answer is deferred the same way, so the bot user of a
+    /// creation that died before recording it is found once Rocket.Chat
+    /// answers. A bot user that Rocket.Chat says doesn't exist
+    /// (`error-invalid-user` or `error-user-not-found`) counts as retired.
+    /// Returns whether it is retired now; false also when there is nothing
+    /// to claim.
     ///
     /// # Errors
     ///
     /// A [`StoreError`].
     pub async fn retire(&self, binding: BindingId) -> Result<bool, StoreError> {
         let store = &self.inner.store;
-        let Some(bot) = store.binding(binding).await?.and_then(|b| b.bot_user) else {
-            return Ok(false);
-        };
         let now = OffsetDateTime::now_utc();
         let Some(attempt) = store
             .claim_retirement(binding, now, now + RETIRE_LEASE, RETIRE_MAX_ATTEMPTS)
             .await?
         else {
             return Ok(false);
+        };
+        let Some(row) = store.binding(binding).await? else {
+            return Ok(false);
+        };
+        let bot = match (row.bot_user, row.bot_username) {
+            (Some(bot), _) => bot,
+            (None, Some(username)) => match self.inner.rest.user_by_username(&username).await {
+                Ok(user) => match self.adopt_orphan(binding, user).await? {
+                    Some(bot) => bot,
+                    None => return Ok(false),
+                },
+                Err(err) => {
+                    tracing::debug!(%binding, attempt, error = %err, "couldn't look up the bot user of an abandoned creation");
+                    self.defer_retirement(binding, attempt).await?;
+                    return Ok(false);
+                }
+            },
+            (None, None) => return Ok(false),
         };
         match self.inner.rest.set_active(&bot, false).await {
             Ok(()) => {
@@ -473,11 +480,7 @@ impl RocketChatAgents {
             }
             Err(err) => {
                 tracing::warn!(%binding, %bot, attempt, error = %err, "couldn't deactivate a deleted agent's bot user");
-                let retry_at = OffsetDateTime::now_utc() + backoff(attempt);
-                store.defer_retirement(binding, retry_at).await?;
-                if attempt >= RETIRE_MAX_ATTEMPTS {
-                    tracing::warn!(%binding, %bot, "giving up on deactivating the bot user");
-                }
+                self.defer_retirement(binding, attempt).await?;
                 return Ok(false);
             }
         }
@@ -485,6 +488,17 @@ impl RocketChatAgents {
             .mark_retired(binding, OffsetDateTime::now_utc())
             .await?;
         Ok(true)
+    }
+
+    /// Ends the failed retirement attempt number `attempt` on `binding`
+    /// with its backoff.
+    async fn defer_retirement(&self, binding: BindingId, attempt: u32) -> Result<(), StoreError> {
+        let retry_at = OffsetDateTime::now_utc() + backoff(attempt);
+        self.inner.store.defer_retirement(binding, retry_at).await?;
+        if attempt >= RETIRE_MAX_ATTEMPTS {
+            tracing::warn!(%binding, "giving up on retiring the bot user");
+        }
+        Ok(())
     }
 
     /// Retires every bot user on this server that owes it and may be
