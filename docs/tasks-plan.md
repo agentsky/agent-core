@@ -2700,8 +2700,10 @@ Deliverables:
   and its bot user) and deletes the binding. That needs the owner's
   configuration token, which `/agent logout` deletes (T30). Without one,
   agentd disables the binding, stops handling its events, and tells the owner
-  to delete the app at api.slack.com. `pause` stops handling its events
-  without touching Slack.
+  to delete the app at api.slack.com. `pause` doesn't touch Slack and, as
+  in T14, leaves the binding active: the agent's app keeps verifying its
+  events and reading each message back, and the router refuses a message
+  addressed to it with "<name> is paused by its owner."
 - agentd's receiver of T28's `SlackInbound` (T30's `slack::Inbound`, which
   handles only the manager app's requests so far) builds a T29
   `SlackSurface` per active binding, with one `TeamDirectory` per team. Whenever a team's
