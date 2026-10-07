@@ -26,7 +26,10 @@ pub struct QueuedPost {
     pub to: ReplyTarget,
     /// The Markdown text to render and post.
     pub text: String,
-    /// The agent the post asks, when `agentctl ask-agent` queued it.
+    /// The agent the post asks, when `agentctl ask-agent` queued it. A
+    /// post without it that mentions an agent still starts that agent's
+    /// hop, and spends the turn's one hop to it, `(agent, turn)`, if it
+    /// goes out first.
     pub asks: Option<AgentId>,
 }
 
