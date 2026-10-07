@@ -27,7 +27,8 @@ compiler (and `cmake` on some targets), which the GitHub Ubuntu runners have.
 Consequences:
 
 - The workspace declares reqwest with `default-features = false` and only
-  `json`. Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
+  `json`, `form` and `query` (reqwest 0.13 made `form` and `query` opt-in
+  features). Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
   plain HTTP to `agentctl.internal` and doesn't, so its static musl build
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
@@ -165,7 +166,10 @@ concurrency group of their own: in `main`'s group, where
 `cancel-in-progress` is false, a scheduled run arriving while a push run is
 pending would cancel that pending run, and its badges would not be
 published. GitHub runs schedules on the default branch only, so the trigger
-takes effect once this workflow is on `main`.
+takes effect once this workflow is on `main`. GitHub also disables
+`schedule` triggers in a public repository after 60 days without repository
+activity, so on a quiet repository the weekly advisory run can stop and has
+to be re-enabled from the Actions tab.
 
 ## T03: core-types
 
