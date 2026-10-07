@@ -966,8 +966,10 @@ anything but whitespace or `>`. When a single construct is longer than the
 chunk and a cut has to fall inside it, the cut still avoids the inside of a
 name and the position just before an `@` that follows anything but
 whitespace or `>`: it falls right after the `@` instead, so neither chunk
-holds a shortened name or starts with a new one. Together with the final
-pass above, every `@` run in a chunk is a run of the rendered text, and
+holds a shortened name or starts with a new one. This holds inside a
+`<…>` token and after an unclosed `<` as well: the token scan first jumped
+past them without looking at their `@`s, so a forced cut in `<aaaaaaaa/@all`
+gave a chunk `@all`. Together with the final pass above, every `@` run in a chunk is a run of the rendered text, and
 those are already neutralized or follow a `/`, where the server reads no
 mention.
 
