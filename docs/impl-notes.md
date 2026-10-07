@@ -7262,7 +7262,9 @@ would let a bot post in any public channel, is off unless
 - The reminder is claimed with a 10-minute lease, like the relink notice, and
   tried at most five times (the relink notice allows 20); an owner no
   manager DM reaches waits. Its link is built before the claim, so an
-  attempt is never spent on a link that can't be made.
+  attempt is never spent on a link that can't be made. The owner's
+  identity in the workspace is looked up after the claim, so an owner with
+  none uses up the attempts rather than being read again on every sweep.
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
