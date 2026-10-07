@@ -549,6 +549,11 @@ fn bare_urls() {
                 "<https://x.io/a>`c`_b_",
             ),
             (
+                "a URL in a link label ends with the label",
+                "[https://x.io/a](https://y.io)*b*",
+                "https://x.io/a (<https://y.io>)_b_",
+            ),
+            (
                 "an entity that stays in a URL keeps emphasis in it",
                 "https://x.io/?a&amp;_b_/c",
                 "<https://x.io/?a&amp;_b_/c>",
@@ -1079,6 +1084,25 @@ fn long_bracket_runs_stay_linear() {
     let out = to_mrkdwn(&md, &NOBODY);
     assert!(out.starts_with("<https://x.io/>)"));
     assert_eq!(out.len(), md.len() + 2);
+}
+
+#[test]
+fn many_cut_bare_urls_stay_linear() {
+    let count = 10_000;
+    for (unit, link) in [
+        ("`c`https://a", "<https://a>"),
+        ("&lt;https://a", "<https://a>"),
+        ("&#32;https://a/", "<https://a/>"),
+    ] {
+        let md = unit.repeat(count);
+        let started = std::time::Instant::now();
+        let out = to_mrkdwn(&md, &NOBODY);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{unit:?}"
+        );
+        assert_eq!(out.matches(link).count(), count, "{unit:?}");
+    }
 }
 
 #[test]
