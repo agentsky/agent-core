@@ -569,6 +569,11 @@ fn bare_urls() {
                 "<https://x.io/_a> <https://y.io|b>_",
             ),
             (
+                "a URL a character reference joins to a word isn't one",
+                "&#97;https://x.io/*a* b",
+                "ahttps://x.io/_a_ b",
+            ),
+            (
                 "a broadcast after such a URL stays neutralized",
                 "https://x.io/_a_/b @here",
                 "<https://x.io/_a_/b> @\u{200B}here",
