@@ -27,7 +27,9 @@ orders the work. If a task has to deviate from the design, the same PR updates
    another task. If you find the task needs something that no task owns, add it
    to [Deferred work](#deferred-work) in the same PR rather than widening the
    change.
-5. Tick the task's box in [Task index](#task-index) in the same PR.
+5. Leave the task's box in [Task index](#task-index) unticked. It is ticked
+   when the PR merges, so a PR stacked on unmerged work never marks its task
+   done before its base lands.
 
 A task that grows past about 1,500 changed lines (lockfile and fixtures
 excluded) should be split. Say where you split it in the PR description, and
@@ -339,7 +341,7 @@ Every PR, in addition to its task's acceptance criteria:
   the rule they check.
 - `config/agentd.example.toml` and `README.md` are updated when the task adds
   configuration or an operator-visible step.
-- The task's box is ticked in the [Task index](#task-index).
+- The task's box in the [Task index](#task-index) is ticked when the PR merges.
 - The PR description links the task (`docs/tasks-plan.md#t07`), lists any
   deviation from the design or this plan, and lists what was verified live, if
   anything.
@@ -2749,8 +2751,10 @@ Deliverables:
   and its bot user) and deletes the binding. That needs the owner's
   configuration token, which `/agent logout` deletes (T30). Without one,
   agentd disables the binding, stops handling its events, and tells the owner
-  to delete the app at api.slack.com. `pause` stops handling its events
-  without touching Slack.
+  to delete the app at api.slack.com. `pause` doesn't touch Slack and, as
+  in T14, leaves the binding active: the agent's app keeps verifying its
+  events and reading each message back, and the router refuses a message
+  addressed to it with "<name> is paused by its owner."
 - agentd's receiver of T28's `SlackInbound` (T30's `slack::Inbound`, which
   handles only the manager app's requests so far) builds a T29
   `SlackSurface` per active binding, with one `TeamDirectory` per team. Whenever a team's
