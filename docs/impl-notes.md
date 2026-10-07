@@ -3007,6 +3007,11 @@ can't, and reqwest adds one.
   nothing (`no_gzip` and friends, in case a feature elsewhere in the
   workspace enables them), and honors the system proxy settings like `auth`'s
   client does.
+- A placeholder in a header other than the credential header, or in the
+  body, is forwarded as it came, on purpose: that is the plan's "every other
+  header untouched", and `never_substitutes_in_body` tests it. Upstream sees
+  only a placeholder, which is useless anywhere but from the bound sandbox
+  IP through this proxy.
 
 ### Streaming needs reqwest's `stream` feature
 
