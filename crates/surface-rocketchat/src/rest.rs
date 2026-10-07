@@ -79,6 +79,9 @@ const PASSWORD_LEN: usize = 48;
 /// The longest platform error description kept in a [`SurfaceError`].
 const MAX_DESCRIPTION: usize = 200;
 
+/// How `users.info` describes a user it doesn't know.
+const USER_NOT_FOUND: &str = "User not found.";
+
 /// Error codes that mean the caller may not do this.
 const FORBIDDEN_CODES: &[&str] = &[
     "error-action-not-allowed",
@@ -821,15 +824,22 @@ impl RestClient {
         Ok(found.user)
     }
 
-    /// `GET users.info`: a user by username. Roles come back as for
-    /// [`RestClient::user_info`]. An unknown username fails with
-    /// [`SurfaceError::Api`], since Rocket.Chat reports it without an error
-    /// code.
-    pub async fn user_by_username(&self, username: &str) -> Result<User> {
-        let found: UserEnvelope = self
-            .call(Call::get("users.info").query("username", username))
-            .await?;
-        Ok(found.user)
+    /// `GET users.info`: a user by username, or `None` if Rocket.Chat
+    /// knows no user of that name. Roles come back as for
+    /// [`RestClient::user_info`].
+    ///
+    /// Rocket.Chat answers an unknown username with HTTP 400 and the error
+    /// `User not found.`, without a code. Any other failure, such as a 5xx,
+    /// a 429 or a transport error, stays an error.
+    pub async fn user_by_username(&self, username: &str) -> Result<Option<User>> {
+        match self
+            .call::<UserEnvelope>(Call::get("users.info").query("username", username))
+            .await
+        {
+            Ok(found) => Ok(Some(found.user)),
+            Err(SurfaceError::Api(description)) if description == USER_NOT_FOUND => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     /// `POST im.create`: opens (or finds) the direct message with the user
