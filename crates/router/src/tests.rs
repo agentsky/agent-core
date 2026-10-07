@@ -41,6 +41,7 @@ struct FakeView {
     bans_unavailable: bool,
     thread: ThreadBudget,
     thread_unavailable: bool,
+    members_unavailable: bool,
 }
 
 impl RouterView for FakeView {
@@ -56,8 +57,8 @@ impl RouterView for FakeView {
         self.refs.get(msg).cloned()
     }
 
-    fn member_for(&self, key: &MemberKey) -> Option<MemberId> {
-        self.members.get(key).copied()
+    fn member_for(&self, key: &MemberKey) -> Option<Option<MemberId>> {
+        (!self.members_unavailable).then(|| self.members.get(key).copied())
     }
 
     fn link_state(&self, member: MemberId) -> LinkState {
@@ -239,7 +240,7 @@ impl World {
 
     fn requester(&self, key: &MemberKey) -> Requester {
         Requester {
-            member: self.view.member_for(key),
+            member: self.view.member_for(key).flatten(),
             key: key.clone(),
         }
     }
@@ -274,7 +275,7 @@ impl World {
             Some(attribution) if from_agent => {
                 let Requester { member, key } = attribution.requester.clone();
                 Requester {
-                    member: member.or_else(|| self.view.member_for(&key)),
+                    member: member.or_else(|| self.view.member_for(&key).flatten()),
                     key,
                 }
             }
@@ -286,7 +287,7 @@ impl World {
     fn member_target(&self, key: &MemberKey) -> PolicyTarget {
         PolicyTarget::Member {
             key: key.clone(),
-            member: self.view.member_for(key),
+            member: self.view.members.get(key).copied(),
         }
     }
 
@@ -417,12 +418,22 @@ fn hop_bills_the_inherited_requester_never_the_thread_starter_or_posting_agents_
         conv: conv("C1"),
         id: "1.0".into(),
     };
+    w.view.refs.insert(
+        root.clone(),
+        Attribution {
+            agent: w.b,
+            requester: w.requester(&w.owner_key.clone()),
+            hop: Hop::ZERO,
+        },
+    );
+    w.view.agent_posts.insert((root.clone(), w.b));
     event.thread_root = Some(root.id.clone());
     event.reply_to = Some(root);
     assert_eq!(
         w.route(&event),
         Decision::LinkPrompt { requester },
-        "an unlinked requester gets a link prompt, not B's owner's credential"
+        "an unlinked requester gets a link prompt, not the credential of B's owner \
+         or of the linked owner whose turn started the thread"
     );
 
     w.view.community_key = true;
@@ -1512,6 +1523,70 @@ fn missing_ban_answer_refuses_instead_of_allowing() {
 }
 
 #[test]
+fn owner_dm_with_an_unanswered_member_refuses_instead_of_running_as_a_stranger() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    w.view.members_unavailable = true;
+    assert_eq!(
+        w.route(&w.dm(&w.owner_key)),
+        refused(RefuseReason::PolicyUnavailable),
+        "never the community key on the public DM volume"
+    );
+    for event in [
+        w.mention(&w.owner_key),
+        w.mention(&w.linked_key),
+        w.mention(&w.stranger_key),
+        w.dm(&w.linked_key),
+    ] {
+        assert_eq!(w.route(&event), refused(RefuseReason::PolicyUnavailable));
+    }
+}
+
+#[test]
+fn hop_with_an_unrecorded_member_refuses_when_the_member_is_unanswered() {
+    let mut w = World::new();
+    w.view.community_key = true;
+    let unrecorded = Requester {
+        member: None,
+        key: w.owner_key.clone(),
+    };
+    let event = w.b_mentions_a(unrecorded, Hop::ZERO);
+    w.view.members_unavailable = true;
+    assert_eq!(w.route(&event), refused(RefuseReason::PolicyUnavailable));
+
+    let recorded = Requester {
+        member: Some(w.linked),
+        key: w.linked_key.clone(),
+    };
+    let event = w.b_mentions_a(recorded.clone(), Hop::ZERO);
+    assert_eq!(
+        w.route(&event),
+        run(
+            recorded,
+            Hop(1),
+            CredentialRef::Member(w.linked),
+            ScopeKind::Channel
+        ),
+        "a recorded member needs no member lookup"
+    );
+}
+
+#[test]
+fn precedence_unanswered_member_after_ignores_and_paused() {
+    let mut w = World::new();
+    w.view.members_unavailable = true;
+    assert_eq!(
+        w.route(&w.message(&w.linked_key)),
+        ignored(IgnoreReason::NotAddressed)
+    );
+    w.view.states.insert(w.a, AgentState::Paused);
+    assert_eq!(
+        w.route(&w.mention(&w.linked_key)),
+        refused(RefuseReason::Paused)
+    );
+}
+
+#[test]
 fn missing_policy_refuses_instead_of_allowing_even_for_the_owner() {
     let mut w = World::new();
     w.view.community_key = true;
@@ -1802,7 +1877,9 @@ fn check_invariants(case: Case) -> usize {
             let requester = Requester {
                 member: w
                     .view
-                    .member_for(&requester_key)
+                    .members
+                    .get(&requester_key)
+                    .copied()
                     .filter(|_| case.recorded_member),
                 key: requester_key,
             };
@@ -1934,10 +2011,11 @@ fn check_invariants(case: Case) -> usize {
 
 #[test]
 fn model_policy_maps_plans_and_falls_back_to_the_default() {
-    let policy = ModelPolicy::new("claude-sonnet").with_plan("max", "claude-opus");
-    assert_eq!(policy.model_for(Some("max")), "claude-opus");
-    assert_eq!(policy.model_for(Some("Max")), "claude-sonnet");
-    assert_eq!(policy.model_for(Some("pro")), "claude-sonnet");
+    let policy = ModelPolicy::new("claude-sonnet").with_plan("claude_max", "claude-opus");
+    assert_eq!(policy.model_for(Some("claude_max")), "claude-opus");
+    assert_eq!(policy.model_for(Some("Claude_Max")), "claude-sonnet");
+    assert_eq!(policy.model_for(Some("max")), "claude-sonnet");
+    assert_eq!(policy.model_for(Some("claude_pro")), "claude-sonnet");
     assert_eq!(policy.model_for(None), "claude-sonnet");
     assert_eq!(policy.default_model(), "claude-sonnet");
 }
@@ -1946,6 +2024,6 @@ fn model_policy_maps_plans_and_falls_back_to_the_default() {
 fn model_policy_configuration_needs_a_default_and_rejects_unknown_keys() {
     let only_default: ModelPolicy = toml::from_str(r#"default = "claude-sonnet""#).unwrap();
     assert_eq!(only_default, ModelPolicy::new("claude-sonnet"));
-    assert!(toml::from_str::<ModelPolicy>(r#"plans = { max = "claude-opus" }"#).is_err());
+    assert!(toml::from_str::<ModelPolicy>(r#"plans = { claude_max = "claude-opus" }"#).is_err());
     assert!(toml::from_str::<ModelPolicy>("default = \"a\"\nmodel = \"b\"").is_err());
 }
