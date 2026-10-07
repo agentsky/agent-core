@@ -762,7 +762,9 @@ impl Pipeline {
 
     /// Looks the session up, builds the turn message and runs the turn,
     /// once more on a session reset in between. What the turn message
-    /// recorded is forgotten when the turn didn't run.
+    /// recorded is forgotten when the turn didn't run, which includes a
+    /// process that crashed or timed out before the CLI read the message
+    /// (no `init` line): that is [`PipelineError::Unread`].
     async fn turn(
         &self,
         event: &InboundEvent,
@@ -805,6 +807,10 @@ impl Pipeline {
             };
             let turn_id = request.turn;
             match sessions.run_turn(session.id, request).await {
+                Ok(report) if unread(&report.outcome) => {
+                    built.forget(store, session.id).await;
+                    return Err(PipelineError::Unread);
+                }
                 Ok(report) => return Ok((session, turn_id, report)),
                 Err(err) => {
                     built.forget(store, session.id).await;
@@ -1125,9 +1131,20 @@ impl Delivery<'_> {
     }
 }
 
+/// Whether a turn that ended with `outcome` ended before the CLI read its
+/// message: it crashed or timed out without printing `init`.
+fn unread(outcome: &TurnOutcome) -> bool {
+    match outcome {
+        TurnOutcome::Crashed { stats, .. } | TurnOutcome::TimedOut { stats } => !stats.init_seen,
+        TurnOutcome::Finished(_) => false,
+    }
+}
+
 /// Why handling a message failed.
 #[derive(Debug, thiserror::Error)]
 enum PipelineError {
+    #[error("the CLI ended before it read the turn's message")]
+    Unread,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -1153,6 +1170,27 @@ impl Sink<InboundEvent> for PipelineSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_crash_or_timeout_before_init_leaves_the_message_unread() {
+        let before = runner::TurnStats::default();
+        let after = runner::TurnStats {
+            init_seen: true,
+            ..runner::TurnStats::default()
+        };
+        assert!(unread(&TurnOutcome::Crashed {
+            exit_code: Some(70),
+            stats: before.clone(),
+        }));
+        assert!(unread(&TurnOutcome::TimedOut {
+            stats: before.clone()
+        }));
+        assert!(!unread(&TurnOutcome::Crashed {
+            exit_code: Some(70),
+            stats: after.clone(),
+        }));
+        assert!(!unread(&TurnOutcome::TimedOut { stats: after }));
+    }
 
     #[test]
     fn a_long_reply_is_cut_on_a_character_boundary_with_a_note() {

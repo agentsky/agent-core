@@ -5540,7 +5540,12 @@ included), the busy line, the notice that part of a reply was lost, and
 the one a shutdown posts. Nothing reads one: no turn is billed for it, and
 a reply in its thread replies to the thread's root, not to the notice. A
 turn's own failure message (a usage limit, a login that expired, a crash, a
-timeout) comes from a turn that ran, and is recorded as its reply.
+timeout) comes from a turn that ran, and is recorded as its reply. A crash
+or timeout before the CLI printed `init` is not one: the CLI never read the
+message, so it counts as a failure before the turn reached the model. What
+its turn message recorded is forgotten, so the next turn shows the request
+again, and its notice has no row. `fake-claude`'s `Turn::crash_at_start`
+plays that crash.
 
 The files a turn uploads have no row either: `Surface::upload` returns no
 message, and Slack's `files.completeUploadExternal` doesn't say which

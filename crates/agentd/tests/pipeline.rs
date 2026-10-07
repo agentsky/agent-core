@@ -1236,6 +1236,55 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
 }
 
 #[tokio::test]
+async fn a_request_whose_turn_crashed_before_the_cli_read_it_reaches_the_next_turn() {
+    let stack = start().await;
+    let store = stack.store();
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::crash_at_start());
+    let mut first = stack.event("alice", "GENERAL", ConvKind::Channel, "r1", None, &[BOT]);
+    first.text = "@UBOT do X".into();
+    stack.handle(first).await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("r1")));
+    assert_eq!(sent[0].1, FAILED_TEXT);
+    assert_eq!(
+        store.posted_message_ref(&sent[0].2).await.unwrap(),
+        None,
+        "the failure isn't recorded as the agent's reply"
+    );
+
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT do X"),
+            said(sent[0].2.id.as_str(), BOT, FAILED_TEXT),
+            said("r2", "alice", "@UBOT try again"),
+        ],
+    );
+    stack.next_turn(Turn::reply("Done."));
+    let before = stack.mock.calls().len();
+    let mut again = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "r2",
+        Some("r1"),
+        &[BOT],
+    );
+    again.text = "@UBOT try again".into();
+    stack.handle(again).await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "Done.");
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1, "the crashed turn reached no upstream");
+    assert!(bodies[0].contains("do X"), "{}", bodies[0]);
+    assert!(bodies[0].contains("try again"), "{}", bodies[0]);
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_message_said_while_a_turn_ran_reaches_the_next_turn() {
     let stack = start().await;
     let first = stack.answered_root("r1", "First.").await;
