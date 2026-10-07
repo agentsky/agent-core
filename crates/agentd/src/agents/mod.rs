@@ -376,7 +376,9 @@ impl RocketChatAgents {
     /// a crash or failure between `users.create` and
     /// [`Store::set_binding_bot_user`], and returns the bot user the
     /// binding then records. Otherwise, also when the manager may not see
-    /// emails, the username is forgotten and nothing is owed.
+    /// emails, the username is forgotten and nothing is owed; a user who
+    /// shows no email at all is logged as a warning, since a manager
+    /// without `view-full-other-user-info` sees every user that way.
     async fn adopt_orphan(
         &self,
         binding: BindingId,
@@ -384,6 +386,9 @@ impl RocketChatAgents {
     ) -> Result<Option<UserId>, StoreError> {
         let store = &self.inner.store;
         let email = bot_email(binding);
+        if user.emails.is_empty() {
+            tracing::warn!(%binding, username = %user.username, "the user named by an abandoned creation shows no email, so it can't be adopted; does the manager lack view-full-other-user-info?");
+        }
         if !user
             .emails
             .iter()
@@ -467,7 +472,7 @@ impl RocketChatAgents {
                     return Ok(false);
                 }
                 Err(err) => {
-                    tracing::debug!(%binding, attempt, error = %err, "couldn't look up the bot user of an abandoned creation");
+                    tracing::warn!(%binding, attempt, error = %err, "couldn't look up the bot user of an abandoned creation");
                     self.defer_retirement(binding, attempt).await?;
                     return Ok(false);
                 }
