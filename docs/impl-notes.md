@@ -699,10 +699,15 @@ scan of one text node linked only the part before:
 kept such URLs whole.
 
 **Solution.** While parsing, the renderer measures each bare URL in the source
-from where a text node starts it. Emphasis or strikethrough with a delimiter
-inside such a range is replaced by its children, with its delimiters as
-text, so the URL is one text run again and is linked whole. Markup that only
-wraps a URL, as in `*https://x.io/#/y*`, is not touched.
+from where a text node starts it, and ends it early where the rendered text
+stops being a URL: at a character reference or escape that renders as a
+space, `<`, `>` or `|` (`&lt;`), and at anything other than text and
+emphasis, such as inline code. Emphasis or strikethrough whose opening
+delimiter is inside such a range is replaced by its children, with its
+delimiters as text, so the URL is one text run again and is linked whole.
+Markup that opens before a URL wraps it and is not touched, even when the
+source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
+as `*<https://x.io/a>*'s`.
 
 ### CommonMark disagrees with some qm-core regex cases
 
@@ -1005,8 +1010,10 @@ anything but whitespace or `>`. When a single construct is longer than the
 chunk and a cut has to fall inside it, the cut still avoids the inside of a
 name and the position just before an `@` that follows anything but
 whitespace or `>`: it falls right after the `@` instead, so neither chunk
-holds a shortened name or starts with a new one. Together with the final
-pass above, every `@` run in a chunk is a run of the rendered text, and
+holds a shortened name or starts with a new one. This holds inside a
+`<…>` token and after an unclosed `<` as well: the token scan first jumped
+past them without looking at their `@`s, so a forced cut in `<aaaaaaaa/@all`
+gave a chunk `@all`. Together with the final pass above, every `@` run in a chunk is a run of the rendered text, and
 those are already neutralized or follow a `/`, where the server reads no
 mention.
 
@@ -1239,6 +1246,15 @@ is judged by `Command::is_secret_bearing` alone, so a persona mentioning
 `sk-ant-` is still just a persona. Error messages still never repeat the
 text.
 
+A pasted login code counts whatever the verb, in both forms T09's
+`parse_pasted` accepts: a word with a `code=` query parameter, such as the
+callback URL, and `<code>#<state>` whose parts use the login's token
+alphabet, printable ASCII other than `#`, `&`, `?`, `=` and `|`, so
+`logn abc.def~1#state` and `logn ABC123%2F#state` count. A URL with a
+fragment and no `code=` (`https://x.io/r#main`) doesn't, since the login
+reads a URL only by its query. Any other `word#word` does, so `PR#42` is a
+false positive the rule accepts.
+
 ## T09: auth
 
 ### Claude Code 2.1.285's OAuth requests, read from the binary
@@ -1445,6 +1461,13 @@ ID, or `scopes` widened after members linked), so `auth` asks the member to
 log in again rather than retrying forever; and the plan's wording ("HTTP
 400, 401 or 403") is narrowed to these codes. Tests cover each code, the
 account-on-hold body, and 4xx responses that must not break the link.
+
+OAuth response bodies are read up to 64 KiB, by `Content-Length` and as
+they stream in. An oversized failure keeps its status, as
+`AuthError::Status` without an OAuth code, so an oversized 400, 401 or 403
+to the code exchange is still `CodeRejected`, and an oversized refresh
+failure is transient: its body isn't read, so it can't say the token is
+dead. Only an oversized success is `InvalidResponse`.
 
 ### The plan was read while holding the member's lock
 
