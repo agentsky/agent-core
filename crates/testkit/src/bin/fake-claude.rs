@@ -9,6 +9,7 @@ use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, CommandFactory, Parser, error::ErrorKind};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use testkit::claude::{
     API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, REPLY_COST_USD, SCRIPT_ENV, Turn,
@@ -94,14 +95,19 @@ impl Args {
 }
 
 enum Credential {
-    ApiKey(String),
-    OAuth(String),
+    ApiKey(SecretString),
+    OAuth(SecretString),
     Missing,
 }
 
 impl Credential {
     fn from_env() -> Self {
-        let var = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let var = |name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(SecretString::from)
+        };
         match (var("ANTHROPIC_API_KEY"), var("CLAUDE_CODE_OAUTH_TOKEN")) {
             (Some(key), _) => Self::ApiKey(key),
             (None, Some(token)) => Self::OAuth(token),
@@ -224,6 +230,9 @@ async fn run(args: Args) -> Result<ExitCode, String> {
         session.total_cost_usd.set(session.restored_cost()?);
     }
 
+    if session.crashes_at_start() {
+        std::process::exit(CRASH_EXIT_CODE);
+    }
     let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
     let mut failed = false;
     while let Some(line) = lines
@@ -275,10 +284,7 @@ impl Session {
             let text = format!("API Error: {}", err.message);
             return self.fail(&text, err.kind, err.status, started);
         }
-        let turns: Vec<Turn> = std::fs::read(&self.script)
-            .map_err(|err| err.to_string())
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()))
-            .map_err(|err| format!("reading the script {}: {err}", self.script.display()))?;
+        let turns = self.script_turns()?;
         let Some(turn) = turns.get(index) else {
             let text = format!("fake-claude: the script has no turn {index}");
             return self.fail(&text, "invalid_request", None, started);
@@ -373,6 +379,23 @@ impl Session {
         writeln!(file, "{line}").map_err(|err| format!("writing the transcript: {err}"))
     }
 
+    fn script_turns(&self) -> Result<Vec<Turn>, String> {
+        std::fs::read(&self.script)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()))
+            .map_err(|err| format!("reading the script {}: {err}", self.script.display()))
+    }
+
+    /// Whether the script turn the next message would play has
+    /// `crash_at_start`. A script or transcript that can't be read is left
+    /// to that turn to report.
+    fn crashes_at_start(&self) -> bool {
+        let (Ok(index), Ok(turns)) = (self.user_turns(), self.script_turns()) else {
+            return false;
+        };
+        turns.get(index).is_some_and(|turn| turn.crash_at_start)
+    }
+
     fn user_turns(&self) -> Result<usize, String> {
         let file = match File::open(&self.transcript) {
             Ok(file) => file,
@@ -426,10 +449,10 @@ impl Session {
             }));
         let request = match &self.credential {
             Credential::ApiKey(key) => request
-                .header("x-api-key", key)
+                .header("x-api-key", key.expose_secret())
                 .header("anthropic-beta", API_KEY_BETA),
             Credential::OAuth(token) => request
-                .bearer_auth(token)
+                .bearer_auth(token.expose_secret())
                 .header("anthropic-beta", OAUTH_BETA),
             Credential::Missing => {
                 return Err(ApiError {

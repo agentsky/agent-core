@@ -729,7 +729,37 @@ fn secret_bearing_variants_redact_themselves_in_debug() {
             assert!(!debug.contains(secret), "{debug}");
             assert!(!debug.contains("SECRET"), "{debug}");
         }
-        assert!(debug.contains("REDACTED"), "{debug}");
+        assert!(debug.contains(command.name()), "{debug}");
+    }
+}
+
+#[test]
+fn debug_prints_the_command_name_and_no_free_text() {
+    for text in ["persona helper PERSONA-TEXT", "admin ban @alice BAN-REASON"] {
+        let command = ok(text);
+        let debug = format!("{command:?} {command:#?}");
+        assert!(debug.contains(command.name()), "{debug}");
+        assert!(!debug.contains("TEXT"), "{debug}");
+        assert!(!debug.contains("REASON"), "{debug}");
+    }
+}
+
+#[test]
+fn admin_command_debug_prints_the_variant_and_no_free_text() {
+    for (text, variant) in [
+        ("admin ban @alice BAN-REASON", "Ban"),
+        ("admin unban @alice", "Unban"),
+        ("admin api-key set key-SECRET", "ApiKey"),
+        ("admin slack", "Slack"),
+    ] {
+        let Command::Admin(admin) = ok(text) else {
+            panic!("{text} is not an admin command");
+        };
+        let debug = format!("{admin:?} {admin:#?}");
+        assert!(debug.contains(variant), "{debug}");
+        assert!(!debug.contains("REASON"), "{debug}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        assert!(!debug.contains("alice"), "{debug}");
     }
 }
 
@@ -874,6 +904,26 @@ fn misspelt_secret_bearing_commands_are_still_secret_bearing() {
 }
 
 #[test]
+fn a_pasted_login_code_is_secret_bearing_under_any_verb() {
+    for text in [
+        "logn abc123#state",
+        "lgoin abc123#state-xyz",
+        "frobnicate x_Y-1#Z_2",
+        "pause helper abc#def.",
+        "persona Bad-Name (abc123#state)",
+        "lgoin https://console.anthropic.com/oauth/code/callback?code=abc123&state=xyz",
+        "frobnicate <https://x.io/cb?state=s&code=abc123|link>",
+        "logn abc.def~1#state",
+        "logn abc+/#state",
+        "logn ABC123%2F#state",
+    ] {
+        let err = fail(text);
+        assert!(err.is_secret_bearing(), "{text:?}");
+        assert!(!err.to_string().contains("abc123#state"), "{text:?}");
+    }
+}
+
+#[test]
 fn errors_holding_a_known_token_prefix_are_secret_bearing() {
     for text in [
         "sk-ant-api03-SECRET",
@@ -902,6 +952,15 @@ fn errors_without_a_secret_are_not_secret_bearing() {
         "help admin",
         "frobnicate",
         "logn abc123",
+        "logn #general",
+        "logn abc#",
+        "logn a#b#c",
+        "skill add Bad-Name https://x.io/r#main",
+        "skill add Bad-Name https://x.io/r?ref=main#main",
+        "skill add Bad-Name HTTPS://x.io/r#main",
+        "skill add Bad-Name Http://x.io/r#main",
+        "logn https://x.io/a?decode=1",
+        "allow Bad-Name <#C123|general>",
         "logout now",
         "pause Bad",
         "api-key",

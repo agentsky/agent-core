@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::web::{PageRequest, map_error};
+use surface_slack::web::{Message, MessagesPage, PageRequest, map_error};
 use surface_slack::{SlackClient, WebApi};
 use testkit::TempDir;
 use wiremock::matchers::{header, method, path};
@@ -567,6 +567,28 @@ async fn a_refused_upload_shares_nothing() {
 }
 
 #[tokio::test]
+async fn a_rate_limited_upload_is_rate_limited() {
+    let (server, api) = server().await;
+    mount_upload_flow(&server).await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex("^/upload/v1/"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "7"))
+        .mount(&server)
+        .await;
+    let dir = TempDir::new("surface-slack");
+    let err = api
+        .upload_files(&channel(), None, &[staged(&dir, "a.txt", "x")])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SurfaceError::RateLimited {
+            retry_after: Duration::from_secs(7)
+        }
+    );
+}
+
+#[tokio::test]
 async fn an_upload_of_nothing_or_of_a_missing_file_sends_nothing() {
     let (server, api) = server().await;
     assert_eq!(
@@ -745,6 +767,46 @@ async fn http_failures_and_unreadable_bodies_are_errors() {
         "{err:?}"
     );
     assert_eq!(requests(&server).await.len(), 4, "no redirect was followed");
+}
+
+#[tokio::test]
+async fn an_http_failure_with_an_error_code_maps_the_code() {
+    let (server, api) = server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth.test"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"ok": false, "error": "invalid_arguments"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/bots.info"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"ok": false, "error": "Bad <b>things</b>"})),
+        )
+        .mount(&server)
+        .await;
+    assert_eq!(
+        api.auth_test().await.unwrap_err(),
+        SurfaceError::Api("invalid_arguments".into())
+    );
+    assert_eq!(
+        api.user_info(&"U1".into()).await.unwrap_err(),
+        SurfaceError::Unauthorized
+    );
+    assert_eq!(
+        api.bot_info("B1").await.unwrap_err(),
+        SurfaceError::Api("unknown_error".into())
+    );
 }
 
 #[tokio::test]
@@ -1432,5 +1494,28 @@ mod apps {
             .await
             .unwrap_err();
         assert_eq!(err, SurfaceError::Api("invalid_code".into()));
+    }
+}
+
+#[test]
+fn message_debug_shows_the_text_length_not_the_text() {
+    let message = Message {
+        ts: MessageId::from("1.2"),
+        user: Some(UserId::from("U1")),
+        bot_id: None,
+        is_bot: false,
+        subtype: None,
+        text: "MESSAGE-TEXT".into(),
+        thread_ts: None,
+        files: Vec::new(),
+    };
+    let page = MessagesPage {
+        messages: vec![message],
+        next_cursor: None,
+    };
+    let debug = format!("{page:?} {page:#?}");
+    assert!(!debug.contains("MESSAGE-TEXT"), "{debug}");
+    for shown in ["1.2", "U1", "text_len: 12", "files_len: 0", "is_bot: false"] {
+        assert!(debug.contains(shown), "{shown}: {debug}");
     }
 }

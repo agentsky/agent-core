@@ -56,7 +56,9 @@ pub use egress::{
     SystemNetwork,
 };
 pub use hooks::{CommunityKey, CommunityKeyError, FixedKey, Observation, ProxyObserver};
-pub use proxy::{CONNECT_TIMEOUT, CredProxy, DEFAULT_UPSTREAM, ProxyError, check_upstream};
+pub use proxy::{
+    CONNECT_TIMEOUT, CredProxy, DEFAULT_UPSTREAM, ProxyError, check_upstream, is_default_upstream,
+};
 pub use registry::{
     API_KEY_PREFIX, Placeholder, PlaceholderId, Registry, RegistryError, SUBSCRIPTION_PREFIX,
 };
