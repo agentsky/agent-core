@@ -2593,10 +2593,11 @@ is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
 Rocket.Chat doesn't answer is an attempt that failed, deferred with the
 retirement's backoff, so a creation that died because Rocket.Chat was
 unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
-answers an unknown username without an error code, so a creation that
-never got as far as `users.create` is indistinguishable from an outage and
-spends the retirement's attempts (about three days of `users.info` calls)
-before it is given up. The adoption needs the manager's
+answers an unknown username with HTTP 400 and the error `User not found.`,
+without an error code; `user_by_username` reads that answer as no user, so
+the username of a creation that never got as far as `users.create` is
+forgotten at the first lookup, like another's email, while a transport
+error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
 out. A bot user still missed has no token and no password anyone knows, so
 it can't be used, but it keeps its username until an admin removes it.
@@ -5036,12 +5037,15 @@ pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
 panicking message doesn't stop its lane. The set is behind a
 `std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
 a Rocket.Chat connection's is on every reconnect, can't leave a lane
-created without its task. Queueing checks that the pipeline is open under
-that lock and never starts a task once it is closed, and a lane starts none
-of its waiting messages once it is closed: a message that passed
-`dispatch`'s check just before a shutdown, or waited behind a running
-turn, is dropped as one sent after closing is, so the drain waits only for
-the turns already running. `drain` polls the set
+created without its task. Queueing checks that the pipeline is open, adds
+the message to its lane and starts a new lane's task all under the lanes'
+lock, and `close` sets the flag under the same lock, so a message is either
+queued before the close, in a lane whose task the drain waits for, or
+dropped as one sent after closing is, even one that passed `dispatch`'s
+check just before. Messages accepted before a shutdown, including those
+waiting behind a running turn, are answered within the drain: Rocket.Chat
+has marked them processed and Slack has acknowledged them, so dropping them
+would lose them silently. `drain` polls the set
 under the lock without holding it across a wait, so a drain cut off by its
 timeout leaves the tasks for `cut_short`, which takes the set and shuts it
 down. On shutdown `Server::run` stops the public listener and the chat
@@ -5055,8 +5059,8 @@ turn's working emoji is kept until its reply, or its failure notice, has
 gone out, so a reply stuck on a slow post isn't lost without a word. That
 is the simplest option that tells people: the turns and their queue stay in
 memory rather than the store, so a crash, unlike a shutdown, still loses
-them silently, and messages still waiting in a lane when the pipeline
-closes are dropped without a word, since no decision was made about them. The working
+them silently, and messages still waiting in a lane at the timeout are
+dropped without a word, since no decision was made about them. The working
 emoji is held by a guard, so a panicking turn takes it off too.
 
 ### An agent's post can arrive before its attribution
@@ -5328,9 +5332,10 @@ write, for no gain. The follow-up itself holds a strong `SessionControl`
 handle until its resets end, so on shutdown the `SessionManager`'s inner
 state, whose drop aborts the reaper and the container event follower, can
 outlive the `Turns` handle while a reset waits behind a long turn; that is
-bounded by the drain, which drops a follow-up still waiting when it ends. The follow-up lives only in memory: if the instance
-dies, the queued resets die with it and nothing is reset, which the owner
-sees in `sessions` and can send again.
+bounded by the drain, which drops a follow-up still waiting when it ends.
+The follow-up lives only in memory: if the instance dies, the queued resets
+die with it and nothing is reset, which the owner sees in `sessions` and can
+send again.
 
 The follow-up isn't polled while the reply is being sent. A reset queued on
 a busy session whose turn ends in that window is handed the session's lock,
