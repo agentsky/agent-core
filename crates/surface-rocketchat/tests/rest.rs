@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime};
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType};
+use surface_rocketchat::rest::{Credentials, Message, NewBotUser, RestClient, RoomType};
 use testkit::TempDir;
 use testkit::rocketchat::FakeRest;
 use wiremock::matchers::path;
@@ -970,7 +970,7 @@ async fn upload_errors_map_at_each_step() {
     let as_bot = bot(&client, "helper").await;
     assert_eq!(
         as_bot.upload(&conv("G1"), None, &file).await,
-        Err(SurfaceError::Forbidden("unauthorized".into()))
+        Err(SurfaceError::Forbidden("forbidden".into()))
     );
     fake.fail(
         "rooms.mediaConfirm",
@@ -1493,6 +1493,22 @@ fn debug_output_never_shows_secrets() {
     let client = RestClient::new("https://chat.example.com", creds.clone()).unwrap();
     assert!(!format!("{creds:?}").contains("super-secret-token"));
     assert!(!format!("{client:?}").contains("super-secret-token"));
+}
+
+#[test]
+fn message_debug_shows_the_text_length_not_the_text() {
+    let message: Message = serde_json::from_value(serde_json::json!({
+        "_id": "m1",
+        "rid": "r1",
+        "msg": "MESSAGE-TEXT",
+        "ts": "2026-10-07T08:00:00.000Z",
+        "u": { "_id": "u1", "username": "alice" },
+    }))
+    .unwrap();
+    let debug = format!("{message:?} {message:#?}");
+    assert!(!debug.contains("MESSAGE-TEXT"), "{debug}");
+    assert!(debug.contains("text_len: 12"), "{debug}");
+    assert!(debug.contains("m1"), "{debug}");
 }
 
 #[tokio::test]
