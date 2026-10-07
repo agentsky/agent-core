@@ -494,3 +494,13 @@ fn problems_never_repeat_the_content() {
         assert!(!err.to_string().contains(secret), "{err}");
     }
 }
+
+#[test]
+fn debug_shows_the_description_length_not_the_description() {
+    let manifest =
+        parse_skill_file("---\nname: pdf-tools\ndescription: the secret plan\n---\n").unwrap();
+    let debug = format!("{manifest:?}");
+    assert!(!debug.contains("secret plan"), "{debug}");
+    assert!(debug.contains("description_len: 15"), "{debug}");
+    assert!(debug.contains("pdf-tools"), "{debug}");
+}
