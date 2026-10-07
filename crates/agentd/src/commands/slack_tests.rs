@@ -1977,6 +1977,39 @@ async fn a_card_update_that_fails_on_the_way_is_tried_again() {
 }
 
 #[tokio::test]
+async fn a_claim_that_cannot_be_released_does_not_stop_the_pass() {
+    use sqlx::Connection as _;
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&h.slack)
+        .await;
+    approved_with_a_card(&h).await;
+    let mut db = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_card_release BEFORE UPDATE OF card_closed_at ON consents \
+         WHEN NEW.card_closed_at IS NULL BEGIN SELECT RAISE(FAIL, 'injected write failure'); END;",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            h.consents.close_cards(h.commands.replies()).await.unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        h.calls("chat.update").await.len(),
+        1,
+        "the claim stays held"
+    );
+}
+
+#[tokio::test]
 async fn a_card_the_platform_refuses_to_update_is_not_tried_again() {
     let h = slack_harness().await;
     Mock::given(method("POST"))

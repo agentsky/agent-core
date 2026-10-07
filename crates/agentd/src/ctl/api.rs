@@ -655,7 +655,11 @@ async fn lock(
 /// handle before anyone's name. A turn asks each agent once: the other
 /// agent takes one turn for this turn however many of its posts mention
 /// it. Only an earlier `ask-agent` counts as asking, never an
-/// `agentctl post` whose text looks like one.
+/// `agentctl post` whose text looks like one. Such a plain post that
+/// mentions the agent still spends the hop: the agent runs once per
+/// `(agent, turn)`, on whichever of the turn's posts mentioning it comes
+/// first, so a plain post queued before the `ask-agent` is the one it
+/// answers, and the task goes unread.
 async fn ask_agent(
     State(ctl): State<Ctl>,
     Caller(caller): Caller,
