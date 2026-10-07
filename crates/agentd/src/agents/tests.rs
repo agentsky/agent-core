@@ -273,13 +273,73 @@ async fn an_abandoned_creations_unrecorded_bot_is_found_by_its_email_and_retired
     );
 
     assert_eq!(h.agents.abandon_stale().await.unwrap(), 2);
+    assert_eq!(h.agents.retire_pending().await.unwrap(), 1);
     let row = h.store.binding(binding).await.unwrap().unwrap();
     assert_eq!(row.bot_user, Some(made.id));
     let other_row = h.store.binding(other).await.unwrap().unwrap();
     assert_eq!(other_row.bot_user, None, "someone else's user isn't taken");
-    assert_eq!(h.agents.retire_pending().await.unwrap(), 1);
+    assert_eq!(other_row.bot_username, None, "and is looked up only once");
     assert!(!h.fake.user("helper").unwrap().active);
     assert!(h.fake.user("writer").unwrap().active);
+    assert_eq!(h.agents.retire_pending().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn an_unrecorded_bot_whose_lookup_failed_is_looked_up_again_and_retired() {
+    let h = harness().await;
+    let old = OffsetDateTime::now_utc() - CREATION_LEASE - time::Duration::seconds(5);
+    let binding = h.creating("helper", old).await;
+    assert!(
+        h.store
+            .set_binding_bot_username(binding, "helper")
+            .await
+            .unwrap()
+    );
+    let email = bot_email(binding);
+    let (made, _) = h
+        .agents
+        .rest()
+        .create_bot_user(&NewBotUser {
+            username: "helper",
+            name: "helper",
+            email: &email,
+        })
+        .await
+        .unwrap();
+    Mock::given(path("/api/v1/users.info"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(h.fake.server())
+        .await;
+
+    assert_eq!(h.agents.abandon_stale().await.unwrap(), 1);
+    assert_eq!(h.agents.retire_pending().await.unwrap(), 0);
+    assert_eq!(h.fake.requests("users.info").await.len(), 1);
+    assert!(h.fake.user("helper").unwrap().active);
+    assert_eq!(h.agents.retire_pending().await.unwrap(), 0, "backing off");
+    let pending = h
+        .store
+        .pending_retirements(
+            SurfaceKind::RocketChat,
+            &TEAM.into(),
+            OffsetDateTime::now_utc() + RETIRE_BACKOFF_INITIAL,
+            RETIRE_MAX_ATTEMPTS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "due again after the backoff");
+
+    assert!(
+        h.store
+            .defer_retirement(binding, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+    );
+    assert_eq!(h.agents.retire_pending().await.unwrap(), 1);
+    let row = h.store.binding(binding).await.unwrap().unwrap();
+    assert_eq!(row.bot_user, Some(made.id));
+    assert!(!h.fake.user("helper").unwrap().active);
 }
 
 #[tokio::test]

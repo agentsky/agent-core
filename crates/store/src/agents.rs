@@ -10,7 +10,11 @@
 //! agent deleted, which frees its name.
 //!
 //! A disabled binding whose bot user exists owes its retirement:
-//! deactivating the bot user. It follows the relink notices' pattern. A
+//! deactivating the bot user. So does one that only noted a username, since
+//! a creation that died after `users.create` may have made a bot user under
+//! it: the retirement looks it up first, and
+//! [forgets the username](Store::forget_binding_bot_username) once it is
+//! known to be no bot user of the binding. It follows the relink notices' pattern. A
 //! caller [claims](Store::claim_retirement) it with a conditional `UPDATE`,
 //! which counts an attempt and holds a lease, so one caller at a time
 //! retires it across processes and restarts, then
@@ -224,8 +228,9 @@ pub struct ActiveBot {
 pub struct PendingRetirement {
     /// The binding.
     pub binding: BindingId,
-    /// The bot user to deactivate.
-    pub bot_user: UserId,
+    /// The bot user to deactivate, or `None` while it is still to be found
+    /// by the username the binding noted.
+    pub bot_user: Option<UserId>,
 }
 
 /// The columns an [`AgentRow`] reads, from `agents a`.
@@ -316,7 +321,8 @@ fn token_aad(binding: &str) -> Aad<'_> {
 /// first) with fewer than `max_attempts` claims so far (bound second).
 macro_rules! retirable {
     () => {
-        "state = 'disabled' AND bot_user_id IS NOT NULL AND retired_at IS NULL \
+        "state = 'disabled' AND (bot_user_id IS NOT NULL OR bot_username IS NOT NULL) \
+         AND retired_at IS NULL \
          AND (retire_next_attempt_at IS NULL OR retire_next_attempt_at <= ?) \
          AND retire_attempts < ?"
     };
@@ -826,8 +832,8 @@ impl Store {
     }
 
     /// Every retirement on `surface` and `team` that may be claimed at
-    /// `now`, oldest first: the binding is disabled, has a bot user that
-    /// isn't retired, no lease or backoff runs past `now`, and it was
+    /// `now`, oldest first: the binding is disabled, has a bot user, or a
+    /// noted username, that isn't retired, no lease or backoff runs past `now`, and it was
     /// claimed fewer than `max_attempts` times.
     ///
     /// # Errors
@@ -841,7 +847,7 @@ impl Store {
         now: OffsetDateTime,
         max_attempts: u32,
     ) -> Result<Vec<PendingRetirement>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(concat!(
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(concat!(
             "SELECT id, bot_user_id FROM agent_bindings WHERE surface = ? AND team_id = ? AND ",
             retirable!(),
             " ORDER BY state_changed_at, rowid"
@@ -856,7 +862,7 @@ impl Store {
             .map(|(binding, user)| {
                 Ok(PendingRetirement {
                     binding: parse_column(&binding, BINDINGS, "id")?,
-                    bot_user: user.into(),
+                    bot_user: user.map(UserId::from),
                 })
             })
             .collect()
@@ -895,6 +901,24 @@ impl Store {
         attempt
             .map(|attempt| u32::try_from(attempt).map_err(|_| corrupt(BINDINGS, "retire_attempts")))
             .transpose()
+    }
+
+    /// Forgets the username the disabled `binding` noted without recording
+    /// a bot user, once the user of that name is known not to be its bot
+    /// user: it then owes no retirement. Returns false if nothing changed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn forget_binding_bot_username(&self, binding: BindingId) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE agent_bindings SET bot_username = NULL \
+             WHERE id = ? AND state = 'disabled' AND bot_user_id IS NULL",
+        )
+        .bind(binding.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Records that the bot user of the disabled `binding` was deactivated

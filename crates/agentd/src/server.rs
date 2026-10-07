@@ -425,7 +425,7 @@ impl Server {
             () = &mut abort => Some("shutdown forced; dropping in-flight work"),
         };
         if let Some(reason) = cut_short {
-            tracing::warn!(unfinished = tasks.len(), "{reason}");
+            tracing::warn!(unfinished_tasks = tasks.len(), "{reason}");
             tasks.shutdown().await;
         }
         if cut_short.is_some() && turns.is_some() {

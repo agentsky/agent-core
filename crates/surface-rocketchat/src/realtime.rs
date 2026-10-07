@@ -66,7 +66,8 @@ pub struct RealtimeOptions {
     pub backoff_max: Duration,
     /// How long the server may stay silent before the client pings it. After
     /// twice this without any frame, the connection counts as dead and the
-    /// client reconnects.
+    /// client reconnects. Time spent waiting for the consumer to take a
+    /// message doesn't count.
     pub heartbeat: Duration,
     /// How long connecting, logging in and subscribing may take.
     pub setup_timeout: Duration,
@@ -333,7 +334,10 @@ struct Connection<'a> {
     /// Notices that arrived while the room list was being read, applied
     /// on top of it.
     pending: Option<Vec<Notice>>,
-    last_frame: Instant,
+    /// When the connection last read a frame or finished handling one.
+    /// Silence is measured from it, so time spent waiting for the
+    /// consumer to take a message doesn't count as the server's.
+    ready_since: Instant,
     notify_event: String,
 }
 
@@ -353,7 +357,7 @@ impl<'a> Connection<'a> {
             docs: HashMap::new(),
             refused: HashSet::new(),
             pending: None,
-            last_frame: Instant::now(),
+            ready_since: Instant::now(),
             notify_event: format!("{user}/subscriptions-changed"),
         }
     }
@@ -378,7 +382,7 @@ impl<'a> Connection<'a> {
                 Some(Err(err)) => return Err(End::Retry(format!("could not read: {err}"))),
                 Some(Ok(frame)) => frame,
             };
-            self.last_frame = Instant::now();
+            self.ready_since = Instant::now();
             match frame {
                 Frame::Text(text) => match Incoming::parse(&text) {
                     Some(incoming) => return Ok(incoming),
@@ -478,11 +482,14 @@ impl<'a> Connection<'a> {
                 _ => End::Retry(format!("login failed: {error}")),
             });
         }
-        let logged_in = result
+        let Some(logged_in) = result
             .as_ref()
             .and_then(|r| r.get("id"))
-            .and_then(Value::as_str);
-        if logged_in != Some(self.user.as_str()) {
+            .and_then(Value::as_str)
+        else {
+            return Err(End::Retry("the login result named no user".into()));
+        };
+        if logged_in != self.user.as_str() {
             return Err(End::Fatal(SurfaceError::Api(
                 "the realtime login answered for another user".into(),
             )));
@@ -511,7 +518,11 @@ impl<'a> Connection<'a> {
         loop {
             let step = tokio::select! {
                 frame = self.next() => match frame {
-                    Ok(frame) => self.handle(frame).await,
+                    Ok(frame) => {
+                        let step = self.handle(frame).await;
+                        self.ready_since = Instant::now();
+                        step
+                    }
                     Err(end) => Err(end),
                 },
                 _ = tick.tick() => self.heartbeat(heartbeat).await,
@@ -524,7 +535,7 @@ impl<'a> Connection<'a> {
     }
 
     async fn heartbeat(&mut self, heartbeat: Duration) -> Step {
-        let silent = self.last_frame.elapsed();
+        let silent = self.ready_since.elapsed();
         if silent >= heartbeat.saturating_mul(2) {
             return Err(End::Retry("the server stopped answering".into()));
         }
