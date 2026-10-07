@@ -818,15 +818,22 @@ Deliverables:
   JavaScript string length, so its limit counts UTF-16 code units, and an emoji
   counts as two. It:
   - Prefers paragraph breaks, then line breaks, then spaces.
-  - Never cuts inside a Slack `<…>` token, a Markdown link, a mention or a
-    multi-byte character. Cuts fall on `char` boundaries.
+  - Never cuts inside a Slack `<…>` token, an HTML entity, a Markdown link
+    (inline, or a reference with a definition in the text), a mention or a
+    grapheme cluster, nor right before an `@` that follows anything but
+    whitespace or `>`. Cuts fall on `char` boundaries.
   - Closes an open code fence at the end of a chunk and reopens it, with the
     same info string, at the start of the next.
 - `render::directives::extract(text) -> (String, Vec<Directive>)` for
   `[[react: <emoji>]]` (the only directive for now). Directives inside code are
-  not parsed.
+  not parsed. Emoji names longer than 64 characters are dropped.
 - `render::rocketchat::to_markdown(md, directory)`: pass-through, neutralizing
-  `@all` and `@here` outside code, with the same `@Name` resolution as Slack.
+  `@all` and `@here` everywhere, code included, because the server finds
+  mentions in the raw text (see
+  [impl-notes](impl-notes.md#code-doesnt-protect-a-broadcast-on-rocketchat)),
+  with the same `@Name` resolution as Slack
+  (the directory returns usernames there; see
+  [impl-notes](impl-notes.md#rocketchat-mentions-need-a-username-not-an-id)).
 - Per-surface limits as constants: Slack 3,000 characters per `text` chunk
   (under the 4,000 hard limit, leaving room for rendering growth), and
   Rocket.Chat 5,000 UTF-16 units (the server default `Message_MaxAllowedSize`).
