@@ -27,7 +27,7 @@ pub(crate) fn ends_url(c: char) -> bool {
 
 /// Drops trailing punctuation, and closing brackets that have no opening
 /// partner inside the URL, so `(see https://x.io/a).` keeps `)` and `.` out.
-pub(crate) fn trim_url_tail(url: &str) -> &str {
+fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let mut unmatched = PAIRS.map(|(open, close)| {
         url.matches(close).count() as isize - url.matches(open).count() as isize
