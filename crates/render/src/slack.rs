@@ -68,6 +68,8 @@ const MAX_DEPTH: usize = 64;
 ///   `good.com (<https://evil.com>)`. A link with an empty URL shows only its
 ///   label. Bare `http(s)` URLs get explicit `<url>` boundaries, so Slack
 ///   doesn't pull neighboring punctuation or formatting marks into them.
+///   Emphasis-shaped runs inside a URL's path (`/__main__.html`) stay part
+///   of the URL.
 /// - List items become `•` or numbered lines, indented two spaces per
 ///   nesting level. Blockquotes keep their `>` prefix on every line.
 /// - Tables become aligned plain text inside a code block.
@@ -139,6 +141,7 @@ fn parse(md: &str) -> Vec<Node<'_>> {
     let mut root = Vec::new();
     let mut open: Vec<(Tag<'_>, Range<usize>, Vec<Node<'_>>)> = Vec::new();
     let mut flattened = 0usize;
+    let mut urls: Vec<Range<usize>> = Vec::new();
     for (event, span) in Parser::new_ext(md, options).into_offset_iter() {
         let node = match event {
             Event::Start(_) if open.len() >= MAX_DEPTH => {
@@ -157,12 +160,20 @@ fn parse(md: &str) -> Vec<Node<'_>> {
                 let Some((tag, span, children)) = open.pop() else {
                     continue;
                 };
+                if splits_bare_url(&tag, &span, &urls) {
+                    let siblings = open
+                        .last_mut()
+                        .map_or(&mut root, |(_, _, children)| children);
+                    unwrap_markup(md, span, children, siblings);
+                    continue;
+                }
                 Node {
                     kind: Kind::Elem(tag, children),
                     span,
                 }
             }
             Event::Text(text) => {
+                note_bare_urls(md, &span, &mut urls);
                 let escaped = if is_escaped_delimiter(md, &span, &text) {
                     vec![0]
                 } else {
@@ -200,6 +211,60 @@ fn parse(md: &str) -> Vec<Node<'_>> {
         push_merging_text(siblings, node);
     }
     root
+}
+
+/// Records the source ranges of the bare URLs that start in a text event's
+/// span. Each URL is measured in the source, not in the event, because
+/// pulldown-cmark ends a text event at `_`, `*` or `~` that it takes for
+/// emphasis even in the middle of a URL. The ranges stay sorted and
+/// disjoint.
+fn note_bare_urls(md: &str, span: &Range<usize>, urls: &mut Vec<Range<usize>>) {
+    for (offset, _) in md[span.clone()].match_indices("http") {
+        let at = span.start + offset;
+        if urls.last().is_some_and(|last| at < last.end) {
+            continue;
+        }
+        if let Some(url) = bare_url(md, at) {
+            urls.push(at..at + url.len());
+        }
+    }
+}
+
+/// Whether `tag` is emphasis or strikethrough with a delimiter inside a bare
+/// URL. Such markup is part of the URL's path, as in
+/// `https://docs.python.org/3/library/__main__.html`, so it is kept as the
+/// source wrote it and the URL is linked whole.
+fn splits_bare_url(tag: &Tag<'_>, span: &Range<usize>, urls: &[Range<usize>]) -> bool {
+    let inside = |at: usize| {
+        let after = urls.partition_point(|url| url.start <= at);
+        after > 0 && at < urls[after - 1].end
+    };
+    matches!(tag, Tag::Strong | Tag::Emphasis | Tag::Strikethrough)
+        && !span.is_empty()
+        && (inside(span.start) || inside(span.end - 1))
+}
+
+/// Puts the children of an element in its place, with its delimiters as
+/// text, as the source wrote them.
+fn unwrap_markup<'a>(
+    md: &str,
+    span: Range<usize>,
+    children: Vec<Node<'a>>,
+    siblings: &mut Vec<Node<'a>>,
+) {
+    let inner_start = children.first().map_or(span.end, |child| child.span.start);
+    let inner_end = children.last().map_or(span.end, |child| child.span.end);
+    let delimiter = |range: Range<usize>| Node {
+        kind: Kind::Text(md[range.clone()].to_string(), Vec::new()),
+        span: range,
+    };
+    push_merging_text(siblings, delimiter(span.start..inner_start));
+    for child in children {
+        push_merging_text(siblings, child);
+    }
+    if inner_end < span.end {
+        push_merging_text(siblings, delimiter(inner_end..span.end));
+    }
 }
 
 /// Whether a text event starts with a formatting character that the source

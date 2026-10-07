@@ -2030,6 +2030,11 @@ handling, and that `render` converts and splits through `render`, so that
 nor `parse: full`. Slack returns HTTP 200 with `ok: false` on errors; test
 that mapping.
 
+Live check (manual, recorded in the PR): post a reply whose Markdown has `|`
+inside a link label, such as `[a | b](https://x.io)`, which `render` sends
+as `<https://x.io|a | b>`, and confirm Slack shows the whole label `a | b`
+linking to `https://x.io`.
+
 ### T30
 
 **Slack manager app and configuration token.** Branch
