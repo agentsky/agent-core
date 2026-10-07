@@ -1515,6 +1515,12 @@ fn outside_unknown() -> Option<Outside> {
     Some(Outside { team: None })
 }
 
+fn outside_of(team: &str) -> Option<Outside> {
+    Some(Outside {
+        team: Some(team.into()),
+    })
+}
+
 #[tokio::test]
 async fn a_sender_is_home_only_when_the_home_check_agrees() {
     let (server, surface) = listing(&[(USER, TEAM), ("U0HUMAN02", OUTSIDE_TEAM)]).await;
@@ -1536,10 +1542,10 @@ async fn a_sender_is_home_only_when_the_home_check_agrees() {
     mount_user(&server, "U0GONE001", refused("user_not_found")).await;
     for (user, outside) in [
         (USER, None),
-        ("U0HUMAN02", outside_unknown()),
+        ("U0HUMAN02", outside_of(OUTSIDE_TEAM)),
         ("U0LOOKUP1", None),
         ("U0NOTEAM1", outside_unknown()),
-        ("U0THEIRS1", outside_unknown()),
+        ("U0THEIRS1", outside_of(OUTSIDE_TEAM)),
         ("U0ORGWIDE", outside_unknown()),
         ("U0GONE001", outside_unknown()),
     ] {
@@ -1636,8 +1642,8 @@ async fn a_home_organization_field_with_a_home_lookup_is_home() {
     surface.fill_sender_team(&mut sibling).await.unwrap();
     assert_eq!(
         sibling.outside,
-        outside_unknown(),
-        "another workspace of the organization isn't home"
+        outside_of("T0SIBLING"),
+        "another workspace of the organization isn't home, and is named"
     );
 
     mount_user(
@@ -1779,11 +1785,11 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
             .to_string();
         warned.lines().filter(|line| line.contains("WARN")).count()
     };
-    let look_up = async |user: &str| {
+    let look_up = async |user: &str, organization: &str| {
         let mut event = home_event_from(user);
         event.sender.team = LONE.into();
         surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_unknown(), "{user}");
+        assert_eq!(event.outside, outside_of(organization), "{user}");
     };
     mount_user(
         &server,
@@ -1791,7 +1797,7 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
         grid_member("U0THEIRS1", OUTSIDE_TEAM, "E0THEIRS1"),
     )
     .await;
-    look_up("U0THEIRS1").await;
+    look_up("U0THEIRS1", OUTSIDE_TEAM).await;
     assert_eq!(
         warnings(),
         0,
@@ -1799,7 +1805,7 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
     );
     for user in ["U0GRIDMEM", "U0GRIDME2"] {
         mount_user(&server, user, grid_member(user, LONE, HOME_ORG)).await;
-        look_up(user).await;
+        look_up(user, HOME_ORG).await;
     }
     assert_eq!(warnings(), 1);
 
@@ -1824,7 +1830,7 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
         let mut event = home_event_from(user);
         event.sender.team = lone.into();
         surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_unknown(), "{user}");
+        assert_eq!(event.outside, outside_of(team_id), "{user}");
         let warned = logs
             .snapshot()
             .matching("auth.test gave the workspace none")
@@ -2060,7 +2066,7 @@ async fn confirm_reads_who_is_outside_from_slacks_copy() {
         (
             json!({"ts": ts, "user": USER, "text": event.text, "team": TEAM}),
             Some(user_in(USER, Some(OUTSIDE_TEAM))),
-            outside_unknown(),
+            outside_of(OUTSIDE_TEAM),
         ),
         (
             json!({"ts": ts, "user": USER, "text": event.text, "team": TEAM}),

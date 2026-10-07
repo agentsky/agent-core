@@ -99,7 +99,11 @@ impl std::fmt::Display for DdpError {
 }
 
 /// One frame from the server, as far as the client cares.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` prints whether a result is present and how many arguments an
+/// event has, never their values: a login result holds the auth token, and
+/// event arguments hold messages.
+#[derive(Clone, PartialEq)]
 pub(crate) enum Incoming {
     /// `connected`: the server accepted `connect`.
     Connected,
@@ -137,6 +141,39 @@ pub(crate) enum Incoming {
     /// Anything else: `pong`, `updated`, `added`, `server_id`, errors about
     /// frames the client never sends.
     Other,
+}
+
+impl std::fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connected => f.write_str("Connected"),
+            Self::Failed => f.write_str("Failed"),
+            Self::Ping(id) => f.debug_tuple("Ping").field(id).finish(),
+            Self::Result { id, result, error } => f
+                .debug_struct("Result")
+                .field("id", id)
+                .field("has_result", &result.is_some())
+                .field("error", error)
+                .finish(),
+            Self::Ready(subs) => f.debug_tuple("Ready").field(subs).finish(),
+            Self::Nosub { id, error } => f
+                .debug_struct("Nosub")
+                .field("id", id)
+                .field("error", error)
+                .finish(),
+            Self::Event {
+                stream,
+                event,
+                args,
+            } => f
+                .debug_struct("Event")
+                .field("stream", stream)
+                .field("event", event)
+                .field("args_len", &args.len())
+                .finish(),
+            Self::Other => f.write_str("Other"),
+        }
+    }
 }
 
 impl Incoming {
@@ -224,6 +261,31 @@ mod tests {
         assert_eq!(value(&ping("p1")), json!({ "msg": "ping", "id": "p1" }));
         assert_eq!(value(&pong(Some("x"))), json!({ "msg": "pong", "id": "x" }));
         assert_eq!(value(&pong(None)), json!({ "msg": "pong" }));
+    }
+
+    #[test]
+    fn debug_hides_results_and_event_arguments() {
+        let login = Incoming::parse(
+            r#"{"msg":"result","id":"m1","result":{"id":"u1","token":"TOKEN-SECRET"}}"#,
+        )
+        .unwrap();
+        let event = Incoming::parse(
+            r#"{"msg":"changed","collection":"stream-room-messages","fields":{"eventName":"r1","args":[{"msg":"MESSAGE-TEXT"},{}]}}"#,
+        )
+        .unwrap();
+        let debug = format!("{login:?} {login:#?} {event:?} {event:#?}");
+        assert!(!debug.contains("TOKEN-SECRET"), "{debug}");
+        assert!(!debug.contains("MESSAGE-TEXT"), "{debug}");
+        for shown in [
+            "Result",
+            "m1",
+            "has_result: true",
+            "stream-room-messages",
+            "r1",
+            "args_len: 2",
+        ] {
+            assert!(debug.contains(shown), "{shown}: {debug}");
+        }
     }
 
     #[test]

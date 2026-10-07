@@ -66,6 +66,16 @@ async fn opened(store: &Store, member: MemberId, label: &str) -> Option<(Routine
         .map(|found| (found.routine_id, shown(&found.token).to_owned()))
 }
 
+/// The registration of `member`'s routine `label` stored now, or none.
+async fn registration(store: &Store, member: MemberId, label: &str) -> CloudRoutineVersion {
+    store
+        .cloud_routine(member, label)
+        .await
+        .unwrap()
+        .map(|found| found.version)
+        .unwrap_or_default()
+}
+
 async fn begin(store: &Store, member: MemberId, task: &str, now: i64) -> CloudHandoffId {
     let routine_id = routine("trig_1");
     let held = store
@@ -82,12 +92,14 @@ async fn begin(store: &Store, member: MemberId, task: &str, now: i64) -> CloudHa
         }
     };
     let requested_by = member_key("ada");
+    let registration = registration(store, member, &label).await;
     let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member,
                 routine_label: &label,
                 routine_id: &routine_id,
+                registration: &registration,
                 requested_by: &requested_by,
                 origin: CloudOrigin::RocketChatDm,
                 task,
@@ -468,12 +480,14 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
     let routine_id = routine("trig_7");
     let requested_by = slack_key("U7");
     put(&store, ada, "docs", "trig_7", "sk", 10).await;
+    let registration = registration(&store, ada, "docs").await;
     let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member: ada,
                 routine_label: "docs",
                 routine_id: &routine_id,
+                registration: &registration,
                 requested_by: &requested_by,
                 origin: CloudOrigin::SlackSlash,
                 task: "t",
@@ -518,12 +532,14 @@ async fn begin_capped(
     per_hour: u32,
     now: i64,
 ) -> CloudBegun {
+    let registration = registration(store, member, label).await;
     store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member,
                 routine_label: label,
                 routine_id: &routine(id),
+                registration: &registration,
                 requested_by: &member_key("ada"),
                 origin: CloudOrigin::RocketChatDm,
                 task: "t",
@@ -616,6 +632,44 @@ async fn concurrent_handoffs_never_pass_the_hourly_cap_together() {
     }
     assert_eq!(begun, 1, "one place was left");
     assert_eq!(handoffs_held(&store).await, i64::from(per_hour));
+}
+
+#[tokio::test]
+async fn a_token_replaced_after_it_was_read_records_nothing() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "r", "trig_1", "old", 10).await;
+    let read = store.cloud_routine(ada, "r").await.unwrap().unwrap();
+    put(&store, ada, "r", "trig_1", "new", 10).await;
+    let begin = |registration: CloudRoutineVersion| {
+        let store = store.clone();
+        async move {
+            store
+                .begin_cloud_handoff(
+                    &NewCloudHandoff {
+                        member: ada,
+                        routine_label: "r",
+                        routine_id: &routine("trig_1"),
+                        registration: &registration,
+                        requested_by: &member_key("ada"),
+                        origin: CloudOrigin::RocketChatDm,
+                        task: "t",
+                    },
+                    10,
+                    at(10),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        begin(read.version).await,
+        CloudBegun::RoutineGone,
+        "the same label, routine id and second, but another token"
+    );
+    assert_eq!(handoffs_held(&store).await, 0);
+    let current = store.cloud_routine(ada, "r").await.unwrap().unwrap();
+    assert!(matches!(begin(current.version).await, CloudBegun::Begun(_)));
 }
 
 #[tokio::test]
@@ -1150,6 +1204,27 @@ async fn a_handoff_notice_is_claimed_once_and_backs_off() {
 }
 
 #[tokio::test]
+async fn claim_zero_neither_defers_nor_marks_a_notice() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let id = unknown(&store, ada, 1_000).await;
+    assert!(
+        !store
+            .defer_cloud_handoff_notice(id, 0, at(1_000))
+            .await
+            .unwrap(),
+        "a never-claimed notice isn't pushed back"
+    );
+    assert!(
+        !store
+            .mark_cloud_handoff_notified(id, 0, at(1_000))
+            .await
+            .unwrap()
+    );
+    assert_eq!(due(&store, 1_000).await, [id], "still due at once");
+}
+
+#[tokio::test]
 async fn a_handoff_notice_is_given_up_after_a_day() {
     let store = memory_store().await;
     let ada = member(&store, "ada").await;
@@ -1468,6 +1543,7 @@ fn a_new_handoff_leaves_its_task_out_of_debug() {
         member,
         routine_label: "r",
         routine_id: &routine_id,
+        registration: &CloudRoutineVersion::default(),
         requested_by: &requested_by,
         origin: CloudOrigin::SlackDm,
         task: "TASK-TEXT",

@@ -25,7 +25,10 @@ pub const MAX_TASK_BYTES: usize = 65_536;
 /// What a session's link must start with, followed by exactly its id, to be
 /// kept.
 pub const SESSION_URL_PREFIX: &str = "https://claude.ai/code/";
-/// The most characters after a session id's `session_`.
+/// The prefixes a session id may start with: the two forms the cloud
+/// documentation shows.
+const SESSION_ID_PREFIXES: [&str; 2] = ["session_", "cse_"];
+/// The most characters after a session id's prefix.
 const MAX_SESSION_ID_TAIL: usize = 128;
 /// The longest `error.type` kept from an error body.
 const MAX_ERROR_TYPE: usize = 64;
@@ -96,9 +99,9 @@ pub fn check_task(task: &str) -> Result<(), TaskError> {
 /// What a fire request led to, which the hand-off records as it is:
 ///
 /// - [`Fired`](CloudOutcome::Fired) for a 200 naming the session it
-///   started. `session_id` is `session_` and 1 to 128 ASCII letters and
-///   digits; `session_url` is kept only when it is [`SESSION_URL_PREFIX`]
-///   followed by `session_id`.
+///   started. `session_id` is `session_` or `cse_` and 1 to 128 ASCII
+///   letters and digits; `session_url` is kept only when it is
+///   [`SESSION_URL_PREFIX`] followed by `session_id`.
 /// - [`Rejected`](CloudOutcome::Rejected) for a documented refusal (400,
 ///   401, 403, 404 or 429), or a request that wasn't sent, with no status:
 ///   the connection failed first, the routine was registered for another
@@ -469,9 +472,11 @@ fn retry_after_secs(value: &str) -> Option<u32> {
 }
 
 fn is_session_id(id: &str) -> bool {
-    id.strip_prefix("session_").is_some_and(|tail| {
-        (1..=MAX_SESSION_ID_TAIL).contains(&tail.len())
-            && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+    SESSION_ID_PREFIXES.iter().any(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|tail| {
+            (1..=MAX_SESSION_ID_TAIL).contains(&tail.len())
+                && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
     })
 }
 

@@ -800,7 +800,9 @@ impl Pipeline {
             .clone()
     }
 
-    /// Answers the lane's messages one at a time, until none waits.
+    /// Answers the lane's messages one at a time, until none waits. Once
+    /// the pipeline is closed it starts none of those still waiting: they
+    /// are dropped, as a message sent after closing is.
     async fn lane(self, key: LaneKey, mut job: Job) {
         let agent = key.0;
         loop {
@@ -820,6 +822,13 @@ impl Pipeline {
             drop(job);
             let next = {
                 let mut lanes = lock(&self.inner.lanes);
+                if self.is_closed() {
+                    let dropped = lanes.remove(&key).map_or(0, |queue| queue.len());
+                    if dropped > 0 {
+                        tracing::info!(%agent, messages = dropped, "shutting down: not handling the messages still waiting");
+                    }
+                    return;
+                }
                 match lanes.get_mut(&key).and_then(VecDeque::pop_front) {
                     Some(next) => next,
                     None => {
@@ -946,10 +955,10 @@ impl Pipeline {
 
     /// Routes `job`'s message for `agent`, and unless the decision is to
     /// ignore it, routes the platform's copy again and acts on the copy
-    /// if its decision may stand ([`copy_stands`]). A copy the platform
-    /// gave without [`outside`](InboundEvent::outside) takes the event's,
-    /// so an event saying its sender is from outside is never made home by
-    /// its copy. A hand-off agentd built
+    /// if its decision may stand ([`copy_stands`]). The event and the copy
+    /// must agree on [`outside`](InboundEvent::outside) ([`agreeing_copy`]):
+    /// the copy's comes from the platform alone, and a disagreement drops
+    /// the message. A hand-off agentd built
     /// itself is acted on as it is, once the agent's bot is found, asking
     /// the platform now, to be able to post in the conversation.
     ///
@@ -1015,7 +1024,13 @@ impl Pipeline {
             let Some(copy) = self.confirmed(job, agent).await else {
                 return true;
             };
-            Some(outside_kept(copy, event)).filter(|copy| copy != event)
+            let Some(copy) = agreeing_copy(copy, event) else {
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message says otherwise of whether its sender is from outside; dropped it");
+                }
+                return true;
+            };
+            Some(copy).filter(|copy| copy != event)
         };
         let (event, decision) = if let Some(copy) = &copy {
             let Some(confirmed) = self.decide(copy, agent, caps).await else {
@@ -1763,7 +1778,9 @@ impl Pipeline {
 
     /// Looks the session up, builds the turn message and runs the turn,
     /// once more on a session reset in between. What the turn message
-    /// recorded is forgotten when the turn didn't run.
+    /// recorded is forgotten when the turn didn't run, which includes a
+    /// process that crashed or timed out before the CLI read the message
+    /// (no `init` line): that is [`PipelineError::Unread`].
     async fn turn(
         &self,
         event: &InboundEvent,
@@ -1806,6 +1823,10 @@ impl Pipeline {
             };
             let turn_id = request.turn;
             match sessions.run_turn(session.id, request).await {
+                Ok(report) if unread(&report.outcome) => {
+                    built.forget(store, session.id).await;
+                    return Err(PipelineError::Unread);
+                }
                 Ok(report) => return Ok((session, turn_id, report)),
                 Err(err) => {
                     built.forget(store, session.id).await;
@@ -1991,14 +2012,14 @@ fn limited(decision: &Decision) -> bool {
     )
 }
 
-/// The platform's `copy` of `event`, taking the event's
-/// [`outside`](InboundEvent::outside) when the copy has none: an event that
-/// says its sender is from outside is never made home by its copy.
-fn outside_kept(mut copy: InboundEvent, event: &InboundEvent) -> InboundEvent {
-    if copy.outside.is_none() {
-        copy.outside.clone_from(&event.outside);
-    }
-    copy
+/// The platform's `copy` of `event`, if the two agree on whether the
+/// sender is from outside and of which organization
+/// ([`outside`](InboundEvent::outside)); `None` otherwise, and the message
+/// is dropped. The copy's `outside` comes from the platform's data alone,
+/// its own team fields or the platform's answer about the sender, so
+/// nothing an event says, an organization included, is carried into it.
+fn agreeing_copy(copy: InboundEvent, event: &InboundEvent) -> Option<InboundEvent> {
+    (copy.outside == event.outside).then_some(copy)
 }
 
 /// Whether the decision on the platform's copy of a message, `confirmed`,
@@ -2572,11 +2593,22 @@ impl Delivery<'_> {
     }
 }
 
+/// Whether a turn that ended with `outcome` ended before the CLI read its
+/// message: it crashed or timed out without printing `init`.
+fn unread(outcome: &TurnOutcome) -> bool {
+    match outcome {
+        TurnOutcome::Crashed { stats, .. } | TurnOutcome::TimedOut { stats } => !stats.init_seen,
+        TurnOutcome::Finished(_) => false,
+    }
+}
+
 /// Why handling a message failed.
 #[derive(Debug, thiserror::Error)]
 enum PipelineError {
     #[error("the turn isn't the owner's own, so it can't run on the agent's private side")]
     NotTheOwnersTurn,
+    #[error("the CLI ended before it read the turn's message")]
+    Unread,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -2935,17 +2967,17 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn an_event_saying_outside_keeps_the_copy_outside() {
+    /// A Slack channel message from U1, from outside with the organization
+    /// `outside` names (`""` for none known), or home for `None`.
+    fn event_with_outside(outside: Option<&str>) -> InboundEvent {
         let conv = core_types::ConvRef {
             surface: core_types::SurfaceKind::Slack,
             team: "T1".into(),
             conversation: "C1".into(),
         };
-        let binding = core_types::BindingId::new_v4();
-        let event = |outside: Option<&str>| InboundEvent {
+        InboundEvent {
             event_id: "Ev1".into(),
-            binding,
+            binding: core_types::BindingId::new_v4(),
             sender: asker("U1", None).key,
             sender_is_bot: false,
             sender_bot_user: None,
@@ -2953,7 +2985,7 @@ mod tests {
             conv_kind: ConvKind::Channel,
             thread_root: None,
             message: MsgRef {
-                conv: conv.clone(),
+                conv,
                 id: "1.0".into(),
             },
             text: String::new(),
@@ -2962,19 +2994,36 @@ mod tests {
             files: Vec::new(),
             received_at: OffsetDateTime::UNIX_EPOCH,
             outside: asker("U1", outside).outside,
-        };
-        let theirs = event(Some("T0THEIRS1"));
-        let home = event(None);
-        let unknown = event(Some(""));
-        assert_eq!(outside_kept(home.clone(), &theirs), theirs);
-        assert_eq!(
-            outside_kept(unknown.clone(), &theirs),
-            unknown,
-            "the copy's own outside stands"
-        );
-        assert_eq!(outside_kept(theirs.clone(), &home), theirs);
-        assert_eq!(outside_kept(unknown.clone(), &home), unknown);
-        assert_eq!(outside_kept(home.clone(), &home), home);
+        }
+    }
+
+    #[test]
+    fn an_event_and_its_copy_disagreeing_on_outside_is_dropped() {
+        let theirs = event_with_outside(Some("T0THEIRS1"));
+        let home = event_with_outside(None);
+        let unknown = event_with_outside(Some(""));
+        for (copy, event) in [
+            (&home, &theirs),
+            (&theirs, &home),
+            (&unknown, &theirs),
+            (&theirs, &unknown),
+            (&unknown, &home),
+            (&home, &unknown),
+        ] {
+            assert_eq!(agreeing_copy(copy.clone(), event), None, "{copy:?}");
+        }
+        for copy in [&home, &theirs, &unknown] {
+            assert_eq!(agreeing_copy(copy.clone(), copy).as_ref(), Some(copy));
+        }
+    }
+
+    #[test]
+    fn a_forged_organization_on_an_event_cannot_change_the_stored_team() {
+        let copy = event_with_outside(Some("T0REAL001"));
+        let forged = event_with_outside(Some("T0LISTED1"));
+        assert_eq!(agreeing_copy(copy.clone(), &forged), None);
+        let kept = agreeing_copy(copy.clone(), &event_with_outside(Some("T0REAL001"))).unwrap();
+        assert_eq!(kept.outside, copy.outside, "the copy's own organization");
     }
 
     #[test]
@@ -3187,6 +3236,25 @@ mod tests {
         }
         assert_eq!(checked, 3 * 3 * 4 * 2 * 3 * 2 * 4);
         assert_eq!(private, 1, "exactly one combination is the owner's own DM");
+    }
+
+    #[test]
+    fn only_a_crash_or_timeout_before_init_leaves_the_message_unread() {
+        let before = runner::TurnStats::default();
+        let mut after = runner::TurnStats::default();
+        after.init_seen = true;
+        assert!(unread(&TurnOutcome::Crashed {
+            exit_code: Some(70),
+            stats: before.clone(),
+        }));
+        assert!(unread(&TurnOutcome::TimedOut {
+            stats: before.clone()
+        }));
+        assert!(!unread(&TurnOutcome::Crashed {
+            exit_code: Some(70),
+            stats: after.clone(),
+        }));
+        assert!(!unread(&TurnOutcome::TimedOut { stats: after }));
     }
 
     #[test]

@@ -8,9 +8,12 @@
 use std::ops::Range;
 
 use core_types::{LengthUnit, Limit};
-use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
+};
 
-use crate::{MentionDirectory, mention, url::bare_url};
+use crate::url::{bare_url, ends_url};
+use crate::{MentionDirectory, mention};
 
 /// The most text one Slack message chunk holds: 3,000 characters, under
 /// Slack's 4,000-character limit for a message's `text`.
@@ -68,6 +71,8 @@ const MAX_DEPTH: usize = 64;
 ///   `good.com (<https://evil.com>)`. A link with an empty URL shows only its
 ///   label. Bare `http(s)` URLs get explicit `<url>` boundaries, so Slack
 ///   doesn't pull neighboring punctuation or formatting marks into them.
+///   Emphasis-shaped runs inside a URL's path (`/__main__.html`) stay part
+///   of the URL.
 /// - List items become `•` or numbered lines, indented two spaces per
 ///   nesting level. Blockquotes keep their `>` prefix on every line.
 /// - Tables become aligned plain text inside a code block.
@@ -139,7 +144,9 @@ fn parse(md: &str) -> Vec<Node<'_>> {
     let mut root = Vec::new();
     let mut open: Vec<(Tag<'_>, Range<usize>, Vec<Node<'_>>)> = Vec::new();
     let mut flattened = 0usize;
-    for (event, span) in Parser::new_ext(md, options).into_offset_iter() {
+    let events: Vec<_> = Parser::new_ext(md, options).into_offset_iter().collect();
+    let urls = bare_urls(md, &events);
+    for (event, span) in events {
         let node = match event {
             Event::Start(_) if open.len() >= MAX_DEPTH => {
                 flattened += 1;
@@ -157,6 +164,13 @@ fn parse(md: &str) -> Vec<Node<'_>> {
                 let Some((tag, span, children)) = open.pop() else {
                     continue;
                 };
+                if splits_bare_url(&tag, &span, &urls) {
+                    let siblings = open
+                        .last_mut()
+                        .map_or(&mut root, |(_, _, children)| children);
+                    unwrap_markup(md, span, children, siblings);
+                    continue;
+                }
                 Node {
                     kind: Kind::Elem(tag, children),
                     span,
@@ -200,6 +214,98 @@ fn parse(md: &str) -> Vec<Node<'_>> {
         push_merging_text(siblings, node);
     }
     root
+}
+
+/// The source ranges of the bare URLs as rendered, sorted and disjoint.
+///
+/// A URL is measured in the source over a run of text and emphasis events,
+/// because pulldown-cmark ends a text event at `_`, `*` or `~` that it takes
+/// for emphasis even in the middle of a URL. Any other event, such as inline
+/// code, ends the run, and so does a character reference or escape that
+/// renders as a character no URL holds, as `&lt;` does. Each run is scanned
+/// once.
+fn bare_urls(md: &str, events: &[(Event<'_>, Range<usize>)]) -> Vec<Range<usize>> {
+    let mut urls = Vec::new();
+    let mut run: Option<Range<usize>> = None;
+    for (event, span) in events {
+        let piece = match event {
+            Event::Text(text) if md[span.clone()] == **text || !text.contains(ends_url) => {
+                Some(span.clone())
+            }
+            Event::Start(Tag::Strong | Tag::Emphasis | Tag::Strikethrough) => {
+                Some(span.start..span.start)
+            }
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
+                Some(span.end..span.end)
+            }
+            _ => None,
+        };
+        match (piece, &mut run) {
+            (Some(piece), Some(run)) => run.end = run.end.max(piece.end),
+            (Some(piece), None) => run = Some(piece),
+            (None, _) => {
+                if let Some(run) = run.take() {
+                    scan_run(md, run, &mut urls);
+                }
+            }
+        }
+    }
+    if let Some(run) = run {
+        scan_run(md, run, &mut urls);
+    }
+    urls
+}
+
+/// Records the bare URLs in one run of source text.
+fn scan_run(md: &str, run: Range<usize>, urls: &mut Vec<Range<usize>>) {
+    let text = &md[..run.end];
+    let mut at = run.start;
+    while let Some(offset) = text[at..].find("http") {
+        let start = at + offset;
+        at = match bare_url(text, start) {
+            Some(url) => {
+                urls.push(start..start + url.len());
+                start + url.len()
+            }
+            None => start + "http".len(),
+        };
+    }
+}
+
+/// Whether `tag` is emphasis or strikethrough that opens inside a bare URL
+/// as rendered. Such markup is part of the URL's path, as in
+/// `https://docs.python.org/3/library/__main__.html`, so it is kept as the
+/// source wrote it and the URL is linked whole. Markup that opens before a
+/// URL wraps it, as in `**https://x.io/a**'s`, and its closing delimiter ends
+/// the URL.
+fn splits_bare_url(tag: &Tag<'_>, span: &Range<usize>, urls: &[Range<usize>]) -> bool {
+    let after = urls.partition_point(|url| url.start <= span.start);
+    matches!(tag, Tag::Strong | Tag::Emphasis | Tag::Strikethrough)
+        && after > 0
+        && span.start < urls[after - 1].end
+}
+
+/// Puts the children of an element in its place, with its delimiters as
+/// text, as the source wrote them.
+fn unwrap_markup<'a>(
+    md: &str,
+    span: Range<usize>,
+    children: Vec<Node<'a>>,
+    siblings: &mut Vec<Node<'a>>,
+) {
+    let inner_start = children.first().map_or(span.end, |child| child.span.start);
+    let inner_end = children.last().map_or(span.end, |child| child.span.end);
+    let delimiter = |range: Range<usize>| Node {
+        kind: Kind::Text(md[range.clone()].to_string(), Vec::new()),
+        span: range,
+    };
+    push_merging_text(siblings, delimiter(span.start..inner_start));
+    for child in children {
+        push_merging_text(siblings, child);
+    }
+    if inner_end < span.end {
+        push_merging_text(siblings, delimiter(inner_end..span.end));
+    }
 }
 
 /// Whether a text event starts with a formatting character that the source

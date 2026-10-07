@@ -13,7 +13,7 @@ use render::MentionDirectory;
 use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
-use crate::directory::{MemberDirectory, TeamDirectory};
+use crate::directory::{MemberDirectory, Membership, TeamDirectory};
 use crate::normalize::{self, Context, KEPT_SUBTYPES, is_channel_id};
 use crate::web::{Message, PageRequest, Result, WebApi};
 
@@ -266,8 +266,10 @@ impl SlackSurface {
 
     /// Decides whether `event`'s sender is from outside the workspace when
     /// its team fields left [`outside`](InboundEvent::outside) `None`: a
-    /// sender [`home_user`](Self::home_user) doesn't say is home is set
-    /// outside with no known organization. A failed lookup that says
+    /// sender the directory doesn't say is home is set outside, of the
+    /// organization `users.info` named for them
+    /// ([`directory::organization`](crate::directory::organization)), or of
+    /// none known. A failed lookup that says
     /// nothing about the user does that too ([`SurfaceError::Api`],
     /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), so
     /// the fields alone never make a sender home; the directory logs it
@@ -293,9 +295,16 @@ impl SlackSurface {
         }
         if event.sender.surface == SurfaceKind::Slack && event.sender.team == *self.directory.team()
         {
-            match self.home_user(&event.sender.user).await {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
+            match self
+                .directory
+                .membership(&self.members_api.without_waiting(), &event.sender.user)
+                .await
+            {
+                Ok(Membership::Home) => return Ok(()),
+                Ok(Membership::Outside(team)) => {
+                    event.outside = Some(Outside { team });
+                    return Ok(());
+                }
                 Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => {
                     return Err(err);
                 }

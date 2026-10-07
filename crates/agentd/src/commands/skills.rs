@@ -8,7 +8,7 @@ use store::SkillState;
 use super::agents::{Download, no_such_agent};
 use super::{Commands, Failure, Origin};
 use crate::skills::package::{MAX_SKILL_BYTES, MAX_SKILL_MD_BYTES};
-use crate::skills::{Added, BUNDLED_NAME, Confirmed, Manifest, PENDING_TTL, Source};
+use crate::skills::{Added, BUNDLED_NAME, Confirmed, Manifest, PENDING_TTL, Removed, Source};
 
 impl Commands {
     pub(super) async fn skill(
@@ -42,7 +42,7 @@ impl Commands {
                         Err(problem) => return Ok(problem),
                     },
                 };
-                Ok(match skills.add(agent.id, source, agent.owner).await? {
+                let reply = match skills.add(agent.id, source, agent.owner).await? {
                     Ok(Added::Active(manifest)) => format!(
                         "Added the skill `{}` to `{name}`. Its conversations use it from their \
                          next start.",
@@ -50,6 +50,15 @@ impl Commands {
                     ),
                     Ok(Added::Pending(manifest)) => pending_reply(name, &manifest, origin),
                     Err(refused) => refused.to_string(),
+                };
+                Ok(match (source, files.len()) {
+                    (Source::Git(_), 1) => {
+                        format!("{reply}\nYou gave a Git URL, so I ignored the attached file.")
+                    }
+                    (Source::Git(_), 2..) => {
+                        format!("{reply}\nYou gave a Git URL, so I ignored the attached files.")
+                    }
+                    _ => reply,
                 })
             }
             SkillCommand::Confirm { skill, .. } => {
@@ -71,18 +80,27 @@ impl Commands {
                 })
             }
             SkillCommand::Rm { skill, .. } => {
-                if skill.as_str() == BUNDLED_NAME {
-                    return Ok(format!(
-                        "`{BUNDLED_NAME}` is built into every agent and can't be removed."
-                    ));
-                }
-                if skills.remove(agent.id, skill.as_str()).await? {
-                    return Ok(format!(
-                        "Removed the skill `{skill}` from `{name}`. Its sandboxes can't open new \
-                         connections to the hosts it let them reach, and connections already \
-                         open close within the hour. Conversations running now keep the skill \
-                         until they next start."
-                    ));
+                match skills.remove(agent.id, skill.as_str()).await? {
+                    Removed::Active => {
+                        return Ok(format!(
+                            "Removed the skill `{skill}` from `{name}`. Its sandboxes can't open \
+                             new connections to the hosts it let them reach, and connections \
+                             already open close within the hour. Conversations running now keep \
+                             the skill until they next start."
+                        ));
+                    }
+                    Removed::Unconfirmed => {
+                        return Ok(format!(
+                            "Removed the skill `{skill}` from `{name}`. It was still waiting for \
+                             you to confirm its hosts, so its sandboxes never got to reach them."
+                        ));
+                    }
+                    Removed::Bundled => {
+                        return Ok(format!(
+                            "`{BUNDLED_NAME}` is built into every agent and can't be removed."
+                        ));
+                    }
+                    Removed::NotFound => {}
                 }
                 let names: Vec<String> = skills
                     .list(agent.id)

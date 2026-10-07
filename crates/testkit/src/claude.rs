@@ -75,6 +75,9 @@
 //! which against a local server is once per process, and never with an API
 //! key. It is a line the runner must skip.
 //!
+//! A process whose next turn has [`Turn::crash_at_start`] exits with
+//! [`CRASH_EXIT_CODE`] as it starts, before step 1.
+//!
 //! The script is read again for every turn, and turn *n* of a session plays
 //! script turn *n*: the count comes from the user messages already in the
 //! transcript, so a resumed process carries on where the last one stopped.
@@ -139,6 +142,12 @@ pub struct Turn {
     /// without a result.
     #[serde(default, skip_serializing_if = "is_false")]
     pub crash: bool,
+    /// Exit with [`CRASH_EXIT_CODE`] as the process starts, when this is
+    /// the turn its next message would play: before it reads stdin or
+    /// prints anything, so no `init` line is seen. A process already
+    /// running ignores it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub crash_at_start: bool,
     /// Commands to run, in order, before replying, as the model would run
     /// them with its Bash tool: each is an argv whose program is found on
     /// `PATH`, such as `["agentctl", "react", "eyes"]`. They inherit the
@@ -184,6 +193,16 @@ impl Turn {
     pub fn crash() -> Self {
         Self {
             crash: true,
+            ..Self::default()
+        }
+    }
+
+    /// A turn whose process exits with [`CRASH_EXIT_CODE`] as it starts,
+    /// before it reads the message; see
+    /// [`crash_at_start`](Self::crash_at_start).
+    pub fn crash_at_start() -> Self {
+        Self {
+            crash_at_start: true,
             ..Self::default()
         }
     }

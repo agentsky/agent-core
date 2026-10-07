@@ -27,12 +27,15 @@ compiler (and `cmake` on some targets), which the GitHub Ubuntu runners have.
 Consequences:
 
 - The workspace declares reqwest with `default-features = false` and only
-  `json`. Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
+  `json`, `form` and `query` (reqwest 0.13 made `form` and `query` opt-in
+  features). Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
   plain HTTP to `agentctl.internal` and doesn't, so its static musl build
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception.
+  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
+  use that license; see
+  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -165,7 +168,10 @@ concurrency group of their own: in `main`'s group, where
 `cancel-in-progress` is false, a scheduled run arriving while a push run is
 pending would cancel that pending run, and its badges would not be
 published. GitHub runs schedules on the default branch only, so the trigger
-takes effect once this workflow is on `main`.
+takes effect once this workflow is on `main`. GitHub also disables
+`schedule` triggers in a public repository after 60 days without repository
+activity, so on a quiet repository the weekly advisory run can stop and has
+to be re-enabled from the Actions tab.
 
 ## T03: core-types
 
@@ -640,6 +646,17 @@ if the OS generator fails.
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
 
+### The `members` table lists the surfaces
+
+**Issue.** The foundation migration declares `members.surface` with
+`CHECK (surface IN ('slack', 'rocketchat'))`, which couples `SurfaceKind` in
+core-types to the schema.
+
+**Solution.** Kept, so the store refuses a surface it has never heard of.
+A task that adds a `SurfaceKind` variant must also add a migration that
+relaxes the constraint; until it does, `ensure_member` fails at runtime for
+the new surface.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
@@ -702,6 +719,29 @@ Slack's `*` right back next to the URL.
 trailing punctuation and unmatched closing brackets left outside, as qm-core's
 `trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
 still left to Slack. The T06 bullet in the plan now says so.
+
+### Emphasis inside a bare URL cut the link
+
+**Issue.** CommonMark reads `_…_`, `__…__`, `*…*` and `~~…~~` inside a URL's
+path as emphasis, so pulldown-cmark splits the URL's text around it, and a
+scan of one text node linked only the part before:
+`see https://docs.python.org/3/library/__main__.html` became
+`see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
+kept such URLs whole.
+
+**Solution.** Before building the tree, the renderer measures bare URLs in
+the source over each run of text and emphasis events. A run ends where the
+rendered text stops being a URL: at a character reference or escape that
+renders as a space, `<`, `>` or `|` (`&lt;`), and at anything other than
+text and emphasis, such as inline code. Each run is scanned once, so the
+pass stays linear; measuring from every text node to the next source
+terminator instead took 19 s on ``"`c`https://a"`` repeated 10,000 times,
+since each cut made the next URL scan the rest of the run again. Emphasis or strikethrough whose opening
+delimiter is inside such a range is replaced by its children, with its
+delimiters as text, so the URL is one text run again and is linked whole.
+Markup that opens before a URL wraps it and is not touched, even when the
+source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
+as `*<https://x.io/a>*'s`.
 
 ### CommonMark disagrees with some qm-core regex cases
 
@@ -971,19 +1011,24 @@ directory entry resolving to `allé` all broadcast.
 **Solution.** After rendering, `to_markdown` makes one last pass over the
 whole output, code and link targets included, with the server's grammar: it
 inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
-`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
-precedes the `@`. The server reads no name after the zero-width space. A
-URL or a code sample containing `/@all` or `@here` gets the zero-width space
-too; that is the price of the server not knowing about code. `@allison` and
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, unless a `/`
+precedes the `@`. The server reads no name after the zero-width space, and
+it never reads one after `/`, which is not in `(^|\s|>)`; link removal can't
+put anything else before such an `@` either, since a removed link ends in
+`)`. So `https://x.io/@all` stays a working link, while a code sample
+containing ` @here` still gets the zero-width space, because the server
+doesn't know about code. `split` never cuts just before an `@` that follows
+anything but whitespace or `>`, even when a construct longer than a chunk
+forces a cut, so a chunk can't start with the `@all` of such a URL. `@allison` and
 `@all.hands` stay untouched. The pass is the only place that inserts the
 space; name resolution just skips broadcasts so they are never offered to
 the directory. Usernames from the directory must match the server's ASCII
 class. The tests port the server's regex (`rocketchat::server`, checked
 against the JavaScript regex under Node on 30,000 generated strings while
 writing it) and assert that no output, and no chunk `split` makes from it,
-yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
-pattern; a server configured with a narrower name pattern could read `@all`
-out of `@all.hands`.
+yields `all` or `here`. The rule assumes the default
+`UTF8_User_Names_Validation` pattern; a server configured with a narrower
+name pattern could read `@all` out of `@all.hands`.
 
 ### A cut can create or shorten a mention
 
@@ -997,9 +1042,14 @@ cut inside an oversized construct could shorten `@herectic` to `@here`.
 whatever precedes the `@`, and never cuts right before an `@` that follows
 anything but whitespace or `>`. When a single construct is longer than the
 chunk and a cut has to fall inside it, the cut still avoids the inside of a
-name: it falls right after the `@` instead, so neither chunk holds a
-shortened name. Together with the final pass above, every `@` run in a chunk
-is a run of the rendered text, and those are already neutralized.
+name and the position just before an `@` that follows anything but
+whitespace or `>`: it falls right after the `@` instead, so neither chunk
+holds a shortened name or starts with a new one. This holds inside a
+`<…>` token and after an unclosed `<` as well: the token scan first jumped
+past them without looking at their `@`s, so a forced cut in `<aaaaaaaa/@all`
+gave a chunk `@all`. Together with the final pass above, every `@` run in a chunk is a run of the rendered text, and
+those are already neutralized or follow a `/`, where the server reads no
+mention.
 
 ### Grapheme clusters need a mark table
 
@@ -1230,6 +1280,15 @@ is judged by `Command::is_secret_bearing` alone, so a persona mentioning
 `sk-ant-` is still just a persona. Error messages still never repeat the
 text.
 
+A pasted login code counts whatever the verb, in both forms T09's
+`parse_pasted` accepts: a word with a `code=` query parameter, such as the
+callback URL, and `<code>#<state>` whose parts use the login's token
+alphabet, printable ASCII other than `#`, `&`, `?`, `=` and `|`, so
+`logn abc.def~1#state` and `logn ABC123%2F#state` count. A URL with a
+fragment and no `code=` (`https://x.io/r#main`) doesn't, since the login
+reads a URL only by its query. Any other `word#word` does, so `PR#42` is a
+false positive the rule accepts.
+
 ## T09: auth
 
 ### Claude Code 2.1.285's OAuth requests, read from the binary
@@ -1274,7 +1333,8 @@ around `grant_type:"authorization_code"`:
   `user:inference` alone, so the authorization server accepts a subset for
   this client. agentd keeps the plan's `user:profile user:inference`: the
   profile needs the first, the proxy the second. Whether the server accepts
-  exactly this pair is part of the live check still to be done.
+  exactly this pair is part of the live login, which T13's live check
+  carries, together with the revoke path below.
 
 ### Claude Code revokes the refresh token on logout
 
@@ -1435,6 +1495,13 @@ ID, or `scopes` widened after members linked), so `auth` asks the member to
 log in again rather than retrying forever; and the plan's wording ("HTTP
 400, 401 or 403") is narrowed to these codes. Tests cover each code, the
 account-on-hold body, and 4xx responses that must not break the link.
+
+OAuth response bodies are read up to 64 KiB, by `Content-Length` and as
+they stream in. An oversized failure keeps its status, as
+`AuthError::Status` without an OAuth code, so an oversized 400, 401 or 403
+to the code exchange is still `CodeRejected`, and an oversized refresh
+failure is transient: its body isn't read, so it can't say the token is
+dead. Only an oversized success is `InvalidResponse`.
 
 ### The plan was read while holding the member's lock
 
@@ -2168,7 +2235,9 @@ token with `type: "personalAccessToken"`
 where the resume handler finds it, so the realtime client sends the bot's
 token as `{"resume": token}`. A login error `403` ends `events` with
 `SurfaceError::Unauthorized` instead of reconnecting forever. A login that
-answers for another user id also ends it.
+answers for another user id also ends it. A login result with no user id
+reconnects instead, since a single malformed or proxy-mangled frame would
+otherwise end the bot's events until agentd restarts it.
 
 ### DDP details the client relies on
 
@@ -2246,6 +2315,26 @@ server's pings.
 
 **Solution.** The socket loop hands raw messages to the surface through a
 channel of 256, and the surface normalizes them in order on its own.
+
+### A slow consumer looked like a silent server
+
+**Issue.** Review found that the heartbeat watchdog measured silence from
+the last frame read. While the loop waited for a full channel to take a
+message it read nothing, so a consumer slower than two heartbeats ended the
+connection as "the server stopped answering", and the frames still unread
+in the socket were lost.
+
+**Solution.** Silence is measured from the last frame read or the end of
+handling one, whichever is later, so time spent waiting for the consumer
+does not count. A test holds a channel of one for three heartbeats of
+500 ms and checks that the connection is not replaced and the next message
+arrives. The heartbeat is that long so a ping and its pong fit in one
+heartbeat on a loaded CI runner.
+
+While the loop waits for the consumer it reads no frames, so it also
+answers no server ping. The streamer closes a socket about 30 seconds
+after a ping goes unanswered, so a consumer stalled for that long still
+ends the connection; the client then reconnects as after any other drop.
 
 ### tokio-tungstenite uses rustls's default provider
 
@@ -2400,6 +2489,16 @@ connections stop listening, and the intake runs the commands it already
 received (the store has recorded them as processed, so no other instance
 would) and waits for them within the drain timeout.
 
+One window is left. `listen` stops on the shutdown signal by dropping the
+surface's events future, and that future may be between the
+`mark_event_processed` commit and the end of the `send` into the intake. A
+command dropped there is recorded as processed and never run by any
+instance. The window covers the store write and `CommandFeed::offer`'s
+`send` into the intake's channel, which holds 64 commands: normally both
+are short, but under a backlog the `send` waits while the channel is full,
+and the window lasts that long. It is inherent to recording an event before
+delivering it; the member sees no reply and can send the command again.
+
 ### Secret-looking text that doesn't parse, in a channel
 
 **Issue.** `ParseError::is_secret_bearing` says malformed text may hold a
@@ -2413,7 +2512,10 @@ command that parses gets the refusal for its kind: `login <code>` cancels
 the pending logins, `admin api-key set` says to revoke the key at the
 Anthropic Console, `slack-token` says to revoke it at api.slack.com. None
 of them is used. The refusal matches every command explicitly, so a new
-secret-bearing command doesn't compile until it has its own advice. A
+secret-bearing command doesn't compile until it has its own advice. If
+cancelling the pending logins fails in the store, the failure is logged and
+the member still gets the refusal, which then doesn't claim the login was
+cancelled; the parsed and the unparsed paths agree on this. A
 public `login <code>` also takes the pending login its `state` names
 (`Auth::cancel_pasted_login`, with `auth`'s own paste parsing and no
 exchange), whoever started it: the sender's own pending logins are not
@@ -2503,14 +2605,23 @@ that races a slow creation, the creation's own `activate_binding` fails and
 it gives up.
 
 A crash, or a store failure, between `users.create` answering and the bot
-user being recorded leaves a bot user no binding records. Abandoning a
-creation therefore looks the noted username up with `users.info` and, if
-that user's email is the binding's (`agent-<binding id>@agent-core.invalid`),
-records it, so it is retired. That needs the manager's
+user being recorded leaves a bot user no binding records. A disabled
+binding that noted a username but records no bot user therefore owes
+retirement too, and its retirement first looks the noted username up with
+`users.info`: if that user's email is the binding's
+(`agent-<binding id>@agent-core.invalid`), it is recorded and deactivated
+in the same attempt; if the email is another's, or missing, the username
+is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
+Rocket.Chat doesn't answer is an attempt that failed, deferred with the
+retirement's backoff, so a creation that died because Rocket.Chat was
+unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
+answers an unknown username without an error code, so a creation that
+never got as far as `users.create` is indistinguishable from an outage and
+spends the retirement's attempts (about three days of `users.info` calls)
+before it is given up. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
-out, and it is tried once, when the creation is abandoned. A bot user
-still missed has no token and no password anyone knows, so it can't be
-used, but it keeps its username until an admin removes it.
+out. A bot user still missed has no token and no password anyone knows, so
+it can't be used, but it keeps its username until an admin removes it.
 
 ### Deactivating a deleted agent's bot is owed until it happens
 
@@ -2644,6 +2755,11 @@ their user id as display name.
   for good: creating an agent of the same name again gets the prefixed
   username, and once that one is deleted too, the name can't be created
   again by that owner until an admin removes the old bot users.
+- So does the bot user of a creation that failed after `users.create`, for
+  example because the `bot` role lacks `create-personal-access-tokens`: it
+  is deactivated, not deleted, so a retry after the failure gets the
+  prefixed username. Deleting it would need `delete-user` on the manager's
+  role, a broader grant than the username is worth.
 
 ### Agent names are the owner's
 
@@ -2893,6 +3009,10 @@ by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
 a command by default, so the model sees why it failed rather than a killed
 command.
 
+Review found that `--timeout 18446744073709551615` panicked on `Instant +
+Duration` overflow. The wait is now clamped to a day, which no turn
+outlasts, so any `u64` the model types gives a sane wait.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
@@ -3062,12 +3182,15 @@ its own, with `platform` `linux-x64` or `linux-arm64` from BuildKit's
 its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
 `CLAUDE_CODE_SHA256_ARM64`, pinned next to `CLAUDE_CODE_VERSION`, and print
 `<version> (Claude Code)`; only then is it copied to
-`/usr/local/bin/claude`. The checksums are `platforms.<platform>.checksum`
-in the release's `manifest.json`; for 2.1.285 the manifest was read from
-the release bucket, and the `linux-x64` binary downloaded from it hashed to
-the manifest's value and printed `2.1.285 (Claude Code)`. The CI build
-downloads it from `downloads.claude.ai` and `sha256sum` reports it OK.
-A copy outside
+`/usr/local/bin/claude`, with `--chown=0:0`, since BuildKit keeps a
+stage-to-stage copy's ownership and the file would otherwise belong to
+`nobody` (harmless at mode 0755 on a read-only root, but `agentctl` is
+root's). The images job checks that both belong to root. The checksums are
+`platforms.<platform>.checksum` in the release's `manifest.json`; for
+2.1.285 the manifest was read from the release bucket, and the `linux-x64`
+binary downloaded from it hashed to the manifest's value and printed
+`2.1.285 (Claude Code)`. The CI build downloads it from
+`downloads.claude.ai` and `sha256sum` reports it OK. A copy outside
 `~/.local/bin` is left alone by the auto-updater, which
 `DISABLE_AUTOUPDATER=1` also turns off. `CLAUDE_CODE_VERSION` is still the
 only place the version is written: the CI check reads it from there.
@@ -3216,6 +3339,28 @@ spawned task, which a current-thread runtime whose `block_on` returned,
 or any runtime shutting down, dropped unpolled, so the process group
 lived on. `kill(2)` returns at once, so `Drop` now sends the signal
 itself.
+
+### `wait` after `kill` hung on unread stdout
+
+**Issue.** Review found that `DockerChild::wait` awaited the task copying
+the exec's output into a 64 KiB duplex before asking Docker for the exit
+code. With more than 64 KiB unread, for example when T20's turn times out
+mid-stream, that task blocked in `write_all`, so `wait` never returned after
+`kill`, although a `ProcessSandbox` child is reaped whether its stdout is
+read or not. And when the output ended but `inspect_exec` still said
+running after ten seconds, `wait` answered `code: None`, which reads as an
+exit.
+
+**Solution.** A successful `kill` aborts the copying task, so `wait` goes
+straight to polling `inspect_exec`, and stdout ends after what was already
+copied. Both sandboxes now return from `wait` after `kill` whether stdout
+was read or not, with a unit test for each (the Docker one against a fake
+daemon) and `docker_kill_then_wait_returns_with_stdout_unread` against a
+real daemon. A process still running ten seconds after its output ended or
+it was killed is now a `SandboxError::Docker` for `inspect exec`. `wait`
+awaits the copying task where it is stored rather than taking it out first,
+so a `wait` that is cancelled, for example by a timeout, leaves the task for
+a later `kill` to abort; a unit test cancels a `wait` and then kills.
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -3612,6 +3757,11 @@ can't, and reqwest adds one.
   nothing (`no_gzip` and friends, in case a feature elsewhere in the
   workspace enables them), and honors the system proxy settings like `auth`'s
   client does.
+- A placeholder in a header other than the credential header, or in the
+  body, is forwarded as it came, on purpose: that is the plan's "every other
+  header untouched", and `never_substitutes_in_body` tests it. Upstream sees
+  only a placeholder, which is useless anywhere but from the bound sandbox
+  IP through this proxy.
 
 ### Streaming needs reqwest's `stream` feature
 
@@ -4074,6 +4224,12 @@ touches a new one. `turn_finished` returns `Self::Finished`, which
 turn's `Outbox` there. `SessionManager` is generic over its hooks rather
 than holding a `dyn TurnHooks`.
 
+A death revokes the process at once even while a turn runs in it:
+`a_container_killed_mid_turn_has_its_process_revoked_before_the_turn_ends`
+kills the container under a running turn and holds that turn's
+`turn_finished` until `process_stopping` has run, so the test fails if the
+revocation waits for the turn.
+
 ### A turn cut off before its outcome was recorded
 
 **Issue.** A session is marked started after a turn whose `init_seen` is
@@ -4477,6 +4633,23 @@ turn when it has no answer. The trait's rustdoc lists every lookup `route`
 may make for an event, in order, so T23 knows what to load, and T23's and
 T27's plan text say what they fill.
 
+### An unanswered `member_for` made the owner a stranger
+
+**Issue.** Review found that `member_for` still failed open. It returned
+`Option<MemberId>`, so the router could not tell "this identity belongs to
+no member" from "the view didn't load it". If T23's view missed the owner's
+own key, or turned a store error into `None`, the owner was not the owner:
+their DM ran on the community key, in the `Dm` scope on the public side.
+
+**Solution.** `member_for` returns `Option<Option<MemberId>>`, like
+`is_banned`: `Some(None)` is a stranger and `None` refuses with
+`PolicyUnavailable`, after the paused check and before the ban check. A
+hop asks only when its attribution recorded no member. A store-backed view
+must map a store error to `None`, never to `Some(None)`. The test of the
+thread-starter half of the hop billing rule now attributes the thread root
+to the linked owner's turn, so billing the thread starter would run on the
+owner's credential instead of giving the link prompt.
+
 ## T23: Turn pipeline end to end
 
 ### One row per session and one attribution per post
@@ -4839,7 +5012,12 @@ included), the busy line, the notice that part of a reply was lost, and
 the one a shutdown posts. Nothing reads one: no turn is billed for it, and
 a reply in its thread replies to the thread's root, not to the notice. A
 turn's own failure message (a usage limit, a login that expired, a crash, a
-timeout) comes from a turn that ran, and is recorded as its reply.
+timeout) comes from a turn that ran, and is recorded as its reply. A crash
+or timeout before the CLI printed `init` is not one: the CLI never read the
+message, so it counts as a failure before the turn reached the model. What
+its turn message recorded is forgotten, so the next turn shows the request
+again, and its notice has no row. `fake-claude`'s `Turn::crash_at_start`
+plays that crash.
 
 The files a turn uploads have no row either: `Surface::upload` returns no
 message, and Slack's `files.completeUploadExternal` doesn't say which
@@ -4896,7 +5074,11 @@ panicking message doesn't stop its lane. The set is behind a
 `std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
 a Rocket.Chat connection's is on every reconnect, can't leave a lane
 created without its task. Queueing checks that the pipeline is open under
-that lock and never starts a task once it is closed. `drain` polls the set
+that lock and never starts a task once it is closed, and a lane starts none
+of its waiting messages once it is closed: a message that passed
+`dispatch`'s check just before a shutdown, or waited behind a running
+turn, is dropped as one sent after closing is, so the drain waits only for
+the turns already running. `drain` polls the set
 under the lock without holding it across a wait, so a drain cut off by its
 timeout leaves the tasks for `cut_short`, which takes the set and shuts it
 down. On shutdown `Server::run` stops the public listener and the chat
@@ -4910,8 +5092,8 @@ turn's working emoji is kept until its reply, or its failure notice, has
 gone out, so a reply stuck on a slow post isn't lost without a word. That
 is the simplest option that tells people: the turns and their queue stay in
 memory rather than the store, so a crash, unlike a shutdown, still loses
-them silently, and messages still waiting in a lane at the timeout are
-dropped without a word, since no decision was made about them. The working
+them silently, and messages still waiting in a lane when the pipeline
+closes are dropped without a word, since no decision was made about them. The working
 emoji is held by a guard, so a panicking turn takes it off too.
 
 ### An agent's post can arrive before its attribution
@@ -5179,7 +5361,11 @@ transaction in progress, and one begun after it fails at once, leaving the
 session unreset with its container stopped, as any failed reset does, and
 the process's exit ends the task anyway. Stopping the task with its caller
 would cancel a container stop part way or thread a cancellation into the
-write, for no gain. The follow-up lives only in memory: if the instance
+write, for no gain. The follow-up itself holds a strong `SessionControl`
+handle until its resets end, so on shutdown the `SessionManager`'s inner
+state, whose drop aborts the reaper and the container event follower, can
+outlive the `Turns` handle while a reset waits behind a long turn; that is
+bounded by the drain, which drops a follow-up still waiting when it ends. The follow-up lives only in memory: if the instance
 dies, the queued resets die with it and nothing is reset, which the owner
 sees in `sessions` and can send again.
 
@@ -6218,6 +6404,10 @@ otherwise pass), under `slack:<binding>:request`. Slack doesn't retry them, so
 a second copy is never legitimate. Timestamps are also refused when more than
 five minutes in the future, not only in the past.
 
+That Slack never retries an interactivity payload is unverified live. A
+retry would be signed again with a new timestamp, so its signature differs
+and it would run twice. T31's live check records whether Slack retries one.
+
 ### Current Slack apps post without a subtype
 
 **Issue.** The plan ignores every subtype but `file_share` and
@@ -6431,9 +6621,20 @@ similar are `NotFound`; anything else is `Api` with the code. A code is
 kept only if it is at most 64 lowercase letters, digits and underscores, so
 an error never carries arbitrary response text. `already_reacted` from
 `reactions.add` and `no_reaction` from `reactions.remove` count as success.
-A non-2xx status other than 429 is `Api("HTTP <status>")`, an unreadable
-body is `Transport`, and redirects are never followed. Transport errors drop
+A non-2xx status other than 429 maps the body's `ok: false` code like any
+other and is `Api("HTTP <status>")` only when the body has none, an
+unreadable body is `Transport`, and redirects are never followed. Transport errors drop
 the request URL, so a `response_url` or upload URL can't leak through one.
+
+Review found that a non-2xx answer whose body carries an `ok: false` code,
+such as HTTP 400 with `invalid_arguments`, lost the code, while
+`respond_ephemeral` already read it. Such a code now goes through the same
+sanitizing and `map_error`; only a non-2xx answer without one is
+`Api("HTTP <status>")`. A 429 from a presigned upload URL, which had been
+`Api("the file upload was refused (HTTP 429)")`, is now `RateLimited` with
+its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
+is not a Web API method, so it has no bucket, and the caller can retry the
+whole upload, which shared nothing.
 
 ### Names two members share
 
@@ -6674,20 +6875,24 @@ T31 routes agents' messages.
   the SDKs have no revoke method for configuration tokens, and whether
   `auth.revoke` accepts one is unverified.
 
-### Files in the manager DM wait for their handlers
+### Files in the manager DM
 
 **Issue.** The plan says files attached to a manager DM feed `persona`
 (T14's upload rule) and `skill add` (T25), downloaded with the manager's bot
-token. Neither handler is in this stack yet; both commands answer "isn't
-available yet".
+token. `persona` was in place but read files only in the Rocket.Chat manager
+DM, so a Slack member who attached `persona.md` was told to attach it.
 
 **Solution.** T30 adds the download, `WebApi::download_file(file,
 max_bytes)`: it sends the bot token only to an `https` URL on `slack.com` or
 a subdomain (or the API URL's own origin, for tests), follows no redirects
 (Slack redirects a request it refuses to its sign-in page), checks the
 declared size and the `Content-Length` before reading, and stops reading
-past the limit. Passing the DM's files to the handlers is left to T14 and
-T25, whose plan text now says so.
+past the limit with `SurfaceError::TooLarge`, as Rocket.Chat's download
+does. `dm_command` passes the DM's files with the command, and
+`Commands::download` reads a file attached in either manager DM with that
+surface's manager credentials, so `persona` takes a `persona.md` on Slack
+under the same 64 KB cap. A slash command carries no files. `skill add`
+(T25) reads its attachment with the same download.
 
 ### The manager's events URL before its secret is set
 
@@ -7562,7 +7767,9 @@ would let a bot post in any public channel, is off unless
 - The reminder is claimed with a 10-minute lease, like the relink notice, and
   tried at most five times (the relink notice allows 20); an owner no
   manager DM reaches waits. Its link is built before the claim, so an
-  attempt is never spent on a link that can't be made.
+  attempt is never spent on a link that can't be made. The owner's
+  identity in the workspace is looked up after the claim, so an owner with
+  none uses up the attempts rather than being read again on every sweep.
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
@@ -7892,7 +8099,10 @@ maps the identity to its member and refuses anyone but the agent's owner
 with the same answer as for an unknown id. Nothing else in the payload is
 trusted: which message was clicked doesn't matter. Once decided or expired,
 the card is updated once (`chat.update` with the outcome in place of the
-buttons); on Rocket.Chat its one message is edited to the outcome.
+buttons); on Rocket.Chat its one message is edited to the outcome. An
+update that fails on the way (a rate limit or a transport error) releases
+its claim and is tried on a later pass; one the platform refuses is not
+tried again, and the card's buttons answer that the task was settled.
 
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a
@@ -8826,8 +9036,9 @@ the edges to the implementation.
   `unknown` with reason `other_status`, and so is every status but 200,
   400, 401, 403, 404, 429, a 3xx (`redirect`) and a 5xx (`server_error`),
   a 413 from a proxy in front of the endpoint among them.
-- `claude_code_session_id` must be `session_` and 1 to 128 ASCII letters
-  and digits exactly, with nothing trimmed. `claude_code_session_url` is
+- `claude_code_session_id` must be `session_` or `cse_`, the two forms the
+  cloud documentation shows, and 1 to 128 ASCII letters and digits exactly,
+  with nothing trimmed. `claude_code_session_url` is
   kept only when it is byte for byte `https://claude.ai/code/` and that
   id, so a query, an extra segment or another host's look-alike loses the
   URL and keeps the id.
@@ -9146,6 +9357,25 @@ manager DM's "try again" line when Slack can't answer. That can't be
 avoided without knowing home first; the design says so, and that none of
 them says more than that the agent is busy or Slack failed.
 
+### The copy's organization is Slack's, and a disagreement drops the message
+
+**Issue.** Confirmation copied the event's `outside` onto a copy that had
+none (`outside_kept`), so the organization `[slack_connect] teams` will
+judge at T36b came from the event, which an agent's owner can sign. Fail
+closed for T36a, which ignores outside requesters, but a forged
+organization could later move a home member's mention to the community
+key or pass an unlisted organization's member off as a listed one.
+
+**Solution.** The copy's `outside` comes from Slack's data only: its own
+team fields, else the home lookup, whose answer now carries the
+organization `users.info` names (`directory::Membership`, from `team_id`,
+else `enterprise_user.enterprise_id`, whichever is not home). The pipeline
+drops a message whose event and copy disagree on `outside`, organization
+included (`agreeing_copy`), with the throttled "routes differently"
+warning. At T36a the event of an outside sender is ignored before
+confirmation, so the drop only replaces what `copy_stands` already did; it
+is there for T36b.
+
 ### The store refuses outside requesters until T36b
 
 **Issue.** `message_refs`, `consents` and `ctl_tokens` have no column for
@@ -9160,10 +9390,10 @@ writes `outside: None` for every thread message it shows a session.
 `create_consent` and `set_ctl_turn` refuse a requester with `outside` set
 with `StoreError::Refused`, through one helper, `store::home_requester`.
 The T36b plan says so, and that admitting a listed organization rests on
-T36e: confirmation keeps the copy's own `outside`, which is `Outside { team:
-None }` when the copy's fields don't name the organization, so
-`copy_stands` drops an admitted outside message unless Slack's copy names
-it.
+T36e: confirmation keeps the copy's own `outside`, from its fields or
+else the organization `users.info` names, and drops a message whose event
+and copy disagree on it, so an admitted outside message runs only when
+Slack's data and the event name the same organization.
 
 Review round 2 found that the earlier wording here and in the plan, "no
 row reads back as home", was wrong: `record` writes a home requester for
@@ -9418,8 +9648,13 @@ and recording the answer then logged "had its outcome already", which
 wasn't so.
 
 **Solution.** The same transaction checks the member still holds a
-routine under the label with that routine id (`CloudBegun::RoutineGone`
-otherwise, answered "was removed or replaced while I was starting it").
+routine under the label with that routine id, and that it is still the
+registration `cloud_routine` read (`CloudBegun::RoutineGone` otherwise,
+answered "was removed or replaced while I was starting it"). The
+registration is the sealed token itself, which a fresh nonce makes
+different on every `cloud add`, so a token-only replacement in the same
+second, from another identity whose commands aren't ordered with this
+one, is caught too, and the revoked token is never fired.
 A deletion either comes first, and nothing is written or sent, or comes
 after and deletes the row with the rest; the request already out still
 runs, as the member asked for it. `finish_cloud_handoff` returns

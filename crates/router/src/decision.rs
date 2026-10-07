@@ -54,7 +54,9 @@ pub enum Decision {
     Refuse {
         /// Why.
         reason: RefuseReason,
-        /// Whose request is refused, as for [`Decision::LinkPrompt`].
+        /// Whose request is refused, as for [`Decision::LinkPrompt`]. Its
+        /// member is `None` when the view couldn't say which member the
+        /// requester is.
         requester: Requester,
     },
 }
@@ -166,9 +168,9 @@ pub enum RefuseReason {
         /// The tokens agents' turns may use in a thread in a day.
         max: u64,
     },
-    /// The view couldn't say whether the requester is banned, or what the
-    /// agent's rules are, so the router refuses rather than assume the
-    /// requester is allowed.
+    /// The view couldn't say which member the requester is, whether they
+    /// are banned, or what the agent's rules are, so the router refuses
+    /// rather than assume the requester is allowed or a stranger.
     PolicyUnavailable,
 }
 
