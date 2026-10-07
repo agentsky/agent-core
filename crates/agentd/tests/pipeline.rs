@@ -775,6 +775,50 @@ async fn dms_and_channels_use_their_own_sessions_and_volumes() {
 }
 
 #[tokio::test]
+async fn an_owners_dm_whose_member_lookup_fails_is_refused_not_run() {
+    use sqlx::Connection as _;
+    let stack = start().await;
+    let mut db = sqlx::SqliteConnection::connect(&stack._dir.db_url())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         UPDATE surface_identities SET member_id = 'not-a-member-id' WHERE user_id = 'alice';",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    assert!(
+        stack
+            .store()
+            .member_for_identity(&key("alice"))
+            .await
+            .is_err(),
+        "the owner's member lookup fails"
+    );
+
+    stack.next_turn(Turn::reply("Ran anyway."));
+    let requests = stack.fake.message_requests().await.len();
+    stack
+        .handle(stack.event("alice", "DM1", ConvKind::Dm, "d1", None, &[]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, in_thread("DM1", None));
+    assert_eq!(
+        sent[0].1,
+        "helper can't check who may use it right now. Try again later."
+    );
+    assert_eq!(
+        stack.fake.message_requests().await.len(),
+        requests,
+        "no turn ran, on any key"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn failures_and_refusals_say_why_and_a_bot_never_joins_a_room() {
     let stack = start().await;
 
