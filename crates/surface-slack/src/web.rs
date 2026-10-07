@@ -14,7 +14,9 @@
 //! # Errors
 //!
 //! Slack answers most failures with HTTP 200 and `{"ok": false, "error":
-//! "<code>"}`. [`map_error`] turns the code into a [`SurfaceError`]. A 429
+//! "<code>"}`, and some with another status and the same body. [`map_error`]
+//! turns the code into a [`SurfaceError`]; another status without a code is
+//! [`SurfaceError::Api`] with the status. A 429
 //! (or an `ok: false` with `ratelimited`) is retried after `Retry-After`,
 //! at most [`MAX_RETRIES`] times and only while the wait is within
 //! [`SlackClient::with_max_retry_wait`]; otherwise it fails with
@@ -936,16 +938,17 @@ impl WebApi {
     ///
     /// # Errors
     ///
-    /// [`SurfaceError::Api`] if the URL isn't Slack's, the file is larger
-    /// than `max_bytes`, or Slack answers anything but 200;
-    /// [`SurfaceError::Transport`] if the download fails. No error repeats
-    /// the URL.
+    /// [`SurfaceError::TooLarge`] if the file is larger than `max_bytes`;
+    /// [`SurfaceError::Api`] if the URL isn't Slack's, or Slack answers
+    /// anything but 200; [`SurfaceError::Transport`] if the download fails.
+    /// No error repeats the URL.
     pub async fn download_file(&self, file: &InFile, max_bytes: u64) -> Result<Vec<u8>> {
         let url = Url::parse(&file.url)
             .ok()
             .filter(|url| self.client.may_send_token_to(url))
             .ok_or_else(|| SurfaceError::Api("the file's URL is not a Slack URL".into()))?;
-        let too_large = || SurfaceError::Api(format!("the file is larger than {max_bytes} bytes"));
+        let too_large =
+            || SurfaceError::TooLarge(format!("the file is larger than {max_bytes} bytes"));
         if file.size.is_some_and(|size| size > max_bytes) {
             return Err(too_large());
         }
@@ -1051,7 +1054,8 @@ impl WebApi {
     ///
     /// # Errors
     ///
-    /// [`SurfaceError::NotFound`] if a file can't be read, and
+    /// [`SurfaceError::NotFound`] if a file can't be read,
+    /// [`SurfaceError::RateLimited`] if an upload URL answers 429, and
     /// [`SurfaceError::Api`] if an upload is refused; otherwise see
     /// [`map_error`].
     pub async fn upload_files(
@@ -1114,6 +1118,11 @@ impl WebApi {
         let status = response.status();
         if status.is_success() {
             Ok(())
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
+            Err(SurfaceError::RateLimited {
+                retry_after: retry_after(response.headers().get(RETRY_AFTER))
+                    .unwrap_or(DEFAULT_RETRY_WAIT),
+            })
         } else {
             Err(SurfaceError::Api(format!(
                 "the file upload was refused (HTTP {})",
@@ -1293,10 +1302,14 @@ async fn reply(response: reqwest::Response) -> Result<Reply> {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Ok(Reply::RateLimited(wait.unwrap_or(DEFAULT_RETRY_WAIT)));
     }
-    if !status.is_success() {
+    let envelope = serde_json::from_slice::<Envelope>(&bytes).ok();
+    let has_code = envelope
+        .as_ref()
+        .is_some_and(|envelope| !envelope.ok && envelope.error.is_some());
+    if !status.is_success() && !has_code {
         return Err(SurfaceError::Api(format!("HTTP {}", status.as_u16())));
     }
-    let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|_| {
+    let envelope = envelope.ok_or_else(|| {
         SurfaceError::Transport(format!("unreadable response (HTTP {})", status.as_u16()))
     })?;
     if envelope.ok {

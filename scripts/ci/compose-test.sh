@@ -5,9 +5,9 @@
 # 1. The sandbox image, run the way the sandbox crate runs it (Docker's
 #    init, read-only root, a tmpfs /tmp, no capabilities, a HOME of its
 #    own): `claude --version` prints the pinned CLAUDE_CODE_VERSION, it runs
-#    as uid 10001 in /volume, has no entrypoint and idles under Docker's
-#    init, has the tools agents use, and has no `node`. The agentd image
-#    runs as uid 10001.
+#    as uid 10001 in /volume, `claude` and `agentctl` belong to root, it has
+#    no entrypoint and idles under Docker's init, has the tools agents use,
+#    and has no `node`. The agentd image runs as uid 10001.
 # 2. The stack: Rocket.Chat's first admin, from RC_ADMIN_PASS, can log in.
 # 3. The Compose networks: a container on `sandbox` reaches agentd's proxy
 #    and ctl ports (8080 and 8081), and not its public port (8443),
@@ -113,6 +113,8 @@ check_output "claude --version prints the pinned $version" "$version (Claude Cod
 check_output "the sandbox runs as uid 10001" 10001 sandbox id -u
 check_output "the sandbox runs as gid 10001" 10001 sandbox id -g
 check_output "the sandbox starts in /volume" /volume sandbox pwd
+check_output "claude and agentctl belong to root" "0:0 0:0" \
+    sandbox sh -c 'echo $(stat -c %u:%g /usr/local/bin/claude /usr/local/bin/agentctl)'
 if sandbox which claude agentctl git curl jq rg; then
     pass "claude, agentctl, git, curl, jq and rg are on PATH"
 else

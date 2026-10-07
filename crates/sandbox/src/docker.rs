@@ -58,7 +58,7 @@ pub const LABEL_INSTANCE: &str = "agentd.instance";
 const EXEC_WRAPPER: [&str; 4] = ["/bin/sh", "-c", "echo $$; exec \"$@\"", "sh"];
 
 /// How long [`ChildHandle::wait`] polls Docker for an exit code after the
-/// output ends.
+/// output ends, or after a kill.
 const EXIT_POLL: Duration = Duration::from_secs(10);
 
 /// How long [`ChildHandle::kill`] waits for the pid line before giving up.
@@ -723,7 +723,11 @@ impl DockerChild {
                 });
             }
             if tokio::time::Instant::now() >= deadline {
-                return Ok(ExitStatus { code: None });
+                return Err(SandboxError::Docker {
+                    op: "inspect exec",
+                    status: None,
+                    message: Some("the process still runs after its output ended".into()),
+                });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -767,6 +771,9 @@ impl DockerChild {
             )
             .await
             .map_err(docker_err("start exec", false))?;
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
         Ok(())
     }
 }

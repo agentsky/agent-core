@@ -404,6 +404,32 @@ async fn a_login_code_in_a_channel_is_refused_and_invalidates_the_pending_login(
 }
 
 #[tokio::test]
+async fn a_public_secret_is_still_reported_when_the_store_fails() {
+    let h = harness().await;
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+    h.store.close().await;
+
+    h.channel("alice", &format!("login {CODE}#{state}")).await;
+    let reply = h.last_reply("alice");
+    assert!(
+        reply.starts_with("You posted a secret in a room others can read."),
+        "{reply}"
+    );
+    assert!(reply.contains("so I didn't use it."), "{reply}");
+    assert!(!reply.contains("cancelled"), "{reply}");
+
+    h.channel("alice", &format!("logn {CODE}#{state}")).await;
+    let reply = h.last_reply("alice");
+    assert!(
+        reply.starts_with("Your message looked like it held a secret"),
+        "{reply}"
+    );
+    assert!(!reply.contains("cancelled"), "{reply}");
+    assert_eq!(h.oauth_requests().await, 0);
+}
+
+#[tokio::test]
 async fn a_login_code_posted_publicly_by_someone_else_cancels_the_login_it_names() {
     let h = harness().await;
     h.dm("alice", "login").await;

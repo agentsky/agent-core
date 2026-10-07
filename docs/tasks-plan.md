@@ -160,7 +160,8 @@ description, and must pass T02's policy.
   and the request shapes, against the 2.1.285 binary
   ([impl-notes](impl-notes.md#t09-auth)). Claude Code's own claude.ai login
   asks for more scopes; `user:profile user:inference` is the least agentd
-  needs. A live login is still to be done.
+  needs. The live login T09 couldn't run is on
+  [T13's live-check list](#t13).
 
 ### Network and deployment shape
 
@@ -998,7 +999,9 @@ Acceptance:
 
 Live check (manual, recorded in the PR): one real login against the default
 endpoints. Say which endpoints worked. If any default is wrong, fix it here and
-in [Configuration](#configuration).
+in [Configuration](#configuration). T09's environment had no browser or
+Claude account, so this login moved to [T13's live check](#t13), where
+`login` first exists end to end.
 
 ### T10
 
@@ -1198,6 +1201,18 @@ Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
 the channel refusal and invalidation path, logout, and `me` for linked and
 unlinked members.
 
+Live check (manual, recorded in the PR), the real login T09 couldn't run:
+with the default `[claude_oauth]` endpoints and a real Claude account, run
+`login`, open the link, and paste the `code#state` back. Confirm the
+authorization server accepts the narrowed scopes `user:profile
+user:inference`, that the token works for a model request and `me` shows the
+plan from the profile, and that a refresh succeeds. Then `logout` and confirm
+the revocation at `revoke_url`
+(`https://platform.claude.com/v1/oauth/token/revoke`, read from the binary,
+never called live) succeeds and a refresh with the revoked token is refused.
+Say which endpoints worked; fix any wrong default here, in
+[Configuration](#configuration) and in impl-notes.
+
 ### T14
 
 **Agent lifecycle on Rocket.Chat.** Branch
@@ -1237,9 +1252,9 @@ Deliverables:
     DM with the manager bot, with `persona <name>` as its text, replaces the
     persona the same way. Size is capped at 64 KB. On Slack (T30 landed
     first) the file is downloaded with the manager's
-    `WebApi::download_file`, and the DM's files have to be passed from
-    `commands::slack::dm_command` to the handler
-    ([impl-notes](impl-notes.md#files-in-the-manager-dm-wait-for-their-handlers)).
+    `WebApi::download_file`, and `commands::slack::dm_command` passes the
+    DM's files to the handler
+    ([impl-notes](impl-notes.md#files-in-the-manager-dm)).
   - `list [@user]`: an agent directory.
   - `pause`, `resume` and `delete`, owner only. Delete deactivates the bot user
     and stops its connection; state becomes `deleted`. A paused agent's bot
@@ -1285,7 +1300,13 @@ each in a channel. Before T23 the reply can be a fixed acknowledgement; record
 that mentions arrive per bot. To check avatars, set `avatar_url` to a public
 image URL: `users.setAvatar` refuses private addresses, redirects and
 anything not `image/*`
-([impl-notes](impl-notes.md#the-live-check-against-7139)).
+([impl-notes](impl-notes.md#the-live-check-against-7139)). Also record whether 7.x answers
+`users.create` for an email already in use with `error-field-unavailable`,
+the code read as "username taken". If it does, a creation whose email is
+already taken, by a first `users.create` that succeeded unrecorded, moves
+on to the prefixed username, and the orphan lookup then searches that name
+instead of the one the bot user got
+([impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
 
 ## Phase 2: sessions, sandboxes, credential proxy (design milestone 2)
 
@@ -1929,8 +1950,9 @@ Deliverables:
   - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
     accepted only when `agent` is the agent that sent the message
     ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
-  - `member_for(MemberKey)`, `link_state(member)` (unlinked, linked or
-    broken; T26 replaced `is_linked`,
+  - `member_for(MemberKey) -> Option<Option<MemberId>>`: `Some(None)` for
+    an identity that belongs to no member. `link_state(member)` (unlinked,
+    linked or broken; T26 replaced `is_linked`,
     [impl-notes](impl-notes.md#a-broken-link-asks-for-a-new-login-never-the-community-key)).
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
@@ -1939,8 +1961,10 @@ Deliverables:
     the effective hop cap (T27 fills it; an agent with no rules has
     `AgentPolicy::default()`, which allows, with a cap of 3).
   - `is_banned(requester) -> Option<bool>` (T27 fills it).
-  - `policy` and `is_banned` fail closed: `None` means the view doesn't
-    know, and the router refuses with `RefuseReason::PolicyUnavailable`. The
+  - `member_for`, `policy` and `is_banned` fail closed: `None` means the
+    view doesn't know, and the router refuses with
+    `RefuseReason::PolicyUnavailable`
+    ([impl-notes](impl-notes.md#an-unanswered-member_for-made-the-owner-a-stranger)). The
     trait's rustdoc lists every lookup `route` may make for an event, in
     order
     ([impl-notes](impl-notes.md#a-synchronous-view-over-an-asynchronous-store-failed-open)).
@@ -2069,8 +2093,9 @@ Deliverables:
      the event and every candidate, the manager bot's identities included.
      Until T27, `policy` answers `AgentPolicy::default()` and `is_banned`
      answers `Some(false)`. A lookup the view can't answer withholds the
-     turn: `None` from `is_banned` or `policy` is refused as
-     `PolicyUnavailable`. The candidates are every managed agent mentioned,
+     turn: `None` from `member_for`, `is_banned` or `policy` is refused as
+     `PolicyUnavailable`, so a store error while loading a member must
+     become `None`, never `Some(None)`. The candidates are every managed agent mentioned,
      the agent whose DM it is, and the agent that posted the thread root
      (`reply_to`, looked up in `message_refs`). When the surface has
      `per_binding_delivery`, only the receiving binding's agent is a
@@ -2241,9 +2266,10 @@ Deliverables:
     `--opt=value` word, so neither can be read as an option;
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
     On Slack the DM's files are the `InboundEvent::files` that T30's
-    `commands::slack::dm_command` sees but doesn't pass on yet; download
-    them with the manager's `WebApi::download_file`, which caps the size
-    ([impl-notes](impl-notes.md#files-in-the-manager-dm-wait-for-their-handlers)).
+    `commands::slack::dm_command` passes with the command; download them
+    with `Commands::download`, which uses the manager's
+    `WebApi::download_file` and caps the size
+    ([impl-notes](impl-notes.md#files-in-the-manager-dm)).
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
 - `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
@@ -2444,6 +2470,12 @@ Deliverables:
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
+- Slack sends `&`, `<` and `>` in message and slash command text as
+  `&amp;`, `&lt;` and `&gt;`. The ingress passes that text on as Slack sent
+  it, and the Slack surface decodes the three entities before any of it
+  reaches `commands::parse` (T30), which works on plain text: otherwise a
+  persona typed as `You & me` arrives as `You &amp; me`. Mention and link
+  tokens parse either way.
 - `testkit::slack`: request signing helpers and payload fixtures.
 
 Acceptance:
@@ -2506,6 +2538,11 @@ handling, and that `render` converts and splits through `render`, so that
 nor `parse: full`. Slack returns HTTP 200 with `ok: false` on errors; test
 that mapping.
 
+Live check (manual, recorded in the PR): post a reply whose Markdown has `|`
+inside a link label, such as `[a | b](https://x.io)`, which `render` sends
+as `<https://x.io|a | b>`, and confirm Slack shows the whole label `a | b`
+linking to `https://x.io`.
+
 ### T30
 
 **Slack manager app and configuration token.** Branch
@@ -2532,6 +2569,10 @@ Deliverables:
 - Manager DMs on Slack work as on Rocket.Chat: the whole text is parsed as a
   command. Files attached there feed `persona` (T14's upload rule) and
   `skill add` (T25), downloaded with the manager's bot token.
+- The `&amp;`, `&lt;` and `&gt;` entities in slash command and manager-DM
+  text are decoded before `commands::parse` sees it (the contract in the
+  `commands` crate docs), with a test that `persona <name> You & me` sets
+  the persona `You & me`.
 - `/agent slack-token <token> <refresh>`, for linked members on Slack.
   - Validate the token with `auth.test` on the tooling API, or by calling
     `tooling.tokens.rotate` at once, which also proves the refresh token works.
@@ -2562,9 +2603,9 @@ Notes from implementing it
 - Commands from every surface go through one `commands::intake::CommandIntake`.
   A DM to the manager app is `Origin::SlackDm`. Command text is decoded with
   `surface_slack::normalize::unescape` before parsing.
-- Files attached to the manager DM aren't passed on yet, since `persona`
-  (T14) and `skill add` (T25) aren't in place; `WebApi::download_file` is
-  the download they use.
+- Files attached to the manager DM go with the command. `persona` (T14)
+  reads one with `WebApi::download_file` under its 64 KB cap; `skill add`
+  (T25) isn't in place yet and can use the same download.
 - The manifest's tests use `serde_norway`, a dev-dependency (MIT or
   Apache-2.0).
 
@@ -2648,7 +2689,15 @@ the agent produces a reply posted with the agent's bot token.
 
 Live check (manual): on the Slack development workspace, create two agents,
 install them, invite them to a channel, mention each, and get replies. That
-completes design milestone 4.
+completes design milestone 4. Also check and record:
+
+- Whether Slack retries an interactivity payload, for example a button press
+  answered slowly. T28 deduplicates commands and interactions by their
+  signature, so a retry signed with a new timestamp would run twice
+  ([impl-notes](impl-notes.md#replays-inside-the-five-minute-window)).
+- Whether `conversations.replies` with an agent's bot token reads a thread
+  in a public and a private channel (T29 calls it for `Surface::thread`). A
+  refusal surfaces as `Forbidden`, not as an empty thread.
 
 ## Phase 5: private tasks and agent-to-agent (design milestone 5)
 

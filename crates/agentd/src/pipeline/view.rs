@@ -48,7 +48,10 @@ async fn attribution(
 /// the event's message and whether its reply-to message is the agent's,
 /// the members of the sender and of an attributed requester, whether the
 /// owner and those members have a link and whether it broke, and whether a
-/// community admin has set the community API key. Until T27, `policy` answers
+/// community admin has set the community API key. A member lookup the store
+/// fails leaves that identity unknown, so the router refuses with
+/// [`PolicyUnavailable`](router::RefuseReason::PolicyUnavailable) rather
+/// than taking the sender for a stranger. Until T27, `policy` answers
 /// [`AgentPolicy::default`] and `is_banned` `Some(false)`.
 ///
 /// The attribution is waited for only when the router reads it: another
@@ -62,7 +65,7 @@ pub(crate) struct StoreView {
     binding: Option<(BindingId, AgentId)>,
     attribution: Option<(MsgRef, Attribution)>,
     replied: Option<(MsgRef, AgentId)>,
-    members: HashMap<MemberKey, MemberId>,
+    members: HashMap<MemberKey, Option<MemberId>>,
     links: HashMap<MemberId, LinkState>,
     community_key: bool,
 }
@@ -140,10 +143,19 @@ impl StoreView {
         Ok(view)
     }
 
-    /// Records the member `key` belongs to, and whether it is linked.
+    /// Records the member `key` belongs to, or that it belongs to none,
+    /// and whether that member is linked. A lookup the store fails leaves
+    /// `key` unknown.
     async fn member(&mut self, store: &Store, key: &MemberKey) -> Result<(), StoreError> {
-        if let Some(member) = store.member_for_identity(key).await? {
-            self.members.insert(key.clone(), member);
+        let member = match store.member_for_identity(key).await {
+            Ok(member) => member,
+            Err(err) => {
+                tracing::warn!(member = %key, error = %err, "couldn't look up a member; routing will refuse");
+                return Ok(());
+            }
+        };
+        self.members.insert(key.clone(), member);
+        if let Some(member) = member {
             self.link(store, member).await?;
         }
         Ok(())
@@ -179,7 +191,7 @@ impl RouterView for StoreView {
             .map(|(_, attribution)| attribution.clone())
     }
 
-    fn member_for(&self, key: &MemberKey) -> Option<MemberId> {
+    fn member_for(&self, key: &MemberKey) -> Option<Option<MemberId>> {
         self.members.get(key).copied()
     }
 

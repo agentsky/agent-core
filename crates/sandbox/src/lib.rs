@@ -333,12 +333,15 @@ enum ChildInner {
 }
 
 impl ChildHandle {
-    /// Waits for the process to exit.
+    /// Waits for the process to exit. Without a [`kill`](Self::kill), the
+    /// caller must read or drop stdout, or a process with more output than
+    /// the buffers hold never ends. After a kill it returns either way.
     ///
     /// # Errors
     ///
     /// [`SandboxError::Io`] or [`SandboxError::Docker`] if the status can't
-    /// be read.
+    /// be read, including when a Docker sandbox still reports the process
+    /// running ten seconds after its output ended.
     pub async fn wait(&mut self) -> Result<ExitStatus> {
         match &mut self.0 {
             ChildInner::Process(child) => child.wait().await,
@@ -346,7 +349,9 @@ impl ChildHandle {
         }
     }
 
-    /// Sends the process SIGKILL; [`wait`](Self::wait) then reaps it.
+    /// Sends the process SIGKILL; [`wait`](Self::wait) then reaps it,
+    /// whether or not stdout was read. Output the caller hasn't read yet may
+    /// be cut short: a Docker sandbox stops copying it to stdout.
     ///
     /// Processes it started may survive it: a process sandbox kills its
     /// process group, a Docker sandbox only the process. Stopping the
