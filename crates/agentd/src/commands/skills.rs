@@ -44,8 +44,9 @@ impl Commands {
                 };
                 let reply = match skills.add(agent.id, source, agent.owner).await? {
                     Ok(Added::Active(manifest)) => format!(
-                        "Added the skill `{}` to `{name}`. Its conversations use it from their \
-                         next start.",
+                        "Added the skill `{}` to `{name}`. Its files are in its sandboxes now, \
+                         though a conversation already running may not use it until it next \
+                         starts.",
                         manifest.name
                     ),
                     Ok(Added::Pending(manifest)) => pending_reply(name, &manifest, origin),
@@ -65,7 +66,8 @@ impl Commands {
                 Ok(match skills.confirm(agent.id, skill.as_str()).await? {
                     Confirmed::Active(row) => format!(
                         "Added the skill `{skill}` to `{name}`. Its sandboxes may now reach {}, \
-                         and its conversations use it from their next start.",
+                         and its files are in them now, though a conversation already running \
+                         may not use it until it next starts.",
                         list(&row.hosts)
                     ),
                     Confirmed::NotPending => format!(
@@ -81,14 +83,22 @@ impl Commands {
             }
             SkillCommand::Rm { skill, .. } => {
                 match skills.remove(agent.id, skill.as_str()).await? {
-                    Removed::Active => {
-                        return Ok(format!(
-                            "Removed the skill `{skill}` from `{name}`. It no longer lets its \
-                             sandboxes reach the hosts it asked for: a host the configuration or \
-                             another skill still allows stays reachable, new connections to the \
-                             others are refused, and connections open to them close within the \
-                             hour. Conversations running now keep the skill until they next start."
-                        ));
+                    Removed::Active { had_hosts } => {
+                        let removed = format!(
+                            "Removed the skill `{skill}` from `{name}`, and its files are gone \
+                             from its sandboxes, though a conversation already running may keep \
+                             what it read of it until it next starts."
+                        );
+                        return Ok(if had_hosts {
+                            format!(
+                                "{removed} It no longer lets its sandboxes reach the hosts it \
+                                 asked for: a host the configuration or another skill still \
+                                 allows stays reachable, new connections to the others are \
+                                 refused, and connections open to them close within the hour."
+                            )
+                        } else {
+                            removed
+                        });
                     }
                     Removed::Unconfirmed => {
                         return Ok(format!(
