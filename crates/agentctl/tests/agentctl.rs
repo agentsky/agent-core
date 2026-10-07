@@ -515,6 +515,19 @@ async fn lock_gives_up_after_its_timeout() {
 }
 
 #[tokio::test]
+async fn a_huge_lock_timeout_is_clamped_instead_of_panicking() {
+    let server = Server::start().await;
+    let (_, token) = server.turn().await;
+    server
+        .run(
+            &token,
+            &["lock", "--timeout", "18446744073709551615", "--", "true"],
+        )
+        .await
+        .ok();
+}
+
+#[tokio::test]
 async fn the_lock_renews_while_the_command_runs() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
     let (_, token) = server.turn().await;

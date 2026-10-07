@@ -77,7 +77,13 @@ impl LogFormat {
     /// [`Human`](Self::Human) with colors when standard error is a terminal,
     /// [`Json`](Self::Json) otherwise.
     pub fn detect() -> Self {
-        if std::io::stderr().is_terminal() {
+        Self::for_stderr(std::io::stderr().is_terminal())
+    }
+
+    /// [`Human`](Self::Human) with colors when standard error `is_terminal`,
+    /// [`Json`](Self::Json) otherwise.
+    pub fn for_stderr(is_terminal: bool) -> Self {
+        if is_terminal {
             Self::Human { ansi: true }
         } else {
             Self::Json
@@ -543,13 +549,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn detect_picks_json_when_stderr_is_not_a_terminal() {
-        let expected = if std::io::stderr().is_terminal() {
-            LogFormat::Human { ansi: true }
-        } else {
-            LogFormat::Json
-        };
-        assert_eq!(LogFormat::detect(), expected);
+    fn a_terminal_gets_colored_human_lines() {
+        assert_eq!(LogFormat::for_stderr(true), LogFormat::Human { ansi: true });
+    }
+
+    #[test]
+    fn anything_else_gets_json() {
+        assert_eq!(LogFormat::for_stderr(false), LogFormat::Json);
     }
 
     #[test]
