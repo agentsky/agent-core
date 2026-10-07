@@ -293,7 +293,9 @@ fn splits_bare_url(tag: &Tag<'_>, span: &Range<usize>, urls: &[Range<usize>]) ->
 }
 
 /// Puts the children of an element in its place, with its delimiters as
-/// text, as the source wrote them.
+/// text, as the source wrote them. The opening delimiter stops before the
+/// backslash of an escape that starts the first child, which is not part
+/// of the text.
 fn unwrap_markup<'a>(
     md: &str,
     span: Range<usize>,
@@ -306,7 +308,9 @@ fn unwrap_markup<'a>(
         kind: Kind::Text(md[range.clone()].to_string(), Vec::new()),
         span: range,
     };
-    push_merging_text(siblings, delimiter(span.start..inner_start));
+    let opening = &md[span.start..inner_start];
+    let opening = opening.strip_suffix('\\').unwrap_or(opening);
+    push_merging_text(siblings, delimiter(span.start..span.start + opening.len()));
     for child in children {
         push_merging_text(siblings, child);
     }
@@ -1113,8 +1117,9 @@ fn ends_url(c: char) -> bool {
 /// the URL after its scheme, as in `…#object.__init__` or `/~~a~~`.
 /// Otherwise it is dropped, as a footnote star or a stray closer is, and
 /// trimming goes on, so `(https://x.io/a).*` keeps `).*` out and
-/// `(https://x.io/_a)_` keeps `)_` out. The text it gets is decoded, so it
-/// can't tell an escaped mark; the Slack renderer ends a URL before one.
+/// `(https://x.io/_a)_` keeps `)_` out. In decoded text it can't tell an
+/// escaped mark; the Slack renderer ends a URL before an escaped mark in
+/// that trailing run.
 fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let body = url.find("://").map_or(0, |at| at + 3);
