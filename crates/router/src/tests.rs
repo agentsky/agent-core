@@ -240,7 +240,7 @@ impl World {
 
     fn requester(&self, key: &MemberKey) -> Requester {
         Requester {
-            member: self.view.members.get(key).copied(),
+            member: self.view.member_for(key).flatten(),
             key: key.clone(),
         }
     }
@@ -1554,7 +1554,10 @@ fn hop_with_an_unrecorded_member_refuses_when_the_member_is_unanswered() {
     w.view.members_unavailable = true;
     assert_eq!(w.route(&event), refused(RefuseReason::PolicyUnavailable));
 
-    let recorded = w.requester(&w.linked_key.clone());
+    let recorded = Requester {
+        member: Some(w.linked),
+        key: w.linked_key.clone(),
+    };
     let event = w.b_mentions_a(recorded.clone(), Hop::ZERO);
     assert_eq!(
         w.route(&event),
