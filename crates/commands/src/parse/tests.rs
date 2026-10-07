@@ -928,6 +928,8 @@ fn errors_without_a_secret_are_not_secret_bearing() {
         "logn a#b#c",
         "skill add Bad-Name https://x.io/r#main",
         "skill add Bad-Name https://x.io/r?ref=main#main",
+        "skill add Bad-Name HTTPS://x.io/r#main",
+        "skill add Bad-Name Http://x.io/r#main",
         "logn https://x.io/a?decode=1",
         "allow Bad-Name <#C123|general>",
         "logout now",

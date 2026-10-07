@@ -185,8 +185,9 @@ fn looks_secret_bearing(tokens: &[Token<'_>]) -> bool {
 /// `code=` query parameter, such as the callback URL, or the
 /// `<code>#<state>` string the callback page shows, two non-empty runs of
 /// printable ASCII other than `#`, `&`, `?`, `=` and `|` joined by one `#`.
-/// A channel (`#general`) or a Git URL with a ref (`https://x.io/r#main`)
-/// isn't, since the login reads a URL only by its query. A word such as
+/// A channel (`#general`) or a Git URL with a ref (`https://x.io/r#main`,
+/// with the scheme in any case) isn't, since the login reads a URL only by
+/// its query. A word such as
 /// `PR#42` is a false positive: the heuristic only decides whether a failed
 /// command is handled like a secret-bearing one, so it errs that way.
 fn is_login_code(word: &str) -> bool {
@@ -200,7 +201,11 @@ fn is_login_code(word: &str) -> bool {
     if word.contains("?code=") || word.contains("&code=") {
         return true;
     }
-    !(word.starts_with("https://") || word.starts_with("http://"))
+    let has_scheme = |scheme: &str| {
+        word.get(..scheme.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(scheme))
+    };
+    !(has_scheme("https://") || has_scheme("http://"))
         && word
             .split_once('#')
             .is_some_and(|(code, state)| is_part(code) && is_part(state))
