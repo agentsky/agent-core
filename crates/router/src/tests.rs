@@ -275,7 +275,7 @@ impl World {
             Some(attribution) if from_agent => {
                 let Requester { member, key } = attribution.requester.clone();
                 Requester {
-                    member: member.or_else(|| self.view.member_for(&key)),
+                    member: member.or_else(|| self.view.member_for(&key).flatten()),
                     key,
                 }
             }

@@ -54,7 +54,9 @@ pub enum Decision {
     Refuse {
         /// Why.
         reason: RefuseReason,
-        /// Whose request is refused, as for [`Decision::LinkPrompt`].
+        /// Whose request is refused, as for [`Decision::LinkPrompt`]. Its
+        /// member is `None` when the view couldn't say which member the
+        /// requester is.
         requester: Requester,
     },
 }

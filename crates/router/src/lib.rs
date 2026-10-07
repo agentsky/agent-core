@@ -155,11 +155,17 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
     if state == AgentState::Paused {
         return Decision::Refuse {
             reason: RefuseReason::Paused,
-            requester,
+            requester: Requester {
+                member: member.flatten(),
+                key,
+            },
         };
     }
     let Some(member) = member else {
-        return Decision::Refuse(RefuseReason::PolicyUnavailable);
+        return Decision::Refuse {
+            reason: RefuseReason::PolicyUnavailable,
+            requester: Requester { member: None, key },
+        };
     };
     let requester = Requester { member, key };
     match view.is_banned(&requester) {

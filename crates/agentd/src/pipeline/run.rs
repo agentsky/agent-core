@@ -1989,10 +1989,8 @@ mod tests {
     #[test]
     fn only_a_crash_or_timeout_before_init_leaves_the_message_unread() {
         let before = runner::TurnStats::default();
-        let after = runner::TurnStats {
-            init_seen: true,
-            ..runner::TurnStats::default()
-        };
+        let mut after = runner::TurnStats::default();
+        after.init_seen = true;
         assert!(unread(&TurnOutcome::Crashed {
             exit_code: Some(70),
             stats: before.clone(),

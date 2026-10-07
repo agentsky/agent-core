@@ -929,7 +929,7 @@ async fn dms_and_channels_use_their_own_sessions_and_volumes() {
 async fn an_owners_dm_whose_member_lookup_fails_is_refused_not_run() {
     use sqlx::Connection as _;
     let stack = start().await;
-    let mut db = sqlx::SqliteConnection::connect(&stack._dir.db_url())
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
         .await
         .unwrap();
     sqlx::raw_sql(

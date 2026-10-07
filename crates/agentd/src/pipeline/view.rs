@@ -204,6 +204,7 @@ impl StoreView {
             .members
             .values()
             .copied()
+            .flatten()
             .chain(
                 self.attribution
                     .as_ref()
@@ -322,7 +323,7 @@ impl RouterView for StoreView {
             requester
                 .member
                 .into_iter()
-                .chain(self.member_for(&requester.key))
+                .chain(self.member_for(&requester.key).flatten())
                 .any(|member| banned.contains(&member)),
         )
     }
