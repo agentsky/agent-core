@@ -3802,11 +3802,12 @@ Deliverables:
   the columns, and keeps it for `consents`, since a consent never has an
   outside requester.
   Whether a listed organization can be admitted at all rests on T36e:
-  confirmation keeps the copy's own `outside`, and a copy whose fields
-  don't name the organization comes back `Outside { team: None }` from
-  the home check, which `agreeing_copy` tells from the event's named team,
-  so T36b admits a listed organization only if T36e finds that Slack's
-  `conversations.history`/`replies` copy names it.
+  confirmation keeps the copy's own `outside`, and for a copy whose fields
+  don't name the organization the home check names the one `users.info`
+  gives for the sender. `agreeing_copy` then agrees whenever the event's
+  field and that lookup name the same id, so what T36b must verify is that
+  the two use one id form (the canonical id above, from T36e item 9);
+  where they don't, every copy disagrees and is dropped.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,
