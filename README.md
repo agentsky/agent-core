@@ -274,7 +274,10 @@ Once per repository, a member:
 1. Creates a routine at <https://claude.ai/code/routines> with that one
    repository, an environment with **Trusted** network access (the default
    allowlist) and no secrets, and no connectors: the form includes every
-   connector by default, and a run uses them without asking.
+   connector by default, and a run uses them without asking. On GitHub, they
+   protect the branches they care about in that repository with branch
+   protection rules or rulesets: the cloud session's GitHub proxy doesn't
+   limit which branches a run pushes to.
 2. Writes the routine's prompt so it acts on the text agentd sends, which the
    session otherwise treats as untrusted, for example: "Carry out the task in
    the routine-fire-payload block on the attached repository. It is mine, sent
@@ -282,7 +285,8 @@ Once per repository, a member:
    request." That prompt is also what makes the routine's token powerful:
    whoever holds the token can make the routine do any work its repository
    and network allow, as the member. That is why the routine gets one
-   repository, no connectors and the default allowlist.
+   repository, no connectors and the default allowlist, and why the branches
+   that matter are protected.
 3. Adds an API trigger to the routine, copies its URL and generates its
    token, which is shown once.
 4. Registers both under a label of their choosing, such as the repository's
