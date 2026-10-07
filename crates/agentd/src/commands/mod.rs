@@ -546,20 +546,26 @@ impl Commands {
         let place = origin.private_place();
         let advice = match command {
             Command::Login { code: Some(code) } => {
-                let cancelled = self.cancel_pending_logins(key).await;
-                match self.inner.auth.cancel_pasted_login(code).await {
-                    Ok(true) => tracing::info!(
-                        member = %key,
-                        "cancelled the pending login a public code belongs to"
-                    ),
-                    Ok(false) => {}
-                    Err(err) => tracing::warn!(
-                        member = %key,
-                        error = %err,
-                        "couldn't cancel the pending login a public code belongs to"
-                    ),
-                }
-                let and_cancelled = if cancelled {
+                let own = self.cancel_pending_logins(key).await;
+                let pasted = match self.inner.auth.cancel_pasted_login(code).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            member = %key,
+                            "cancelled the pending login a public code belongs to"
+                        );
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(err) => {
+                        tracing::warn!(
+                            member = %key,
+                            error = %err,
+                            "couldn't cancel the pending login a public code belongs to"
+                        );
+                        false
+                    }
+                };
+                let and_cancelled = if own.is_some_and(|count| count > 0) || pasted {
                     " and cancelled your pending login"
                 } else {
                     ""
@@ -618,7 +624,7 @@ impl Commands {
         if !err.is_secret_bearing() || origin.is_private() {
             return err.to_string();
         }
-        let cancelled = if self.cancel_pending_logins(key).await {
+        let cancelled = if self.cancel_pending_logins(key).await.is_some() {
             "I cancelled any pending login, so "
         } else {
             ""
@@ -636,20 +642,22 @@ impl Commands {
     /// Cancels the pending logins of the member `key` belongs to, after a
     /// secret was posted publicly. A store failure is logged rather than
     /// returned, so the member still hears that the secret is public.
-    /// Returns whether the cancellation went through.
-    async fn cancel_pending_logins(&self, key: &MemberKey) -> bool {
+    /// Returns how many pending logins it cancelled, or `None` if the
+    /// cancellation didn't go through.
+    async fn cancel_pending_logins(&self, key: &MemberKey) -> Option<u64> {
         let cancelled = async {
-            if let Some(member) = self.member(key).await? {
-                let cancelled = self.inner.store.invalidate_pending_logins(member).await?;
-                tracing::info!(%member, cancelled, "cancelled pending logins after a public secret");
-            }
-            Ok::<_, Failure>(())
+            let Some(member) = self.member(key).await? else {
+                return Ok(0);
+            };
+            let cancelled = self.inner.store.invalidate_pending_logins(member).await?;
+            tracing::info!(%member, cancelled, "cancelled pending logins after a public secret");
+            Ok::<_, Failure>(cancelled)
         };
         match cancelled.await {
-            Ok(()) => true,
+            Ok(cancelled) => Some(cancelled),
             Err(failure) => {
                 tracing::warn!(member = %key, error = %failure, "couldn't cancel pending logins");
-                false
+                None
             }
         }
     }
