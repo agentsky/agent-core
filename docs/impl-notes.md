@@ -954,7 +954,7 @@ scanner moved from `slack.rs` to `render::url` to be shared.
 
 The shared trim keeps a trailing run of `*`, `_` or `~` only when it
 follows an alphanumeric character and the URL holds the same mark earlier,
-for both surfaces (see
+after its scheme, for both surfaces (see
 [Emphasis inside a bare URL cut the link](#emphasis-inside-a-bare-url-cut-the-link)).
 On Rocket.Chat the URL only bounds the text name resolution skips: the
 renderer copies the source through either way, and what the trim drops is
