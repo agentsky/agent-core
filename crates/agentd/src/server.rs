@@ -100,7 +100,7 @@ impl Routers {
         );
         let tokens: Arc<dyn TokenSource> = app.auth().clone();
         let upstream = &app.config().proxy.upstream;
-        if upstream != cred_proxy::DEFAULT_UPSTREAM {
+        if !cred_proxy::is_default_upstream(upstream) {
             tracing::warn!(
                 %upstream,
                 default = cred_proxy::DEFAULT_UPSTREAM,
@@ -555,7 +555,8 @@ mod tests {
         assert_eq!(warnings[0]["level"], "WARN");
         assert_eq!(warnings[0]["fields"]["upstream"], upstream);
 
-        for quiet in [None, Some(cred_proxy::DEFAULT_UPSTREAM)] {
+        let slashed = "https://api.anthropic.com/";
+        for quiet in [None, Some(cred_proxy::DEFAULT_UPSTREAM), Some(slashed)] {
             build_routers(quiet).await;
         }
         global_logs()
@@ -565,7 +566,8 @@ mod tests {
             .assert_lacks(&format!(
                 "\"upstream\":\"{}\"",
                 cred_proxy::DEFAULT_UPSTREAM
-            ));
+            ))
+            .assert_lacks(&format!("\"upstream\":\"{slashed}\""));
     }
 
     #[test]
