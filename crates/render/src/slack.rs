@@ -212,13 +212,24 @@ fn parse(md: &str) -> Vec<Node<'_>> {
 /// for emphasis even in the middle of a URL. Any other event, such as inline
 /// code, ends the run, and so does a character reference or escape that
 /// renders as a character no URL holds, as `&lt;` does. Each run is scanned
-/// once.
+/// once. A URL right after a character reference or escape that renders as
+/// a letter or digit, as `&#97;` does, is joined to a word as rendered, so
+/// it isn't one.
 fn bare_urls(md: &str, events: &[(Event<'_>, Range<usize>)]) -> Vec<Range<usize>> {
     let mut urls = Vec::new();
+    let mut joined = Vec::new();
     let mut run: Option<Range<usize>> = None;
     for (event, span) in events {
         let piece = match event {
             Event::Text(text) if md[span.clone()] == **text || !text.contains(ends_url) => {
+                if md[span.clone()] != **text
+                    && text
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
+                    joined.push(span.end);
+                }
                 Some(span.clone())
             }
             Event::Start(Tag::Strong | Tag::Emphasis | Tag::Strikethrough) => {
@@ -234,24 +245,27 @@ fn bare_urls(md: &str, events: &[(Event<'_>, Range<usize>)]) -> Vec<Range<usize>
             (Some(piece), None) => run = Some(piece),
             (None, _) => {
                 if let Some(run) = run.take() {
-                    scan_run(md, run, &mut urls);
+                    scan_run(md, run, &joined, &mut urls);
                 }
             }
         }
     }
     if let Some(run) = run {
-        scan_run(md, run, &mut urls);
+        scan_run(md, run, &joined, &mut urls);
     }
     urls
 }
 
-/// Records the bare URLs in one run of source text.
-fn scan_run(md: &str, run: Range<usize>, urls: &mut Vec<Range<usize>>) {
+/// Records the bare URLs in one run of source text. `joined` holds the
+/// sorted source offsets where the rendered text before ends in a letter or
+/// digit although the source doesn't.
+fn scan_run(md: &str, run: Range<usize>, joined: &[usize], urls: &mut Vec<Range<usize>>) {
     let text = &md[..run.end];
     let mut at = run.start;
     while let Some(offset) = text[at..].find("http") {
         let start = at + offset;
-        at = match bare_url(text, start) {
+        let found = bare_url(text, start).filter(|_| joined.binary_search(&start).is_err());
+        at = match found {
             Some(url) => {
                 urls.push(start..start + url.len());
                 start + url.len()
