@@ -294,7 +294,7 @@ async fn a_bot_user_is_recorded_on_an_abandoned_binding_and_then_owes_retirement
         pending,
         [PendingRetirement {
             binding,
-            bot_user: UserId::new("bot1"),
+            bot_user: Some(UserId::new("bot1")),
         }]
     );
 }
@@ -626,7 +626,7 @@ async fn a_stale_creation_is_abandoned_once_and_frees_the_name() {
         pending,
         [PendingRetirement {
             binding: old_binding,
-            bot_user: UserId::new("bot1"),
+            bot_user: Some(UserId::new("bot1")),
         }]
     );
 }
@@ -648,6 +648,68 @@ async fn an_abandoned_creation_without_a_bot_user_owes_nothing() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_noted_username_owes_retirement_until_it_is_forgotten() {
+    let store = memory_store().await;
+    let ada = owner(&store, "ada").await;
+    let (_, binding) = create(&store, ada, "helper", 1_000).await;
+    assert!(
+        store
+            .set_binding_bot_username(binding, "helper")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store.forget_binding_bot_username(binding).await.unwrap(),
+        "still creating"
+    );
+    assert!(
+        store
+            .abandon_creation(binding, at(1_000), at(1_001))
+            .await
+            .unwrap()
+    );
+    let pending = store
+        .pending_retirements(SurfaceKind::RocketChat, &team(), at(1_002), 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending,
+        [PendingRetirement {
+            binding,
+            bot_user: None,
+        }]
+    );
+    assert!(store.forget_binding_bot_username(binding).await.unwrap());
+    assert!(
+        store
+            .pending_retirements(SurfaceKind::RocketChat, &team(), at(1_002), 3)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .set_binding_bot_user(binding, &UserId::new("bot1"), "helper")
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    assert!(
+        !store.forget_binding_bot_username(binding).await.unwrap(),
+        "a recorded bot user is kept"
+    );
+    assert_eq!(
+        store
+            .pending_retirements(SurfaceKind::RocketChat, &team(), at(1_002), 3)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a bot user recorded late owes retirement again"
     );
 }
 

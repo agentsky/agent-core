@@ -520,6 +520,28 @@ async fn a_refused_upload_shares_nothing() {
 }
 
 #[tokio::test]
+async fn a_rate_limited_upload_is_rate_limited() {
+    let (server, api) = server().await;
+    mount_upload_flow(&server).await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex("^/upload/v1/"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "7"))
+        .mount(&server)
+        .await;
+    let dir = TempDir::new("surface-slack");
+    let err = api
+        .upload_files(&channel(), None, &[staged(&dir, "a.txt", "x")])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SurfaceError::RateLimited {
+            retry_after: Duration::from_secs(7)
+        }
+    );
+}
+
+#[tokio::test]
 async fn an_upload_of_nothing_or_of_a_missing_file_sends_nothing() {
     let (server, api) = server().await;
     assert_eq!(
@@ -698,6 +720,46 @@ async fn http_failures_and_unreadable_bodies_are_errors() {
         "{err:?}"
     );
     assert_eq!(requests(&server).await.len(), 4, "no redirect was followed");
+}
+
+#[tokio::test]
+async fn an_http_failure_with_an_error_code_maps_the_code() {
+    let (server, api) = server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/auth.test"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"ok": false, "error": "invalid_arguments"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .respond_with(
+            ResponseTemplate::new(401).set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/bots.info"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"ok": false, "error": "Bad <b>things</b>"})),
+        )
+        .mount(&server)
+        .await;
+    assert_eq!(
+        api.auth_test().await.unwrap_err(),
+        SurfaceError::Api("invalid_arguments".into())
+    );
+    assert_eq!(
+        api.user_info(&"U1".into()).await.unwrap_err(),
+        SurfaceError::Unauthorized
+    );
+    assert_eq!(
+        api.bot_info("B1").await.unwrap_err(),
+        SurfaceError::Api("unknown_error".into())
+    );
 }
 
 #[tokio::test]
@@ -1017,7 +1079,7 @@ mod downloads {
             .download_file(&file(url(&server), Some(100)), 10)
             .await
             .unwrap_err();
-        assert!(matches!(err, SurfaceError::Api(_)), "{err:?}");
+        assert!(matches!(err, SurfaceError::TooLarge(_)), "{err:?}");
         assert!(
             requests(&server).await.is_empty(),
             "the declared size is checked first"
@@ -1027,7 +1089,7 @@ mod downloads {
             .download_file(&file(url(&server), None), 10)
             .await
             .unwrap_err();
-        assert!(matches!(err, SurfaceError::Api(_)), "{err:?}");
+        assert!(matches!(err, SurfaceError::TooLarge(_)), "{err:?}");
         assert!(!err.to_string().contains("files-pri"));
     }
 

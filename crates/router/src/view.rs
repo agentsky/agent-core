@@ -40,14 +40,16 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 ///
 /// # Missing answers
 ///
-/// The lookups that grant or withhold permission fail closed. [`is_banned`]
-/// and [`policy`] return `None` when the view doesn't have the answer, for
-/// example because the pipeline didn't preload it, and the router then
+/// The lookups that grant or withhold permission, or decide whose turn it
+/// is, fail closed. [`member_for`], [`is_banned`] and [`policy`] return
+/// `None` when the view doesn't have the answer, for example because the
+/// pipeline didn't preload it or the store failed, and the router then
 /// refuses with [`RefuseReason::PolicyUnavailable`] instead of assuming the
-/// requester is allowed. A missing answer anywhere else can only withhold a
-/// turn: an unknown agent is ignored, an unknown mention or reply doesn't
-/// address the agent, and an unknown link or community key gives a link
-/// prompt.
+/// requester is allowed, or taking the agent's owner for a stranger and
+/// running their DM on the community key on the public side. A missing
+/// answer anywhere else can only withhold a turn: an unknown agent is
+/// ignored, an unknown mention or reply doesn't address the agent, and an
+/// unknown link or community key gives a link prompt.
 ///
 /// [`agent_owner`]: RouterView::agent_owner
 /// [`agent_state`]: RouterView::agent_state
@@ -84,8 +86,10 @@ pub trait RouterView {
     /// messages, which name no agent, are `None` too.
     fn message_ref(&self, msg: &MsgRef) -> Option<Attribution>;
 
-    /// The member a surface identity belongs to, linked or not.
-    fn member_for(&self, key: &MemberKey) -> Option<MemberId>;
+    /// The member a surface identity belongs to, linked or not:
+    /// `Some(None)` for an identity that belongs to no member, and `None`
+    /// if the view doesn't know, which refuses.
+    fn member_for(&self, key: &MemberKey) -> Option<Option<MemberId>>;
 
     /// Whether `member` has a Claude account linked that turns can run on.
     fn is_linked(&self, member: MemberId) -> bool;

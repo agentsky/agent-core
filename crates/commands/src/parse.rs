@@ -84,7 +84,7 @@ fn parse_tokens(text: &str, tokens: &[Token<'_>]) -> Result<Command, ParseError>
 
 /// A word of the input and where it starts, so a free-text tail can be cut
 /// from the original text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Token<'a> {
     start: usize,
     text: &'a str,
@@ -145,7 +145,8 @@ fn command_words(tokens: &[Token<'_>]) -> Vec<&'static str> {
 /// stands, so misspelt commands such as `api-key set <key>` without
 /// `admin`, `slack_token <token>` or `admin apikey set <key>` count. It also
 /// does when any word holds a known token prefix (`sk-ant-`, `xoxb-`,
-/// `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`), whatever the command.
+/// `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`), or has the shape of a pasted login
+/// code, `<code>#<state>` or a `code=` query parameter, whatever the command.
 fn looks_secret_bearing(tokens: &[Token<'_>]) -> bool {
     const TOKEN_PREFIXES: [&str; 6] = ["sk-ant-", "xoxb-", "xoxp-", "xoxe.", "xoxe-", "xapp-"];
     let names_a_secret = |token: &Token<'_>| {
@@ -176,6 +177,33 @@ fn looks_secret_bearing(tokens: &[Token<'_>]) -> bool {
             let word = token.text.to_ascii_lowercase();
             TOKEN_PREFIXES.iter().any(|prefix| word.contains(prefix))
         })
+        || tokens.iter().any(|token| is_login_code(token.text))
+}
+
+/// Whether a word, less surrounding punctuation, is shaped like a pasted
+/// Claude login code in either form the login accepts: a word with a
+/// `code=` query parameter, such as the callback URL, or the
+/// `<code>#<state>` string the callback page shows, two non-empty runs of
+/// printable ASCII other than `#`, `&`, `?`, `=` and `|` joined by one `#`.
+/// A channel (`#general`) or a Git URL with a ref (`https://x.io/r#main`)
+/// isn't, since the login reads a URL only by its query. A word such as
+/// `PR#42` is a false positive: the heuristic only decides whether a failed
+/// command is handled like a secret-bearing one, so it errs that way.
+fn is_login_code(word: &str) -> bool {
+    let is_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !matches!(b, b'#' | b'&' | b'?' | b'=' | b'|'))
+    };
+    let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '#');
+    if word.contains("?code=") || word.contains("&code=") {
+        return true;
+    }
+    !(word.starts_with("https://") || word.starts_with("http://"))
+        && word
+            .split_once('#')
+            .is_some_and(|(code, state)| is_part(code) && is_part(state))
 }
 
 /// The arguments for clap: the command words in lowercase, then the other
@@ -253,14 +281,14 @@ fn clap_command() -> clap::Command {
     plain(Cli::command())
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "agent", no_binary_name = true)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Cmd {
     Login {
         #[arg(value_name = "code")]
@@ -352,7 +380,7 @@ enum Cmd {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum SkillCmd {
     Add {
         #[arg(value_name = "name", value_parser = parse_agent_name)]
@@ -368,7 +396,7 @@ enum SkillCmd {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum AdminCmd {
     ApiKey {
         #[command(subcommand)]
@@ -387,7 +415,7 @@ enum AdminCmd {
     Slack,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum ApiKeyCmd {
     Set {
         #[arg(value_name = "key")]
