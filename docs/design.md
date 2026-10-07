@@ -1936,10 +1936,13 @@ channel would stop applying: a `deny <name> #room` would stop denying at the
 moment the channel gains outside members. So agent apps subscribe to
 `channel_id_changed`, and when one arrives agentd:
 
-1. Confirms the new id with `conversations.info` on that binding's token: the
-   channel exists, its id is exactly the new one, and the bot is a member.
-2. Rewrites that agent's own `#room` rules from the old id to the new, in one
-   transaction. Where the agent already has a rule on the new id, the two
+1. Asks `conversations.info` on that binding's token where the channel is
+   now, following the binding's recorded changes from the new id to the
+   last one they reach: the channel exists, the bot is a member, and Slack
+   answers with a channel-shaped id, whichever it is. Slack may already
+   follow the new id to one it has since, and that answer is the one used.
+2. Rewrites that agent's own `#room` rules from the old id to the id Slack
+   answered with, in one transaction. Where the agent already has a rule on the new id, the two
    merge: a deny on either id is kept as a deny, and duplicates are
    dropped.
 
