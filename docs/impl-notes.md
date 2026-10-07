@@ -3426,11 +3426,9 @@ whole upload, which shared nothing.
 `org_login_required` was first among the `Forbidden` codes. Slack answers
 it while a workspace is being migrated into an Enterprise Grid
 organization, which passes on its own, so it is not a refusal of the bot
-and now falls to `Api` with the code. No caller needs it to be
-`Forbidden`, but one answers differently: `SlackSurface::member` took the
-code as "the bot may not post" and now returns it as an error, so a
-can-post check made during a migration fails instead of saying no. App
-creation answers `Refused` for either variant.
+and now falls to `Api` with the code. A caller that reads `Forbidden` as
+"the bot may not" sees an error for it instead; the callers that differ
+later in the stack say how they treat it.
 
 ### Names two members share
 
