@@ -460,6 +460,128 @@ can't see. A `--profile` flag doesn't change feature resolution: it would
 only help under `cargo test --release`, which nothing here runs, so it isn't
 passed.
 
+## T05: store
+
+### The key reaches the store through `open`
+
+**Issue.** The plan gives `Store::open(url)` and `Store::open_in_memory()`,
+but the store owns encryption, so it needs the master key, and nothing said
+how the key gets there.
+
+**Solution.** Both take a `Sealer`: `Store::open(url, sealer)` and
+`Store::open_in_memory(sealer)`. agentd builds the `Sealer` with
+`Sealer::from_base64(&master_key)` when it loads its configuration (T10), so
+a bad key fails at startup rather than at the first login.
+`Sealer::generate_key()` writes a key in the form `from_base64` reads, for
+`agentd gen-key` and for tests. The key is standard base64 with padding;
+surrounding whitespace, such as a trailing newline, is ignored.
+
+### In-memory SQLite needs one connection that never closes
+
+**Issue.** Every connection to a plain `:memory:` database is a separate,
+empty database, so a pool sees a different database on each connection.
+sqlx's `sqlite::memory:` URL works around that with a shared-cache database
+under a unique name, but a shared-cache in-memory database is deleted when
+its last connection closes, and the pool closes idle connections after 10
+minutes and every connection after 30. Shared cache also swaps
+`busy_timeout` for table-level locks, which can fail with `SQLITE_LOCKED`.
+
+**Solution.** `open_in_memory` uses a pool of exactly one connection with no
+idle timeout and no maximum lifetime. Concurrent callers queue for it. `open`
+routes in-memory URLs (`sqlite::memory:`, or a `mode=memory` parameter) to the
+same pool settings, so an agentd test configured with an in-memory URL (T10)
+behaves the same way.
+
+### Switching to WAL can't wait on `busy_timeout`
+
+**Issue.** Changing a database into WAL mode needs an exclusive lock that
+SQLite's busy handler doesn't wait for (sqlx says so where it declines to
+set a journal mode by default). Two connections opening a new file at once
+could fail.
+
+**Solution.** `open` sets `journal_mode=WAL` on every connection, but the
+pool opens one connection first and runs the migrations on it before
+returning, so the switch happens before any concurrency. WAL mode is stored
+in the file, and later connections find it already set. A test checks
+`journal_mode`, `foreign_keys` and `busy_timeout` on a file database.
+
+### A deferred transaction can't upgrade to a write under contention
+
+**Issue.** In WAL mode, a transaction that reads and then writes fails at
+once with `SQLITE_BUSY` if another connection committed in between;
+`busy_timeout` doesn't retry it, because the read snapshot is already stale.
+sqlx's `begin()` starts such a deferred transaction.
+
+**Solution.** Writes that must be atomic use a single statement or
+`BEGIN IMMEDIATE`, which takes the write lock up front and does wait on
+`busy_timeout`. `take_pending_login` is one `DELETE … RETURNING`. With a
+separate `SELECT` and `DELETE`, the concurrent test (eight callers, twenty
+rounds, file database) failed in each of three runs. `ensure_member` checks
+for the identity, and if it's missing takes
+`pool.begin_with("BEGIN IMMEDIATE")`, checks again and inserts, so concurrent
+calls for one identity create one member. Later tasks with read-then-write transactions (T15's scope locks,
+T21's sessions) should do the same.
+
+### Timestamps are Unix seconds and IDs are text
+
+**Issue.** sqlx encodes `OffsetDateTime` as RFC 3339 text in the value's own
+offset, writing fractional seconds only when they are non-zero. SQLite
+compares that text byte by byte, so `expires_at <= ?` is wrong across
+offsets, and even in UTC `…:00Z` sorts after `…:00.5Z`. sqlx encodes `Uuid`
+as a 16-byte blob, which is unreadable in the `sqlite3` shell and doesn't
+match the canonical text form core-types uses in keys.
+
+**Solution.** Timestamps are `INTEGER` Unix seconds (sub-second precision is
+dropped), and IDs are `TEXT` in core-types' lowercase hyphenated form, bound
+with `to_string()` and parsed back with `FromStr`. A value that doesn't parse
+is `StoreError::Corrupt`. Tables are `STRICT`, so a mistyped bind fails
+instead of being stored. The foundation migration's header lists these
+conventions for later migrations.
+
+### `sqlx::migrate!` doesn't notice new migrations
+
+**Issue.** `sqlx::migrate!` embeds `migrations/` at compile time, but on
+stable Rust it can't ask Cargo to watch the directory. Adding a migration
+without touching Rust code leaves a stale build that doesn't apply it.
+
+**Solution.** `crates/store/build.rs` prints
+`cargo:rerun-if-changed=migrations`. sqlx also checksums applied migrations,
+so a migration must never be edited once merged; add a new one instead.
+
+### sqlx 0.9.0 brings older copies of six crates
+
+**Issue.** With sqlx in the lockfile, cargo-deny warned about duplicate
+versions: sqlx-core 0.9.0, the latest release, depends on `base64` 0.22,
+`sha2` 0.10 (so `block-buffer` 0.10, `cpufeatures` 0.2 and `crypto-common`
+0.1), `hashlink` 0.11 (so `hashbrown` 0.16) and `syn` 2, while the workspace
+uses the newer ones (`base64` 0.23, chacha20poly1305's RustCrypto 0.2/0.3
+crates, `syn` 3).
+
+**Solution.** `deny.toml` skips exactly those versions, each with the reason,
+so a new duplicate of the same crates still warns. No license changed.
+
+### The store needs no `rand`
+
+**Issue.** The plan lists `rand` for crypto. chacha20poly1305 0.11 (aead
+0.6) generates nonces and keys itself through its default `getrandom`
+feature (`Nonce::try_generate()`), returning an error instead of panicking
+if the OS generator fails.
+
+**Solution.** `store` doesn't depend on `rand`. It enables chacha20poly1305's
+`zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
+buffer that is wiped after the `SecretString` is built.
+
+### The `members` table lists the surfaces
+
+**Issue.** The foundation migration declares `members.surface` with
+`CHECK (surface IN ('slack', 'rocketchat'))`, which couples `SurfaceKind` in
+core-types to the schema.
+
+**Solution.** Kept, so the store refuses a surface it has never heard of.
+A task that adds a `SurfaceKind` variant must also add a migration that
+relaxes the constraint; until it does, `ensure_member` fails at runtime for
+the new surface.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
