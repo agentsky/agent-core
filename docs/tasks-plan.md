@@ -3458,9 +3458,16 @@ is classed `rejected`: with `[cloud] connect_timeout_secs` below
 `timeout_secs`, point `base_url` at an address that drops the connection
 attempt, and see that reqwest reports a connect error (`is_connect`), so
 the reply says nothing was started, rather than a timeout, which would be
-`unknown`; T35b's rule rests on a local probe of this. Update the design's
-[Verified and assumed](design.md#verified-and-assumed) and failure table
-with the result and date. That completes design milestone 6.
+`unknown`; T35b's rule rests on a local probe of this. Record which form
+the session id takes, `session_…` or `cse_…` (T35b accepts both, as the
+cloud documentation shows both). And check the push restriction the design
+now describes: that a fired session can push to a branch other than its
+`claude/` working branch unless branch protection or a ruleset on GitHub
+stops it, so the setup's advice to protect branches is needed. Update the
+design's [Verified and assumed](design.md#verified-and-assumed),
+[Repository access](design.md#repository-access) and failure table with
+the result and date. That completes design milestone 6; until this check
+is done, the milestone stays open.
 
 Decided in T35c ([impl-notes](impl-notes.md#t35c-cloud-hand-off-commands)):
 Slack command text reaches `Commands::answer_text` as Slack delivered it,
