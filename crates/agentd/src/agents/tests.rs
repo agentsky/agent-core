@@ -343,6 +343,54 @@ async fn an_unrecorded_bot_whose_lookup_failed_is_looked_up_again_and_retired() 
 }
 
 #[tokio::test]
+async fn a_noted_username_no_user_has_is_forgotten_at_once() {
+    for code in [
+        None,
+        Some("error-user-not-found"),
+        Some("error-invalid-user"),
+    ] {
+        let h = harness().await;
+        if let Some(code) = code {
+            Mock::given(path("/api/v1/users.info"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "success": false,
+                    "error": format!("User not found [{code}]"),
+                    "errorType": code,
+                })))
+                .with_priority(1)
+                .mount(h.fake.server())
+                .await;
+        }
+        let old = OffsetDateTime::now_utc() - CREATION_LEASE - time::Duration::seconds(5);
+        let binding = h.creating("helper", old).await;
+        assert!(
+            h.store
+                .set_binding_bot_username(binding, "helper")
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(h.agents.abandon_stale().await.unwrap(), 1);
+        assert_eq!(h.agents.retire_pending().await.unwrap(), 0, "{code:?}");
+        assert_eq!(h.fake.requests("users.info").await.len(), 1, "{code:?}");
+        let row = h.store.binding(binding).await.unwrap().unwrap();
+        assert_eq!(row.bot_user, None, "{code:?}");
+        assert_eq!(row.bot_username, None, "forgotten, not deferred: {code:?}");
+        let pending = h
+            .store
+            .pending_retirements(
+                SurfaceKind::RocketChat,
+                &TEAM.into(),
+                OffsetDateTime::now_utc() + RETIRE_BACKOFF_MAX,
+                RETIRE_MAX_ATTEMPTS,
+            )
+            .await
+            .unwrap();
+        assert!(pending.is_empty(), "{code:?}: {pending:?}");
+    }
+}
+
+#[tokio::test]
 async fn the_fallback_username_joins_owner_and_name_with_a_dot() {
     let h = harness().await;
     h.fake.add_user("helper");
@@ -503,6 +551,13 @@ async fn usernames_rooms_and_files_go_through_the_manager() {
         Some(UserId::new(alice.as_str()))
     );
     assert_eq!(h.agents.user_named("nobody").await.unwrap(), None);
+    Mock::given(path("/api/v1/users.info"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(h.fake.server())
+        .await;
+    assert!(h.agents.user_named("alice").await.is_err());
     h.fake.add_room("DM", "d", "");
     let err = h
         .agents

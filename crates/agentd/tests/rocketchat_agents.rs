@@ -22,6 +22,8 @@ use testkit::{FakeAnthropic, TempDir, Turn, agentctl_path, fake_anthropic, fake_
 use time::OffsetDateTime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use wiremock::matchers::{path, query_param};
+use wiremock::{Mock, ResponseTemplate};
 
 use common::{CONFIG, master_key};
 
@@ -766,6 +768,30 @@ async fn a_failed_deactivation_is_retried_until_it_works() {
     let binding = &running.app.store().bindings_of(agent.id).await.unwrap()[0];
     assert_eq!(binding.state, BindingState::Disabled);
     assert_eq!(binding.retired_at, None);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_name_an_older_server_says_no_user_has_is_no_member() {
+    let chat = Chat::start().await;
+    let running = Running::start(&chat, "sqlite::memory:").await;
+    for code in ["error-user-not-found", "error-invalid-user"] {
+        Mock::given(path("/api/v1/users.info"))
+            .and(query_param("username", code))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "success": false,
+                "error": format!("User not found [{code}]"),
+                "errorType": code,
+            })))
+            .with_priority(1)
+            .mount(chat.fake.server())
+            .await;
+        assert_eq!(
+            chat.command("alice", &format!("list @{code}")).await,
+            "I don't know that member.",
+            "{code}"
+        );
+    }
     running.stop().await;
 }
 
