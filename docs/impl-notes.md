@@ -2172,7 +2172,9 @@ token with `type: "personalAccessToken"`
 where the resume handler finds it, so the realtime client sends the bot's
 token as `{"resume": token}`. A login error `403` ends `events` with
 `SurfaceError::Unauthorized` instead of reconnecting forever. A login that
-answers for another user id also ends it.
+answers for another user id also ends it. A login result with no user id
+reconnects instead, since a single malformed or proxy-mangled frame would
+otherwise end the bot's events until agentd restarts it.
 
 ### DDP details the client relies on
 
@@ -2250,6 +2252,19 @@ server's pings.
 
 **Solution.** The socket loop hands raw messages to the surface through a
 channel of 256, and the surface normalizes them in order on its own.
+
+### A slow consumer looked like a silent server
+
+**Issue.** Review found that the heartbeat watchdog measured silence from
+the last frame read. While the loop waited for a full channel to take a
+message it read nothing, so a consumer slower than two heartbeats ended the
+connection as "the server stopped answering", and the frames still unread
+in the socket were lost.
+
+**Solution.** Silence is measured from the last frame read or the end of
+handling one, whichever is later, so time spent waiting for the consumer
+does not count. A test holds a channel of one for five heartbeats and
+checks that the connection is not replaced and the next message arrives.
 
 ### tokio-tungstenite uses rustls's default provider
 
