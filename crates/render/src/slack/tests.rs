@@ -503,6 +503,46 @@ fn bare_urls() {
                 "www.example.com",
                 "www.example.com",
             ),
+            (
+                "underscore emphasis inside a URL path",
+                "https://example.com/_next_/x",
+                "<https://example.com/_next_/x>",
+            ),
+            (
+                "star emphasis inside a URL path",
+                "https://x.io/a*b*c",
+                "<https://x.io/a*b*c>",
+            ),
+            (
+                "underscore bold inside a URL path",
+                "see https://docs.python.org/3/library/__main__.html",
+                "see <https://docs.python.org/3/library/__main__.html>",
+            ),
+            (
+                "strikethrough inside a URL path",
+                "https://x.io/~~a~~/b",
+                "<https://x.io/~~a~~/b>",
+            ),
+            (
+                "emphasis closing inside a URL",
+                "*see https://x.io/a*b",
+                "*see <https://x.io/a*b>",
+            ),
+            (
+                "emphasis after a URL still formats",
+                "https://x.io/a *b*",
+                "<https://x.io/a> _b_",
+            ),
+            (
+                "markup inside emphasis that starts in a URL is kept",
+                "https://x.io/_a [b](https://y.io)_",
+                "<https://x.io/_a> <https://y.io|b>_",
+            ),
+            (
+                "a broadcast after such a URL stays neutralized",
+                "https://x.io/_a_/b @here",
+                "<https://x.io/_a_/b> @\u{200B}here",
+            ),
         ],
     );
 }

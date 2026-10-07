@@ -745,7 +745,7 @@ async fn upload_errors_map_at_each_step() {
     let as_bot = bot(&client, "helper").await;
     assert_eq!(
         as_bot.upload(&conv("G1"), None, &file).await,
-        Err(SurfaceError::Forbidden("unauthorized".into()))
+        Err(SurfaceError::Forbidden("forbidden".into()))
     );
     fake.fail(
         "rooms.mediaConfirm",
