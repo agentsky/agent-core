@@ -24,6 +24,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_EXPIRES_IN: u64 = 365 * 24 * 60 * 60;
 /// Longest OAuth `error` code kept for an error message.
 const MAX_ERROR_CODE: usize = 64;
+/// The most of a response body [`send`] reads. Token, profile and
+/// revocation answers are a few hundred bytes, so a longer one is refused
+/// rather than buffered, whatever the endpoint sends.
+const MAX_RESPONSE_BODY: usize = 64 * 1024;
 
 /// Builds the HTTP client. It never follows redirects: a 307 or 308 from the
 /// token endpoint would otherwise resend a body holding a code or refresh
@@ -193,14 +197,32 @@ struct Response {
     body: Vec<u8>,
 }
 
+/// Sends `request` and reads the whole response, refusing a body longer
+/// than [`MAX_RESPONSE_BODY`] by its `Content-Length` or as it streams in.
 async fn send(request: reqwest::RequestBuilder, endpoint: Endpoint) -> Result<Response, AuthError> {
     let http = |source: reqwest::Error| AuthError::Http {
         endpoint,
         source: Arc::new(source.without_url()),
     };
-    let response = request.send().await.map_err(http)?;
+    let too_large = || AuthError::InvalidResponse {
+        endpoint,
+        reason: "response body too large",
+    };
+    let mut response = request.send().await.map_err(http)?;
     let status = response.status();
-    let body = response.bytes().await.map_err(http)?.to_vec();
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_RESPONSE_BODY as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(http)? {
+        if body.len() + chunk.len() > MAX_RESPONSE_BODY {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
     Ok(Response { status, body })
 }
 
@@ -333,7 +355,69 @@ pub(crate) async fn revoke(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    async fn send_to(url: &str) -> Result<Response, AuthError> {
+        send(Client::new().post(url), Endpoint::Token).await
+    }
+
+    fn is_too_large(result: &Result<Response, AuthError>) -> bool {
+        matches!(
+            result,
+            Err(AuthError::InvalidResponse {
+                endpoint: Endpoint::Token,
+                reason: "response body too large",
+            })
+        )
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_by_its_content_length() {
+        let server = MockServer::start().await;
+        for (len, refused) in [(MAX_RESPONSE_BODY, false), (MAX_RESPONSE_BODY + 1, true)] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'a'; len]))
+                .mount(&server)
+                .await;
+            let result = send_to(&server.uri()).await;
+            assert_eq!(is_too_large(&result), refused, "{len}");
+            if !refused {
+                assert_eq!(result.unwrap().body.len(), len);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_over_the_cap_is_refused_as_it_streams() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let chunk = vec![b'a'; 16 * 1024];
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            for _ in 0..(MAX_RESPONSE_BODY / chunk.len() + 2) {
+                let _ = stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await;
+                let _ = stream.write_all(&chunk).await;
+                let _ = stream.write_all(b"\r\n").await;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+        assert!(is_too_large(&send_to(&url).await));
+        server.await.unwrap();
+    }
 
     fn tokens(json: &str) -> Result<Tokens, AuthError> {
         serde_json::from_str::<TokenResponse>(json)
