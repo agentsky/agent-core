@@ -275,7 +275,11 @@ fn scan_run(md: &str, run: Range<usize>, joined: &[usize], urls: &mut Vec<Range<
     let mut at = run.start;
     while let Some(offset) = text[at..].find("http") {
         let start = at + offset;
-        let found = bare_url(text, start).filter(|_| joined.binary_search(&start).is_err());
+        let found = joined
+            .binary_search(&start)
+            .is_err()
+            .then(|| bare_url(text, start))
+            .flatten();
         at = match found {
             Some(url) => {
                 urls.push(start..start + url.len());
