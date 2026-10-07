@@ -74,6 +74,9 @@ const STOP_POLL: Duration = Duration::from_millis(20);
 /// agentd doesn't answer, so a signal never waits long for it.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Why a lease whose `seconds_left` the clock can't hold isn't relied on.
+const TOO_LONG: &str = "agentd granted a lease longer than the clock can hold";
+
 /// Runs `command` under the lock and returns its exit status.
 ///
 /// # Errors
@@ -151,7 +154,10 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
                 seconds_left,
                 ..
             } => {
-                let deadline = reliable_until(sent, seconds_left);
+                let Some(deadline) = reliable_until(sent, seconds_left) else {
+                    let _ = release(client, lease, stop).await;
+                    return Err(format!("couldn't hold the shared/ lock ({TOO_LONG})"));
+                };
                 if deadline.saturating_duration_since(Instant::now()) < MIN_TIME_LEFT {
                     let _ = release(client, lease, stop).await;
                     return Err(format!(
@@ -218,11 +224,14 @@ async fn hold(
                 .take()
                 .unwrap_or_else(|| "agentd didn't renew it in time".to_owned()),
             (sent, renewed) = renewal => match renewed {
-                Ok(LockResponse::Held { seconds_left, .. }) => {
-                    deadline = reliable_until(sent, seconds_left);
-                    failure = None;
-                    continue;
-                }
+                Ok(LockResponse::Held { seconds_left, .. }) => match reliable_until(sent, seconds_left) {
+                    Some(until) => {
+                        deadline = until;
+                        failure = None;
+                        continue;
+                    }
+                    None => TOO_LONG.to_owned(),
+                },
                 Ok(LockResponse::Busy | LockResponse::Released) => "the lease expired".to_owned(),
                 Err(Failure::Refused(err)) if err.code == CtlErrorCode::Internal => {
                     failure = Some(err.message);
@@ -370,11 +379,10 @@ impl Stop {
 /// request sent at `sent`, has `seconds_left`: [`ROUNDING`] and
 /// [`SAFETY_MARGIN`] before `seconds_left` have passed since `sent`.
 /// agentd measured it no earlier than `sent`, so the time the answer took
-/// only makes this earlier. A `seconds_left` past what the clock can hold
-/// is not relied on at all: it gives `sent`.
-fn reliable_until(sent: Instant, seconds_left: u64) -> Instant {
+/// only makes this earlier. `None` for a `seconds_left` past what the
+/// clock can hold, which is not relied on at all.
+fn reliable_until(sent: Instant, seconds_left: u64) -> Option<Instant> {
     sent.checked_add(Duration::from_secs(seconds_left).saturating_sub(ROUNDING + SAFETY_MARGIN))
-        .unwrap_or(sent)
 }
 
 /// How long to wait before renewing a lease that can be relied on for
@@ -408,23 +416,26 @@ mod tests {
     #[test]
     fn a_lease_is_relied_on_until_two_seconds_before_its_seconds_left() {
         let sent = Instant::now();
-        assert_eq!(reliable_until(sent, 30), sent + Duration::from_secs(28));
-        assert_eq!(reliable_until(sent, 3), sent + Duration::from_secs(1));
-        assert_eq!(reliable_until(sent, 2), sent);
-        assert_eq!(reliable_until(sent, 0), sent);
+        assert_eq!(
+            reliable_until(sent, 30),
+            Some(sent + Duration::from_secs(28))
+        );
+        assert_eq!(reliable_until(sent, 3), Some(sent + Duration::from_secs(1)));
+        assert_eq!(reliable_until(sent, 2), Some(sent));
+        assert_eq!(reliable_until(sent, 0), Some(sent));
     }
 
     #[test]
     fn a_lease_too_long_for_the_clock_is_not_relied_on() {
         let sent = Instant::now();
-        assert_eq!(reliable_until(sent, u64::MAX), sent);
+        assert_eq!(reliable_until(sent, u64::MAX), None);
     }
 
     #[test]
     fn the_shortest_lease_agentctl_holds_lasts_three_seconds() {
         let sent = Instant::now();
-        assert!(reliable_until(sent, 3) - sent >= MIN_TIME_LEFT);
-        assert!(reliable_until(sent, 2) - sent < MIN_TIME_LEFT);
+        assert!(reliable_until(sent, 3).unwrap() - sent >= MIN_TIME_LEFT);
+        assert!(reliable_until(sent, 2).unwrap() - sent < MIN_TIME_LEFT);
     }
 
     #[test]

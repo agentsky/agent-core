@@ -40,7 +40,9 @@ pub const DEFAULT_WORKING_EMOJI: &str = "hourglass_flowing_sand";
 /// What any other failed turn tells the thread, including one that failed
 /// before it reached the model.
 pub const FAILED_TEXT: &str = "Sorry, that turn failed. Try again in a moment.";
-/// What a turn that ran out of time tells the thread.
+/// What a turn that ran out of time after the CLI read its message tells
+/// the thread. One that ran out of time before tells [`FAILED_TEXT`], as a
+/// turn that never reached the model does.
 pub const TIMED_OUT_TEXT: &str = "Sorry, that took too long, and the turn was stopped.";
 /// What the thread is told when part of a turn's reply, its files or its
 /// queued posts couldn't be posted.
@@ -177,7 +179,10 @@ pub struct PipelineSettings {
 ///    told privately by the manager bot, unless the thread is their own DM
 ///    with the agent or they were told about the same kind of failure
 ///    within [`FAILURE_DM_INTERVAL`]; the agent's owner never is, unless
-///    they asked.
+///    they asked. A turn that ran out of time after the CLI read its
+///    message posts [`TIMED_OUT_TEXT`]; any other failure, including a
+///    crash or a timeout before the CLI read the message, posts
+///    [`FAILED_TEXT`].
 /// 7. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
 ///    one saying their link stopped working and how to link it again, when
@@ -396,8 +401,12 @@ impl Pipeline {
         }
     }
 
-    /// Stops taking messages: those sent from now on are dropped.
+    /// Stops taking messages: those sent from now on are dropped. It sets
+    /// the flag under the lanes' lock, where queueing checks it, so a
+    /// message is either queued before the close, and answered by the
+    /// drain, or dropped.
     pub fn close(&self) {
+        let _lanes = lock(&self.inner.lanes);
         self.inner.closed.store(true, Ordering::SeqCst);
     }
 
@@ -541,30 +550,33 @@ impl Pipeline {
     }
 
     /// Queues `job` for the agent of `key`, starting the lane's task if it
-    /// has none. False when the lane is full. It never waits, so a sender
-    /// cancelled mid-dispatch can't leave a lane without its task.
+    /// has none. False when the lane is full. Once the pipeline is
+    /// [closed](Self::close) the job is dropped instead, and true returned.
+    /// It never waits, so a sender cancelled mid-dispatch can't leave a
+    /// lane without its task.
+    ///
+    /// The open check, the queueing and the start of a lane's task happen
+    /// under the lanes' lock, so every message queued before the close is
+    /// in a lane whose task is in the set [`drain`](Self::drain) waits for.
     fn enqueue(&self, key: LaneKey, job: Job) -> bool {
-        let first = {
-            let mut lanes = lock(&self.inner.lanes);
-            match lanes.get_mut(&key) {
-                Some(queue) if queue.len() >= self.inner.settings.queue_per_thread => return false,
-                Some(queue) => {
-                    queue.push_back(job);
-                    return true;
-                }
-                None => {
-                    lanes.insert(key.clone(), VecDeque::new());
-                    job
-                }
-            }
-        };
-        let mut tasks = lock(&self.inner.tasks);
+        let mut lanes = lock(&self.inner.lanes);
         if self.is_closed() {
-            lock(&self.inner.lanes).remove(&key);
+            tracing::info!(agent = %key.0, message = %job.event.message.id, "shutting down: not handling a message");
             return true;
         }
+        match lanes.get_mut(&key) {
+            Some(queue) if queue.len() >= self.inner.settings.queue_per_thread => return false,
+            Some(queue) => {
+                queue.push_back(job);
+                return true;
+            }
+            None => {
+                lanes.insert(key.clone(), VecDeque::new());
+            }
+        }
+        let mut tasks = lock(&self.inner.tasks);
         reap(&mut tasks);
-        tasks.spawn(self.clone().lane(key, first));
+        tasks.spawn(self.clone().lane(key, job));
         true
     }
 
@@ -580,9 +592,7 @@ impl Pipeline {
             .clone()
     }
 
-    /// Answers the lane's messages one at a time, until none waits. Once
-    /// the pipeline is closed it starts none of those still waiting: they
-    /// are dropped, as a message sent after closing is.
+    /// Answers the lane's messages one at a time, until none waits.
     async fn lane(self, key: LaneKey, mut job: Job) {
         let agent = key.0;
         loop {
@@ -595,13 +605,6 @@ impl Pipeline {
             drop(job);
             let next = {
                 let mut lanes = lock(&self.inner.lanes);
-                if self.is_closed() {
-                    let dropped = lanes.remove(&key).map_or(0, |queue| queue.len());
-                    if dropped > 0 {
-                        tracing::info!(%agent, messages = dropped, "shutting down: not handling the messages still waiting");
-                    }
-                    return;
-                }
                 match lanes.get_mut(&key).and_then(VecDeque::pop_front) {
                     Some(next) => next,
                     None => {
@@ -1782,6 +1785,119 @@ impl Sink<InboundEvent> for PipelineSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::App;
+    use crate::config::Config;
+    use crate::config::tests::{MINIMAL, env};
+    use crate::pipeline::TurnSettings;
+    use core_types::{BindingId, ConvRef, SurfaceKind};
+    use runner::{PoolConfig, ProcessConfig};
+    use sandbox::ProcessSandbox;
+    use testkit::TempDir;
+    use testkit::surface::MockSurface;
+    use time::macros::datetime;
+
+    async fn pipeline(dir: &TempDir) -> Pipeline {
+        let config = Config::parse(MINIMAL, env()).unwrap();
+        let store = Store::open_in_memory(config.sealer().unwrap())
+            .await
+            .unwrap();
+        let app = App::new(config, store.clone(), None).unwrap();
+        let sandbox = ProcessSandbox::new(store, dir.path()).unwrap();
+        let settings = TurnSettings {
+            process: ProcessConfig::default(),
+            pool: PoolConfig::default(),
+            image: "unused".to_owned(),
+            data_dir: dir.path().to_owned(),
+            agentctl_url: "http://127.0.0.1:1".to_owned(),
+            env: std::collections::BTreeMap::new(),
+        };
+        let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
+        Pipeline::for_app(&app, turns)
+    }
+
+    fn lane_key() -> LaneKey {
+        let conv = ConvRef {
+            surface: SurfaceKind::RocketChat,
+            team: "chat.example.org".into(),
+            conversation: "GENERAL".into(),
+        };
+        (
+            AgentId::new_v4(),
+            ThreadKey {
+                conv,
+                root: Some("q1".into()),
+            },
+        )
+    }
+
+    fn event(key: &LaneKey) -> Arc<InboundEvent> {
+        let conv = key.1.conv.clone();
+        Arc::new(InboundEvent {
+            event_id: "Ev-q2".to_owned(),
+            binding: BindingId::new_v4(),
+            sender: MemberKey {
+                surface: conv.surface,
+                team: conv.team.clone(),
+                user: "alice".into(),
+            },
+            sender_is_bot: false,
+            sender_bot_user: None,
+            conv: conv.clone(),
+            conv_kind: ConvKind::Channel,
+            thread_root: key.1.root.clone(),
+            message: MsgRef {
+                conv,
+                id: "q2".into(),
+            },
+            text: "and then?".to_owned(),
+            mentions: vec![],
+            reply_to: None,
+            files: vec![],
+            received_at: datetime!(2026-10-07 00:00 UTC),
+        })
+    }
+
+    fn job(pipeline: &Pipeline, key: &LaneKey, owner: MemberId) -> (Job, oneshot::Receiver<()>) {
+        let (done, finished) = oneshot::channel();
+        let job = Job {
+            event: event(key),
+            caps: MockSurface::DEFAULT_CAPS,
+            owner,
+            _pending: pipeline.places(owner).unwrap(),
+            done: Arc::new(done),
+        };
+        (job, finished)
+    }
+
+    #[tokio::test]
+    async fn after_close_a_message_for_a_running_lane_is_dropped_not_queued() {
+        let dir = TempDir::new("pipeline-lanes");
+        let pipeline = pipeline(&dir).await;
+        let key = lane_key();
+        let owner = MemberId::new_v4();
+        lock(&pipeline.inner.lanes).insert(key.clone(), VecDeque::new());
+        let permits = pipeline.inner.pending.available_permits();
+
+        let (queued, before) = job(&pipeline, &key, owner);
+        assert!(pipeline.enqueue(key.clone(), queued));
+        assert_eq!(
+            lock(&pipeline.inner.lanes)[&key].len(),
+            1,
+            "queued while open"
+        );
+
+        pipeline.close();
+        let (dropped, after) = job(&pipeline, &key, owner);
+        assert!(pipeline.enqueue(key.clone(), dropped));
+        assert_eq!(
+            lock(&pipeline.inner.lanes)[&key].len(),
+            1,
+            "not queued once closed"
+        );
+        assert!(after.await.is_err(), "the dropped message is done with");
+        assert_eq!(pipeline.inner.pending.available_permits(), permits - 1);
+        drop(before);
+    }
 
     #[test]
     fn only_a_limits_refusal_may_differ_between_an_event_and_its_copy() {

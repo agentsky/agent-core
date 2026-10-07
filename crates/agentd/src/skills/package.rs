@@ -61,8 +61,9 @@ const MACOS_METADATA: &str = "__MACOSX";
 /// may add or remove.
 pub const BUNDLED_NAME: &str = "agentctl";
 
-/// What a `SKILL.md`'s front matter says.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a `SKILL.md`'s front matter says. Its `Debug` shows the
+/// description's length, not the description.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Manifest {
     /// The skill's name, which is also its directory's.
     pub name: SkillName,
@@ -71,6 +72,16 @@ pub struct Manifest {
     /// The hosts it asks the agent's sandboxes to reach, from
     /// `allowed-hosts`, without repeats.
     pub hosts: Vec<HostRule>,
+}
+
+impl std::fmt::Debug for Manifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Manifest")
+            .field("name", &self.name)
+            .field("description_len", &self.description.len())
+            .field("hosts", &self.hosts)
+            .finish()
+    }
 }
 
 /// Why a skill's files were refused. Its message is for the owner, and
