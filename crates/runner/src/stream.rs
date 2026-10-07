@@ -242,7 +242,9 @@ impl ErrorKind {
 }
 
 /// A `result` line's fields, before the turn's stats are attached.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` shows the reply's length, never its text.
+#[derive(Clone, PartialEq)]
 pub(crate) struct ResultLine {
     is_error: bool,
     subtype: Option<String>,
@@ -252,6 +254,21 @@ pub(crate) struct ResultLine {
     usage: Option<Usage>,
     total_cost_usd: Option<f64>,
     session_id: Option<SessionId>,
+}
+
+impl fmt::Debug for ResultLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResultLine")
+            .field("is_error", &self.is_error)
+            .field("subtype", &self.subtype)
+            .field("result_len", &self.result.as_ref().map(String::len))
+            .field("terminal_reason", &self.terminal_reason)
+            .field("api_error_status", &self.api_error_status)
+            .field("usage", &self.usage)
+            .field("total_cost_usd", &self.total_cost_usd)
+            .field("session_id", &self.session_id)
+            .finish()
+    }
 }
 
 impl ResultLine {
@@ -856,6 +873,16 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_result_line_debug_hides_the_reply_text() {
+        let mut stats = TurnStats::default();
+        let line = br#"{"type":"result","is_error":false,"result":"the password is hunter2"}"#;
+        let result = note_line(line, &mut stats).unwrap();
+        let debug = format!("{result:?} {result:#?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("result_len: Some(23)"), "{debug}");
     }
 
     #[test]

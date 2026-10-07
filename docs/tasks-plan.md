@@ -2067,10 +2067,12 @@ Deliverables:
      Until T27, `policy` answers `AgentPolicy::default()` and `is_banned`
      answers `Some(false)`. A lookup the view can't answer withholds the
      turn: `None` from `member_for`, `is_banned` or `policy` is refused as
-     `PolicyUnavailable`, so a store error while loading a member must
-     become `None`, never `Some(None)`. The candidates are every managed agent mentioned,
-     the agent whose DM it is, and the agent that posted the thread root
-     (`reply_to`, looked up in `message_refs`). When the surface has
+     `PolicyUnavailable`. The view must never answer `Some(None)` for an
+     identity whose lookup failed: it either propagates the store error or
+     leaves the key unknown, so `member_for` answers `None`. The candidates
+     are every managed agent mentioned, the agent whose DM it is, and the
+     agent that posted the thread root (`reply_to`, looked up in
+     `message_refs`). When the surface has
      `per_binding_delivery`, only the receiving binding's agent is a
      candidate, since each other agent gets its own copy.
   3. On `Run`, look up the session, build the turn message, and call

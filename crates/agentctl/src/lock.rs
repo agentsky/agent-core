@@ -370,9 +370,11 @@ impl Stop {
 /// request sent at `sent`, has `seconds_left`: [`ROUNDING`] and
 /// [`SAFETY_MARGIN`] before `seconds_left` have passed since `sent`.
 /// agentd measured it no earlier than `sent`, so the time the answer took
-/// only makes this earlier.
+/// only makes this earlier. A `seconds_left` past what the clock can hold
+/// is not relied on at all: it gives `sent`.
 fn reliable_until(sent: Instant, seconds_left: u64) -> Instant {
-    sent + Duration::from_secs(seconds_left).saturating_sub(ROUNDING + SAFETY_MARGIN)
+    sent.checked_add(Duration::from_secs(seconds_left).saturating_sub(ROUNDING + SAFETY_MARGIN))
+        .unwrap_or(sent)
 }
 
 /// How long to wait before renewing a lease that can be relied on for
@@ -410,6 +412,12 @@ mod tests {
         assert_eq!(reliable_until(sent, 3), sent + Duration::from_secs(1));
         assert_eq!(reliable_until(sent, 2), sent);
         assert_eq!(reliable_until(sent, 0), sent);
+    }
+
+    #[test]
+    fn a_lease_too_long_for_the_clock_is_not_relied_on() {
+        let sent = Instant::now();
+        assert_eq!(reliable_until(sent, u64::MAX), sent);
     }
 
     #[test]

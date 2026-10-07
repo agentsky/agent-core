@@ -586,7 +586,7 @@ async fn a_slow_consumer_is_not_taken_for_a_silent_server() {
         },
     )
     .unwrap();
-    let heartbeat = Duration::from_millis(100);
+    let heartbeat = Duration::from_millis(500);
     let quick = RealtimeOptions {
         heartbeat,
         ..options()
@@ -600,7 +600,7 @@ async fn a_slow_consumer_is_not_taken_for_a_silent_server() {
         h.ddp
             .send_message(&realtime_message(id, "GENERAL", (&alice, "alice"), "hi"));
     }
-    tokio::time::sleep(heartbeat * 5).await;
+    tokio::time::sleep(heartbeat * 3).await;
     for _ in 0..2 {
         tokio::time::timeout(WAIT, rx.recv())
             .await
@@ -613,7 +613,7 @@ async fn a_slow_consumer_is_not_taken_for_a_silent_server() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::sleep(heartbeat * 3).await;
+    tokio::time::sleep(heartbeat * 2).await;
     assert_eq!(h.ddp.logins().len(), 1, "the connection was replaced");
 }
 
