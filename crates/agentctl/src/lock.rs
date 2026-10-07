@@ -42,6 +42,9 @@ use tokio::time::Instant;
 
 use crate::client::{Client, Failure};
 
+/// The longest `lock` waits for the lock, whatever `--timeout` says, so a
+/// huge timeout can't overflow the deadline.
+const MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// The first wait between acquire attempts.
 const FIRST_RETRY: Duration = Duration::from_millis(100);
 /// The longest wait between acquire attempts.
@@ -75,8 +78,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// # Errors
 ///
-/// If the lock can't be had within `timeout`, its lease is too short to
-/// hold, the command can't be started, or the lease is lost while it runs.
+/// If the lock can't be had within `timeout` (at most [`MAX_WAIT`]), its
+/// lease is too short to hold, the command can't be started, or the lease is
+/// lost while it runs.
 pub async fn run(
     client: &Client,
     timeout: Duration,
@@ -122,6 +126,7 @@ enum Acquired {
 }
 
 async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<Acquired, String> {
+    let timeout = timeout.min(MAX_WAIT);
     let give_up = Instant::now() + timeout;
     let mut wait = FIRST_RETRY;
     let mut told = false;

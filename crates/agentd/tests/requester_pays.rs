@@ -289,11 +289,30 @@ impl Stack {
     }
 
     /// Makes every turn play `turn`, after writing its `claude` process's
-    /// pid to [`Stack::pids`], so a restart shows as a new pid.
+    /// pid to [`Stack::pids`], so a restart shows as a new pid, and its
+    /// command line to [`Stack::argvs`].
     fn every_turn(&self, turn: Turn) {
-        let record = format!("echo $PPID >> '{}'", self.pids.display());
+        let record = format!(
+            "echo $PPID >> '{}'; tr '\\0' ' ' < /proc/$PPID/cmdline >> '{argv}'; echo >> '{argv}'",
+            self.pids.display(),
+            argv = self.argv_file().display()
+        );
         let turn = turn.with_command(["sh", "-c", record.as_str()]);
         testkit::write_script(&self.script, &vec![turn; 16]).unwrap();
+    }
+
+    fn argv_file(&self) -> PathBuf {
+        self.pids.with_file_name("argv")
+    }
+
+    /// The command line of the `claude` process of every turn that ran so
+    /// far, its arguments joined by spaces.
+    fn argvs(&self) -> Vec<String> {
+        std::fs::read_to_string(self.argv_file())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The pid of the `claude` process of every turn that ran so far.
@@ -518,6 +537,19 @@ async fn each_turn_in_a_thread_runs_on_its_requesters_account_or_the_community_k
         "another plan's model: the process restarts"
     );
     assert_ne!(pids[3], pids[4]);
+    let argvs = stack.argvs();
+    assert_eq!(argvs.len(), 5, "{argvs:?}");
+    assert!(
+        argvs[0].contains(&format!("--session-id {session}")),
+        "{argvs:?}"
+    );
+    for restarted in &argvs[1..] {
+        assert!(
+            restarted.contains(&format!("--resume {session}")),
+            "a restart for another credential or model resumes the session: {argvs:?}"
+        );
+        assert!(!restarted.contains("--session-id"), "{argvs:?}");
+    }
 
     let row = stack.store().session(session).await.unwrap().unwrap();
     assert_eq!(row.scope, ScopeKey::Channel(conv("GENERAL")));

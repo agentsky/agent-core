@@ -10,6 +10,8 @@
 //! Message ids and targets are strings as the model wrote them. The server
 //! resolves them against the current turn.
 
+use std::fmt;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -53,12 +55,23 @@ pub struct AttachResponse {
 
 /// `agentctl post --to <target> <text>`: post somewhere else the agent may
 /// post. The message is queued and sent after the turn.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output shows the text's length, never the text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostRequest {
     /// Where to post, as the model named it.
     pub to: String,
     /// The Markdown text to post.
     pub text: String,
+}
+
+impl fmt::Debug for PostRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostRequest")
+            .field("to", &self.to)
+            .field("text_len", &self.text.len())
+            .finish()
+    }
 }
 
 impl CtlRequest for PostRequest {
@@ -168,12 +181,23 @@ pub enum LockResponse {
 
 /// `agentctl ask-agent <agent> <task>`: hand a task to another agent. The
 /// hop is billed to this turn's requester.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output shows the task's length, never the task.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskAgentRequest {
     /// The other agent's name.
     pub agent: String,
     /// The task for it.
     pub task: String,
+}
+
+impl fmt::Debug for AskAgentRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AskAgentRequest")
+            .field("agent", &self.agent)
+            .field("task_len", &self.task.len())
+            .finish()
+    }
 }
 
 impl CtlRequest for AskAgentRequest {
@@ -183,13 +207,24 @@ impl CtlRequest for AskAgentRequest {
 
 /// `agentctl private [--file <path>]… <task>`: ask for a task on the owner's
 /// private resources. It answers at once with a consent id.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output shows the task's length, never the task.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateRequest {
     /// The task text, shown to the owner exactly as given.
     pub task: String,
     /// Files in the calling session's directory, as the CLI sees their
     /// paths, to copy into the private task.
     pub files: Vec<String>,
+}
+
+impl fmt::Debug for PrivateRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PrivateRequest")
+            .field("task_len", &self.task.len())
+            .field("files", &self.files)
+            .finish()
+    }
 }
 
 impl CtlRequest for PrivateRequest {
@@ -433,6 +468,62 @@ mod tests {
         );
         assert_eq!(response, json!({"consent": consent.to_string()}));
         assert_rejects::<PrivateResponse>(json!({"consent": "nope"}));
+    }
+
+    #[test]
+    fn debug_shows_text_lengths_not_chat_or_model_text() {
+        let post = format!(
+            "{:?}",
+            PostRequest {
+                to: "#general".into(),
+                text: "the secret plan".into(),
+            }
+        );
+        assert!(!post.contains("secret plan"), "{post}");
+        assert!(
+            post.contains("text_len: 15") && post.contains("#general"),
+            "{post}"
+        );
+        let ask = format!(
+            "{:?}",
+            AskAgentRequest {
+                agent: "reviewer".into(),
+                task: "the secret plan".into(),
+            }
+        );
+        assert!(!ask.contains("secret plan"), "{ask}");
+        assert!(
+            ask.contains("task_len: 15") && ask.contains("reviewer"),
+            "{ask}"
+        );
+        let private = format!(
+            "{:?}",
+            PrivateRequest {
+                task: "the secret plan".into(),
+                files: vec!["work/notes.md".into()],
+            }
+        );
+        assert!(!private.contains("secret plan"), "{private}");
+        assert!(private.contains("task_len: 15"), "{private}");
+        let history = format!(
+            "{:?}",
+            HistoryResponse {
+                messages: vec![Msg {
+                    id: "1.1".into(),
+                    sender: MemberKey {
+                        surface: SurfaceKind::Slack,
+                        team: "T1".into(),
+                        user: "U1".into(),
+                    },
+                    sender_is_bot: false,
+                    text: "the secret plan".into(),
+                    files: vec![],
+                    sent_at: datetime!(2026-09-29 23:00 UTC),
+                }],
+            }
+        );
+        assert!(!history.contains("secret plan"), "{history}");
+        assert!(history.contains("text_len: 15"), "{history}");
     }
 
     #[test]
