@@ -1008,6 +1008,50 @@ async fn dms_and_channels_use_their_own_sessions_and_volumes() {
 }
 
 #[tokio::test]
+async fn an_owners_dm_whose_member_lookup_fails_is_refused_not_run() {
+    use sqlx::Connection as _;
+    let stack = start().await;
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         UPDATE surface_identities SET member_id = 'not-a-member-id' WHERE user_id = 'alice';",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    assert!(
+        stack
+            .store()
+            .member_for_identity(&key("alice"))
+            .await
+            .is_err(),
+        "the owner's member lookup fails"
+    );
+
+    stack.next_turn(Turn::reply("Ran anyway."));
+    let requests = stack.fake.message_requests().await.len();
+    stack
+        .handle(stack.event("alice", "DM1", ConvKind::Dm, "d1", None, &[]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, in_thread("DM1", None));
+    assert_eq!(
+        sent[0].1,
+        "helper can't check who may use it right now. Try again later."
+    );
+    assert_eq!(
+        stack.fake.message_requests().await.len(),
+        requests,
+        "no turn ran, on any key"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn failures_and_refusals_say_why_and_a_bot_never_joins_a_room() {
     let stack = start().await;
 
@@ -1159,6 +1203,11 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     let attributed = store.posted_message_ref(&sent[0].2).await.unwrap().unwrap();
     assert_eq!(attributed.requester.key, key("bob"), "the hop is bob's");
     assert_eq!(attributed.hop.0, 2);
+    assert_eq!(
+        stack.bearers().await.last().map(String::as_str),
+        Some("Bearer token-of-bob"),
+        "the hop runs on bob's account"
+    );
     stack.stop().await;
 }
 
@@ -1804,6 +1853,44 @@ async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
 }
 
 #[tokio::test]
+async fn a_message_waiting_behind_a_turn_is_dropped_once_the_pipeline_closes() {
+    let stack = start().await;
+    stack.next_turn(Turn::reply("First.").with_delay(Duration::from_millis(1500)));
+    let upstream = stack.fake.message_requests().await.len();
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "q1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("the turn runs", || {
+        stack.mock.calls().contains(&working_on("q1"))
+    })
+    .await;
+    sink.send(stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "q2",
+        Some("q1"),
+        &[BOT],
+    ))
+    .await
+    .unwrap();
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let calls = stack.mock.calls();
+    let sent = posts(&calls);
+    assert_eq!(sent.len(), 1, "{calls:#?}");
+    assert_eq!(sent[0].1, "First.");
+    assert!(!calls.contains(&working_on("q2")), "{calls:#?}");
+    assert_eq!(
+        stack.fake.message_requests().await.len(),
+        upstream + 1,
+        "the waiting message never ran"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
     let stack = start_with(Setup {
         drain_timeout_secs: 1,
@@ -1971,6 +2058,55 @@ async fn a_turn_that_never_ran_forgets_what_it_recorded_and_its_notice_has_no_re
         msg: msg("GENERAL", "r2"),
         emoji: "hourglass".into()
     }));
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_request_whose_turn_crashed_before_the_cli_read_it_reaches_the_next_turn() {
+    let stack = start().await;
+    let store = stack.store();
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::crash_at_start());
+    let mut first = stack.event("alice", "GENERAL", ConvKind::Channel, "r1", None, &[BOT]);
+    first.text = "@UBOT do X".into();
+    stack.handle(first).await;
+    let sent = posts(&stack.calls_since(0));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, in_thread("GENERAL", Some("r1")));
+    assert_eq!(sent[0].1, FAILED_TEXT);
+    assert_eq!(
+        store.posted_message_ref(&sent[0].2).await.unwrap(),
+        None,
+        "the failure isn't recorded as the agent's reply"
+    );
+
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT do X"),
+            said(sent[0].2.id.as_str(), BOT, FAILED_TEXT),
+            said("r2", "alice", "@UBOT try again"),
+        ],
+    );
+    stack.next_turn(Turn::reply("Done."));
+    let before = stack.mock.calls().len();
+    let mut again = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "r2",
+        Some("r1"),
+        &[BOT],
+    );
+    again.text = "@UBOT try again".into();
+    stack.handle(again).await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "Done.");
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1, "the crashed turn reached no upstream");
+    assert!(bodies[0].contains("do X"), "{}", bodies[0]);
+    assert!(bodies[0].contains("try again"), "{}", bodies[0]);
     stack.stop().await;
 }
 
@@ -2831,6 +2967,11 @@ async fn an_agents_own_hop_limit_lowers_the_cap() {
             "writer won't answer: it takes part in chains of at most 1 hand-off."
         ]
     );
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"; 3],
+        "every turn of the chain runs on bob's account"
+    );
     stack.stop().await;
 }
 
@@ -2860,6 +3001,11 @@ async fn the_thread_token_budget_stops_a_chain() {
     stack.pipeline.close();
     stack.pipeline.drain().await;
     assert_eq!(stack.mock.posts().len(), 2);
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"],
+        "the turn that started the chain ran on bob's account"
+    );
     stack.stop().await;
 }
 
@@ -2954,7 +3100,11 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
         [reply, reply, "later", "later"],
         "agentd's own copy, arriving second, is dropped"
     );
-    assert_eq!(stack.bearers().await.len(), 4);
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"; 4],
+        "both hops, and the turns that posted them, ran on bob's account"
+    );
     stack.stop().await;
 }
 

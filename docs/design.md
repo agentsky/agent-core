@@ -817,6 +817,9 @@ Once per repository, the member:
    environment with **Trusted** network access (the default allowlist) and
    no secrets, and no connectors: the form includes every connector by
    default, and a run uses them without asking for approval[^cc-routines].
+   On GitHub, protects the branches they care about in that repository
+   with branch protection rules or rulesets, since a run can push to any
+   branch it can reach ([Repository access](#repository-access)).
 2. Writes the routine's prompt so it acts on the fired text. Anthropic hands
    that text to the session inside a `<routine-fire-payload>` block that
    labels it untrusted, and the session ignores instructions in it unless the
@@ -837,7 +840,7 @@ says, so whoever holds the token (the member, agentd, or anyone who steals
 it, or steals agentd's store together with its master key) can make the
 routine do any work its repositories, connectors and network allow, as the
 member. That is why step 1 keeps a routine to one repository, no connectors
-and the default allowlist.
+and the default allowlist, and protects the branches that matter.
 
 ### Command surface
 
@@ -957,13 +960,18 @@ The cloud session gets the routine's repositories, through the member's own
 GitHub connection at claude.ai (the Claude GitHub App or
 `/web-setup`)[^cloud]. Each run clones them, starting from the default
 branch unless the routine's prompt says otherwise, and pushes to `claude/`
-branches; a push to any other branch is refused when the branch is
-protected, has someone else's open pull request, or carries someone else's
-commits[^cc-routines]. In Anthropic-hosted environments the GitHub
-credential stays outside the VM, `git push` reaches only the session's
-working branch, and the GitHub API only the session's
-repositories[^cc-cloud-env]. Network access, environment variables and the
-setup script are the routine's environment's.
+branches[^cc-routines]. In Anthropic-hosted environments the GitHub
+credential stays outside the VM, and the GitHub proxy rejects branch
+deletions and pushes to anything but a branch, but doesn't limit which
+branches a push can update; to control that, the documentation says to use
+branch protection rules or rulesets on GitHub[^cc-cloud-env][^cc-routines].
+So a fired session, or whoever holds a routine's token, can push to any
+branch the member's GitHub connection can reach in the routine's
+repositories, and the setup has the member protect the branches they care
+about. The documentation cited as of 2026-10-01 was read as limiting
+`git push` to the session's working branch; the current pages say
+otherwise, and this section follows them. Network access, environment
+variables and the setup script are the routine's environment's.
 
 agentd sends no repository, file, GitHub token or anything from a volume:
 only the task text. A repository an owner keeps in their agent's private
@@ -1011,8 +1019,9 @@ sequenceDiagram
   won't follow the session, and how to: open the link, the Claude app, or
   `claude --teleport <session id>` in a checkout of the repository.
   agentd shows the URL only when it is `https://claude.ai/code/` followed by
-  the returned session id, which must be `session_` and ASCII letters and
-  digits; otherwise it shows the id and `https://claude.ai/code`. The link
+  the returned session id, which must be `session_` or `cse_` and ASCII
+  letters and digits, the two forms the cloud documentation shows;
+  otherwise it shows the id and `https://claude.ai/code`. The link
   is never posted to a channel or thread, nor shown to any agent's turn.
 
 ### Status
@@ -1093,6 +1102,10 @@ The member hears each outcome at least once, usually once:
   `unknown`, and the reply already said what happened. The purge keeps a
   row whose notice is still owed, and a `sending` row the pass hasn't
   marked yet.
+- If the store fails to record a 200, the reply still carries the link,
+  but the row stays `sending`, so the pass later marks it `unknown` and the
+  member also gets the "may have started" notice. They hear that outcome
+  twice, the second time less precisely.
 
 Logs carry the command's name, the member, routine and hand-off ids, the
 state, the status and the session id. Never the token, the task text, or
@@ -1105,7 +1118,7 @@ the pasted URL as typed.
 | `[cloud]` isn't configured | Nothing stored | Cloud hand-off is off on this agentd. `cloud list` and `cloud rm` still work |
 | Not linked, a public place, a ban, an unknown label, a task the checks refuse | Nothing stored | Why, privately |
 | The store fails before the request | Nothing sent | Nothing was started; try again |
-| No connection: DNS, refused, TLS, all before the request was sent | `rejected` | Nothing was started |
+| No connection: DNS, refused, TLS, or a connect timeout, all before the request was sent | `rejected` | Nothing was started |
 | 400: the routine is paused, the text too long, or the `anthropic-version` missing or unsupported | `rejected` | The routine refused the task and may be paused |
 | 401: the token doesn't match the routine | `rejected` | Generate a new token, then `cloud add` again |
 | 403: the account or organization has no access to the endpoint | `rejected` | The account can't fire routines |
@@ -1113,7 +1126,7 @@ the pasted URL as typed.
 | 429: an hourly fire limit | `rejected` | When it resets, from `Retry-After` in seconds (an HTTP date is ignored). agentd doesn't retry |
 | 500 or 503, a timeout after sending, a reset connection, a redirect, or a 200 agentd can't read | `unknown` | It may have started; check claude.ai/code before running it again |
 | agentd stops during the request | `unknown`, by the pass | The same, once, in the manager bot's DM |
-| The store fails after a 200 | stays `sending`, then `unknown` | The link at once, from memory; the reply already carried it |
+| The store fails after a 200 | stays `sending`, then `unknown` | The link at once, from memory, and later the "may have started" notice in the manager bot's DM, since the row became `unknown`: one outcome, heard twice |
 | The reply can't be delivered | as recorded | Nothing at once; `cloud list` shows the outcome and link |
 | The account is out of usage, its GitHub connection is gone, its subscription is paused, or the task fails in the cloud | Not documented: `fired`, or a `rejected` the endpoint may give | What the endpoint answers; otherwise the session shows it |
 
@@ -1123,7 +1136,9 @@ Verified, from the documentation on 2026-10-01: everything in
 [What Claude Code documents](#what-claude-code-documents), the routine
 endpoint's request, response, documented errors, limits and token scope,
 its tokens' `sk-ant-oat01-` prefix, the untrusted wrapping of fired text,
-how routines clone and push, and the GitHub proxy's limits.
+and how routines clone and push. The GitHub proxy's limits were read again
+on 2026-10-07, and differ from how the 2026-10-01 reading put them
+([Repository access](#repository-access)).
 
 Assumed, until the live check in the plan's implementation tasks:
 
@@ -1131,6 +1146,12 @@ Assumed, until the live check in the plan's implementation tasks:
   lists the errors but doesn't say so.
 - That a 500 or 503 may have started one. The reference says to retry a 500;
   without an idempotency key agentd won't.
+- That a connect timeout means nothing was sent. `[cloud]
+  connect_timeout_secs` is at most `timeout_secs`, and when it is below it
+  a connection that doesn't open in time is a connect error, before the
+  request is written, so agentd records it `rejected`, not `unknown`.
+  Only a timeout once the request was sent is `unknown`. This rests on a
+  local probe of reqwest; the live check confirms it.
 - What the endpoint answers when the account is out of usage, its GitHub
   connection is gone (routines skip runs for up to 72 hours, then turn
   off[^cc-routines]) or its subscription is paused: an error, or a session
@@ -1368,7 +1389,7 @@ for members of other organizations too, whose own organization is kept as
 | An agent's owner forges its app's events | Each agent's app is created with its owner's configuration token, so the owner can read the app's signing secret, client secret and bot token at api.slack.com. With the signing secret they can sign a `message` event with any sender, conversation, kind, thread, mentions and files: a copy of a linked member's message with a mention added, to run a turn on that member's Claude plan; a message in another member's DM with the agent, to resume that member's scope; an agent's post with a mention added, to inherit the requester recorded for it; or a message from themselves in another member's thread or DM, to resume, reset or replace that member's session. So Slack's copy is the source of truth: before agentd acts on any message it doesn't ignore (a turn, a link prompt or a refusal), whoever the event says sent it, the owner included, it reads the message back from Slack over TLS with the app's bot token (`conversations.history`, or `conversations.replies` in the thread the event names, at exactly that `ts`), takes the conversation's kind from `conversations.info` (cached per channel for an hour, and refused unless Slack's channel id is the event's exactly), normalizes Slack's copy with the ingress's own rules, and routes that copy again. It acts only if the copy is the same message in the same thread and routes to the same decision, a limit's refusal aside (the counts a limit reads can change between the two routings), and then acts on the copy. What the forged event said decides nothing. A message older than 15 minutes when its event arrived is acknowledged and dropped before it is recorded, since deduplication forgets a message after an hour and messages from before the bot joined never had one. A copy Slack doesn't have, won't show or that routes differently is dropped silently. An unreachable Slack or a rate limit drops the message and tells the thread to try again. A bot's post that was edited is refused, since agentd never edits its agents' posts. An edited message runs once, with its text when its turn comes; the edit starts no turn of its own, and a deleted message is dropped. The cost is one cached `conversations.info` per channel plus one Tier 3 read per message not ignored, on the agent's own token. Forged events slow or refuse only their owner's own agents: each agent's app has at most 32 requests in flight, from the ack until its message reaches the pipeline, one owner's agents' apps together 64, and each app gets 503 past that or past a rate of 100 at once then 8 a second, near Slack's own ceiling for one app; one owner's apps together keep 200 messages at once then 16 a second, and drop the rest after their 200, but only messages an agent's app keeps count, and outside one-to-one DMs it keeps only mentions of its bot and replies in threads its bot may have started, so busy channels and threads one owner's agents share take from that owner's bucket only what may be addressed to one of them, however many agents are there; each deduplication key is made of ids shaped like Slack's, or the body gets 400, so the rows one owner can add to the shared store are at most about a hundred bytes each, at 16 a second, kept an hour, about 60,000 rows or 20 MB at most, and only for messages; each app's messages reach the pipeline in a lane of their own, so the `bots.info` lookup of a sender known only by a made-up bot id holds up only that app's, and a message whose bot id isn't shaped like Slack's is dropped after its 200, with a throttled warning, before it is looked up or cached; an event keeps at most 160 KB of text, 10 files and 100 mentions, each id shaped like Slack's, so the 64 messages one owner's apps may have in flight hold at most about 14 MB; the lookups never wait for the token's quota or retry a 429 (past it, a bot sender stays unknown and is ignored, and the thread gets the "try again" line, posted like the busy line in a task that holds no place); one owner's agents, however many, hold at most 16 of the pipeline's 64 places and post 8 such lines at once; the warnings a flood causes, confirmations that fail included, are logged once a minute per agent; and the workspace's shared member list is read only with the manager app's token, never an agent's, which its owner could revoke or exhaust. Only several owners flooding together (four for the pipeline's places, 16 for the ingress's 1024) could take what other agents need. The owner's bot token still reads every conversation the bot is in, so confirming protects other members' sessions, scopes and bills, not what the bot can read. The manager app's secret stays with the operators, so its requests aren't read back. Slack Connect's home check (`users.info` on the manager app's token) runs only on a confirmed copy's human sender, never on a forged event's claim or a bot's post, and doesn't wait for a used-up quota either. A made-up user id costs it nothing, but a forged event naming a real message the bot can read from the last 15 minutes costs one lookup per real sender, cached an hour. Most senders are answered from the member list while it is less than an hour old; while it can't be read, or once it is older, each costs a `users.info`, so one owner can use up the manager's shared quota and turn other owners' confirmations into "try again" lines until it refills. That is the one way one owner's forged events reach other owners' agents. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 | A cloud session acts with a member's GitHub identity, connectors and subscription, beyond agentd's sandbox and sight | Only the member's own `/agent cloud run`, typed where only they and the manager bot read it, starts one. No `agentctl` command or consent card can, and bots' messages are never commands. The task gets a consent card's checks for characters that don't show. agentd sends only the task text; the repositories, environment and connectors are the routine's, set by the member at claude.ai. |
-| A routine token leaks, or agentd's store leaks with its master key | Anthropic scopes a token to firing one routine, with no read access. But the routine's prompt tells the session to act on fired text, so a token lets its holder do any work the routine's repositories, connectors and network allow, as the member, and a stolen store and key do that for every member with a routine. The setup keeps each routine to one repository, no connectors and the default allowlist. Tokens are sealed at rest, decrypted only for agentd's own request, never logged and never in a sandbox; `cloud rm` and `logout` delete them, and the member revokes them at claude.ai. |
+| A routine token leaks, or agentd's store leaks with its master key | Anthropic scopes a token to firing one routine, with no read access. But the routine's prompt tells the session to act on fired text, so a token lets its holder do any work the routine's repositories, connectors and network allow, as the member, and a stolen store and key do that for every member with a routine. The setup keeps each routine to one repository, no connectors and the default allowlist, and has the member protect the branches they care about on GitHub, since the GitHub proxy doesn't limit which branches a session pushes to. Tokens are sealed at rest, decrypted only for agentd's own request, never logged and never in a sandbox; `cloud rm` and `logout` delete them, and the member revokes them at claude.ai. |
 | agentd's Claude links gain control of members' cloud sessions | Configuration refuses any scope but `user:profile` and `user:inference`, so no turn can reach a member's cloud sessions through the credential proxy. |
 | A member's pasted URL steers agentd's request and token to another host | Only the routine id is kept, from a URL whose path and origin must match; the URL is rebuilt from `[cloud] base_url`, and redirects aren't followed. |
 | A retried fire starts two sessions | A fire is recorded before it is sent and never retried. An outcome agentd can't know is reported as such, and the member decides. |
@@ -1554,12 +1575,23 @@ member they name. The person's own organization is a separate field,
      home workspace or the home workspace's own Enterprise Grid
      organization (the `enterprise_id` `auth.test` gives at startup, T30):
      `user_team`, `source_team`, `user_profile.team` and `team`, in the
-     event and in Slack's copy ([below](#confirmation)). A field that names
-     anything else makes the sender outside, with that team as their
+     event and in Slack's copy ([below](#confirmation)). A field that
+     names anything else makes the sender outside, with that team as their
      organization: the first of `user_team`, `source_team`,
      `user_profile.team` and `team` that isn't home. A team not shaped like
      Slack's (`T` or `E` and up to 64 letters or digits) makes the message
      malformed, and it is dropped.
+
+     When `team` and `user_team` differ, `user_team` is the sender's, as
+     Bolt's `extract_actor_team_id` takes it[^bolt-actor]: `team` may name
+     the organization that hosts the channel. T36a keeps the stricter rule
+     above, under which a `team` naming another organization makes even a
+     home member outside; that can only refuse a home member, never admit
+     an outside one. T36b, which first admits outside members, decides the
+     sender's team from `user_team` (then `source_team`,
+     `user_profile.team`, and `team` only when none of those is given),
+     once T36e has captured what `team` holds for a home member's message
+     in a channel the other organization hosts.
   2. An independent source says the user belongs to the home workspace: the
      home member list agentd already reads (`users.list`), while it is less
      than an hour old, or else `users.info` on the manager app's token, its
@@ -1682,16 +1714,17 @@ another workspace too gets events whose `authorizations[0]` may name that
 installation. agentd drops those, so the agent may miss messages in channels
 both installations see. That only fails closed, and only for that owner's
 agent. `apps.event.authorizations.list` would show every installation, but it
-takes an app-level token[^slack-event-authorizations], which no API creates,
-as for Socket Mode[^slack-socket], so agentd doesn't call it.
+needs the `authorizations:read` scope[^slack-event-authorizations], which
+agentd's apps don't ask for, so agentd doesn't call it.
 
 ### Confirmation
 
 Nothing an event says decides anything (T31): the owner of an agent's app
 holds its signing secret and can sign any body, an envelope's
 `is_ext_shared_channel`, `context_team_id` and `user_team` included. agentd
-never reads the first two, and the event can only make a sender outside,
-never home:
+never reads the first two, and what the event says about the sender's
+organization decides nothing: Slack's copy decides it, and an event that
+disagrees with the copy is dropped:
 
 - `Surface::confirm` reads the message back with the binding's bot token, as
   today, and normalizes the copy with the ingress's rules, now including
@@ -1704,15 +1737,20 @@ never home:
   owner-side post.
 - The sender is looked up as above, never taken as home from the fields
   alone.
-- The sender is outside if the event or the copy says so. The pipeline's
+- Whether the sender is outside, and their organization, come from Slack's
+  data only: the copy's own team fields, else the lookup's answer,
+  `users.info`'s `team_id` or `enterprise_user.enterprise_id`. Nothing of
+  the event's `outside` is carried into the copy. The pipeline's
   `copy_stands` lets a copy stand when only a limit's refusal differs and
   the requesters' keys match, and an outside member's key names the home
-  workspace like a home member's; so the copy takes the event's `outside`
-  when the event's says outside and the copy's doesn't, and `copy_stands`
-  compares the requester's key and `outside`. It still ignores the member
-  a key belongs to, which may be made between the two routings (T27). An
-  owner who forges `outside` onto a home member's message only keeps
-  their own agent from answering it.
+  workspace like a home member's; so `copy_stands` also compares
+  `outside`, organization included, and the message is dropped when the
+  event and the copy disagree on it, in either direction, as T31 drops any
+  other difference. It still ignores the member a key belongs to, which
+  may be made between the two routings (T27). So an owner who forges
+  `outside`, or another organization, onto a home member's message only
+  gets it dropped: it can't move a home member's turn to the community
+  key, or pass an unlisted organization's member off as a listed one.
 
 ### Audience
 
@@ -1912,7 +1950,8 @@ one on which team sent a message, which is assumed below. Read from Slack's
 SDK sources: the field names agentd reads, that Bolt takes an event's
 installation from `authorizations[0]` and the actor's team from
 `user_team`, then `team`, and that Bolt's fixtures disagree on what `team`
-holds for an outside actor.
+holds for an outside actor, and for a home member's `app_mention` in a
+shared channel.
 
 Assumed, until T36e's live check. T36e gates admission: T36b, which first
 lets an outside member's message run a turn, and T36c after it, depend on
@@ -1932,8 +1971,13 @@ T36d only close things, and may land first.
 - That every event to an agent's app has the home workspace in
   `authorizations[0].team_id`.
 - That a home member's message in a shared channel names the home workspace
-  or the home organization. If it named another, home members would be
-  refused there.
+  or the home organization in every team field. Bolt's fixtures don't show
+  this for every event: in one, a home member's `app_mention` has `team` set
+  to the other organization while `user_team`, `source_team` and
+  `user_profile.team` name home[^bolt-actor]; its `message` fixtures name
+  home in `team`. Under T36a's rule such a member is refused there, and
+  T36e captures `team` for a home member's `message` in a channel the other
+  side hosts.
 - That an outside member's user id is the same in both organizations, in
   `<@U…>` mentions too.
 - That `conversations.info` gives a bot token `is_ext_shared` and
@@ -2053,13 +2097,13 @@ Direct calls would also need our own agent loop.
 [^cc-routines-fire]: [Trigger a routine through the API](https://platform.claude.com/docs/en/api/claude-code/routines-fire): the `/fire` request, the optional beta header, the 65,536-character `text`, the response, errors, no idempotency key, rate limits, and the token scoped to one routine with no read access, prefixed `sk-ant-oat01-`, which only the web UI generates, regenerates or revokes. Experimental.
 [^cc-oauth-scope]: Claude Code 2.1.286's bundled JavaScript: `formatTokens` keeps `scopes: Hgn(e.scope)`, where `Hgn` splits a string on spaces and gives `[]` for anything else, and the save path `p8n` stores the tokens only when those scopes include `user:inference` (`rU`), as do its auth-source detection and its refresh eligibility. A login whose answer left `scope` out would leave Claude Code without a claude.ai login, assuming the endpoint answers agentd's narrower scope pair the way it answers Claude Code's.
 [^cc-routines]: [Automate work with routines](https://code.claude.com/docs/en/routines): API triggers, the dated beta header and its migration window, the `routine-fire-payload` wrapping of fired text, connectors included by default, cloning from the default branch unless the prompt says otherwise, `claude/` branches, skipped runs while GitHub is disconnected, the run list's status, usage and hourly limits.
-[^cc-cloud-env]: [Configure cloud environments](https://code.claude.com/docs/en/cloud-environments#github-proxy): the GitHub proxy keeps credentials outside the VM, limits `git push` to the working branch and the API to the session's repositories.
+[^cc-cloud-env]: [Configure cloud environments](https://code.claude.com/docs/en/cloud-environments#github-proxy): the GitHub proxy keeps credentials outside the VM and rejects branch deletions and pushes to anything but a branch, but doesn't limit which branches a push can update; branch protection rules or rulesets on GitHub do that.
 [^slack-connect]: [Slack Connect guide](https://slack.com/help/articles/115004151203-Slack-Connect-guide--Work-with-external-organizations).
 [^slack-connect-apps]: [Understanding Slack Connect](https://docs.slack.dev/apis/slack-connect/): no duplicate events from shared channels with the Events API, a message's `team` against the installation's `team_id`, slash commands and message shortcuts only for the installing team, and bots DMing external members only with a shared channel in common. Read through search excerpts on 2026-10-01; the site wasn't reachable.
 [^slack-events]: [The Events API](https://docs.slack.dev/apis/events-api/): the event wrapper's `event_id` ("globally unique across all workspaces"), `event_context`, `authorizations`, `is_ext_shared_channel` and `context_team_id`. Read through search excerpts on 2026-10-01.
 [^slack-api-specs]: Slack's event wrapper schema, [`slackapi/slack-api-specs` `events-api/slack_common_event_wrapper_schema.json`](https://github.com/slackapi/slack-api-specs/blob/master/events-api/slack_common_event_wrapper_schema.json): `team_id` is "the unique identifier of the workspace where the event occurred", `event_id` "globally unique across all workspaces". Read on 2026-10-01. The schema predates `authorizations`.
 [^slack-authed]: [Events API truncate authed users](https://docs.slack.dev/changelog/2020-09-15-events-api-truncate-authed-users/): `authed_users` and `authed_teams` deprecated for one `authorizations` entry, from 2021-02-24. Read through search excerpts on 2026-10-01.
-[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with an app-level token holding `authorizations:read`. Read through search excerpts on 2026-10-01.
+[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with a token holding the `authorizations:read` scope, the only requirement the method's reference states. Read through search excerpts on 2026-10-01.
 [^slack-enterprise]: [Developing apps for Enterprise orgs](https://docs.slack.dev/enterprise/developing-for-enterprise-orgs/): one event per shared-channel event whatever the number of installations, `is_enterprise_install`, one global `U…` or `W…` user id per person. Read through search excerpts on 2026-10-01.
 [^slack-conversation]: [Conversation object](https://docs.slack.dev/reference/objects/conversation-object/) and [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/): `is_shared`, `is_ext_shared`, `is_org_shared`, `connected_team_ids`, `shared_team_ids` and `context_team_id`. Read through search excerpts on 2026-10-01; the field names match the Java SDK's `Conversation`.
 [^slack-users-identity]: [`users.identity`](https://docs.slack.dev/reference/methods/users.identity/): user ids are globally unique, and the same user on two unrelated workspaces has two. Read through search excerpts on 2026-10-01.

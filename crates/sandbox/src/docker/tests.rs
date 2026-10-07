@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bollard::models::EventActor;
 use core_types::{AgentId, ScopeKey};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::test_util::{awkward_channel, volume};
@@ -634,6 +634,77 @@ async fn kill_without_a_pid_is_an_error() {
     let err = child_waiting_for(pid).kill().await.unwrap_err();
     assert!(
         matches!(err, SandboxError::Docker { op: "kill", .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn wait_after_kill_returns_although_stdout_is_unread() {
+    let docker = fake_docker(r#"{"Id":"k1","Running":false,"ExitCode":137}"#.into()).await;
+    let (stdout, mut writer) = tokio::io::duplex(64 * 1024);
+    let pump = tokio::spawn(async move {
+        let _ = writer.write_all(&[b'x'; 128 * 1024]).await;
+    });
+    let (_pid_tx, pid) = watch::channel(Some(42));
+    let mut child = DockerChild {
+        pump: Some(pump),
+        docker,
+        ..child_waiting_for(pid)
+    };
+    child.kill().await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("wait hung on the unread stdout")
+        .unwrap();
+    assert_eq!(status.code, Some(137));
+    drop(stdout);
+}
+
+#[tokio::test]
+async fn kill_after_a_cancelled_wait_stops_copying_output() {
+    let docker = fake_docker(r#"{"Id":"k1","Running":false,"ExitCode":137}"#.into()).await;
+    let (mut stdout, mut writer) = tokio::io::duplex(64 * 1024);
+    let pump = tokio::spawn(async move { while writer.write_all(&[b'x'; 1024]).await.is_ok() {} });
+    let (_pid_tx, pid) = watch::channel(Some(42));
+    let mut child = DockerChild {
+        pump: Some(pump),
+        docker,
+        ..child_waiting_for(pid)
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), child.wait())
+            .await
+            .is_err()
+    );
+    child.kill().await.unwrap();
+    let mut copied = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_to_end(&mut copied))
+        .await
+        .expect("the output kept coming after the kill")
+        .unwrap();
+    assert_eq!(child.wait().await.unwrap().code, Some(137));
+}
+
+#[tokio::test]
+async fn wait_is_an_error_while_docker_says_the_process_still_runs() {
+    let docker = fake_docker(r#"{"Running":true}"#.into()).await;
+    let (_pid_tx, pid) = watch::channel(Some(42));
+    let mut child = DockerChild {
+        docker,
+        ..child_waiting_for(pid)
+    };
+    let err = tokio::time::timeout(EXIT_POLL * 2, child.wait())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SandboxError::Docker {
+                op: "inspect exec",
+                ..
+            }
+        ),
         "{err:?}"
     );
 }

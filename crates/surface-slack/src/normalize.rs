@@ -197,7 +197,7 @@ pub enum Skip {
     EditedByBot,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default)]
 struct MessageEvent {
     subtype: Option<String>,
@@ -347,7 +347,7 @@ impl<'de> Visitor<'de> for ShapedOrNothing {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct SlackFile {
     id: Option<String>,

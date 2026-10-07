@@ -134,6 +134,21 @@ pub enum Added {
     Pending(Manifest),
 }
 
+/// What [`Skills::remove`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removed {
+    /// It removed the skill in use, and with it any hosts its owner
+    /// confirmed.
+    Active,
+    /// It removed a skill still waiting for its owner to confirm its
+    /// hosts, or files no row recorded: no host had been granted.
+    Unconfirmed,
+    /// The agent has no skill of that name.
+    NotFound,
+    /// It refused: [`BUNDLED_NAME`] is built into every agent.
+    Bundled,
+}
+
 /// Why [`Skills::add`] refused a skill: something the owner can fix, said
 /// in its message.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -457,18 +472,27 @@ impl Skills {
         }
     }
 
-    /// Removes `agent`'s skill `name`, in use or waiting, with its hosts.
-    /// Returns whether there was one.
+    /// Removes `agent`'s skill `name`, in use or waiting, with its hosts,
+    /// and says which it was. The bundled skill is never removed.
     ///
     /// # Errors
     ///
     /// If the store or the disk fails.
-    pub async fn remove(&self, agent: AgentId, name: &str) -> Result<bool, SkillError> {
+    pub async fn remove(&self, agent: AgentId, name: &str) -> Result<Removed, SkillError> {
+        if name == BUNDLED_NAME {
+            return Ok(Removed::Bundled);
+        }
         let states = self.inner.store.delete_skill(agent, name, None).await?;
         let live = remove_dir(&self.live_dir(agent, name)).await?;
         let pending = remove_dir(&self.pending_dir(agent, name)).await?;
         tracing::info!(%agent, skill = name, rows = states.len(), live, pending, "removed a skill");
-        Ok(!states.is_empty() || live || pending)
+        Ok(if states.contains(&SkillState::Active) {
+            Removed::Active
+        } else if !states.is_empty() || live || pending {
+            Removed::Unconfirmed
+        } else {
+            Removed::NotFound
+        })
     }
 
     /// Deletes skills that waited too long for confirmation, with their

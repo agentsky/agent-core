@@ -316,6 +316,34 @@ async fn a_bad_store_url_is_named() {
     assert!(format!("{err:#}").contains("store.url"), "{err:#}");
 }
 
+#[tokio::test]
+async fn the_proxy_listener_hands_connect_to_the_egress_proxy() {
+    let running = Running::start(CONFIG, |routers| routers).await;
+    let proxy = running.addrs.proxy;
+    let answer = tokio::task::spawn_blocking(move || {
+        let mut stream =
+            std::net::TcpStream::connect_timeout(&proxy, Duration::from_secs(5)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut stream,
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+        common::read_response(&mut stream)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(answer.status, 403, "{answer:?}");
+    assert!(
+        answer.body.contains("This address has no sandbox session."),
+        "{answer:?}"
+    );
+    running.stop().await.1.unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_public_listener_refuses_the_sandbox_subnet() {
