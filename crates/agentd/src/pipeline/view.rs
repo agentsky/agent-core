@@ -64,7 +64,10 @@ async fn attribution(
 ///
 /// Those last three fail closed on their own: a lookup that fails is logged
 /// and leaves its answer `None`, which the router refuses, rather than
-/// failing the whole view.
+/// failing the whole view. So does a member lookup the store fails: it
+/// leaves that identity unknown, so the router refuses with
+/// [`PolicyUnavailable`](router::RefuseReason::PolicyUnavailable) rather
+/// than taking the sender for a stranger.
 ///
 /// The attribution is waited for only when the router reads it: another
 /// agent's bot sent the message, mentioning this agent. A post of an
@@ -77,7 +80,7 @@ pub(crate) struct StoreView {
     binding: Option<(BindingId, AgentId)>,
     attribution: Option<(MsgRef, Attribution)>,
     replied: Option<(MsgRef, AgentId)>,
-    members: HashMap<MemberKey, MemberId>,
+    members: HashMap<MemberKey, Option<MemberId>>,
     links: HashMap<MemberId, LinkState>,
     community_key: bool,
     admins: Vec<MemberKey>,
@@ -223,10 +226,19 @@ impl StoreView {
         Some(banned)
     }
 
-    /// Records the member `key` belongs to, and whether it is linked.
+    /// Records the member `key` belongs to, or that it belongs to none,
+    /// and whether that member is linked. A lookup the store fails leaves
+    /// `key` unknown.
     async fn member(&mut self, store: &Store, key: &MemberKey) -> Result<(), StoreError> {
-        if let Some(member) = store.member_for_identity(key).await? {
-            self.members.insert(key.clone(), member);
+        let member = match store.member_for_identity(key).await {
+            Ok(member) => member,
+            Err(err) => {
+                tracing::warn!(member = %key, error = %err, "couldn't look up a member; routing will refuse");
+                return Ok(());
+            }
+        };
+        self.members.insert(key.clone(), member);
+        if let Some(member) = member {
             self.link(store, member).await?;
         }
         Ok(())
@@ -262,7 +274,7 @@ impl RouterView for StoreView {
             .map(|(_, attribution)| attribution.clone())
     }
 
-    fn member_for(&self, key: &MemberKey) -> Option<MemberId> {
+    fn member_for(&self, key: &MemberKey) -> Option<Option<MemberId>> {
         self.members.get(key).copied()
     }
 

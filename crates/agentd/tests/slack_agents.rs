@@ -673,6 +673,71 @@ async fn an_owner_is_reminded_once_when_the_app_waits_for_its_install() {
     harness.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reminder_for_an_owner_unreachable_here_stops_after_its_attempts() {
+    let mut harness = Harness::start("install_reminder_secs = 60\n").await;
+    let store = harness.store().clone();
+    let start = OffsetDateTime::now_utc();
+    let elsewhere = MemberKey {
+        surface: SurfaceKind::RocketChat,
+        team: TeamId::new("rocketchat"),
+        user: UserId::new("bob"),
+    };
+    let bob = store.ensure_member(&elsewhere, "bob", start).await.unwrap();
+    let team = TeamId::new(fixtures::TEAM);
+    let AgentCreation::Created(_, binding) = store
+        .create_agent(
+            &NewAgent {
+                owner: bob,
+                name: "stray",
+                persona: "p",
+                visibility: Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            start,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    assert!(
+        store
+            .set_slack_app(
+                binding,
+                &NewSlackApp {
+                    app_id: "A0STRAY01".to_owned(),
+                    client_id: "3333.4444".to_owned(),
+                    client_secret: SecretString::from("client-SECRET-stray"),
+                    signing_secret: SecretString::from("signing-SECRET-stray"),
+                    scopes: "chat:write".to_owned(),
+                    redirect_url: format!("{PUBLIC_URL}/slack/oauth/callback"),
+                },
+                "stray",
+                start,
+            )
+            .await
+            .unwrap()
+    );
+    let agents = harness.app.slack_agents().unwrap().clone();
+    let lease = agentd::slack::agents::REMINDER_LEASE;
+    let attempts = agentd::slack::agents::REMINDER_MAX_ATTEMPTS;
+    let first = start + Duration::from_secs(120);
+    for attempt in 0..attempts + 1 {
+        let at = first + lease * attempt;
+        assert_eq!(agents.pass_at(|| at).await.unwrap().reminded, 0);
+    }
+    let due = store
+        .due_install_reminders(&team, first, first + lease * 100, attempts)
+        .await
+        .unwrap();
+    assert!(due.is_empty(), "every attempt was used");
+    assert!(harness.manager_posts().await.is_empty());
+    harness.stop().await;
+}
+
 /// Creates and installs `helper`, and returns its binding.
 async fn installed(harness: &mut Harness) -> BindingId {
     let (_, state) = create(harness).await;

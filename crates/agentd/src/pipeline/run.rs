@@ -580,7 +580,9 @@ impl Pipeline {
             .clone()
     }
 
-    /// Answers the lane's messages one at a time, until none waits.
+    /// Answers the lane's messages one at a time, until none waits. Once
+    /// the pipeline is closed it starts none of those still waiting: they
+    /// are dropped, as a message sent after closing is.
     async fn lane(self, key: LaneKey, mut job: Job) {
         let agent = key.0;
         loop {
@@ -593,6 +595,13 @@ impl Pipeline {
             drop(job);
             let next = {
                 let mut lanes = lock(&self.inner.lanes);
+                if self.is_closed() {
+                    let dropped = lanes.remove(&key).map_or(0, |queue| queue.len());
+                    if dropped > 0 {
+                        tracing::info!(%agent, messages = dropped, "shutting down: not handling the messages still waiting");
+                    }
+                    return;
+                }
                 match lanes.get_mut(&key).and_then(VecDeque::pop_front) {
                     Some(next) => next,
                     None => {
@@ -1169,7 +1178,9 @@ impl Pipeline {
 
     /// Looks the session up, builds the turn message and runs the turn,
     /// once more on a session reset in between. What the turn message
-    /// recorded is forgotten when the turn didn't run.
+    /// recorded is forgotten when the turn didn't run, which includes a
+    /// process that crashed or timed out before the CLI read the message
+    /// (no `init` line): that is [`PipelineError::Unread`].
     async fn turn(
         &self,
         event: &InboundEvent,
@@ -1212,6 +1223,10 @@ impl Pipeline {
             };
             let turn_id = request.turn;
             match sessions.run_turn(session.id, request).await {
+                Ok(report) if unread(&report.outcome) => {
+                    built.forget(store, session.id).await;
+                    return Err(PipelineError::Unread);
+                }
                 Ok(report) => return Ok((session, turn_id, report)),
                 Err(err) => {
                     built.forget(store, session.id).await;
@@ -1722,11 +1737,22 @@ impl Delivery<'_> {
     }
 }
 
+/// Whether a turn that ended with `outcome` ended before the CLI read its
+/// message: it crashed or timed out without printing `init`.
+fn unread(outcome: &TurnOutcome) -> bool {
+    match outcome {
+        TurnOutcome::Crashed { stats, .. } | TurnOutcome::TimedOut { stats } => !stats.init_seen,
+        TurnOutcome::Finished(_) => false,
+    }
+}
+
 /// Why handling a message failed.
 #[derive(Debug, thiserror::Error)]
 enum PipelineError {
     #[error("the turn isn't the owner's own, so it can't run on the agent's private side")]
     NotTheOwnersTurn,
+    #[error("the CLI ended before it read the turn's message")]
+    Unread,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -1958,6 +1984,27 @@ mod tests {
         }
         assert_eq!(checked, 3 * 3 * 4 * 2 * 3 * 2 * 4);
         assert_eq!(private, 1, "exactly one combination is the owner's own DM");
+    }
+
+    #[test]
+    fn only_a_crash_or_timeout_before_init_leaves_the_message_unread() {
+        let before = runner::TurnStats::default();
+        let after = runner::TurnStats {
+            init_seen: true,
+            ..runner::TurnStats::default()
+        };
+        assert!(unread(&TurnOutcome::Crashed {
+            exit_code: Some(70),
+            stats: before.clone(),
+        }));
+        assert!(unread(&TurnOutcome::TimedOut {
+            stats: before.clone()
+        }));
+        assert!(!unread(&TurnOutcome::Crashed {
+            exit_code: Some(70),
+            stats: after.clone(),
+        }));
+        assert!(!unread(&TurnOutcome::TimedOut { stats: after }));
     }
 
     #[test]

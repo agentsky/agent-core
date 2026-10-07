@@ -133,7 +133,9 @@ pub struct InFile {
 }
 
 /// One message read back with [`Surface::history`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output shows the text's length, never the text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Msg {
     /// The message's id in its conversation.
     pub id: MessageId,
@@ -149,6 +151,19 @@ pub struct Msg {
     /// When it was sent.
     #[serde(with = "time::serde::rfc3339")]
     pub sent_at: OffsetDateTime,
+}
+
+impl fmt::Debug for Msg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Msg")
+            .field("id", &self.id)
+            .field("sender", &self.sender)
+            .field("sender_is_bot", &self.sender_is_bot)
+            .field("text_len", &self.text.len())
+            .field("files", &self.files)
+            .field("sent_at", &self.sent_at)
+            .finish()
+    }
 }
 
 /// What a surface supports. Shared code branches on these, never on the

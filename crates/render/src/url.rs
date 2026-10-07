@@ -15,11 +15,14 @@ pub(crate) fn bare_url(text: &str, at: usize) -> Option<&str> {
     {
         return None;
     }
-    let len = rest
-        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '|'))
-        .unwrap_or(rest.len());
+    let len = rest.find(ends_url).unwrap_or(rest.len());
     let url = trim_url_tail(&rest[..len]);
     (url.len() > scheme.len()).then_some(url)
+}
+
+/// Whether `c` ends a bare URL.
+pub(crate) fn ends_url(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '<' | '>' | '|')
 }
 
 /// Drops trailing punctuation, and closing brackets that have no opening
