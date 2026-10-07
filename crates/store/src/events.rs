@@ -20,7 +20,7 @@ pub struct Swept {
 
 impl Store {
     /// Records that the event `event_id` from `source` (such as `slack` or
-    /// `rocketchat`) is being handled.
+    /// `rocketchat`) is being handled, as seen at `now`.
     ///
     /// Returns true the first time, and false when the event was already
     /// recorded, so the caller drops a retry or a second bot's copy. Under
@@ -30,14 +30,19 @@ impl Store {
     ///
     /// [`StoreError::Database`](crate::StoreError::Database) if the query
     /// fails.
-    pub async fn mark_event_processed(&self, source: &str, event_id: &str) -> Result<bool> {
+    pub async fn mark_event_processed(
+        &self,
+        source: &str,
+        event_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
         let result = sqlx::query(
             "INSERT INTO processed_events (source, event_id, seen_at) VALUES (?, ?, ?) \
              ON CONFLICT (source, event_id) DO NOTHING",
         )
         .bind(source)
         .bind(event_id)
-        .bind(to_unix(OffsetDateTime::now_utc()))
+        .bind(to_unix(now))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -79,12 +84,27 @@ mod tests {
     #[tokio::test]
     async fn an_event_is_new_only_once() {
         let store = memory_store().await;
-        assert!(store.mark_event_processed("slack", "Ev1").await.unwrap());
-        assert!(!store.mark_event_processed("slack", "Ev1").await.unwrap());
-        assert!(store.mark_event_processed("slack", "Ev2").await.unwrap());
         assert!(
             store
-                .mark_event_processed("rocketchat", "Ev1")
+                .mark_event_processed("slack", "Ev1", at(1_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .mark_event_processed("slack", "Ev1", at(1_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_event_processed("slack", "Ev2", at(1_000))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_event_processed("rocketchat", "Ev1", at(1_000))
                 .await
                 .unwrap()
         );
@@ -95,10 +115,10 @@ mod tests {
         let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let (a, b, c, d) = tokio::join!(
-            store.mark_event_processed("rocketchat", "m1"),
-            store.mark_event_processed("rocketchat", "m1"),
-            store.mark_event_processed("rocketchat", "m1"),
-            store.mark_event_processed("rocketchat", "m1"),
+            store.mark_event_processed("rocketchat", "m1", at(1_000)),
+            store.mark_event_processed("rocketchat", "m1", at(1_000)),
+            store.mark_event_processed("rocketchat", "m1", at(1_000)),
+            store.mark_event_processed("rocketchat", "m1", at(1_000)),
         );
         let firsts = [a, b, c, d]
             .into_iter()
@@ -110,9 +130,12 @@ mod tests {
     #[tokio::test]
     async fn sweep_deletes_expired_pending_logins() {
         let store = memory_store().await;
-        let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
         let verifier = SecretString::from("v");
         for (state, expires_at) in [("old", 1_000), ("edge", 2_000), ("live", 3_000)] {
+            let member = store
+                .ensure_member(&member_key(state), "Ada", at(1_000))
+                .await
+                .unwrap();
             store
                 .put_pending_login(state, member, &verifier, at(expires_at))
                 .await
@@ -134,15 +157,33 @@ mod tests {
     #[tokio::test]
     async fn sweep_forgets_events_after_the_retention() {
         let store = memory_store().await;
-        assert!(store.mark_event_processed("slack", "Ev1").await.unwrap());
-        let now = OffsetDateTime::now_utc();
-        let swept = store.sweep_expired(now).await.unwrap();
+        let seen = at(1_000_000);
+        assert!(
+            store
+                .mark_event_processed("slack", "Ev1", seen)
+                .await
+                .unwrap()
+        );
+        let swept = store
+            .sweep_expired(seen + PROCESSED_EVENT_RETENTION)
+            .await
+            .unwrap();
         assert_eq!(swept, Swept::default());
-        assert!(!store.mark_event_processed("slack", "Ev1").await.unwrap());
+        assert!(
+            !store
+                .mark_event_processed("slack", "Ev1", seen)
+                .await
+                .unwrap()
+        );
 
-        let later = now + PROCESSED_EVENT_RETENTION + Duration::minutes(1);
+        let later = seen + PROCESSED_EVENT_RETENTION + Duration::seconds(1);
         let swept = store.sweep_expired(later).await.unwrap();
         assert_eq!(swept.processed_events, 1);
-        assert!(store.mark_event_processed("slack", "Ev1").await.unwrap());
+        assert!(
+            store
+                .mark_event_processed("slack", "Ev1", later)
+                .await
+                .unwrap()
+        );
     }
 }
