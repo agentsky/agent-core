@@ -2254,6 +2254,7 @@ dependencies = [
  "clap",
  "core-types",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "time",
