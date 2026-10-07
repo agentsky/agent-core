@@ -7317,6 +7317,10 @@ would let a bot post in any public channel, is off unless
   attempt is never spent on a link that can't be made. The owner's
   identity in the workspace is looked up after the claim, so an owner with
   none uses up the attempts rather than being read again on every sweep.
+  An owner whose Slack identity is missing for all five leases therefore
+  never gets the reminder, even after joining the workspace, since
+  `install_reminder_attempts` never resets while the binding stays
+  `pending_install`; that is permanent per binding, on purpose.
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
