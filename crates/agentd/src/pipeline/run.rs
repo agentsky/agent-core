@@ -958,10 +958,10 @@ impl Pipeline {
 
     /// Routes `job`'s message for `agent`, and unless the decision is to
     /// ignore it, routes the platform's copy again and acts on the copy
-    /// if its decision may stand ([`copy_stands`]). The event and the copy
-    /// must agree on [`outside`](InboundEvent::outside) ([`agreeing_copy`]):
-    /// the copy's comes from the platform alone, and a disagreement drops
-    /// the message. A hand-off agentd built
+    /// if its decision may stand ([`copy_stands`]). The event and a
+    /// person's copy must agree on [`outside`](InboundEvent::outside)
+    /// ([`agreeing_copy`]): the copy's comes from the platform alone, and a
+    /// disagreement drops the message. A hand-off agentd built
     /// itself is acted on as it is, once the agent's bot is found, asking
     /// the platform now, to be able to post in the conversation.
     ///
@@ -2021,8 +2021,12 @@ fn limited(decision: &Decision) -> bool {
 /// is dropped. The copy's `outside` comes from the platform's data alone,
 /// its own team fields or the platform's answer about the sender, so
 /// nothing an event says, an organization included, is carried into it.
+/// Only a person's copy is compared: a bot's own `outside` says nothing,
+/// as a hop takes its requester's from the attribution, so a bot's copy,
+/// an agent's hop among them, is kept whatever either says.
 fn agreeing_copy(copy: InboundEvent, event: &InboundEvent) -> Option<InboundEvent> {
-    (copy.outside == event.outside).then_some(copy)
+    let from_a_bot = copy.sender_is_bot || copy.sender_bot_user.is_some();
+    (from_a_bot || copy.outside == event.outside).then_some(copy)
 }
 
 /// Whether the decision on the platform's copy of a message, `confirmed`,
@@ -3133,6 +3137,32 @@ mod tests {
         for copy in [&home, &theirs, &unknown] {
             assert_eq!(agreeing_copy(copy.clone(), copy).as_ref(), Some(copy));
         }
+    }
+
+    #[test]
+    fn a_bots_copy_is_kept_whatever_it_says_of_outside() {
+        let bot = |outside| InboundEvent {
+            sender_is_bot: true,
+            ..event_with_outside(outside)
+        };
+        let agent = |outside| InboundEvent {
+            sender_bot_user: Some(core_types::UserId::new("UWRITER")),
+            ..event_with_outside(outside)
+        };
+        for copy in [bot(None), agent(None)] {
+            for event in [
+                event_with_outside(Some("T0THEIRS1")),
+                event_with_outside(Some("")),
+            ] {
+                assert_eq!(
+                    agreeing_copy(copy.clone(), &event).as_ref(),
+                    Some(&copy),
+                    "{copy:?}"
+                );
+            }
+        }
+        let person = event_with_outside(None);
+        assert_eq!(agreeing_copy(person, &bot(Some("T0THEIRS1"))), None);
     }
 
     #[test]
