@@ -1945,7 +1945,7 @@ moment the channel gains outside members. So agent apps subscribe to
    answers with a channel-shaped id, whichever it is. Slack may already
    follow the new id to one it has since, and that answer is the one used.
 2. Rewrites that agent's own `#room` rules from the old id to the id Slack
-   answered with, in one transaction. Where the agent already has a rule on the new id, the two
+   answered with, in one transaction. Where the agent already has a rule on that id, the two
    merge: a deny on either id is kept as a deny, and duplicates are
    dropped.
 
