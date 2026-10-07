@@ -12,7 +12,7 @@ use pulldown_cmark::{
     Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
 };
 
-use crate::url::{bare_url, ends_url, trim_url_tail};
+use crate::url::{bare_url, ends_url};
 use crate::{MentionDirectory, mention};
 
 /// The most text one Slack message chunk holds: 3,000 characters, under
