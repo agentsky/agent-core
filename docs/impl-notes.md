@@ -2138,6 +2138,252 @@ messages `t` (`au` with the added username as `msg`).
   `<uid>/subscriptions-changed` sent `inserted` when a DM or channel was
   created with the user and `updated` on new messages.
 
+## T12: Rocket.Chat realtime
+
+DDP and stream behavior below was read from the Rocket.Chat source on
+`develop` (commit `fad30ab`): `ee/apps/ddp-streamer/src/ddp/`,
+`packages/streamer/src/` and `apps/meteor/server/lib/notifyListener.ts`. No
+server was available, so none of it is verified live yet.
+
+### The store reaches the surface through a `Dedup` trait
+
+**Issue.** T12 deduplicates with `store.mark_event_processed("rocketchat",
+_id)`, but surface crates don't depend on the store, and agentd is what holds
+it.
+
+**Solution.** surface-rocketchat defines `Dedup`, one async method with the
+store's signature and contract, and `RocketChatSurface::new` takes an
+`Arc<dyn Dedup>`. agentd implements it with a one-line call to the store;
+`DEDUP_SOURCE` is `"rocketchat"`. The tests use a real in-memory `Store`
+(a dev-dependency) behind it. A copy is recorded only after it was
+normalized, and a failure to read the room or to record skips that copy
+without recording it, so another bot's connection can still deliver the
+message. A failure to read the sender's roles doesn't skip it: every surface
+shares one `BotRoles`, so every connection would fail alike and the message
+would be lost everywhere. The sender then counts as a person, with a warning
+logged, as history already did; the router looks every sender up as a
+managed agent whatever `sender_is_bot` says, so a managed agent's post still
+takes the agent path. A copy recorded when the event receiver has just
+closed is lost, which only happens at shutdown.
+
+### Messages don't carry the sender's roles
+
+**Issue.** A sender with the `bot` role must set `sender_is_bot`, but a
+message's `u` holds only `_id`, `username` and `name`. `users.info` returns
+another user's `roles` only to a caller with `view-full-other-user-info`
+(`apps/meteor/server/lib/users/getFullUserData.ts`), which bots don't have.
+Since whichever connection records a message first delivers it, a lookup made
+with that connection's own token would classify agent A's post as a bot's
+when A's connection won and as a human's when B's did. The `bot` field
+doesn't help for agentd's own bots: `chat.postMessage` refuses it
+(`additionalProperties: false` in its schema), so only integrations and apps
+set it.
+
+**Solution.** `BotRoles` reads roles with `users.info` and remembers them for
+ten minutes. agentd builds one from the manager's client and shares it
+between every surface, so the manager's roles also need
+`view-full-other-user-info`; on the Community Edition the admin adds it to
+`app` ([T11's live check](#the-live-check-against-7139)), and the design's
+Rocket.Chat section says so. A sender is a bot when the message has a
+non-false `bot` field or the sender has the `bot` role. `RestClient` gains `user_info`, and `FakeRest` shows roles
+only to the user itself and to the manager.
+
+Without the permission, `users.info` leaves `roles` out rather than
+failing, which would have classified every bot as a person without a word.
+Every Rocket.Chat user has at least one role, so `BotRoles::is_bot` treats
+an empty or missing list as `SurfaceError::Forbidden`, naming the missing
+permission and the manager's user id (never the token), and doesn't cache
+it. Messages still flow, as above, and each one logs the error, so a
+misconfigured manager is loud until it is fixed. The cache keeps at most
+10,000 users: making room drops expired entries, then the oldest.
+
+### Room lists and room kinds come from REST
+
+**Issue.** Nothing in the realtime API lists the rooms a user is in without
+`__my_messages__`, and a `stream-room-messages` event has no room type, so it
+can't tell a DM from a group DM.
+
+**Solution.** Each connection lists rooms with REST `subscriptions.get`, and
+the surface reads a room's `t`, `usersCount` and `uids` with `rooms.info` the
+first time a message arrives from it, then keeps it for the surface's
+lifetime (a DM's members are fixed), for at most 10,000 rooms, dropping the
+oldest beyond that. `RestClient` gains `subscriptions`,
+`file_url` (`<base>/file-upload/<id>/<name>`, for `InFile::url`) and
+`credentials` (the realtime login reuses the token), and `FakeRest` answers
+`subscriptions.get`. Only channels, private groups and DMs are listened to:
+omnichannel rooms (`l`) and other types aren't agent conversations.
+
+### `stream-room-messages` resends a message whenever it changes
+
+**Issue.** `notifyOnMessageChange` broadcasts the whole message on every
+change: a reaction, a reply in its thread (the root's `tcount`), a link
+preview. Dedup by `_id` drops these for a message already recorded, but a
+message recorded by nobody, posted before the bot joined or while every
+connection was down, would look new when someone reacts to it, and would
+arrive with the mentions it had then. Only `editedAt` marks an edit.
+
+**Solution.** Besides `t` and `editedAt`, a message whose `_updatedAt` is
+more than two minutes after its `ts` is skipped as a change to an old
+message. The margin covers the `sendMessage` method, which accepts a client's
+`ts` up to 60 seconds off the server's clock.
+
+### `@all` and `@here` appear in `mentions[]`
+
+**Issue.** Rocket.Chat puts the broadcasts in `mentions[]` with `_id` `all`
+or `here`. They name no user.
+
+**Solution.** They are left out of `InboundEvent::mentions`, so a broadcast
+never counts as mentioning an agent. Repeated ids are kept once.
+
+### Personal access tokens work as resume tokens
+
+**Issue.** T12 logs in "with a `resume` token", and T11 issues personal
+access tokens.
+
+**Solution.** Rocket.Chat stores a personal access token as a hashed login
+token with `type: "personalAccessToken"`
+(`apps/meteor/imports/personal-access-tokens/server/api/methods/generateToken.ts`),
+where the resume handler finds it, so the realtime client sends the bot's
+token as `{"resume": token}`. A login error `403` ends `events` with
+`SurfaceError::Unauthorized` instead of reconnecting forever. A login that
+answers for another user id also ends it. A login result with no user id
+reconnects instead, since a single malformed or proxy-mangled frame would
+otherwise end the bot's events until agentd restarts it.
+
+### DDP details the client relies on
+
+- The server's first frame is `{"server_id": "0"}` from Meteor or
+  `{"msg": "server_id", …}` from the split-out streamer. The client ignores
+  anything it doesn't know.
+- The streamer pings a client that has been silent for 30 seconds and closes
+  the socket 30 seconds later (`TIMEOUT` in `ddp/constants.ts`). The client
+  answers pings with their id, pings after 20 seconds of silence itself, and
+  reconnects after 40 seconds without any frame.
+- A stream subscription is `sub` with `params: [event, false]`; the second
+  parameter turns off collection compatibility. A refused one gets `nosub`
+  with `error: "not-allowed"`. A refused room is dropped and the connection
+  stays up; a refused `subscriptions-changed` reconnects. The refused room
+  is remembered until an `inserted` notice for it or the next connection,
+  since `updated` notices would otherwise ask for it again on every unread
+  change.
+- `subscriptions-changed` carries `[action, subscription]`. `updated` fires
+  on every unread-count change, so subscribing is idempotent. `removed` may
+  lack `rid`, so each connection keeps the subscription document `_id` of
+  each room, from `subscriptions.get` (`Subscription` gains `id`) and from
+  `inserted` and `updated` notices, and resolves such a removal through it.
+  The server also stops a room's message subscription itself when the user
+  is removed, without telling the client, and the client sends `unsub`
+  anyway. Because of that, `inserted` is authoritative: for a room already
+  subscribed, the client sends `unsub` for the old subscription and
+  subscribes again, so a removal it couldn't resolve doesn't leave the bot
+  deaf after it is added back.
+
+### Reconnecting lists the rooms again instead of remembering them
+
+**Issue.** Resubscribing to every room a connection knew would include rooms
+the bot was removed from while disconnected, and `stream-room-messages`
+lets any user with `view-c-room` read a public channel's messages
+(`canReadRoom`), so the bot would keep hearing a channel it left.
+
+**Solution.** Each connection subscribes to what `subscriptions.get` lists
+then, plus what `subscriptions-changed` adds, which also covers rooms joined
+while disconnected. Messages posted while a bot had no connection are not
+fetched; [Deferred work](tasks-plan.md#deferred-work) has a bullet for it.
+
+### Changes that arrive while the rooms are listed
+
+**Issue.** `subscriptions.get` runs after the `subscriptions-changed`
+subscription is ready, so a notice can arrive while the listing is in
+flight. Applied at once, a removal found nothing to unsubscribe, and the
+listing, possibly read before the removal, then subscribed to the room
+anyway.
+
+**Solution.** Notices that arrive during the listing are kept, then applied
+in order to the listed rooms before anything is subscribed: a removal takes
+its room out (resolving a missing `rid` through the listing's document ids),
+and `inserted` or `updated` puts it in. A notice about a change the listing
+already reflects changes nothing.
+
+### The backoff starts over only after a healthy connection
+
+**Issue.** The backoff reset as soon as a connection had logged in and
+subscribed, so a server that accepted and subscribed and then dropped the
+socket, or refused `subscriptions-changed` right after, was reconnected at
+the initial wait forever.
+
+**Solution.** The backoff resets only when a connection stays up for the
+longer of `backoff_max` and twice `heartbeat` (60 s by default). That is
+long enough that reconnecting at once costs no more than waiting the
+longest backoff, and longer than it takes to notice a silent server, which
+is declared dead after twice `heartbeat`. A connection that drops sooner
+counts as a failed attempt and the next wait doubles.
+
+### Normalizing runs off the socket
+
+**Issue.** Normalizing a message can call `rooms.info` and `users.info`, and
+recording it hits the store. Doing that inline would delay answering the
+server's pings.
+
+**Solution.** The socket loop hands raw messages to the surface through a
+channel of 256, and the surface normalizes them in order on its own.
+
+### A slow consumer looked like a silent server
+
+**Issue.** Review found that the heartbeat watchdog measured silence from
+the last frame read. While the loop waited for a full channel to take a
+message it read nothing, so a consumer slower than two heartbeats ended the
+connection as "the server stopped answering", and the frames still unread
+in the socket were lost.
+
+**Solution.** Silence is measured from the last frame read or the end of
+handling one, whichever is later, so time spent waiting for the consumer
+does not count. A test holds a channel of one for three heartbeats of
+500 ms and checks that the connection is not replaced and the next message
+arrives. The heartbeat is that long so a ping and its pong fit in one
+heartbeat on a loaded CI runner.
+
+While the loop waits for the consumer it reads no frames, so it also
+answers no server ping. The streamer closes a socket about 30 seconds
+after a ping goes unanswered, so a consumer stalled for that long still
+ends the connection; the client then reconnects as after any other drop.
+
+### tokio-tungstenite uses rustls's default provider
+
+**Issue.** tokio-tungstenite builds its TLS configuration with
+`ClientConfig::builder()`, which takes the process-wide `CryptoProvider`, or
+the one crate features select when exactly one of `aws-lc-rs` and `ring` is
+enabled, and panics otherwise.
+
+**Solution.** reqwest's `rustls` feature enables `aws-lc-rs`, and nothing
+enables `ring`, so `wss://` connects work without installing a provider. A
+test connects to a local port that drops the TLS handshake and checks that
+the client retries instead of panicking, so a second provider appearing in
+the graph fails CI.
+
+### `Surface::render` has no mention directory
+
+**Issue.** `render::rocketchat::to_markdown` resolves `@Name` through a
+`MentionDirectory`, but `Surface::render(&self, markdown)` takes none, and
+T23 says the pipeline builds a directory snapshot per reply.
+
+**Solution.** `RocketChatSurface::render` passes a directory that resolves
+nothing, so `@Name` stays as written. On Rocket.Chat that loses little, since
+an `@username` in the text is already a mention and broadcasts are still
+neutralized. If T23 needs display names resolved, it has to add the
+directory to `Surface::render` (or render outside the trait).
+
+### Thread history includes the root
+
+**Issue.** `chat.getThreadMessages` returns replies only, newest first, and
+has no `latest`, but T23 and `agentctl history` want the thread as a whole,
+older than a cursor.
+
+**Solution.** `history` for a thread reads pages of 100 newest first, keeps
+messages older than the cursor message's `ts`, and adds the root once the
+replies run out, as Slack's `conversations.replies` would. It reads at most
+50 pages. Both thread and top-level history leave out system messages, so a
+call can return fewer than `limit`.
+
 ## T22: router
 
 ### The plan and the design name no order for the checks
