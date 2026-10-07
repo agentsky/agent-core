@@ -75,7 +75,7 @@ RUN case "$TARGETARCH" in \
 
 FROM base
 COPY --from=agentctl /usr/local/bin/agentctl /usr/local/bin/agentctl
-COPY --from=claude /download/claude /usr/local/bin/claude
+COPY --from=claude --chown=0:0 /download/claude /usr/local/bin/claude
 
 RUN groupadd --gid 10001 agent \
     && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash agent
