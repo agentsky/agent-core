@@ -747,6 +747,13 @@ Markup that opens before a URL wraps it and is not touched, even when the
 source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
 as `*<https://x.io/a>*'s`.
 
+qm-core's `trimUrlTail` also drops a trailing `*`, `_` or `~`, since its
+regexes could hand formatting marks to the URL scan. Here that cut a URL the
+pass had kept whole: `…/datamodel.html#object.__init__` was linked as
+`<…#object.__init>__`, landing on the wrong anchor. The parser has already
+taken every delimiter that formats, and the ones left in a text node are
+literal or were put back above, so the trim keeps those three characters.
+
 ### CommonMark disagrees with some qm-core regex cases
 
 **Issue.** qm-core converts with regexes; this renderer walks the
@@ -994,6 +1001,16 @@ Broadcasts are neutralized everywhere, code and URLs included (see [Code
 doesn't protect a broadcast on
 Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
 scanner moved from `slack.rs` to `render::url` to be shared.
+
+The shared trim keeps a trailing `*`, `_` or `~` for both surfaces (see
+[Emphasis inside a bare URL cut the link](#emphasis-inside-a-bare-url-cut-the-link)).
+On Rocket.Chat the URL only bounds the text name resolution skips: the
+renderer copies the source through either way, and what the trim drops is
+never an `@`, so trimming those marks there would change no output. What
+the server's own Markdown makes of `…#object.__init__` depends on the text
+it receives, which is the same either way, so Rocket.Chat has no reason for
+a trim of its own. A Rocket.Chat test pins that such a URL passes through
+whole, with a name after it resolved and a name inside it left alone.
 
 ### Code doesn't protect a broadcast on Rocket.Chat
 
@@ -2628,6 +2645,12 @@ error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
 out. A bot user still missed has no token and no password anyone knows, so
 it can't be used, but it keeps its username until an admin removes it.
+Review asked for both quiet paths to be visible: a found user with no
+email at all is logged as a warning (binding and username only) before the
+username is forgotten, since that is what every user looks like to a
+manager without `view-full-other-user-info`, and a lookup that fails is a
+warning like a failed deactivation, bounded by the retirement's backoff,
+instead of a debug line that hid a long outage until "giving up".
 
 ### Deactivating a deleted agent's bot is owed until it happens
 
@@ -5588,19 +5611,20 @@ sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
 directory exists as the container starts. A skill added, replaced or removed
 reaches a conversation when its process next starts, as a persona does.
 
-### Files from both manager DMs reach the handlers
+### `skill add` reads its attachment like `persona`
 
-**Issue.** T30 left the Slack DM's files unpassed and T14 read attachments
-only in the Rocket.Chat DM, and `WebApi::download_file` reported a file over
-the limit as `SurfaceError::Api`, where Rocket.Chat's download says
-`TooLarge`.
+**Issue.** The plan has `skill add` take a `SKILL.md` or `.zip` attached in
+a manager DM, and the file passing it needs is T30's: `dm_command` returns
+the DM's files, the Slack inbound submits them with the command,
+`Commands::download` reads an attachment from either manager's DM, and
+`download_file` answers `TooLarge` past its limit
+([Files in the manager DM](#files-in-the-manager-dm)).
 
-**Solution.** `commands::slack::dm_command` returns the event's files and
-the Slack inbound submits them with the command. `Commands::download` reads
-an attachment from either manager's DM (and nowhere else), and both
-`persona` and `skill add` use it, so `persona <name>` with a `persona.md`
-attached works on Slack too. `download_file` answers `TooLarge` past its
-limit.
+**Solution.** `skill add` with no Git URL takes exactly one attachment
+through `Commands::download`, with its own caps (256 KB for a `.md`, 10 MB
+for a `.zip`), so it works in either manager DM as `persona` does. A file
+over the cap is refused with the limit, and a command without exactly one
+attachment, or one sent outside a manager DM, is told how to add a skill.
 
 ### Skills reach the model only with the Skill tool
 
@@ -6654,6 +6678,13 @@ sanitizing and `map_error`; only a non-2xx answer without one is
 its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
 is not a Web API method, so it has no bucket, and the caller can retry the
 whole upload, which shared nothing.
+
+`org_login_required` was first among the `Forbidden` codes. Slack answers
+it while a workspace is being migrated into an Enterprise Grid
+organization, which passes on its own, so it is not a refusal of the bot
+and now falls to `Api` with the code. No caller needs it to be
+`Forbidden`: those that treat `Forbidden` as a no or a refusal answer
+`Api` the same way or fail closed on it.
 
 ### Names two members share
 
@@ -7789,6 +7820,10 @@ would let a bot post in any public channel, is off unless
   attempt is never spent on a link that can't be made. The owner's
   identity in the workspace is looked up after the claim, so an owner with
   none uses up the attempts rather than being read again on every sweep.
+  An owner whose Slack identity is missing for all five leases therefore
+  never gets the reminder, even after joining the workspace, since
+  `install_reminder_attempts` never resets while the binding stays
+  `pending_install`; that is permanent per binding, on purpose.
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
@@ -9391,7 +9426,10 @@ organization `users.info` names (`directory::Membership`, from `team_id`,
 else `enterprise_user.enterprise_id`, whichever is not home). The pipeline
 drops a message whose event and copy disagree on `outside`, organization
 included (`agreeing_copy`), with a throttled warning that the platform's
-copy says otherwise of whether the sender is from outside. Only a
+copy doesn't agree on whether the sender is from outside, or that the
+sender couldn't be looked up: a home member whose `users.info` lookup was
+refused (`Api`, `Unauthorized`, `Forbidden`) gets a copy with
+`Outside { team: None }`, and is dropped under the same warning. Only a
 person's copy is compared (07 Oct review): a bot's own `outside` decides
 nothing, since a hop's requester takes it from the attribution, and
 comparing it dropped an agent's hop copy under that warning. At T36a the event of an outside sender is ignored before
