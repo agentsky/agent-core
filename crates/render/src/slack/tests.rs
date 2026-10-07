@@ -658,6 +658,31 @@ fn bare_urls() {
                 "https://x.io/a\\_b",
                 "<https://x.io/a_b>",
             ),
+            (
+                "an escape opening emphasis unwrapped at a URL's end",
+                "https://x.io/a_b\\__\\__",
+                "<https://x.io/a_b>\u{200b}_\u{200b}_\u{200b}_\u{200b}_",
+            ),
+            (
+                "an escape opening bold unwrapped inside a URL",
+                "_https://x.io/**\\_]b**\\*~~.",
+                "_<https://x.io/**_]b**>\u{200b}*\u{200b}~~.",
+            ),
+            (
+                "an escaped underscore opening unwrapped bold",
+                "https://x.io/**\\_a**",
+                "<https://x.io/**_a**>",
+            ),
+            (
+                "an escaped star opening unwrapped emphasis",
+                "https://x.io/_\\*a_",
+                "<https://x.io/_*a_>",
+            ),
+            (
+                "an escaped tilde opening unwrapped strikethrough",
+                "see https://x.io/~~\\~a~~ ok",
+                "see <https://x.io/~~~a~~> ok",
+            ),
             ("a host of only an underscore", "https://_", "https://_"),
             ("a host of only stars", "https://***", "https://***"),
             ("a host of only tildes", "https://~~~", "https://~~~"),
