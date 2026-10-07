@@ -1216,9 +1216,13 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     assert_eq!(attributed.requester.key, key("bob"), "the hop is bob's");
     assert_eq!(attributed.hop.0, 2);
     assert_eq!(
-        stack.bearers().await.last().map(String::as_str),
-        Some("Bearer token-of-bob"),
-        "the hop runs on bob's account"
+        stack.bearers().await,
+        vec![
+            "Bearer token-of-alice",
+            "Bearer token-of-alice",
+            "Bearer token-of-bob"
+        ],
+        "alice's failed turns ran on her account, and the hop runs on bob's"
     );
     stack.stop().await;
 }
