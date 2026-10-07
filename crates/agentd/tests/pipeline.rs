@@ -1201,6 +1201,11 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
     let attributed = store.posted_message_ref(&sent[0].2).await.unwrap().unwrap();
     assert_eq!(attributed.requester.key, key("bob"), "the hop is bob's");
     assert_eq!(attributed.hop.0, 2);
+    assert_eq!(
+        stack.bearers().await.last().map(String::as_str),
+        Some("Bearer token-of-bob"),
+        "the hop runs on bob's account"
+    );
     stack.stop().await;
 }
 
@@ -2891,6 +2896,11 @@ async fn an_agents_own_hop_limit_lowers_the_cap() {
             "writer won't answer: it takes part in chains of at most 1 hand-off."
         ]
     );
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"; 3],
+        "every turn of the chain runs on bob's account"
+    );
     stack.stop().await;
 }
 
@@ -2920,6 +2930,11 @@ async fn the_thread_token_budget_stops_a_chain() {
     stack.pipeline.close();
     stack.pipeline.drain().await;
     assert_eq!(stack.mock.posts().len(), 2);
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"],
+        "the turn that started the chain ran on bob's account"
+    );
     stack.stop().await;
 }
 
@@ -3014,7 +3029,11 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
         [reply, reply, "later", "later"],
         "agentd's own copy, arriving second, is dropped"
     );
-    assert_eq!(stack.bearers().await.len(), 4);
+    assert_eq!(
+        stack.bearers().await,
+        vec!["Bearer token-of-bob"; 4],
+        "both hops, and the turns that posted them, ran on bob's account"
+    );
     stack.stop().await;
 }
 
