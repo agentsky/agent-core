@@ -686,16 +686,23 @@ same mark appears earlier in the URL after the scheme (`#object.__init__`,
 `/_a_`, `/~~a~~`, and `/_a_` in `https://x.io/_a_)`). Otherwise the run is
 dropped and trimming goes on, so a mark after punctuation or a closing
 bracket, as in `(https://x.io/_a)_` or `https://x.io/my*page.*`, never
-shields the characters before it. The trim sees decoded text, so the Slack
-renderer, which knows the offsets of the marks the source escaped (`\_`,
-`&#95;`, `&lowbar;`), ends a URL before the first escaped mark in that
-trailing run: `https://x.io/my_page\_` keeps its `_` out of the link, while
-an escaped mark inside the path, as in `https://x.io/a\_b`, stays part of
-it. A URL that is only a scheme and marks, such as `https://_`, is left as
-text. Dropping the run only after punctuation or an unmatched closer was
-tried too: on a corpus of generated inputs it linked past the original trim
-in about three times as many inputs, and still linked `https://x.io/a.*__*`
-whole.
+shields the characters before it. When rendering, the trim sees decoded
+text, so the Slack renderer, which knows the offsets of the marks the source
+escaped (`\_`, `&#95;`, `&lowbar;`), ends a URL before the first escaped
+mark in that trailing run: `https://x.io/my_page\_` keeps its `_` out of the
+link, while an escaped mark inside the path, as in `https://x.io/a\_b`,
+stays part of it. A URL that is only a scheme and marks, such as
+`https://_`, is left as text. Dropping the run only after punctuation or an
+unmatched closer was tried too: on a corpus of generated inputs it linked
+past the original trim in about three times as many inputs, and still linked
+`https://x.io/a.*__*` whole.
+
+Unwrapping such markup took its opening delimiter from the source up to its
+first child, and when that child was a backslash escape the `\` came along,
+so a stray backslash reached the link target: `https://x.io/a_b\__\__` gave
+`<https://x.io/a_b__\>`. The opening delimiter now stops before the escape's
+backslash, so the link holds the URL as the reader sees it, and the escaped
+mark is handled as above.
 
 ### CommonMark disagrees with some qm-core regex cases
 
@@ -947,7 +954,7 @@ scanner moved from `slack.rs` to `render::url` to be shared.
 
 The shared trim keeps a trailing run of `*`, `_` or `~` only when it
 follows an alphanumeric character and the URL holds the same mark earlier,
-for both surfaces (see
+after its scheme, for both surfaces (see
 [Emphasis inside a bare URL cut the link](#emphasis-inside-a-bare-url-cut-the-link)).
 On Rocket.Chat the URL only bounds the text name resolution skips: the
 renderer copies the source through either way, and what the trim drops is
