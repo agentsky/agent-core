@@ -2624,18 +2624,13 @@ async fn me_shows_what_was_billed_today_and_this_month() {
         conv: conv("GENERAL"),
         root: None,
     };
-    let now = OffsetDateTime::now_utc();
-    let today = now.replace_time(time::Time::MIDNIGHT);
-    let earlier = if today.day() > 1 {
-        today - time::Duration::days(1)
-    } else {
-        today
-    };
+    let now = time::macros::datetime!(2026-10-15 12:00 UTC);
     for (at, input) in [
         (now, 100),
         (now, 20),
-        (earlier, 3),
-        (today - time::Duration::days(40), 7),
+        (time::macros::datetime!(2026-10-14 23:59:59 UTC), 3),
+        (time::macros::datetime!(2026-09-30 23:59:59 UTC), 7),
+        (time::macros::datetime!(2026-10-16 00:00 UTC), 50),
     ] {
         h.store
             .record_turn_usage(
@@ -2653,16 +2648,19 @@ async fn me_shows_what_was_billed_today_and_this_month() {
             .await
             .unwrap();
     }
-    h.dm("BOB", "me").await;
-    let reply = h.last_reply("BOB");
+    let origin = Origin::RocketChatDm {
+        room: dm_room("BOB").into(),
+    };
+    let reply = h.commands.me(&key("BOB"), &origin, now).await.unwrap();
     let usage = reply.lines().nth(1).unwrap();
-    let today_turns = if earlier == today { 3 } else { 2 };
-    let today_tokens = if earlier == today { 126 } else { 122 };
     assert_eq!(
         usage,
-        format!(
-            "Usage billed to you today: {today_turns} turns, {today_tokens} tokens. This month: \
-             3 turns, 126 tokens (days start at midnight UTC)."
-        )
+        "Usage billed to you today: 2 turns, 122 tokens. This month: 3 turns, 126 tokens (days \
+         start at midnight UTC)."
+    );
+    h.dm("BOB", "me").await;
+    assert!(
+        h.last_reply("BOB").starts_with("Claude account: "),
+        "the command answers through the same handler"
     );
 }

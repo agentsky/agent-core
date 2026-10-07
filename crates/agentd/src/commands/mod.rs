@@ -480,7 +480,7 @@ impl Commands {
                     self.login_complete(member, &code, origin).await
                 }
                 Command::Logout => self.logout(member, origin).await,
-                Command::Me => self.me(member, origin).await,
+                Command::Me => self.me(member, origin, now()).await,
                 Command::SlackToken { refresh, .. } => {
                     self.slack_token(member, &refresh, origin).await
                 }
@@ -616,7 +616,13 @@ impl Commands {
         Ok(reply)
     }
 
-    async fn me(&self, key: &MemberKey, origin: &Origin) -> Result<String, Failure> {
+    /// The reply to `me` from `key`, with usage counted up to `now`.
+    async fn me(
+        &self,
+        key: &MemberKey,
+        origin: &Origin,
+        now: OffsetDateTime,
+    ) -> Result<String, Failure> {
         let member = self.member(key).await?;
         let status = match member {
             Some(member) => self.inner.auth.status(member).await?,
@@ -636,7 +642,7 @@ impl Commands {
             },
         };
         reply.push('\n');
-        reply.push_str(&self.usage(member).await?);
+        reply.push_str(&self.usage(member, now).await?);
         if let Some(member) = member.filter(|_| !self.is_admin(key))
             && let Some(ban) = self.inner.store.ban(member).await?
         {
@@ -672,10 +678,14 @@ impl Commands {
     }
 
     /// `member`'s usage line for `me`: the turns and tokens billed to them
-    /// today and this month, UTC.
-    async fn usage(&self, member: Option<MemberId>) -> Result<String, Failure> {
+    /// on `now`'s day and month, UTC.
+    async fn usage(
+        &self,
+        member: Option<MemberId>,
+        now: OffsetDateTime,
+    ) -> Result<String, Failure> {
         let billed = match member {
-            Some(member) => self.inner.store.member_usage(member, now()).await?,
+            Some(member) => self.inner.store.member_usage(member, now).await?,
             None => MemberUsage::default(),
         };
         let describe = |usage: UsageTotals| {
