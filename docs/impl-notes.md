@@ -10147,7 +10147,11 @@ and no new install is needed, and an event its owner removed, such as
   challenge (T31 above), which passes once the ingress answers. Slack's
   reference pages for `apps.manifest.update` and `apps.manifest.export`
   couldn't be read from this environment, and no other code is known to
-  be permanent, so only `Forbidden` blocks.
+  be permanent, so only `Forbidden` blocks. `org_login_required`, which
+  Slack answers while a workspace moves into an Enterprise Grid
+  organization, is `Api` since T29's review rather than `Forbidden`, so an
+  update during such a migration is tried again each hour instead of
+  being blocked at the version.
 - **`/agent me`.** It lists the agents agentd still updates ("try again
   every hour") apart from those it can't update ("delete the agent and
   create it again"), so it never promises a retry that won't come.
