@@ -2289,8 +2289,15 @@ in the socket were lost.
 
 **Solution.** Silence is measured from the last frame read or the end of
 handling one, whichever is later, so time spent waiting for the consumer
-does not count. A test holds a channel of one for five heartbeats and
-checks that the connection is not replaced and the next message arrives.
+does not count. A test holds a channel of one for three heartbeats of
+500 ms and checks that the connection is not replaced and the next message
+arrives. The heartbeat is that long so a ping and its pong fit in one
+heartbeat on a loaded CI runner.
+
+While the loop waits for the consumer it reads no frames, so it also
+answers no server ping. The streamer closes a socket about 30 seconds
+after a ping goes unanswered, so a consumer stalled for that long still
+ends the connection; the client then reconnects as after any other drop.
 
 ### tokio-tungstenite uses rustls's default provider
 
