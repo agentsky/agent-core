@@ -8,7 +8,9 @@
 use std::ops::Range;
 
 use core_types::{LengthUnit, Limit};
-use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag};
+use pulldown_cmark::{
+    Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd,
+};
 
 use crate::url::{bare_url, ends_url, trim_url_tail};
 use crate::{MentionDirectory, mention};
@@ -142,11 +144,9 @@ fn parse(md: &str) -> Vec<Node<'_>> {
     let mut root = Vec::new();
     let mut open: Vec<(Tag<'_>, Range<usize>, Vec<Node<'_>>)> = Vec::new();
     let mut flattened = 0usize;
-    let mut urls: Vec<Range<usize>> = Vec::new();
-    for (event, span) in Parser::new_ext(md, options).into_offset_iter() {
-        if ends_bare_url(md, &span, &event) {
-            cut_bare_url(md, span.start, &mut urls);
-        }
+    let events: Vec<_> = Parser::new_ext(md, options).into_offset_iter().collect();
+    let urls = bare_urls(md, &events);
+    for (event, span) in events {
         let node = match event {
             Event::Start(_) if open.len() >= MAX_DEPTH => {
                 flattened += 1;
@@ -177,7 +177,6 @@ fn parse(md: &str) -> Vec<Node<'_>> {
                 }
             }
             Event::Text(text) => {
-                note_bare_urls(md, &span, &mut urls);
                 let escaped = if is_escaped_delimiter(md, &span, &text) {
                     vec![0]
                 } else {
@@ -217,42 +216,59 @@ fn parse(md: &str) -> Vec<Node<'_>> {
     root
 }
 
-/// Records the source ranges of the bare URLs that start in a text event's
-/// span. Each URL is measured in the source, not in the event, because
-/// pulldown-cmark ends a text event at `_`, `*` or `~` that it takes for
-/// emphasis even in the middle of a URL. The ranges stay sorted and
-/// disjoint.
-fn note_bare_urls(md: &str, span: &Range<usize>, urls: &mut Vec<Range<usize>>) {
-    for (offset, _) in md[span.clone()].match_indices("http") {
-        let at = span.start + offset;
-        if urls.last().is_some_and(|last| at < last.end) {
-            continue;
-        }
-        if let Some(url) = bare_url(md, at) {
-            urls.push(at..at + url.len());
+/// The source ranges of the bare URLs as rendered, sorted and disjoint.
+///
+/// A URL is measured in the source over a run of text and emphasis events,
+/// because pulldown-cmark ends a text event at `_`, `*` or `~` that it takes
+/// for emphasis even in the middle of a URL. Any other event, such as inline
+/// code, ends the run, and so does a character reference or escape that
+/// renders as a character no URL holds, as `&lt;` does. Each run is scanned
+/// once.
+fn bare_urls(md: &str, events: &[(Event<'_>, Range<usize>)]) -> Vec<Range<usize>> {
+    let mut urls = Vec::new();
+    let mut run: Option<Range<usize>> = None;
+    for (event, span) in events {
+        let piece = match event {
+            Event::Text(text) if md[span.clone()] == **text || !text.contains(ends_url) => {
+                Some(span.clone())
+            }
+            Event::Start(Tag::Strong | Tag::Emphasis | Tag::Strikethrough) => {
+                Some(span.start..span.start)
+            }
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
+                Some(span.end..span.end)
+            }
+            _ => None,
+        };
+        match (piece, &mut run) {
+            (Some(piece), Some(run)) => run.end = run.end.max(piece.end),
+            (Some(piece), None) => run = Some(piece),
+            (None, _) => {
+                if let Some(run) = run.take() {
+                    scan_run(md, run, &mut urls);
+                }
+            }
         }
     }
-}
-
-/// Whether an event ends the rendered text of a bare URL that the source
-/// would carry on past it: a character reference or escape that renders as
-/// a character no URL holds, as `&lt;` does, or anything but text and
-/// emphasis, such as inline code.
-fn ends_bare_url(md: &str, span: &Range<usize>, event: &Event<'_>) -> bool {
-    match event {
-        Event::Text(text) => md[span.clone()] != **text && text.contains(ends_url),
-        Event::Start(Tag::Strong | Tag::Emphasis | Tag::Strikethrough) | Event::End(_) => false,
-        _ => true,
+    if let Some(run) = run {
+        scan_run(md, run, &mut urls);
     }
+    urls
 }
 
-/// Ends the last bare URL at `at` if it runs past it, then trims its tail as
-/// [`bare_url`] would.
-fn cut_bare_url(md: &str, at: usize, urls: &mut [Range<usize>]) {
-    if let Some(url) = urls.last_mut()
-        && url.contains(&at)
-    {
-        url.end = url.start + trim_url_tail(&md[url.start..at]).len();
+/// Records the bare URLs in one run of source text.
+fn scan_run(md: &str, run: Range<usize>, urls: &mut Vec<Range<usize>>) {
+    let text = &md[..run.end];
+    let mut at = run.start;
+    while let Some(offset) = text[at..].find("http") {
+        let start = at + offset;
+        at = match bare_url(text, start) {
+            Some(url) => {
+                urls.push(start..start + url.len());
+                start + url.len()
+            }
+            None => start + "http".len(),
+        };
     }
 }
 
