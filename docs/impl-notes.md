@@ -707,11 +707,14 @@ scan of one text node linked only the part before:
 `see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
 kept such URLs whole.
 
-**Solution.** While parsing, the renderer measures each bare URL in the source
-from where a text node starts it, and ends it early where the rendered text
-stops being a URL: at a character reference or escape that renders as a
-space, `<`, `>` or `|` (`&lt;`), and at anything other than text and
-emphasis, such as inline code. Emphasis or strikethrough whose opening
+**Solution.** Before building the tree, the renderer measures bare URLs in
+the source over each run of text and emphasis events. A run ends where the
+rendered text stops being a URL: at a character reference or escape that
+renders as a space, `<`, `>` or `|` (`&lt;`), and at anything other than
+text and emphasis, such as inline code. Each run is scanned once, so the
+pass stays linear; measuring from every text node to the next source
+terminator instead took 19 s on ``"`c`https://a"`` repeated 10,000 times,
+since each cut made the next URL scan the rest of the run again. Emphasis or strikethrough whose opening
 delimiter is inside such a range is replaced by its children, with its
 delimiters as text, so the URL is one text run again and is linked whole.
 Markup that opens before a URL wraps it and is not touched, even when the
@@ -2301,8 +2304,15 @@ in the socket were lost.
 
 **Solution.** Silence is measured from the last frame read or the end of
 handling one, whichever is later, so time spent waiting for the consumer
-does not count. A test holds a channel of one for five heartbeats and
-checks that the connection is not replaced and the next message arrives.
+does not count. A test holds a channel of one for three heartbeats of
+500 ms and checks that the connection is not replaced and the next message
+arrives. The heartbeat is that long so a ping and its pong fit in one
+heartbeat on a loaded CI runner.
+
+While the loop waits for the consumer it reads no frames, so it also
+answers no server ping. The streamer closes a socket about 30 seconds
+after a ping goes unanswered, so a consumer stalled for that long still
+ends the connection; the client then reconnects as after any other drop.
 
 ### tokio-tungstenite uses rustls's default provider
 
@@ -2457,13 +2467,15 @@ connections stop listening, and the intake runs the commands it already
 received (the store has recorded them as processed, so no other instance
 would) and waits for them within the drain timeout.
 
-One narrow window is left. `listen` stops on the shutdown signal by dropping
-the surface's events future, and that future may be between the
-`mark_event_processed` commit and the `send` into the intake. A command
-dropped there is recorded as processed and never run by any instance. The
-window is the store write itself and is inherent to recording an event
-before delivering it; the member sees no reply and can send the command
-again.
+One window is left. `listen` stops on the shutdown signal by dropping the
+surface's events future, and that future may be between the
+`mark_event_processed` commit and the end of the `send` into the intake. A
+command dropped there is recorded as processed and never run by any
+instance. The window covers the store write and `CommandFeed::offer`'s
+`send` into the intake's channel, which holds 64 commands: normally both
+are short, but under a backlog the `send` waits while the channel is full,
+and the window lasts that long. It is inherent to recording an event before
+delivering it; the member sees no reply and can send the command again.
 
 ### Secret-looking text that doesn't parse, in a channel
 
@@ -3150,12 +3162,12 @@ its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
 `/usr/local/bin/claude`, with `--chown=0:0`, since BuildKit keeps a
 stage-to-stage copy's ownership and the file would otherwise belong to
 `nobody` (harmless at mode 0755 on a read-only root, but `agentctl` is
-root's). The images job checks that both belong to root. The checksums are `platforms.<platform>.checksum`
-in the release's `manifest.json`; for 2.1.285 the manifest was read from
-the release bucket, and the `linux-x64` binary downloaded from it hashed to
-the manifest's value and printed `2.1.285 (Claude Code)`. The CI build
-downloads it from `downloads.claude.ai` and `sha256sum` reports it OK.
-A copy outside
+root's). The images job checks that both belong to root. The checksums are
+`platforms.<platform>.checksum` in the release's `manifest.json`; for
+2.1.285 the manifest was read from the release bucket, and the `linux-x64`
+binary downloaded from it hashed to the manifest's value and printed
+`2.1.285 (Claude Code)`. The CI build downloads it from
+`downloads.claude.ai` and `sha256sum` reports it OK. A copy outside
 `~/.local/bin` is left alone by the auto-updater, which
 `DISABLE_AUTOUPDATER=1` also turns off. `CLAUDE_CODE_VERSION` is still the
 only place the version is written: the CI check reads it from there.
@@ -3321,8 +3333,11 @@ straight to polling `inspect_exec`, and stdout ends after what was already
 copied. Both sandboxes now return from `wait` after `kill` whether stdout
 was read or not, with a unit test for each (the Docker one against a fake
 daemon) and `docker_kill_then_wait_returns_with_stdout_unread` against a
-real daemon. A process still running ten seconds after its output ended is
-now a `SandboxError::Docker` for `inspect exec`.
+real daemon. A process still running ten seconds after its output ended or
+it was killed is now a `SandboxError::Docker` for `inspect exec`. `wait`
+awaits the copying task where it is stored rather than taking it out first,
+so a `wait` that is cancelled, for example by a timeout, leaves the task for
+a later `kill` to abort; a unit test cancels a `wait` and then kills.
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -4630,8 +4645,9 @@ similar are `NotFound`; anything else is `Api` with the code. A code is
 kept only if it is at most 64 lowercase letters, digits and underscores, so
 an error never carries arbitrary response text. `already_reacted` from
 `reactions.add` and `no_reaction` from `reactions.remove` count as success.
-A non-2xx status other than 429 is `Api("HTTP <status>")`, an unreadable
-body is `Transport`, and redirects are never followed. Transport errors drop
+A non-2xx status other than 429 maps the body's `ok: false` code like any
+other and is `Api("HTTP <status>")` only when the body has none, an
+unreadable body is `Transport`, and redirects are never followed. Transport errors drop
 the request URL, so a `response_url` or upload URL can't leak through one.
 
 Review found that a non-2xx answer whose body carries an `ok: false` code,
