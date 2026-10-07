@@ -5913,9 +5913,10 @@ write, for no gain. The follow-up itself holds a strong `SessionControl`
 handle until its resets end, so on shutdown the `SessionManager`'s inner
 state, whose drop aborts the reaper and the container event follower, can
 outlive the `Turns` handle while a reset waits behind a long turn; that is
-bounded by the drain, which drops a follow-up still waiting when it ends. The follow-up lives only in memory: if the instance
-dies, the queued resets die with it and nothing is reset, which the owner
-sees in `sessions` and can send again.
+bounded by the drain, which drops a follow-up still waiting when it ends.
+The follow-up lives only in memory: if the instance dies, the queued resets
+die with it and nothing is reset, which the owner sees in `sessions` and can
+send again.
 
 The follow-up isn't polled while the reply is being sent. A reset queued on
 a busy session whose turn ends in that window is handed the session's lock,
