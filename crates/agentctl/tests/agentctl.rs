@@ -661,6 +661,8 @@ enum Renewals {
     /// It fails the first renewal with agentd's internal error, and grants
     /// the rest.
     FailOnce,
+    /// It grants renewals with more seconds left than a clock can hold.
+    Endless,
 }
 
 /// A fake ctl API whose lock grants leases of `ttl` seconds, with whole
@@ -766,6 +768,14 @@ async fn fake_lock(
             if state.renewals == Renewals::Stall {
                 return std::future::pending().await;
             }
+            if state.renewals == Renewals::Endless {
+                return Json(LockResponse::Held {
+                    lease,
+                    expires_at: OffsetDateTime::now_utc(),
+                    seconds_left: u64::MAX,
+                })
+                .into_response();
+            }
             let first = {
                 let mut renewed = state.renewed.lock().unwrap();
                 *renewed += 1;
@@ -834,6 +844,27 @@ async fn a_transient_agentd_error_is_retried_under_a_clock_behind_agentctls() {
     assert!(out.stderr.is_empty(), "{out:?}");
     assert!(fake.renewed() >= 3, "{} renewals", fake.renewed());
     assert_eq!(fake.released(), fake.granted());
+}
+
+#[tokio::test]
+async fn a_renewal_too_long_for_the_clock_stops_the_command_and_says_so() {
+    let fake = FakeLock::start(3, 0, Renewals::Endless).await;
+    let dir = TempDir::new("agentctl-test");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "sleep", "30"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.refused(
+        "lost the shared/ lock (agentd granted a lease longer than the clock can hold); \
+         stopped the command",
+    );
 }
 
 #[tokio::test]
