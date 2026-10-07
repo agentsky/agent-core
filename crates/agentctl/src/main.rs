@@ -283,7 +283,9 @@ mod tests {
             ["cloud", "add", "agent-core", "https://x", "sk-ant-oat01-x"].as_slice(),
             ["cloud-run", "agent-core", "fix it"].as_slice(),
         ] {
-            let err = parse(args).unwrap_err();
+            let Err(err) = parse(args) else {
+                panic!("{args:?} parsed as a command");
+            };
             assert_eq!(err.kind(), ErrorKind::InvalidSubcommand, "{args:?}");
         }
         let help = cli.clone().render_long_help().to_string();
