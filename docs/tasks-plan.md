@@ -2336,7 +2336,12 @@ the agent produces a reply posted with the agent's bot token.
 
 Live check (manual): on the Slack development workspace, create two agents,
 install them, invite them to a channel, mention each, and get replies. That
-completes design milestone 4.
+completes design milestone 4. Also check and record:
+
+- Whether Slack retries an interactivity payload, for example a button press
+  answered slowly. T28 deduplicates commands and interactions by their
+  signature, so a retry signed with a new timestamp would run twice
+  ([impl-notes](impl-notes.md#replays-inside-the-five-minute-window)).
 
 ## Phase 5: private tasks and agent-to-agent (design milestone 5)
 

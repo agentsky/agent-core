@@ -76,7 +76,7 @@ pub enum Skip {
     NotAddressed,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default)]
 struct MessageEvent {
     subtype: Option<String>,
@@ -92,7 +92,7 @@ struct MessageEvent {
     files: Option<Vec<SlackFile>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default)]
 struct SlackFile {
     id: Option<String>,

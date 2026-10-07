@@ -3114,6 +3114,10 @@ otherwise pass), under `slack:<binding>:request`. Slack doesn't retry them, so
 a second copy is never legitimate. Timestamps are also refused when more than
 five minutes in the future, not only in the past.
 
+That Slack never retries an interactivity payload is unverified live. A
+retry would be signed again with a new timestamp, so its signature differs
+and it would run twice. T31's live check records whether Slack retries one.
+
 ### Current Slack apps post without a subtype
 
 **Issue.** The plan ignores every subtype but `file_share` and
