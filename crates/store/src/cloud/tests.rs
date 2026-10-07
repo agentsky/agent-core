@@ -1150,6 +1150,27 @@ async fn a_handoff_notice_is_claimed_once_and_backs_off() {
 }
 
 #[tokio::test]
+async fn claim_zero_neither_defers_nor_marks_a_notice() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let id = unknown(&store, ada, 1_000).await;
+    assert!(
+        !store
+            .defer_cloud_handoff_notice(id, 0, at(1_000))
+            .await
+            .unwrap(),
+        "a never-claimed notice isn't pushed back"
+    );
+    assert!(
+        !store
+            .mark_cloud_handoff_notified(id, 0, at(1_000))
+            .await
+            .unwrap()
+    );
+    assert_eq!(due(&store, 1_000).await, [id], "still due at once");
+}
+
+#[tokio::test]
 async fn a_handoff_notice_is_given_up_after_a_day() {
     let store = memory_store().await;
     let ada = member(&store, "ada").await;

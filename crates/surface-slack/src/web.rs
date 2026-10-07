@@ -14,7 +14,9 @@
 //! # Errors
 //!
 //! Slack answers most failures with HTTP 200 and `{"ok": false, "error":
-//! "<code>"}`. [`map_error`] turns the code into a [`SurfaceError`]. A 429
+//! "<code>"}`, and some with another status and the same body. [`map_error`]
+//! turns the code into a [`SurfaceError`]; another status without a code is
+//! [`SurfaceError::Api`] with the status. A 429
 //! (or an `ok: false` with `ratelimited`) is retried after `Retry-After`,
 //! at most [`MAX_RETRIES`] times and only while the wait is within
 //! [`SlackClient::with_max_retry_wait`]; otherwise it fails with
@@ -1050,7 +1052,9 @@ pub struct Bot {
 }
 
 /// A message read with `conversations.history` or `conversations.replies`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` prints the text's length and the number of files, not the text.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Message {
     /// The message's `ts`, its id in the conversation.
     pub ts: MessageId,
@@ -1069,6 +1073,21 @@ pub struct Message {
     pub thread_ts: Option<MessageId>,
     /// The files the bot can download.
     pub files: Vec<InFile>,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Message")
+            .field("ts", &self.ts)
+            .field("user", &self.user)
+            .field("bot_id", &self.bot_id)
+            .field("is_bot", &self.is_bot)
+            .field("subtype", &self.subtype)
+            .field("text_len", &self.text.len())
+            .field("thread_ts", &self.thread_ts)
+            .field("files_len", &self.files.len())
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1680,7 +1699,8 @@ impl WebApi {
     ///
     /// # Errors
     ///
-    /// [`SurfaceError::NotFound`] if a file can't be read, and
+    /// [`SurfaceError::NotFound`] if a file can't be read,
+    /// [`SurfaceError::RateLimited`] if an upload URL answers 429, and
     /// [`SurfaceError::Api`] if an upload is refused; otherwise see
     /// [`map_error`].
     pub async fn upload_files(
@@ -1748,6 +1768,11 @@ impl WebApi {
                 "the file upload failed (HTTP {})",
                 status.as_u16()
             )))
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
+            Err(SurfaceError::RateLimited {
+                retry_after: retry_after(response.headers().get(RETRY_AFTER))
+                    .unwrap_or(DEFAULT_RETRY_WAIT),
+            })
         } else {
             Err(SurfaceError::Api(format!(
                 "the file upload was refused (HTTP {})",
@@ -1978,10 +2003,14 @@ async fn reply(response: reqwest::Response) -> Result<Reply> {
     if status.is_server_error() {
         return Err(SurfaceError::Transport(format!("HTTP {}", status.as_u16())));
     }
-    if !status.is_success() {
+    let envelope = serde_json::from_slice::<Envelope>(&bytes).ok();
+    let has_code = envelope
+        .as_ref()
+        .is_some_and(|envelope| !envelope.ok && envelope.error.is_some());
+    if !status.is_success() && !has_code {
         return Err(SurfaceError::Api(format!("HTTP {}", status.as_u16())));
     }
-    let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|_| {
+    let envelope = envelope.ok_or_else(|| {
         SurfaceError::Transport(format!("unreadable response (HTTP {})", status.as_u16()))
     })?;
     if envelope.ok {

@@ -1,5 +1,7 @@
 //! [`InboundEvent`]: a chat message, normalized by its surface.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -31,7 +33,9 @@ pub const MAX_MENTIONS: usize = 100;
 /// no user, as for legacy integrations) has `sender_bot_user: None` and its
 /// bot id (`B…`) in `sender.user`. No binding has that id, so the router
 /// treats the sender as an unmanaged bot and ignores it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output shows the text's length, never the text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundEvent {
     /// The platform's id for this delivery, used to drop duplicates: a Slack
     /// `event_id` or a Rocket.Chat message `_id`.
@@ -44,9 +48,9 @@ pub struct InboundEvent {
     /// Whether the sender is from outside the workspace agentd serves, and
     /// from which organization; `None` for a member of the workspace, and
     /// always on Rocket.Chat. On Slack it is what the message's own team
-    /// fields say, and for Slack's copy of it also what a lookup said: an
-    /// event can make a sender outside, never home. A bot's says nothing,
-    /// since the router never takes a bot for a requester.
+    /// fields say, and for Slack's copy of it also what a lookup said; the
+    /// pipeline acts only on a copy whose `outside` is the event's. A bot's
+    /// says nothing, since the router never takes a bot for a requester.
     #[serde(default)]
     pub outside: Option<Outside>,
     /// Whether the sender is a bot, managed by agentd or not.
@@ -77,6 +81,28 @@ pub struct InboundEvent {
     /// When agentd received the event.
     #[serde(with = "time::serde::rfc3339")]
     pub received_at: OffsetDateTime,
+}
+
+impl fmt::Debug for InboundEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InboundEvent")
+            .field("event_id", &self.event_id)
+            .field("binding", &self.binding)
+            .field("sender", &self.sender)
+            .field("outside", &self.outside)
+            .field("sender_is_bot", &self.sender_is_bot)
+            .field("sender_bot_user", &self.sender_bot_user)
+            .field("conv", &self.conv)
+            .field("conv_kind", &self.conv_kind)
+            .field("thread_root", &self.thread_root)
+            .field("message", &self.message)
+            .field("text_len", &self.text.len())
+            .field("mentions", &self.mentions)
+            .field("reply_to", &self.reply_to)
+            .field("files", &self.files)
+            .field("received_at", &self.received_at)
+            .finish()
+    }
 }
 
 impl InboundEvent {
@@ -151,6 +177,17 @@ mod tests {
         json.as_object_mut().unwrap().remove("outside");
         let event: InboundEvent = serde_json::from_value(json).unwrap();
         assert_eq!(event.outside, None);
+    }
+
+    #[test]
+    fn debug_shows_the_text_length_not_the_text() {
+        let mut event = sample_event(ConvKind::Channel);
+        event.text = "the secret plan".into();
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("secret plan"), "{debug}");
+        assert!(debug.contains("text_len: 15"), "{debug}");
+        assert!(debug.contains("Ev01"), "{debug}");
+        assert!(debug.contains("T9"), "the outside organization: {debug}");
     }
 
     #[test]

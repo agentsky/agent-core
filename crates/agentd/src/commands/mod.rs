@@ -599,7 +599,7 @@ impl Commands {
     ) -> Result<String, Failure> {
         let name = command.name();
         if command.is_secret_bearing() && !origin.is_private() {
-            self.refuse_public_secret(member, &command, origin).await
+            Ok(self.refuse_public_secret(member, &command, origin).await)
         } else {
             match command {
                 Command::Login { code: None } => self.login_start(member, origin).await,
@@ -607,7 +607,7 @@ impl Commands {
                     self.login_complete(member, &code, origin).await
                 }
                 Command::Logout => self.logout(member, origin).await,
-                Command::Me => self.me(member, origin).await,
+                Command::Me => self.me(member, origin, now()).await,
                 Command::SlackToken { refresh, .. } => {
                     self.slack_token(member, &refresh, origin).await
                 }
@@ -816,7 +816,13 @@ impl Commands {
         Ok(reply)
     }
 
-    async fn me(&self, key: &MemberKey, origin: &Origin) -> Result<String, Failure> {
+    /// The reply to `me` from `key`, with usage counted up to `now`.
+    async fn me(
+        &self,
+        key: &MemberKey,
+        origin: &Origin,
+        now: OffsetDateTime,
+    ) -> Result<String, Failure> {
         let member = self.member(key).await?;
         let status = match member {
             Some(member) => self.inner.auth.status(member).await?,
@@ -836,7 +842,7 @@ impl Commands {
             },
         };
         reply.push('\n');
-        reply.push_str(&self.usage(member).await?);
+        reply.push_str(&self.usage(member, now).await?);
         if let Some(member) = member.filter(|_| !self.is_admin(key))
             && let Some(ban) = self.inner.store.ban(member).await?
         {
@@ -872,10 +878,14 @@ impl Commands {
     }
 
     /// `member`'s usage line for `me`: the turns and tokens billed to them
-    /// today and this month, UTC.
-    async fn usage(&self, member: Option<MemberId>) -> Result<String, Failure> {
+    /// on `now`'s day and month, UTC.
+    async fn usage(
+        &self,
+        member: Option<MemberId>,
+        now: OffsetDateTime,
+    ) -> Result<String, Failure> {
         let billed = match member {
-            Some(member) => self.inner.store.member_usage(member, now()).await?,
+            Some(member) => self.inner.store.member_usage(member, now).await?,
             None => MemberUsage::default(),
         };
         let describe = |usage: UsageTotals| {
@@ -894,23 +904,44 @@ impl Commands {
     }
 
     /// The reply to a secret-bearing `command` sent where others can read
-    /// it. The secret isn't used.
+    /// it. The secret isn't used. A store failure while cancelling logins is
+    /// logged, and the member is still told the secret is public.
     async fn refuse_public_secret(
         &self,
         key: &MemberKey,
         command: &Command,
         origin: &Origin,
-    ) -> Result<String, Failure> {
+    ) -> String {
         let place = origin.private_place();
         let advice = match command {
             Command::Login { code: Some(code) } => {
-                self.cancel_pending_logins(key).await?;
-                if self.inner.auth.cancel_pasted_login(code).await? {
-                    tracing::info!(member = %key, "cancelled the pending login a public code belongs to");
-                }
+                let own = self.cancel_pending_logins(key).await;
+                let pasted = match self.inner.auth.cancel_pasted_login(code).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            member = %key,
+                            "cancelled the pending login a public code belongs to"
+                        );
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(err) => {
+                        tracing::warn!(
+                            member = %key,
+                            error = %err,
+                            "couldn't cancel the pending login a public code belongs to"
+                        );
+                        false
+                    }
+                };
+                let and_cancelled = if own.is_some_and(|count| count > 0) || pasted {
+                    " and cancelled your pending login"
+                } else {
+                    ""
+                };
                 format!(
-                    "That login code is no longer secret, so I didn't use it and cancelled your \
-                     pending login. Start again with {}, and send the code only {place}.",
+                    "That login code is no longer secret, so I didn't use it{and_cancelled}. \
+                     Start again with {}, and send the code only {place}.",
                     origin.command("login")
                 )
             }
@@ -957,10 +988,10 @@ impl Commands {
                  and send a new one only {place}."
             ),
         };
-        Ok(format!(
+        format!(
             "You posted a secret in a room others can read. {advice} You may also want to \
              delete your message there."
-        ))
+        )
     }
 
     /// The reply to text that didn't parse. If it looks like it held a
@@ -970,26 +1001,43 @@ impl Commands {
         if !err.is_secret_bearing() || origin.is_private() {
             return err.to_string();
         }
-        if let Err(failure) = self.cancel_pending_logins(key).await {
-            tracing::warn!(member = %key, error = %failure, "couldn't cancel pending logins");
-        }
+        let cancelled = if self.cancel_pending_logins(key).await.is_some() {
+            "I cancelled any pending login, so "
+        } else {
+            ""
+        };
         format!(
             "Your message looked like it held a secret (a login code, an API key or a token), \
              and others can read the room you posted it in. If it did, that secret is no longer \
-             private: I cancelled any pending login, so start again with {}, and revoke any key \
-             or token you posted (a routine token with **Regenerate** or **Revoke** at \
-             claude.ai/code/routines). Send secrets only {}.\n\n{err}",
+             private: {cancelled}start again with {}, and revoke any key or token you posted \
+             (a routine token with **Regenerate** or **Revoke** at claude.ai/code/routines). \
+             Send secrets only {}.\n\n{err}",
             origin.command("login"),
             origin.private_place(),
         )
     }
 
-    async fn cancel_pending_logins(&self, key: &MemberKey) -> Result<(), Failure> {
-        if let Some(member) = self.member(key).await? {
+    /// Cancels the pending logins of the member `key` belongs to, after a
+    /// secret was posted publicly. A store failure is logged rather than
+    /// returned, so the member still hears that the secret is public.
+    /// Returns how many pending logins it cancelled, or `None` if the
+    /// cancellation didn't go through.
+    async fn cancel_pending_logins(&self, key: &MemberKey) -> Option<u64> {
+        let cancelled = async {
+            let Some(member) = self.member(key).await? else {
+                return Ok(0);
+            };
             let cancelled = self.inner.store.invalidate_pending_logins(member).await?;
             tracing::info!(%member, cancelled, "cancelled pending logins after a public secret");
+            Ok::<_, Failure>(cancelled)
+        };
+        match cancelled.await {
+            Ok(cancelled) => Some(cancelled),
+            Err(failure) => {
+                tracing::warn!(member = %key, error = %failure, "couldn't cancel pending logins");
+                None
+            }
         }
-        Ok(())
     }
 }
 

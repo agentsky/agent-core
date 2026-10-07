@@ -1049,7 +1049,8 @@ impl Store {
     /// Ends claim `claim` on hand-off `id`'s notice, which couldn't be sent
     /// at `now`: it may be claimed again after a backoff of a minute after
     /// the first claim, doubling with each claim up to an hour. False if
-    /// the notice isn't owed any more, or a later claim took it over.
+    /// the notice isn't owed any more, a later claim took it over, or
+    /// `claim` is 0, which no claim is.
     ///
     /// # Errors
     ///
@@ -1063,10 +1064,12 @@ impl Store {
         let retry_at = later(now, notice_backoff(claim));
         let result = sqlx::query(
             "UPDATE cloud_handoffs SET notice_next_attempt_at = ? \
-             WHERE id = ? AND notice_attempts = ? AND state = 'unknown' AND notified_at IS NULL",
+             WHERE id = ? AND notice_attempts = ? AND ? > 0 \
+             AND state = 'unknown' AND notified_at IS NULL",
         )
         .bind(to_unix(retry_at))
         .bind(id.to_string())
+        .bind(i64::from(claim))
         .bind(i64::from(claim))
         .execute(&self.pool)
         .await?;

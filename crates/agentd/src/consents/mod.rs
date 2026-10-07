@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use core_types::{ConsentId, MemberKey, PrivateRequest, SessionId, Side, VolumeKey};
+use core_types::{ConsentId, MemberKey, PrivateRequest, SessionId, Side, SurfaceError, VolumeKey};
 use store::{
     AgentState, Consent, ConsentState, CtlToken, CtlTurn, NewConsent, OpenLimits, Store, StoreError,
 };
@@ -521,8 +521,10 @@ impl Consents {
     }
 
     /// Updates each decided or expired consent's card with its outcome,
-    /// through `replies`, once: a card that can't be updated stays as it
-    /// is, and its buttons answer that the task was settled.
+    /// through `replies`. An update that fails on the way (a rate limit or
+    /// a transport error) releases its claim, so a later pass tries again;
+    /// a card the platform refuses to update stays as it is, and its
+    /// buttons answer that the task was settled.
     ///
     /// # Errors
     ///
@@ -534,8 +536,9 @@ impl Consents {
             let Some(posted) = consent.card.clone() else {
                 continue;
             };
+            let claimed_at = Self::now();
             if !store
-                .claim_consent_card_close(consent.id, Self::now())
+                .claim_consent_card_close(consent.id, claimed_at)
                 .await?
             {
                 continue;
@@ -557,6 +560,16 @@ impl Consents {
             .closed();
             match replies.update_rich(&posted, &card).await {
                 Ok(()) => closed += 1,
+                Err(
+                    err @ ReplyError::Surface(
+                        SurfaceError::RateLimited { .. } | SurfaceError::Transport(_),
+                    ),
+                ) => {
+                    tracing::warn!(consent = %consent.id, error = %err, "couldn't update a consent card with its outcome; it will be tried again");
+                    store
+                        .release_consent_card_close(consent.id, claimed_at)
+                        .await?;
+                }
                 Err(err) => {
                     tracing::warn!(consent = %consent.id, error = %err, "couldn't update a consent card with its outcome");
                 }

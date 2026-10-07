@@ -779,7 +779,8 @@ impl SlackAgents {
     }
 
     /// Sends the reminder `due`, if its owner is reachable here; true if it
-    /// was sent.
+    /// was sent. The attempt is claimed first, so an owner who is not
+    /// reachable here uses up attempts like a failed send does.
     async fn remind(
         &self,
         due: &store::InstallReminder,
@@ -787,10 +788,6 @@ impl SlackAgents {
         now: &impl Fn() -> OffsetDateTime,
     ) -> Result<bool, StoreError> {
         let store = &self.inner.store;
-        let Some(owner) = self.identity_here(due.owner).await? else {
-            tracing::debug!(binding = %due.binding, "an install reminder's owner has no identity here");
-            return Ok(false);
-        };
         let state = store.install_state(due.binding)?;
         let scopes: Vec<&str> = due.scopes.split(',').collect();
         let link = install_url(&due.client_id, &scopes, &due.redirect_url, &state);
@@ -805,6 +802,10 @@ impl SlackAgents {
             )
             .await?
         else {
+            return Ok(false);
+        };
+        let Some(owner) = self.identity_here(due.owner).await? else {
+            tracing::debug!(binding = %due.binding, attempt, "an install reminder's owner has no identity here");
             return Ok(false);
         };
         let name = &due.agent_name;
