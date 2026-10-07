@@ -822,6 +822,21 @@ fn misspelt_secret_bearing_commands_are_still_secret_bearing() {
 }
 
 #[test]
+fn a_pasted_login_code_is_secret_bearing_under_any_verb() {
+    for text in [
+        "logn abc123#state",
+        "lgoin abc123#state-xyz",
+        "frobnicate x_Y-1#Z_2",
+        "pause helper abc#def.",
+        "persona Bad-Name (abc123#state)",
+    ] {
+        let err = fail(text);
+        assert!(err.is_secret_bearing(), "{text:?}");
+        assert!(!err.to_string().contains("abc123#state"), "{text:?}");
+    }
+}
+
+#[test]
 fn errors_holding_a_known_token_prefix_are_secret_bearing() {
     for text in [
         "sk-ant-api03-SECRET",
@@ -850,6 +865,11 @@ fn errors_without_a_secret_are_not_secret_bearing() {
         "help admin",
         "frobnicate",
         "logn abc123",
+        "logn #general",
+        "logn abc#",
+        "logn a#b#c",
+        "skill add Bad-Name https://x.io/r#main",
+        "allow Bad-Name <#C123|general>",
         "logout now",
         "pause Bad",
         "api-key",

@@ -62,6 +62,9 @@ pub use names::{AgentName, RoomRef, SkillName, Target, UserRef};
 pub use parse::parse;
 
 /// A parsed `/agent` command. Handlers live in agentd.
+///
+/// Handlers log only [`name`](Self::name). `Debug` redacts the secrets but
+/// prints free text, such as a persona or a ban reason, as written.
 #[derive(Debug, Clone)]
 pub enum Command {
     /// `login [code]`: start linking a Claude account, or finish with the
@@ -369,8 +372,9 @@ impl ParseError {
     /// secret-bearing command with extra or missing words, or with a
     /// misspelt or missing command word such as `api-key set <key>` without
     /// `admin`. It is also the case when any word holds a known token prefix
-    /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`), and for
-    /// unknown commands and help requests too.
+    /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`) or has the
+    /// shape of a pasted login code, `<code>#<state>` (`logn abc123#state`),
+    /// and for unknown commands and help requests too.
     ///
     /// The secret may still be in the text, so callers apply the same
     /// channel rules as for [`Command::is_secret_bearing`]. The heuristic
