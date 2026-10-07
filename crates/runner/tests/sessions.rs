@@ -49,6 +49,7 @@ struct Faults {
     fail_turn_finished: AtomicBool,
     panic_turn_starting: AtomicBool,
     panic_turn_finished: AtomicBool,
+    hold_turn_finished_until_revoked: AtomicBool,
     panic_process_starting: AtomicBool,
     panic_process_stopping: AtomicBool,
     fail_process_stopping: AtomicBool,
@@ -124,6 +125,15 @@ impl TurnHooks for Hooks {
         process: &u32,
         turn: &TurnRequest,
     ) -> Result<TurnId, HookError> {
+        if Faults::take(&self.faults.hold_turn_finished_until_revoked) {
+            let revoked = Event::ProcessStopping(session.id, *process);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !self.log.lock().unwrap().contains(&revoked)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
         push(
             &self.log,
             Event::TurnFinished(session.id, *process, turn.turn),
@@ -853,6 +863,40 @@ async fn a_killed_container_has_its_process_stopped_at_once() {
         .filter(|event| matches!(event, Event::ProcessStopping(_, 1)))
         .count();
     assert!(stops >= 1);
+}
+
+#[tokio::test]
+async fn a_container_killed_mid_turn_has_its_process_revoked_before_the_turn_ends() {
+    let h = Harness::new(&[
+        Turn::reply("late").with_delay(Duration::from_secs(30)),
+        Turn::reply("two"),
+    ])
+    .await;
+    let session = h.thread_session("1.1").await;
+    h.faults
+        .hold_turn_finished_until_revoked
+        .store(true, Ordering::SeqCst);
+    let first = request("1");
+    let kill = async {
+        eventually("the CLI is in the turn", || h.transcript(&session) == ["1"]).await;
+        let container = h.sandbox.inner.list_managed().await.unwrap()[0].id.clone();
+        h.sandbox.inner.stop(&container).await.unwrap();
+    };
+    let (report, ()) = tokio::join!(h.manager.run_turn(session.id, first.clone()), kill);
+    let report = report.unwrap();
+    assert!(
+        matches!(report.outcome, TurnOutcome::Crashed { .. }),
+        "{report:?}"
+    );
+    let events = h.events();
+    assert!(
+        position(&events, &Event::ProcessStopping(session.id, 1))
+            < position(&events, &Event::TurnFinished(session.id, 1, first.turn)),
+        "revoked only after the turn ended: {events:?}"
+    );
+    let next = h.run(session.id, request("2")).await;
+    assert_eq!(reply(&next), "two");
+    assert_eq!(next.process_start, Some(SessionStart::Resume));
 }
 
 #[tokio::test]

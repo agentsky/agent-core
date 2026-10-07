@@ -4746,6 +4746,12 @@ touches a new one. `turn_finished` returns `Self::Finished`, which
 turn's `Outbox` there. `SessionManager` is generic over its hooks rather
 than holding a `dyn TurnHooks`.
 
+A death revokes the process at once even while a turn runs in it:
+`a_container_killed_mid_turn_has_its_process_revoked_before_the_turn_ends`
+kills the container under a running turn and holds that turn's
+`turn_finished` until `process_stopping` has run, so the test fails if the
+revocation waits for the turn.
+
 ### A turn cut off before its outcome was recorded
 
 **Issue.** A session is marked started after a turn whose `init_seen` is
