@@ -2641,6 +2641,7 @@ dependencies = [
  "futures",
  "hmac",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "serde_urlencoded",
