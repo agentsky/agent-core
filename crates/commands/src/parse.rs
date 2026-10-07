@@ -397,7 +397,7 @@ enum Cmd {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum CloudCmd {
     Add {
         #[arg(value_name = "routine", value_parser = parse_routine_label)]

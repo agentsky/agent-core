@@ -805,14 +805,16 @@ fn cloud_add_is_secret_bearing() {
 }
 
 #[test]
-fn cloud_add_debug_redacts_the_token() {
+fn cloud_debug_names_the_command_and_holds_no_token_or_task() {
     let command = ok(&format!("cloud add r {FIRE} sk-ant-oat01-SECRET"));
     let debug = format!("{command:?} {command:#?}");
+    assert!(debug.contains(command.name()), "{debug}");
     assert!(!debug.contains("SECRET"), "{debug}");
     assert!(!debug.contains("sk-ant"), "{debug}");
-    assert!(debug.contains("REDACTED"), "{debug}");
     let command = ok("cloud run r TASK-TEXT");
-    assert!(!format!("{command:?} {command:#?}").contains("TASK-TEXT"));
+    let debug = format!("{command:?} {command:#?}");
+    assert!(debug.contains(command.name()), "{debug}");
+    assert!(!debug.contains("TASK-TEXT"), "{debug}");
 }
 
 #[test]
