@@ -3453,7 +3453,12 @@ whether routine ids are case-insensitive (if so,
 normalize them, since `trig_AB` and `trig_ab` would register one routine
 under two labels; a token's associated data holds the stored routine id, so
 normalize when parsing new ones, and re-seal stored rows in Rust with the
-master key, never with a SQL `UPDATE`). Update the design's
+master key, never with a SQL `UPDATE`). Also check that a connect timeout
+is classed `rejected`: with `[cloud] connect_timeout_secs` below
+`timeout_secs`, point `base_url` at an address that drops the connection
+attempt, and see that reqwest reports a connect error (`is_connect`), so
+the reply says nothing was started, rather than a timeout, which would be
+`unknown`; T35b's rule rests on a local probe of this. Update the design's
 [Verified and assumed](design.md#verified-and-assumed) and failure table
 with the result and date. That completes design milestone 6.
 
