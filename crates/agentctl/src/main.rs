@@ -30,14 +30,14 @@ pub const DEFAULT_LOCK_TIMEOUT_SECS: u64 = 100;
 
 /// Calls back into agentd from inside the sandbox. Every command works only
 /// during a turn.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "agentctl", version, about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Command {
     /// Stage a file to upload with this turn's reply.
     Attach {
@@ -76,7 +76,8 @@ enum Command {
     /// Run a command while holding this scope's `shared/` lock, for writes
     /// to `shared/`. Waits while another command holds it.
     Lock {
-        /// Give up after waiting this many seconds for the lock.
+        /// Give up after waiting this many seconds for the lock, at most a
+        /// day.
         #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_LOCK_TIMEOUT_SECS)]
         timeout: u64,
         /// The command and its arguments, after `--`. It is run directly,
@@ -215,7 +216,9 @@ mod tests {
 
     #[test]
     fn prints_version() {
-        let err = Cli::try_parse_from(["agentctl", "--version"]).unwrap_err();
+        let Err(err) = Cli::try_parse_from(["agentctl", "--version"]) else {
+            panic!("--version parsed as a command");
+        };
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
     }
 
@@ -226,14 +229,14 @@ mod tests {
                 assert_eq!(to, "here");
                 assert_eq!(text.join(" "), "hello - world");
             }
-            other => panic!("{other:?}"),
+            _ => panic!("parsed as another command"),
         }
         match parse(&["private", "--file", "a", "--file", "b", "do", "it"]).unwrap() {
             Command::Private { files, task } => {
                 assert_eq!(files, ["a", "b"]);
                 assert_eq!(task, ["do", "it"]);
             }
-            other => panic!("{other:?}"),
+            _ => panic!("parsed as another command"),
         }
         assert!(parse(&["post", "--to", "here"]).is_err());
         assert!(parse(&["ask-agent", "reviewer"]).is_err());
@@ -246,11 +249,11 @@ mod tests {
                 assert_eq!(timeout, DEFAULT_LOCK_TIMEOUT_SECS);
                 assert_eq!(command, ["git", "commit", "-m", "x"]);
             }
-            other => panic!("{other:?}"),
+            _ => panic!("parsed as another command"),
         }
         match parse(&["lock", "--timeout", "5", "--", "true"]).unwrap() {
             Command::Lock { timeout, .. } => assert_eq!(timeout, 5),
-            other => panic!("{other:?}"),
+            _ => panic!("parsed as another command"),
         }
         assert!(parse(&["lock"]).is_err());
         assert!(parse(&["lock", "git"]).is_err());

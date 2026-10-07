@@ -1,6 +1,7 @@
 //! [`Supervisor`]: one realtime connection per active binding.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -120,12 +121,9 @@ impl Connections {
         {
             tracing::error!(%binding, "an agent's Rocket.Chat connection panicked");
         }
-        let Some(running) = self
-            .running
-            .remove(&binding)
-            .filter(|r| r.generation == generation)
-        else {
-            return;
+        let running = match self.running.entry(binding) {
+            Entry::Occupied(entry) if entry.get().generation == generation => entry.remove(),
+            _ => return,
         };
         let ran = running.started.elapsed();
         let failing = self.failing.entry(binding).or_insert(Failing {
@@ -300,3 +298,6 @@ impl Supervisor {
         Some((task.id(), stop))
     }
 }
+
+#[cfg(test)]
+mod tests;

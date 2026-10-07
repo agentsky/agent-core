@@ -411,6 +411,51 @@ async fn a_login_code_in_a_channel_is_refused_and_invalidates_the_pending_login(
 }
 
 #[tokio::test]
+async fn a_public_login_code_says_it_cancelled_a_login_only_when_one_was_pending() {
+    let h = harness().await;
+    h.channel("alice", &format!("login {CODE}#no-such-state"))
+        .await;
+    let reply = h.last_reply("alice");
+    assert!(reply.contains("so I didn't use it."), "{reply}");
+    assert!(!reply.contains("cancelled"), "{reply}");
+
+    h.dm("bob", "login").await;
+    let state = state_of(&h.last_reply("bob"));
+    h.channel("bob", &format!("login {CODE}#{state}")).await;
+    assert!(h.last_reply("bob").contains("cancelled your pending login"));
+    h.channel("bob", &format!("login {CODE}#{state}")).await;
+    let reply = h.last_reply("bob");
+    assert!(reply.contains("so I didn't use it."), "{reply}");
+    assert!(!reply.contains("cancelled"), "{reply}");
+}
+
+#[tokio::test]
+async fn a_public_secret_is_still_reported_when_the_store_fails() {
+    let h = harness().await;
+    h.dm("alice", "login").await;
+    let state = state_of(&h.last_reply("alice"));
+    h.store.close().await;
+
+    h.channel("alice", &format!("login {CODE}#{state}")).await;
+    let reply = h.last_reply("alice");
+    assert!(
+        reply.starts_with("You posted a secret in a room others can read."),
+        "{reply}"
+    );
+    assert!(reply.contains("so I didn't use it."), "{reply}");
+    assert!(!reply.contains("cancelled"), "{reply}");
+
+    h.channel("alice", &format!("logn {CODE}#{state}")).await;
+    let reply = h.last_reply("alice");
+    assert!(
+        reply.starts_with("Your message looked like it held a secret"),
+        "{reply}"
+    );
+    assert!(!reply.contains("cancelled"), "{reply}");
+    assert_eq!(h.oauth_requests().await, 0);
+}
+
+#[tokio::test]
 async fn a_login_code_posted_publicly_by_someone_else_cancels_the_login_it_names() {
     let h = harness().await;
     h.dm("alice", "login").await;
@@ -1345,6 +1390,27 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         "`helper` has no skill `gh` waiting for you to confirm its hosts."
     );
 
+    let attached = InFile {
+        id: "F1".into(),
+        name: "SKILL.md".into(),
+        mime_type: None,
+        size: Some(10),
+        url: "https://chat.example/file-upload/F1/SKILL.md".into(),
+    };
+    commands
+        .handle_text(
+            &key("alice"),
+            "skill add helper https://git.test/notes.git",
+            &dm("alice"),
+            &[attached],
+        )
+        .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Added the skill `notes` to `helper`. Its conversations use it from their next start.\n\
+         You gave a Git URL, so I ignored the attached file."
+    );
+
     run("alice", "skill rm helper agentctl", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
@@ -1368,6 +1434,20 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     assert_eq!(
         h.last_reply("alice"),
         "`helper` has no skill `notes`, and no skills besides `agentctl`."
+    );
+
+    run(
+        "alice",
+        "skill add helper https://git.test/gh.git",
+        dm("alice"),
+    )
+    .await;
+    assert!(h.last_reply("alice").starts_with("The skill `gh` asks"));
+    run("alice", "skill rm helper gh", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Removed the skill `gh` from `helper`. It was still waiting for you to confirm its \
+         hosts, so its sandboxes never got to reach them."
     );
 
     run(

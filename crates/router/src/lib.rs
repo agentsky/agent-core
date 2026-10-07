@@ -39,7 +39,8 @@
 //! 6. **Paused**: [`RefuseReason::Paused`].
 //! 7. **Banned requester**: [`RefuseReason::Banned`]. For a hop that is the
 //!    inherited requester, so a ban can't be sidestepped through an agent.
-//!    If the view can't say: [`RefuseReason::PolicyUnavailable`].
+//!    If the view can't say which member the requester is, or whether they
+//!    are banned: [`RefuseReason::PolicyUnavailable`].
 //! 8. **Allow and deny rules**, for anyone but the owner:
 //!    [`RefuseReason::Denied`]. If the view has no policy for the agent:
 //!    [`RefuseReason::PolicyUnavailable`], for the owner too, since the
@@ -109,7 +110,7 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
         return Decision::Ignore(IgnoreReason::NotThisAgentsDm);
     }
 
-    let (requester, hop) = match sender {
+    let (key, member, hop) = match sender {
         Sender::Person => {
             let mentions = mentions(event, agent, view);
             let addressed = mentions == Mentions::ThisAgent
@@ -121,11 +122,11 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
             if !addressed {
                 return Decision::Ignore(IgnoreReason::NotAddressed);
             }
-            let requester = Requester {
-                member: view.member_for(&event.sender),
-                key: event.sender.clone(),
-            };
-            (requester, Some(Hop::ZERO))
+            (
+                event.sender.clone(),
+                view.member_for(&event.sender),
+                Some(Hop::ZERO),
+            )
         }
         Sender::Agent(posted_by) => {
             if mentions(event, agent, view) != Mentions::ThisAgent {
@@ -138,14 +139,18 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
                 return Decision::Ignore(IgnoreReason::UnattributedManagedBot);
             };
             let Requester { member, key } = attribution.requester;
-            let member = member.or_else(|| view.member_for(&key));
-            (Requester { member, key }, attribution.hop.next())
+            let member = member.map(Some).or_else(|| view.member_for(&key));
+            (key, member, attribution.hop.next())
         }
     };
 
     if state == AgentState::Paused {
         return Decision::Refuse(RefuseReason::Paused);
     }
+    let Some(member) = member else {
+        return Decision::Refuse(RefuseReason::PolicyUnavailable);
+    };
+    let requester = Requester { member, key };
     match view.is_banned(&requester) {
         Some(false) => {}
         Some(true) => return Decision::Refuse(RefuseReason::Banned),

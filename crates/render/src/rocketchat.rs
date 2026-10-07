@@ -37,8 +37,10 @@ pub const DEFAULT_MESSAGE_LIMIT: Limit = Limit {
 ///   `all` or `here` is a broadcast, wherever it is and whatever follows.
 ///   So `@allé` and `` `@here` `` are neutralized too, and so is a run
 ///   that only adds trailing `.`, `_` or `-` (`@here.`), while `@allison`
-///   and `@all.hands` are not. Broadcasts are never offered to the
-///   directory.
+///   and `@all.hands` are not. An `@` right after `/` is left alone,
+///   because the server only reads a mention after the start of a line,
+///   whitespace or `>`, so `https://x.io/@all` stays a working link.
+///   Broadcasts are never offered to the directory.
 /// - Outside code spans, code blocks, link destinations and URLs, `@Name`
 ///   becomes `@username` when `directory` resolves it, and stays text
 ///   otherwise. On Rocket.Chat the directory returns usernames. A username
@@ -107,13 +109,14 @@ fn rewrite(text: &str, directory: &dyn MentionDirectory, out: &mut String) {
     }
 }
 
-/// Inserts a zero-width space after every `@` that starts a broadcast in
-/// the server's grammar.
+/// Inserts a zero-width space after every `@` that could start a broadcast
+/// in the server's grammar, `(^|\s|>)@`. An `@` after `/` can't, so URLs
+/// such as `https://x.io/@all` keep working.
 fn neutralize_broadcasts(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut at = 0;
     for (i, _) in text.match_indices('@') {
-        if broadcast_end(text, i).is_some() {
+        if !text[..i].ends_with('/') && broadcast_end(text, i).is_some() {
             out.push_str(&text[at..=i]);
             out.push(ZERO_WIDTH_SPACE);
             at = i + 1;
@@ -141,7 +144,7 @@ fn is_broadcast(name: &str) -> bool {
 }
 
 /// The characters of a name in the server's mention pattern: its default
-/// `UTF8_Names_Validation` setting, `[0-9a-zA-Z-_.]+`.
+/// `UTF8_User_Names_Validation` setting, `[0-9a-zA-Z-_.]+`.
 fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
 }
@@ -240,9 +243,14 @@ mod tests {
                 "    @\u{200B}here indented",
             ),
             (
-                "link destination",
+                "link destination after a slash",
                 "[x](https://x.io/@all)",
-                "[x](https://x.io/@\u{200B}all)",
+                "[x](https://x.io/@all)",
+            ),
+            (
+                "link destination after another character",
+                "[x](https://x.io/~@all)",
+                "[x](https://x.io/~@\u{200B}all)",
             ),
             (
                 "link title across lines",
@@ -250,14 +258,19 @@ mod tests {
                 "[x](https://a.io '\n@\u{200B}all')",
             ),
             (
-                "autolink",
+                "autolink after a slash",
                 "<https://x.io/@here>",
-                "<https://x.io/@\u{200B}here>",
+                "<https://x.io/@here>",
             ),
             (
-                "bare URL",
+                "bare URL after a slash",
                 "https://x.io/@all ok",
-                "https://x.io/@\u{200B}all ok",
+                "https://x.io/@all ok",
+            ),
+            (
+                "a slash only shields the @ right after it",
+                "https://x.io/@all @all\n@here >@all /x @here",
+                "https://x.io/@all @\u{200B}all\n@\u{200B}here >@\u{200B}all /x @\u{200B}here",
             ),
             (
                 "inline HTML",
@@ -347,6 +360,11 @@ mod tests {
         "text\n[x](y)@all",
         "[x](y)\n@here",
         "@all\u{2028}@here",
+        "https://x.io/@all",
+        "[x](https://x.io/@all)",
+        "<https://x.io/@here>",
+        "[a](/@all)",
+        "/[a](b)@all",
     ];
 
     #[test]
@@ -410,6 +428,7 @@ mod tests {
             "\u{200B}",
             "é",
             "https://x.io/",
+            "/",
             "<",
             ">",
             "'",

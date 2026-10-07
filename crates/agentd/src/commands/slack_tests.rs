@@ -1057,6 +1057,90 @@ fn a_manager_dm_is_parsed_whole_or_after_a_prefix() {
     assert_eq!(text, "me");
 }
 
+async fn slack_agent(h: &SlackHarness, owner: MemberId) -> store::Agent {
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    agent
+}
+
+#[tokio::test]
+async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let agent = slack_agent(&h, alice).await;
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F9/download/persona.md"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {BOT_TOKEN}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("Via the DM.\n"))
+        .mount(&h.slack)
+        .await;
+    let file = |size: u64| core_types::InFile {
+        id: "F9".into(),
+        name: "persona.md".into(),
+        mime_type: None,
+        size: Some(size),
+        url: format!(
+            "{}/files-pri/T0TEAM001-F9/download/persona.md",
+            h.slack.uri()
+        ),
+    };
+    let running = Running::start(&h);
+    let mut too_big = dm_event("U0HUMAN01", "persona helper");
+    too_big.files = vec![file(64 * 1024 + 1)];
+    running.send(SlackInbound::Message(Box::new(too_big))).await;
+    let mut event = dm_event("U0HUMAN01", "persona helper");
+    event.files = vec![file(12)];
+    running.send(SlackInbound::Message(Box::new(event))).await;
+    running.stop().await;
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "Via the DM.\n");
+    let posts: Vec<String> = h.posts().await.into_iter().map(|(_, text)| text).collect();
+    assert_eq!(posts.len(), 2, "{posts:?}");
+    assert_eq!(posts[0], "That file is over the 64 KB limit.");
+    assert!(
+        posts[1].starts_with("Replaced `helper`'s persona."),
+        "{posts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_persona_sent_in_a_manager_dm_arrives_decoded() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let agent = slack_agent(&h, alice).await;
+    let running = Running::start(&h);
+    running
+        .send(SlackInbound::Message(Box::new(dm_event(
+            "U0HUMAN01",
+            "persona helper You &amp; me &lt;3",
+        ))))
+        .await;
+    running.stop().await;
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "You & me <3");
+}
+
 #[test]
 fn only_a_deleted_user_in_a_user_change_has_left() {
     let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
@@ -1529,65 +1613,6 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
         reply.starts_with("Give the skill's https:// Git URL"),
         "a slash command carries no files: {reply}"
     );
-}
-
-#[tokio::test]
-async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
-    let h = slack_harness().await;
-    let alice = h.linked("U0HUMAN01").await;
-    let team = TeamId::new(TEAM);
-    let store::AgentCreation::Created(agent, _) = h
-        .store
-        .create_agent(
-            &store::NewAgent {
-                owner: alice,
-                name: "helper",
-                persona: "p",
-                visibility: store::Visibility::Public,
-                surface: SurfaceKind::Slack,
-                team: &team,
-            },
-            10,
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("created");
-    };
-    Mock::given(method("GET"))
-        .and(path("/files-pri/T0TEAM001-F9/download/persona.md"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("Via the DM.\n"))
-        .mount(&h.slack)
-        .await;
-    let (intake, submitter) = CommandIntake::new(h.commands.clone());
-    let inbound = Sender::new(Inbound::new(h.store.clone(), Some(identity()), submitter));
-    let running = tokio::spawn(intake.run());
-    let mut event = dm_event("U0HUMAN01", "persona helper");
-    event.files = vec![core_types::InFile {
-        id: "F9".into(),
-        name: "persona.md".into(),
-        mime_type: None,
-        size: Some(12),
-        url: format!(
-            "{}/files-pri/T0TEAM001-F9/download/persona.md",
-            h.slack.uri()
-        ),
-    }];
-    inbound
-        .send(SlackInbound::Message(
-            Box::new(event),
-            InFlight::untracked(),
-        ))
-        .await
-        .unwrap();
-    drop(inbound);
-    tokio::time::timeout(Duration::from_secs(10), running)
-        .await
-        .unwrap()
-        .unwrap();
-    let row = h.store.agent(agent.id).await.unwrap().unwrap();
-    assert_eq!(row.persona, "Via the DM.\n");
 }
 
 #[tokio::test]

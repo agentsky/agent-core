@@ -449,6 +449,28 @@ async fn docker_exec_pipes_stdio_and_kill_stops_the_process() {
 
 #[tokio::test]
 #[ignore = "needs docker"]
+async fn docker_kill_then_wait_returns_with_stdout_unread() {
+    let fx = Fixture::new().await;
+    let volume = fx.volume(AgentId::new_v4(), channel()).await;
+    let container = fx.start(&fx.spec(&volume)).await;
+    let argv = ["sh", "-c", "head -c 1000000 /dev/zero; sleep 600"].map(String::from);
+    let mut io = fx
+        .sandbox
+        .exec(&container, &argv, &BTreeMap::new())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    io.child.kill().await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(20), io.child.wait())
+        .await
+        .expect("wait hung on the unread stdout")
+        .unwrap();
+    assert_eq!(status.code, Some(137));
+    drop(io.stdout);
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
 async fn docker_reap_orphans_stops_only_this_instances_containers() {
     let fx = Fixture::new().await;
     let other = Fixture::new_on(Network::Shared(&fx.network)).await;
