@@ -27,12 +27,15 @@ compiler (and `cmake` on some targets), which the GitHub Ubuntu runners have.
 Consequences:
 
 - The workspace declares reqwest with `default-features = false` and only
-  `json`. Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
+  `json`, `form` and `query` (reqwest 0.13 made `form` and `query` opt-in
+  features). Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
   plain HTTP to `agentctl.internal` and doesn't, so its static musl build
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception.
+  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
+  use that license; see
+  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -165,7 +168,10 @@ concurrency group of their own: in `main`'s group, where
 `cancel-in-progress` is false, a scheduled run arriving while a push run is
 pending would cancel that pending run, and its badges would not be
 published. GitHub runs schedules on the default branch only, so the trigger
-takes effect once this workflow is on `main`.
+takes effect once this workflow is on `main`. GitHub also disables
+`schedule` triggers in a public repository after 60 days without repository
+activity, so on a quiet repository the weekly advisory run can stop and has
+to be re-enabled from the Actions tab.
 
 ## T03: core-types
 
@@ -565,6 +571,17 @@ if the OS generator fails.
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
 
+### The `members` table lists the surfaces
+
+**Issue.** The foundation migration declares `members.surface` with
+`CHECK (surface IN ('slack', 'rocketchat'))`, which couples `SurfaceKind` in
+core-types to the schema.
+
+**Solution.** Kept, so the store refuses a surface it has never heard of.
+A task that adds a `SurfaceKind` variant must also add a migration that
+relaxes the constraint; until it does, `ensure_member` fails at runtime for
+the new surface.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
@@ -627,6 +644,21 @@ Slack's `*` right back next to the URL.
 trailing punctuation and unmatched closing brackets left outside, as qm-core's
 `trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
 still left to Slack. The T06 bullet in the plan now says so.
+
+### Emphasis inside a bare URL cut the link
+
+**Issue.** CommonMark reads `_…_`, `__…__`, `*…*` and `~~…~~` inside a URL's
+path as emphasis, so pulldown-cmark splits the URL's text around it, and a
+scan of one text node linked only the part before:
+`see https://docs.python.org/3/library/__main__.html` became
+`see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
+kept such URLs whole.
+
+**Solution.** While parsing, the renderer measures each bare URL in the source
+from where a text node starts it. Emphasis or strikethrough with a delimiter
+inside such a range is replaced by its children, with its delimiters as
+text, so the URL is one text run again and is linked whole. Markup that only
+wraps a URL, as in `*https://x.io/#/y*`, is not touched.
 
 ### CommonMark disagrees with some qm-core regex cases
 
@@ -896,19 +928,24 @@ directory entry resolving to `allé` all broadcast.
 **Solution.** After rendering, `to_markdown` makes one last pass over the
 whole output, code and link targets included, with the server's grammar: it
 inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
-`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
-precedes the `@`. The server reads no name after the zero-width space. A
-URL or a code sample containing `/@all` or `@here` gets the zero-width space
-too; that is the price of the server not knowing about code. `@allison` and
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, unless a `/`
+precedes the `@`. The server reads no name after the zero-width space, and
+it never reads one after `/`, which is not in `(^|\s|>)`; link removal can't
+put anything else before such an `@` either, since a removed link ends in
+`)`. So `https://x.io/@all` stays a working link, while a code sample
+containing ` @here` still gets the zero-width space, because the server
+doesn't know about code. `split` never cuts just before an `@` that follows
+anything but whitespace or `>`, even when a construct longer than a chunk
+forces a cut, so a chunk can't start with the `@all` of such a URL. `@allison` and
 `@all.hands` stay untouched. The pass is the only place that inserts the
 space; name resolution just skips broadcasts so they are never offered to
 the directory. Usernames from the directory must match the server's ASCII
 class. The tests port the server's regex (`rocketchat::server`, checked
 against the JavaScript regex under Node on 30,000 generated strings while
 writing it) and assert that no output, and no chunk `split` makes from it,
-yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
-pattern; a server configured with a narrower name pattern could read `@all`
-out of `@all.hands`.
+yields `all` or `here`. The rule assumes the default
+`UTF8_User_Names_Validation` pattern; a server configured with a narrower
+name pattern could read `@all` out of `@all.hands`.
 
 ### A cut can create or shorten a mention
 
@@ -922,9 +959,12 @@ cut inside an oversized construct could shorten `@herectic` to `@here`.
 whatever precedes the `@`, and never cuts right before an `@` that follows
 anything but whitespace or `>`. When a single construct is longer than the
 chunk and a cut has to fall inside it, the cut still avoids the inside of a
-name: it falls right after the `@` instead, so neither chunk holds a
-shortened name. Together with the final pass above, every `@` run in a chunk
-is a run of the rendered text, and those are already neutralized.
+name and the position just before an `@` that follows anything but
+whitespace or `>`: it falls right after the `@` instead, so neither chunk
+holds a shortened name or starts with a new one. Together with the final
+pass above, every `@` run in a chunk is a run of the rendered text, and
+those are already neutralized or follow a `/`, where the server reads no
+mention.
 
 ### Grapheme clusters need a mark table
 
