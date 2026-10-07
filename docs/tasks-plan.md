@@ -2662,8 +2662,12 @@ Deliverables:
     `message.mpim` (T28 explains why not `app_mention`).
   - Scopes: `chat:write`, `chat:write.public` (off by
     default, a configuration switch), `channels:history`, `groups:history`,
-    `im:history`, `mpim:history`, `im:write`, `reactions:write`,
-    `files:read`, `files:write`, `users:read`, `channels:join`.
+    `im:history`, `mpim:history`, `channels:read`, `groups:read`,
+    `im:read`, `mpim:read`, `im:write`, `reactions:write`,
+    `files:read`, `files:write`, `users:read`, `channels:join`. The four
+    `:read` conversation scopes are for `conversations.info`, which the
+    confirm step calls to learn a message's conversation kind before acting
+    on it (see the notes below).
   - Events and interactivity URLs under `/slack/b/{binding}/…`.
   - `redirect_urls` set to `{public_url}/slack/oauth/callback`.
 - On `/agent create <name>` on Slack:
