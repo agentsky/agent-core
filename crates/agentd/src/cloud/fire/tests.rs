@@ -4,8 +4,8 @@ use core_types::{CloudRoutineId, MemberKey, RoutineToken, SurfaceKind, TeamId, U
 use secrecy::SecretString;
 use serde_json::json;
 use store::{
-    CloudBegun, CloudFinished, CloudHandoffState, CloudOrigin, NewCloudHandoff, NewCloudRoutine,
-    Sealer, Store,
+    CloudBegun, CloudFinished, CloudHandoffState, CloudOrigin, CloudRoutineVersion,
+    NewCloudHandoff, NewCloudRoutine, Sealer, Store,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -59,6 +59,7 @@ fn routine(base: &str) -> CloudRoutineToken {
         routine_id: ROUTINE.parse().unwrap(),
         url_origin: Url::parse(base).unwrap().origin().ascii_serialization(),
         token: RoutineToken::parse(SecretString::from(TOKEN)).unwrap(),
+        version: CloudRoutineVersion::default(),
     }
 }
 
@@ -936,12 +937,18 @@ async fn every_outcome_is_recorded_as_it_is() {
         )
         .await
         .unwrap();
+    let registered = store
+        .cloud_routine(member, "agent-core")
+        .await
+        .unwrap()
+        .unwrap();
     for outcome in &outcomes {
         let begun = store
             .begin_cloud_handoff(
                 &NewCloudHandoff {
                     member,
                     routine_label: "agent-core",
+                    registration: &registered.version,
                     routine_id: &routine_id,
                     requested_by: &key,
                     origin: CloudOrigin::RocketChatDm,

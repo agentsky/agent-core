@@ -106,6 +106,21 @@ pub struct CloudRoutine {
     pub added_at: OffsetDateTime,
 }
 
+/// Which registration of a routine [`Store::cloud_routine`] read: each
+/// `cloud add` stores a new one, a token replaced under the same label
+/// included. [`Store::begin_cloud_handoff`] records a hand-off only while
+/// it is still the one stored. `Debug` shows nothing of it.
+/// The default is no registration's: a hand-off naming it is never
+/// recorded.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct CloudRoutineVersion(Vec<u8>);
+
+impl fmt::Debug for CloudRoutineVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CloudRoutineVersion(..)")
+    }
+}
+
 /// A routine with its opened token, from [`Store::cloud_routine`], for the
 /// fire request. `Debug` redacts the token.
 #[derive(Debug, Clone)]
@@ -119,6 +134,8 @@ pub struct CloudRoutineToken {
     pub url_origin: String,
     /// The routine's API trigger token.
     pub token: RoutineToken,
+    /// Which registration this is, for [`NewCloudHandoff::registration`].
+    pub version: CloudRoutineVersion,
 }
 
 /// A routine to register, for [`Store::put_cloud_routine`]. `Debug`
@@ -165,7 +182,8 @@ pub enum CloudBegun {
     /// The hand-off is recorded as `sending`, as this row.
     Begun(CloudHandoffId),
     /// Nothing was recorded: the member has no routine under the label with
-    /// the routine id any more, since it was removed or replaced.
+    /// the routine id and the registration read any more, since it was
+    /// removed or replaced, its token alone included.
     RoutineGone,
     /// Nothing was recorded: the member asked for the cap's worth of
     /// hand-offs within [`CLOUD_HANDOFF_WINDOW`] already.
@@ -358,6 +376,9 @@ pub struct NewCloudHandoff<'a> {
     pub routine_label: &'a str,
     /// The routine's id.
     pub routine_id: &'a RoutineId,
+    /// The registration of the routine the fire request will use, as
+    /// [`Store::cloud_routine`] read it.
+    pub registration: &'a CloudRoutineVersion,
     /// The identity that typed the command.
     pub requested_by: &'a MemberKey,
     /// Where it was typed.
@@ -687,6 +708,7 @@ impl Store {
             id: parse_column(&id, ROUTINES, "id")?,
             routine_id: parse_column(&routine_id, ROUTINES, "routine_id")?,
             url_origin,
+            version: CloudRoutineVersion(sealed),
         }))
     }
 
@@ -757,7 +779,9 @@ impl Store {
     }
 
     /// Records `handoff`, asked at `now`, as `sending`, with its task sealed
-    /// to its row, unless the member's routine is gone or they asked for
+    /// to its row, unless the member's routine is gone or no longer the
+    /// registration `handoff` names (its token replaced since it was
+    /// read, under the same label and routine id), or they asked for
     /// `per_hour` hand-offs or more within [`CLOUD_HANDOFF_WINDOW`] before
     /// `now`. Write it before the request is sent. The checks and the write
     /// are one transaction, so a deletion of the member's routines either
@@ -779,11 +803,13 @@ impl Store {
         let task = self.seal(task_aad(&key), &SecretString::from(handoff.task))?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let routine: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM cloud_routines WHERE member_id = ? AND label = ? AND routine_id = ?",
+            "SELECT 1 FROM cloud_routines WHERE member_id = ? AND label = ? AND routine_id = ? \
+             AND token_enc = ?",
         )
         .bind(handoff.member.to_string())
         .bind(handoff.routine_label)
         .bind(handoff.routine_id.as_str())
+        .bind(handoff.registration.0.as_slice())
         .fetch_optional(&mut *tx)
         .await?;
         if routine.is_none() {

@@ -271,6 +271,7 @@ impl Commands {
                     member,
                     routine_label: label.as_str(),
                     routine_id: &routine.routine_id,
+                    registration: &routine.version,
                     requested_by: key,
                     origin: place,
                     task: &task,

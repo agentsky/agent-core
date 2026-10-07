@@ -165,13 +165,14 @@ async fn begin(
     if store.cloud_routine(member, LABEL).await.unwrap().is_none() {
         put_routine(store, member, "https://api.anthropic.com", by).await;
     }
-    let routine_id: RoutineId = ROUTINE.parse().unwrap();
+    let registered = store.cloud_routine(member, LABEL).await.unwrap().unwrap();
     let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member,
                 routine_label: LABEL,
-                routine_id: &routine_id,
+                routine_id: &registered.routine_id,
+                registration: &registered.version,
                 requested_by: by,
                 origin: CloudOrigin::RocketChatDm,
                 task: "Fix the flaky test",

@@ -9646,8 +9646,13 @@ and recording the answer then logged "had its outcome already", which
 wasn't so.
 
 **Solution.** The same transaction checks the member still holds a
-routine under the label with that routine id (`CloudBegun::RoutineGone`
-otherwise, answered "was removed or replaced while I was starting it").
+routine under the label with that routine id, and that it is still the
+registration `cloud_routine` read (`CloudBegun::RoutineGone` otherwise,
+answered "was removed or replaced while I was starting it"). The
+registration is the sealed token itself, which a fresh nonce makes
+different on every `cloud add`, so a token-only replacement in the same
+second, from another identity whose commands aren't ordered with this
+one, is caught too, and the revoked token is never fired.
 A deletion either comes first, and nothing is written or sent, or comes
 after and deletes the row with the rest; the request already out still
 runs, as the member asked for it. `finish_cloud_handoff` returns

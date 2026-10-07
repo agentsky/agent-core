@@ -78,8 +78,8 @@ pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink
 pub use cloud::{
     CLOUD_HANDOFF_WINDOW, CLOUD_NOTICE_GIVE_UP, CLOUD_NOTICE_LEASE, CloudBegun, CloudDeleted,
     CloudFinished, CloudHandoff, CloudHandoffState, CloudOrigin, CloudOutcome, CloudRoutine,
-    CloudRoutinePut, CloudRoutineToken, CloudUnknownReason, MAX_CLOUD_ROUTINES, NewCloudHandoff,
-    NewCloudRoutine, RecentCloudHandoff,
+    CloudRoutinePut, CloudRoutineToken, CloudRoutineVersion, CloudUnknownReason,
+    MAX_CLOUD_ROUTINES, NewCloudHandoff, NewCloudRoutine, RecentCloudHandoff,
 };
 pub use community::CommunityKeyStatus;
 pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
