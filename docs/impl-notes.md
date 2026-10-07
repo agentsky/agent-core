@@ -5449,11 +5449,14 @@ the clone timeout and three minutes, since in a blue-green deploy the old
 instance may still be cloning into a work directory. The 32-skill cap is
 checked inside `put_skill`'s transaction.
 
-`skill rm` refuses new connections to the skill's hosts at once, but the
-egress proxy has no hook to close one agent's tunnels to one host, and
-revoking the agent's sessions would restart its conversations. Tunnels
-already open end on their own, within the 5-minute idle timeout or the
-1-hour lifetime, and the reply says so.
+`skill rm` stops granting the skill's hosts at once, so new connections
+to them are refused unless the operator's allowlist or another active
+skill allows the same host (a session's allowlist is the union of those).
+The egress proxy has no hook to close one agent's tunnels to one host,
+and revoking the agent's sessions would restart its conversations, so
+tunnels already open end on their own, within the 5-minute idle timeout or
+the 1-hour lifetime, and the reply says so. It names hosts only when the
+skill had any.
 
 ### A clone reaches agentd's own network unless the host is checked
 
@@ -5585,8 +5588,13 @@ before every turn, next to the persona and with the same
 write-only-when-changed helper (`runner::write_if_changed`, which
 `write_persona` now uses), so an upgrade of agentd updates it. The runner
 sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
-directory exists as the container starts. A skill added, replaced or removed
-reaches a conversation when its process next starts, as a persona does.
+directory exists as the container starts. Sandboxes mount the agent's
+skills directory itself (the process backend links it), so a skill added,
+replaced or removed changes in running sandboxes at once: a removal's
+`remove_dir_all` takes the files away from a running conversation too.
+What a running Claude Code has already loaded is up to it, so the replies
+say only that a conversation already running may not see the change until
+its process next starts, unlike a persona, which is read at start.
 
 ### `skill add` reads its attachment like `persona`
 

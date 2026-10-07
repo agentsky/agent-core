@@ -590,10 +590,13 @@ and a `SKILL.md` with `name` and `description` front matter. A skill may
 declare `allowed-hosts:` in its front matter; it is held back until the
 owner confirms those hosts with `/agent skill confirm`, and they then extend
 the egress allowlist for that agent's sandboxes only, never to
-`api.anthropic.com` or private and metadata addresses. Skills reach a
-conversation when its process next starts; removing one refuses new
-connections to its hosts at once, and connections already open end within
-the egress proxy's idle and lifetime limits. Claude Code shows the model
+`api.anthropic.com` or private and metadata addresses. A skill's files
+change in the agent's sandboxes at once, running ones included, though a
+conversation already running may keep what it loaded until its process
+next starts. Removing one stops granting its hosts at once: new
+connections to them are refused unless the configuration or another skill
+allows the host, and connections already open end within the egress
+proxy's idle and lifetime limits. Claude Code shows the model
 its skills only when the `Skill` tool is enabled, so the launch flags
 enable it.
 

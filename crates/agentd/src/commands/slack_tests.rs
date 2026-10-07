@@ -1547,7 +1547,8 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
         .await;
     assert_eq!(
         reply,
-        "Added the skill `notes` to `helper`. Its conversations use it from their next start."
+        "Added the skill `notes` to `helper`. Its files are in its sandboxes now, though a \
+         conversation already running may not use it until it next starts."
     );
     let installed = runner::skills_dir(data.path(), agent.id).join("notes/SKILL.md");
     assert_eq!(std::fs::read_to_string(installed).unwrap(), skill);
