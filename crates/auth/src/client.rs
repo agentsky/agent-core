@@ -640,7 +640,7 @@ mod tests {
             .await;
         let url = Url::parse(&server.uri()).unwrap();
         let result = refresh(
-            &Client::new(),
+            &build_client(None).unwrap(),
             &url,
             &SecretString::from("r"),
             "client",
