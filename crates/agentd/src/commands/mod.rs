@@ -600,10 +600,11 @@ impl Commands {
                         false
                     }
                 };
-                let and_cancelled = if own.is_some_and(|count| count > 0) || pasted {
-                    " and cancelled your pending login"
-                } else {
-                    ""
+                let and_cancelled = match (own.is_some_and(|count| count > 0), pasted) {
+                    (true, true) => " and cancelled your pending login and the one it belongs to",
+                    (true, false) => " and cancelled your pending login",
+                    (false, true) => " and cancelled the pending login it belongs to",
+                    (false, false) => "",
                 };
                 format!(
                     "That login code is no longer secret, so I didn't use it{and_cancelled}. \
