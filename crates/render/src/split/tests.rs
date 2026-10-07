@@ -371,6 +371,18 @@ fn a_forced_cut_never_shortens_a_mention() {
 }
 
 #[test]
+fn a_forced_cut_never_starts_a_chunk_with_an_at_after_a_slash() {
+    let md = format!("[x](https://x.io/{}/@all) /@here", "a".repeat(40));
+    let rendered = rocketchat::to_markdown(&md, &Team);
+    assert!(rendered.contains("/@all") && rendered.contains("/@here"));
+    for max in 2..60 {
+        for chunk in split_checked(&rendered, utf16(max)) {
+            assert!(server::broadcasts(&chunk).is_empty(), "{max}: {chunk:?}");
+        }
+    }
+}
+
+#[test]
 fn rendered_rocketchat_chunks_hold_no_broadcast() {
     let md = format!("{}x@all", "a".repeat(4999));
     let rendered = rocketchat::to_markdown(&md, &Team);
@@ -898,6 +910,8 @@ fn property_rocketchat_chunks_hold_no_broadcast() {
         "`@all`",
         "\n```\n@here\n```\n",
         "> @all",
+        "/@all",
+        "x.io/@here",
         "[a](b)@all",
         "@all@x",
         "@Ada",

@@ -152,8 +152,11 @@ pub(crate) struct Doc<'a> {
     breaks: Vec<Break>,
     hard: Vec<bool>,
     /// Positions inside the name of an `@mention`, past its first
-    /// character. Even a forced cut avoids them, so a chunk can't end with
-    /// a shortened name, such as `@here` cut from `@herectic`.
+    /// character, and positions just before an `@` that follows anything
+    /// but whitespace or `>`. Even a forced cut avoids them, so a chunk
+    /// can't end with a shortened name, such as `@here` cut from
+    /// `@herectic`, or start with a mention that wasn't one in the text,
+    /// such as `@all` cut from `https://x.io/@all`.
     names: Vec<bool>,
     soft: Vec<bool>,
     fences: Vec<Fence>,
@@ -390,6 +393,9 @@ impl<'a> Doc<'a> {
                     let bounded = k == 0 || chars[k - 1].is_whitespace() || chars[k - 1] == '>';
                     marks.block(if bounded { k } else { k - 1 }, k + 1 + name);
                     names.block(k + 1, k + 1 + name);
+                    if !bounded {
+                        names.block(k - 1, k + 1);
+                    }
                 }
                 _ => {}
             }
