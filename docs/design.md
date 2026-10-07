@@ -1740,14 +1740,17 @@ disagrees with the copy is dropped:
 - Whether the sender is outside, and their organization, come from Slack's
   data only: the copy's own team fields, else the lookup's answer,
   `users.info`'s `team_id` or `enterprise_user.enterprise_id`. Nothing of
-  the event's `outside` is carried into the copy. The pipeline's
-  `copy_stands` lets a copy stand when only a limit's refusal differs and
-  the requesters' keys match, and an outside member's key names the home
-  workspace like a home member's; so `copy_stands` also compares
-  `outside`, organization included, and the message is dropped when the
-  event and the copy disagree on it, in either direction, as T31 drops any
-  other difference. It still ignores the member a key belongs to, which
-  may be made between the two routings (T27). So an owner who forges
+  the event's `outside` is carried into the copy. The pipeline drops the
+  message when the event and a person's copy disagree on `outside`,
+  organization included, in either direction (`agreeing_copy`), before
+  it routes the copy, as T31 drops any other difference. A bot's own
+  `outside` decides nothing, since a hop's requester takes it from the
+  attribution, so a bot's copy isn't compared. The pipeline's
+  `copy_stands`, which lets a copy stand when only a limit's refusal
+  differs and the requesters' keys match, compares the requesters'
+  `outside` too, since an outside member's key names the home workspace
+  like a home member's. It still ignores the member a key belongs to,
+  which may be made between the two routings (T27). So an owner who forges
   `outside`, or another organization, onto a home member's message only
   gets it dropped: it can't move a home member's turn to the community
   key, or pass an unlisted organization's member off as a listed one.

@@ -3611,11 +3611,12 @@ Deliverables:
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): the copy's `outside`
   and organization come from Slack's data only, the copy's own team fields,
   else the home lookup's `team_id` or `enterprise_user.enterprise_id`;
-  nothing of the event's is carried into the copy. `copy_stands`, which
-  lets a copy stand when only a limit's refusal differs, compares the
-  requester's `MemberKey` and `outside`, organization included, so an
-  event and a copy that disagree on it are dropped, in either direction.
-  It keeps ignoring the requester's `member`, which may be made for the
+  nothing of the event's is carried into the copy. `agreeing_copy` drops
+  the message, before the copy is routed, when the event and a person's
+  copy disagree on `outside`, organization included, in either direction.
+  `copy_stands`, which lets a copy stand when only a limit's refusal
+  differs, compares the requester's `MemberKey` and `outside` too, and
+  keeps ignoring the requester's `member`, which may be made for the
   identity between the two routings, as its rustdoc says (T27).
 - agentd (`crates/agentd/src/slack/mod.rs`):
   - The other-workspace checks of T30 and T31 compare the workspace above.
@@ -3693,6 +3694,7 @@ Acceptance:
 - `a_home_lookup_slack_refuses_is_outside`.
 - `an_event_and_its_copy_disagreeing_on_outside_is_dropped`.
 - `a_forged_organization_on_an_event_cannot_change_the_stored_team`.
+- `a_bots_copy_is_kept_whatever_it_says_of_outside`.
 - `copy_stands_compares_key_and_outside`.
 - `copy_stands_still_lets_a_member_be_made_between_routings`.
 - `confirm_drops_an_event_that_claims_home_for_an_outside_copy`.
@@ -3736,6 +3738,13 @@ Deliverables:
     workspace, which it learns from `auth.test` (T30). It is operator
     configuration, unlike the community admins' `/agent admin` choices,
     and the README says so.
+  - Before it admits anyone, T36b defines one canonical id for an
+    organization from what T36e item 9 records: the `E…` enterprise id
+    when Slack names one, else the `T…` team id. The event's and the
+    copy's fields, `users.info`'s answer and the `teams` entries are all
+    read in that form, so an organization listed under one id can't
+    arrive under the other. T36a's `directory::organization` takes
+    `team_id` first, so T36b changes it to match.
   - `hand_off`, `false` by default.
 - `router`:
   - `RouterView::outside_access(&Outside) -> Option<OutsideAccess { heard,
@@ -3785,7 +3794,7 @@ Deliverables:
   Whether a listed organization can be admitted at all rests on T36e:
   confirmation keeps the copy's own `outside`, and a copy whose fields
   don't name the organization comes back `Outside { team: None }` from
-  the home check, which `copy_stands` tells from the event's named team,
+  the home check, which `agreeing_copy` tells from the event's named team,
   so T36b admits a listed organization only if T36e finds that Slack's
   `conversations.history`/`replies` copy names it.
 - Notices (`crates/agentd/src/pipeline`):
@@ -4011,6 +4020,11 @@ Deliverables:
   8. Whether `app_uninstalled` and `tokens_revoked`, sent when a scratch
      app is uninstalled at the end, carry `authorizations`, for the
      deferred work on uninstalls.
+  9. Which id form names an outside member's organization, a workspace's
+     `T…` team id or an Enterprise Grid organization's `E…` id, in the
+     event's and the copy's team fields (items 1 and 2) and in
+     `users.info` (item 7), for a member of a Grid organization and of a
+     workspace on no Grid.
 - On an Enterprise Grid workspace, if one is available, the same for a
   member of another workspace of the home organization, and for a home
   member whose `users.info` names another workspace of the organization,

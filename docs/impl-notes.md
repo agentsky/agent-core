@@ -9388,8 +9388,11 @@ team fields, else the home lookup, whose answer now carries the
 organization `users.info` names (`directory::Membership`, from `team_id`,
 else `enterprise_user.enterprise_id`, whichever is not home). The pipeline
 drops a message whose event and copy disagree on `outside`, organization
-included (`agreeing_copy`), with the throttled "routes differently"
-warning. At T36a the event of an outside sender is ignored before
+included (`agreeing_copy`), with a throttled warning that the platform's
+copy says otherwise of whether the sender is from outside. Only a
+person's copy is compared (07 Oct review): a bot's own `outside` decides
+nothing, since a hop's requester takes it from the attribution, and
+comparing it dropped an agent's hop copy under that warning. At T36a the event of an outside sender is ignored before
 confirmation, so the drop only replaces what `copy_stands` already did; it
 is there for T36b.
 
@@ -9504,6 +9507,18 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
   the operator at the network). An organization-wide install never
   worked: every request names a member's workspace, never the
   organization.
+
+### A home Grid member reads as their own organization without `auth.test`'s
+
+When `auth.test` names no organization on Grid (round 2 above), a member
+of the home organization whose answer names its `enterprise_id` is not
+home, and `directory::organization` gives that id, so they read as
+`Outside(Some(<home organization>))`. T36a ignores them, failing closed.
+At T36b, an operator who lists their own organization's `E…` id in
+`[slack_connect] teams` would admit them as outside members: `App::open`
+refuses only the home workspace's `T…` id, and can't tell the
+organization's id when `auth.test` gives none. T36b must refuse or warn
+on that.
 
 ### Left as they are
 
