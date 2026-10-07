@@ -16,9 +16,11 @@
 //! place with a rename, so a session sees a skill whole or not at all;
 //! replacing a skill moves the old one aside first, so a session starting
 //! between the two renames sees neither. A skill added, replaced or
-//! removed reaches a conversation when its process next starts. Its hosts
-//! change for new connections at once; a tunnel already open ends within
-//! the egress proxy's idle and lifetime limits.
+//! removed changes in every sandbox of the agent at once, running ones
+//! included, since they mount the directory itself; a conversation already
+//! running may keep what it loaded of the old files until its process next
+//! starts. Its hosts change for new connections at once; a tunnel already
+//! open ends within the egress proxy's idle and lifetime limits.
 //!
 //! The row and the files can't change together, so they change in the
 //! order that never grants hosts to files the owner didn't confirm them
@@ -152,8 +154,11 @@ pub enum Added {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Removed {
     /// It removed the skill in use, and with it any hosts its owner
-    /// confirmed.
-    Active,
+    /// confirmed: `had_hosts` says whether there were any.
+    Active {
+        /// Whether the skill had confirmed hosts.
+        had_hosts: bool,
+    },
     /// It removed a skill still waiting for its owner to confirm its
     /// hosts, or files no row records, such as those a removal that failed
     /// on the disk left after deleting the rows: no host is granted for it
@@ -498,13 +503,16 @@ impl Skills {
         if name == BUNDLED_NAME {
             return Ok(Removed::Bundled);
         }
-        let states = self.inner.store.delete_skill(agent, name, None).await?;
+        let rows = self.inner.store.delete_skill(agent, name, None).await?;
         let live = remove_dir(&self.live_dir(agent, name)).await?;
         let pending = remove_dir(&self.pending_dir(agent, name)).await?;
-        tracing::info!(%agent, skill = name, rows = states.len(), live, pending, "removed a skill");
-        Ok(if states.contains(&SkillState::Active) {
-            Removed::Active
-        } else if !states.is_empty() || live || pending {
+        tracing::info!(%agent, skill = name, rows = rows.len(), live, pending, "removed a skill");
+        let active = rows.iter().find(|row| row.state == SkillState::Active);
+        Ok(if let Some(active) = active {
+            Removed::Active {
+                had_hosts: !active.hosts.is_empty(),
+            }
+        } else if !rows.is_empty() || live || pending {
             Removed::Unconfirmed
         } else {
             Removed::NotFound
