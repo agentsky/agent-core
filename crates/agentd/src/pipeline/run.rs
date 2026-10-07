@@ -1601,17 +1601,29 @@ mod tests {
         })
     }
 
+    fn job(pipeline: &Pipeline, key: &LaneKey, owner: MemberId) -> (Job, oneshot::Receiver<()>) {
+        let (done, finished) = oneshot::channel();
+        let job = Job {
+            event: event(key),
+            caps: MockSurface::DEFAULT_CAPS,
+            owner,
+            _pending: pipeline.places(owner).unwrap(),
+            done: Arc::new(done),
+        };
+        (job, finished)
+    }
+
     #[tokio::test]
     async fn after_close_a_message_for_a_running_lane_is_dropped_not_queued() {
         let dir = TempDir::new("pipeline-lanes");
         let pipeline = pipeline(&dir).await;
         let key = lane_key();
+        let owner = MemberId::new_v4();
         lock(&pipeline.inner.lanes).insert(key.clone(), VecDeque::new());
         let permits = pipeline.inner.pending.available_permits();
 
-        let (done, before) = oneshot::channel();
-        let caps = MockSurface::DEFAULT_CAPS;
-        assert!(pipeline.enqueue(key.clone(), event(&key), caps, done));
+        let (queued, before) = job(&pipeline, &key, owner);
+        assert!(pipeline.enqueue(key.clone(), queued));
         assert_eq!(
             lock(&pipeline.inner.lanes)[&key].len(),
             1,
@@ -1619,8 +1631,8 @@ mod tests {
         );
 
         pipeline.close();
-        let (done, after) = oneshot::channel();
-        assert!(pipeline.enqueue(key.clone(), event(&key), caps, done));
+        let (dropped, after) = job(&pipeline, &key, owner);
+        assert!(pipeline.enqueue(key.clone(), dropped));
         assert_eq!(
             lock(&pipeline.inner.lanes)[&key].len(),
             1,
