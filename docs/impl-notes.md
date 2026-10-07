@@ -5602,7 +5602,11 @@ panicking message doesn't stop its lane. The set is behind a
 `std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
 a Rocket.Chat connection's is on every reconnect, can't leave a lane
 created without its task. Queueing checks that the pipeline is open under
-that lock and never starts a task once it is closed. `drain` polls the set
+that lock and never starts a task once it is closed, and a lane starts none
+of its waiting messages once it is closed: a message that passed
+`dispatch`'s check just before a shutdown, or waited behind a running
+turn, is dropped as one sent after closing is, so the drain waits only for
+the turns already running. `drain` polls the set
 under the lock without holding it across a wait, so a drain cut off by its
 timeout leaves the tasks for `cut_short`, which takes the set and shuts it
 down. On shutdown `Server::run` stops the public listener and the chat
@@ -5616,8 +5620,8 @@ turn's working emoji is kept until its reply, or its failure notice, has
 gone out, so a reply stuck on a slow post isn't lost without a word. That
 is the simplest option that tells people: the turns and their queue stay in
 memory rather than the store, so a crash, unlike a shutdown, still loses
-them silently, and messages still waiting in a lane at the timeout are
-dropped without a word, since no decision was made about them. The working
+them silently, and messages still waiting in a lane when the pipeline
+closes are dropped without a word, since no decision was made about them. The working
 emoji is held by a guard, so a panicking turn takes it off too.
 
 ### An agent's post can arrive before its attribution

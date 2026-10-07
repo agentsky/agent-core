@@ -1066,6 +1066,44 @@ async fn shutdown_waits_for_a_running_turn_within_the_drain_timeout() {
 }
 
 #[tokio::test]
+async fn a_message_waiting_behind_a_turn_is_dropped_once_the_pipeline_closes() {
+    let stack = start().await;
+    stack.next_turn(Turn::reply("First.").with_delay(Duration::from_millis(1500)));
+    let upstream = stack.fake.message_requests().await.len();
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "q1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("the turn runs", || {
+        stack.mock.calls().contains(&working_on("q1"))
+    })
+    .await;
+    sink.send(stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "q2",
+        Some("q1"),
+        &[BOT],
+    ))
+    .await
+    .unwrap();
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let calls = stack.mock.calls();
+    let sent = posts(&calls);
+    assert_eq!(sent.len(), 1, "{calls:#?}");
+    assert_eq!(sent[0].1, "First.");
+    assert!(!calls.contains(&working_on("q2")), "{calls:#?}");
+    assert_eq!(
+        stack.fake.message_requests().await.len(),
+        upstream + 1,
+        "the waiting message never ran"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn a_turn_past_the_drain_timeout_is_cut_short_and_its_thread_told() {
     let stack = start_with(Setup {
         drain_timeout_secs: 1,

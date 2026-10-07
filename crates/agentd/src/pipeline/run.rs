@@ -447,7 +447,9 @@ impl Pipeline {
         true
     }
 
-    /// Answers the lane's messages one at a time, until none waits.
+    /// Answers the lane's messages one at a time, until none waits. Once
+    /// the pipeline is closed it starts none of those still waiting: they
+    /// are dropped, as a message sent after closing is.
     async fn lane(self, key: LaneKey, mut job: Job) {
         let agent = key.0;
         loop {
@@ -460,6 +462,13 @@ impl Pipeline {
             drop(job);
             let next = {
                 let mut lanes = lock(&self.inner.lanes);
+                if self.is_closed() {
+                    let dropped = lanes.remove(&key).map_or(0, |queue| queue.len());
+                    if dropped > 0 {
+                        tracing::info!(%agent, messages = dropped, "shutting down: not handling the messages still waiting");
+                    }
+                    return;
+                }
                 match lanes.get_mut(&key).and_then(VecDeque::pop_front) {
                     Some(next) => next,
                     None => {
