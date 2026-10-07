@@ -654,11 +654,14 @@ scan of one text node linked only the part before:
 `see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
 kept such URLs whole.
 
-**Solution.** While parsing, the renderer measures each bare URL in the source
-from where a text node starts it, and ends it early where the rendered text
-stops being a URL: at a character reference or escape that renders as a
-space, `<`, `>` or `|` (`&lt;`), and at anything other than text and
-emphasis, such as inline code. Emphasis or strikethrough whose opening
+**Solution.** Before building the tree, the renderer measures bare URLs in
+the source over each run of text and emphasis events. A run ends where the
+rendered text stops being a URL: at a character reference or escape that
+renders as a space, `<`, `>` or `|` (`&lt;`), and at anything other than
+text and emphasis, such as inline code. Each run is scanned once, so the
+pass stays linear; measuring from every text node to the next source
+terminator instead took 19 s on ``"`c`https://a"`` repeated 10,000 times,
+since each cut made the next URL scan the rest of the run again. Emphasis or strikethrough whose opening
 delimiter is inside such a range is replaced by its children, with its
 delimiters as text, so the URL is one text run again and is linked whole.
 Markup that opens before a URL wraps it and is not touched, even when the
