@@ -680,12 +680,17 @@ mark was wrong too: a mark left in a text node is literal, but it can be a
 footnote star, an escaped mark or a stray closer as easily as part of the
 path, and since the trim stops at the first character it keeps, a kept star
 also shielded the `)` or `.` before it, so `(https://x.io/pricing).*` was
-linked as `<https://x.io/pricing).*>`. The trim now treats a trailing run
-of one mark like an unmatched closing bracket: it stays only when the same
-mark appears earlier in the URL after the scheme (`#object.__init__`,
-`/_a_`, `/~~a~~`), and is dropped otherwise, after which trimming goes on.
-A URL that is only a scheme and marks, such as `https://_`, is left as
-text.
+linked as `<https://x.io/pricing).*>`. The trim now keeps a trailing run
+of one mark only when it follows a letter or digit and the same mark
+appears earlier in the URL after the scheme (`#object.__init__`, `/_a_`,
+`/~~a~~`, and `/_a_` in `https://x.io/_a_)`). Otherwise the run is dropped
+and trimming goes on, so a mark after punctuation or a closing bracket,
+as in `(https://x.io/_a)_` or `https://x.io/my*page.*`, never shields the
+characters before it. A URL that is only a scheme and marks, such as
+`https://_`, is left as text. Dropping the run only after punctuation or
+an unmatched closer was tried too: on a corpus of generated inputs it
+linked past the original trim in about three times as many inputs, escaped marks
+included, and still linked `https://x.io/a.*__*` whole.
 
 ### CommonMark disagrees with some qm-core regex cases
 
