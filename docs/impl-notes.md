@@ -4327,7 +4327,8 @@ Rocket.Chat doesn't answer is an attempt that failed, deferred with the
 retirement's backoff, so a creation that died because Rocket.Chat was
 unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
 answers an unknown username with HTTP 400 and the error `User not found.`,
-without an error code; `user_by_username` reads that answer as no user, so
+without an error code, and older servers with `error-user-not-found` or
+`error-invalid-user`; `user_by_username` reads those answers as no user, so
 the username of a creation that never got as far as `users.create` is
 forgotten at the first lookup, like another's email, while a transport
 error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
