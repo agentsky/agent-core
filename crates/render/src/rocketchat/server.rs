@@ -4,7 +4,8 @@
 //! (the same in 7.10.0 and 8.0.0) removes `[label](dest)` links from the raw
 //! message text with `/\[[^\]]*\]\([^)]+\)/g`, then matches
 //! `(^|\s|>)@(P(@(P))?(:([0-9a-zA-Z-_.]+))?)` with flags `gm`, where `P`
-//! is the `UTF8_Names_Validation` setting, `[0-9a-zA-Z-_.]+` by default.
+//! is the `UTF8_User_Names_Validation` setting, `[0-9a-zA-Z-_.]+` by
+//! default.
 //! `MentionsServer.getUsersByMentions` in `app/mentions/server/Mentions.ts`
 //! treats a match as a broadcast when the name is `all` or `here`. It
 //! ignores code, and the port does too.

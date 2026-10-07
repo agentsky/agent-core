@@ -372,11 +372,6 @@ impl Surface for MockSurface {
         limit: usize,
     ) -> Result<Vec<Msg>> {
         let mut state = self.begin(Op::History, thread.root.as_ref())?;
-        state.calls.push(Call::History {
-            thread: thread.clone(),
-            before: before.clone(),
-            limit,
-        });
         let messages = state.history.get(thread).map_or(&[][..], Vec::as_slice);
         let end = match &before {
             None => messages.len(),
@@ -385,8 +380,13 @@ impl Surface for MockSurface {
                 .position(|msg| msg.id.as_str() == cursor.as_str())
                 .ok_or_else(|| SurfaceError::NotFound("history cursor".into()))?,
         };
-        let start = end.saturating_sub(limit);
-        Ok(messages[start..end].to_vec())
+        let page = messages[end.saturating_sub(limit)..end].to_vec();
+        state.calls.push(Call::History {
+            thread: thread.clone(),
+            before,
+            limit,
+        });
+        Ok(page)
     }
 
     fn render(&self, markdown: &str) -> Vec<String> {
@@ -626,6 +626,7 @@ mod tests {
             mock.history(&thread, Some(Cursor::new("9")), 2).await,
             Err(SurfaceError::NotFound("history cursor".into()))
         );
+        assert_eq!(mock.calls().len(), 4, "a failed call is not recorded");
 
         let other = ThreadKey {
             conv: conv("C1"),
@@ -640,7 +641,7 @@ mod tests {
                 limit: 5,
             })
         );
-        assert_eq!(mock.calls().len(), 6);
+        assert_eq!(mock.calls().len(), 5);
     }
 
     #[tokio::test]

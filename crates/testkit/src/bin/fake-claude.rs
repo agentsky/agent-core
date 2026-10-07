@@ -9,6 +9,7 @@ use std::process::{ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{ArgGroup, CommandFactory, Parser, error::ErrorKind};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use testkit::claude::{API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, SCRIPT_ENV, Turn};
 use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
@@ -92,14 +93,19 @@ impl Args {
 }
 
 enum Credential {
-    ApiKey(String),
-    OAuth(String),
+    ApiKey(SecretString),
+    OAuth(SecretString),
     Missing,
 }
 
 impl Credential {
     fn from_env() -> Self {
-        let var = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let var = |name| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(SecretString::from)
+        };
         match (var("ANTHROPIC_API_KEY"), var("CLAUDE_CODE_OAUTH_TOKEN")) {
             (Some(key), _) => Self::ApiKey(key),
             (None, Some(token)) => Self::OAuth(token),
@@ -364,10 +370,10 @@ impl Session {
             }));
         let request = match &self.credential {
             Credential::ApiKey(key) => request
-                .header("x-api-key", key)
+                .header("x-api-key", key.expose_secret())
                 .header("anthropic-beta", API_KEY_BETA),
             Credential::OAuth(token) => request
-                .bearer_auth(token)
+                .bearer_auth(token.expose_secret())
                 .header("anthropic-beta", OAUTH_BETA),
             Credential::Missing => {
                 return Err(ApiError {
