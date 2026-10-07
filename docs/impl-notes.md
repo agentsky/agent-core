@@ -3367,8 +3367,9 @@ similar are `NotFound`; anything else is `Api` with the code. A code is
 kept only if it is at most 64 lowercase letters, digits and underscores, so
 an error never carries arbitrary response text. `already_reacted` from
 `reactions.add` and `no_reaction` from `reactions.remove` count as success.
-A non-2xx status other than 429 is `Api("HTTP <status>")`, an unreadable
-body is `Transport`, and redirects are never followed. Transport errors drop
+A non-2xx status other than 429 maps the body's `ok: false` code like any
+other and is `Api("HTTP <status>")` only when the body has none, an
+unreadable body is `Transport`, and redirects are never followed. Transport errors drop
 the request URL, so a `response_url` or upload URL can't leak through one.
 
 Review found that a non-2xx answer whose body carries an `ok: false` code,
