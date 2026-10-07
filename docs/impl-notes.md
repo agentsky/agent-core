@@ -4317,10 +4317,11 @@ is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
 Rocket.Chat doesn't answer is an attempt that failed, deferred with the
 retirement's backoff, so a creation that died because Rocket.Chat was
 unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
-answers an unknown username without an error code, so a creation that
-never got as far as `users.create` is indistinguishable from an outage and
-spends the retirement's attempts (about three days of `users.info` calls)
-before it is given up. The adoption needs the manager's
+answers an unknown username with HTTP 400 and the error `User not found.`,
+without an error code; `user_by_username` reads that answer as no user, so
+the username of a creation that never got as far as `users.create` is
+forgotten at the first lookup, like another's email, while a transport
+error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
 out. A bot user still missed has no token and no password anyone knows, so
 it can't be used, but it keeps its username until an admin removes it.

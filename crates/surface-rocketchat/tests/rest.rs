@@ -447,13 +447,25 @@ async fn user_by_username_finds_the_user_or_fails() {
     let fake = FakeRest::start().await;
     let alice = fake.add_user("alice");
     let client = manager(&fake);
-    let found = client.user_by_username("alice").await.unwrap();
+    let found = client.user_by_username("alice").await.unwrap().unwrap();
     assert_eq!(found.id.as_str(), alice);
     assert_eq!(found.roles, ["user"]);
     let requests = fake.requests("users.info").await;
     assert_eq!(requests[0].url.query(), Some("username=alice"));
+    assert_eq!(client.user_by_username("nobody").await, Ok(None));
+}
+
+#[tokio::test]
+async fn user_by_username_fails_when_the_server_does() {
+    let fake = FakeRest::start().await;
+    fake.add_user("alice");
+    Mock::given(path("/api/v1/users.info"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
     assert!(matches!(
-        client.user_by_username("nobody").await,
+        manager(&fake).user_by_username("alice").await,
         Err(SurfaceError::Api(_))
     ));
 }
