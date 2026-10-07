@@ -2425,6 +2425,14 @@ connections stop listening, and the intake runs the commands it already
 received (the store has recorded them as processed, so no other instance
 would) and waits for them within the drain timeout.
 
+One narrow window is left. `listen` stops on the shutdown signal by dropping
+the surface's events future, and that future may be between the
+`mark_event_processed` commit and the `send` into the intake. A command
+dropped there is recorded as processed and never run by any instance. The
+window is the store write itself and is inherent to recording an event
+before delivering it; the member sees no reply and can send the command
+again.
+
 ### Secret-looking text that doesn't parse, in a channel
 
 **Issue.** `ParseError::is_secret_bearing` says malformed text may hold a
@@ -2438,7 +2446,10 @@ command that parses gets the refusal for its kind: `login <code>` cancels
 the pending logins, `admin api-key set` says to revoke the key at the
 Anthropic Console, `slack-token` says to revoke it at api.slack.com. None
 of them is used. The refusal matches every command explicitly, so a new
-secret-bearing command doesn't compile until it has its own advice. A
+secret-bearing command doesn't compile until it has its own advice. If
+cancelling the pending logins fails in the store, the failure is logged and
+the member still gets the refusal, which then doesn't claim the login was
+cancelled; the parsed and the unparsed paths agree on this. A
 public `login <code>` also takes the pending login its `state` names
 (`Auth::cancel_pasted_login`, with `auth`'s own paste parsing and no
 exchange), whoever started it: the sender's own pending logins are not
