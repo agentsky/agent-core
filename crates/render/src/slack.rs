@@ -1069,7 +1069,8 @@ fn wire_broadcast(text: &str, at: usize) -> Option<(usize, &str)> {
 
 /// Finds a bare `http://` or `https://` URL at byte offset `at`, trimmed of
 /// trailing punctuation the way qm-core's `trimUrlTail` does, except that
-/// a run of `*`, `_` or `~` stays when the URL holds the same mark earlier.
+/// a run of `*`, `_` or `~` right after a letter or digit stays when the URL
+/// holds the same mark earlier.
 fn bare_url(text: &str, at: usize) -> Option<&str> {
     let rest = &text[at..];
     let scheme = ["https://", "http://"]
@@ -1094,11 +1095,12 @@ fn ends_url(c: char) -> bool {
 
 /// Drops trailing punctuation, and closing brackets that have no opening
 /// partner inside the URL, so `(see https://x.io/a).` keeps `)` and `.` out.
-/// A trailing run of `*`, `_` or `~` is treated like such a bracket: it
-/// stays only when the same mark appears earlier in the URL after its
-/// scheme, as in `…#object.__init__` or `/~~a~~`, and is dropped otherwise,
-/// as a footnote star, an escaped mark or a stray closer is, so
-/// `(https://x.io/a).*` keeps `).*` out.
+/// A trailing run of `*`, `_` or `~` stays only when it follows a letter or
+/// digit and the same mark appears earlier in the URL after its scheme, as
+/// in `…#object.__init__` or `/~~a~~`. Otherwise it is dropped, as a
+/// footnote star, an escaped mark or a stray closer is, and trimming goes
+/// on, so `(https://x.io/a).*` keeps `).*` out and `(https://x.io/_a)_`
+/// keeps `)_` out.
 fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
     let body = url.find("://").map_or(0, |at| at + 3);
@@ -1115,7 +1117,11 @@ fn trim_url_tail(url: &str) -> &str {
             end - c.len_utf8()
         } else if matches!(c, '*' | '_' | '~') {
             let run = url[..end].trim_end_matches(c).len();
-            if url.get(body..run).is_some_and(|before| before.contains(c)) {
+            let closes_a_word = url[..run]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric);
+            if closes_a_word && url.get(body..run).is_some_and(|before| before.contains(c)) {
                 break;
             }
             run
