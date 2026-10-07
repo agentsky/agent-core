@@ -1755,14 +1755,17 @@ disagrees with the copy is dropped:
 - Whether the sender is outside, and their organization, come from Slack's
   data only: the copy's own team fields, else the lookup's answer,
   `users.info`'s `team_id` or `enterprise_user.enterprise_id`. Nothing of
-  the event's `outside` is carried into the copy. The pipeline's
-  `copy_stands` lets a copy stand when only a limit's refusal differs and
-  the requesters' keys match, and an outside member's key names the home
-  workspace like a home member's; so `copy_stands` also compares
-  `outside`, organization included, and the message is dropped when the
-  event and the copy disagree on it, in either direction, as T31 drops any
-  other difference. It still ignores the member a key belongs to, which
-  may be made between the two routings (T27). So an owner who forges
+  the event's `outside` is carried into the copy. The pipeline drops the
+  message when the event and a person's copy disagree on `outside`,
+  organization included, in either direction (`agreeing_copy`), before
+  it routes the copy, as T31 drops any other difference. A bot's own
+  `outside` decides nothing, since a hop's requester takes it from the
+  attribution, so a bot's copy isn't compared. The pipeline's
+  `copy_stands`, which lets a copy stand when only a limit's refusal
+  differs and the requesters' keys match, compares the requesters'
+  `outside` too, since an outside member's key names the home workspace
+  like a home member's. It still ignores the member a key belongs to,
+  which may be made between the two routings (T27). So an owner who forges
   `outside`, or another organization, onto a home member's message only
   gets it dropped: it can't move a home member's turn to the community
   key, or pass an unlisted organization's member off as a listed one.
@@ -2118,7 +2121,7 @@ Direct calls would also need our own agent loop.
 [^slack-events]: [The Events API](https://docs.slack.dev/apis/events-api/): the event wrapper's `event_id` ("globally unique across all workspaces"), `event_context`, `authorizations`, `is_ext_shared_channel` and `context_team_id`. Read through search excerpts on 2026-10-01.
 [^slack-api-specs]: Slack's event wrapper schema, [`slackapi/slack-api-specs` `events-api/slack_common_event_wrapper_schema.json`](https://github.com/slackapi/slack-api-specs/blob/master/events-api/slack_common_event_wrapper_schema.json): `team_id` is "the unique identifier of the workspace where the event occurred", `event_id` "globally unique across all workspaces". Read on 2026-10-01. The schema predates `authorizations`.
 [^slack-authed]: [Events API truncate authed users](https://docs.slack.dev/changelog/2020-09-15-events-api-truncate-authed-users/): `authed_users` and `authed_teams` deprecated for one `authorizations` entry, from 2021-02-24. Read through search excerpts on 2026-10-01.
-[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with a token holding the `authorizations:read` scope, the only requirement the method's reference states. Read through search excerpts on 2026-10-01.
+[^slack-event-authorizations]: [`apps.event.authorizations.list`](https://docs.slack.dev/reference/methods/apps.event.authorizations.list/): every installation an event is visible to, from its `event_context`, with a token holding the `authorizations:read` scope. Slack's OpenAPI spec ([`slack_web_openapi_v2.json`](https://github.com/slackapi/slack-api-specs/blob/master/web-api/slack_web_openapi_v2.json)) names only that scope for it; whether the method needs anything more, such as an app-level token, isn't settled here. The reference was read through search excerpts on 2026-10-01, the spec on 2026-10-07.
 [^slack-enterprise]: [Developing apps for Enterprise orgs](https://docs.slack.dev/enterprise/developing-for-enterprise-orgs/): one event per shared-channel event whatever the number of installations, `is_enterprise_install`, one global `U…` or `W…` user id per person. Read through search excerpts on 2026-10-01.
 [^slack-conversation]: [Conversation object](https://docs.slack.dev/reference/objects/conversation-object/) and [`conversations.info`](https://docs.slack.dev/reference/methods/conversations.info/): `is_shared`, `is_ext_shared`, `is_org_shared`, `connected_team_ids`, `shared_team_ids` and `context_team_id`. Read through search excerpts on 2026-10-01; the field names match the Java SDK's `Conversation`.
 [^slack-users-identity]: [`users.identity`](https://docs.slack.dev/reference/methods/users.identity/): user ids are globally unique, and the same user on two unrelated workspaces has two. Read through search excerpts on 2026-10-01.

@@ -523,8 +523,9 @@ impl Consents {
     /// Updates each decided or expired consent's card with its outcome,
     /// through `replies`. An update that fails on the way (a rate limit or
     /// a transport error) releases its claim, so a later pass tries again;
-    /// a card the platform refuses to update stays as it is, and its
-    /// buttons answer that the task was settled.
+    /// a card the platform refuses to update, or whose claim can't be
+    /// released, stays as it is, and its buttons answer that the task was
+    /// settled. Neither stops the pass.
     ///
     /// # Errors
     ///
@@ -566,9 +567,12 @@ impl Consents {
                     ),
                 ) => {
                     tracing::warn!(consent = %consent.id, error = %err, "couldn't update a consent card with its outcome; it will be tried again");
-                    store
+                    if let Err(err) = store
                         .release_consent_card_close(consent.id, claimed_at)
-                        .await?;
+                        .await
+                    {
+                        tracing::warn!(consent = %consent.id, error = %err, "couldn't release a consent card's close claim; it won't be tried again");
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(consent = %consent.id, error = %err, "couldn't update a consent card with its outcome");
