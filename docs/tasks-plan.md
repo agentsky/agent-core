@@ -1343,7 +1343,10 @@ the code read as "username taken". If it does, a creation whose email is
 already taken, by a first `users.create` that succeeded unrecorded, moves
 on to the prefixed username, and the orphan lookup then searches that name
 instead of the one the bot user got
-([impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
+([impl-notes](impl-notes.md#a-creation-can-stop-halfway)). Confirm the exact
+error the server answers `users.info?username=` with for a username no user
+has: `user_by_username` matches the codeless `User not found.` word for word,
+and different wording falls back to the retirement's 20 attempts.
 
 ## Phase 2: sessions, sandboxes, credential proxy (design milestone 2)
 
@@ -1919,6 +1922,9 @@ Deliverables:
     queue, after an idle container of the scope is stopped for them if
     there is one
     ([impl-notes](impl-notes.md#idle-containers-hold-places-under-the-caps)).
+    A busy session can keep a waiting one out for as long as it has turns;
+    making it yield is [deferred](#deferred-work) ("Fairness at the
+    per-scope cap").
   - A global cap, default 32, which stops idle containers the same way.
   - A container's mounts follow the turn's `Side` on the agent's `Private`
     volume, and a turn with other mounts restarts the container
@@ -2337,8 +2343,8 @@ Notes from implementing it
   checked, with no redirects, `https` only and a size and time cap. The
   agentd image moves from distroless to Debian slim for `git`.
 - An upload is a `.md` (up to 256 KB) or a `.zip` (up to 10 MB, unpacked
-  too); both surfaces' manager DMs pass their files to the handlers, so a
-  `persona.md` attached on Slack works now too.
+  too), read from either manager DM through T30's `Commands::download`
+  ([impl-notes](impl-notes.md#files-in-the-manager-dm)).
 - The launch flags enable the `Skill` tool: without it Claude Code never
   tells the model about the mounted skills.
 
@@ -3827,11 +3833,12 @@ Deliverables:
   the columns, and keeps it for `consents`, since a consent never has an
   outside requester.
   Whether a listed organization can be admitted at all rests on T36e:
-  confirmation keeps the copy's own `outside`, and a copy whose fields
-  don't name the organization comes back `Outside { team: None }` from
-  the home check, which `agreeing_copy` tells from the event's named team,
-  so T36b admits a listed organization only if T36e finds that Slack's
-  `conversations.history`/`replies` copy names it.
+  confirmation keeps the copy's own `outside`, and for a copy whose fields
+  don't name the organization the home check names the one `users.info`
+  gives for the sender. `agreeing_copy` then agrees whenever the event's
+  field and that lookup name the same id, so what T36b must verify is that
+  the two use one id form (the canonical id above, from T36e item 9);
+  where they don't, every copy disagrees and is dropped.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,
@@ -4175,6 +4182,17 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Switching models over the stream-json control channel** instead of
   restarting the process.
 - **Per-scope container cap tuning** from real usage (T21 sets a default).
+- **Fairness at the per-scope cap**, a follow-up to T21's pool. A session
+  keeps its container while it has turns, so a busy session can hold its
+  place at the cap while another session of the same scope waits. That
+  delays the waiting session but can't deadlock it: it gets a container as
+  soon as any session of the scope goes idle. The proposal: a session that
+  has run N consecutive turns (N = 4 to start) while a session of the same
+  scope is waiting on the cap gives its container back after the current
+  turn, and its next turn queues like any other. It yields only when a
+  scope-mate is actually waiting, so a lone busy session never pays a
+  container restart, and its next turn queues behind the waiter (FIFO at
+  the cap), so a steady stream of turns can't take the place straight back.
 - **Community bot fallback** that posts as each agent with
   `chat:write.customize`, for workspaces at the app limit (design,
   [Alternatives considered](design.md#alternatives-considered)).

@@ -881,9 +881,11 @@ pub fn is_home(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> bool {
 }
 
 /// The organization Slack's `user` belongs to when it isn't home: their
-/// `team_id`, else their `enterprise_user.enterprise_id`, the first that is
-/// shaped like a workspace's or an organization's id and is neither `team`
-/// nor `home_org`. `None` when there is none.
+/// `team_id` if it is shaped like a workspace's id (`T…`), else their
+/// `enterprise_user.enterprise_id` if it is shaped like an organization's
+/// id (`E…`), either only when it is neither `team` nor `home_org`. `None`
+/// when neither is, so a `team_id` shaped like an organization's id names
+/// nothing on its own.
 pub fn organization(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> Option<TeamId> {
     let foreign = |id: &str| id != team.as_str() && home_org.is_none_or(|org| id != org.as_str());
     user.team_id
