@@ -935,11 +935,12 @@ doesn't protect a broadcast on
 Rocket.Chat](#code-doesnt-protect-a-broadcast-on-rocketchat)). The bare URL
 scanner moved from `slack.rs` to `render::url` to be shared.
 
-The shared trim keeps a trailing `*`, `_` or `~` for both surfaces (see
+The shared trim keeps a trailing run of `*`, `_` or `~` only when the URL
+holds the same mark earlier, for both surfaces (see
 [Emphasis inside a bare URL cut the link](#emphasis-inside-a-bare-url-cut-the-link)).
 On Rocket.Chat the URL only bounds the text name resolution skips: the
 renderer copies the source through either way, and what the trim drops is
-never an `@`, so trimming those marks there would change no output. What
+never an `@`, so how it treats those marks changes no output there. What
 the server's own Markdown makes of `…#object.__init__` depends on the text
 it receives, which is the same either way, so Rocket.Chat has no reason for
 a trim of its own. A Rocket.Chat test pins that such a URL passes through
