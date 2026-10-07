@@ -111,9 +111,9 @@ pub enum RefuseReason {
         /// The largest hop the agent accepts.
         max: Hop,
     },
-    /// The view couldn't say whether the requester is banned, or what the
-    /// agent's rules are, so the router refuses rather than assume the
-    /// requester is allowed.
+    /// The view couldn't say which member the requester is, whether they
+    /// are banned, or what the agent's rules are, so the router refuses
+    /// rather than assume the requester is allowed or a stranger.
     PolicyUnavailable,
 }
 

@@ -27,12 +27,15 @@ compiler (and `cmake` on some targets), which the GitHub Ubuntu runners have.
 Consequences:
 
 - The workspace declares reqwest with `default-features = false` and only
-  `json`. Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
+  `json`, `form` and `query` (reqwest 0.13 made `form` and `query` opt-in
+  features). Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
   plain HTTP to `agentctl.internal` and doesn't, so its static musl build
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception.
+  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
+  use that license; see
+  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -165,7 +168,10 @@ concurrency group of their own: in `main`'s group, where
 `cancel-in-progress` is false, a scheduled run arriving while a push run is
 pending would cancel that pending run, and its badges would not be
 published. GitHub runs schedules on the default branch only, so the trigger
-takes effect once this workflow is on `main`.
+takes effect once this workflow is on `main`. GitHub also disables
+`schedule` triggers in a public repository after 60 days without repository
+activity, so on a quiet repository the weekly advisory run can stop and has
+to be re-enabled from the Actions tab.
 
 ## T03: core-types
 
@@ -618,6 +624,17 @@ if the OS generator fails.
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
 
+### The `members` table lists the surfaces
+
+**Issue.** The foundation migration declares `members.surface` with
+`CHECK (surface IN ('slack', 'rocketchat'))`, which couples `SurfaceKind` in
+core-types to the schema.
+
+**Solution.** Kept, so the store refuses a surface it has never heard of.
+A task that adds a `SurfaceKind` variant must also add a migration that
+relaxes the constraint; until it does, `ensure_member` fails at runtime for
+the new surface.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
@@ -680,6 +697,26 @@ Slack's `*` right back next to the URL.
 trailing punctuation and unmatched closing brackets left outside, as qm-core's
 `trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
 still left to Slack. The T06 bullet in the plan now says so.
+
+### Emphasis inside a bare URL cut the link
+
+**Issue.** CommonMark reads `_…_`, `__…__`, `*…*` and `~~…~~` inside a URL's
+path as emphasis, so pulldown-cmark splits the URL's text around it, and a
+scan of one text node linked only the part before:
+`see https://docs.python.org/3/library/__main__.html` became
+`see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
+kept such URLs whole.
+
+**Solution.** While parsing, the renderer measures each bare URL in the source
+from where a text node starts it, and ends it early where the rendered text
+stops being a URL: at a character reference or escape that renders as a
+space, `<`, `>` or `|` (`&lt;`), and at anything other than text and
+emphasis, such as inline code. Emphasis or strikethrough whose opening
+delimiter is inside such a range is replaced by its children, with its
+delimiters as text, so the URL is one text run again and is linked whole.
+Markup that opens before a URL wraps it and is not touched, even when the
+source runs on past its closing delimiter: `**https://x.io/a**'s` stays bold,
+as `*<https://x.io/a>*'s`.
 
 ### CommonMark disagrees with some qm-core regex cases
 
@@ -949,19 +986,24 @@ directory entry resolving to `allé` all broadcast.
 **Solution.** After rendering, `to_markdown` makes one last pass over the
 whole output, code and link targets included, with the server's grammar: it
 inserts U+200B after every `@` whose following run of `[0-9A-Za-z._-]` is
-`all` or `here`, ignoring case and trailing `.`, `_` and `-`, whatever
-precedes the `@`. The server reads no name after the zero-width space. A
-URL or a code sample containing `/@all` or `@here` gets the zero-width space
-too; that is the price of the server not knowing about code. `@allison` and
+`all` or `here`, ignoring case and trailing `.`, `_` and `-`, unless a `/`
+precedes the `@`. The server reads no name after the zero-width space, and
+it never reads one after `/`, which is not in `(^|\s|>)`; link removal can't
+put anything else before such an `@` either, since a removed link ends in
+`)`. So `https://x.io/@all` stays a working link, while a code sample
+containing ` @here` still gets the zero-width space, because the server
+doesn't know about code. `split` never cuts just before an `@` that follows
+anything but whitespace or `>`, even when a construct longer than a chunk
+forces a cut, so a chunk can't start with the `@all` of such a URL. `@allison` and
 `@all.hands` stay untouched. The pass is the only place that inserts the
 space; name resolution just skips broadcasts so they are never offered to
 the directory. Usernames from the directory must match the server's ASCII
 class. The tests port the server's regex (`rocketchat::server`, checked
 against the JavaScript regex under Node on 30,000 generated strings while
 writing it) and assert that no output, and no chunk `split` makes from it,
-yields `all` or `here`. The rule assumes the default `UTF8_Names_Validation`
-pattern; a server configured with a narrower name pattern could read `@all`
-out of `@all.hands`.
+yields `all` or `here`. The rule assumes the default
+`UTF8_User_Names_Validation` pattern; a server configured with a narrower
+name pattern could read `@all` out of `@all.hands`.
 
 ### A cut can create or shorten a mention
 
@@ -975,9 +1017,14 @@ cut inside an oversized construct could shorten `@herectic` to `@here`.
 whatever precedes the `@`, and never cuts right before an `@` that follows
 anything but whitespace or `>`. When a single construct is longer than the
 chunk and a cut has to fall inside it, the cut still avoids the inside of a
-name: it falls right after the `@` instead, so neither chunk holds a
-shortened name. Together with the final pass above, every `@` run in a chunk
-is a run of the rendered text, and those are already neutralized.
+name and the position just before an `@` that follows anything but
+whitespace or `>`: it falls right after the `@` instead, so neither chunk
+holds a shortened name or starts with a new one. This holds inside a
+`<…>` token and after an unclosed `<` as well: the token scan first jumped
+past them without looking at their `@`s, so a forced cut in `<aaaaaaaa/@all`
+gave a chunk `@all`. Together with the final pass above, every `@` run in a chunk is a run of the rendered text, and
+those are already neutralized or follow a `/`, where the server reads no
+mention.
 
 ### Grapheme clusters need a mark table
 
@@ -1208,6 +1255,15 @@ is judged by `Command::is_secret_bearing` alone, so a persona mentioning
 `sk-ant-` is still just a persona. Error messages still never repeat the
 text.
 
+A pasted login code counts whatever the verb, in both forms T09's
+`parse_pasted` accepts: a word with a `code=` query parameter, such as the
+callback URL, and `<code>#<state>` whose parts use the login's token
+alphabet, printable ASCII other than `#`, `&`, `?`, `=` and `|`, so
+`logn abc.def~1#state` and `logn ABC123%2F#state` count. A URL with a
+fragment and no `code=` (`https://x.io/r#main`) doesn't, since the login
+reads a URL only by its query. Any other `word#word` does, so `PR#42` is a
+false positive the rule accepts.
+
 ## T09: auth
 
 ### Claude Code 2.1.285's OAuth requests, read from the binary
@@ -1252,7 +1308,8 @@ around `grant_type:"authorization_code"`:
   `user:inference` alone, so the authorization server accepts a subset for
   this client. agentd keeps the plan's `user:profile user:inference`: the
   profile needs the first, the proxy the second. Whether the server accepts
-  exactly this pair is part of the live check still to be done.
+  exactly this pair is part of the live login, which T13's live check
+  carries, together with the revoke path below.
 
 ### Claude Code revokes the refresh token on logout
 
@@ -1413,6 +1470,13 @@ ID, or `scopes` widened after members linked), so `auth` asks the member to
 log in again rather than retrying forever; and the plan's wording ("HTTP
 400, 401 or 403") is narrowed to these codes. Tests cover each code, the
 account-on-hold body, and 4xx responses that must not break the link.
+
+OAuth response bodies are read up to 64 KiB, by `Content-Length` and as
+they stream in. An oversized failure keeps its status, as
+`AuthError::Status` without an OAuth code, so an oversized 400, 401 or 403
+to the code exchange is still `CodeRejected`, and an oversized refresh
+failure is transient: its body isn't read, so it can't say the token is
+dead. Only an oversized success is `InvalidResponse`.
 
 ### The plan was read while holding the member's lock
 
@@ -2146,7 +2210,9 @@ token with `type: "personalAccessToken"`
 where the resume handler finds it, so the realtime client sends the bot's
 token as `{"resume": token}`. A login error `403` ends `events` with
 `SurfaceError::Unauthorized` instead of reconnecting forever. A login that
-answers for another user id also ends it.
+answers for another user id also ends it. A login result with no user id
+reconnects instead, since a single malformed or proxy-mangled frame would
+otherwise end the bot's events until agentd restarts it.
 
 ### DDP details the client relies on
 
@@ -2224,6 +2290,19 @@ server's pings.
 
 **Solution.** The socket loop hands raw messages to the surface through a
 channel of 256, and the surface normalizes them in order on its own.
+
+### A slow consumer looked like a silent server
+
+**Issue.** Review found that the heartbeat watchdog measured silence from
+the last frame read. While the loop waited for a full channel to take a
+message it read nothing, so a consumer slower than two heartbeats ended the
+connection as "the server stopped answering", and the frames still unread
+in the socket were lost.
+
+**Solution.** Silence is measured from the last frame read or the end of
+handling one, whichever is later, so time spent waiting for the consumer
+does not count. A test holds a channel of one for five heartbeats and
+checks that the connection is not replaced and the next message arrives.
 
 ### tokio-tungstenite uses rustls's default provider
 
@@ -2378,6 +2457,14 @@ connections stop listening, and the intake runs the commands it already
 received (the store has recorded them as processed, so no other instance
 would) and waits for them within the drain timeout.
 
+One narrow window is left. `listen` stops on the shutdown signal by dropping
+the surface's events future, and that future may be between the
+`mark_event_processed` commit and the `send` into the intake. A command
+dropped there is recorded as processed and never run by any instance. The
+window is the store write itself and is inherent to recording an event
+before delivering it; the member sees no reply and can send the command
+again.
+
 ### Secret-looking text that doesn't parse, in a channel
 
 **Issue.** `ParseError::is_secret_bearing` says malformed text may hold a
@@ -2391,7 +2478,10 @@ command that parses gets the refusal for its kind: `login <code>` cancels
 the pending logins, `admin api-key set` says to revoke the key at the
 Anthropic Console, `slack-token` says to revoke it at api.slack.com. None
 of them is used. The refusal matches every command explicitly, so a new
-secret-bearing command doesn't compile until it has its own advice. A
+secret-bearing command doesn't compile until it has its own advice. If
+cancelling the pending logins fails in the store, the failure is logged and
+the member still gets the refusal, which then doesn't claim the login was
+cancelled; the parsed and the unparsed paths agree on this. A
 public `login <code>` also takes the pending login its `state` names
 (`Auth::cancel_pasted_login`, with `auth`'s own paste parsing and no
 exchange), whoever started it: the sender's own pending logins are not
@@ -2593,6 +2683,10 @@ by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
 a command by default, so the model sees why it failed rather than a killed
 command.
 
+Review found that `--timeout 18446744073709551615` panicked on `Instant +
+Duration` overflow. The wait is now clamped to a day, which no turn
+outlasts, so any `u64` the model types gives a sane wait.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
@@ -2761,7 +2855,10 @@ its own, with `platform` `linux-x64` or `linux-arm64` from BuildKit's
 its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
 `CLAUDE_CODE_SHA256_ARM64`, pinned next to `CLAUDE_CODE_VERSION`, and print
 `<version> (Claude Code)`; only then is it copied to
-`/usr/local/bin/claude`. The checksums are `platforms.<platform>.checksum`
+`/usr/local/bin/claude`, with `--chown=0:0`, since BuildKit keeps a
+stage-to-stage copy's ownership and the file would otherwise belong to
+`nobody` (harmless at mode 0755 on a read-only root, but `agentctl` is
+root's). The images job checks that both belong to root. The checksums are `platforms.<platform>.checksum`
 in the release's `manifest.json`; for 2.1.285 the manifest was read from
 the release bucket, and the `linux-x64` binary downloaded from it hashed to
 the manifest's value and printed `2.1.285 (Claude Code)`. The CI build
@@ -2915,6 +3012,25 @@ spawned task, which a current-thread runtime whose `block_on` returned,
 or any runtime shutting down, dropped unpolled, so the process group
 lived on. `kill(2)` returns at once, so `Drop` now sends the signal
 itself.
+
+### `wait` after `kill` hung on unread stdout
+
+**Issue.** Review found that `DockerChild::wait` awaited the task copying
+the exec's output into a 64 KiB duplex before asking Docker for the exit
+code. With more than 64 KiB unread, for example when T20's turn times out
+mid-stream, that task blocked in `write_all`, so `wait` never returned after
+`kill`, although a `ProcessSandbox` child is reaped whether its stdout is
+read or not. And when the output ended but `inspect_exec` still said
+running after ten seconds, `wait` answered `code: None`, which reads as an
+exit.
+
+**Solution.** A successful `kill` aborts the copying task, so `wait` goes
+straight to polling `inspect_exec`, and stdout ends after what was already
+copied. Both sandboxes now return from `wait` after `kill` whether stdout
+was read or not, with a unit test for each (the Docker one against a fake
+daemon) and `docker_kill_then_wait_returns_with_stdout_unread` against a
+real daemon. A process still running ten seconds after its output ended is
+now a `SandboxError::Docker` for `inspect exec`.
 
 ### Agent-writable directories are given to the sandbox user
 
@@ -3311,6 +3427,11 @@ can't, and reqwest adds one.
   nothing (`no_gzip` and friends, in case a feature elsewhere in the
   workspace enables them), and honors the system proxy settings like `auth`'s
   client does.
+- A placeholder in a header other than the credential header, or in the
+  body, is forwarded as it came, on purpose: that is the plan's "every other
+  header untouched", and `never_substitutes_in_body` tests it. Upstream sees
+  only a placeholder, which is useless anywhere but from the bound sandbox
+  IP through this proxy.
 
 ### Streaming needs reqwest's `stream` feature
 
@@ -3728,6 +3849,23 @@ turn when it has no answer. The trait's rustdoc lists every lookup `route`
 may make for an event, in order, so T23 knows what to load, and T23's and
 T27's plan text say what they fill.
 
+### An unanswered `member_for` made the owner a stranger
+
+**Issue.** Review found that `member_for` still failed open. It returned
+`Option<MemberId>`, so the router could not tell "this identity belongs to
+no member" from "the view didn't load it". If T23's view missed the owner's
+own key, or turned a store error into `None`, the owner was not the owner:
+their DM ran on the community key, in the `Dm` scope on the public side.
+
+**Solution.** `member_for` returns `Option<Option<MemberId>>`, like
+`is_banned`: `Some(None)` is a stranger and `None` refuses with
+`PolicyUnavailable`, after the paused check and before the ban check. A
+hop asks only when its attribution recorded no member. A store-backed view
+must map a store error to `None`, never to `Some(None)`. The test of the
+thread-starter half of the hop billing rule now attributes the thread root
+to the linked owner's turn, so billing the thread starter would run on the
+owner's credential instead of giving the link prompt.
+
 ## T28: Slack ingress
 
 ### The manager binding needs a `BindingId`
@@ -3792,6 +3930,10 @@ lowercased (the verifier accepts either hex case, so an uppercased copy would
 otherwise pass), under `slack:<binding>:request`. Slack doesn't retry them, so
 a second copy is never legitimate. Timestamps are also refused when more than
 five minutes in the future, not only in the past.
+
+That Slack never retries an interactivity payload is unverified live. A
+retry would be signed again with a new timestamp, so its signature differs
+and it would run twice. T31's live check records whether Slack retries one.
 
 ### Current Slack apps post without a subtype
 
@@ -4009,6 +4151,16 @@ an error never carries arbitrary response text. `already_reacted` from
 A non-2xx status other than 429 is `Api("HTTP <status>")`, an unreadable
 body is `Transport`, and redirects are never followed. Transport errors drop
 the request URL, so a `response_url` or upload URL can't leak through one.
+
+Review found that a non-2xx answer whose body carries an `ok: false` code,
+such as HTTP 400 with `invalid_arguments`, lost the code, while
+`respond_ephemeral` already read it. Such a code now goes through the same
+sanitizing and `map_error`; only a non-2xx answer without one is
+`Api("HTTP <status>")`. A 429 from a presigned upload URL, which had been
+`Api("the file upload was refused (HTTP 429)")`, is now `RateLimited` with
+its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
+is not a Web API method, so it has no bucket, and the caller can retry the
+whole upload, which shared nothing.
 
 ### Names two members share
 
