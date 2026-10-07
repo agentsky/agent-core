@@ -1998,6 +1998,12 @@ Deliverables:
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
+- Slack sends `&`, `<` and `>` in message and slash command text as
+  `&amp;`, `&lt;` and `&gt;`. The ingress passes that text on as Slack sent
+  it, and the Slack surface decodes the three entities before any of it
+  reaches `commands::parse` (T30), which works on plain text: otherwise a
+  persona typed as `You & me` arrives as `You &amp; me`. Mention and link
+  tokens parse either way.
 - `testkit::slack`: request signing helpers and payload fixtures.
 
 Acceptance:
@@ -2055,6 +2061,11 @@ handling, and that `render` converts and splits through `render`, so that
 nor `parse: full`. Slack returns HTTP 200 with `ok: false` on errors; test
 that mapping.
 
+Live check (manual, recorded in the PR): post a reply whose Markdown has `|`
+inside a link label, such as `[a | b](https://x.io)`, which `render` sends
+as `<https://x.io|a | b>`, and confirm Slack shows the whole label `a | b`
+linking to `https://x.io`.
+
 ### T30
 
 **Slack manager app and configuration token.** Branch
@@ -2081,6 +2092,10 @@ Deliverables:
 - Manager DMs on Slack work as on Rocket.Chat: the whole text is parsed as a
   command. Files attached there feed `persona` (T14's upload rule) and
   `skill add` (T25), downloaded with the manager's bot token.
+- The `&amp;`, `&lt;` and `&gt;` entities in slash command and manager-DM
+  text are decoded before `commands::parse` sees it (the contract in the
+  `commands` crate docs), with a test that `persona <name> You & me` sets
+  the persona `You & me`.
 - `/agent slack-token <token> <refresh>`, for linked members on Slack.
   - Validate the token with `auth.test` on the tooling API, or by calling
     `tooling.tokens.rotate` at once, which also proves the refresh token works.
