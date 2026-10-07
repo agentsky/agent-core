@@ -2636,8 +2636,11 @@ straight to polling `inspect_exec`, and stdout ends after what was already
 copied. Both sandboxes now return from `wait` after `kill` whether stdout
 was read or not, with a unit test for each (the Docker one against a fake
 daemon) and `docker_kill_then_wait_returns_with_stdout_unread` against a
-real daemon. A process still running ten seconds after its output ended is
-now a `SandboxError::Docker` for `inspect exec`.
+real daemon. A process still running ten seconds after its output ended or
+it was killed is now a `SandboxError::Docker` for `inspect exec`. `wait`
+awaits the copying task where it is stored rather than taking it out first,
+so a `wait` that is cancelled, for example by a timeout, leaves the task for
+a later `kill` to abort; a unit test cancels a `wait` and then kills.
 
 ### Agent-writable directories are given to the sandbox user
 
