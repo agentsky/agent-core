@@ -529,6 +529,31 @@ fn bare_urls() {
                 "<https://x.io/~~a~~/b>",
             ),
             (
+                "an anchor ending in underscore bold",
+                "https://docs.python.org/3/reference/datamodel.html#object.__init__",
+                "<https://docs.python.org/3/reference/datamodel.html#object.__init__>",
+            ),
+            (
+                "a path and an anchor ending in underscore bold",
+                "https://docs.python.org/3/library/__main__.html#module-__main__",
+                "<https://docs.python.org/3/library/__main__.html#module-__main__>",
+            ),
+            (
+                "a path ending in underscore emphasis",
+                "https://x.io/_a_",
+                "<https://x.io/_a_>",
+            ),
+            (
+                "a path ending in star emphasis",
+                "https://x.io/*a*",
+                "<https://x.io/*a*>",
+            ),
+            (
+                "a path ending in strikethrough",
+                "https://x.io/~~a~~",
+                "<https://x.io/~~a~~>",
+            ),
+            (
                 "emphasis closing where the source URL goes on",
                 "*see https://x.io/a*b",
                 "*see <https://x.io/a>*b",
