@@ -1069,7 +1069,7 @@ fn wire_broadcast(text: &str, at: usize) -> Option<(usize, &str)> {
 
 /// Finds a bare `http://` or `https://` URL at byte offset `at`, trimmed of
 /// trailing punctuation the way qm-core's `trimUrlTail` does, except that
-/// `*`, `_` and `~` stay.
+/// a run of `*`, `_` or `~` stays when the URL holds the same mark earlier.
 fn bare_url(text: &str, at: usize) -> Option<&str> {
     let rest = &text[at..];
     let scheme = ["https://", "http://"]
@@ -1094,28 +1094,37 @@ fn ends_url(c: char) -> bool {
 
 /// Drops trailing punctuation, and closing brackets that have no opening
 /// partner inside the URL, so `(see https://x.io/a).` keeps `)` and `.` out.
-/// Formatting marks are kept: the Markdown parser has already taken every
-/// one that formats, so one still in the text is part of the URL, as in
-/// `…#object.__init__`.
+/// A trailing run of `*`, `_` or `~` is treated like such a bracket: it
+/// stays only when the same mark appears earlier in the URL after its
+/// scheme, as in `…#object.__init__` or `/~~a~~`, and is dropped otherwise,
+/// as a footnote star, an escaped mark or a stray closer is, so
+/// `(https://x.io/a).*` keeps `).*` out.
 fn trim_url_tail(url: &str) -> &str {
     const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+    let body = url.find("://").map_or(0, |at| at + 3);
     let mut unmatched = PAIRS.map(|(open, close)| {
         url.matches(close).count() as isize - url.matches(open).count() as isize
     });
     let mut end = url.len();
     while let Some(c) = url[..end].chars().next_back() {
-        let drop = match PAIRS.iter().position(|&(_, close)| close == c) {
-            Some(pair) if unmatched[pair] > 0 => {
-                unmatched[pair] -= 1;
-                true
+        let next = if let Some(pair) = PAIRS.iter().position(|&(_, close)| close == c) {
+            if unmatched[pair] <= 0 {
+                break;
             }
-            Some(_) => false,
-            None => matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"'),
-        };
-        if !drop {
+            unmatched[pair] -= 1;
+            end - c.len_utf8()
+        } else if matches!(c, '*' | '_' | '~') {
+            let run = url[..end].trim_end_matches(c).len();
+            if url.get(body..run).is_some_and(|before| before.contains(c)) {
+                break;
+            }
+            run
+        } else if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"') {
+            end - c.len_utf8()
+        } else {
             break;
-        }
-        end -= c.len_utf8();
+        };
+        end = next;
     }
     &url[..end]
 }
