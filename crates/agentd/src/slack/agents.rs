@@ -38,13 +38,17 @@
 //! scopes, request URLs, install and whatever its owner changed stay as
 //! they are. Each update is claimed for [`MANIFEST_UPDATE_LEASE`], an hour,
 //! so one that fails is tried again an hour later, and one whose owner has
-//! no usable token waits for one; registering one ends the leases. An app
-//! Slack says is gone, whose manifest subscribes to no bot events, or whose
-//! update Slack refuses for good (any refusal but the token's, a rate
-//! limit or Slack failing to answer), is blocked at the version: no update
-//! to it is tried again. `/agent me`
-//! lists the owner's agents still on an older manifest, and which of them
-//! agentd can't update.
+//! no usable token, or whose token Slack refused, waits for one. An app
+//! Slack says is gone ([`SurfaceError::NotFound`]), whose manifest
+//! subscribes to no bot events, or whose update Slack refuses with
+//! [`SurfaceError::Forbidden`] is blocked at the version: no update to it
+//! is tried again. Any other failure, such as a rate limit, Slack failing
+//! to answer, `invalid_manifest`, an unknown code or an HTTP error without
+//! one, is tried again an hour later. An owner registering a new
+//! configuration token ends the leases and lifts the blocks of their apps'
+//! updates in that team only, since a block may have been the old token's
+//! doing. `/agent me` lists the owner's agents still on an older manifest,
+//! and which of them agentd can't update.
 //!
 //! # Channels that change id
 //!
