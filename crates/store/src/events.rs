@@ -92,7 +92,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_marks_let_one_caller_through() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let (a, b, c, d) = tokio::join!(
             store.mark_event_processed("rocketchat", "m1"),

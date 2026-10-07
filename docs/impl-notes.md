@@ -1261,3 +1261,373 @@ alphabet, printable ASCII other than `#`, `&`, `?`, `=` and `|`, so
 fragment and no `code=` (`https://x.io/r#main`) doesn't, since the login
 reads a URL only by its query. Any other `word#word` does, so `PR#42` is a
 false positive the rule accepts.
+
+## T11: Rocket.Chat REST
+
+Server behavior below was read from the Rocket.Chat source on `develop`
+(commit `fad30ab`, 8.8.x), where the REST API lives in
+`apps/meteor/server/api/`, and checked against the 7.0.0 and 7.10.0 tags,
+where it lives in `apps/meteor/app/api/server/`. On 2026-10-02 it was checked
+against a live Rocket.Chat 7.13.9 Community Edition server; see
+[The live check against 7.13.9](#the-live-check-against-7139) for what held,
+what didn't, and the roles the manager needs.
+
+### `rooms.upload` is gone in Rocket.Chat 8.0
+
+**Issue.** The plan names `rooms.upload/{rid}`. Rocket.Chat 8.0 removed it
+(RocketChat/Rocket.Chat#36857 in `apps/meteor/CHANGELOG.md`). Its
+replacement, `rooms.media/{rid}` followed by
+`rooms.mediaConfirm/{rid}/{fileId}`, exists from 7.0 on. On 7.x,
+`mediaConfirm` passes its whole body, less `description`, as `msgData` to
+`sendFileMessage`, whose `check` rejects unknown keys, so `fileName` (which
+8.x accepts and strips) breaks a 7.x upload.
+
+**Solution.** `RestClient::upload` uses the two-step endpoints on every
+version: a multipart `file` part carrying the name and a MIME type guessed
+from the extension, then a confirm whose body is `{}` or `{"tmid": …}`.
+`FakeRest` refuses confirm keys 7.x refuses. The T11 bullet in the plan now
+names these endpoints.
+
+### `users.createToken` needs a server secret, and its token expires
+
+**Issue.** The plan says recent servers refuse `users.createToken` unless
+started with `CREATE_TOKENS_FOR_USERS=true`. That was 6.x and 7.x, where the
+endpoint was deprecated. Since 8.0 it takes a `secret` that must equal the
+server's `CREATE_TOKENS_FOR_USERS_SECRET` environment variable, and the
+caller needs `user-generate-access-token` for another user, which only
+`admin` has by default (`apps/meteor/server/meteor-methods/auth/createToken.ts`,
+`apps/meteor/server/lib/authorization/constant/permissions.ts`). It also
+returns a login (resume) token, which expires after `Accounts_LoginExpiration`
+(90 days by default) and counts against the user's login-token limit.
+
+**Solution.** Use the other route, which works for a manager with only the
+roles the design gives it: `RestClient::issue_bot_token` logs in as the bot
+with its random password (`POST login`), calls
+`users.generatePersonalAccessToken`, then
+`POST logout`s the login session. A personal access token doesn't expire. The
+manager needs no permission for this step. The password is generated in
+`create_bot_user`, held in a `BotPassword` that can't be cloned or
+serialized, and consumed by `issue_bot_token`.
+
+### The token route needs care around two-factor authentication
+
+**Issue.** Three server behaviors get in the way of the login route:
+
+- `users.generatePersonalAccessToken` is `twoFactorRequired`
+  (`apps/meteor/server/api/v1/users.ts`). `checkCodeForUser`
+  (`apps/meteor/server/lib/2fa/code/index.ts`) lets it through without a
+  code only within `Accounts_TwoFactorAuthentication_RememberFor` (1800 s)
+  of the user's creation, and only while the user has no 2FA method.
+  Otherwise, with `Accounts_TwoFactorAuthentication_Enforce_Password_Fallback`
+  on (the default), it wants `x-2fa-method: password` and
+  `x-2fa-code: <sha256 hex of the password>`.
+- With 2FA, email 2FA and `Accounts_TwoFactorAuthentication_By_Email_Auto_Opt_In`
+  on (all defaults), every new user gets email 2FA enabled
+  (`apps/meteor/server/lib/auth/startup.js`). It takes effect once the user
+  has a verified email (`EmailCheck.isEnabled`). Then the password login
+  itself asks for an emailed code (`apps/meteor/server/lib/2fa/loginHandler.ts`
+  passes `disablePasswordFallback`), and the token endpoint picks email over
+  the password fallback.
+- `users.create` requires `email` (`packages/rest-typings/src/v1/users/UserCreateParamsPOST.ts`).
+
+**Solution.** The bot is created with `verified: false` (the plan listed
+`verified` without a value), so email 2FA never applies to it, and
+`issue_bot_token` always sends the password-fallback headers, which the server
+ignores when it doesn't need them. The token is created with
+`bypassTwoFactor: true`: once the password is discarded the bot has no second
+factor at all, so without it every 2FA-gated endpoint would fail for the bot
+after the 30-minute grace period, and anyone holding the token can already act
+as the bot. The caller supplies the email; T14 has to pick an address
+(`<name>@<something>.invalid` passes the default checks). With
+`Accounts_EmailVerification` on (off by default), password login refuses
+unverified emails (`validateLoginAttempt` in `startup.js`; live, HTTP 401
+`error-invalid-email`, which the client reports as `Unauthorized`, though the
+saved logs don't keep that answer), so such a server needs email 2FA auto
+opt-in off and `verified: true`.
+
+### What the server source says about the manager's custom role
+
+**Issue.** The design leaves the custom role open. The source narrows it
+down, and the live check confirmed the rows agentd relies on (see
+[The live check against 7.13.9](#the-live-check-against-7139)). It didn't
+exercise `users.create` with `active` (agentd never sends it), the
+`manage-moderation-actions` alternative for `users.setActiveStatus`,
+`assign-admin-role` or `Accounts_AllowUserAvatarChange`; those rows rest on
+the source alone:
+
+| Operation | Permission checked | Where |
+| --- | --- | --- |
+| `users.create` | `create-user`; `assign-admin-role` only if `roles` contains `admin`. No `assign-roles`, no edit-user permission (RocketChat/Rocket.Chat#7351 no longer applies). | `apps/meteor/server/lib/users/saveUser/validateUserData.ts` |
+| `users.create` with `active` | also `edit-other-user-active-status` (so `active` is never sent) | `executeSetUserActiveStatus`, called from `users.create` in `apps/meteor/server/api/v1/users.ts` |
+| bot token (login route) | none for the manager; the bot needs `create-personal-access-tokens`, which defaults to `admin` and `user` only, so the admin must add it to the `bot` role | `apps/meteor/imports/personal-access-tokens/server/api/methods/generateToken.ts`, `permissions.ts` |
+| `users.setActiveStatus` | `edit-other-user-active-status` or `manage-moderation-actions` | `users.ts` |
+| `users.update` of another user | `edit-other-user-info`; the endpoint is also `twoFactorRequired`, so the manager's personal access token must be created with "Ignore Two Factor Authentication" | `validateUserData.ts`, `users.ts` |
+| `users.setAvatar` of another user | `edit-other-user-avatar`; a bot may set its own while `Accounts_AllowUserAvatarChange` is on (default) | `users.ts` |
+| `channels.invite`, `groups.invite` | `add-user-to-joined-room` in a room the manager is in, else `add-user-to-any-c-room` or `add-user-to-any-p-room` | `apps/meteor/server/meteor-methods/rooms/addUsersToRoom.ts` |
+
+**Solution.** Recorded here for T14's live check and README. The minimal
+role for create is `create-user`, plus the one-time admin change that grants
+`create-personal-access-tokens` to `bot`. Delete (T14) adds
+`edit-other-user-active-status`. The manager is subject to the REST rate
+limiter (10 calls per route per minute per IP by default; `bot` bypasses it
+through `api-bypass-rate-limit`), so the role should include
+`api-bypass-rate-limit` once the manager bot posts DMs (T13). The live check
+settled the design's open question.
+
+### `x-ratelimit-reset` is an absolute time in milliseconds
+
+**Issue.** The header isn't a delay: `enforceRateLimit`
+(`apps/meteor/server/api/ApiClass.ts`) sets it to `Date.now() + timeToReset`.
+The body is `{"success": false, "error": "… [error-too-many-requests]"}`
+without `errorType`. Meteor's DDP rate limiter, which guards `login`, instead
+surfaces through the login route as HTTP 401 with `error: "too-many-requests"`
+and no header.
+
+**Solution.** The wait is the header minus the response's `Date` (at first
+the local clock; see
+[Clock skew defeated the 429 retry](#clock-skew-defeated-the-429-retry)),
+floored at zero, and one second when the header is missing or unreadable. A 429, or either
+code in any status, is retried once when the wait is at most
+`with_max_retry_wait` (61 s by default, the server's default window plus a
+second; see [Clock skew defeated the 429 retry](#clock-skew-defeated-the-429-retry));
+otherwise, or on a second limit, the call fails with
+`SurfaceError::RateLimited`. The 429 is raised before the endpoint runs, so
+retrying a POST can't apply it twice.
+
+### Error bodies put the code in different places
+
+**Issue.** Meteor errors arrive as `error: "<reason> [<code>]"` plus
+`errorType: "<code>"`. `API.v1.failure("<code>")` sends the code as `error`
+with no `errorType`, `rooms.info` swaps them (`error: "not-allowed"`,
+`errorType: "Not Allowed"`), and the permissions middleware sends 403 with
+only `error: "… [error-unauthorized]"`. `error-unauthorized` thrown by a
+handler becomes 403 today but 401 from 9.0 (`applyBreakingChanges` in
+`ApiClass.ts`), the status that otherwise means a rejected token.
+
+**Solution.** `map_error` collects candidate codes from `errorType`, a
+space-free `error`, and a trailing `[code]`, and matches them against
+permission codes (`Forbidden`) and missing-object codes (`NotFound`) before
+looking at the status, so only a 401 without such a code means
+`Unauthorized`. On a 401 a bare `error` isn't read as a code, since
+`API.v1.unauthorized()` sends `error: "unauthorized"` for a rejected login.
+Everything else is
+`Api` with the server's description, cut to 200 characters. A body with
+`success: false` is an error even on 200. A success body of the wrong shape
+reports serde's error category and column, never the value, so message text
+can't leak into the error.
+
+### Smaller server behaviors the client works around
+
+- `chat.react` toggles when `shouldReact` is absent
+  (`apps/meteor/server/lib/messaging/reactions/setReaction.ts`), so a second
+  `:eyes:` would remove the first. The client always sends `shouldReact: true`.
+- `groups.history` includes thread replies unless `showThreadMessages=false`;
+  `channels.history` and `im.history` exclude them unless it is `true`. The
+  client always sends `false`, and `inclusive=false`.
+- `latest` is parsed with JavaScript's `new Date`, and messages carry
+  millisecond timestamps, so the client formats it like `toISOString`.
+- `chat.postMessage` with a `roomId` joins a public channel the poster isn't
+  in (`getRoomByNameOrIdWithOptionToJoin` with `joinChannel: true` in
+  `apps/meteor/server/lib/messages/processWebhookMessage.ts`). T12 and T23
+  should expect a bot to join a channel it posts to.
+- `chat.getThreadMessages` has no `latest`. The client asks for newest first
+  (`sort={"ts":-1}`) and pages by `offset`; `aroundId` exists only on newer
+  servers. To turn a `Cursor` (a message id) into a `latest` time for the
+  top level, the client also has `chat.getMessage`, which the plan didn't
+  list.
+
+### Clock skew defeated the 429 retry
+
+**Issue.** `x-ratelimit-reset` is the server's `Date.now()` plus the time to
+reset, so subtracting the local clock folds in any skew between the two
+hosts. With the local clock more than a minute behind the server's, the wait
+exceeded `with_max_retry_wait` and a call that would have succeeded a
+second later failed with `RateLimited`; with it ahead, the client retried at
+once and hit the limit again.
+
+**Solution.** The wait is the reset minus the response's own `Date` header,
+which the server (Node's `http` sets it on every response) or a proxy in
+front of it writes from a clock that is at worst next to the server's. It is
+parsed as RFC 7231's IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) with the
+`time` crate; the obsolete RFC 850 and asctime forms, which no current server
+sends, count as unreadable. A missing or unreadable `Date` falls back to the
+local clock, and the bounded maximum still applies. `Date` has whole seconds,
+so the wait can come out up to a second longer than the server's, never
+shorter. The default maximum is therefore 61 seconds, not the window's 60:
+live, a burst that hits the limit sees a reset about 60 s away, and with
+`Date` truncated the wait measured 60.13 s, which a 60 s maximum refused.
+`FakeRest::rate_limit_at` sends a 429 from a skewed server clock, with a
+`Date` in whole seconds and a reset measured from it.
+
+### Uploads are capped and read once
+
+**Issue.** `upload` read the whole file into memory with no limit, and read
+it again for the retry after a 429. The file comes from an agent's session,
+so its size is whatever the agent wrote, and a path to a device such as
+`/dev/zero` would read until memory ran out.
+
+**Solution.** `RestClient::with_max_upload_size` sets a limit, 100 MiB by
+default, which is Rocket.Chat's default `FileUpload_MaxFileSize`
+(`apps/meteor/server/settings/file-upload.ts`); a server with a lower limit
+still refuses with its own error. Before reading, the file's metadata must
+show a regular file within the limit, else the call fails with
+`SurfaceError::Api` naming the size and the limit, and nothing is sent. The
+read itself stops after limit + 1 bytes, so a file that grows after the check
+can't take more memory than that and is refused too. The bytes are read once
+into `Bytes`, and each attempt's multipart part is a cheap clone of them.
+Streaming the file instead would need reqwest's `stream` feature and
+`tokio-util`, would reopen and reread the file for the retry (which could
+then send different content), and would send a malformed body if the file
+changed size after its length was declared; with the cap, reading into memory
+is bounded and simpler.
+
+### The live check against 7.13.9
+
+**Setup.** On 2026-10-02, `rocketchat/rocket.chat:7.13.9` and `mongo:7.0` as
+a one-node replica set, started like the T16 Compose file but with only those
+two services, the admin created from `ADMIN_USERNAME`/`ADMIN_PASS`. The server
+is the Community Edition: `licenses.info` lists no active modules. An ignored
+integration test, not committed, drove `RestClient` for every method; the
+admin's steps (`permissions.update`, rooms, integrations) and the raw bodies
+below were plain REST calls.
+
+**Custom roles need an Enterprise license.** `roles.create` answers HTTP 400
+`{"success":false,"error":"This is an enterprise feature [error-action-not-allowed]","errorType":"error-action-not-allowed"}`,
+and so does `roles.update` on the built-in `bot` role. `users.create` with a
+role id that doesn't exist fails with `The field Roles consist invalid role id
+[error-action-not-allowed]` (`details.action: "Assign_role"`). On the
+Community Edition the only lever is which built-in roles hold a permission.
+
+**The role.** The manager holds the built-in roles `bot` and `app`, the
+manager's extra permissions are added to `app`, and `create-personal-access-tokens`
+is added to `bot`. `app` is a global built-in role whose other holders are
+Apps-Engine app users, which have no password or token to call the REST API
+with. Nothing in the 7.13.9 server treats the role specially beyond its default
+permissions, which already include all of `bot`'s, `api-bypass-rate-limit`
+among them. Adding the permissions to `bot` instead would give them to every
+bot in the workspace, agentd's agents and other integrations alike, and the
+`livechat-*`, `guest` and `anonymous` roles carry omnichannel or guest
+behavior. With an Enterprise license the same permissions go on a custom role.
+Every row below was run with the permission missing, then present:
+
+| What agentd does | Endpoint | Permission, on the manager unless noted | Without it (HTTP, body, client error) |
+| --- | --- | --- | --- |
+| The manager's own token | `users.generatePersonalAccessToken` | `create-personal-access-tokens` on a role it holds (`bot`) | 400 `Not Authorized [not-authorized]`, `Forbidden("not-authorized")` |
+| Create a bot | `users.create` with `roles: ["bot"]` | `create-user` only: no `assign-roles`, no `edit-other-user-info` | 400 `Adding user is not allowed [error-action-not-allowed]`, `Forbidden` |
+| The bot's token | `login`, `users.generatePersonalAccessToken`, `logout` | none on the manager; `create-personal-access-tokens` on `bot` | 400 `not-authorized`, `Forbidden`; the bot user stays behind |
+| Deactivate, reactivate | `users.setActiveStatus` | `edit-other-user-active-status` | 403 `User does not have the permissions required for this action [error-unauthorized]`, `Forbidden("error-unauthorized")` |
+| Invite into a room the manager is in | `channels.invite`, `groups.invite` | `add-user-to-joined-room` (default: `owner`, `moderator`, not a plain member) | 400 `Not allowed [error-not-allowed]`, `Forbidden` |
+| Invite into another room | same | `add-user-to-any-c-room`, `add-user-to-any-p-room` | the same |
+| Read another user's roles | `users.info` | `view-full-other-user-info` | 200 with no `roles` field (only `_id`, `active`, `avatarETag`, `canViewAllInfo`, `name`, `status`, `type`, `username`, `utcOffset`) |
+| Rename another user | `users.update` | `edit-other-user-info`, and a token that bypasses 2FA | 400 `Editing user is not allowed [error-action-not-allowed]`, `Forbidden` |
+| Another user's avatar | `users.setAvatar` | `edit-other-user-avatar` | 403 `{"error":"unauthorized"}`, `Forbidden("unauthorized")` |
+| Room details | `rooms.info` | none for a public room or one it is in | private room it isn't in: 400 `error: "not-allowed"`, `Forbidden`; unknown: `NotFound("error-room-not-found")` |
+| Open a DM | `im.create` | `create-d` (`bot` has it) | |
+| Not be rate limited | every call | `api-bypass-rate-limit` (`bot` and `app` have it) | twelve `me` calls in a row passed |
+
+A bot renames itself and sets its own avatar with its own token and no
+permission, so agentd needs `edit-other-user-info` and `edit-other-user-avatar`
+only if the manager edits bots. The Community Edition recipe is therefore: the
+manager holds `bot` and `app`; `app` gains `create-user`,
+`edit-other-user-active-status`, `add-user-to-joined-room` and
+`view-full-other-user-info`; `bot` gains `create-personal-access-tokens`.
+`users.create`'s answer shows the new user's `roles` only to a caller with
+`view-full-other-user-info` (otherwise `[]`), so nothing should read the
+role from it.
+
+**Two-factor authentication.** A personal access token made without "Ignore
+Two Factor Authentication" passes 2FA-gated endpoints only during the
+registration grace (`Accounts_TwoFactorAuthentication_RememberFor`, 1800 s
+after the user's creation). With the grace cut to one second, `users.update`
+and `users.generatePersonalAccessToken` answered 400 `TOTP Required
+[totp-required]` (`details.method: "password"`) for such a token and for a
+login session without the `x-2fa-*` headers, while a token with the bypass
+passed. The manager's token must be created with the bypass. With a verified
+email and default settings, the password login itself answers 401
+`totp-required` with `method: "email"`, which is why bots are created with
+`verified: false`. These refusals were seen during the run but the saved
+logs don't keep them: they hold only the within-grace success
+(`users.update name (manager PAT without bypass): ()`). They match the
+server source, and a rerun should save them.
+
+**A workspace that can't reach Rocket.Chat Cloud can't post.** 7.13.9 restricts
+a Community Edition workspace that hasn't reported statistics to
+`collector.rocket.chat` within ten days, and one that never has (no stats
+token) from its first start (`AirGappedRestriction` in `@rocket.chat/license`,
+applied by `ee/server/patches/airGappedRestrictionsWrapper.ts`; any valid
+license lifts it). The test container's egress allowed no Rocket.Chat Cloud
+host, so `Cloud_Workspace_AirGapped_Restrictions_Remaining_Days` read 0 and
+`chat.postMessage`, `chat.update` and `rooms.mediaConfirm` answered 400
+`{"success":false,"error":"restricted-workspace"}`, which the client reports
+as `Api("restricted-workspace")`. Reads, reactions, invites and user
+management were unaffected. A deployment on the Community Edition needs
+outbound HTTPS to Rocket.Chat Cloud's statistics collector, or a license.
+Posting, editing and the upload's confirm step were therefore not run end to
+end. `rooms.media` itself accepted the client's multipart upload (stored
+complete, expiring after 24 hours unless confirmed). The messages the read
+paths were checked against were posted as the bot and the manager through
+incoming webhooks, which 7.13.9 doesn't restrict and which run the same
+`sendMessage` as `chat.postMessage`.
+
+**What held.** `chat.react` with `shouldReact: true` twice left one `:eyes:`
+reaction, with and without colons. `chat.getThreadMessages` returned the
+replies newest first without the root; an unknown root is
+`NotFound("error-invalid-message")`. `channels.history`, `groups.history` and
+`im.history` returned top-level messages only, newest first, and `latest` set
+to a message's `ts` left that message out. A room the bot isn't in is
+`Forbidden("unauthorized")` (public) or `NotFound("error-room-not-found")`
+(private); `chat.getMessage` there is `Forbidden("error-not-allowed")`, and
+`chat.react` `Forbidden("not-authorized")`. A wrong token is 401 `You must be
+logged in to do this.`, `Unauthorized`. A taken username is
+`Api("… is already in use :( [error-field-unavailable]")`. REST messages
+carry `ts` as ISO 8601 with milliseconds, `u` with `_id`, `username` and
+`name`, `mentions[]` with `_id`, `username`, `name` and `type`, and system
+messages `t` (`au` with the added username as `msg`).
+
+**What didn't, and was fixed.**
+
+- `im.create` with a username it doesn't know, including one that differs
+  only in case, answers success with the caller's self-DM
+  (`{"room":{"t":"d","usernames":["admin"],…},"success":true}`), so
+  `create_dm` returned a room that wasn't the requested DM. It now checks that
+  the room's `usernames` include the name and otherwise fails with
+  `NotFound("error-invalid-user")`. `FakeRest` answers the same way.
+- `chat.getMessage` with an unknown id answers a bare `{"success":false}`
+  (HTTP 400, `API.v1.failure()`), which mapped to `Api("HTTP 400")`.
+  `get_message` now maps it to `NotFound("message")`, and `FakeRest` sends that
+  body.
+- The 429 retry. With the default 60 s maximum, the client gave up on the first
+  429 of a burst: the reset was 59.9 s away and the wait measured against the
+  whole-second `Date` came to 60.13 s. The default is now 61 s; live, the same
+  call then waited out the window and succeeded.
+
+**Other shapes, for T12 to T14.**
+
+- Every response to a caller without `api-bypass-rate-limit` carries
+  `x-ratelimit-limit` (10), `x-ratelimit-remaining` and `x-ratelimit-reset` (an
+  epoch time in milliseconds). The 429 body is
+  `{"success":false,"error":"Error, too many requests. Please slow down. You must wait 60 seconds before trying this endpoint again. [error-too-many-requests]"}`,
+  with no `errorType`. `login` has no caller to exempt, so it is limited per
+  client address like any route: a burst of logins from one host, the bots'
+  token logins included, gets the same 429.
+- A message from a user without `mention-all` or `mention-here` (`bot` has
+  neither) that contains `@all` or `@here` is refused whole with
+  `error-action-not-allowed`, not stripped, so the neutralizing in `render`
+  is required, not cosmetic.
+- `users.setAvatar` from a URL refuses private addresses
+  (`checkUrlForSsrf`): `http://172.18.0.1:8765/avatar.png` got
+  `Api("Invalid avatar URL: … [error-avatar-invalid-url]")`, while a public
+  `https` image worked. The server also refuses redirects and anything not
+  `image/*`. T14 needs a public avatar URL.
+- The messages posted through integrations carried `bot` (`{"i":
+  "<integration id>"}`). Whether a bot user's own `chat.postMessage` does
+  could not be checked, so the sender's `bot` role stays the reliable signal.
+- Realtime, over DDP on 7.13.9: `login` with `resume` returns `id`, `token`,
+  `tokenExpires` and `type: "resume"`; the server pings every 30 s;
+  `stream-room-messages` sends `ts` and `_updatedAt` as `{"$date": ms}`; a
+  thread reply makes the server send the root again, same `_id`, with
+  `tcount`, `replies` and `tlm` and no `editedAt`. `__my_messages__` delivered
+  messages from a joined channel and a DM, each with a second argument such as
+  `{"roomParticipant":true,"roomType":"c","roomName":"…"}`.
+  `<uid>/subscriptions-changed` sent `inserted` when a DM or channel was
+  created with the user and `updated` on new messages.
