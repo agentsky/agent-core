@@ -27,12 +27,15 @@ compiler (and `cmake` on some targets), which the GitHub Ubuntu runners have.
 Consequences:
 
 - The workspace declares reqwest with `default-features = false` and only
-  `json`. Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
+  `json`, `form` and `query` (reqwest 0.13 made `form` and `query` opt-in
+  features). Crates that talk HTTPS add the `rustls` feature. `agentctl` talks
   plain HTTP to `agentctl.internal` and doesn't, so its static musl build
   stays free of C code.
 - T02's license policy has to allow the `OpenSSL` license for `aws-lc-sys`
   (its expression is `ISC AND (Apache-2.0 OR ISC) AND OpenSSL`) as a
-  per-crate exception.
+  per-crate exception. (Superseded: current `aws-lc-sys` releases no longer
+  use that license; see
+  [T02](#aws-lc-sys-no-longer-needs-an-openssl-exception).)
 - The plan's Libraries table and T02 are updated to match.
 
 ### cargo-llvm-cov ignores `default-members`
@@ -165,7 +168,10 @@ concurrency group of their own: in `main`'s group, where
 `cancel-in-progress` is false, a scheduled run arriving while a push run is
 pending would cancel that pending run, and its badges would not be
 published. GitHub runs schedules on the default branch only, so the trigger
-takes effect once this workflow is on `main`.
+takes effect once this workflow is on `main`. GitHub also disables
+`schedule` triggers in a public repository after 60 days without repository
+activity, so on a quiet repository the weekly advisory run can stop and has
+to be re-enabled from the Actions tab.
 
 ## T03: core-types
 
@@ -627,6 +633,21 @@ Slack's `*` right back next to the URL.
 trailing punctuation and unmatched closing brackets left outside, as qm-core's
 `trimUrlTail` does. Link labels and code are not scanned. `www.` addresses are
 still left to Slack. The T06 bullet in the plan now says so.
+
+### Emphasis inside a bare URL cut the link
+
+**Issue.** CommonMark reads `_…_`, `__…__`, `*…*` and `~~…~~` inside a URL's
+path as emphasis, so pulldown-cmark splits the URL's text around it, and a
+scan of one text node linked only the part before:
+`see https://docs.python.org/3/library/__main__.html` became
+`see <https://docs.python.org/3/library/>*main*.html`. qm-core's regex pass
+kept such URLs whole.
+
+**Solution.** While parsing, the renderer measures each bare URL in the source
+from where a text node starts it. Emphasis or strikethrough with a delimiter
+inside such a range is replaced by its children, with its delimiters as
+text, so the URL is one text run again and is linked whole. Markup that only
+wraps a URL, as in `*https://x.io/#/y*`, is not touched.
 
 ### CommonMark disagrees with some qm-core regex cases
 
