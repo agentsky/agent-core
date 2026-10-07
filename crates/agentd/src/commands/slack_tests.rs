@@ -1845,6 +1845,118 @@ fn click(user: &str, action: &str, value: &str, response_url: SecretString) -> I
     }
 }
 
+/// A consent of `helper`, owned by U0OWNER, asked for by U0BOB, whose card
+/// was sent and which the owner then approved.
+async fn approved_with_a_card(h: &SlackHarness) -> core_types::ConsentId {
+    let owner = h.linked("U0OWNER").await;
+    let bob = h.linked("U0BOB").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let id = core_types::ConsentId::new_v4();
+    let now = OffsetDateTime::now_utc();
+    h.store
+        .create_consent(
+            &store::NewConsent {
+                id,
+                agent: agent.id,
+                requester: &core_types::Requester {
+                    member: Some(bob),
+                    key: slack_key("U0BOB"),
+                },
+                hop: core_types::Hop::ZERO,
+                task: "Read my notes",
+                attachments_json: "[]",
+                thread: &core_types::ThreadKey {
+                    conv: slack_channel("C0CHAN001"),
+                    root: Some("1727697600.000100".into()),
+                },
+                origin_session: core_types::SessionId::new_v4(),
+                expires_at: now + time::Duration::hours(1),
+                approved_by_owner: None,
+            },
+            store::OpenLimits {
+                per_requester: 1,
+                per_agent: 1,
+            },
+            now,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.consents.send_cards(h.commands.replies()).await.unwrap(),
+        1
+    );
+    h.store
+        .decide_consent(id, true, &slack_key("U0OWNER"), now)
+        .await
+        .unwrap()
+        .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn a_card_update_that_fails_on_the_way_is_tried_again() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ok(json!({"ts": "1727700000.000100"})))
+        .mount(&h.slack)
+        .await;
+    approved_with_a_card(&h).await;
+    let close = async || h.consents.close_cards(h.commands.replies()).await.unwrap();
+    assert_eq!(close().await, 0, "the first update fails");
+    assert_eq!(close().await, 1, "and the next pass closes the card");
+    assert_eq!(close().await, 0, "once");
+    assert_eq!(h.calls("chat.update").await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_card_the_platform_refuses_to_update_is_not_tried_again() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "cant_update_message"})),
+        )
+        .mount(&h.slack)
+        .await;
+    approved_with_a_card(&h).await;
+    for _ in 0..2 {
+        assert_eq!(
+            h.consents.close_cards(h.commands.replies()).await.unwrap(),
+            0
+        );
+    }
+    assert_eq!(h.calls("chat.update").await.len(), 1);
+}
+
 #[test]
 fn only_a_consent_cards_buttons_are_commands() {
     let (url, _) = (SecretString::from("https://hooks.slack.com/actions/x"), ());
