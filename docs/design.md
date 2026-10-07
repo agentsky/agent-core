@@ -1081,9 +1081,10 @@ name, as a consent keeps its task.
 
 A fire runs at most once. The row is written as `sending` before the
 request, in a transaction that also checks the routine is still the
-member's, so a `logout` or deletion that comes first leaves nothing to fire,
-and one that comes after deletes the row; an outcome then finds no row and
-is only logged. The request is sent once and never retried; only the member,
+member's and still the registration the command read, sealed token
+included, so a `logout`, deletion or replacement that comes first, even of
+the token alone, leaves nothing to fire. A `logout` or deletion that comes
+after deletes the row; an outcome then finds no row and is only logged. The request is sent once and never retried; only the member,
 with another `cloud run`, starts another session. Commands themselves run
 once: Slack's replayed slash commands are dropped by their signature, and
 Rocket.Chat edits don't run again.
