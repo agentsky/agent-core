@@ -2700,6 +2700,7 @@ mod tests {
                 team: conv.team.clone(),
                 user: "alice".into(),
             },
+            outside: None,
             sender_is_bot: false,
             sender_bot_user: None,
             conv: conv.clone(),
