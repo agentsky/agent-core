@@ -1484,6 +1484,34 @@ mod tests {
     }
 
     #[test]
+    fn a_dm_from_an_outside_member_is_marked_outside_by_its_fields() {
+        let bot = UserId::from(testkit::slack::BOT_USER);
+        let team = TeamId::from(testkit::slack::TEAM);
+        let context = Context {
+            binding: BindingId::from_uuid(uuid::Uuid::nil()),
+            bot_user: Some(&bot),
+            team: &team,
+            home_org: None,
+            event_id: "Ev1",
+            received_at: datetime!(2026-09-30 12:00 UTC),
+        };
+        let mut dm = fixture_event(testkit::slack::MESSAGE_IM);
+        dm["user"] = json!(testkit::slack::OUTSIDE_USER);
+        dm["team"] = json!(testkit::slack::TEAM);
+        dm["user_team"] = json!(testkit::slack::OUTSIDE_TEAM);
+        dm["source_team"] = json!(testkit::slack::OUTSIDE_TEAM);
+        let event = message(&context, &dm).unwrap();
+        assert!(event.is_dm());
+        assert_eq!(event.sender.team.as_str(), testkit::slack::TEAM);
+        assert_eq!(event.sender.user.as_str(), testkit::slack::OUTSIDE_USER);
+        assert_eq!(event.outside, outside(testkit::slack::OUTSIDE_TEAM));
+
+        let home = message(&context, &fixture_event(testkit::slack::MESSAGE_IM)).unwrap();
+        assert!(home.is_dm());
+        assert_eq!(home.outside, None, "a home member's DM stays home");
+    }
+
+    #[test]
     fn an_outside_actor_with_the_installing_team_in_team_is_outside() {
         let event = in_workspace(
             &fixture_event(testkit::slack::MESSAGE_CONNECT_NO_ACTOR_TEAM),
