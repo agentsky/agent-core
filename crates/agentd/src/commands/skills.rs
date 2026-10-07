@@ -92,7 +92,8 @@ impl Commands {
                     Removed::Unconfirmed => {
                         return Ok(format!(
                             "Removed the skill `{skill}` from `{name}`. None of the hosts it asks \
-                             for had been confirmed, so its sandboxes never got to reach them."
+                             for is confirmed, so its sandboxes can't open new connections to \
+                             them."
                         ));
                     }
                     Removed::Bundled => {
