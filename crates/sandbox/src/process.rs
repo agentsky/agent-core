@@ -663,6 +663,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_after_kill_returns_although_stdout_is_unread() {
+        let dir = TempDir::new("sandbox-test");
+        let sandbox = sandbox(&dir).await;
+        let container = started(&sandbox, &dir, ScopeKey::Private).await;
+        let mut io = sandbox
+            .exec(
+                &container,
+                &argv(&["/bin/sh", "-c", "head -c 1000000 /dev/zero; sleep 30"]),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        io.child.kill().await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(10), io.child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code, Some(128 + 9));
+    }
+
+    #[tokio::test]
     async fn dropping_a_child_kills_it_before_closing_its_stdin() {
         let dir = TempDir::new("sandbox-test");
         let sandbox = sandbox(&dir).await;
