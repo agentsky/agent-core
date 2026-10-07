@@ -354,7 +354,7 @@ async fn declared_hosts_wait_for_confirmation_then_extend_the_allowlist() {
 
     assert_eq!(
         h.skills.remove(h.agent, "gh").await.unwrap(),
-        Removed::Active
+        Removed::Active { had_hosts: true }
     );
     assert!(!h.live("gh").exists());
     assert!(

@@ -1382,7 +1382,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     .await;
     assert_eq!(
         h.last_reply("alice"),
-        "Added the skill `notes` to `helper`. Its conversations use it from their next start."
+        "Added the skill `notes` to `helper`. Its files are in its sandboxes now, though a \
+         conversation already running may not use it until it next starts."
     );
     let skills = runner::skills_dir(&data, agent.id);
     assert!(skills.join("notes/SKILL.md").is_file());
@@ -1411,7 +1412,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     assert_eq!(
         h.last_reply("alice"),
         "Added the skill `gh` to `helper`. Its sandboxes may now reach `api.github.com`, and \
-         its conversations use it from their next start."
+         its files are in them now, though a conversation already running may not use it until \
+         it next starts."
     );
     assert!(skills.join("gh/SKILL.md").is_file());
     run("alice", "skill confirm helper gh", dm("alice")).await;
@@ -1437,7 +1439,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         .await;
     assert_eq!(
         h.last_reply("alice"),
-        "Added the skill `notes` to `helper`. Its conversations use it from their next start.\n\
+        "Added the skill `notes` to `helper`. Its files are in its sandboxes now, though a \
+         conversation already running may not use it until it next starts.\n\
          You gave a Git URL, so I ignored the attached file."
     );
 
@@ -1454,13 +1457,19 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     run("alice", "skill rm helper gh", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
-        "Removed the skill `gh` from `helper`. It no longer lets its sandboxes reach the hosts it \
-         asked for: a host the configuration or another skill still allows stays reachable, new \
-         connections to the others are refused, and connections open to them close within the \
-         hour. Conversations running now keep the skill until they next start."
+        "Removed the skill `gh` from `helper`, and its files are gone from its sandboxes, though \
+         a conversation already running may keep what it read of it until it next starts. It no \
+         longer lets its sandboxes reach the hosts it asked for: a host the configuration or \
+         another skill still allows stays reachable, new connections to the others are refused, \
+         and connections open to them close within the hour."
     );
     assert!(!skills.join("gh").exists());
     run("alice", "skill rm helper notes", dm("alice")).await;
+    assert_eq!(
+        h.last_reply("alice"),
+        "Removed the skill `notes` from `helper`, and its files are gone from its sandboxes, \
+         though a conversation already running may keep what it read of it until it next starts."
+    );
     run("alice", "skill rm helper notes", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
