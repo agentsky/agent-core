@@ -62,7 +62,7 @@ pub(crate) struct StoreView {
     binding: Option<(BindingId, AgentId)>,
     attribution: Option<(MsgRef, Attribution)>,
     replied: Option<(MsgRef, AgentId)>,
-    members: HashMap<MemberKey, MemberId>,
+    members: HashMap<MemberKey, Option<MemberId>>,
     linked: HashSet<MemberId>,
 }
 
@@ -138,10 +138,12 @@ impl StoreView {
         Ok(view)
     }
 
-    /// Records the member `key` belongs to, and whether it is linked.
+    /// Records the member `key` belongs to, or that it belongs to none,
+    /// and whether that member is linked.
     async fn member(&mut self, store: &Store, key: &MemberKey) -> Result<(), StoreError> {
-        if let Some(member) = store.member_for_identity(key).await? {
-            self.members.insert(key.clone(), member);
+        let member = store.member_for_identity(key).await?;
+        self.members.insert(key.clone(), member);
+        if let Some(member) = member {
             self.link(store, member).await?;
         }
         Ok(())
@@ -179,7 +181,7 @@ impl RouterView for StoreView {
             .map(|(_, attribution)| attribution.clone())
     }
 
-    fn member_for(&self, key: &MemberKey) -> Option<MemberId> {
+    fn member_for(&self, key: &MemberKey) -> Option<Option<MemberId>> {
         self.members.get(key).copied()
     }
 
