@@ -1248,9 +1248,9 @@ Deliverables:
     DM with the manager bot, with `persona <name>` as its text, replaces the
     persona the same way. Size is capped at 64 KB. On Slack (T30 landed
     first) the file is downloaded with the manager's
-    `WebApi::download_file`, and the DM's files have to be passed from
-    `commands::slack::dm_command` to the handler
-    ([impl-notes](impl-notes.md#files-in-the-manager-dm-wait-for-their-handlers)).
+    `WebApi::download_file`, and `commands::slack::dm_command` passes the
+    DM's files to the handler
+    ([impl-notes](impl-notes.md#files-in-the-manager-dm)).
   - `list [@user]`: an agent directory.
   - `pause`, `resume` and `delete`, owner only. Delete deactivates the bot user
     and stops its connection; state becomes `deleted`. A paused agent's bot
@@ -2198,9 +2198,10 @@ Deliverables:
     `--opt=value` word, so neither can be read as an option;
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
     On Slack the DM's files are the `InboundEvent::files` that T30's
-    `commands::slack::dm_command` sees but doesn't pass on yet; download
-    them with the manager's `WebApi::download_file`, which caps the size
-    ([impl-notes](impl-notes.md#files-in-the-manager-dm-wait-for-their-handlers)).
+    `commands::slack::dm_command` passes with the command; download them
+    with `Commands::download`, which uses the manager's
+    `WebApi::download_file` and caps the size
+    ([impl-notes](impl-notes.md#files-in-the-manager-dm)).
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
 - `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
@@ -2512,9 +2513,9 @@ Notes from implementing it
 - Commands from every surface go through one `commands::intake::CommandIntake`.
   A DM to the manager app is `Origin::SlackDm`. Command text is decoded with
   `surface_slack::normalize::unescape` before parsing.
-- Files attached to the manager DM aren't passed on yet, since `persona`
-  (T14) and `skill add` (T25) aren't in place; `WebApi::download_file` is
-  the download they use.
+- Files attached to the manager DM go with the command. `persona` (T14)
+  reads one with `WebApi::download_file` under its 64 KB cap; `skill add`
+  (T25) isn't in place yet and can use the same download.
 - The manifest's tests use `serde_norway`, a dev-dependency (MIT or
   Apache-2.0).
 

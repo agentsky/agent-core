@@ -5147,20 +5147,24 @@ T31 routes agents' messages.
   the SDKs have no revoke method for configuration tokens, and whether
   `auth.revoke` accepts one is unverified.
 
-### Files in the manager DM wait for their handlers
+### Files in the manager DM
 
 **Issue.** The plan says files attached to a manager DM feed `persona`
 (T14's upload rule) and `skill add` (T25), downloaded with the manager's bot
-token. Neither handler is in this stack yet; both commands answer "isn't
-available yet".
+token. `persona` was in place but read files only in the Rocket.Chat manager
+DM, so a Slack member who attached `persona.md` was told to attach it.
 
 **Solution.** T30 adds the download, `WebApi::download_file(file,
 max_bytes)`: it sends the bot token only to an `https` URL on `slack.com` or
 a subdomain (or the API URL's own origin, for tests), follows no redirects
 (Slack redirects a request it refuses to its sign-in page), checks the
 declared size and the `Content-Length` before reading, and stops reading
-past the limit. Passing the DM's files to the handlers is left to T14 and
-T25, whose plan text now says so.
+past the limit with `SurfaceError::TooLarge`, as Rocket.Chat's download
+does. `dm_command` passes the DM's files with the command, and
+`Commands::download` reads a file attached in either manager DM with that
+surface's manager credentials, so `persona` takes a `persona.md` on Slack
+under the same 64 KB cap. A slash command carries no files. `skill add`
+(T25) isn't in this stack yet; it can use the same download.
 
 ### The manager's events URL before its secret is set
 
