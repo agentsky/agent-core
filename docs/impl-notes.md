@@ -9456,14 +9456,14 @@ else `enterprise_user.enterprise_id`, whichever is not home). The pipeline
 drops a message whose event and copy disagree on `outside`, organization
 included (`agreeing_copy`), with a throttled warning that the platform's
 copy doesn't agree on whether the sender is from outside or of which
-organization, or that the sender couldn't be looked up: a home member whose `users.info` lookup was
-refused (`Api`, `Unauthorized`, `Forbidden`) gets a copy with
-`Outside { team: None }`, and is dropped under the same warning. Only a
-person's copy is compared (07 Oct review): a bot's own `outside` decides
-nothing, since a hop's requester takes it from the attribution, and
-comparing it dropped an agent's hop copy under that warning. At T36a the event of an outside sender is ignored before
-confirmation, so the drop only replaces what `copy_stands` already did; it
-is there for T36b.
+organization, or that the sender couldn't be looked up: a home member whose
+`users.info` lookup was refused (`Api`, `Unauthorized`, `Forbidden`) gets a
+copy with `Outside { team: None }`, and is dropped under the same warning.
+Only a person's copy is compared (07 Oct review): a bot's own `outside`
+decides nothing, since a hop's requester takes it from the attribution, and
+comparing it dropped an agent's hop copy under that warning. At T36a the
+event of an outside sender is ignored before confirmation, so the drop only
+replaces what `copy_stands` already did; it is there for T36b.
 
 ### The store refuses outside requesters until T36b
 
