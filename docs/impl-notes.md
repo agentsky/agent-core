@@ -3131,16 +3131,21 @@ doesn't say what a full queue does.
 lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
 bounded queue. A full or closed queue answers 503; Slack retries an event
 that gets one, but not a slash command or an interaction, whose user sees
-Slack's error. The handler never waits for the queue. `Queue::run` then deduplicates through the
-`Dedup` trait (agentd's `StoreDedup` over `mark_event_processed`), normalizes,
-and sends `SlackInbound` items, one at a time and in order, to a
-`core_types::Sender`. A failed dedup write drops the request rather than risk
-a duplicate turn. Until T29 and T30 consume it, agentd's sink (`Unrouted`)
-logs each item's binding and kind and drops it. agentd runs the queue as a
-`server::Worker` next to the listeners: `Routers` gained a `workers` field,
-and the queue ends once the public listener's router is dropped, so every
-acknowledged request is handled within the drain timeout. An acknowledged
-request is lost if agentd dies before handling it; Slack won't retry it.
+Slack's error. The handler never waits for the queue. `Queue::run` then
+deduplicates through the `Dedup` trait (agentd's `StoreDedup` over
+`mark_event_processed`), normalizes, and sends `SlackInbound` items, one at
+a time and in order, to a `core_types::Sender`. A failed dedup write drops
+the request rather than risk a duplicate turn. Until T29 and T30 consume
+it, agentd's sink (`Unrouted`) logs each item's binding and kind and drops
+it. agentd runs the queue as a `server::Worker` next to the listeners:
+`Routers` gained a `workers` field, and the queue ends once the public
+listener's router is dropped, so every acknowledged request still queued
+at shutdown is passed to the sink within the drain timeout, unless the
+timeout runs out first. That doesn't make it answered: a sink that has
+stopped taking work by then drops it, as the turn pipeline does once it is
+closed (T30). An acknowledged request is lost if agentd dies before
+handling it, or if it reaches a sink that no longer takes it; Slack won't
+retry it.
 
 ### Replays inside the five-minute window
 
