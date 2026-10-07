@@ -99,8 +99,9 @@ pub async fn write_bundled(data_dir: &Path, agent: AgentId) -> runner::Result<bo
     runner::write_if_changed(&dir, package::SKILL_FILE, BUNDLED_SKILL.as_bytes()).await
 }
 
-/// Where a skill's files come from.
-#[derive(Debug, Clone, Copy)]
+/// Where a skill's files come from. Its `Debug` shows an upload's length,
+/// not its bytes.
+#[derive(Clone, Copy)]
 pub enum Source<'a> {
     /// A Git repository: an `https://` URL with an optional `#ref`, as
     /// [`commands::parse`] accepts it.
@@ -113,6 +114,19 @@ pub enum Source<'a> {
         /// Its bytes.
         bytes: &'a [u8],
     },
+}
+
+impl fmt::Debug for Source<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Git(url) => f.debug_tuple("Git").field(url).finish(),
+            Self::Upload { name, bytes } => f
+                .debug_struct("Upload")
+                .field("name", name)
+                .field("bytes_len", &bytes.len())
+                .finish(),
+        }
+    }
 }
 
 impl Source<'_> {
