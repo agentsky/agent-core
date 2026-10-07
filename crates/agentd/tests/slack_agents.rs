@@ -730,6 +730,7 @@ async fn a_reminder_for_an_owner_unreachable_here_stops_after_its_attempts() {
                     signing_secret: SecretString::from("signing-SECRET-stray"),
                     scopes: "chat:write".to_owned(),
                     redirect_url: format!("{PUBLIC_URL}/slack/oauth/callback"),
+                    manifest_version: surface_slack::manifest::MANIFEST_VERSION,
                 },
                 "stray",
                 start,
@@ -743,7 +744,7 @@ async fn a_reminder_for_an_owner_unreachable_here_stops_after_its_attempts() {
     let first = start + Duration::from_secs(120);
     for attempt in 0..attempts + 1 {
         let at = first + lease * attempt;
-        assert_eq!(agents.pass_at(|| at).await.unwrap().reminded, 0);
+        assert_eq!(agents.pass_at(|| at).await.reminded, 0);
     }
     let due = store
         .due_install_reminders(&team, first, first + lease * 100, attempts)
