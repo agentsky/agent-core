@@ -3953,7 +3953,9 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Killing leftover processes" entry covers that).
+"Killing leftover processes" entry covers that). Resolving the name with a
+trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
+allowed host to a fixed address there; pin it in DNS instead.
 
 ### Log lines don't name the host
 
