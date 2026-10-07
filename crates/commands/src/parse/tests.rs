@@ -679,7 +679,18 @@ fn secret_bearing_variants_redact_themselves_in_debug() {
             assert!(!debug.contains(secret), "{debug}");
             assert!(!debug.contains("SECRET"), "{debug}");
         }
-        assert!(debug.contains("REDACTED"), "{debug}");
+        assert!(debug.contains(command.name()), "{debug}");
+    }
+}
+
+#[test]
+fn debug_prints_the_command_name_and_no_free_text() {
+    for text in ["persona helper PERSONA-TEXT", "admin ban @alice BAN-REASON"] {
+        let command = ok(text);
+        let debug = format!("{command:?} {command:#?}");
+        assert!(debug.contains(command.name()), "{debug}");
+        assert!(!debug.contains("TEXT"), "{debug}");
+        assert!(!debug.contains("REASON"), "{debug}");
     }
 }
 

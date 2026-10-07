@@ -50,6 +50,8 @@
 //!
 //! The crate does no I/O.
 
+use std::fmt;
+
 use core_types::{ConsentId, ConvKind};
 use secrecy::SecretString;
 
@@ -63,9 +65,10 @@ pub use parse::parse;
 
 /// A parsed `/agent` command. Handlers live in agentd.
 ///
-/// Handlers log only [`name`](Self::name). `Debug` redacts the secrets but
-/// prints free text, such as a persona or a ban reason, as written.
-#[derive(Debug, Clone)]
+/// Handlers log only [`name`](Self::name). `Debug` prints the name and
+/// nothing else, so neither a secret nor free text such as a persona or a
+/// ban reason can reach a log through it.
+#[derive(Clone)]
 pub enum Command {
     /// `login [code]`: start linking a Claude account, or finish with the
     /// code the login page shows. Secret-bearing with a code.
@@ -234,6 +237,14 @@ pub enum ApiKeyCommand {
     },
     /// `admin api-key clear`.
     Clear,
+}
+
+impl fmt::Debug for Command {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Command")
+            .field("name", &self.name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Command {
