@@ -593,6 +593,46 @@ fn bare_urls() {
                 "https://x.io/_a and https://y.io/b_",
                 "<https://x.io/_a> and <https://y.io/b>_",
             ),
+            (
+                "an underscore after a closing parenthesis",
+                "(https://x.io/_a)_",
+                "(<https://x.io/_a>)_",
+            ),
+            (
+                "an escaped underscore after a closing parenthesis",
+                "Read (https://x.io/my_page)\\_",
+                "Read (<https://x.io/my_page>)\u{200b}_\u{200b}",
+            ),
+            (
+                "an underscore after a parenthesis and a period",
+                "https://x.io/a_b)._",
+                "<https://x.io/a_b>)._",
+            ),
+            (
+                "an underscore after a closing bracket",
+                "[https://x.io/a_b]_",
+                "[<https://x.io/a_b>]_",
+            ),
+            (
+                "a footnote star after a period in a URL with a star",
+                "https://x.io/my*page.*",
+                "<https://x.io/my*page>.*",
+            ),
+            (
+                "marks after a period",
+                "https://x.io/a.*__*",
+                "<https://x.io/a>.____",
+            ),
+            (
+                "underscore emphasis before an unmatched parenthesis",
+                "https://x.io/_a_)",
+                "<https://x.io/_a_>)",
+            ),
+            (
+                "strikethrough before an unmatched parenthesis",
+                "https://x.io/~a~)~",
+                "<https://x.io/~a~>)~",
+            ),
             ("a host of only an underscore", "https://_", "https://_"),
             ("a host of only stars", "https://***", "https://***"),
             ("a host of only tildes", "https://~~~", "https://~~~"),

@@ -222,7 +222,7 @@ impl Store {
     }
 
     /// Deletes the agent's skill `name` in `state`, or in both states
-    /// with `None`, and returns the states it had.
+    /// with `None`, and returns the rows it deleted, by state.
     ///
     /// # Errors
     ///
@@ -233,23 +233,24 @@ impl Store {
         agent: AgentId,
         name: &str,
         state: Option<SkillState>,
-    ) -> Result<Vec<SkillState>> {
-        let states: Vec<String> = sqlx::query_scalar(
+    ) -> Result<Vec<AgentSkill>> {
+        let rows: Vec<Row> = sqlx::query_as(concat!(
             "DELETE FROM agent_skills WHERE agent_id = ? AND name = ? \
-             AND (? IS NULL OR state = ?) RETURNING state",
-        )
+             AND (? IS NULL OR state = ?) RETURNING ",
+            columns!()
+        ))
         .bind(agent.to_string())
         .bind(name)
         .bind(state.map(SkillState::as_str))
         .bind(state.map(SkillState::as_str))
         .fetch_all(&self.pool)
         .await?;
-        let mut states = states
-            .iter()
-            .map(|state| SkillState::parse(state))
+        let mut deleted = rows
+            .into_iter()
+            .map(Row::into_skill)
             .collect::<Result<Vec<_>>>()?;
-        states.sort_by_key(|state| state.as_str());
-        Ok(states)
+        deleted.sort_by_key(|row| row.state.as_str());
+        Ok(deleted)
     }
 
     /// The agent's skills, active and pending, by name.
@@ -539,16 +540,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let deleted = store.delete_skill(a, "gh", None).await.unwrap();
         assert_eq!(
-            store.delete_skill(a, "gh", None).await.unwrap(),
-            [SkillState::Active]
+            deleted
+                .iter()
+                .map(|row| (row.state, row.hosts.len()))
+                .collect::<Vec<_>>(),
+            [(SkillState::Active, 0)]
         );
         assert!(store.delete_skill(a, "gh", None).await.unwrap().is_empty());
+        let deleted = store
+            .delete_skill(a, "late", Some(SkillState::Pending))
+            .await
+            .unwrap();
         assert_eq!(
-            store
-                .delete_skill(a, "late", Some(SkillState::Pending))
-                .await
-                .unwrap(),
+            deleted.iter().map(|row| row.state).collect::<Vec<_>>(),
             [SkillState::Pending]
         );
         assert!(store.agent_skills(a).await.unwrap().is_empty());
