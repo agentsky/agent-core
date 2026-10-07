@@ -304,7 +304,9 @@ fn splits_bare_url(tag: &Tag<'_>, span: &Range<usize>, urls: &[Range<usize>]) ->
 }
 
 /// Puts the children of an element in its place, with its delimiters as
-/// text, as the source wrote them.
+/// text, as the source wrote them. The opening delimiter stops before the
+/// backslash of an escape that starts the first child, which is not part
+/// of the text.
 fn unwrap_markup<'a>(
     md: &str,
     span: Range<usize>,
@@ -317,7 +319,9 @@ fn unwrap_markup<'a>(
         kind: Kind::Text(md[range.clone()].to_string(), Vec::new()),
         span: range,
     };
-    push_merging_text(siblings, delimiter(span.start..inner_start));
+    let opening = &md[span.start..inner_start];
+    let opening = opening.strip_suffix('\\').unwrap_or(opening);
+    push_merging_text(siblings, delimiter(span.start..span.start + opening.len()));
     for child in children {
         push_merging_text(siblings, child);
     }
