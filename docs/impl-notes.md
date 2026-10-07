@@ -3335,6 +3335,16 @@ A non-2xx status other than 429 is `Api("HTTP <status>")`, an unreadable
 body is `Transport`, and redirects are never followed. Transport errors drop
 the request URL, so a `response_url` or upload URL can't leak through one.
 
+Review found that a non-2xx answer whose body carries an `ok: false` code,
+such as HTTP 400 with `invalid_arguments`, lost the code, while
+`respond_ephemeral` already read it. Such a code now goes through the same
+sanitizing and `map_error`; only a non-2xx answer without one is
+`Api("HTTP <status>")`. A 429 from a presigned upload URL, which had been
+`Api("the file upload was refused (HTTP 429)")`, is now `RateLimited` with
+its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
+is not a Web API method, so it has no bucket, and the caller can retry the
+whole upload, which shared nothing.
+
 ### Names two members share
 
 **Issue.** Display names aren't unique in Slack, and the plan didn't say

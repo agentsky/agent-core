@@ -2357,6 +2357,9 @@ completes design milestone 4. Also check and record:
   answered slowly. T28 deduplicates commands and interactions by their
   signature, so a retry signed with a new timestamp would run twice
   ([impl-notes](impl-notes.md#replays-inside-the-five-minute-window)).
+- Whether `conversations.replies` with an agent's bot token reads a thread
+  in a public and a private channel (T29 calls it for `Surface::thread`). A
+  refusal surfaces as `Forbidden`, not as an empty thread.
 
 ## Phase 5: private tasks and agent-to-agent (design milestone 5)
 
