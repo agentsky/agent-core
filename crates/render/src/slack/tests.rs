@@ -1082,6 +1082,25 @@ fn long_bracket_runs_stay_linear() {
 }
 
 #[test]
+fn many_cut_bare_urls_stay_linear() {
+    let count = 10_000;
+    for (unit, link) in [
+        ("`c`https://a", "<https://a>"),
+        ("&lt;https://a", "<https://a>"),
+        ("&#32;https://a/", "<https://a/>"),
+    ] {
+        let md = unit.repeat(count);
+        let started = std::time::Instant::now();
+        let out = to_mrkdwn(&md, &NOBODY);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{unit:?}"
+        );
+        assert_eq!(out.matches(link).count(), count, "{unit:?}");
+    }
+}
+
+#[test]
 fn mention_scan_ignores_a_position_without_an_at() {
     assert!(mention::scan("ankit", 0, BROADCASTS, &TEAM).is_none());
     assert!(mention::broadcast("here", 0, BROADCASTS).is_none());
