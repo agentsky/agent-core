@@ -37,7 +37,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use core_types::{BindingId, ConversationId, SurfaceError, SurfaceKind, TeamId, UserId};
 use store::{Store, StoreError};
-use surface_rocketchat::rest::{Credentials, NewBotUser, RestClient, RoomType, User};
+use surface_rocketchat::rest::{
+    Credentials, NewBotUser, RestClient, RoomType, USER_GONE_CODES, User,
+};
 use time::OffsetDateTime;
 use tokio::sync::Notify;
 
@@ -73,11 +75,6 @@ pub const DEFAULT_MAX_PER_OWNER: u32 = 10;
 /// no agent's name, or fallback username, can be another owner's fallback
 /// username.
 const OWNER_SEPARATOR: char = '.';
-
-/// The error codes with which Rocket.Chat says a user doesn't exist. Any
-/// other not-found, such as a bare HTTP 404 from a proxy, isn't taken to
-/// mean the bot user is gone.
-const USER_GONE_CODES: &[&str] = &["error-invalid-user", "error-user-not-found"];
 
 /// Usernames Rocket.Chat reads as broadcasts, so a bot can't be mentioned
 /// by them.

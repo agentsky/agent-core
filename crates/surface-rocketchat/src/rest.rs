@@ -82,6 +82,12 @@ const MAX_DESCRIPTION: usize = 200;
 /// How `users.info` describes a user it doesn't know.
 const USER_NOT_FOUND: &str = "User not found.";
 
+/// The error codes with which Rocket.Chat says a user doesn't exist, as
+/// older servers also answer `users.info` for an unknown name. Any other
+/// not-found, such as a bare HTTP 404 from a proxy, isn't taken to mean
+/// the user is gone.
+pub const USER_GONE_CODES: &[&str] = &["error-invalid-user", "error-user-not-found"];
+
 /// Error codes that mean the caller may not do this.
 const FORBIDDEN_CODES: &[&str] = &[
     "error-action-not-allowed",
@@ -820,8 +826,9 @@ impl RestClient {
     /// [`RestClient::user_info`].
     ///
     /// Rocket.Chat answers an unknown username with HTTP 400 and the error
-    /// `User not found.`, without a code. Any other failure, such as a 5xx,
-    /// a 429 or a transport error, stays an error.
+    /// `User not found.`, without a code, and older servers with one of
+    /// [`USER_GONE_CODES`]. Any other failure, such as a 5xx, a 429 or a
+    /// transport error, stays an error.
     pub async fn user_by_username(&self, username: &str) -> Result<Option<User>> {
         match self
             .call::<UserEnvelope>(Call::get("users.info").query("username", username))
@@ -829,6 +836,9 @@ impl RestClient {
         {
             Ok(found) => Ok(Some(found.user)),
             Err(SurfaceError::Api(description)) if description == USER_NOT_FOUND => Ok(None),
+            Err(SurfaceError::NotFound(code)) if USER_GONE_CODES.contains(&code.as_str()) => {
+                Ok(None)
+            }
             Err(err) => Err(err),
         }
     }
