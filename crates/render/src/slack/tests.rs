@@ -554,6 +554,49 @@ fn bare_urls() {
                 "<https://x.io/~~a~~>",
             ),
             (
+                "a footnote star after a parenthesized URL and a period",
+                "See the pricing page (https://x.io/pricing).*",
+                "See the pricing page (<https://x.io/pricing>).*",
+            ),
+            (
+                "a footnote star after a parenthesized URL",
+                "Pricing (https://x.io/pricing)*",
+                "Pricing (<https://x.io/pricing>)*",
+            ),
+            (
+                "a footnote star after a URL and a period",
+                "Read https://x.io/terms.*",
+                "Read <https://x.io/terms>.*",
+            ),
+            (
+                "a footnote star after emphasis and a URL",
+                "*Note:* see https://x.io/a.*",
+                "_Note:_ see <https://x.io/a>.*",
+            ),
+            (
+                "an escaped star after a URL",
+                "see https://x.io/pricing\\*",
+                "see <https://x.io/pricing>\u{200b}*\u{200b}",
+            ),
+            (
+                "an underscore entity after a URL",
+                "https://x.io/a&#95;",
+                "<https://x.io/a>\u{200b}_\u{200b}",
+            ),
+            (
+                "an escaped underscore after a URL",
+                "https://x.io/a\\_",
+                "<https://x.io/a>\u{200b}_\u{200b}",
+            ),
+            (
+                "an underscore closing emphasis opened in an earlier URL",
+                "https://x.io/_a and https://y.io/b_",
+                "<https://x.io/_a> and <https://y.io/b>_",
+            ),
+            ("a host of only an underscore", "https://_", "https://_"),
+            ("a host of only stars", "https://***", "https://***"),
+            ("a host of only tildes", "https://~~~", "https://~~~"),
+            (
                 "emphasis closing where the source URL goes on",
                 "*see https://x.io/a*b",
                 "*see <https://x.io/a>*b",
