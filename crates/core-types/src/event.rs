@@ -1,5 +1,7 @@
 //! [`InboundEvent`]: a chat message, normalized by its surface.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -26,7 +28,9 @@ use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, 
 /// no user, as for legacy integrations) has `sender_bot_user: None` and its
 /// bot id (`B…`) in `sender.user`. No binding has that id, so the router
 /// treats the sender as an unmanaged bot and ignores it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` output shows the text's length, never the text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundEvent {
     /// The platform's id for this delivery, used to drop duplicates: a Slack
     /// `event_id` or a Rocket.Chat message `_id`.
@@ -63,6 +67,27 @@ pub struct InboundEvent {
     /// When agentd received the event.
     #[serde(with = "time::serde::rfc3339")]
     pub received_at: OffsetDateTime,
+}
+
+impl fmt::Debug for InboundEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InboundEvent")
+            .field("event_id", &self.event_id)
+            .field("binding", &self.binding)
+            .field("sender", &self.sender)
+            .field("sender_is_bot", &self.sender_is_bot)
+            .field("sender_bot_user", &self.sender_bot_user)
+            .field("conv", &self.conv)
+            .field("conv_kind", &self.conv_kind)
+            .field("thread_root", &self.thread_root)
+            .field("message", &self.message)
+            .field("text_len", &self.text.len())
+            .field("mentions", &self.mentions)
+            .field("reply_to", &self.reply_to)
+            .field("files", &self.files)
+            .field("received_at", &self.received_at)
+            .finish()
+    }
 }
 
 impl InboundEvent {
@@ -125,6 +150,16 @@ mod tests {
         let json = json_round_trip(&sample_event(ConvKind::Channel));
         assert_eq!(json["received_at"], "2026-09-30T12:34:56.789Z");
         assert_eq!(json["conv_kind"], "channel");
+    }
+
+    #[test]
+    fn debug_shows_the_text_length_not_the_text() {
+        let mut event = sample_event(ConvKind::Channel);
+        event.text = "the secret plan".into();
+        let debug = format!("{event:?}");
+        assert!(!debug.contains("secret plan"), "{debug}");
+        assert!(debug.contains("text_len: 15"), "{debug}");
+        assert!(debug.contains("Ev01"), "{debug}");
     }
 
     #[test]
