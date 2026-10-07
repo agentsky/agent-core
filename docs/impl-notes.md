@@ -2587,6 +2587,25 @@ or any runtime shutting down, dropped unpolled, so the process group
 lived on. `kill(2)` returns at once, so `Drop` now sends the signal
 itself.
 
+### `wait` after `kill` hung on unread stdout
+
+**Issue.** Review found that `DockerChild::wait` awaited the task copying
+the exec's output into a 64 KiB duplex before asking Docker for the exit
+code. With more than 64 KiB unread, for example when T20's turn times out
+mid-stream, that task blocked in `write_all`, so `wait` never returned after
+`kill`, although a `ProcessSandbox` child is reaped whether its stdout is
+read or not. And when the output ended but `inspect_exec` still said
+running after ten seconds, `wait` answered `code: None`, which reads as an
+exit.
+
+**Solution.** A successful `kill` aborts the copying task, so `wait` goes
+straight to polling `inspect_exec`, and stdout ends after what was already
+copied. Both sandboxes now return from `wait` after `kill` whether stdout
+was read or not, with a unit test for each (the Docker one against a fake
+daemon) and `docker_kill_then_wait_returns_with_stdout_unread` against a
+real daemon. A process still running ten seconds after its output ended is
+now a `SandboxError::Docker` for `inspect exec`.
+
 ### Agent-writable directories are given to the sandbox user
 
 **Issue.** The sandbox runs as uid 10001, but agentd creates the volume
