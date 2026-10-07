@@ -2694,6 +2694,7 @@ mod tests {
             event: event(key),
             caps: MockSurface::DEFAULT_CAPS,
             owner,
+            hand_off: None,
             _pending: pipeline.places(owner).unwrap(),
             done: Arc::new(done),
         };
