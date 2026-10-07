@@ -1,6 +1,7 @@
 //! The per-turn outbox: what agentctl queued for the turn pipeline to
 //! deliver after the turn.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -16,12 +17,24 @@ pub const MAX_REACTIONS: usize = 20;
 
 /// A message queued with `agentctl post`. Its target already passed the
 /// turn's target rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its `Debug` prints the text's length, never the text, which is model
+/// output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct QueuedPost {
     /// Where to post.
     pub to: ReplyTarget,
     /// The Markdown text to render and post.
     pub text: String,
+}
+
+impl fmt::Debug for QueuedPost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueuedPost")
+            .field("to", &self.to)
+            .field("text_len", &self.text.len())
+            .finish()
+    }
 }
 
 /// A reaction queued with `agentctl react`.
@@ -39,7 +52,9 @@ pub struct QueuedReaction {
 /// Attachments are staged in a directory of their own under the data
 /// directory. Dropping the outbox deletes that directory, so the pipeline
 /// uploads the files and then drops it.
-#[derive(Debug)]
+///
+/// Its `Debug` prints the turn and how many of each thing it holds, never
+/// the posts' text.
 pub struct Outbox {
     turn: TurnId,
     staging: PathBuf,
@@ -116,6 +131,17 @@ fn push_capped<T>(items: &mut Vec<T>, item: T, max: usize) -> bool {
     }
     items.push(item);
     true
+}
+
+impl fmt::Debug for Outbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Outbox")
+            .field("turn", &self.turn)
+            .field("attachments", &self.attachments.len())
+            .field("posts", &self.posts.len())
+            .field("reactions", &self.reactions.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for Outbox {
@@ -208,6 +234,25 @@ mod tests {
         assert_eq!(outbox.posts().len(), MAX_POSTS);
         assert_eq!(outbox.reactions().len(), MAX_REACTIONS);
         assert!(!outbox.is_empty());
+    }
+
+    #[test]
+    fn debug_never_prints_a_posts_text() {
+        let dir = std::env::temp_dir().join(format!("agentd-outbox-{}", uuid_like()));
+        let mut outbox = Outbox::new(TurnId::new_v4(), dir);
+        let post = QueuedPost {
+            to: ReplyTarget {
+                conv: conv(),
+                thread_root: None,
+            },
+            text: "model secret words".into(),
+        };
+        assert!(outbox.push_post(post.clone()));
+        for printed in [format!("{post:?}"), format!("{outbox:?}")] {
+            assert!(!printed.contains("secret"), "{printed}");
+        }
+        assert!(format!("{post:?}").contains("text_len: 18"));
+        assert!(format!("{outbox:?}").contains("posts: 1"));
     }
 
     fn uuid_like() -> String {

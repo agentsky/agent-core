@@ -678,7 +678,7 @@ impl Respond for Router {
                     .is_some_and(|r| r.members.contains(&caller))
                 {
                     return ResponseTemplate::new(403)
-                        .set_body_json(json!({ "success": false, "error": "unauthorized" }));
+                        .set_body_json(json!({ "success": false, "error": "forbidden" }));
                 }
                 let Some(name) = multipart_file_name(&request.body) else {
                     return meteor_error("error-no-file-uploaded", "No file was uploaded");

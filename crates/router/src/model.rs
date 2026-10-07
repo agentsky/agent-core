@@ -16,12 +16,12 @@ use serde::Deserialize;
 /// let policy: router::ModelPolicy = toml::from_str(
 ///     r#"
 ///     default = "claude-sonnet"
-///     plans = { max = "claude-opus" }
+///     plans = { claude_max = "claude-opus" }
 ///     "#,
 /// )
 /// .unwrap();
-/// assert_eq!(policy.model_for(Some("max")), "claude-opus");
-/// assert_eq!(policy.model_for(Some("pro")), "claude-sonnet");
+/// assert_eq!(policy.model_for(Some("claude_max")), "claude-opus");
+/// assert_eq!(policy.model_for(Some("claude_pro")), "claude-sonnet");
 /// assert_eq!(policy.model_for(None), "claude-sonnet");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
