@@ -1432,7 +1432,17 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
     let h = harness().await;
     let gone = installed_as(&h, "gone", WRITER_TOKEN, 0).await;
     let eventless = installed_as(&h, "eventless", "xoxb-eventless", 0).await;
+    let forbidden = installed_as(&h, "forbidden", "xoxb-forbidden", 0).await;
     let refusing = installed_as(&h, "refusing", "xoxb-refusing", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .and(header("authorization", bearer().as_str()))
+        .and(wiremock::matchers::body_string_contains(
+            "app_id=A0FORBIDDEN",
+        ))
+        .respond_with(refused("access_denied"))
+        .mount(&h.slack)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/apps.manifest.export"))
         .and(header("authorization", bearer().as_str()))
@@ -1460,7 +1470,7 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
         .await;
     let start = OffsetDateTime::now_utc();
     assert_eq!(h.agents.pass_at(|| start).await.updated, 0);
-    assert_eq!(h.calls("apps.manifest.export").await, 3);
+    assert_eq!(h.calls("apps.manifest.export").await, 4);
     let status = h
         .store
         .slack_config_token_status(h.owner, &TeamId::new(TEAM))
@@ -1479,7 +1489,12 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
         .collect();
     assert_eq!(
         blocked,
-        [("eventless", true), ("gone", true), ("refusing", false)]
+        [
+            ("eventless", true),
+            ("forbidden", true),
+            ("gone", true),
+            ("refusing", false)
+        ]
     );
 
     register_token(&h, start).await;
@@ -1487,11 +1502,11 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
     assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
     assert_eq!(
         h.calls("apps.manifest.export").await,
-        4,
+        5,
         "only the app whose token was refused is tried again"
     );
     assert_eq!(h.calls("apps.manifest.update").await, 0);
-    let _ = (gone, eventless, refusing);
+    let _ = (gone, eventless, refusing, forbidden);
 }
 
 #[tokio::test]

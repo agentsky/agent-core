@@ -39,8 +39,10 @@
 //! they are. Each update is claimed for [`MANIFEST_UPDATE_LEASE`], an hour,
 //! so one that fails is tried again an hour later, and one whose owner has
 //! no usable token waits for one; registering one ends the leases. An app
-//! Slack says is gone, or whose manifest subscribes to no bot events, is
-//! blocked at the version: no update to it is tried again. `/agent me`
+//! Slack says is gone, whose manifest subscribes to no bot events, or whose
+//! update Slack refuses for good (any refusal but the token's, a rate
+//! limit or Slack failing to answer), is blocked at the version: no update
+//! to it is tried again. `/agent me`
 //! lists the owner's agents still on an older manifest, and which of them
 //! agentd can't update.
 //!
@@ -1055,6 +1057,13 @@ impl SlackAgents {
                     .block_manifest_update(binding, MANIFEST_VERSION)
                     .await?;
                 tracing::warn!(%binding, app_id, code, version = MANIFEST_VERSION, "Slack says an agent's app is gone; not trying to update its manifest again for this version");
+                Ok(false)
+            }
+            Err(err @ (SurfaceError::Forbidden(_) | SurfaceError::Api(_))) => {
+                store
+                    .block_manifest_update(binding, MANIFEST_VERSION)
+                    .await?;
+                tracing::warn!(%binding, app_id, error = %err, version = MANIFEST_VERSION, "Slack refused to update an agent's app's manifest; not trying again for this version");
                 Ok(false)
             }
             Err(SurfaceError::Unauthorized) => {

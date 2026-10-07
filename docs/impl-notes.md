@@ -10028,8 +10028,12 @@ and no new install is needed, and an event its owner removed, such as
   later, with a warning throttled per binding. A success raises the
   version, which only ever goes up, and clears the lease.
 - **Blocking.** An app Slack says is gone (`app_not_found`,
-  `invalid_app_id`, on export or update) or that has no event list is
-  blocked at the version (`block_manifest_update`). No update to it is
+  `invalid_app_id`, on export or update), that has no event list, or
+  whose export or update Slack refuses for good (a `Forbidden` or any
+  other `Api` code, such as an app made under someone else's token that
+  the owner's token can't manage) is blocked at the version
+  (`block_manifest_update`). Only a refused token, a rate limit and Slack
+  failing to answer are tried again. No update to it is
   claimed again, and its single warning isn't repeated. A later version
   tries it again.
 - **`/agent me`.** It lists the agents agentd still updates ("try again

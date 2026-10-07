@@ -3955,8 +3955,10 @@ Deliverables:
   registered and every hour, claiming each binding with a lease as T30's
   rotation does. The update reads the app's manifest with
   `apps.manifest.export` and adds only the bot events it lacks, so it
-  never takes a new install; an app Slack says is gone, or that subscribes
-  to no events, is blocked at the version and not tried again. `/agent me`
+  never takes a new install; an app Slack says is gone, that subscribes to
+  no events, or whose update Slack refuses for good (any refusal but the
+  token's or a rate limit), is blocked at the version and not tried
+  again. `/agent me`
   lists the owner's agents still on an older manifest and says they won't
   follow a private channel shared later, and which of them agentd can't
   update.
