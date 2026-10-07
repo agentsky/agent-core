@@ -3519,7 +3519,7 @@ listener's router is dropped, so every acknowledged request still queued
 at shutdown is passed to the sink within the drain timeout, unless the
 timeout runs out first. That doesn't make it answered: a sink that has
 stopped taking work by then drops it, as the turn pipeline does once it is
-closed (T30). An acknowledged request is lost if agentd dies before
+closed (T23). An acknowledged request is lost if agentd dies before
 handling it, or if it reaches a sink that no longer takes it; Slack won't
 retry it.
 
