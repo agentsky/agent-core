@@ -695,6 +695,25 @@ fn debug_prints_the_command_name_and_no_free_text() {
 }
 
 #[test]
+fn admin_command_debug_prints_the_variant_and_no_free_text() {
+    for (text, variant) in [
+        ("admin ban @alice BAN-REASON", "Ban"),
+        ("admin unban @alice", "Unban"),
+        ("admin api-key set key-SECRET", "ApiKey"),
+        ("admin slack", "Slack"),
+    ] {
+        let Command::Admin(admin) = ok(text) else {
+            panic!("{text} is not an admin command");
+        };
+        let debug = format!("{admin:?} {admin:#?}");
+        assert!(debug.contains(variant), "{debug}");
+        assert!(!debug.contains("REASON"), "{debug}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        assert!(!debug.contains("alice"), "{debug}");
+    }
+}
+
+#[test]
 fn only_the_three_secret_bearing_commands_say_so() {
     let secret = ["login x", "slack-token a b", "admin api-key set k"];
     let plain = [

@@ -206,7 +206,9 @@ pub enum SkillCommand {
 }
 
 /// `admin …` commands.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the variant only, since a ban reason is free text.
+#[derive(Clone)]
 pub enum AdminCommand {
     /// `admin api-key set <key>` and `admin api-key clear`.
     ApiKey(ApiKeyCommand),
@@ -237,6 +239,18 @@ pub enum ApiKeyCommand {
     },
     /// `admin api-key clear`.
     Clear,
+}
+
+impl fmt::Debug for AdminCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let variant = match self {
+            AdminCommand::ApiKey(_) => "ApiKey",
+            AdminCommand::Ban { .. } => "Ban",
+            AdminCommand::Unban { .. } => "Unban",
+            AdminCommand::Slack => "Slack",
+        };
+        f.debug_struct(variant).finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for Command {
