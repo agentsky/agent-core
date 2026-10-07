@@ -569,6 +569,11 @@ fn bare_urls() {
                 "<https://x.io/_a> <https://y.io|b>_",
             ),
             (
+                "a URL a character reference joins to a word isn't one",
+                "&#97;https://x.io/*a* b",
+                "ahttps://x.io/_a_ b",
+            ),
+            (
                 "a broadcast after such a URL stays neutralized",
                 "https://x.io/_a_/b @here",
                 "<https://x.io/_a_/b> @\u{200B}here",
@@ -1103,6 +1108,11 @@ fn many_cut_bare_urls_stay_linear() {
         );
         assert_eq!(out.matches(link).count(), count, "{unit:?}");
     }
+    let md = "&#97;https://x.io/_a_".repeat(count);
+    let started = std::time::Instant::now();
+    let out = to_mrkdwn(&md, &NOBODY);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!out.contains("<https"), "{out}");
 }
 
 #[test]
