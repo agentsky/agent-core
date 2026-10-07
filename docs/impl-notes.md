@@ -3408,6 +3408,13 @@ its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
 is not a Web API method, so it has no bucket, and the caller can retry the
 whole upload, which shared nothing.
 
+`org_login_required` was first among the `Forbidden` codes. Slack answers
+it while a workspace is being migrated into an Enterprise Grid
+organization, which passes on its own, so it is not a refusal of the bot
+and now falls to `Api` with the code. No caller needs it to be
+`Forbidden`: those that treat `Forbidden` as a no or a refusal answer
+`Api` the same way or fail closed on it.
+
 ### Names two members share
 
 **Issue.** Display names aren't unique in Slack, and the plan didn't say
