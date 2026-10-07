@@ -2464,6 +2464,10 @@ by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
 a command by default, so the model sees why it failed rather than a killed
 command.
 
+Review found that `--timeout 18446744073709551615` panicked on `Instant +
+Duration` overflow. The wait is now clamped to a day, which no turn
+outlasts, so any `u64` the model types gives a sane wait.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
