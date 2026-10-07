@@ -1721,7 +1721,8 @@ Deliverables:
   - `message_ref(msg) -> Option<Attribution { agent, requester, hop }>`,
     accepted only when `agent` is the agent that sent the message
     ([impl-notes](impl-notes.md#message_ref-needed-the-posting-agent-and-the-requesters-member-may-be-stale)).
-  - `member_for(MemberKey)`, `is_linked(member)`.
+  - `member_for(MemberKey) -> Option<Option<MemberId>>`: `Some(None)` for
+    an identity that belongs to no member. `is_linked(member)`.
   - `community_key_configured()`.
   - `agent_owner(agent)`, `agent_state(agent)`.
   - `is_reply_to_agent(msg, agent)`.
@@ -1729,8 +1730,10 @@ Deliverables:
     the effective hop cap (T27 fills it; an agent with no rules has
     `AgentPolicy::default()`, which allows, with a cap of 3).
   - `is_banned(requester) -> Option<bool>` (T27 fills it).
-  - `policy` and `is_banned` fail closed: `None` means the view doesn't
-    know, and the router refuses with `RefuseReason::PolicyUnavailable`. The
+  - `member_for`, `policy` and `is_banned` fail closed: `None` means the
+    view doesn't know, and the router refuses with
+    `RefuseReason::PolicyUnavailable`
+    ([impl-notes](impl-notes.md#an-unanswered-member_for-made-the-owner-a-stranger)). The
     trait's rustdoc lists every lookup `route` may make for an event, in
     order
     ([impl-notes](impl-notes.md#a-synchronous-view-over-an-asynchronous-store-failed-open)).
@@ -1805,8 +1808,9 @@ Deliverables:
      the event and every candidate, the manager bot's identities included.
      Until T27, `policy` answers `AgentPolicy::default()` and `is_banned`
      answers `Some(false)`. A lookup the view can't answer withholds the
-     turn: `None` from `is_banned` or `policy` is refused as
-     `PolicyUnavailable`. The candidates are every managed agent mentioned,
+     turn: `None` from `member_for`, `is_banned` or `policy` is refused as
+     `PolicyUnavailable`, so a store error while loading a member must
+     become `None`, never `Some(None)`. The candidates are every managed agent mentioned,
      the agent whose DM it is, and the agent that posted the thread root
      (`reply_to`, looked up in `message_refs`). When the surface has
      `per_binding_delivery`, only the receiving binding's agent is a

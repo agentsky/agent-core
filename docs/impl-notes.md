@@ -2230,3 +2230,20 @@ the policy also holds the hop cap. Every other lookup already withholds a
 turn when it has no answer. The trait's rustdoc lists every lookup `route`
 may make for an event, in order, so T23 knows what to load, and T23's and
 T27's plan text say what they fill.
+
+### An unanswered `member_for` made the owner a stranger
+
+**Issue.** Review found that `member_for` still failed open. It returned
+`Option<MemberId>`, so the router could not tell "this identity belongs to
+no member" from "the view didn't load it". If T23's view missed the owner's
+own key, or turned a store error into `None`, the owner was not the owner:
+their DM ran on the community key, in the `Dm` scope on the public side.
+
+**Solution.** `member_for` returns `Option<Option<MemberId>>`, like
+`is_banned`: `Some(None)` is a stranger and `None` refuses with
+`PolicyUnavailable`, after the paused check and before the ban check. A
+hop asks only when its attribution recorded no member. A store-backed view
+must map a store error to `None`, never to `Some(None)`. The test of the
+thread-starter half of the hop billing rule now attributes the thread root
+to the linked owner's turn, so billing the thread starter would run on the
+owner's credential instead of giving the link prompt.
