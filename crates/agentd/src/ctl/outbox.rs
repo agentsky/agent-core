@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use core_types::{MsgRef, OutFile, ReplyTarget, TurnId};
+use core_types::{AgentId, MsgRef, OutFile, ReplyTarget, TurnId};
 
 /// The most files one turn may attach.
 pub const MAX_ATTACHMENTS: usize = 10;
@@ -26,6 +26,8 @@ pub struct QueuedPost {
     pub to: ReplyTarget,
     /// The Markdown text to render and post.
     pub text: String,
+    /// The agent the post asks, when `agentctl ask-agent` queued it.
+    pub asks: Option<AgentId>,
 }
 
 impl fmt::Debug for QueuedPost {
@@ -33,6 +35,7 @@ impl fmt::Debug for QueuedPost {
         f.debug_struct("QueuedPost")
             .field("to", &self.to)
             .field("text_len", &self.text.len())
+            .field("asks", &self.asks)
             .finish()
     }
 }
@@ -206,6 +209,7 @@ mod tests {
                     thread_root: None,
                 },
                 text: "x".into(),
+                asks: None,
             }));
         }
         assert!(!outbox.push_post(QueuedPost {
@@ -214,6 +218,7 @@ mod tests {
                 thread_root: None,
             },
             text: "x".into(),
+            asks: None,
         }));
         for _ in 0..MAX_REACTIONS {
             assert!(outbox.push_reaction(QueuedReaction {
@@ -246,6 +251,7 @@ mod tests {
                 thread_root: None,
             },
             text: "model secret words".into(),
+            asks: None,
         };
         assert!(outbox.push_post(post.clone()));
         for printed in [format!("{post:?}"), format!("{outbox:?}")] {
