@@ -4359,6 +4359,12 @@ error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
 `view-full-other-user-info`, without which `users.info` leaves the emails
 out. A bot user still missed has no token and no password anyone knows, so
 it can't be used, but it keeps its username until an admin removes it.
+Review asked for both quiet paths to be visible: a found user with no
+email at all is logged as a warning (binding and username only) before the
+username is forgotten, since that is what every user looks like to a
+manager without `view-full-other-user-info`, and a lookup that fails is a
+warning like a failed deactivation, bounded by the retirement's backoff,
+instead of a debug line that hid a long outage until "giving up".
 
 ### Deactivating a deleted agent's bot is owed until it happens
 
