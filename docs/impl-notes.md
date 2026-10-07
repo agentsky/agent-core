@@ -1201,3 +1201,12 @@ naming a token. The flag is computed only for errors; a command that parses
 is judged by `Command::is_secret_bearing` alone, so a persona mentioning
 `sk-ant-` is still just a persona. Error messages still never repeat the
 text.
+
+A pasted login code counts whatever the verb, in both forms T09's
+`parse_pasted` accepts: a word with a `code=` query parameter, such as the
+callback URL, and `<code>#<state>` whose parts use the login's token
+alphabet, printable ASCII other than `#`, `&`, `?`, `=` and `|`, so
+`logn abc.def~1#state` and `logn ABC123%2F#state` count. A URL with a
+fragment and no `code=` (`https://x.io/r#main`) doesn't, since the login
+reads a URL only by its query. Any other `word#word` does, so `PR#42` is a
+false positive the rule accepts.

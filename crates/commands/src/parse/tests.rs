@@ -859,6 +859,11 @@ fn a_pasted_login_code_is_secret_bearing_under_any_verb() {
         "frobnicate x_Y-1#Z_2",
         "pause helper abc#def.",
         "persona Bad-Name (abc123#state)",
+        "lgoin https://console.anthropic.com/oauth/code/callback?code=abc123&state=xyz",
+        "frobnicate <https://x.io/cb?state=s&code=abc123|link>",
+        "logn abc.def~1#state",
+        "logn abc+/#state",
+        "logn ABC123%2F#state",
     ] {
         let err = fail(text);
         assert!(err.is_secret_bearing(), "{text:?}");
@@ -899,6 +904,8 @@ fn errors_without_a_secret_are_not_secret_bearing() {
         "logn abc#",
         "logn a#b#c",
         "skill add Bad-Name https://x.io/r#main",
+        "skill add Bad-Name https://x.io/r?ref=main#main",
+        "logn https://x.io/a?decode=1",
         "allow Bad-Name <#C123|general>",
         "logout now",
         "pause Bad",
