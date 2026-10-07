@@ -96,7 +96,6 @@ use surface_slack::ingress::WARNING_INTERVAL;
 use surface_slack::manifest::{
     AgentApp, MANIFEST_VERSION, add_bot_events, agent_manifest, install_url,
 };
-use surface_slack::web::MANIFEST_REFUSED_CODES;
 use time::OffsetDateTime;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -1060,7 +1059,7 @@ impl SlackAgents {
                 tracing::warn!(%binding, app_id, code, version = MANIFEST_VERSION, "Slack says an agent's app is gone; not trying to update its manifest again for this version");
                 Ok(false)
             }
-            Err(err) if refused_for_good(&err) => {
+            Err(err @ SurfaceError::Forbidden(_)) => {
                 store
                     .block_manifest_update(binding, MANIFEST_VERSION)
                     .await?;
@@ -1459,19 +1458,6 @@ pub async fn oauth_callback(
     RawQuery(query): RawQuery,
 ) -> Response {
     agents.callback(query.as_deref()).await
-}
-
-/// Whether Slack's `err` refuses a manifest update in a way trying again
-/// won't change: the owner's token may not manage the app (a `Forbidden`
-/// code such as `access_denied`, which a new token can lift), or the
-/// manifest is refused ([`MANIFEST_REFUSED_CODES`]). An answer with an
-/// unknown code, or none, as a proxy's error page has, is tried again.
-fn refused_for_good(err: &SurfaceError) -> bool {
-    match err {
-        SurfaceError::Forbidden(_) => true,
-        SurfaceError::Api(code) => MANIFEST_REFUSED_CODES.contains(&code.as_str()),
-        _ => false,
-    }
 }
 
 #[cfg(test)]

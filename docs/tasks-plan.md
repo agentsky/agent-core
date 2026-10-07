@@ -3969,11 +3969,11 @@ Deliverables:
   rotation does. The update reads the app's manifest with
   `apps.manifest.export` and adds only the bot events it lacks, so it
   never takes a new install; an app Slack says is gone, that subscribes to
-  no events, or whose update Slack refuses for good (a `Forbidden` code
-  such as `access_denied`, or `invalid_manifest`), is blocked at the
-  version and not tried again until its owner registers a new
-  configuration token. Any other failure, an unknown code or an answer
-  with none included, is tried again every hour. `/agent me`
+  no events, or whose export or update Slack forbids the owner's token (a
+  `Forbidden` code such as `access_denied`), is blocked at the version
+  and not tried again until its owner registers a new configuration
+  token. Any other failure, `invalid_manifest`, an unknown code or an
+  answer with none included, is tried again every hour. `/agent me`
   lists the owner's agents still on an older manifest and says they won't
   follow a private channel shared later, and which of them agentd can't
   update.

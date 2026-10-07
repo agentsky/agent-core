@@ -1516,11 +1516,19 @@ async fn a_manifest_update_that_cant_succeed_stops_and_a_refused_token_breaks() 
 }
 
 #[tokio::test]
-async fn a_manifest_update_refused_without_a_known_code_is_tried_again() {
+async fn a_manifest_update_refused_but_not_forbidden_is_tried_again() {
     let h = harness().await;
     let codeless = installed_as(&h, "codeless", WRITER_TOKEN, 0).await;
     installed_as(&h, "unknown", "xoxb-unknown", 0).await;
     installed_as(&h, "invalid", "xoxb-invalid", 0).await;
+    Mock::given(method("POST"))
+        .and(path("/api/apps.manifest.export"))
+        .and(header("authorization", bearer().as_str()))
+        .and(wiremock::matchers::body_string_contains("app_id=A0UNKNOWN"))
+        .respond_with(refused("some_new_code"))
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
     mount(
         &h.slack,
         "apps.manifest.export",
@@ -1533,7 +1541,6 @@ async fn a_manifest_update_refused_without_a_known_code_is_tried_again() {
             "A0CODELESS",
             ResponseTemplate::new(403).set_body_string("Forbidden by proxy"),
         ),
-        ("A0UNKNOWN", refused("some_new_code")),
         ("A0INVALID", refused("invalid_manifest")),
     ] {
         Mock::given(method("POST"))
@@ -1549,7 +1556,8 @@ async fn a_manifest_update_refused_without_a_known_code_is_tried_again() {
     let start = OffsetDateTime::now_utc();
     register_token(&h, start).await;
     assert_eq!(h.agents.pass_at(|| start).await.updated, 0);
-    assert_eq!(h.calls("apps.manifest.update").await, 3);
+    assert_eq!(h.calls("apps.manifest.export").await, 3);
+    assert_eq!(h.calls("apps.manifest.update").await, 2);
     let blocked: Vec<_> = h
         .store
         .outdated_slack_apps(h.owner, &TeamId::new(TEAM), MANIFEST_VERSION)
@@ -1562,16 +1570,19 @@ async fn a_manifest_update_refused_without_a_known_code_is_tried_again() {
         blocked,
         [
             ("codeless".to_owned(), false),
-            ("invalid".to_owned(), true),
+            ("invalid".to_owned(), false),
             ("unknown".to_owned(), false)
         ]
     );
     let later = start + MANIFEST_UPDATE_LEASE + Duration::from_secs(1);
     assert_eq!(h.agents.pass_at(|| later).await.updated, 0);
     assert_eq!(
-        h.calls("apps.manifest.update").await,
-        5,
-        "only the invalid manifest isn't tried again"
+        (
+            h.calls("apps.manifest.export").await,
+            h.calls("apps.manifest.update").await
+        ),
+        (6, 4),
+        "each is tried again an hour later"
     );
 }
 

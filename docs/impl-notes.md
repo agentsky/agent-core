@@ -10065,25 +10065,22 @@ and no new install is needed, and an event its owner removed, such as
   version, which only ever goes up, and clears the lease.
 - **Blocking.** An app Slack says is gone (`app_not_found`,
   `invalid_app_id`, on export or update), that has no event list, or
-  whose export or update Slack refuses for good is blocked at the version
-  (`block_manifest_update`). Refused for good is a `Forbidden` code, such
-  as `access_denied` for an app made under someone else's token that the
-  owner's token can't manage, or a code in `MANIFEST_REFUSED_CODES`
-  (`surface-slack`), only `invalid_manifest` so far: Slack's own export
-  with one event added fails the same way each time. No update to it is
-  claimed again, and its single warning isn't repeated. A later version,
-  or a new token (below), tries it again.
+  whose export or update Slack answers with a `Forbidden` code, such as
+  `access_denied` for an app made under someone else's token that the
+  owner's token can't manage, is blocked at the version
+  (`block_manifest_update`). No update to it is claimed again, and its
+  single warning isn't repeated. A later version, or a new token (below),
+  tries it again.
 - **Tried again.** Every other failure waits for the lease's hour (07 Oct
   review): a refused token, a rate limit, Slack failing to answer, any
   other code, and a non-2xx answer without one (`Api("HTTP 403")`, as a
   proxy or CDN error page gives), so a brief proxy fault doesn't block
-  every due app until the next version. Slack's reference pages for
-  `apps.manifest.update` and `apps.manifest.export` couldn't be read from
-  this environment, and search excerpts name only `invalid_manifest`,
-  `app_not_found` and `invalid_app_id` with certainty, so the list stays
-  that short. An `invalid_manifest` whose `errors` say the request URL
-  failed Slack's challenge is blocked too: that URL is the app's own, and
-  a new token or version retries it once the ingress answers.
+  every due app until the next version. `invalid_manifest` is tried again
+  too: it usually means Slack couldn't reach the events URL during its
+  challenge (T31 above), which passes once the ingress answers. Slack's
+  reference pages for `apps.manifest.update` and `apps.manifest.export`
+  couldn't be read from this environment, and no other code is known to
+  be permanent, so only `Forbidden` blocks.
 - **`/agent me`.** It lists the agents agentd still updates ("try again
   every hour") apart from those it can't update ("delete the agent and
   create it again"), so it never promises a retry that won't come.

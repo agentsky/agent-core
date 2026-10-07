@@ -1978,10 +1978,10 @@ Existing agents' apps get the subscription through `apps.manifest.update`
 with their owner's configuration token (T30) when it works, and keep missing
 it until then; `/agent me` says so. The update reads the app's manifest and
 adds only the events it lacks, so nothing else changes and no new install
-is needed. An app Slack says is gone, or whose change Slack refuses for
-good, is not tried again until its owner registers a new configuration
-token, which may be one Slack lets manage the app, and `/agent me` says
-that too. Any other failure, an answer without an error code Slack
+is needed. An app Slack says is gone, or that Slack won't let its owner's
+token change, is not tried again until its owner registers a new
+configuration token, which may be one Slack lets manage the app, and
+`/agent me` says that too. Any other failure, an answer without an error code Slack
 documents included, is tried again every hour.
 
 ### Verified and assumed
