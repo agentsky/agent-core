@@ -1558,11 +1558,12 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
         "`helper` has no skill `nope`. Its skills: `gh`, `notes`."
     );
     run("alice", "skill rm helper gh", dm("alice")).await;
-    assert!(
-        h.last_reply("alice")
-            .starts_with("Removed the skill `gh` from `helper`"),
-        "{}",
-        h.last_reply("alice")
+    assert_eq!(
+        h.last_reply("alice"),
+        "Removed the skill `gh` from `helper`. It no longer lets its sandboxes reach the hosts it \
+         asked for: a host the configuration or another skill still allows stays reachable, new \
+         connections to the others are refused, and connections open to them close within the \
+         hour. Conversations running now keep the skill until they next start."
     );
     assert!(!skills.join("gh").exists());
     run("alice", "skill rm helper notes", dm("alice")).await;
@@ -1582,8 +1583,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     run("alice", "skill rm helper gh", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
-        "Removed the skill `gh` from `helper`. None of the hosts it asks for is confirmed, so \
-         its sandboxes can't open new connections to them."
+        "Removed the skill `gh` from `helper`. It holds no confirmed hosts now, so removing it \
+         doesn't change which hosts its sandboxes may reach."
     );
 
     std::fs::create_dir_all(skills.join("left")).unwrap();
@@ -1591,8 +1592,8 @@ async fn skill_commands_are_the_owners_and_confirm_declared_hosts() {
     run("alice", "skill rm helper left", dm("alice")).await;
     assert_eq!(
         h.last_reply("alice"),
-        "Removed the skill `left` from `helper`. None of the hosts it asks for is confirmed, so \
-         its sandboxes can't open new connections to them."
+        "Removed the skill `left` from `helper`. It holds no confirmed hosts now, so removing it \
+         doesn't change which hosts its sandboxes may reach."
     );
     assert!(!skills.join("left").exists());
 

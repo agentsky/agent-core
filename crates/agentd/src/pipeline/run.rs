@@ -1029,7 +1029,7 @@ impl Pipeline {
             };
             let Some(copy) = agreeing_copy(copy, event) else {
                 if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
-                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message doesn't agree with it on whether its sender is from outside, or the sender couldn't be looked up; dropped it");
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message doesn't agree with it on whether its sender is from outside or of which organization, or the sender couldn't be looked up; dropped it");
                 }
                 return true;
             };
