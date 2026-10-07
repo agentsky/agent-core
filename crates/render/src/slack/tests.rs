@@ -549,6 +549,11 @@ fn bare_urls() {
                 "<https://x.io/a>`c`_b_",
             ),
             (
+                "a URL in a link label ends with the label",
+                "[https://x.io/a](https://y.io)*b*",
+                "https://x.io/a (<https://y.io>)_b_",
+            ),
+            (
                 "an entity that stays in a URL keeps emphasis in it",
                 "https://x.io/?a&amp;_b_/c",
                 "<https://x.io/?a&amp;_b_/c>",
