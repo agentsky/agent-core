@@ -2576,6 +2576,7 @@ dependencies = [
  "core-types",
  "futures",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "time",
