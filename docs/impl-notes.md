@@ -571,6 +571,17 @@ if the OS generator fails.
 `zeroize` feature, so the cipher wipes its key on drop, and decrypts into a
 buffer that is wiped after the `SecretString` is built.
 
+### The `members` table lists the surfaces
+
+**Issue.** The foundation migration declares `members.surface` with
+`CHECK (surface IN ('slack', 'rocketchat'))`, which couples `SurfaceKind` in
+core-types to the schema.
+
+**Solution.** Kept, so the store refuses a surface it has never heard of.
+A task that adds a `SurfaceKind` variant must also add a migration that
+relaxes the constraint; until it does, `ensure_member` fails at runtime for
+the new surface.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
