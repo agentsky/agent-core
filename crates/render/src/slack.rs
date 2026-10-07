@@ -10,7 +10,8 @@ use std::ops::Range;
 use core_types::{LengthUnit, Limit};
 use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag};
 
-use crate::{MentionDirectory, mention, url::bare_url};
+use crate::url::{bare_url, ends_url, trim_url_tail};
+use crate::{MentionDirectory, mention};
 
 /// The most text one Slack message chunk holds: 3,000 characters, under
 /// Slack's 4,000-character limit for a message's `text`.
