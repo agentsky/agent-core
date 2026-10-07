@@ -84,7 +84,7 @@ fn parse_tokens(text: &str, tokens: &[Token<'_>]) -> Result<Command, ParseError>
 
 /// A word of the input and where it starts, so a free-text tail can be cut
 /// from the original text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Token<'a> {
     start: usize,
     text: &'a str,
