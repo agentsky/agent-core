@@ -2458,13 +2458,15 @@ connections stop listening, and the intake runs the commands it already
 received (the store has recorded them as processed, so no other instance
 would) and waits for them within the drain timeout.
 
-One narrow window is left. `listen` stops on the shutdown signal by dropping
-the surface's events future, and that future may be between the
-`mark_event_processed` commit and the `send` into the intake. A command
-dropped there is recorded as processed and never run by any instance. The
-window is the store write itself and is inherent to recording an event
-before delivering it; the member sees no reply and can send the command
-again.
+One window is left. `listen` stops on the shutdown signal by dropping the
+surface's events future, and that future may be between the
+`mark_event_processed` commit and the end of the `send` into the intake. A
+command dropped there is recorded as processed and never run by any
+instance. The window covers the store write and `CommandFeed::offer`'s
+`send` into the intake's channel, which holds 64 commands: normally both
+are short, but under a backlog the `send` waits while the channel is full,
+and the window lasts that long. It is inherent to recording an event before
+delivering it; the member sees no reply and can send the command again.
 
 ### Secret-looking text that doesn't parse, in a channel
 
