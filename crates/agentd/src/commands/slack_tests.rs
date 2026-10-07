@@ -1108,10 +1108,20 @@ async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
     let running = Running::start(&h);
     let mut too_big = dm_event("U0HUMAN01", "persona helper");
     too_big.files = vec![file(64 * 1024 + 1)];
-    running.send(SlackInbound::Message(Box::new(too_big))).await;
+    running
+        .send(SlackInbound::Message(
+            Box::new(too_big),
+            InFlight::untracked(),
+        ))
+        .await;
     let mut event = dm_event("U0HUMAN01", "persona helper");
     event.files = vec![file(12)];
-    running.send(SlackInbound::Message(Box::new(event))).await;
+    running
+        .send(SlackInbound::Message(
+            Box::new(event),
+            InFlight::untracked(),
+        ))
+        .await;
     running.stop().await;
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
     assert_eq!(row.persona, "Via the DM.\n");
@@ -1131,10 +1141,10 @@ async fn a_persona_sent_in_a_manager_dm_arrives_decoded() {
     let agent = slack_agent(&h, alice).await;
     let running = Running::start(&h);
     running
-        .send(SlackInbound::Message(Box::new(dm_event(
-            "U0HUMAN01",
-            "persona helper You &amp; me &lt;3",
-        ))))
+        .send(SlackInbound::Message(
+            Box::new(dm_event("U0HUMAN01", "persona helper You &amp; me &lt;3")),
+            InFlight::untracked(),
+        ))
         .await;
     running.stop().await;
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
