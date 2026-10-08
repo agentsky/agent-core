@@ -1066,9 +1066,10 @@ and writing a hand-off check, in the same transaction, that the member
 still has a Claude link, and `logout` deletes the member's routines and
 hand-offs only after it unlinks them, so a racing row is either deleted by
 the `logout` or refused. Storing a Slack configuration token checks the
-link the same way, and `logout` deletes those tokens after unlinking too,
-so a token a racing `slack-token` stores is deleted or refused, and
-`/agent logout` deletes it as Security's row on those tokens promises.
+link in the same statement as its write, and `logout` deletes those tokens
+after unlinking too, so a token a racing `slack-token` stores is deleted or
+refused, and `/agent logout` deletes it as Security's row on those tokens
+promises.
 
 A member Slack reports deleted keeps their link, so a routine that a racing
 `cloud add` stores after the deletion stays until the member logs out, and

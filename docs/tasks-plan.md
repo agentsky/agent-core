@@ -3108,14 +3108,16 @@ Deliverables:
     The token is a `SecretString`, sealed with
     `cloud_routines/token_enc/<id>` as associated data. It runs in one
     `BEGIN IMMEDIATE` transaction and returns `CloudRoutinePut`:
-    - `Stored` for a new label.
-    - `Replaced` for an existing label, replaced in place, which is how a
-      member registers a new token.
-    - `RoutineTaken` for a routine id registered under another label.
-    - `LimitReached` for a new label past 20 for the member, counted in
-      the transaction.
+    - `Added(id)` for a new label.
+    - `Replaced(id)` for an existing label, replaced in place, which is
+      how a member registers a new token.
+    - `RoutineTaken { label }` for a routine id registered under another
+      label.
+    - `Full` for a new label past 20 for the member, counted in the
+      transaction.
     - `Unlinked` when the member no longer has a Claude link, checked in
-      the transaction. Against a `logout` that unlinks and then deletes
+      the transaction by `claude_links::linked`, the store's shared link
+      check. Against a `logout` that unlinks and then deletes
       the member's routines (T35c), the put either commits first, and the
       delete finds its row, or comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id and the opened
@@ -3127,10 +3129,10 @@ Deliverables:
     `cloud_handoffs`.
   - `begin_cloud_handoff(…)` seals the task with
     `cloud_handoffs/task_enc/<id>` and, in one `BEGIN IMMEDIATE`
-    transaction, checks the member still has a Claude link, as
-    `put_cloud_routine` does, and inserts the row as `sending`. It returns
-    `CloudHandoffBegin::Begun(id)`, or `CloudHandoffBegin::Unlinked` and
-    inserts nothing.
+    transaction, checks the member still has a Claude link with
+    `claude_links::linked`, as `put_cloud_routine` does, and inserts the
+    row as `sending`. It returns `CloudBegun::Begun(id)`, or
+    `CloudBegun::Unlinked` and inserts nothing.
   - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
     `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
     for an answer whose record was held up past the pass. Recording any
@@ -3298,7 +3300,7 @@ Deliverables:
   identity or run on another instance during a blue-green swap, is caught
   by the link check in `put_cloud_routine` and `begin_cloud_handoff`
   (T35a): the handler answers `CloudRoutinePut::Unlinked` as an unlinked
-  `cloud add` and `CloudHandoffBegin::Unlinked` as an unlinked `cloud run`,
+  `cloud add` and `CloudBegun::Unlinked` as an unlinked `cloud run`,
   having stored or sent nothing. A member Slack reports deleted keeps their
   link, so a `cloud add` that races that deletion can still store a
   routine, which then stays until the member logs out, and a racing
@@ -3365,11 +3367,14 @@ Deliverables:
   delete survives the logout, whether the delete runs before the unlink or
   after it. So `logout` deletes the Slack configuration tokens after
   `auth.logout` too, and `put_slack_config_token` checks the link in its
-  write, as `put_cloud_routine` does, returning
-  `SlackConfigTokenPut::Stored(SlackConfigTokenRef)`, what it returns
-  today, or `SlackConfigTokenPut::Unlinked`. The handler answers
-  `Unlinked` with new wording, not the unlinked reply, which ends "I
-  didn't use it": the member is no longer linked, and checking the token
+  write: one `INSERT … SELECT … WHERE EXISTS (SELECT 1 FROM claude_links
+  …) ON CONFLICT …` statement, not a transaction, since a statement that
+  fails inside an explicit transaction rolls back the trigger counts the
+  failure-injection tests read. It returns
+  `Result<Option<SlackConfigTokenRef>>`, with `None` when the member has
+  no Claude link or doesn't exist. The handler answers `None` with new
+  wording, not the unlinked reply, which ends "I didn't use it": the
+  member is no longer linked, and checking the token
   used up its refresh token, so they should generate a new one after
   linking again. The store tests in
   `crates/store/src/slack_config_tokens.rs`, which put tokens for members
