@@ -523,7 +523,7 @@ is a suggestion, not an owner: pick any unblocked task.
 | Execution | T17, T20, T21 | `crates/sandbox`, `crates/runner` |
 | Slack | T28, T29, T30, T31, T32 | `crates/surface-slack`, agentd Slack wiring |
 | Integration | T23 to T27, T33, T34 | `crates/agentd` pipeline, `crates/router` |
-| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `config/agentd.example.toml` |
+| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `crates/agentd/src/commands/mod.rs` (`logout`), `crates/agentd/src/commands/slack_tokens.rs`, `config/agentd.example.toml` |
 
 ## Phase 0: foundation
 
@@ -3106,11 +3106,17 @@ Deliverables:
 - `Store` methods:
   - `put_cloud_routine(member, label, routine_id, token, added_by, now)`.
     The token is a `SecretString`, sealed with
-    `cloud_routines/token_enc/<id>` as associated data. An existing label
-    is replaced in place, which is how a member registers a new token; a
-    routine id registered under another label is refused; a new label past
-    20 for the member is refused, counted in the insert's
-    `BEGIN IMMEDIATE` transaction.
+    `cloud_routines/token_enc/<id>` as associated data. It runs in one
+    `BEGIN IMMEDIATE` transaction and returns `CloudRoutinePut`:
+    - `Stored` for a new label.
+    - `Replaced` for an existing label, replaced in place, which is how a
+      member registers a new token.
+    - `RoutineTaken` for a routine id registered under another label.
+    - `LimitReached` for a new label past 20 for the member, counted in
+      the transaction.
+    - `Unlinked` when the member no longer has a Claude link, checked in
+      the transaction, so a `logout` that unlinks first and then deletes
+      the member's routines (T35c) either finds the row or refuses it.
   - `cloud_routine(member, label)` returns the routine id and the opened
     token. `cloud_routines(member)` lists labels, ids and times, never
     tokens.
@@ -3119,8 +3125,11 @@ Deliverables:
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
   - `begin_cloud_handoff(…)` seals the task with
-    `cloud_handoffs/task_enc/<id>`, inserts the row as `sending` and
-    returns its id.
+    `cloud_handoffs/task_enc/<id>` and, in one `BEGIN IMMEDIATE`
+    transaction, checks the member still has a Claude link, as
+    `put_cloud_routine` does, and inserts the row as `sending`. It returns
+    `CloudHandoffBegin::Begun(id)`, or `CloudHandoffBegin::Unlinked` and
+    inserts nothing.
   - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
     `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
     for an answer whose record was held up past the pass. Recording any
@@ -3180,6 +3189,8 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
+- `a_routine_is_refused_without_a_claude_link`.
+- `a_handoff_is_refused_without_a_claude_link`.
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
@@ -3280,17 +3291,17 @@ Deliverables:
 - Handlers in `crates/agentd/src/commands/cloud.rs`, through the one
   command intake (T30), so commands run once and in order per surface
   identity (`MemberKey`), not per member. A `logout` the intake doesn't
-  order with a `cloud add`, sent from the member's other identity or run on
-  another instance during a blue-green swap, is caught by
-  `put_cloud_routine`, which refuses a member with no Claude link inside
-  its `BEGIN IMMEDIATE` transaction (`CloudRoutinePut::Unlinked`, answered
-  as an unlinked `cloud add`). `logout` unlinks before it deletes the
-  member's routines, so either it finds the routine or it came first and
-  nothing is stored. A member Slack reports deleted keeps their link, so a
-  `cloud add` that races that deletion can still store a routine, which
-  then stays: an accepted gap, since it needs the member's own command to
-  land in the moment Slack deletes them, and only their member can fire
-  the token:
+  order with a `cloud add` or `cloud run`, sent from the member's other
+  identity or run on another instance during a blue-green swap, is caught
+  by the link check in `put_cloud_routine` and `begin_cloud_handoff`
+  (T35a): the handler answers `CloudRoutinePut::Unlinked` as an unlinked
+  `cloud add` and `CloudHandoffBegin::Unlinked` as an unlinked `cloud run`,
+  having stored or sent nothing. A member Slack reports deleted keeps their
+  link, so a `cloud add` that races that deletion can still store a
+  routine, which then stays until the member logs out: an accepted gap,
+  since it needs the member's own command to land in the moment Slack
+  deletes them, and only that member can fire the token, from another
+  identity they've linked; for a member only on Slack, nobody can:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
@@ -3319,6 +3330,22 @@ Deliverables:
   and hand-offs, by `MemberId`, so those registered from any surface go;
   `logout`'s reply says to revoke the tokens, and a deleted member is sent
   nothing.
+- `logout` in `crates/agentd/src/commands/mod.rs`, which today deletes the
+  Slack configuration tokens first and calls `auth.logout(member)` last,
+  deletes the routines and hand-offs after `auth.logout` returns. A
+  `cloud add` or `cloud run` racing it then either commits before the
+  unlink, and the delete finds its row, or checks the link after it and is
+  refused; deleting first would let one pass the check between the delete
+  and the unlink and store a row after the delete.
+- `slack-token` has the same race: its handler checks the link before it
+  rotates the token with Slack, and `put_slack_config_token` doesn't check
+  it again, so a token a racing `slack-token` stores after `logout`'s
+  delete survives the logout, whether the delete runs before the unlink or
+  after it. So `logout` deletes the Slack configuration tokens after
+  `auth.logout` too, and `put_slack_config_token` checks the link in its
+  write, as `put_cloud_routine` does; the handler answers a refusal as it
+  answers an unlinked member, adding that checking the token used up its
+  refresh token.
 - A Slack task's tokens are rewritten to what Slack showed, as the design's
   [Command surface](design.md#command-surface) says: `<@U…|name>` to
   `@name`, `<#C…|name>` to `#name`, `<url>` and a `<url|label>` labelled
@@ -3352,7 +3379,6 @@ Acceptance, as pipeline and command tests named after the rules:
 - `cloud_add_in_a_room_gets_the_secret_refusal_and_stores_nothing`.
 - `cloud_add_and_run_are_refused_without_cloud_config`.
 - `an_unlinked_member_cannot_add_or_run`.
-- `a_routine_is_refused_without_a_claude_link`.
 - `a_banned_member_can_only_rm`.
 - `a_task_with_invisible_characters_is_refused`.
 - `a_bot_message_never_runs_a_cloud_command`.
@@ -3363,6 +3389,7 @@ Acceptance, as pipeline and command tests named after the rules:
 - `a_late_answer_after_the_pass_is_recorded_as_fired`.
 - `a_replayed_slack_command_fires_once`.
 - `logout_drops_routines_and_handoffs`.
+- `a_slack_token_is_refused_without_a_claude_link`.
 - `a_member_slack_reports_deleted_loses_routines_from_every_surface`.
 - `slack_tokens_in_a_task_become_what_slack_showed`.
 - `a_link_label_other_than_its_url_is_shown_with_the_url`.

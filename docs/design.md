@@ -912,11 +912,12 @@ private tasks on purpose:
   agent is taught to write one out.
 
 A member can still paste text from elsewhere, an agent's reply included.
-So a `cloud run` task gets the checks a consent card's task gets (T33): the presentation selectors and joiners that only change how a
-character is drawn are dropped, and a task with control or invisible
-characters, deep indentation, wide runs of blanks, many blank lines in a row
-or stacked combining marks is refused, so what the member sees in their own
-message is what the session reads.
+So a `cloud run` task gets the checks a consent card's task gets (T33): the
+presentation selectors and joiners that only change how a character is
+drawn are dropped, and a task with control or invisible characters, deep
+indentation, wide runs of blanks, many blank lines in a row or stacked
+combining marks is refused, so what the member sees in their own message is
+what the session reads.
 
 ### Credential and billing
 
@@ -1045,9 +1046,9 @@ Two tables, both in the store:
   configuration tokens are; that last one sends no reply, since there is no
   one to reply to. A deletion acts on the member, not the identity, so a
   member Slack reports deleted loses every routine and hand-off they have,
-  those registered from Rocket.Chat included. agentd can't revoke a token at Anthropic, which has no
-  public API for it[^cc-routines-fire], so the other replies tell the member
-  to revoke it at claude.ai/code/routines.
+  those registered from Rocket.Chat included. agentd can't revoke a token
+  at Anthropic, which has no public API for it[^cc-routines-fire], so the
+  other replies tell the member to revoke it at claude.ai/code/routines.
 - `cloud_handoffs`: an id, the member, the routine's label and id (copied, so
   the record outlives the routine's row), the identity that asked and the
   kind of command origin, the sealed task text, the state (`sending`,
@@ -1057,6 +1058,18 @@ Two tables, both in the store:
   characters, as literal text. Rows are deleted 90 days after they were
   asked (`[cloud] retention_days`), and with the member's routines on
   `logout`.
+
+Commands run in order per identity, not per member, so a `logout` sent from
+the member's other identity, or run on another instance during a
+blue-green swap, can race a `cloud add` or `cloud run`. Storing a routine
+and writing a hand-off check, in the same transaction, that the member
+still has a Claude link, and `logout` deletes the member's routines and
+hand-offs only after it unlinks them, so a racing row is either deleted by
+the `logout` or refused. A member Slack reports deleted keeps their link,
+so a routine that a racing `cloud add` stores after the deletion stays
+until the member logs out: an accepted gap, since only that member can
+fire it, from another identity they've linked, and for a member only on
+Slack nobody can.
 
 Sealed columns use their table, column and row as associated data, like
 every sealed column. The task is kept because a member should be able to see

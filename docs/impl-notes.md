@@ -2508,7 +2508,7 @@ whenever the agent's connection recorded it first, and one in a room or DM
 without the manager would never be heard.
 
 **Solution.** `commands::rocketchat::CommandIntake` owns the channel, the
-per-member ordering and the drain at shutdown, and knows nothing of any
+ordering per `MemberKey` and the drain at shutdown, and knows nothing of any
 connection. Each connection delivers through a `CommandFeed`'s
 `into_sender(onward)`, which runs `command_in` with the manager bot's
 binding on every event the connection won, sends commands to the one
@@ -2522,7 +2522,7 @@ an agent's bot is refused whichever connection heard it. The intake runs
 until every feed is dropped, so it finishes the commands it received after
 the connections stop.
 
-### A member's commands run in order, others' alongside
+### An identity's commands run in order, others' alongside
 
 **Issue.** A code exchange can take the token endpoint's 30-second timeout,
 so running commands one after another on the connection would hold up
@@ -2531,8 +2531,9 @@ every member. Running each in its own task could swap one member's
 before it.
 
 **Solution.** Each command runs in its own task inside the intake's
-task, and waits for the previous command of the same member to finish
-first (a `oneshot` per member, pruned once finished). On shutdown the
+task, and waits for the previous command of the same `MemberKey` (one
+identity's key, not the member behind it) to finish first (a `oneshot` per
+`MemberKey`, pruned once finished). On shutdown the
 connections stop listening, and the intake runs the commands it already
 received (the store has recorded them as processed, so no other instance
 would) and waits for them within the drain timeout.
@@ -6927,16 +6928,16 @@ through a `CommandFeed` that knew the Rocket.Chat manager's binding, and
 the Slack queue, which `Routers::new` builds before `run`.
 
 **Solution.** `commands::intake::CommandIntake` takes `(member, text,
-origin)` through a `CommandSubmitter`, keeping T13's ordering per member and
-its drain at shutdown. `CommandFeed::new(submitter, binding)` is the
-Rocket.Chat side. `Routers` carries the intake and one submitter; the Slack
-queue's `slack::Inbound` sink holds another. `Server::run` runs the intake
-always, hands the submitter to the Rocket.Chat connection, and drops its own
-copy when shutdown starts, so the intake finishes what it received once the
-queue and the connection stop. `slack::Unrouted` is gone: `Inbound` passes
-the manager's slash commands and DMs to the intake, deletes the token of a
-member a `user_change` says was deleted, and drops everything else until
-T31 routes agents' messages.
+origin)` through a `CommandSubmitter`, keeping T13's ordering per
+`MemberKey` and its drain at shutdown. `CommandFeed::new(submitter,
+binding)` is the Rocket.Chat side. `Routers` carries the intake and one
+submitter; the Slack queue's `slack::Inbound` sink holds another.
+`Server::run` runs the intake always, hands the submitter to the Rocket.Chat
+connection, and drops its own copy when shutdown starts, so the intake
+finishes what it received once the queue and the connection stop.
+`slack::Unrouted` is gone: `Inbound` passes the manager's slash commands and
+DMs to the intake, deletes the token of a member a `user_change` says was
+deleted, and drops everything else until T31 routes agents' messages.
 
 ### Slack replies and entities
 
