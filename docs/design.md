@@ -1577,9 +1577,12 @@ member they name. The person's own organization is a separate field,
   The fields alone are not enough: in one of Bolt's fixtures an outside
   actor's `app_mention` has `team` set to the installing team and names the
   actor's organization only in `user_team`, `source_team` and
-  `user_profile.team`[^bolt-actor]. A lookup that says another workspace,
-  or that Slack answers for no user, leaves the sender outside with no
-  known organization, which no list admits.
+  `user_profile.team`[^bolt-actor]. A lookup that says another workspace
+  leaves the sender outside with the organization it names (`team_id`,
+  else `enterprise_user.enterprise_id`, when that isn't home). One Slack
+  answers for no user, or that fails other than by a transport error or a
+  rate limit, leaves them outside with no known organization, which no list
+  admits.
 
   The check reads only senders Slack itself vouches for, never what an event
   says, and never a bot: `fill_sender_team` skips a sender with a bot user,

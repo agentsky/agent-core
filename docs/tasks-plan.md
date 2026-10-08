@@ -3479,25 +3479,30 @@ Deliverables:
     one is `false` or absent.
 - The home check:
   - `TeamDirectory` keeps the ids of the `users.list` entries whose
-    `team_id` is the workspace, beside the names. `TeamDirectory::home_user`
-    answers from them, then from `users.info` (Tier 4) with the manager
-    app's token, as T31 reads the member list. It returns `Ok(true)` only
-    when the answer's `team_id` is the workspace, `Ok(false)` for another
-    `team_id` or `user_not_found`, and otherwise the lookup's error as it
-    came, whatever its variant, uncached. Both answers are cached for an
-    hour, at most 4,096 of them, the oldest dropped first; an answer
-    dropped from the cache is looked up again, never taken as home. A
-    caller can ask it not to wait for a used-up quota
-    (`WebApi::without_waiting`).
+    `team_id` is the workspace, beside the names.
+    `TeamDirectory::membership` answers from them, then from `users.info`
+    (Tier 4) with the manager app's token, as T31 reads the member list. It
+    returns `Membership::Home` only when the answer's `team_id` is the
+    workspace, `Membership::Outside(team)` for another `team_id`,
+    `user_not_found` or `user_not_visible`, where `team` is
+    `directory::organization`'s reading of the answer (its `team_id`, else
+    `enterprise_user.enterprise_id`, when that isn't home, and `None` for an
+    answer naming no user), and otherwise the lookup's error as it came,
+    whatever its variant, uncached. Both answers are cached for an hour,
+    with the organization, at most 4,096 of them, the oldest dropped first;
+    an answer dropped from the cache is looked up again, never taken as
+    home. A caller can ask it not to wait for a used-up quota
+    (`WebApi::without_waiting`). `TeamDirectory::home_user` is `membership`
+    answering `Home`, for callers that need only that.
   - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
     SurfaceError>` never waits for a used-up quota, and skips a sender with
     `sender_bot_user` set, whose `outside` decides nothing. When the fields
     left `outside` `None` and the lookup doesn't say home, it sets
-    `Some(Outside { team })` with the organization `users.info` named, its
-    `team_id`, else `enterprise_user.enterprise_id`, as Confirmation below
-    takes it, and `team: None` only when it named none or the lookup failed
-    with an `Api` or `Unauthorized` error; it returns `Ok` either way. It returns `Transport` and `RateLimited` as
-    they came, leaving `outside` alone. Its one caller is
+    `Some(Outside { team })` and returns `Ok`, where `team` is the
+    organization `membership` gave, as Confirmation below takes it, and
+    `None` when Slack named none or the lookup failed with any error but
+    `Transport` or `RateLimited`. Those two it returns as they came,
+    leaving `outside` alone. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
     real user; those two errors fail the confirmation as T31's lookups do,
     and the thread gets the "try again" line.
@@ -3591,6 +3596,7 @@ Acceptance:
 - `the_first_foreign_field_names_the_organization`.
 - `a_sender_is_home_only_when_the_home_check_agrees`.
 - `a_home_member_in_a_shared_channel_is_home`.
+- `a_home_lookup_naming_another_organization_gives_it`.
 - `a_home_organization_field_with_a_home_lookup_is_home`.
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
@@ -3639,7 +3645,10 @@ Deliverables:
   of those is given, replacing T36a's rule that any foreign field makes
   the sender outside, for the event and for Slack's copy alike, following
   what T36e recorded about `team` for a home member's message in a channel
-  another organization hosts.
+  another organization hosts. The home lookup still decides who is home, so
+  a home `user_team` alone admits no one. T36a's
+  `the_first_foreign_field_names_the_organization` and
+  `a_home_member_in_a_shared_channel_is_home` change to match.
 - `[slack_connect]` in the configuration, documented in
   `config/agentd.example.toml` and `README.md`:
   - `teams`: at most 100 ids shaped like Slack team ids (`T…` or `E…`),
