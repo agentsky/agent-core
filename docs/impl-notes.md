@@ -5157,7 +5157,7 @@ register a new token. The encrypted columns' associated data is the row's
 Once Slack has rotated, the old refresh token is used up and the new pair
 exists only in memory, so a store write that fails once would lose the
 token. Both writers, `/agent slack-token` and the rotator, go through
-`store_rotated`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
+`retry_store`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
 250 ms, then 500 ms, then 1 s. If the last try fails, the command tells the
 member that the refresh token is used up and to generate a new one.
 
@@ -5171,6 +5171,22 @@ that works, so `update_rotated_slack_config_token` also clears `broken_at`,
 `notified_at` and `notice_attempts`, and the token is renewed again. A
 rotation whose row was replaced or deleted meanwhile (`/agent logout`, a
 `user_change`) stores nothing and drops its pair.
+
+### A departure lost to a passing store error
+
+**Issue.** A `user_change` saying a member was deleted reaches `Inbound`
+after the ingress acked it and recorded it as processed, so Slack never
+sends it again. A store error in looking the member up or deleting their
+token was only logged, and the rotator kept renewing the departed member's
+token. Returning the error from the sink isn't an option: `Queue::run`
+takes any `Err` to mean the receiver is gone and stops.
+
+**Solution.** The rotated pair's retry, `store_rotated`, became
+`slack_tokens::retry_store(what, op)`, and `Inbound` runs the whole
+departure (lookup and delete) through it as one closure, so a passing error
+costs a retry, not the token. Only after the fourth failure is it logged,
+as before, by member key and error. The retries hold the queue for under
+2 s.
 
 ### Which failures a member hears about
 

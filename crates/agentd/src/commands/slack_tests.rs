@@ -935,19 +935,16 @@ async fn the_managers_own_and_other_bots_messages_are_not_commands() {
     assert!(h.posts().await.is_empty());
 }
 
-#[tokio::test]
-async fn a_deleted_user_loses_their_configuration_token() {
-    let h = slack_harness().await;
-    let grace = h.linked("U0HUMAN02").await;
-    let alice = h.linked("U0HUMAN01").await;
-    for member in [grace, alice] {
-        h.store
+impl SlackHarness {
+    /// Stores a configuration token for `member`.
+    async fn with_token(&self, member: MemberId) {
+        self.store
             .put_slack_config_token(
                 member,
                 &TeamId::new(TEAM),
                 &NewSlackConfigToken {
-                    token: SecretString::from("t"),
-                    refresh_token: SecretString::from("r"),
+                    token: SecretString::from("xoxe.xoxp-1-HELD-SECRET-token"),
+                    refresh_token: SecretString::from("xoxe-1-HELD-SECRET-refresh"),
                     expires_at: OffsetDateTime::now_utc(),
                 },
                 OffsetDateTime::now_utc(),
@@ -955,23 +952,44 @@ async fn a_deleted_user_loses_their_configuration_token() {
             .await
             .unwrap();
     }
-    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
-    let event = |value: Value| SlackEvent {
+}
+
+/// A `user_change` to the manager app, with `event` as its event.
+fn user_change(event: Value) -> SlackInbound {
+    SlackInbound::Event(SlackEvent {
         binding: BindingRef::MANAGER_ID,
         team: Some(TeamId::new(TEAM)),
         event_id: "Ev0USERCHG1".to_owned(),
         event_type: "user_change".to_owned(),
-        event: value,
+        event,
         received_at: OffsetDateTime::now_utc(),
-    };
+    })
+}
+
+/// The event of a `user_change` saying `U0HUMAN02` was deleted.
+fn departed() -> Value {
+    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
+    envelope["event"].clone()
+}
+
+fn departure() -> SlackInbound {
+    user_change(departed())
+}
+
+#[tokio::test]
+async fn a_deleted_user_loses_their_configuration_token() {
+    let h = slack_harness().await;
+    let grace = h.linked("U0HUMAN02").await;
+    let alice = h.linked("U0HUMAN01").await;
+    for member in [grace, alice] {
+        h.with_token(member).await;
+    }
     let running = Running::start(&h);
-    let mut active = envelope["event"].clone();
+    let mut active = departed();
     active["user"]["deleted"] = json!(false);
     active["user"]["id"] = json!("U0HUMAN01");
-    running.send(SlackInbound::Event(event(active))).await;
-    running
-        .send(SlackInbound::Event(event(envelope["event"].clone())))
-        .await;
+    running.send(user_change(active)).await;
+    running.send(departure()).await;
     running.stop().await;
     assert_eq!(h.stored(grace).await, None);
     assert!(h.stored(alice).await.is_some());
@@ -1314,9 +1332,11 @@ async fn file_store() -> (Store, String, TempDir) {
     (store, url, dir)
 }
 
-const FAIL_TOKEN_WRITES: &str = "\
+const TOKEN_WRITE_FAILURES: &str = "\
     CREATE TABLE token_write_failures (remaining INTEGER NOT NULL); \
-    INSERT INTO token_write_failures VALUES (0); \
+    INSERT INTO token_write_failures VALUES (0);";
+
+const FAIL_TOKEN_WRITES: &str = "\
     CREATE TRIGGER fail_token_insert BEFORE INSERT ON slack_config_tokens \
     WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
     UPDATE token_write_failures SET remaining = remaining - 1; \
@@ -1326,15 +1346,33 @@ const FAIL_TOKEN_WRITES: &str = "\
     UPDATE token_write_failures SET remaining = remaining - 1; \
     SELECT RAISE(FAIL, 'injected write failure'); END;";
 
+const FAIL_TOKEN_DELETES: &str = "\
+    CREATE TRIGGER fail_token_delete BEFORE DELETE ON slack_config_tokens \
+    WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
+    UPDATE token_write_failures SET remaining = remaining - 1; \
+    SELECT RAISE(FAIL, 'injected write failure'); END;";
+
 /// Makes the next `failures` writes of configuration tokens to the store
 /// at `url` fail: inserts, and updates that set the tokens.
 async fn fail_token_writes(url: &str, failures: i64) {
+    fail_token_statements(url, FAIL_TOKEN_WRITES, failures).await;
+}
+
+/// Makes the next `failures` deletions of configuration tokens from the
+/// store at `url` fail.
+async fn fail_token_deletes(url: &str, failures: i64) {
+    fail_token_statements(url, FAIL_TOKEN_DELETES, failures).await;
+}
+
+/// Makes the next `failures` statements `triggers` stops fail.
+async fn fail_token_statements(url: &str, triggers: &'static str, failures: i64) {
     use sqlx::Connection as _;
     let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
-    sqlx::raw_sql(FAIL_TOKEN_WRITES)
+    sqlx::raw_sql(TOKEN_WRITE_FAILURES)
         .execute(&mut db)
         .await
         .unwrap();
+    sqlx::raw_sql(triggers).execute(&mut db).await.unwrap();
     sqlx::query("UPDATE token_write_failures SET remaining = ?")
         .bind(failures)
         .execute(&mut db)
@@ -1461,4 +1499,47 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
     assert_eq!(h.stored(alice).await, None);
     assert!(!logs.snapshot().contains("SECRET"));
+}
+
+#[tokio::test]
+async fn a_departed_members_token_is_deleted_although_the_first_deletes_fail() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let grace = h.linked("U0HUMAN02").await;
+    h.with_token(grace).await;
+    fail_token_deletes(&url, 2).await;
+
+    let running = Running::start(&h);
+    running.send(departure()).await;
+    running.stop().await;
+    assert_eq!(failures_left(&url).await, 0);
+    assert_eq!(h.stored(grace).await, None);
+}
+
+#[tokio::test]
+async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let (logs, _guard) = capture_logs();
+    let grace = h.linked("U0HUMAN02").await;
+    h.with_token(grace).await;
+    fail_token_deletes(&url, 10).await;
+
+    let running = Running::start(&h);
+    running.send(departure()).await;
+    let (response_url, hook) = h.response_url();
+    running
+        .send(SlackInbound::Command(slash("me", response_url)))
+        .await;
+    running.stop().await;
+    assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
+    assert!(h.stored(grace).await.is_some());
+    let answered = h.requests().await;
+    assert_eq!(answered.iter().filter(|r| r.url.path() == hook).count(), 1);
+    let logs = logs.snapshot();
+    assert!(
+        logs.contains("couldn't delete the configuration token of a member who left"),
+        "{logs}"
+    );
+    assert!(!logs.contains("SECRET"));
 }

@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use core_types::{MemberId, MemberKey, SurfaceError, SurfaceKind};
+use core_types::{MemberKey, SurfaceError, SurfaceKind};
 use secrecy::SecretString;
 use store::{NewSlackConfigToken, SlackConfigTokenRef, Store, StoreError};
 use surface_slack::{ConfigToken, SlackClient};
@@ -50,12 +50,11 @@ pub const ROTATION_LEASE: Duration = Duration::from_secs(5 * 60);
 /// the new pair is stored before another instance may claim the token.
 pub const ROTATE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-/// How many times a pair `tooling.tokens.rotate` returned is written to the
-/// store before it is given up.
+/// How many times `retry_store` tries store work before it gives up.
 pub const STORE_ATTEMPTS: u32 = 4;
 
-/// The wait before the second write of a rotated pair, doubled before each
-/// one after it.
+/// The wait before `retry_store`'s second try, doubled before each one
+/// after it.
 const STORE_RETRY_WAIT: Duration = Duration::from_millis(250);
 
 /// How long a claim keeps other instances from sending a notice, and so how
@@ -134,7 +133,7 @@ impl Commands {
             ));
         }
         let rotated = stored(rotated);
-        let kept = store_rotated(member, || {
+        let kept = retry_store("storing a checked configuration token", || {
             self.inner
                 .store
                 .put_slack_config_token(member, &key.team, &rotated, now())
@@ -189,24 +188,25 @@ impl Commands {
     }
 }
 
-/// Runs `write`, which stores a pair `tooling.tokens.rotate` returned for
-/// `member`, until it succeeds or has failed [`STORE_ATTEMPTS`] times,
-/// waiting a little longer after each failure. The rotation used up the
-/// old refresh token, so a pair that isn't stored is lost, and the token
-/// with it.
-async fn store_rotated<T, W>(
-    member: MemberId,
-    mut write: impl FnMut() -> W,
+/// Runs `op` until it succeeds or has failed [`STORE_ATTEMPTS`] times,
+/// waiting a little longer after each failure, for store work a passing
+/// error mustn't lose: a pair `tooling.tokens.rotate` returned, which
+/// used up the old refresh token, or the deletion of a departed member's
+/// token, whose Slack event isn't delivered again. `what` names the work
+/// in the log.
+pub(crate) async fn retry_store<T, F>(
+    what: &'static str,
+    mut op: impl FnMut() -> F,
 ) -> Result<T, StoreError>
 where
-    W: Future<Output = Result<T, StoreError>>,
+    F: Future<Output = Result<T, StoreError>>,
 {
     let mut attempt = 1;
     let mut wait = STORE_RETRY_WAIT;
     loop {
-        match write().await {
+        match op().await {
             Err(err) if attempt < STORE_ATTEMPTS => {
-                tracing::warn!(%member, attempt, error = %err, "storing a rotated configuration token failed; trying again");
+                tracing::warn!(what, attempt, error = %err, "a store operation failed; trying again");
                 tokio::time::sleep(wait).await;
                 attempt += 1;
                 wait *= 2;
@@ -340,7 +340,7 @@ impl ConfigTokenRotator {
         match rotation {
             Ok(rotated) => {
                 let rotated = stored(rotated);
-                let kept = store_rotated(row.member, || {
+                let kept = retry_store("storing a renewed configuration token", || {
                     self.store
                         .update_rotated_slack_config_token(row, &rotated, now())
                 })
