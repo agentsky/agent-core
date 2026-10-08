@@ -193,10 +193,9 @@ impl Commands {
 /// waiting a little longer after each failure, for store work a passing
 /// error mustn't lose: a pair `tooling.tokens.rotate` returned, which
 /// used up the old refresh token, or the deletion of a departed member's
-/// token, whose Slack event isn't delivered again. Only a database error
-/// is tried again; a value that can't be sealed, opened or parsed fails
-/// the same way every time. Each failure but the last is logged with
-/// `what`, naming the work, and `member`, an id of whose it is.
+/// token, whose Slack event isn't delivered again. Each failure but the
+/// last is logged with `what`, naming the work, and `member`, an id of
+/// whose it is; the last is returned for the caller to log.
 pub(crate) async fn retry_store<T, F>(
     what: &'static str,
     member: impl fmt::Display,
@@ -209,7 +208,7 @@ where
     let mut wait = STORE_RETRY_WAIT;
     loop {
         match op().await {
-            Err(err @ StoreError::Database(_)) if attempt < STORE_ATTEMPTS => {
+            Err(err) if attempt < STORE_ATTEMPTS => {
                 tracing::warn!(what, %member, attempt, error = %err, "a store operation failed; trying again");
                 tokio::time::sleep(wait).await;
                 attempt += 1;

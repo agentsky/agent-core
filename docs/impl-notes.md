@@ -5184,11 +5184,12 @@ takes any `Err` to mean the receiver is gone and stops.
 **Solution.** The rotated pair's retry, `store_rotated`, became
 `slack_tokens::retry_store(what, member, op)`, and `Inbound` runs the whole
 departure (lookup and delete) through it as one closure, so a passing error
-costs a retry, not the token. Each of the first three failures is logged as
-a retry with the member's id; after the fourth, `Inbound` logs its warning,
-as before, by member key and error. Only `StoreError::Database` is retried:
-a sealing or parsing failure would fail the same way again. It stays in
-`slack_tokens`, since agentd has no shared store or retry module.
+costs a retry, not the token. Every `StoreError` is retried, since even a
+sealing failure can pass (`SealError::Rng`) and the rotator can't afford to
+lose a pair. `retry_store` logs each failure but the last as a retry, with
+the member's id, and returns the last to its caller: `Inbound` logs that
+one, as before, by member key and error. It stays in `slack_tokens`, since
+agentd has no shared store or retry module.
 
 The retries run inline in the sink, so a failing departure holds the shared
 Slack event queue for 1.75 s of waits plus each attempt's own store time,
