@@ -3104,10 +3104,11 @@ Deliverables:
     `state = 'sending'`, and `notice_next_attempt_at` where
     `state = 'unknown' AND notified_at IS NULL`.
 - `Store` methods:
-  - `put_cloud_routine(member, label, routine_id, token, added_by, now)`.
-    The token is a `SecretString`, sealed with
-    `cloud_routines/token_enc/<id>` as associated data. It runs in one
-    `BEGIN IMMEDIATE` transaction and returns `CloudRoutinePut`:
+  - `put_cloud_routine(&NewCloudRoutine { member, label, routine_id,
+    url_origin, token, added_by }, now)`. The token is a `SecretString`,
+    sealed with `cloud_routines/token_enc/<id>` as associated data. It
+    runs in one `BEGIN IMMEDIATE` transaction and returns
+    `CloudRoutinePut`:
     - `Added(id)` for a new label.
     - `Replaced(id)` for an existing label, replaced in place, which is
       how a member registers a new token.
@@ -3115,11 +3116,11 @@ Deliverables:
       label.
     - `Full` for a new label past 20 for the member, counted in the
       transaction.
-    - `Unlinked` when the member no longer has a Claude link, checked in
-      the transaction by `claude_links::linked`, the store's shared link
-      check. Against a `logout` that unlinks and then deletes
-      the member's routines (T35c), the put either commits first, and the
-      delete finds its row, or comes after the unlink and is refused.
+    - `Unlinked` when the member no longer has a Claude link, checked in the
+      transaction by `claude_links::linked`, the store's shared link check.
+      Against a `logout` that unlinks and then deletes the member's routines
+      (T35c), the put either commits first, and the delete finds its row, or
+      comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id and the opened
     token. `cloud_routines(member)` lists labels, ids and times, never
     tokens.
@@ -3127,12 +3128,18 @@ Deliverables:
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(…)` seals the task with
-    `cloud_handoffs/task_enc/<id>` and, in one `BEGIN IMMEDIATE`
-    transaction, checks the member still has a Claude link with
-    `claude_links::linked`, as `put_cloud_routine` does, and inserts the
-    row as `sending`. It returns `CloudBegun::Begun(id)`, or
-    `CloudBegun::Unlinked` and inserts nothing.
+  - `begin_cloud_handoff(&NewCloudHandoff { … }, per_hour, now)` seals
+    the task with `cloud_handoffs/task_enc/<id>` and, in one
+    `BEGIN IMMEDIATE` transaction, checks the member still has a Claude
+    link with `claude_links::linked`, as `put_cloud_routine` does, and
+    inserts the row as `sending`. It returns `CloudBegun`, inserting
+    nothing but for `Begun`:
+    - `Begun(id)` for the row.
+    - `RoutineGone` when the routine was removed, or its token replaced,
+      since the command read it.
+    - `TooMany` when the member asked for `per_hour` hand-offs in the last
+      hour (`CLOUD_HANDOFF_WINDOW`) already.
+    - `Unlinked` when the member no longer has a Claude link.
   - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
     `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
     for an answer whose record was held up past the pass. Recording any
@@ -3363,23 +3370,21 @@ Deliverables:
   hand-off's session may already have fired, and only its record is lost.
 - `slack-token` has the same race: its handler checks the link before it
   rotates the token with Slack, and `put_slack_config_token` doesn't check
-  it again, so a token a racing `slack-token` stores after `logout`'s
-  delete survives the logout, whether the delete runs before the unlink or
-  after it. So `logout` deletes the Slack configuration tokens after
-  `auth.logout` too, and `put_slack_config_token` checks the link in its
-  write: one `INSERT … SELECT … WHERE EXISTS (SELECT 1 FROM claude_links
-  …) ON CONFLICT …` statement, not a transaction, since a statement that
-  fails inside an explicit transaction rolls back the trigger counts the
-  failure-injection tests read. It returns
-  `Result<Option<SlackConfigTokenRef>>`, with `None` when the member has
-  no Claude link or doesn't exist. The handler answers `None` with new
-  wording, not the unlinked reply, which ends "I didn't use it": the
-  member is no longer linked, and checking the token
-  used up its refresh token, so they should generate a new one after
-  linking again. The store tests in
-  `crates/store/src/slack_config_tokens.rs`, which put tokens for members
-  with no link, seed a link first, as do any agentd tests that put a token
-  for an unlinked member.
+  it again, so a token a racing `slack-token` stores after `logout`'s delete
+  survives the logout, whether the delete runs before the unlink or after
+  it. So `logout` deletes the Slack configuration tokens after `auth.logout`
+  too, and `put_slack_config_token` checks the link in its write: one
+  `INSERT … SELECT … WHERE EXISTS (SELECT 1 FROM claude_links …) ON CONFLICT
+  …` statement, not a transaction, since a statement that fails inside an
+  explicit transaction rolls back the trigger counts the failure-injection
+  tests read. It returns `Result<Option<SlackConfigTokenRef>>`, with `None`
+  when the member has no Claude link or doesn't exist. The handler answers
+  `None` with new wording, not the unlinked reply, which ends "I didn't use
+  it": the member is no longer linked, and checking the token used up its
+  refresh token, so they should generate a new one after linking again. The
+  store tests in `crates/store/src/slack_config_tokens.rs`, which put tokens
+  for members with no link, seed a link first, as do any agentd tests that
+  put a token for an unlinked member.
 - A Slack task's tokens are rewritten to what Slack showed, as the design's
   [Command surface](design.md#command-surface) says: `<@U…|name>` to
   `@name`, `<#C…|name>` to `#name`, `<url>` and a `<url|label>` labelled
