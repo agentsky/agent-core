@@ -1687,13 +1687,14 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails. If the kill fails, nothing was signalled
-  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)), and the
-  process, which has no way to stop its container, stays `may_be_alive()`; T21's
-  session manager stops the container before starting another process in it.
-  `ClaudeProcess::may_be_alive` says whether a killed process was seen to
-  exit: a kill can fail, and under Docker signal nothing
-  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  is killed and the turn fails. A kill doesn't always end the process: it
+  can fail, and under Docker signal nothing
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)). So if
+  the exit isn't seen within the grace period, the process stays
+  `may_be_alive()`
+  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)). The process has no
+  way to stop its container; T21 calls `process_stopping` and stops the
+  container for the session before starting another process.
 - Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
   `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
   starts a new process with `--resume`. `TurnStats::init_seen` says whether
