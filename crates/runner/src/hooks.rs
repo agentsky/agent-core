@@ -161,9 +161,10 @@ pub trait TurnHooks: Send + Sync + 'static {
     /// Any failure. The runner can't tell what is still pointed, so it
     /// stops the process (calling
     /// [`process_stopping`](Self::process_stopping)), and its container too
-    /// if that call fails. It does the same when
-    /// this hook, `turn_starting` or the turn panicked, and the panic then
-    /// fails the turn with [`RunnerError::TurnTask`](crate::RunnerError::TurnTask).
+    /// if that call fails or the process may still run. It does the same
+    /// when this hook, `turn_starting` or the turn panicked, and the panic
+    /// then fails the turn with
+    /// [`RunnerError::TurnTask`](crate::RunnerError::TurnTask).
     async fn turn_finished(
         &self,
         session: &Session,
@@ -178,11 +179,16 @@ pub trait TurnHooks: Send + Sync + 'static {
     /// # Errors
     ///
     /// Any failure. It is logged, and the stop goes ahead and takes the
-    /// process's container with it, so nothing left running there keeps
-    /// what the hook failed to revoke. Once the container is stopped the
-    /// runner calls the hook once more, unless a call for the process has
-    /// succeeded since, and only logs a second failure. A panic is handled
-    /// the same way.
+    /// process's container with it, so that once the container is stopped
+    /// nothing left running there keeps what the hook failed to revoke. A
+    /// container the sandbox fails to stop may stay running; it stays the
+    /// session's, marked dead, until a later stop succeeds. Once the
+    /// container is stopped the runner calls the hook once more, unless a
+    /// call for the process has succeeded since. A second failure is logged
+    /// and the runner never calls the hook for that process again, so what it
+    /// failed to revoke stays live unless the implementation revokes it some
+    /// other way, although the container's address may already belong to
+    /// another container. A panic is handled the same way.
     async fn process_stopping(
         &self,
         session: &Session,

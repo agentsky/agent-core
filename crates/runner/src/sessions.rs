@@ -225,20 +225,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A failed or panicking `process_starting` fails the turn and stops the
 /// container, and so does a process that fails or panics while starting. A
 /// failed or panicking `process_stopping` is logged, and the stop goes ahead
-/// and takes the container with it, so nothing left running there keeps
-/// what the hook failed to revoke. Once the container is stopped the hook
-/// runs once more, unless a call for that process has succeeded since, and
-/// if that fails too the runner logs it and gives up.
+/// and takes the container with it, so that once the container is stopped
+/// nothing left running there keeps what the hook failed to revoke; one the
+/// sandbox fails to stop may stay running, and stays the session's, marked
+/// dead, until a later stop succeeds. Once the container is stopped the hook
+/// runs once more, unless a call for that process has succeeded since, and if
+/// that fails too the runner logs it and gives up.
 ///
 /// A turn reuses the session's warm process when its credential kind, its
 /// model and its mounts match, and otherwise stops it (and the container,
 /// for other mounts or a failed `process_stopping`) and starts another,
 /// resuming from the transcript. A process that crashed, timed out or
-/// refused its `--resume` is stopped after the turn; if it wasn't seen to exit, its container is stopped too
-/// before the next process starts, so two processes never write one
-/// transcript. A container the sandbox fails to stop stays the session's,
-/// marked dead: the session's turns fail until a later stop succeeds, rather
-/// than start another process on its transcript.
+/// refused its `--resume` is stopped after the turn; if it wasn't seen to
+/// exit, its container is stopped too before the next process starts, so
+/// two processes never write one transcript. A container the sandbox fails
+/// to stop stays the session's, marked dead: the session's turns fail until
+/// a later stop succeeds, rather than start another process on its
+/// transcript.
 ///
 /// # Started sessions
 ///
