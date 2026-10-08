@@ -21,7 +21,7 @@
 #    message with the manager is a room no connection is in yet, so the
 #    members' direct messages with the manager are opened before agentd
 #    starts, and the test waits for the debug line saying the manager's
-#    connection has set up its subscriptions before posting. A mention in
+#    connection has sent its subscriptions before posting. A mention in
 #    #general needs no such wait: the manager is in #general, and on
 #    Rocket.Chat whichever connection hears a message delivers it for every
 #    agent it mentions.

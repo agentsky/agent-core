@@ -4161,7 +4161,7 @@ Deliverables:
      message with the manager is a room no connection is in yet, so the
      members' direct messages with the manager are opened before agentd
      starts, and the script waits for the Rocket.Chat surface's debug line
-     saying the manager's connection has set up its subscriptions before
+     saying the manager's connection has sent its subscriptions before
      posting.
   4. Runs `fake-anthropic` in agentd's network namespace (`docker run
      --network container:<agentd>`), from the agentd image, since the
