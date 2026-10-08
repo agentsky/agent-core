@@ -1272,6 +1272,9 @@ async fn a_new_token_replaces_the_routine_and_a_routine_is_registered_once() {
     assert_eq!(token.expose_secret(), NEW_TOKEN);
     logs.snapshot()
         .assert_has("registered a cloud routine")
+        .assert_has("replaced a cloud routine")
+        .assert_has("refused a cloud routine registered under another label")
+        .assert_has("refused a cloud routine past the per-member cap")
         .assert_lacks(NEW_TOKEN)
         .assert_lacks(TOKEN);
 }

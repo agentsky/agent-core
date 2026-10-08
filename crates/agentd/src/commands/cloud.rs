@@ -167,29 +167,43 @@ impl Commands {
                 now(),
             )
             .await?;
-        tracing::info!(%member, routine = routine_id.as_str(), put = ?put, "registered a cloud routine");
         let run = origin.command(&format!("cloud run {label} <task>"));
         Ok(match put {
-            CloudRoutinePut::Added(_) => format!(
-                "Registered routine `{label}` (`{routine_id}`). Hand it work with {run}; it runs \
-                 on the account the routine belongs to."
-            ),
-            CloudRoutinePut::Replaced(_) => format!(
-                "Replaced routine `{label}`: it now fires `{routine_id}` with the token you just \
-                 sent. Hand it work with {run}."
-            ),
-            CloudRoutinePut::RoutineTaken { label: taken } => format!(
-                "You registered that routine as `{taken}` already, so I didn't store it again. \
-                 To give it a new token, send {}.",
-                add_command(origin, &format!("{taken} <url> <token>"))
-            ),
-            CloudRoutinePut::Full => format!(
-                "You have {}, the most one member may hold, so I didn't store this one. Remove \
-                 one with {} first.",
-                routines_counted(u64::from(store::MAX_CLOUD_ROUTINES)),
-                origin.command("cloud rm <routine>")
-            ),
-            CloudRoutinePut::Unlinked => link_first(origin),
+            CloudRoutinePut::Added(id) => {
+                tracing::info!(%member, cloud_routine = %id, routine = routine_id.as_str(), "registered a cloud routine");
+                format!(
+                    "Registered routine `{label}` (`{routine_id}`). Hand it work with {run}; it \
+                     runs on the account the routine belongs to."
+                )
+            }
+            CloudRoutinePut::Replaced(id) => {
+                tracing::info!(%member, cloud_routine = %id, routine = routine_id.as_str(), "replaced a cloud routine");
+                format!(
+                    "Replaced routine `{label}`: it now fires `{routine_id}` with the token you \
+                     just sent. Hand it work with {run}."
+                )
+            }
+            CloudRoutinePut::RoutineTaken { label: taken } => {
+                tracing::info!(%member, routine = routine_id.as_str(), "refused a cloud routine registered under another label; stored nothing");
+                format!(
+                    "You registered that routine as `{taken}` already, so I didn't store it \
+                     again. To give it a new token, send {}.",
+                    add_command(origin, &format!("{taken} <url> <token>"))
+                )
+            }
+            CloudRoutinePut::Full => {
+                tracing::info!(%member, routine = routine_id.as_str(), "refused a cloud routine past the per-member cap; stored nothing");
+                format!(
+                    "You have {}, the most one member may hold, so I didn't store this one. \
+                     Remove one with {} first.",
+                    routines_counted(u64::from(store::MAX_CLOUD_ROUTINES)),
+                    origin.command("cloud rm <routine>")
+                )
+            }
+            CloudRoutinePut::Unlinked => {
+                tracing::info!(%member, routine = routine_id.as_str(), "a member was unlinked before their cloud routine was stored; stored nothing");
+                link_first(origin)
+            }
         })
     }
 
