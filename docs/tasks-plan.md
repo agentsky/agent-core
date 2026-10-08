@@ -3018,9 +3018,9 @@ Not scheduled. Each needs a decision before it becomes a task.
   `member_for`, `is_banned` and `policy`, would answer the thread instead.
   It changes the `RouterView` interface (T22) and its implementations in
   T23 and T26 for a reply only, since the request already fails closed. A
-  failed read must never count as "not linked": from T26 that falls through
-  to the community key, so a member's turn would run on the community's
-  budget.
+  failed read must never count as "not linked": from T26 a non-owner's turn
+  would then run on the community key when one is configured, and a broken
+  link would skip the relink prompt.
 - **Per-scope container cap tuning** from real usage (T21 sets a default).
 - **Fairness at the per-scope cap**, a follow-up to T21's pool. A session
   keeps its container while it has turns, so a busy session can hold its
