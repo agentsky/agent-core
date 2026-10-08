@@ -387,6 +387,24 @@ pub fn later_ids(
     order.into_iter().skip(1).cloned().collect()
 }
 
+/// The old ids of `binding`'s waiting changes in `changes` whose chain
+/// reaches `id` ([`later_ids`]): those whose denies apply to `id` while
+/// they wait ([`pending_denials`]).
+pub fn waiting_before<'a>(
+    changes: &'a [KnownChannelIdChange],
+    binding: BindingId,
+    id: &'a ConversationId,
+) -> impl Iterator<Item = &'a ConversationId> {
+    changes
+        .iter()
+        .filter(move |known| {
+            known.waiting
+                && known.change.binding == binding
+                && later_ids(changes, binding, &known.change.old).contains(id)
+        })
+        .map(|known| &known.change.old)
+}
+
 /// The conversations whose denies apply to others too while `changes`, an
 /// agent's recorded channel id changes, wait: for each waiting change,
 /// its old id and each id the channel had since ([`later_ids`]).

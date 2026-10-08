@@ -1965,7 +1965,9 @@ none of which it can forget, has its denies copied at once instead.
 Copies never take an agent's deny list past twice the rules its owner may
 set; the next denies everyone instead, which the owner lifts with `allow
 everyone`, and `deny everyone` is always taken. A chain of changes (A to
-B, then B to C) settles on its last id in any order.
+B, then B to C) settles on its last id in any order. When B to C settles on
+an id Slack gives past C while A to B still waits, A's denies are copied to
+that id with B's move, since no recorded change names it.
 
 Only the receiving agent's rules move: each agent whose bot is in the channel
 gets its own event, and an owner who forges one can change only rules they

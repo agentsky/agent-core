@@ -10038,7 +10038,11 @@ waiting for its quota (`WebApi::without_waiting`).
   the new id to the last id they reach (`policy::later_ids`), so A→B and
   B→C land on C in either order. It then takes the id Slack answers with,
   which covers a Slack that follows an old id to the new one. B's own
-  rules move when B→C settles.
+  rules move when B→C settles. If Slack answers with an id D that no
+  recorded change names while A→B still waits, the same write copies
+  A's denies to D (`policy::waiting_before`, the waiting changes whose
+  chain reaches B), since A's pending denials reach only B and C; A's
+  settle onto D later drops the copy as a duplicate.
 
 ### While a change waits, the old id's denies apply to the new one
 
@@ -10050,7 +10054,9 @@ one.
 store with its settings on every message. `policy::pending_denials` pairs
 each waiting change's old id with every id the channel had since.
 `agent_policy` copies the old id's room denies to each of those. Allows
-never move early, so a pending change only ever narrows access.
+never move early, so a pending change only ever narrows access. An id
+Slack named past the recorded ones when a later change settled is not
+among them; that settle stored the copies there instead (see "Chains").
 
 The view reads the changes before the rules. A settle writes the moved
 rules and only then marks the change settled, and a give-up copies the
@@ -10417,3 +10423,26 @@ it after a rollback. Both are removed, which leaves the system simpler:
 - With the flag gone, round 5's rollback hazard is gone too.
 - The 100-rule line in T27's notes and the "Pending denials" figures are
   corrected.
+
+### A later change settled on an id past the chain
+
+**Issue.** With A→B waiting after a failed try and B→C settled at once on
+D, the id Slack gave for C, B's rules moved to D but A's denies didn't:
+A's pending denials covered B and C only, so a non-owner in D got past
+A's deny until A's retry settled, and for good if A was given up, since
+the give-up copies to `later_ids(A)`, B and C.
+
+**Solution.** `settle_channel_change` copies to the id it moves to the
+denies on the old id of each waiting change whose chain reaches its own
+old id, in the `update_agent_settings` closure that moves its rules, so
+before the row is marked settled. That set, which `copy_denies_onward`
+also uses for its sources, is one helper, `policy::waiting_before`. When
+A later settles on D, `move_room` keeps the first rule on D and drops the
+copy (`a_change_settled_on_a_redirected_id_carries_the_denies_of_a_change_still_waiting`);
+a give-up leaves it there
+(`a_change_given_up_after_a_later_one_settled_on_a_redirected_id_leaves_its_deny_there`).
+When Slack answers with C itself, the copy on C repeats a pending denial
+and is dropped the same way once A settles; if A settles elsewhere, the
+copy stays on an id the channel no longer has. A waiting change that
+settles concurrently has moved its rules off its old id, so the copy
+finds nothing there to copy.

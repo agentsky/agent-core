@@ -3998,7 +3998,9 @@ Deliverables:
   transaction, and drop the old id from the conversation-info cache. Any
   other answer leaves it waiting. While it waits, the router applies the
   agent's denies on the old id to the new one; after a day it is given up
-  and those denies are copied to the new id. When
+  and those denies are copied to the new id. A later change in its chain
+  that settles on an id Slack gives past the recorded ones copies them
+  there too, in the transaction that moves its own rules. When
   the agent already has a rule on the new id, the rules merge: a deny on
   either id stays a deny, and duplicates are dropped. Only an old id
   starting with `G` is expected; any other is logged and handled the same

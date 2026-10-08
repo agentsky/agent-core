@@ -108,7 +108,7 @@ use super::bots::SlackBots;
 use super::manager::SlackManager;
 use crate::agents::CREATION_LEASE;
 use crate::config::Config;
-use crate::policy::{Rules, later_ids};
+use crate::policy::{Rules, later_ids, waiting_before};
 
 /// How often the sweeper looks for creations to abandon and reminders to
 /// send.
@@ -1234,13 +1234,8 @@ impl SlackAgents {
             team: row.team.clone(),
             conversation: conversation.clone(),
         };
-        let upstream = known.iter().filter(|other| {
-            other.waiting
-                && other.change.binding == binding
-                && later_ids(&known, binding, &other.change.old).contains(&change.old)
-        });
         let sources: Vec<ConvRef> = std::iter::once(&change.old)
-            .chain(upstream.map(|other| &other.change.old))
+            .chain(waiting_before(&known, binding, &change.old))
             .map(room)
             .collect();
         let targets: Vec<ConvRef> = later_ids(&known, binding, &change.old)
@@ -1299,8 +1294,12 @@ impl SlackAgents {
     /// binding's recorded changes from the new id to the last id they name,
     /// asks Slack with the binding's bot token where that channel is now,
     /// and, if Slack answers with the bot in it, moves the agent's rules on
-    /// the old id there. Any other answer leaves it waiting for its next
-    /// try.
+    /// the old id there. In the same write it copies there the denies on
+    /// the old id of each waiting change whose chain reaches this one's old
+    /// id ([`waiting_before`]), since Slack may name an id no recorded
+    /// change does, which their pending denies wouldn't reach; a duplicate
+    /// is dropped when such a change moves its rules there in turn. Any
+    /// other answer leaves it waiting for its next try.
     ///
     /// # Errors
     ///
@@ -1352,11 +1351,13 @@ impl SlackAgents {
             conversation: conversation.clone(),
         };
         let (from, into) = (room(old), room(&to));
+        let upstream: Vec<ConvRef> = waiting_before(&known, binding, old).map(room).collect();
         let moved = store
             .update_agent_settings(row.agent, |settings| {
                 let mut rules = Rules::read(settings).ok()?;
                 let moved = rules.move_room(&from, &into);
-                if moved {
+                let copied = rules.copy_denies(upstream.iter().map(|source| (source, &into)));
+                if moved || copied {
                     rules.write(settings);
                 }
                 Some(moved)

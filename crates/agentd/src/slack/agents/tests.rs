@@ -752,6 +752,7 @@ async fn an_install_that_finishes_after_the_agent_was_deleted_is_refused() {
 const OLD: &str = "G0PRIVAT1";
 const NEW: &str = "C0PRIVAT1";
 const NEWER: &str = "C0PRIVAT2";
+const NEWEST: &str = "C0PRIVAT3";
 const WRITER_TOKEN: &str = "xoxb-writer-SECRET";
 
 fn room(id: &str) -> ConvRef {
@@ -1101,6 +1102,87 @@ async fn a_chain_of_changes_lands_on_the_last_id_in_either_order() {
         "Slack names the id the channel has since"
     );
     assert_eq!(rules_of(&h, redirected).await, denying(&[NEWER]));
+}
+
+/// Records [`OLD`] to [`NEW`] and [`NEW`] to [`NEWER`] for `binding`, whose
+/// agent denies [`OLD`], leaves the first waiting, claimed at `at`, and
+/// settles the second on [`NEWEST`], the id Slack says [`NEWER`] has now.
+/// Returns the first.
+async fn settled_past_a_waiting_change(
+    h: &Harness,
+    binding: BindingId,
+    at: OffsetDateTime,
+) -> ChannelIdChange {
+    set_rules(h, binding, &denying(&[OLD])).await;
+    let first = change_of(binding, OLD, NEW);
+    let second = change_of(binding, NEW, NEWER);
+    recorded(h, &first).await;
+    recorded(h, &second).await;
+    channel_info(h, AGENT_TOKEN, NEWER, refused("channel_not_found")).await;
+    assert_eq!(
+        h.agents
+            .settle_channel_change(&first, &|| at)
+            .await
+            .unwrap(),
+        ChannelChange::Waiting
+    );
+    h.slack.reset().await;
+    channel_info(h, AGENT_TOKEN, NEWER, member_of(NEWEST)).await;
+    assert_eq!(
+        h.agents
+            .settle_channel_change(&second, &|| at)
+            .await
+            .unwrap(),
+        ChannelChange::Moved {
+            rules: false,
+            to: NEWEST.into()
+        }
+    );
+    first
+}
+
+#[tokio::test]
+async fn a_change_settled_on_a_redirected_id_carries_the_denies_of_a_change_still_waiting() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let at = OffsetDateTime::now_utc();
+    settled_past_a_waiting_change(&h, helper, at).await;
+    assert_eq!(
+        changes_of(&h, helper).await,
+        [
+            (OLD.to_owned(), NEW.to_owned(), true),
+            (NEW.to_owned(), NEWER.to_owned(), false)
+        ]
+    );
+    for channel in [NEW, NEWER, NEWEST] {
+        assert!(
+            !permits(&h, helper, channel).await,
+            "the waiting change's deny reaches {channel}"
+        );
+    }
+
+    let retry = at + CHANNEL_CHANGE_RETRY;
+    assert_eq!(h.agents.pass_at(|| retry).await.settled, 1);
+    assert_eq!(
+        rules_of(&h, helper).await,
+        denying(&[NEWEST]),
+        "the deny moved onto its copy"
+    );
+    assert!(!permits(&h, helper, NEWEST).await);
+}
+
+#[tokio::test]
+async fn a_change_given_up_after_a_later_one_settled_on_a_redirected_id_leaves_its_deny_there() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    let first = settled_past_a_waiting_change(&h, helper, OffsetDateTime::now_utc()).await;
+    let late = first.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| late).await.given_up, 1);
+    assert_eq!(
+        rules_of(&h, helper).await,
+        denying(&[OLD, NEWEST, NEW, NEWER])
+    );
+    assert!(!permits(&h, helper, NEWEST).await);
 }
 
 #[tokio::test]
