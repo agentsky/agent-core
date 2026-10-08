@@ -5781,6 +5781,54 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
 
+### A lost outbox or attribution is a lost part
+
+**Issue.** Delivery told the thread only about parts it couldn't post.
+When `turn_finished` failed, as when `Ctl::end_turn` couldn't clear the
+token's turn in the store, the outbox was never taken and went with the
+process, so the turn's attachments, reactions and queued
+posts were lost without a word. When the platform accepted a chunk but its
+`message_refs` row couldn't be recorded, the post went unattributed: a
+mention of another agent in it is ignored as an unattributed managed bot's
+(the view's two-second wait can't find a row never written), a person's
+reply to it reaches no agent, and the next turn shows it again as history.
+
+**Solution.** Both count as a lost part, so the thread gets the one line
+saying part of the reply couldn't be delivered. Delivery can't tell
+whether a lost outbox held anything, so it says so whenever
+`turn_finished` failed. The line is the only signal: the post can't be
+attributed after the fact, since the store already failed once. A hook
+that panics fails the whole turn instead, which posts `FAILED_TEXT`, and a
+reaction Slack or Rocket.Chat refuses is only logged: a mistyped emoji
+loses nothing the thread needs to hear about.
+
+### A thread's messages are looked up one at a time
+
+**Issue.** The sink looked a message's candidates up, several store round
+trips, before queueing it in its lanes. A Rocket.Chat connection hands its
+messages over one at a time, but every connection in a room (the manager's
+and each bot's) may deliver a message, whichever records it in `Dedup`
+first, and the sinks of different connections run at once. Two messages
+of one thread delivered by different connections could reach the lane in
+the order their lookups ended rather than the order they were sent: the
+later one's turn then showed the earlier as history, and the earlier's
+turn ran anyway, answering it twice.
+
+**Solution.** `dispatch` takes a lock per thread (the lanes' thread, so a
+DM's or a thread-less channel's conversation) before the lookup and holds
+it until the message is queued for every candidate. Tokio's mutex grants
+in the order asked, so a thread's messages reach its lanes in the order
+their dispatches started; the busy lines are posted after the lock is
+released, so sending still waits only for the lookups of the thread's
+earlier messages, never for a turn. An entry lives only while a dispatch
+holds or waits for it, and a sender cancelled while waiting leaves none,
+as `auth`'s `KeyedLocks` does. That type is crate-private to `auth`, and
+a key-to-lock map isn't authentication, so agentd has its own copy next
+to the pipeline rather than importing it. The lock can't restore an order
+lost before `dispatch` starts: two connections that record two messages
+in `Dedup`, or reach the sink, in the opposite order of the messages are
+dispatched in that order.
+
 ## T24: Session commands
 
 ### Which sessions the commands act on

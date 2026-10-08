@@ -18,6 +18,7 @@
 //! [`Ctl`]: crate::ctl::Ctl
 
 mod hooks;
+mod keyed;
 mod message;
 mod run;
 mod surfaces;
