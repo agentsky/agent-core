@@ -9915,30 +9915,55 @@ it passes.
   may go again after its lease), and the pass's summary, the members told
   included, at debug, as the cloud notifier does.
 
-### Link recheck when a routine is stored
+### Link recheck when a secret is stored or a hand-off begins
 
-- `cloud add` checked the link, then stored the routine in a later
-  transaction. The intake runs one identity's (`MemberKey`'s) commands in
-  order within one instance only, so a `logout` from a second instance in a
-  blue-green overlap, or from the member's identity on another surface,
-  could land between the two and leave a token stored after `logout`.
-  `put_cloud_routine` now checks for a `claude_links` row in its
-  `BEGIN IMMEDIATE` transaction and stores nothing without one
-  (`CloudRoutinePut::Unlinked`), which `cloud add` answers with the
-  "Link your Claude account first" reply. `logout` already unlinks before
-  it deletes the member's routines, which the recheck relies on: a racing
-  `cloud add` either commits before the deletion, which takes its routine,
-  or runs after the unlink and is refused. Store tests and the command
-  tests that put routines directly now link the member first, and the
-  helper asserts the routine was stored.
-- Slack's `member_left` handler deletes a deactivated member's routines
-  without unlinking them, so the recheck doesn't cover a `cloud add` that
-  passes its check before that deletion and commits after it. Such a
+- `cloud add`, `cloud run` and `slack-token` checked the link, then wrote
+  in a later statement. The intake runs one identity's (`MemberKey`'s)
+  commands in order within one instance only, so a `logout` from a second
+  instance in a blue-green overlap, or from the member's identity on
+  another surface, could land between the two: a routine or Slack
+  configuration token stored after `logout`, or a hand-off recorded and
+  fired after it. Each write now checks for a `claude_links` row as it
+  writes and does nothing without one: `put_cloud_routine` and
+  `begin_cloud_handoff` in their `BEGIN IMMEDIATE` transactions
+  (`CloudRoutinePut::Unlinked`, `CloudBegun::Unlinked`, through one
+  `claude_links::linked` helper), and `put_slack_config_token`, which
+  returns `None`, in its one `INSERT … SELECT … WHERE EXISTS` statement.
+  Each command answers that with its own "Link your Claude account first"
+  reply. `slack-token`'s says "I didn't use it", though checking the token
+  used up its refresh token by then; the race is rare enough to share the
+  unlinked reply.
+- `put_slack_config_token` stays a single statement rather than a
+  transaction because the tests that inject token write failures count
+  them in a trigger, and a failed statement in an explicit transaction
+  rolls the count back with it. A member that doesn't exist now gets
+  `None` rather than a foreign key error.
+- `logout` already unlinks (`auth.logout`) before it deletes the member's
+  Slack tokens, routines and hand-offs, and runs those deletes whenever the
+  member exists, linked or not, which the recheck relies on: a racing
+  write either commits before the deletes, which take it, or runs after
+  the unlink and is refused. This closes most of the window noted above in
+  which a run that passed its link check before the unlink still recorded
+  and fired: now only a run whose row was recorded before the unlink
+  fires, and its outcome finds the row gone (`CloudFinished::Gone`), which
+  is logged, not an error.
+- Store tests seed a link for the member (`member` links, and the cloud
+  tests' `unlinked_member` doesn't), and the command tests that put
+  routines or tokens directly link the member first, through one `link`
+  helper in `slack_tests`; the routine helper asserts the routine was
+  stored. The new store tests are `a_routine_is_refused_without_a_claude_link`,
+  `a_handoff_is_refused_without_a_claude_link` and
+  `a_slack_token_stored_after_the_unlink_is_refused`. A command-level test
+  of the race would need a hook between the command's link check and the
+  store call, which there is none of.
+- Slack's `member_left` handler deletes a deactivated member's routines,
+  hand-offs and configuration token for the workspace without unlinking
+  them, so the recheck doesn't cover a `cloud add` or `slack-token` that
+  passes its check before those deletes and commits after them. Such a
   routine stays until the member removes it with `cloud rm` or `logout`
   from an identity they still have (another surface, or the Slack account
   reactivated), or the member row is deleted, which cascades; no retention
   pass purges routines, only hand-offs. Its token stays sealed, and only a
   `cloud run` from a linked identity of that member fires it. A
-  command-level test of the race would need a hook between the command's
-  link check and the store call, which there is none of, so the store test
-  `a_routine_is_refused_without_a_claude_link` covers it.
+  configuration token stored that way stays too, renewed for as long as
+  Slack renews a deactivated user's token, until the member's `logout`.

@@ -4,10 +4,7 @@
 use core_types::{ConvKind, MemberId, RoutineId, SurfaceKind, TeamId, UserId};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use store::{
-    CloudHandoffState, CloudUnknownReason, NewClaudeLink, NewCloudHandoff, RecentCloudHandoff,
-    Store,
-};
+use store::{CloudHandoffState, CloudUnknownReason, NewCloudHandoff, RecentCloudHandoff, Store};
 use surface_slack::{BindingRef, InFlight, SlackEvent, SlackInbound};
 use testkit::{Held, TempDir};
 use time::OffsetDateTime;
@@ -20,8 +17,8 @@ use crate::cloud::FireClient;
 use crate::commands::rocketchat::command_in;
 use crate::commands::slack::dm_command;
 use crate::commands::slack_tests::{
-    Running, SlackHarness, dm_event, file_store, identity, json_body, slack_channel, slack_harness,
-    slack_harness_on, slack_key, sql,
+    Running, SlackHarness, dm_event, file_store, identity, json_body, link, slack_channel,
+    slack_harness, slack_harness_on, slack_key, sql,
 };
 use crate::commands::tests::{Harness, conv, dm_room, harness, key, serve};
 use crate::config::CloudConfig;
@@ -138,24 +135,6 @@ fn clock(at: OffsetDateTime) -> impl Fn() -> OffsetDateTime {
 /// Now, to the whole second, as the store keeps times.
 fn second() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()).unwrap()
-}
-
-/// Links `member`'s Claude account, as `login` does.
-async fn link(store: &Store, member: MemberId) {
-    store
-        .put_claude_link(
-            member,
-            &NewClaudeLink {
-                access_token: SecretString::from("access"),
-                refresh_token: SecretString::from("refresh"),
-                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
-                plan: Some("claude_max".to_owned()),
-                rate_limit_tier: None,
-            },
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap();
 }
 
 /// Registers routine [`LABEL`] for `member`, who must be linked.

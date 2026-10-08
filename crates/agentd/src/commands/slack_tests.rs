@@ -231,20 +231,7 @@ impl SlackHarness {
             .ensure_member(key, key.user.as_str(), OffsetDateTime::now_utc())
             .await
             .unwrap();
-        self.store
-            .put_claude_link(
-                member,
-                &NewClaudeLink {
-                    access_token: SecretString::from("access"),
-                    refresh_token: SecretString::from("refresh"),
-                    expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
-                    plan: Some("claude_max".to_owned()),
-                    rate_limit_tier: None,
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap();
+        link(&self.store, member).await;
         member
     }
 
@@ -550,6 +537,7 @@ async fn me_on_slack_names_the_manager_app_and_the_token_state() {
             OffsetDateTime::now_utc(),
         )
         .await
+        .unwrap()
         .unwrap();
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(reply.contains("Plan: Claude Max."), "{reply}");
@@ -582,6 +570,7 @@ async fn logout_deletes_the_configuration_tokens() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
@@ -610,6 +599,7 @@ async fn the_rotator_renews_each_token_before_it_expires() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     let first_exp = (start + time::Duration::hours(12)).unix_timestamp();
     let second_exp = (start + time::Duration::hours(22)).unix_timestamp();
@@ -683,6 +673,7 @@ async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -740,6 +731,7 @@ async fn a_failed_renewal_is_tried_again_after_the_lease() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -794,6 +786,7 @@ async fn a_notice_nobody_can_send_is_tried_a_bounded_number_of_times() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     h.store
         .mark_slack_config_token_broken(&row, start)
@@ -1010,6 +1003,7 @@ async fn a_deleted_user_loses_their_configuration_token() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
@@ -1260,9 +1254,11 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         .ensure_member(&slack_key("U0HUMAN02"), "bob", start)
         .await
         .unwrap();
+    link(&old_key, bob).await;
     old_key
         .put_slack_config_token(bob, &TeamId::new(TEAM), &token("xoxe-1-BOB", 10), start)
         .await
+        .unwrap()
         .unwrap();
     old_key.close().await;
 
@@ -1272,9 +1268,11 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         .ensure_member(&slack_key("U0HUMAN01"), "alice", start)
         .await
         .unwrap();
+    link(&store, alice).await;
     store
         .put_slack_config_token(alice, &TeamId::new(TEAM), &token("xoxe-1-R0", 20), start)
         .await
+        .unwrap()
         .unwrap();
     mount_rotation(
         &h.slack,
@@ -1320,6 +1318,7 @@ async fn me_says_when_a_token_expired_because_renewing_it_keeps_failing() {
             OffsetDateTime::now_utc(),
         )
         .await
+        .unwrap()
         .unwrap();
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(
@@ -1359,6 +1358,7 @@ async fn requests_from_another_workspace_are_dropped() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let running = Running::start(&h);
@@ -1440,6 +1440,24 @@ const FAIL_TOKEN_WRITES: &str = "\
     UPDATE token_write_failures SET remaining = remaining - 1; \
     SELECT RAISE(FAIL, 'injected write failure'); END;";
 
+/// Links `member`'s Claude account in `store`, as `login` does.
+pub(super) async fn link(store: &Store, member: MemberId) {
+    store
+        .put_claude_link(
+            member,
+            &NewClaudeLink {
+                access_token: SecretString::from("access"),
+                refresh_token: SecretString::from("refresh"),
+                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
+                plan: Some("claude_max".to_owned()),
+                rate_limit_tier: None,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+}
+
 /// Makes the next `failures` writes of configuration tokens to the store
 /// at `url` fail: inserts, and updates that set the tokens.
 async fn fail_token_writes(url: &str, failures: i64) {
@@ -1487,6 +1505,7 @@ async fn a_renewed_pair_is_stored_although_the_first_writes_fail() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     mount_rotation(
         &h.slack,

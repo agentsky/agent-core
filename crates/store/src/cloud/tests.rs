@@ -382,6 +382,39 @@ async fn a_routine_is_refused_without_a_claude_link() {
 }
 
 #[tokio::test]
+async fn a_handoff_is_refused_without_a_claude_link() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "agent-core", "trig_1", "sk", 10).await;
+    let registration = registration(&store, ada, "agent-core").await;
+    assert!(store.delete_claude_link(ada).await.unwrap());
+    let begun = store
+        .begin_cloud_handoff(
+            &NewCloudHandoff {
+                member: ada,
+                routine_label: "agent-core",
+                routine_id: &routine("trig_1"),
+                registration: &registration,
+                requested_by: &member_key("ada"),
+                origin: CloudOrigin::RocketChatDm,
+                task: "Fix the flaky test",
+            },
+            u32::MAX,
+            at(20),
+        )
+        .await
+        .unwrap();
+    assert_eq!(begun, CloudBegun::Unlinked);
+    assert!(
+        store
+            .recent_cloud_handoffs(ada, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn concurrent_registrations_never_pass_the_cap_together() {
     let dir = TempDir::new("store-test");
     let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
@@ -665,7 +698,7 @@ async fn concurrent_handoffs_never_pass_the_hourly_cap_together() {
         match outcome.unwrap() {
             CloudBegun::Begun(_) => begun += 1,
             CloudBegun::TooMany => {}
-            CloudBegun::RoutineGone => panic!("the routine is there"),
+            other @ (CloudBegun::RoutineGone | CloudBegun::Unlinked) => panic!("{other:?}"),
         }
     }
     assert_eq!(begun, 1, "one place was left");

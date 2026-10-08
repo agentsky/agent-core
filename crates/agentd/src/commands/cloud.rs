@@ -9,12 +9,13 @@
 //! DM with the Slack manager app, or a DM with the Rocket.Chat manager bot.
 //! `cloud add` sent anywhere else gets the secret-bearing refusal, which
 //! says to revoke the token. `add` and `run` need a linked member and
-//! `[cloud]` ([`Commands::with_cloud`]); `add` checks the link again in the
-//! transaction that stores the routine
-//! ([`put_cloud_routine`](store::Store::put_cloud_routine)), so a `logout`
-//! that another instance or surface ran meanwhile never leaves a token
-//! behind. `list` and `rm` work for any member, and `rm` is the one `cloud`
-//! command a ban leaves. No `agentctl`
+//! `[cloud]` ([`Commands::with_cloud`]), checked again in the transaction
+//! that stores the routine or records the hand-off
+//! ([`put_cloud_routine`](store::Store::put_cloud_routine),
+//! [`begin_cloud_handoff`](store::Store::begin_cloud_handoff)), so a
+//! `logout` that another instance or surface ran meanwhile never leaves a
+//! token behind or fires a routine. `list` and `rm` work for any member,
+//! and `rm` is the one `cloud` command a ban leaves. No `agentctl`
 //! command or consent card starts a hand-off: only a member typing `cloud
 //! run` does, and messages from bots are never commands.
 //!
@@ -291,6 +292,10 @@ impl Commands {
                      nothing was started. {} shows your routines.",
                     origin.command("cloud list")
                 ));
+            }
+            Ok(CloudBegun::Unlinked) => {
+                tracing::info!(%member, routine = routine.routine_id.as_str(), "a member was unlinked before their cloud hand-off; fired nothing");
+                return Ok(link_first(origin));
             }
             Ok(CloudBegun::TooMany) => {
                 tracing::debug!(%member, routine = routine.routine_id.as_str(), "refused a cloud hand-off past the hourly cap");
