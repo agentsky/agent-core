@@ -425,5 +425,10 @@ if printf '%s\n' "$requests" | grep -q '=other'; then
     die "a request reached fake-anthropic with a credential the proxy didn't swap"
 fi
 pass "every credential fake-anthropic saw was one the proxy swapped in"
+if printf '%s\n' "$requests" | grep -Ev '^POST /v1/oauth/token(/revoke)? ' |
+    grep -q 'authorization=absent x-api-key=absent'; then
+    die "a request reached fake-anthropic with no credential"
+fi
+pass "every request but the OAuth token endpoints carried a credential"
 
 echo "All checks passed"
