@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -42,6 +43,9 @@ struct Fixture {
     store: Store,
     surface: Arc<MockSurface>,
     dir: TempDir,
+    /// The last octet of the next process's container address. The first
+    /// process is at [`CONTAINER`].
+    next_address: AtomicU8,
 }
 
 fn sealer() -> store::Sealer {
@@ -72,7 +76,30 @@ impl Fixture {
             store,
             surface,
             dir,
+            next_address: AtomicU8::new(7),
         }
+    }
+
+    /// A container address no other process of the fixture has.
+    fn address(&self) -> IpAddr {
+        IpAddr::from([
+            172,
+            30,
+            0,
+            self.next_address.fetch_add(1, Ordering::Relaxed),
+        ])
+    }
+
+    /// The address `token` is bound to, or [`CONTAINER`] once it is revoked.
+    async fn peer(&self, token: &ProcessToken) -> String {
+        self.store
+            .ctl_token(&token.hash())
+            .await
+            .unwrap()
+            .map_or_else(
+                || CONTAINER.to_owned(),
+                |stored| stored.container_ip.to_string(),
+            )
     }
 
     async fn process(&self) -> (ProcessInfo, ProcessToken) {
@@ -84,18 +111,19 @@ impl Fixture {
                 agent,
                 scope: ScopeKey::Channel(conv("C1")),
             },
-            container_ip: CONTAINER.parse().unwrap(),
+            container_ip: self.address(),
         };
         let token = self.ctl.issue_process_token(info.clone()).await.unwrap();
         (info, token)
     }
 
-    /// A second process in the same volume, as another session of the same
-    /// channel would be.
+    /// A second process in the same volume, in its own container, as
+    /// another session of the same channel would be.
     async fn sibling(&self, of: &ProcessInfo) -> ProcessToken {
         self.ctl
             .issue_process_token(ProcessInfo {
                 session: SessionId::new_v4(),
+                container_ip: self.address(),
                 ..of.clone()
             })
             .await
@@ -104,7 +132,11 @@ impl Fixture {
 
     async fn call(&self, token: Option<&ProcessToken>, path: &str, body: Value) -> (u16, Value) {
         let body = Body::from(serde_json::to_vec(&body).unwrap());
-        self.send(token.map(bearer), CONTAINER, path, body).await
+        let peer = match token {
+            Some(token) => self.peer(token).await,
+            None => CONTAINER.to_owned(),
+        };
+        self.send(token.map(bearer), &peer, path, body).await
     }
 
     async fn send(
@@ -136,9 +168,10 @@ impl Fixture {
 
     async fn attach(&self, token: &ProcessToken, name: &str, bytes: &[u8]) -> (u16, Value) {
         let path = format!("/v1/attach?name={name}");
+        let peer = self.peer(token).await;
         self.send(
             Some(bearer(token)),
-            CONTAINER,
+            &peer,
             &path,
             Body::from(bytes.to_vec()),
         )
@@ -332,6 +365,27 @@ async fn a_new_process_token_replaces_the_sessions_old_one() {
     assert!(fixture.ctl.end_turn(&old).await.unwrap().is_none());
     fixture.ctl.begin_turn(&new, public()).await.unwrap();
     let (status, _) = fixture.call(Some(&new), "/v1/post", post("here")).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_new_process_token_replaces_any_token_bound_to_its_address() {
+    let fixture = Fixture::new().await;
+    let (info, stale) = fixture.process().await;
+    fixture.ctl.begin_turn(&stale, public()).await.unwrap();
+    let fresh = fixture
+        .ctl
+        .issue_process_token(ProcessInfo {
+            session: SessionId::new_v4(),
+            ..info
+        })
+        .await
+        .unwrap();
+    let (status, _) = fixture.call(Some(&stale), "/v1/post", post("here")).await;
+    assert_eq!(status, 401);
+    assert!(fixture.ctl.end_turn(&stale).await.unwrap().is_none());
+    fixture.ctl.begin_turn(&fresh, public()).await.unwrap();
+    let (status, _) = fixture.call(Some(&fresh), "/v1/post", post("here")).await;
     assert_eq!(status, 200);
 }
 
