@@ -1088,8 +1088,8 @@ The member hears each outcome once:
   session's id and link, or `rejected` with its status, and a notice not
   yet sent is marked done, since the reply tells the member; one a claim is
   sending at that moment may still arrive besides the reply. Nothing
-  retries a record that failed: such a
-  row stays `unknown`, and the reply already said what happened.
+  retries a record that failed: such a row stays `unknown`, and the reply
+  already said what happened.
 - The one exception: if the store fails to record a 200, the reply still
   carries the link, but the row stays `sending`, so the pass later marks it
   `unknown` and the member also gets the "may have started" notice. They

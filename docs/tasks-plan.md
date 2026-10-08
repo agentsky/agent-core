@@ -3127,9 +3127,10 @@ Deliverables:
     outcome from `sending` sets `notified_at`, since the command's reply
     tells the member, and so does recording `fired` or `rejected` from
     `unknown`, so a `fired` or `rejected` row always has `notified_at` and a
-    notice whose claim failed isn't left owed by a row the due-notice index
-    no longer covers. A claim sending at that moment may still deliver its
-    notice besides the reply. Nothing retries a record that failed.
+    notice whose claim failed isn't left owed by a row the partial index on
+    `notice_next_attempt_at`, which covers only `unknown` rows, no longer
+    finds. A claim sending at that moment may still deliver its notice
+    besides the reply. Nothing retries a record that failed.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3278,10 +3279,18 @@ Deliverables:
   present and hands it to the command handlers.
 - Handlers in `crates/agentd/src/commands/cloud.rs`, through the one
   command intake (T30), so commands run once and in order per surface
-  identity (`MemberKey`). A deletion the intake doesn't order, such as
-  `logout` on another instance during a blue-green swap or a member Slack
-  reports gone, is caught by `put_cloud_routine`, which refuses inside its
-  transaction a member with no linked Claude account:
+  identity (`MemberKey`), not per member. A `logout` the intake doesn't
+  order with a `cloud add`, sent from the member's other identity or run on
+  another instance during a blue-green swap, is caught by
+  `put_cloud_routine`, which refuses a member with no Claude link inside
+  its `BEGIN IMMEDIATE` transaction (`CloudRoutinePut::Unlinked`, answered
+  as an unlinked `cloud add`). `logout` unlinks before it deletes the
+  member's routines, so either it finds the routine or it came first and
+  nothing is stored. A member Slack reports deleted keeps their link, so a
+  `cloud add` that races that deletion can still store a routine, which
+  then stays: an accepted gap, since it needs the member's own command to
+  land in the moment Slack deletes them, and only their member can fire
+  the token:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
@@ -3343,6 +3352,7 @@ Acceptance, as pipeline and command tests named after the rules:
 - `cloud_add_in_a_room_gets_the_secret_refusal_and_stores_nothing`.
 - `cloud_add_and_run_are_refused_without_cloud_config`.
 - `an_unlinked_member_cannot_add_or_run`.
+- `a_routine_is_refused_without_a_claude_link`.
 - `a_banned_member_can_only_rm`.
 - `a_task_with_invisible_characters_is_refused`.
 - `a_bot_message_never_runs_a_cloud_command`.
