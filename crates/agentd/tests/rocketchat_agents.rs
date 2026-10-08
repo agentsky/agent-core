@@ -964,6 +964,17 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
         chat.command("alice", "deny helper #nowhere").await,
         "I don't know `#nowhere`. Name a public channel agentd can see."
     );
+    Mock::given(path("/api/v1/rooms.info"))
+        .and(query_param("roomName", "flaky"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(chat.fake.server())
+        .await;
+    assert_eq!(
+        chat.command("alice", "deny helper #flaky").await,
+        "Something went wrong on my side. Please try again in a minute.",
+        "a failed lookup is not an unknown channel"
+    );
     chat.fake.add_room("HIDDEN", "p", "hidden");
     chat.fake.add_member("HIDDEN", FakeRest::MANAGER_ID);
     for text in ["allow helper #hidden", "allow helper <#HIDDEN>"] {

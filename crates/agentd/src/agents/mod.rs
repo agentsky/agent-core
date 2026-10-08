@@ -222,7 +222,11 @@ impl RocketChatAgents {
     ///
     /// # Errors
     ///
-    /// Any other [`SurfaceError`] from `rooms.info`.
+    /// Any other [`SurfaceError`] from `rooms.info`, such as
+    /// [`SurfaceError::Api`] for a server or proxy failure: only
+    /// [`SurfaceError::NotFound`] (an unknown room) and
+    /// [`SurfaceError::Forbidden`] (a private group the manager isn't in)
+    /// mean `None`.
     pub async fn public_channel(
         &self,
         room: &RoomRef,
@@ -234,10 +238,7 @@ impl RocketChatAgents {
         };
         match found {
             Ok(room) if room.room_type == RoomType::Channel => Ok(Some(room.id)),
-            Ok(_)
-            | Err(SurfaceError::Api(_) | SurfaceError::NotFound(_) | SurfaceError::Forbidden(_)) => {
-                Ok(None)
-            }
+            Ok(_) | Err(SurfaceError::NotFound(_) | SurfaceError::Forbidden(_)) => Ok(None),
             Err(err) => Err(err),
         }
     }
