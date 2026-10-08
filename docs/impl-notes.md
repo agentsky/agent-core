@@ -10438,22 +10438,28 @@ Debian, so the binary built on the host finds its glibc), and listens on
 OAuth answers. agentd only calls the fake once a member logs in or a turn
 runs, so the fake can start after it.
 
-### A message posted before a bot subscribes to its room is lost
+### A message posted before any connection subscribes to its room is lost
 
 **Issue.** A realtime connection subscribes to `stream-room-messages` for
 the rooms `subscriptions.get` lists when it connects, and to a room it is
 added to once `subscriptions-changed` says so (T12). Nothing fetches what
-was posted before the subscription was ready. A test that opens a direct
-message with the manager and posts `login` at once, or mentions a bot right
-after `!agent create` invites it, can lose that message: agentd never sees
-it, and the test times out waiting for a reply.
+was posted before the subscription was ready. On Rocket.Chat whichever
+connection records a message first delivers it for every agent it mentions
+(`per_binding_delivery` is false), so this loses a message only in a room
+no agentd connection was in yet: a member's first command the moment they
+open a direct message with the manager, or a mention the moment a bot is
+invited by hand into a room no other agentd bot is in. A test that opens
+the direct message and posts `login` at once can lose it, and time out
+waiting for the reply. `!agent create` in a room is safe: the manager heard
+the command there, so it hears the mention that follows.
 
 **Solution.** Not fixed here; the Deferred work bullet on backfill after a
-reconnect now covers new rooms too. The test opens the direct messages
+reconnect now covers such rooms too. The test opens the direct messages
 before agentd starts, so the manager's first listing includes them, and
 waits, with the Rocket.Chat surface logging at debug level, for the
-manager's `realtime connection ready` and for the bot's `subscribing to a
-room` line for `#general` before posting.
+manager's `realtime connection ready`. That line follows sending the room
+subscriptions, not the server's answer to them; the fake's start leaves
+seconds before the first post.
 
 ### A fresh Community Edition workspace refuses posts at first
 

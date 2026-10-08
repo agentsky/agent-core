@@ -17,10 +17,14 @@
 #    [claude_oauth] URLs on fake-anthropic, [sandbox] on this project's
 #    network under an instance name of its own, and the Rocket.Chat surface
 #    logging at debug level. agentd's realtime connections don't fetch a
-#    message posted before they subscribe to its room, so the members' direct
-#    messages with the manager are opened before agentd starts, and the test
-#    waits for the debug lines saying the manager's connection is ready and
-#    the new bot subscribed to #general before posting there.
+#    message posted in a room before they subscribe to it, and a new direct
+#    message with the manager is a room no connection is in yet, so the
+#    members' direct messages with the manager are opened before agentd
+#    starts, and the test waits for the debug line saying the manager's
+#    connection has set up its subscriptions before posting. A mention in
+#    #general needs no such wait: the manager is in #general, and on
+#    Rocket.Chat whichever connection hears a message delivers it for every
+#    agent it mentions.
 # 4. Runs fake-anthropic (crates/testkit/src/bin/fake-anthropic.rs) in
 #    agentd's network namespace, from the agentd image: the upstream and the
 #    OAuth URLs may only be plain HTTP to a loopback address.
@@ -46,7 +50,9 @@
 # FAKE_ANTHROPIC names the binary when it isn't target/debug/fake-anthropic.
 # It runs on the agentd image's Debian, so the host's glibc must be no newer
 # than that one's. The script needs curl and jq on the host, and Rocket.Chat
-# needs to reach Rocket.Chat Cloud.
+# needs to reach Rocket.Chat Cloud. alice and bob lack Rocket.Chat's
+# api-bypass-rate-limit, so their polling is spaced out, and a wait's budget
+# covers a rate-limited minute.
 #
 # It brings up its own Compose project, agent-core-e2e, with its own network
 # names, a throwaway data directory, master key and passwords, ignores
@@ -116,7 +122,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# poll SECONDS COMMAND...: runs COMMAND every three seconds until it
+# poll SECONDS COMMAND...: runs COMMAND every six seconds until it
 # succeeds, for at most SECONDS. Fails if it never does.
 poll() {
     poll_deadline=$(($(date +%s) + $1))
@@ -125,7 +131,7 @@ poll() {
         if [ "$(date +%s)" -ge "$poll_deadline" ]; then
             return 1
         fi
-        sleep 3
+        sleep 6
     done
 }
 
@@ -199,14 +205,11 @@ wait_manager() {
     fi
 }
 
-# logged MESSAGE USER_ID [ROOM_ID]: whether agentd has logged MESSAGE for
-# that user, and that room if one is given.
+# logged MESSAGE USER_ID: whether agentd has logged MESSAGE for that user.
 logged() {
     compose logs --no-color --no-log-prefix agentd 2>/dev/null |
-        jq -Rc --arg message "$1" --arg user "$2" --arg room "${3:-}" '
-            fromjson? | .fields
-            | select(.message == $message and .user == $user
-                     and ($room == "" or .room == $room))' |
+        jq -Rc --arg message "$1" --arg user "$2" '
+            fromjson? | .fields | select(.message == $message and .user == $user)' |
         grep -q .
 }
 
@@ -269,7 +272,9 @@ pass "the admin can post"
 
 echo "== The manager and the members"
 
-grant=$(api "$admin_id" "$admin_token" GET permissions.listAll | jq -c '
+permissions=$(api "$admin_id" "$admin_token" GET permissions.listAll) ||
+    die "permissions.listAll failed: $permissions"
+grant=$(printf '%s' "$permissions" | jq -c '
     def grant($role; $ids):
         [.update[] | select(._id as $id | $ids | index($id))
          | {_id, roles: (.roles + [$role] | unique)}];
@@ -382,9 +387,6 @@ case $found in
 *) die "the manager didn't add @$bot to #general: $found" ;;
 esac
 pass "alice created helper, whose bot @$bot is in #general"
-bot_id=$(api "$admin_id" "$admin_token" GET "users.info?username=$bot" | jq -er .user._id)
-poll 60 logged "subscribing to a room" "$bot_id" "$general" ||
-    die "@$bot's realtime connection never subscribed to #general"
 
 root_id=$(say "$alice_id" "$alice_token" "$general" "@$bot what is two plus two?")
 wait_answer "$alice_id" "$alice_token" "$root_id" alice

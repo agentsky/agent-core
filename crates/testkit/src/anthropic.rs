@@ -70,7 +70,8 @@ impl FakeAnthropic {
     }
 
     /// Adds `mock` to the server, so a request it matches gets its answer
-    /// instead of a 404. It doesn't change the answers above.
+    /// instead of a 404. At wiremock's default priority it doesn't change
+    /// the answers above, which were mounted first.
     pub async fn register(&self, mock: Mock) {
         self.server.register(mock).await;
     }

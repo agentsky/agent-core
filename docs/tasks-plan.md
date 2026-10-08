@@ -4157,11 +4157,12 @@ Deliverables:
      upstream` and the `[claude_oauth]` URLs on `http://127.0.0.1:18080`,
      and `[sandbox]` on the project's network with `host_data_dir` and an
      `instance` of its own. agentd's realtime connections don't fetch what
-     was posted before they subscribed to a room, so the members' direct
-     messages with the manager are opened before agentd starts, and the
-     script waits for the Rocket.Chat surface's debug lines saying the
-     manager's connection is ready and the new bot subscribed to `#general`
-     before posting there.
+     was posted in a room before they subscribed to it, and a new direct
+     message with the manager is a room no connection is in yet, so the
+     members' direct messages with the manager are opened before agentd
+     starts, and the script waits for the Rocket.Chat surface's debug line
+     saying the manager's connection has set up its subscriptions before
+     posting.
   4. Runs `fake-anthropic` in agentd's network namespace (`docker run
      --network container:<agentd>`), from the agentd image, since the
      upstream and the OAuth URLs may only be plain HTTP to a loopback
@@ -4316,10 +4317,11 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Backfill after a Rocket.Chat reconnect.** A realtime connection that
   drops misses what was posted until it is back (T12). Every bot in a room
   would need to miss it for a message to be lost, but a lone agent in a room,
-  or an agentd restart, loses it. So does a room a connection is added to:
-  what is posted there before its subscription is ready, such as a member's
-  first command the moment they open a direct message with the manager, or a
-  mention the moment a bot is invited, is missed too (found by T37, which
-  waits for the subscription). Fetching each room's history since the last
-  message seen, or since the subscription for a new room, through the same
-  deduplication, would close the gap.
+  or an agentd restart, loses it. So does a room no agentd connection was in
+  yet: what is posted there before a connection's subscription is ready,
+  such as a member's first command the moment they open a direct message
+  with the manager, or a mention the moment a bot is invited by hand into a
+  room no other agentd bot is in, is missed too (found by T37, which opens
+  its direct messages before agentd starts). Fetching each room's history
+  since the last message seen, or since the subscription for a new room,
+  through the same deduplication, would close the gap.
