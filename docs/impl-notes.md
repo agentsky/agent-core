@@ -5232,7 +5232,13 @@ T31 routes agents' messages.
   (`login <code>`), as on Rocket.Chat.
 - A slash command's reply is the rendered Markdown, each chunk sent to its
   `response_url` with T29's `respond_ephemeral`. Slack accepts five
-  responses per URL; command replies are one chunk.
+  responses per URL (`RESPONSE_URL_USES`), and a long reply (`list` in a
+  workspace with a few hundred agents) takes more chunks, so the sixth
+  failed and the rest were dropped. `Replies::respond` renders once; a
+  reply of more than five chunks goes whole to the member's DM with the
+  manager app, and the `response_url` gets one line saying so. If that DM
+  fails, the `response_url` gets the first four chunks and a note that the
+  reply was cut short.
 - Notices (relink, broken token) open the manager's DM with
   `conversations.open` (new in `WebApi::open_dm`, Tier 3, needs `im:write`),
   so relink notices now reach Slack-only members too.

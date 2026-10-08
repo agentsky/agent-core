@@ -2,8 +2,9 @@
 //!
 //! On Rocket.Chat every private reply is a direct message from the manager
 //! bot. On Slack a slash command is answered through its `response_url`, as
-//! an ephemeral message only the member sees, and anything else by a DM
-//! from the manager app.
+//! an ephemeral message only the member sees, unless the reply needs more
+//! messages than Slack accepts there; that one, and anything else, goes by
+//! a DM from the manager app.
 
 use std::fmt;
 use std::sync::Arc;
@@ -16,6 +17,18 @@ use secrecy::SecretString;
 use surface_slack::SlackClient;
 
 use super::Origin;
+
+/// How many times Slack accepts a response through one `response_url`.
+pub(crate) const RESPONSE_URL_USES: usize = 5;
+
+/// The ephemeral answer to a slash command whose reply was too long for
+/// its `response_url` and went to the member's DM instead.
+const LONG_REPLY_IN_DM: &str = "That reply is too long to show here, so I sent it to you in a DM.";
+
+/// The note after the start of a slash command reply that was too long
+/// for its `response_url` and couldn't be sent by DM either.
+const LONG_REPLY_CUT: &str =
+    "That reply is too long to show here in full, and I couldn't send it to you in a DM.";
 
 /// Why a private reply couldn't be sent. The message names no text.
 #[derive(Debug, thiserror::Error)]
@@ -76,12 +89,12 @@ impl ManagerBot {
         self.surface.render(text)
     }
 
-    /// Posts Markdown `text` in `room`, rendered and split for the surface.
+    /// Posts `chunks`, as [`render`](Self::render) returns them, in `room`.
     ///
     /// # Errors
     ///
     /// The first [`SurfaceError`]; chunks after it aren't posted.
-    pub async fn post(&self, room: &ConversationId, text: &str) -> Result<(), SurfaceError> {
+    pub async fn post(&self, room: &ConversationId, chunks: &[String]) -> Result<(), SurfaceError> {
         let to = ReplyTarget {
             conv: ConvRef {
                 surface: self.identity.surface,
@@ -90,20 +103,21 @@ impl ManagerBot {
             },
             thread_root: None,
         };
-        for chunk in self.surface.render(text) {
-            self.surface.post(&to, &chunk).await?;
+        for chunk in chunks {
+            self.surface.post(&to, chunk).await?;
         }
         Ok(())
     }
 
-    /// Sends Markdown `text` to `member` in the manager bot's DM with them.
+    /// Sends `chunks`, as [`render`](Self::render) returns them, to
+    /// `member` in the manager bot's DM with them.
     ///
     /// # Errors
     ///
     /// A [`SurfaceError`] if the DM can't be opened or posted to.
-    pub async fn dm(&self, member: &MemberKey, text: &str) -> Result<(), SurfaceError> {
+    pub async fn dm(&self, member: &MemberKey, chunks: &[String]) -> Result<(), SurfaceError> {
         let room = self.dms.open_dm(member).await?;
-        self.post(&room, text).await
+        self.post(&room, chunks).await
     }
 }
 
@@ -151,15 +165,43 @@ impl Replies {
             .ok_or(ReplyError::NoManagerBot(member.surface))
     }
 
-    /// Answers a slash command privately through its `response_url`, with
-    /// Markdown `text` rendered and split for Slack.
-    async fn respond(&self, response_url: &SecretString, text: &str) -> Result<(), ReplyError> {
+    /// Answers `member`'s slash command privately through its
+    /// `response_url`, with Markdown `text` rendered and split for Slack.
+    ///
+    /// A reply in more chunks than [`RESPONSE_URL_USES`] goes to the
+    /// member's DM with the manager app instead, and the `response_url`
+    /// says so. If that DM fails, the `response_url` gets the reply's first
+    /// chunks and a note that the rest is missing.
+    async fn respond(
+        &self,
+        member: &MemberKey,
+        response_url: &SecretString,
+        text: &str,
+    ) -> Result<(), ReplyError> {
         let slack = self
             .slack
             .as_ref()
             .ok_or(ReplyError::NoManagerBot(SurfaceKind::Slack))?;
-        for chunk in slack.bot.render(text) {
-            slack.client.respond_ephemeral(response_url, &chunk).await?;
+        let chunks = slack.bot.render(text);
+        let ephemeral: Vec<&str> = if chunks.len() <= RESPONSE_URL_USES {
+            chunks.iter().map(String::as_str).collect()
+        } else {
+            let dm =
+                async { Ok::<_, ReplyError>(self.bot_for(member)?.dm(member, &chunks).await?) };
+            match dm.await {
+                Ok(()) => vec![LONG_REPLY_IN_DM],
+                Err(err) => {
+                    tracing::warn!(%member, error = %err, "couldn't DM a slash command reply too long for its response_url; answered with its start");
+                    chunks[..RESPONSE_URL_USES - 1]
+                        .iter()
+                        .map(String::as_str)
+                        .chain([LONG_REPLY_CUT])
+                        .collect()
+                }
+            }
+        };
+        for chunk in ephemeral {
+            slack.client.respond_ephemeral(response_url, chunk).await?;
         }
         Ok(())
     }
@@ -171,7 +213,8 @@ impl Replies {
 
     /// Sends Markdown `text` privately to `member`, who sent a command from
     /// `origin`: through the `response_url` of a Slack slash command, as an
-    /// ephemeral message; in the Slack manager app's DM a command came from;
+    /// ephemeral message, or in the Slack manager app's DM if it is too long
+    /// for that; in the Slack manager app's DM a command came from;
     /// and in the manager bot's DM on Rocket.Chat (the DM the command came
     /// from, or a new one for a channel command).
     ///
@@ -187,9 +230,10 @@ impl Replies {
         text: &str,
     ) -> Result<(), ReplyError> {
         match origin {
-            Origin::SlackSlash { response_url } => self.respond(response_url, text).await,
+            Origin::SlackSlash { response_url } => self.respond(member, response_url, text).await,
             Origin::SlackDm { channel: room } | Origin::RocketChatDm { room } => {
-                Ok(self.bot_for(member)?.post(room, text).await?)
+                let bot = self.bot_for(member)?;
+                Ok(bot.post(room, &bot.render(text)).await?)
             }
             Origin::RocketChatChannel { .. } => self.dm(member, text).await,
         }
@@ -202,6 +246,7 @@ impl Replies {
     ///
     /// As for [`reply_private`](Self::reply_private).
     pub async fn dm(&self, member: &MemberKey, text: &str) -> Result<(), ReplyError> {
-        Ok(self.bot_for(member)?.dm(member, text).await?)
+        let bot = self.bot_for(member)?;
+        Ok(bot.dm(member, &bot.render(text)).await?)
     }
 }

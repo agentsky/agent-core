@@ -1543,3 +1543,90 @@ async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() 
     );
     assert!(!logs.contains("SECRET"));
 }
+
+/// Creates `count` public agents of `owner`'s, with names long enough that
+/// `list` needs more Slack messages than one `response_url` takes, and
+/// returns their names.
+async fn public_agents(h: &SlackHarness, owner: MemberId, count: u32) -> Vec<String> {
+    let team = TeamId::new(TEAM);
+    let mut names = Vec::new();
+    for i in 0..count {
+        let name = format!("helper-{i:03}-with-a-longer-name");
+        h.store
+            .create_agent(
+                &store::NewAgent {
+                    owner,
+                    name: &name,
+                    persona: "p",
+                    visibility: store::Visibility::Public,
+                    surface: SurfaceKind::Slack,
+                    team: &team,
+                },
+                count,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        names.push(name);
+    }
+    names
+}
+
+#[tokio::test]
+async fn a_slash_reply_too_long_for_its_response_url_goes_by_dm() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let names = public_agents(&h, alice, 300).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(
+        replies,
+        ["That reply is too long to show here, so I sent it to you in a DM."]
+    );
+    let posts = h.posts().await;
+    assert!(posts.len() > reply::RESPONSE_URL_USES, "{}", posts.len());
+    assert!(posts.iter().all(|(channel, _)| channel == "D0DM00001"));
+    let dm: String = posts.into_iter().map(|(_, text)| text).collect();
+    for name in names {
+        assert!(dm.contains(&name), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_long_slash_reply_whose_dm_fails_answers_with_its_start() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.open"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "user_not_found"})),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    let alice = h.linked("U0HUMAN01").await;
+    public_agents(&h, alice, 300).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(replies.len(), reply::RESPONSE_URL_USES);
+    assert!(replies[0].starts_with("Agents:"), "{}", replies[0]);
+    assert!(replies[0].contains("helper-000-with-a-longer-name"));
+    assert_eq!(
+        replies[reply::RESPONSE_URL_USES - 1],
+        "That reply is too long to show here in full, and I couldn't send it to you in a DM."
+    );
+    assert!(h.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_short_slash_reply_is_one_ephemeral_and_no_dm() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    slack_agent(&h, alice).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(replies[0].starts_with("Agents:"), "{replies:?}");
+    assert!(h.posts().await.is_empty());
+    assert!(h.calls("conversations.open").await.is_empty());
+}
