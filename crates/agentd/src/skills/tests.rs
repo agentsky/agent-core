@@ -2,6 +2,7 @@ use std::process::Command;
 
 use core_types::{ConvRef, ScopeKey, SurfaceKind, TeamId, ThreadKey};
 use cred_proxy::EgressPolicy;
+use sqlx::Connection as _;
 use store::{AgentCreation, NewAgent, Sealer, Visibility};
 use testkit::TempDir;
 
@@ -64,6 +65,7 @@ struct Harness {
     owner: MemberId,
     data: PathBuf,
     repos: PathBuf,
+    db_url: String,
     _dir: TempDir,
 }
 
@@ -73,10 +75,13 @@ async fn harness() -> Harness {
     let repos = dir.join("repos");
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(&repos).unwrap();
-    let store =
-        Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
-            .await
-            .unwrap();
+    let db_url = dir.db_url();
+    let store = Store::open(
+        &db_url,
+        Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap(),
+    )
+    .await
+    .unwrap();
     let now = OffsetDateTime::now_utc();
     let owner = store
         .ensure_member(
@@ -119,6 +124,7 @@ async fn harness() -> Harness {
         owner,
         data,
         repos,
+        db_url,
         _dir: dir,
     }
 }
@@ -440,29 +446,6 @@ async fn a_confirmation_before_the_files_are_in_deletes_nothing() {
 }
 
 #[tokio::test]
-async fn a_second_confirmation_meanwhile_doesnt_lose_the_skill() {
-    let h = harness().await;
-    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
-        .await
-        .unwrap();
-    let rows = h.store.agent_skills(h.agent).await.unwrap();
-    let first = h.skills.work_dir().await.unwrap();
-    let moved = first.0.join("new");
-    std::fs::rename(h.pending("gh"), &moved).unwrap();
-    assert_eq!(
-        h.skills.confirm_row(&rows[0]).await.unwrap(),
-        Confirmed::NotPending
-    );
-    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
-
-    move_into(&moved, &h.live("gh"), &first.0).await.unwrap();
-    let confirmed = h.store.confirm_skill(&rows[0]).await.unwrap().unwrap();
-    assert_eq!(confirmed.state, SkillState::Active);
-    assert!(h.live("gh").join("SKILL.md").is_file());
-    assert_eq!(h.hosts().await, ["api.github.com"]);
-}
-
-#[tokio::test]
 async fn an_agent_has_at_most_max_skills() {
     let h = harness().await;
     for i in 0..MAX_SKILLS {
@@ -562,28 +545,6 @@ async fn expired_pending_skills_are_dropped_with_their_files() {
         h.skills.confirm(h.agent, "late").await.unwrap(),
         Confirmed::Expired
     );
-}
-
-#[tokio::test]
-async fn a_skill_added_again_while_its_expired_row_is_dropped_keeps_its_files() {
-    let h = harness().await;
-    h.expired("gh").await;
-    let before = OffsetDateTime::now_utc() - PENDING_TTL - SWEEP_INTERVAL;
-    assert_eq!(
-        h.store.delete_pending_skills_before(before).await.unwrap(),
-        [(h.agent, "gh".to_owned())]
-    );
-    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
-        .await
-        .unwrap();
-    h.skills.drop_expired_files(h.agent, "gh").await.unwrap();
-    assert!(h.pending("gh").join("SKILL.md").is_file());
-    assert!(matches!(
-        h.skills.confirm(h.agent, "gh").await.unwrap(),
-        Confirmed::Active(_)
-    ));
-    assert!(h.live("gh").join("SKILL.md").is_file());
-    assert_eq!(h.hosts().await, ["api.github.com"]);
 }
 
 #[tokio::test]
@@ -707,78 +668,6 @@ async fn a_failed_replacement_puts_the_old_skill_back() {
 }
 
 #[tokio::test]
-async fn a_confirmation_whose_row_went_puts_back_only_what_it_moved() {
-    let h = harness().await;
-    h.upload("SKILL.md", &skill_md("notes", &[])).await.unwrap();
-    let moved = h.data.join("moved");
-    std::fs::create_dir_all(&moved).unwrap();
-    std::fs::write(moved.join("SKILL.md"), "unconfirmed").unwrap();
-    std::fs::create_dir_all(h.pending("notes")).unwrap();
-    std::fs::write(h.pending("notes").join("SKILL.md"), "added since").unwrap();
-    let work = h.skills.work_dir().await.unwrap();
-    let ino = inode(&moved).await.unwrap();
-    move_into(&moved, &h.live("notes"), &work.0).await.unwrap();
-    h.skills
-        .put_back(&h.live("notes"), ino, &h.pending("notes"), &work.0)
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(h.live("notes").join("SKILL.md")).unwrap(),
-        skill_md("notes", &[])
-    );
-    assert_eq!(
-        std::fs::read_to_string(h.pending("notes").join("SKILL.md")).unwrap(),
-        "added since"
-    );
-    assert_eq!(h.store.agent_skills(h.agent).await.unwrap().len(), 1);
-    drop(work);
-
-    std::fs::create_dir_all(&moved).unwrap();
-    std::fs::write(moved.join("SKILL.md"), "unconfirmed").unwrap();
-    let work = h.skills.work_dir().await.unwrap();
-    let ino = inode(&moved).await.unwrap();
-    move_into(&moved, &h.live("new"), &work.0).await.unwrap();
-    h.skills
-        .put_back(&h.live("new"), ino, &h.pending("new"), &work.0)
-        .await
-        .unwrap();
-    assert!(!h.live("new").exists());
-    assert_eq!(
-        std::fs::read_to_string(h.pending("new").join("SKILL.md")).unwrap(),
-        "unconfirmed"
-    );
-    assert!(h.live("notes").join("SKILL.md").is_file());
-    drop(work);
-    assert!(h.work_is_empty());
-}
-
-#[tokio::test]
-async fn a_confirmation_leaves_files_that_replaced_the_ones_it_moved() {
-    let h = harness().await;
-    h.upload("SKILL.md", &skill_md("notes", &[])).await.unwrap();
-    let moved = h.data.join("moved");
-    std::fs::create_dir_all(&moved).unwrap();
-    std::fs::write(moved.join("SKILL.md"), "unconfirmed").unwrap();
-    let work = h.skills.work_dir().await.unwrap();
-    let ino = inode(&moved).await.unwrap();
-    move_into(&moved, &h.live("notes"), &work.0).await.unwrap();
-    let newer = h.data.join("newer");
-    std::fs::create_dir_all(&newer).unwrap();
-    std::fs::write(newer.join("SKILL.md"), "newer").unwrap();
-    let other = h.skills.work_dir().await.unwrap();
-    move_into(&newer, &h.live("notes"), &other.0).await.unwrap();
-    h.skills
-        .put_back(&h.live("notes"), ino, &h.pending("notes"), &work.0)
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(h.live("notes").join("SKILL.md")).unwrap(),
-        "newer"
-    );
-    assert!(!h.pending("notes").exists());
-}
-
-#[tokio::test]
 async fn a_stale_confirmation_restores_the_active_skill_and_its_row() {
     let h = harness().await;
     h.upload("SKILL.md", &skill_md("gh", &[])).await.unwrap();
@@ -812,51 +701,150 @@ async fn a_stale_confirmation_restores_the_active_skill_and_its_row() {
 }
 
 #[tokio::test]
-async fn a_stale_confirmation_leaves_a_skill_added_again_waiting() {
+async fn a_stale_confirmation_without_an_active_skill_puts_the_files_back() {
     let h = harness().await;
-    h.waiting_since("gh", Duration::from_secs(60)).await;
-    let read = h.store.agent_skills(h.agent).await.unwrap();
-    let again = format!("{}Added again.\n", skill_md("gh", &["api.github.com"]));
-    h.upload("SKILL.md", &again).await.unwrap();
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
     let rows = h.store.agent_skills(h.agent).await.unwrap();
-    assert_ne!(rows, read);
+    let mut stale = rows[0].clone();
+    stale.added_at -= time::Duration::seconds(1);
     assert_eq!(
-        h.skills.confirm_row(&read[0]).await.unwrap(),
+        h.skills.confirm_row(&stale).await.unwrap(),
         Confirmed::NotPending
     );
     assert!(!h.live("gh").exists());
+    assert!(h.pending("gh").join("SKILL.md").is_file());
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert!(h.work_is_empty());
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn a_confirmation_the_store_fails_puts_back_the_files_and_the_old_skill() {
+    let h = harness().await;
+    let old = skill_md("gh", &["a.example"]);
+    h.upload("SKILL.md", &old).await.unwrap();
+    h.skills.confirm(h.agent, "gh").await.unwrap();
+    let new = skill_md("gh", &["b.example"]);
+    h.upload("SKILL.md", &new).await.unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    let mut db = sqlx::SqliteConnection::connect(&h.db_url).await.unwrap();
+    sqlx::query(
+        "CREATE TRIGGER confirming_fails BEFORE UPDATE OF state ON agent_skills \
+         BEGIN SELECT RAISE(ABORT, 'confirming fails'); END",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+
+    assert!(h.skills.confirm(h.agent, "gh").await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(h.live("gh").join("SKILL.md")).unwrap(),
+        old
+    );
     assert_eq!(
         std::fs::read_to_string(h.pending("gh").join("SKILL.md")).unwrap(),
-        again
+        new
     );
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
-    assert!(h.hosts().await.is_empty());
+    assert_eq!(h.hosts().await, ["a.example"]);
     assert!(h.work_is_empty());
 
+    sqlx::query("DROP TRIGGER confirming_fails")
+        .execute(&mut db)
+        .await
+        .unwrap();
     assert!(matches!(
         h.skills.confirm(h.agent, "gh").await.unwrap(),
         Confirmed::Active(_)
     ));
     assert_eq!(
         std::fs::read_to_string(h.live("gh").join("SKILL.md")).unwrap(),
-        again
+        new
     );
-    assert_eq!(h.hosts().await, ["api.github.com"]);
+    assert_eq!(h.hosts().await, ["b.example"]);
 }
 
 #[tokio::test]
-async fn a_confirmation_that_cant_move_the_files_aside_fails_and_keeps_the_row() {
+async fn a_change_to_a_skill_another_holds_waits_then_changes_nothing() {
     let h = harness().await;
     h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
         .await
         .unwrap();
     let rows = h.store.agent_skills(h.agent).await.unwrap();
-    let agent_dir = h.pending("gh").parent().unwrap().to_owned();
-    std::fs::remove_dir_all(&agent_dir).unwrap();
-    std::fs::write(&agent_dir, "not a directory").unwrap();
-    assert!(h.skills.confirm(h.agent, "gh").await.is_err());
+    let held = h
+        .store
+        .acquire_skill_lease(h.agent, "gh", OffsetDateTime::now_utc(), LEASE_TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    let again = skill_md("gh", &["evil.example"]);
+    let started = std::time::Instant::now();
+    let (confirmed, removed, added) = tokio::join!(
+        h.skills.confirm(h.agent, "gh"),
+        h.skills.remove(h.agent, "gh"),
+        h.upload("SKILL.md", &again),
+    );
+    assert!(started.elapsed() >= LEASE_WAIT);
+    assert_eq!(confirmed.unwrap(), Confirmed::Busy);
+    assert_eq!(removed.unwrap(), Removed::Busy);
+    assert_eq!(added, Err(Refused::Busy));
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert_eq!(
+        std::fs::read_to_string(h.pending("gh").join("SKILL.md")).unwrap(),
+        skill_md("gh", &["api.github.com"])
+    );
+    assert!(!h.live("gh").exists());
     assert!(h.hosts().await.is_empty());
+
+    let release = async {
+        tokio::time::sleep(LEASE_WAIT / 4).await;
+        assert!(
+            h.store
+                .release_skill_lease(h.agent, "gh", held)
+                .await
+                .unwrap()
+        );
+    };
+    let (confirmed, ()) = tokio::join!(h.skills.confirm(h.agent, "gh"), release);
+    assert!(matches!(confirmed.unwrap(), Confirmed::Active(_)));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+    assert!(
+        h.store
+            .acquire_skill_lease(h.agent, "gh", OffsetDateTime::now_utc(), LEASE_TTL)
+            .await
+            .unwrap()
+            .is_some(),
+        "released when done"
+    );
+}
+
+#[tokio::test]
+async fn the_sweeper_skips_an_expired_skill_another_holds() {
+    let h = harness().await;
+    h.expired("gh").await;
+    let held = h
+        .store
+        .acquire_skill_lease(h.agent, "gh", OffsetDateTime::now_utc(), LEASE_TTL)
+        .await
+        .unwrap()
+        .unwrap();
+    h.skills.drop_expired().await.unwrap();
+    assert!(h.pending("gh").join("SKILL.md").is_file());
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap().len(), 1);
+
+    h.store
+        .release_skill_lease(h.agent, "gh", held)
+        .await
+        .unwrap();
+    h.skills.drop_expired().await.unwrap();
+    assert!(!h.pending("gh").exists());
+    assert!(h.store.agent_skills(h.agent).await.unwrap().is_empty());
 }
 
 #[tokio::test]

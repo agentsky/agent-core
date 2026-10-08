@@ -24,3 +24,17 @@ CREATE TABLE agent_skills (
     added_at INTEGER NOT NULL,
     PRIMARY KEY (agent_id, name, state)
 ) STRICT;
+
+-- One writer at a time for each agent's skill name, across instances: a
+-- blue-green deploy runs two agentd processes over the same skills
+-- directories. An add, confirmation, removal or the sweeper's drop takes
+-- the lease for its moves and row writes, and deletes it when done; one
+-- left by a crash ends at `expires_at`.
+
+CREATE TABLE skill_leases (
+    agent_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, name)
+) STRICT;

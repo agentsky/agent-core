@@ -11,7 +11,7 @@ use core_types::{
 };
 use time::OffsetDateTime;
 
-use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
+use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix, ttl_seconds};
 
 const TOKENS: &str = "ctl_tokens";
 const LOCKS: &str = "scope_locks";
@@ -196,10 +196,6 @@ fn hashes(rows: Vec<Vec<u8>>) -> Result<Vec<TokenHash>> {
                 .map_err(|_| corrupt("hash"))
         })
         .collect()
-}
-
-fn ttl_seconds(ttl: Duration) -> i64 {
-    i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX).max(1)
 }
 
 impl Store {
