@@ -1,6 +1,7 @@
 //! `agentctl` driven against agentd's ctl API over TCP: each subcommand
 //! directly, then through a `fake-claude` script as the model would run it.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Output, Stdio};
@@ -9,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agentd::ctl::{Ctl, CtlSettings, ProcessInfo, ProcessToken, STAGING_DIR, SurfaceLookup, Turn};
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse as _;
 use core_types::{
@@ -29,6 +30,11 @@ use tokio::sync::Notify;
 
 const WAIT: Duration = Duration::from_secs(60);
 
+/// The address [`Server`]'s second listener presents every connection as
+/// coming from: another container's, since every connection the tests make
+/// comes from 127.0.0.1, and a container address holds one token at a time.
+const OTHER_CONTAINER: &str = "127.0.0.3";
+
 fn uuid() -> String {
     TurnId::new_v4().to_string()
 }
@@ -44,6 +50,10 @@ impl SurfaceLookup for Lookup {
 struct Server {
     ctl: Ctl,
     url: String,
+    /// The second listener, whose connections come from [`OTHER_CONTAINER`].
+    other_url: String,
+    /// The secrets of the tokens issued at [`OTHER_CONTAINER`].
+    others: Mutex<HashSet<String>>,
     surface: Arc<MockSurface>,
     dir: TempDir,
 }
@@ -73,9 +83,16 @@ impl Server {
             .router()
             .into_make_service_with_connect_info::<SocketAddr>();
         tokio::spawn(async move { axum::serve(listener, service).await });
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_url = format!("http://{}", other.local_addr().unwrap());
+        let peer = SocketAddr::new(OTHER_CONTAINER.parse().unwrap(), 40_000);
+        let service = ctl.router().layer(axum::Extension(ConnectInfo(peer)));
+        tokio::spawn(async move { axum::serve(other, service).await });
         Self {
             ctl,
             url,
+            other_url,
+            others: Mutex::default(),
             surface,
             dir,
         }
@@ -107,8 +124,27 @@ impl Server {
         (info, token)
     }
 
+    /// A process at [`OTHER_CONTAINER`] on `volume`, with a public turn
+    /// running.
+    async fn other(&self, volume: VolumeKey) -> ProcessToken {
+        let (_, token) = self.process_at(OTHER_CONTAINER, Some(volume)).await;
+        self.others
+            .lock()
+            .unwrap()
+            .insert(token.secret().expose_secret().to_owned());
+        self.ctl
+            .begin_turn(&token, turn(Side::Public))
+            .await
+            .unwrap();
+        token
+    }
+
+    /// `agentctl` with `token`, connecting from the token's container.
     fn agentctl(&self, token: &ProcessToken) -> tokio::process::Command {
-        agentctl(&self.url, token.secret().expose_secret(), self.dir.path())
+        let secret = token.secret().expose_secret();
+        let other = self.others.lock().unwrap().contains(secret);
+        let url = if other { &self.other_url } else { &self.url };
+        agentctl(url, secret, self.dir.path())
     }
 
     async fn run(&self, token: &ProcessToken, args: &[&str]) -> Run {
@@ -366,6 +402,8 @@ async fn refusals_exit_non_zero_with_one_line() {
         .run(&token, &["attach", "big.bin"])
         .await
         .refused("attachment limit");
+    server.ctl.revoke_process_token(&token).await.unwrap();
+    server.run(&token, &["history"]).await.refused("revoked");
 
     let (_, private) = server.process_at("127.0.0.1", None).await;
     let mut task = turn(Side::Owner);
@@ -377,9 +415,6 @@ async fn refusals_exit_non_zero_with_one_line() {
         .refused("only `agentctl attach`");
     std::fs::write(server.dir.join("result.txt"), "42").unwrap();
     server.run(&private, &["attach", "result.txt"]).await.ok();
-
-    server.ctl.revoke_process_token(&token).await.unwrap();
-    server.run(&token, &["history"]).await.refused("revoked");
 
     let output = server
         .agentctl(&token)
@@ -477,8 +512,7 @@ async fn a_second_lock_in_the_same_session_waits() {
 async fn a_second_session_waits_for_the_lock() {
     let server = Server::start().await;
     let (info, a) = server.turn().await;
-    let (_, b) = server.process_at("127.0.0.1", Some(info.volume)).await;
-    server.ctl.begin_turn(&b, turn(Side::Public)).await.unwrap();
+    let b = server.other(info.volume).await;
     assert_eq!(
         two_locks(&server, &a, &b).await,
         ["start-a", "end-a", "start-b", "end-b"]
@@ -591,12 +625,7 @@ async fn the_lock_expires_when_its_holder_dies() {
 async fn losing_the_lease_stops_the_command_and_frees_the_lock_at_once() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
     let (info, token) = server.turn().await;
-    let (_, other) = server.process_at("127.0.0.1", Some(info.volume)).await;
-    server
-        .ctl
-        .begin_turn(&other, turn(Side::Public))
-        .await
-        .unwrap();
+    let other = server.other(info.volume).await;
     let hold = |marker: &Path| {
         server
             .agentctl(&token)
