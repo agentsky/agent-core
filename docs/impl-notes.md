@@ -5423,9 +5423,9 @@ kept outside what sandboxes mount (`<data>/skills-pending/<agent>/<name>/`)
 with a `pending` row; the reply lists the hosts and asks for
 `skill confirm <name> <skill>` within an hour (`PENDING_TTL`). Confirming
 moves the files into the agent's skills and makes the row `active`, which is
-when its hosts count. A confirmation after the hour finds the skill dropped;
-the sweeper drops expired ones every minute, with their files, and startup
-too. The parser gained `SkillCommand::Confirm`, and the design's command
+when its hosts count. A confirmation after the hour answers that the skill
+waited too long; the sweeper drops expired ones every minute, with their
+files, and startup too. The parser gained `SkillCommand::Confirm`, and the design's command
 table lists it.
 
 ### Skills are rows, their files are directories
@@ -5738,46 +5738,40 @@ removed each name's pending directory. The directory is keyed by agent and
 name only, and nothing orders `skill add` against the sweeper, this
 instance's or another's: an owner who added the skill again between the
 two had their new files removed, and `skill confirm` then found a row
-without files, deleted it and said nothing was waiting. A confirmation of
-an expired row did the same through its own cleanup, which deleted
-whatever pending row of the name it found, a new one included, and then
-its directory.
+without files, deleted it and said nothing was waiting. A confirmation
+did the same through its own cleanup: one that found its row expired, or
+found no files, deleted whatever pending row of the name existed and its
+directory. That reached a skill being added again (its row recorded, its
+files not moved in yet) and a second confirmation of the same skill (the
+first had moved the files aside), whose own confirmation then failed.
 
-**Solution.** `drop_expired` removes a name's pending directory only when
-no pending row of that name exists once its row is deleted
-(`drop_expired_files`, which a test drives between the delete and the
-removal). A pending row is what owns the directory: an active row of the
-name may sit next to an expired update's files, and keeping them for it
-would leave them for good, since purge keeps every directory of a name
-with a row. A name whose files can't be removed, or whose rows can't be
-read, is logged and left to startup's purge; the other names are still
-removed, since their rows are already gone.
+**Solution.** `skill confirm` never deletes a row. A row that expired
+answers that it waited too long and should be added again, and stays for
+the sweeper, which drops it `PENDING_TTL` plus one to two
+`SWEEP_INTERVAL`s (a minute each) after it was added; until then it is
+listed and counts toward `MAX_SKILLS`, and adding the skill again replaces
+it. Files that aren't in the pending directory when the confirmation moves
+them aside (the rename finds nothing) answer that nothing waits and leave
+the row to whichever add or confirmation has them.
 
-`Store::delete_pending_skill` deletes the pending row a confirmation read
-only while its hosts and `added_at` are unchanged, as `confirm_skill` makes
-it active, and the confirmation removes the directory only when that
-delete removed the row. When it didn't, because the skill was added again
-meanwhile, the confirmation reads the pending row again, once, and
-confirms the one waiting now if its files are in place and it hasn't
-expired, so the reply says the skill the owner has is in use. Otherwise
-it answers for the row it first read, expired or not waiting, and leaves
-the new row and its directory alone: an add that has just replaced the row
-is usually still moving its files in, and dropping its row for having none
-would leave them without one. A row that is simply gone answers as before.
+`drop_expired` removes a name's pending directory only when no pending row
+of that name exists once its row is deleted (`drop_expired_files`, which a
+test drives between the delete and the removal). A pending row is what
+owns the directory: an active row of the name may sit next to an expired
+update's files, and keeping them for it would leave them for good, since
+purge keeps every directory of a name with a row. A name whose files can't
+be removed, or whose rows can't be read, is logged and left to startup's
+purge; the other names are still removed, since their rows are already
+gone.
 
-Two windows remain, in the sweeper and in both of a confirmation's
-cleanups (an expired row, a row without files): an add that records its
-row and moves its files in between the delete, or the sweeper's check, and
-the directory's removal loses its files, and `skill confirm` then finds a
-row without them. And a confirmation that reads a new row before its add
-has moved the files in sees no files and deletes that row, leaving the
-files the add then moves in with no row, until purge removes them or the
-skill is added again. Either way nothing is granted: files in the pending
-directory are never mounted and no pending row's hosts are allowed, and
-the owner adds the skill again. Closing both would need pending
-directories keyed by the row's identity, its `added_at` or an id stored on
-the row, so a removal could only ever reach the files of the row it
-deleted.
+One window remains, in the sweeper: an add that records its row and moves
+its files in between the sweeper's check and its removal loses its files,
+and `skill confirm` then answers that nothing waits until the skill is
+added again or the row expires. Nothing is granted meanwhile: files in the
+pending directory are never mounted and no pending row's hosts are
+allowed. Closing it would need pending directories keyed by the row's
+identity, its `added_at` or an id stored on the row, so a removal could
+only ever reach the files of the row it deleted.
 
 ## T26: Requester-pays routing
 

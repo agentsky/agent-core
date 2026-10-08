@@ -74,8 +74,8 @@ impl Commands {
                         "`{name}` has no skill `{skill}` waiting for you to confirm its hosts."
                     ),
                     Confirmed::Expired => format!(
-                        "The skill `{skill}` waited more than {} minutes, so I dropped it. Add \
-                         it again with {}.",
+                        "The skill `{skill}` waited more than {} minutes for you to confirm \
+                         its hosts. Add it again with {}.",
                         PENDING_TTL.as_secs() / 60,
                         origin.command(&format!("skill add {name}"))
                     ),

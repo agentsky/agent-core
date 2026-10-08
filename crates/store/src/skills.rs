@@ -221,28 +221,6 @@ impl Store {
         }))
     }
 
-    /// Deletes the pending skill `shown` if its row still holds what
-    /// `shown` read: the same hosts, added at the same time. Returns
-    /// whether it deleted it, false if that row is gone or was replaced.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] if the query fails.
-    pub async fn delete_pending_skill(&self, shown: &AgentSkill) -> Result<bool> {
-        let deleted = sqlx::query(
-            "DELETE FROM agent_skills \
-             WHERE agent_id = ? AND name = ? AND state = 'pending' AND hosts = ? AND added_at = ?",
-        )
-        .bind(shown.agent.to_string())
-        .bind(&shown.name)
-        .bind(shown.hosts.join("\n"))
-        .bind(to_unix(shown.added_at))
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(deleted > 0)
-    }
-
     /// Deletes the agent's skill `name` in `state`, or in both states
     /// with `None`, and returns the rows it deleted, by state.
     ///
@@ -432,48 +410,6 @@ mod tests {
         assert_eq!(rows[0].state, SkillState::Active);
         assert_eq!(rows[0].hosts, hosts);
         assert_eq!(store.confirm_skill(&shown).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn a_pending_skill_is_deleted_only_as_shown() {
-        let store = memory_store().await;
-        let owner = store
-            .ensure_member(&member_key("o"), "o", at(1))
-            .await
-            .unwrap();
-        let a = agent(&store, owner, "helper").await;
-        let hosts = vec!["api.github.com".to_owned()];
-        store
-            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, 32, at(1))
-            .await
-            .unwrap();
-        store
-            .put_skill(
-                &skill(a, "gh", &hosts, owner),
-                SkillState::Pending,
-                32,
-                at(20),
-            )
-            .await
-            .unwrap();
-        let rows = store.agent_skills(a).await.unwrap();
-        let shown = rows[1].clone();
-        for replaced in [
-            AgentSkill {
-                added_at: at(19),
-                ..shown.clone()
-            },
-            AgentSkill {
-                hosts: vec!["*.example.org".to_owned()],
-                ..shown.clone()
-            },
-        ] {
-            assert!(!store.delete_pending_skill(&replaced).await.unwrap());
-        }
-        assert_eq!(store.agent_skills(a).await.unwrap(), rows);
-        assert!(store.delete_pending_skill(&shown).await.unwrap());
-        assert_eq!(store.agent_skills(a).await.unwrap(), rows[..1]);
-        assert!(!store.delete_pending_skill(&shown).await.unwrap());
     }
 
     #[tokio::test]
