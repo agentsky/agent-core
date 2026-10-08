@@ -401,7 +401,19 @@ wait_answer "${bob% *}" "${bob#* }" "$root_id" bob
 
 echo "== The credentials fake-anthropic saw"
 
-requests=$(docker logs "$fake" 2>&1 | grep -v '^listening on ')
+# fake-anthropic prints the requests it recorded every 250 ms, so its log
+# can trail the answer the test saw. A log that holds still for a second
+# has printed them all.
+fake_requests() {
+    docker logs "$fake" 2>&1 | grep -v '^listening on ' || true
+}
+settled() {
+    printed=$(fake_requests | wc -l)
+    sleep 1
+    [ "$(fake_requests | wc -l)" = "$printed" ]
+}
+poll 30 settled || die "fake-anthropic's log never stopped growing"
+requests=$(fake_requests)
 printf '%s\n' "$requests" | sort | uniq -c
 printf '%s\n' "$requests" | grep -qx 'POST /v1/messages authorization=issued x-api-key=absent' ||
     die "no turn ran on the access token alice linked"
