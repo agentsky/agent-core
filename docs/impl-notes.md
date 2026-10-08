@@ -3774,9 +3774,10 @@ runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
 What remains: a background process left from turn N can still spend turn
-N+1's credential while N+1 runs, whoever its requester is. Only killing the
-processes a turn leaves behind when it ends removes that; the plan's
-Deferred work has an entry.
+N+1's credential while N+1 runs, whoever its requester is. Killing what a
+turn leaves behind has no clean boundary, and recycling the container when
+the requester changes removes the cross-requester case; the plan's Deferred
+work ("Processes a turn leaves running") has both.
 
 ### Headers the proxy changes besides the credential
 
@@ -4003,7 +4004,8 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Killing leftover processes" entry covers that). Resolving the name with a
+"Processes a turn leaves running" entry records it; recycling the container
+when the requester changes doesn't close it). Resolving the name with a
 trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
 allowed host to a fixed address there; pin it in DNS instead.
 
@@ -6035,8 +6037,8 @@ credential kind or model change) counts its first turn's cost as unknown.
 A runner test resumes in such a container and gets no cost; before this
 it got the turn's cost. Stopping the container before every resume would
 keep that cost known at a container start's price, and would also end
-the agent's leftover processes (Deferred work's "Killing leftover
-processes at turn end").
+the agent's leftover processes (Deferred work's "Processes a
+turn leaves running").
 
 A turn's cost is unknown (an `Err` with a `CostUnknown` reason, and
 billed as 0) when its result or the process's previous one has no
