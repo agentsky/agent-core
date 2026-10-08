@@ -3492,9 +3492,11 @@ Deliverables:
   - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
     SurfaceError>` never waits for a used-up quota, and skips a sender with
     `sender_bot_user` set, whose `outside` decides nothing. When the fields
-    left `outside` `None` and `home_user` doesn't say home, it sets
-    `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
-    `Unauthorized` error too. It returns `Transport` and `RateLimited` as
+    left `outside` `None` and the lookup doesn't say home, it sets
+    `Some(Outside { team })` with the organization `users.info` named, its
+    `team_id`, else `enterprise_user.enterprise_id`, as Confirmation below
+    takes it, and `team: None` only when it named none or the lookup failed
+    with an `Api` or `Unauthorized` error; it returns `Ok` either way. It returns `Transport` and `RateLimited` as
     they came, leaving `outside` alone. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
     real user; those two errors fail the confirmation as T31's lookups do,
@@ -3626,11 +3628,18 @@ recorded.
 
 Design: [Audience](design.md#audience),
 [Paying for outside members' turns](design.md#paying-for-outside-members-turns),
-[Commands](design.md#commands-1), [Hand-offs](design.md#hand-offs), and the
+[Commands](design.md#commands-1), [Hand-offs](design.md#hand-offs),
+[Who is outside](design.md#who-is-outside) (the sender's team), and the
 security rows on Slack Connect.
 
 Deliverables:
 
+- `surface-slack` normalization takes the sender's team from `user_team`,
+  then `source_team`, then `user_profile.team`, and `team` only when none
+  of those is given, replacing T36a's rule that any foreign field makes
+  the sender outside, for the event and for Slack's copy alike, following
+  what T36e recorded about `team` for a home member's message in a channel
+  another organization hosts.
 - `[slack_connect]` in the configuration, documented in
   `config/agentd.example.toml` and `README.md`:
   - `teams`: at most 100 ids shaped like Slack team ids (`T…` or `E…`),
@@ -3698,6 +3707,7 @@ Acceptance:
 - `everyone_and_room_allows_dont_admit_outside_requesters`.
 - `allow_outside_admits_and_any_deny_wins`.
 - `a_member_rule_admits_one_outside_member`.
+- `a_home_sender_in_a_channel_another_organization_hosts_is_home`.
 - `a_ban_on_an_outside_member_applies`.
 - `outside_refusals_are_one_line_per_thread_per_day_and_name_no_reason`.
 - `allow_outside_on_an_open_agent_keeps_home_members_allowed`.
