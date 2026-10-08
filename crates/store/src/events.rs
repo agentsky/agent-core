@@ -230,4 +230,66 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn a_row_recorded_without_an_expiry_is_kept_a_week() {
+        let store = memory_store().await;
+        let seen = at(1_000_000);
+        let hour = Duration::hours(1);
+        for (seen_at, inserted) in [(seen, 1), (seen + hour, 0)] {
+            let result = sqlx::query(
+                "INSERT INTO processed_events (source, event_id, seen_at) VALUES (?, ?, ?) \
+                 ON CONFLICT (source, event_id) DO NOTHING",
+            )
+            .bind("rocketchat")
+            .bind("m1")
+            .bind(to_unix(seen_at))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            assert_eq!(result.rows_affected(), inserted);
+        }
+        assert!(
+            store
+                .mark_event_processed("slack:b:message", "C1:1.1", seen, Duration::days(30))
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            store.sweep_expired(seen + hour).await.unwrap(),
+            Swept::default()
+        );
+        assert_eq!(
+            store
+                .sweep_expired(seen + PROCESSED_EVENT_RETENTION)
+                .await
+                .unwrap(),
+            Swept::default()
+        );
+        assert!(
+            !store
+                .mark_event_processed("rocketchat", "m1", seen + hour, PROCESSED_EVENT_RETENTION)
+                .await
+                .unwrap()
+        );
+
+        let later = seen + PROCESSED_EVENT_RETENTION + Duration::seconds(1);
+        assert_eq!(
+            store.sweep_expired(later).await.unwrap().processed_events,
+            1
+        );
+        assert!(
+            store
+                .mark_event_processed("rocketchat", "m1", later, PROCESSED_EVENT_RETENTION)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .mark_event_processed("slack:b:message", "C1:1.1", later, Duration::days(30))
+                .await
+                .unwrap()
+        );
+    }
 }

@@ -7361,3 +7361,25 @@ would let a bot post in any public channel, is off unless
 - Client and signing secrets, bot tokens, configuration tokens and OAuth
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
+
+### Rows from the previous binary during a blue-green swap
+
+**Issue.** T31's migration adds `processed_events.expires_at` with a
+default of 0, and the sweeper deletes rows whose `expires_at` has passed.
+During a blue-green swap the previous binary still records events on the
+same store ([Connections follow the store](#connections-follow-the-store))
+and inserts only `source`, `event_id` and `seen_at`, so its rows got 0 and
+were swept within a minute: an event it recorded and redelivered later
+would run twice. SQLite refuses an expression such as `seen_at + 604800` as
+the default of an added column.
+
+**Solution.** The migration adds an `AFTER INSERT` trigger that sets
+`expires_at` to `seen_at` plus a week, the retention every row had before,
+for a row inserted with 0, matched by the table's key (`source`,
+`event_id`). An insert that `ON CONFLICT DO NOTHING` skips fires no
+trigger, and the trigger's update doesn't count in the insert's
+`rows_affected`, so the old binary's duplicate check is unchanged. A store
+test inserts a row in the old shape and checks it survives a sweep an hour
+and a week later, is swept a second after that, and that a row recorded
+with an explicit 30-day `expires_at` is left alone. A later migration can
+drop the trigger once no binary from before T31 can run against the store.
