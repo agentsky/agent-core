@@ -1134,9 +1134,10 @@ async fn settled_past_a_waiting_change(
             .await
             .unwrap(),
         ChannelChange::Moved {
-            rules: false,
+            rules: true,
             to: NEWEST.into()
-        }
+        },
+        "the waiting change's deny was copied"
     );
     first
 }
@@ -1161,6 +1162,7 @@ async fn a_change_settled_on_a_redirected_id_carries_the_denies_of_a_change_stil
         );
     }
 
+    channel_info(&h, AGENT_TOKEN, NEWEST, member_of(NEWEST)).await;
     let retry = at + CHANNEL_CHANGE_RETRY;
     assert_eq!(h.agents.pass_at(|| retry).await.settled, 1);
     assert_eq!(
@@ -1181,6 +1183,51 @@ async fn a_change_given_up_after_a_later_one_settled_on_a_redirected_id_leaves_i
     assert_eq!(
         rules_of(&h, helper).await,
         denying(&[OLD, NEWEST, NEW, NEWER])
+    );
+    assert!(!permits(&h, helper, NEWEST).await);
+}
+
+#[tokio::test]
+async fn a_change_recorded_after_a_later_one_settled_on_a_redirected_id_reaches_that_id() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    set_rules(&h, helper, &denying(&[OLD])).await;
+    let second = change_of(helper, NEW, NEWER);
+    recorded(&h, &second).await;
+    channel_info(&h, AGENT_TOKEN, NEWER, member_of(NEWEST)).await;
+    let now = OffsetDateTime::now_utc;
+    assert_eq!(
+        h.agents.settle_channel_change(&second, &now).await.unwrap(),
+        ChannelChange::Moved {
+            rules: false,
+            to: NEWEST.into()
+        }
+    );
+    let first = change_of(helper, OLD, NEW);
+    recorded(&h, &first).await;
+    h.slack.reset().await;
+    channel_info(&h, AGENT_TOKEN, NEWEST, ResponseTemplate::new(503)).await;
+    assert_eq!(
+        h.agents.settle_channel_change(&first, &now).await.unwrap(),
+        ChannelChange::Waiting
+    );
+    assert_eq!(
+        h.calls("conversations.info").await,
+        1,
+        "it asks where the settled change found the channel"
+    );
+    for channel in [NEW, NEWER, NEWEST] {
+        assert!(
+            !permits(&h, helper, channel).await,
+            "the waiting change's deny reaches {channel}"
+        );
+    }
+
+    let late = first.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);
+    assert_eq!(h.agents.pass_at(|| late).await.given_up, 1);
+    assert_eq!(
+        rules_of(&h, helper).await,
+        denying(&[OLD, NEW, NEWER, NEWEST])
     );
     assert!(!permits(&h, helper, NEWEST).await);
 }
@@ -1216,7 +1263,11 @@ async fn a_change_slack_never_confirms_is_given_up_with_its_denies_copied() {
     let settled_long_ago = change_of(helper, "G0PRIVAT3", "C0PRIVAT3");
     recorded(&h, &settled_long_ago).await;
     h.store
-        .settle_channel_id_change(&settled_long_ago, settled_long_ago.received_at)
+        .settle_channel_id_change(
+            &settled_long_ago,
+            &settled_long_ago.new,
+            settled_long_ago.received_at,
+        )
         .await
         .unwrap();
     let later = settled_long_ago.received_at + CHANNEL_CHANGE_TTL + Duration::from_secs(1);

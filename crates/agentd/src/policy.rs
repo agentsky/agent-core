@@ -38,9 +38,9 @@ pub const MAX_RULES: usize = 100;
 
 /// The most rules an agent's deny list holds with the denies copied from
 /// channels' old ids ([`Rules::copy_denies`]): a copy past it denies
-/// everyone instead. A real channel id change copies at most one deny, so
-/// only a flood of forged changes, which only the agent's owner can send,
-/// takes a list there.
+/// everyone instead. A real channel id change copies a deny for each of the
+/// few ids its chain runs through at most, so only a flood of forged
+/// changes, which only the agent's owner can send, takes a list there.
 pub const MAX_DENIES: usize = 2 * MAX_RULES;
 
 /// The community's caps, from `[limits]`.
@@ -356,8 +356,9 @@ fn add(rules: &mut Vec<Rule>, rule: Rule) -> Change {
 
 /// The ids a channel that was `start` had since, as `binding`'s recorded
 /// channel id changes in `changes` say, waiting or settled: those it was
-/// changed to, then those they were changed to, and so on, each once, the
-/// last the latest a chain reaches.
+/// changed to, and those a settled change found it at, then those they
+/// were changed to, and so on, each once, the last the latest a chain
+/// reaches.
 pub fn later_ids(
     changes: &[KnownChannelIdChange],
     binding: BindingId,
@@ -371,7 +372,7 @@ pub fn later_ids(
         onward
             .entry(&known.change.old)
             .or_default()
-            .push(&known.change.new);
+            .extend(std::iter::once(&known.change.new).chain(&known.settled_to));
     }
     let mut seen = HashSet::from([start]);
     let mut order = vec![start];
@@ -786,6 +787,7 @@ mod tests {
             },
             team: "T1".into(),
             waiting,
+            settled_to: (!waiting).then(|| new.into()),
         }
     }
 

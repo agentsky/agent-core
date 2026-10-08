@@ -261,9 +261,11 @@ pub struct SweepPass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelChange {
     /// Slack said where the channel is now, with the bot in it, and the
-    /// agent's rules on the old id, if it had any, moved there.
+    /// agent's rules on the old id, if it had any, moved there, with the
+    /// denies of changes still waiting before it.
     Moved {
-        /// Whether the agent had rules on the old id.
+        /// Whether the agent's rules changed: its rules on the old id moved,
+        /// or denies of changes still waiting before it were copied.
         rules: bool,
         /// Where the channel is now.
         to: ConversationId,
@@ -1228,6 +1230,7 @@ impl SlackAgents {
             change: change.clone(),
             team: row.team.clone(),
             waiting: false,
+            settled_to: None,
         });
         let room = |conversation: &ConversationId| ConvRef {
             surface: SurfaceKind::Slack,
@@ -1291,15 +1294,17 @@ impl SlackAgents {
     }
 
     /// Tries to settle `change`, if this call claims the try: follows the
-    /// binding's recorded changes from the new id to the last id they name,
+    /// binding's recorded changes from the new id to the last id they reach,
     /// asks Slack with the binding's bot token where that channel is now,
     /// and, if Slack answers with the bot in it, moves the agent's rules on
-    /// the old id there. In the same write it copies there the denies on
-    /// the old id of each waiting change whose chain reaches this one's old
-    /// id ([`waiting_before`]), since Slack may name an id no recorded
-    /// change does, which their pending denies wouldn't reach; a duplicate
-    /// is dropped when such a change moves its rules there in turn. Any
-    /// other answer leaves it waiting for its next try.
+    /// the old id there, then marks the change settled there, which chains
+    /// through it follow from then on ([`later_ids`]). In the same write as
+    /// the move it copies there the denies on the old id of each waiting
+    /// change whose chain reaches this one's old id ([`waiting_before`]),
+    /// since their pending denies reach the id Slack named only once the
+    /// change is marked; a duplicate is dropped when such a change moves its
+    /// rules there in turn. Any other answer leaves it waiting for its next
+    /// try.
     ///
     /// # Errors
     ///
@@ -1360,17 +1365,17 @@ impl SlackAgents {
                 if moved || copied {
                     rules.write(settings);
                 }
-                Some(moved)
+                Some(moved || copied)
             })
             .await?;
-        store.settle_channel_id_change(change, now()).await?;
+        store.settle_channel_id_change(change, &to, now()).await?;
         surface.directory().forget_conv(old);
         match moved {
             Some(true) => {
-                tracing::info!(%binding, agent = %row.agent, %old, %new, %to, "a channel changed its id; moved the agent's rules on it to the id it has now");
+                tracing::info!(%binding, agent = %row.agent, %old, %new, %to, "a channel changed its id; moved the agent's rules on it, with the denies of changes still waiting before it, to the id it has now");
             }
             Some(false) => {
-                tracing::debug!(%binding, %old, %new, %to, "a channel changed its id; the agent had no rules on it");
+                tracing::debug!(%binding, %old, %new, %to, "a channel changed its id; the agent had no rules on it or on the ids of changes still waiting before it");
             }
             None => {
                 tracing::warn!(%binding, agent = %row.agent, %old, %new, "a channel changed its id, but the agent's rules don't read, so none moved; they refuse everyone until its owner sets them again");

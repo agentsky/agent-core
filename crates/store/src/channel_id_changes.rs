@@ -40,6 +40,9 @@ pub struct KnownChannelIdChange {
     pub team: TeamId,
     /// Whether it still waits to be settled.
     pub waiting: bool,
+    /// Where Slack said the channel was when the change settled, which its
+    /// chain goes on from as from its new id; `None` while it waits.
+    pub settled_to: Option<ConversationId>,
 }
 
 /// What [`Store::record_channel_id_change`] did.
@@ -63,7 +66,10 @@ macro_rules! reached {
          UNION SELECT old_channel FROM channel_id_changes \
          WHERE binding_id = ? AND settled_at IS NULL \
          UNION SELECT c.new_channel FROM channel_id_changes AS c \
-         JOIN reached AS r ON c.old_channel = r.channel WHERE c.binding_id = ?) "
+         JOIN reached AS r ON c.old_channel = r.channel WHERE c.binding_id = ? \
+         UNION SELECT c.settled_to FROM channel_id_changes AS c \
+         JOIN reached AS r ON c.old_channel = r.channel \
+         WHERE c.binding_id = ? AND c.settled_to IS NOT NULL) "
     };
 }
 
@@ -135,6 +141,7 @@ impl Store {
             .bind(change.new.as_str())
             .bind(&binding)
             .bind(&binding)
+            .bind(&binding)
             .bind(change.old.as_str())
             .bind(change.new.as_str())
             .bind(&binding);
@@ -147,6 +154,7 @@ impl Store {
             .bind(change.new.as_str())
             .bind(&binding)
             .bind(&binding)
+            .bind(&binding)
             .bind(change.old.as_str())
             .bind(change.new.as_str())
             .bind(&binding);
@@ -157,6 +165,7 @@ impl Store {
         sqlx::query(FORGET)
             .bind(change.old.as_str())
             .bind(change.new.as_str())
+            .bind(&binding)
             .bind(&binding)
             .bind(&binding)
             .bind(&binding)
@@ -257,8 +266,8 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Marks the waiting `change` settled at `at`. Returns whether it was
-    /// waiting.
+    /// Marks the waiting `change` settled at `at`, on `to`, where Slack
+    /// said the channel is. Returns whether it was waiting.
     ///
     /// # Errors
     ///
@@ -267,14 +276,16 @@ impl Store {
     pub async fn settle_channel_id_change(
         &self,
         change: &ChannelIdChange,
+        to: &ConversationId,
         at: OffsetDateTime,
     ) -> Result<bool> {
         let result = sqlx::query(
-            "UPDATE channel_id_changes SET settled_at = ? \
+            "UPDATE channel_id_changes SET settled_at = ?, settled_to = ? \
              WHERE binding_id = ? AND old_channel = ? AND new_channel = ? \
              AND settled_at IS NULL",
         )
         .bind(to_unix(at))
+        .bind(to.as_str())
         .bind(change.binding.to_string())
         .bind(change.old.as_str())
         .bind(change.new.as_str())
@@ -336,9 +347,9 @@ impl Store {
         &self,
         agent: AgentId,
     ) -> Result<Vec<KnownChannelIdChange>> {
-        let rows: Vec<(String, String, String, i64, String, bool)> = sqlx::query_as(
+        let rows: Vec<(String, String, String, i64, String, Option<String>)> = sqlx::query_as(
             "SELECT c.binding_id, c.old_channel, c.new_channel, c.received_at, b.team_id, \
-             c.settled_at IS NULL FROM channel_id_changes c \
+             c.settled_to FROM channel_id_changes c \
              JOIN agent_bindings b ON b.id = c.binding_id WHERE b.agent_id = ? \
              ORDER BY c.received_at, c.rowid",
         )
@@ -346,11 +357,12 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(binding, old, new, received_at, team, waiting)| {
+            .map(|(binding, old, new, received_at, team, settled_to)| {
                 Ok(KnownChannelIdChange {
                     change: change_of((binding, old, new, received_at))?,
                     team: team.into(),
-                    waiting,
+                    waiting: settled_to.is_none(),
+                    settled_to: settled_to.map(ConversationId::from),
                 })
             })
             .collect()
