@@ -2271,6 +2271,37 @@ async fn a_failed_reply_post_still_delivers_the_rest_and_says_so() {
 }
 
 #[tokio::test]
+async fn a_failed_upload_still_posts_the_reply_and_says_part_was_lost() {
+    let stack = start().await;
+    stack.next_turn(Turn::reply("Here.").with_command([
+        "sh",
+        "-c",
+        "printf report > report.txt && agentctl attach report.txt",
+    ]));
+    stack
+        .mock
+        .fail_next(Op::Upload, SurfaceError::Api("boom".into()));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "f1", None, &[BOT]))
+        .await;
+    let sent: Vec<_> = posts(&stack.calls_since(0))
+        .into_iter()
+        .map(|(to, text, _)| (to, text))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (in_thread("GENERAL", Some("f1")), "Here.".to_owned()),
+            (
+                in_thread("GENERAL", Some("f1")),
+                DELIVERY_FAILED_TEXT.to_owned()
+            ),
+        ]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
     let stack = start_with(Setup {
         pipeline: |settings| {

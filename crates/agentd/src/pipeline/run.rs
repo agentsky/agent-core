@@ -2390,7 +2390,8 @@ impl Delivery<'_> {
             uploaded = false;
         }
         let mut handed = Vec::new();
-        let mut complete = uploaded && self.post(Some(turn), &reply, &mut handed).await;
+        let posted = self.post(Some(turn), &reply, &mut handed).await;
+        let mut complete = uploaded && posted;
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
                 self.react(answered, &emoji).await;
