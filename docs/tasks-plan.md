@@ -3135,6 +3135,17 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Steering** a running turn with a new message, instead of queueing it.
 - **Switching models over the stream-json control channel** instead of
   restarting the process.
+- **A refusal in the thread when a link read fails.** `StoreView::load`
+  (T23) propagates a failed `claude_links` read, so the whole load aborts:
+  nothing runs and a log line records the store error, but the thread gets
+  no answer. Having the view's link lookup (`is_linked`, `link_state` from
+  T26) answer `None` for a failed read, refused as `PolicyUnavailable` like
+  `member_for`, `is_banned` and `policy`, would answer the thread instead.
+  It changes the `RouterView` interface (T22) and its implementations in
+  T23 and T26 for a reply only, since the request already fails closed. A
+  failed read must never count as "not linked": from T26 that falls through
+  to the community key, so a member's turn would run on the community's
+  budget.
 - **Per-scope container cap tuning** from real usage (T21 sets a default).
 - **Fairness at the per-scope cap**, a follow-up to T21's pool. A session
   keeps its container while it has turns, so a busy session can hold its
