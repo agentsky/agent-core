@@ -8710,6 +8710,23 @@ those depend on the requester and the thread, and the router says them
 when the hand-off runs, so the skill tells the agent not to promise an
 answer.
 
+### A chunk posted but not recorded
+
+**Issue.** The requester-pays delivery counted a reply whose
+`message_refs` row failed to record as incomplete, but `post_to` here
+logged a failed `record_post` and went on as if the chunk were
+delivered, though it hands nothing off, no short id names it, and its
+thread was never told. Separately, a failed upload skipped the reply's
+post: `uploaded && self.post(..)` short-circuited.
+
+**Solution.** The reply is posted whatever the upload did, and `post_to`
+returns `Sent { posted, recorded }`; a turn's delivery is complete only
+when the upload, every post and every record succeeded, and otherwise
+says `DELIVERY_FAILED_TEXT`. A private task's outcome (`tell_thread`)
+still needs only `posted`: its record is what `consent_posted` reads to
+mark the outcome posted, so treating an unrecorded outcome as unposted
+would post it again on each retry.
+
 ### Smaller choices
 
 - The hand-offs are queued once the whole delivery is done, after any

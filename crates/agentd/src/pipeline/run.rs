@@ -2297,6 +2297,21 @@ struct HandedOff {
     event: Arc<InboundEvent>,
 }
 
+/// What [`Delivery::post_to`] got out of a text: whether every chunk was
+/// posted, and whether every chunk posted was recorded.
+#[derive(Debug, Clone, Copy)]
+struct Sent {
+    posted: bool,
+    recorded: bool,
+}
+
+impl Sent {
+    /// Whether nothing was lost: every chunk posted and recorded.
+    fn complete(self) -> bool {
+        self.posted && self.recorded
+    }
+}
+
 /// Delivers what one turn made, as the agent's bot.
 struct Delivery<'a> {
     store: &'a Store,
@@ -2390,8 +2405,8 @@ impl Delivery<'_> {
             uploaded = false;
         }
         let mut handed = Vec::new();
-        let posted = self.post(Some(turn), &reply, &mut handed).await;
-        let mut complete = uploaded && posted;
+        let sent = self.post(Some(turn), &reply, &mut handed).await;
+        let mut complete = uploaded && sent.complete();
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
                 self.react(answered, &emoji).await;
@@ -2404,7 +2419,8 @@ impl Delivery<'_> {
             for queued in outbox.posts() {
                 complete &= self
                     .post_to(Some(turn), &queued.to, &queued.text, &mut handed)
-                    .await;
+                    .await
+                    .complete();
             }
         }
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
@@ -2414,14 +2430,16 @@ impl Delivery<'_> {
     }
 
     /// [`post_to`](Self::post_to) the target: the turn's own thread.
-    async fn post(&self, turn: Option<TurnId>, text: &str, handed: &mut Vec<HandedOff>) -> bool {
+    async fn post(&self, turn: Option<TurnId>, text: &str, handed: &mut Vec<HandedOff>) -> Sent {
         self.post_to(turn, &self.target, text, handed).await
     }
 
     /// Renders and posts Markdown `text` to `target`, recording a
     /// `message_refs` row for each chunk, of `turn` if a turn made it. A
     /// chunk that can't be posted is skipped and the rest still go. Empty
-    /// text posts nothing. Returns false if a chunk was lost.
+    /// text posts nothing. Returns whether every chunk was posted, and
+    /// whether each one posted was recorded too: one that wasn't hands
+    /// nothing off and no short id names it.
     ///
     /// A chunk hands off when a turn posted it in the turn's own thread,
     /// with [`HandOffs`]: then a `hand_offs` row is recorded with its row,
@@ -2435,22 +2453,25 @@ impl Delivery<'_> {
         target: &ReplyTarget,
         text: &str,
         handed: &mut Vec<HandedOff>,
-    ) -> bool {
+    ) -> Sent {
         let hands_off = self
             .hand_offs
             .as_ref()
             .zip(turn)
             .filter(|_| *target == self.target);
+        let mut sent = Sent {
+            posted: true,
+            recorded: true,
+        };
         if text.trim().is_empty() {
-            return true;
+            return sent;
         }
-        let mut complete = true;
         for chunk in self.surface.render(text) {
             let posted = match post_chunk(self.surface, target, &chunk).await {
                 Ok(posted) => posted,
                 Err(err) => {
                     tracing::warn!(session = %self.session, conv = %target.conv, error = %err, "posting part of a reply failed");
-                    complete = false;
+                    sent.posted = false;
                     continue;
                 }
             };
@@ -2508,6 +2529,7 @@ impl Delivery<'_> {
                 Ok((_, ids)) => ids,
                 Err(err) => {
                     tracing::warn!(session = %self.session, msg = %posted.msg.id, error = %err, "recording a posted message and its hand-offs failed");
+                    sent.recorded = false;
                     continue;
                 }
             };
@@ -2525,7 +2547,7 @@ impl Delivery<'_> {
                 }
             }
         }
-        complete
+        sent
     }
 
     /// The managed agents `posted` mentions whose bot is active on the
@@ -2867,7 +2889,7 @@ mod tests {
             "@U2 and @U3 and @U4 too",
             "@U3 again",
         ] {
-            assert!(posting.post(Some(turn), text, &mut handed).await);
+            assert!(posting.post(Some(turn), text, &mut handed).await.complete());
         }
         let to: Vec<(AgentId, &str)> = handed
             .iter()
@@ -2949,7 +2971,8 @@ mod tests {
             assert!(
                 delivery(answering, hands_off)
                     .post_to(turn, &to, text, &mut handed)
-                    .await,
+                    .await
+                    .complete(),
                 "{text}"
             );
             assert!(handed.is_empty(), "{text}");

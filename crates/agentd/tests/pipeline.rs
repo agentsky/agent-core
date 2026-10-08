@@ -2302,6 +2302,36 @@ async fn a_failed_upload_still_posts_the_reply_and_says_part_was_lost() {
 }
 
 #[tokio::test]
+async fn a_reply_posted_but_not_recorded_says_part_was_lost() {
+    use sqlx::Connection as _;
+    let stack = start().await;
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_agent_posts BEFORE INSERT ON message_refs \
+         WHEN NEW.agent_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    stack.next_turn(Turn::reply("Here."));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "r1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(texts, ["Here.", DELIVERY_FAILED_TEXT]);
+    assert_eq!(
+        stack.store().posted_message_ref(&sent[0].2).await.unwrap(),
+        None,
+        "the reply went out, but its row couldn't be recorded"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
     let stack = start_with(Setup {
         pipeline: |settings| {

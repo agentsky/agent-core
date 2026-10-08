@@ -491,7 +491,7 @@ impl Pipeline {
             answering: Answering::PrivateTask(consent.id),
             hand_offs: None,
         };
-        if !delivery.post(None, text, &mut Vec::new()).await {
+        if !delivery.post(None, text, &mut Vec::new()).await.posted {
             return Err(PipelineError::NotPosted);
         }
         tracing::info!(consent = %consent.id, "posted a private task's outcome");
