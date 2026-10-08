@@ -3357,7 +3357,8 @@ Deliverables:
   window, anything stored from that identity (a routine, a hand-off or a
   Slack configuration token, whose refresh token is already used up) is
   deleted by this `logout`: accepted, since the member logged out and in
-  at once and can register it again.
+  at once and can add the routine or register the token again; a deleted
+  hand-off's session may already have fired, and only its record is lost.
 - `slack-token` has the same race: its handler checks the link before it
   rotates the token with Slack, and `put_slack_config_token` doesn't check
   it again, so a token a racing `slack-token` stores after `logout`'s
