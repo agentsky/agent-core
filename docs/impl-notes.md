@@ -3416,11 +3416,14 @@ the calls in the last minute, and a call waits while the quota is used up.
 It is in memory and per process, which is enough to stay under Slack's
 limits; Slack's 429 remains the authority.
 
-A 429, or `ok: false` with `ratelimited`, blocks that bucket until
-`Retry-After` has passed, so concurrent callers wait too. A call is retried
+A 429, or `ok: false` with `ratelimited`, blocks the method for that token
+until `Retry-After` has passed, so concurrent callers wait too. Slack limits
+`chat.postMessage` both per channel and per token, and a 429 doesn't say
+which limit it hit, so a 429 on a post to one channel holds posts to every
+channel; each channel's quota stays its own. A call is retried
 up to three times while the wait is at most `max_retry_wait` (60 s by
 default); a longer wait fails at once with `SurfaceError::RateLimited`, and
-so does any later call in that bucket while it stays blocked, instead of
+so does any later call to that method while it stays blocked, instead of
 sleeping silently. `Retry-After` is read as whole seconds and capped at a
 day so it can't overflow a deadline.
 

@@ -5,9 +5,11 @@
 //! limit of about one message per second per channel, with bursts allowed.
 //! The limiter keeps, for each token and method (and channel, for
 //! `chat.postMessage`), the times of the calls in the last minute, and makes
-//! a call wait while the tier's quota for that minute is used up. After a
-//! 429 it also holds every call in that bucket until `Retry-After` has
-//! passed, so concurrent callers don't keep hitting the limit.
+//! a call wait while the tier's quota for that minute is used up. A 429
+//! doesn't say which limit it hit, so after one the limiter holds every call
+//! to that method with that token, in any channel, until `Retry-After` has
+//! passed, so concurrent callers don't keep hitting the limit. Each
+//! channel's quota stays its own.
 //!
 //! Tokens are never stored: a bucket is keyed by a digest of the token.
 
@@ -83,6 +85,16 @@ impl Bucket {
             channel: channel.map(str::to_owned),
         }
     }
+
+    /// The bucket of the same token and method in every channel, which
+    /// holds the method's 429 block.
+    fn method_wide(&self) -> Self {
+        Self {
+            token: self.token,
+            method: self.method,
+            channel: None,
+        }
+    }
 }
 
 /// Why a call has to wait, and until when.
@@ -143,20 +155,22 @@ impl Limiter {
         }
     }
 
-    /// Counts a call and returns `None` if `bucket` has quota left at `now`,
-    /// or else says until when to wait.
+    /// Counts a call and returns `None` if `bucket`'s method isn't blocked
+    /// and `bucket` has quota left at `now`, or else says until when to
+    /// wait.
     fn try_acquire(&self, bucket: &Bucket, tier: Tier, now: Instant) -> Option<Wait> {
         let mut buckets = self.lock();
+        if let Some(until) = buckets
+            .get(&bucket.method_wide())
+            .and_then(|window| window.blocked_until)
+            .filter(|until| *until > now)
+        {
+            return Some(Wait::Blocked(until));
+        }
         if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(bucket) {
             buckets.retain(|_, window| !window.idle(now));
         }
         let window = buckets.entry(bucket.clone()).or_default();
-        if let Some(until) = window.blocked_until {
-            if until > now {
-                return Some(Wait::Blocked(until));
-            }
-            window.blocked_until = None;
-        }
         while window
             .calls
             .front()
@@ -174,10 +188,11 @@ impl Limiter {
             .map(|oldest| Wait::Quota(*oldest + WINDOW))
     }
 
-    /// Holds every call in `bucket` until `until`, after a 429.
+    /// Holds every call to `bucket`'s method with its token, in any channel,
+    /// until `until`, after a 429.
     pub(crate) fn block(&self, bucket: &Bucket, until: Instant) {
         let mut buckets = self.lock();
-        let window = buckets.entry(bucket.clone()).or_default();
+        let window = buckets.entry(bucket.method_wide()).or_default();
         window.blocked_until = Some(window.blocked_until.map_or(until, |at| at.max(until)));
     }
 
@@ -215,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn buckets_are_separate_per_token_method_and_channel() {
+    fn quotas_are_separate_per_token_method_and_channel() {
         let limiter = Limiter::default();
         let now = Instant::now();
         let first = bucket("chat.postMessage", Some("C1"));
@@ -258,6 +273,34 @@ mod tests {
             Some(Wait::Blocked(until))
         );
         assert_eq!(limiter.try_acquire(&replies, Tier::Tier3, until), None);
+    }
+
+    #[test]
+    fn a_block_in_one_channel_holds_the_method_in_every_channel() {
+        let limiter = Limiter::default();
+        let now = Instant::now();
+        let until = now + Duration::from_secs(30);
+        limiter.block(&bucket("chat.postMessage", Some("C1")), until);
+        let other_channel = bucket("chat.postMessage", Some("C2"));
+        assert_eq!(
+            limiter.try_acquire(&other_channel, Tier::PostMessage, now),
+            Some(Wait::Blocked(until))
+        );
+        let other_method = bucket("chat.update", Some("C2"));
+        assert_eq!(limiter.try_acquire(&other_method, Tier::Tier3, now), None);
+        let other_token = Bucket::new(
+            TokenKey::of(&SecretString::from("xoxb-2")),
+            "chat.postMessage",
+            Some("C2"),
+        );
+        assert_eq!(
+            limiter.try_acquire(&other_token, Tier::PostMessage, now),
+            None
+        );
+        assert_eq!(
+            limiter.try_acquire(&other_channel, Tier::PostMessage, until),
+            None
+        );
     }
 
     #[test]
