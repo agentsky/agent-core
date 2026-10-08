@@ -440,6 +440,52 @@ async fn a_confirmation_after_the_wait_finds_it_expired() {
 }
 
 #[tokio::test]
+async fn a_confirmation_leaves_a_skill_added_again_before_its_files_are_in() {
+    let h = harness().await;
+    h.waiting_since("gh", PENDING_TTL + Duration::from_secs(60))
+        .await;
+    let expired = h.store.agent_skills(h.agent).await.unwrap().remove(0);
+    std::fs::remove_dir_all(h.pending("gh")).unwrap();
+    let hosts = vec!["api.github.com".to_owned()];
+    let new = NewSkill {
+        agent: h.agent,
+        name: "gh",
+        source: "upload:SKILL.md",
+        hosts: &hosts,
+        added_by: h.owner,
+    };
+    h.store
+        .put_skill(
+            &new,
+            SkillState::Pending,
+            MAX_SKILLS,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.skills.confirm_row(&expired).await.unwrap(),
+        Confirmed::Expired
+    );
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].state, SkillState::Pending);
+    assert!(rows[0].added_at > expired.added_at);
+
+    std::fs::create_dir_all(h.pending("gh")).unwrap();
+    std::fs::write(
+        h.pending("gh").join("SKILL.md"),
+        skill_md("gh", &["api.github.com"]),
+    )
+    .unwrap();
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
 async fn a_pending_skill_without_its_files_cant_be_confirmed() {
     let h = harness().await;
     h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))

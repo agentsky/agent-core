@@ -5757,11 +5757,13 @@ removed, since their rows are already gone.
 only while its hosts and `added_at` are unchanged, as `confirm_skill` makes
 it active, and the confirmation removes the directory only when that
 delete removed the row. When it didn't, because the skill was added again
-meanwhile, the confirmation reads the pending row again and confirms the
-one waiting now, once, so the reply names what happened to the skill the
-owner has: in use with the new row's hosts, or, if that one can't be
-confirmed either, expired or not waiting. A row that is simply gone
-answers as before.
+meanwhile, the confirmation reads the pending row again, once, and
+confirms the one waiting now if its files are in place and it hasn't
+expired, so the reply says the skill the owner has is in use. Otherwise
+it answers for the row it first read, expired or not waiting, and leaves
+the new row and its directory alone: an add that has just replaced the row
+is usually still moving its files in, and dropping its row for having none
+would leave them without one. A row that is simply gone answers as before.
 
 Two windows remain, in the sweeper and in both of a confirmation's
 cleanups (an expired row, a row without files): an add that records its
