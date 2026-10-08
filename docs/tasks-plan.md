@@ -3455,9 +3455,8 @@ Deliverables:
 - `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`, and
   `User` keeps `team_id`, both leniently. `user_not_visible` joins
   `NOT_FOUND_CODES`, so it arrives as `SurfaceError::NotFound` like
-  `user_not_found`. Every Web API call shares that list, so it does so
-  from any of them, `conversations.open` included, and their callers treat
-  `NotFound` as they treat `Api`.
+  `user_not_found`. Only `users.info` and `conversations.open` can return
+  it, and their callers treat `NotFound` as they treat `Api`.
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.
