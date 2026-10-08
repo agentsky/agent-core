@@ -3,9 +3,20 @@ use secrecy::ExposeSecret;
 
 use super::*;
 use crate::SealError;
+use crate::claude_links::tests::new_link;
 use crate::test_util::*;
 
+/// A member with a Claude link, as `cloud add` needs.
 async fn member(store: &Store, user: &str) -> MemberId {
+    let member = unlinked_member(store, user).await;
+    store
+        .put_claude_link(member, &new_link("a", "r"), at(1))
+        .await
+        .unwrap();
+    member
+}
+
+async fn unlinked_member(store: &Store, user: &str) -> MemberId {
     store
         .ensure_member(&member_key(user), user, at(1))
         .await
@@ -341,6 +352,33 @@ async fn the_twenty_first_routine_is_refused() {
         put(&store, ada, "r20", "trig_20", "t", 13).await,
         CloudRoutinePut::Added(_)
     ));
+}
+
+#[tokio::test]
+async fn a_routine_is_refused_without_a_claude_link() {
+    let store = memory_store().await;
+    let ada = unlinked_member(&store, "ada").await;
+    assert_eq!(
+        put(&store, ada, "agent-core", "trig_1", "t", 10).await,
+        CloudRoutinePut::Unlinked
+    );
+    let bob = member(&store, "bob").await;
+    put(&store, bob, "agent-core", "trig_1", "t", 10).await;
+    assert!(store.delete_claude_link(bob).await.unwrap());
+    assert_eq!(
+        put(&store, bob, "agent-core", "trig_2", "u", 11).await,
+        CloudRoutinePut::Unlinked
+    );
+    assert_eq!(
+        put(&store, bob, "other", "trig_3", "v", 11).await,
+        CloudRoutinePut::Unlinked
+    );
+    assert!(store.cloud_routines(ada).await.unwrap().is_empty());
+    assert_eq!(
+        opened(&store, bob, "agent-core").await,
+        Some((routine("trig_1"), "t".to_owned()))
+    );
+    assert_eq!(store.cloud_routines(bob).await.unwrap().len(), 1);
 }
 
 #[tokio::test]

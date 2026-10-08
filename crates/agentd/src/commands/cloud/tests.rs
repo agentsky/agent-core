@@ -4,7 +4,10 @@
 use core_types::{ConvKind, MemberId, RoutineId, SurfaceKind, TeamId, UserId};
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use store::{CloudHandoffState, CloudUnknownReason, NewCloudHandoff, RecentCloudHandoff, Store};
+use store::{
+    CloudHandoffState, CloudUnknownReason, NewClaudeLink, NewCloudHandoff, RecentCloudHandoff,
+    Store,
+};
 use surface_slack::{BindingRef, InFlight, SlackEvent, SlackInbound};
 use testkit::{Held, TempDir};
 use time::OffsetDateTime;
@@ -137,10 +140,29 @@ fn second() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()).unwrap()
 }
 
+/// Links `member`'s Claude account, as `login` does.
+async fn link(store: &Store, member: MemberId) {
+    store
+        .put_claude_link(
+            member,
+            &NewClaudeLink {
+                access_token: SecretString::from("access"),
+                refresh_token: SecretString::from("refresh"),
+                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
+                plan: Some("claude_max".to_owned()),
+                rate_limit_tier: None,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+}
+
+/// Registers routine [`LABEL`] for `member`, who must be linked.
 async fn put_routine(store: &Store, member: MemberId, url_origin: &str, added_by: &MemberKey) {
     let token = RoutineToken::parse(SecretString::from(TOKEN)).unwrap();
     let routine_id: RoutineId = ROUTINE.parse().unwrap();
-    store
+    let put = store
         .put_cloud_routine(
             &NewCloudRoutine {
                 member,
@@ -154,6 +176,13 @@ async fn put_routine(store: &Store, member: MemberId, url_origin: &str, added_by
         )
         .await
         .unwrap();
+    assert!(
+        matches!(
+            put,
+            CloudRoutinePut::Added(_) | CloudRoutinePut::Replaced(_)
+        ),
+        "{put:?}"
+    );
 }
 
 async fn begin(
@@ -352,7 +381,9 @@ async fn an_unlinked_member_cannot_add_or_run() {
     );
     assert!(c.h.store.cloud_routines(alice).await.unwrap().is_empty());
 
+    link(&c.h.store, alice).await;
     put_routine(&c.h.store, alice, &c.endpoint.uri(), &key("alice")).await;
+    assert!(c.h.store.delete_claude_link(alice).await.unwrap());
     let ran = c.run("alice", "Fix the flaky test").await;
     assert!(ran.starts_with("Link your Claude account first"), "{ran}");
     assert!(handoffs(&c.h.store, alice).await.is_empty());
@@ -650,6 +681,7 @@ async fn a_notice_no_manager_bot_reaches_waits_and_a_failed_one_is_deferred() {
         .ensure_member(&slack, "U0HUMAN01", OffsetDateTime::now_utc())
         .await
         .unwrap();
+    link(&h.store, member).await;
     let t0 = second();
     begin(&h.store, member, &slack, t0).await;
     let notifier = CloudNotifier::new(h.store.clone(), h.commands.replies().clone(), None);

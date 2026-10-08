@@ -9,8 +9,12 @@
 //! DM with the Slack manager app, or a DM with the Rocket.Chat manager bot.
 //! `cloud add` sent anywhere else gets the secret-bearing refusal, which
 //! says to revoke the token. `add` and `run` need a linked member and
-//! `[cloud]` ([`Commands::with_cloud`]); `list` and `rm` work for any
-//! member, and `rm` is the one `cloud` command a ban leaves. No `agentctl`
+//! `[cloud]` ([`Commands::with_cloud`]); `add` checks the link again in the
+//! transaction that stores the routine
+//! ([`put_cloud_routine`](store::Store::put_cloud_routine)), so a `logout`
+//! that another instance or surface ran meanwhile never leaves a token
+//! behind. `list` and `rm` work for any member, and `rm` is the one `cloud`
+//! command a ban leaves. No `agentctl`
 //! command or consent card starts a hand-off: only a member typing `cloud
 //! run` does, and messages from bots are never commands.
 //!
@@ -115,13 +119,10 @@ impl Commands {
         key: &MemberKey,
         origin: &Origin,
     ) -> Result<Result<MemberId, String>, Failure> {
-        Ok(self.linked_owner(key, origin).await?.map_err(|_| {
-            format!(
-                "Link your Claude account first: send {}. Only a linked member can register \
-                 or run routines.",
-                origin.command("login")
-            )
-        }))
+        Ok(self
+            .linked_owner(key, origin)
+            .await?
+            .map_err(|_| link_first(origin)))
     }
 
     async fn cloud_add(
@@ -187,6 +188,7 @@ impl Commands {
                 routines_counted(u64::from(store::MAX_CLOUD_ROUTINES)),
                 origin.command("cloud rm <routine>")
             ),
+            CloudRoutinePut::Unlinked => link_first(origin),
         })
     }
 
@@ -442,6 +444,16 @@ fn cloud_origin(origin: &Origin) -> Option<CloudOrigin> {
 fn cloud_off(what: &str) -> String {
     format!(
         "Cloud hand-off is off on this agentd, so {what}. `cloud list` and `cloud rm` still work."
+    )
+}
+
+/// The reply to `cloud add` or `cloud run` from a member with no Claude
+/// link.
+fn link_first(origin: &Origin) -> String {
+    format!(
+        "Link your Claude account first: send {}. Only a linked member can register or run \
+         routines.",
+        origin.command("login")
     )
 }
 

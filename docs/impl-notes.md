@@ -9914,3 +9914,31 @@ it passes.
   it was doing (a failure to record a notice that was sent says the notice
   may go again after its lease), and the pass's summary, the members told
   included, at debug, as the cloud notifier does.
+
+### Link recheck when a routine is stored
+
+- `cloud add` checked the link, then stored the routine in a later
+  transaction. The intake runs one identity's (`MemberKey`'s) commands in
+  order within one instance only, so a `logout` from a second instance in a
+  blue-green overlap, or from the member's identity on another surface,
+  could land between the two and leave a token stored after `logout`.
+  `put_cloud_routine` now checks for a `claude_links` row in its
+  `BEGIN IMMEDIATE` transaction and stores nothing without one
+  (`CloudRoutinePut::Unlinked`), which `cloud add` answers with the
+  "Link your Claude account first" reply. `logout` already unlinks before
+  it deletes the member's routines, which the recheck relies on: a racing
+  `cloud add` either commits before the deletion, which takes its routine,
+  or runs after the unlink and is refused. Store tests and the command
+  tests that put routines directly now link the member first, and the
+  helper asserts the routine was stored.
+- Slack's `member_left` handler deletes a deactivated member's routines
+  without unlinking them, so the recheck doesn't cover a `cloud add` that
+  passes its check before that deletion and commits after it. Such a
+  routine stays until the member removes it with `cloud rm` or `logout`
+  from an identity they still have (another surface, or the Slack account
+  reactivated), or the member row is deleted, which cascades; no retention
+  pass purges routines, only hand-offs. Its token stays sealed, and only a
+  `cloud run` from a linked identity of that member fires it. A
+  command-level test of the race would need a hook between the command's
+  link check and the store call, which there is none of, so the store test
+  `a_routine_is_refused_without_a_claude_link` covers it.

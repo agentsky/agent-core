@@ -174,6 +174,9 @@ pub enum CloudRoutinePut {
     /// Nothing was stored: the label is new and the member holds
     /// [`MAX_CLOUD_ROUTINES`] routines already.
     Full,
+    /// Nothing was stored: the member has no Claude link, as after a
+    /// `logout` that ran since the command checked for one.
+    Unlinked,
 }
 
 /// What [`Store::begin_cloud_handoff`] did.
@@ -583,9 +586,12 @@ impl Store {
     /// keeps its id and takes the new routine id, token, identity and time,
     /// which is how a member registers a new token. A routine id the member
     /// registered under another label is refused, and so is a new label once
-    /// the member holds [`MAX_CLOUD_ROUTINES`]. The checks and the write are
-    /// one `BEGIN IMMEDIATE` transaction, so concurrent calls never pass
-    /// them together.
+    /// the member holds [`MAX_CLOUD_ROUTINES`], and so is any routine while
+    /// the member has no Claude link. The checks and the write are one
+    /// `BEGIN IMMEDIATE` transaction, so concurrent calls never pass them
+    /// together, and a `logout`, which unlinks before it deletes the
+    /// member's routines, either finds the routine to delete or comes
+    /// first and nothing is stored.
     ///
     /// # Errors
     ///
@@ -605,6 +611,14 @@ impl Store {
             added_by,
         } = *routine;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let linked: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM claude_links WHERE member_id = ?")
+                .bind(member.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        if linked.is_none() {
+            return Ok(CloudRoutinePut::Unlinked);
+        }
         let taken: Option<String> = sqlx::query_scalar(
             "SELECT label FROM cloud_routines WHERE member_id = ? AND routine_id = ? \
              AND label <> ?",
