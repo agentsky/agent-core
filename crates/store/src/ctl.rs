@@ -205,36 +205,48 @@ fn ttl_seconds(ttl: Duration) -> i64 {
 impl Store {
     /// Stores the token of a new `claude` process, with no turn running.
     ///
-    /// A session runs one process at a time, so a token already stored for
-    /// the same session is deleted in the same transaction: the newest
-    /// process's token is the only one that works. The session's leases go
-    /// with the old token, whose process can no longer renew them. Returns
-    /// the digests of the tokens it replaced.
+    /// A session runs one process at a time, and a container address holds
+    /// one container at a time, so every token already stored for the same
+    /// session or the same `container_ip` is deleted in the same
+    /// transaction: the newest process's token is the only one that works
+    /// for its session and from its address. A token whose revocation failed
+    /// when its container stopped can't be presented from a new container
+    /// Docker gives the address to. The leases of the replaced tokens'
+    /// sessions go with them, since their processes can no longer renew
+    /// them. Returns the digests of the tokens it replaced.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, including when `hash` is
     /// already stored.
     pub async fn put_ctl_token(&self, token: &NewCtlToken) -> Result<Vec<TokenHash>> {
+        let session = token.session.to_string();
+        let container_ip = token.container_ip.to_canonical().to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM scope_locks WHERE holder_session = ?")
-            .bind(token.session.to_string())
-            .execute(&mut *tx)
-            .await?;
-        let replaced: Vec<Vec<u8>> =
-            sqlx::query_scalar("DELETE FROM ctl_tokens WHERE session_id = ? RETURNING hash")
-                .bind(token.session.to_string())
-                .fetch_all(&mut *tx)
-                .await?;
+        sqlx::query(
+            "DELETE FROM scope_locks WHERE holder_session = ? OR holder_session IN \
+             (SELECT session_id FROM ctl_tokens WHERE container_ip = ?)",
+        )
+        .bind(&session)
+        .bind(&container_ip)
+        .execute(&mut *tx)
+        .await?;
+        let replaced: Vec<Vec<u8>> = sqlx::query_scalar(
+            "DELETE FROM ctl_tokens WHERE session_id = ? OR container_ip = ? RETURNING hash",
+        )
+        .bind(&session)
+        .bind(&container_ip)
+        .fetch_all(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO ctl_tokens (hash, session_id, agent_id, volume_key, container_ip) \
              VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&token.hash.0[..])
-        .bind(token.session.to_string())
+        .bind(&session)
         .bind(token.agent.to_string())
         .bind(token.volume.to_string())
-        .bind(token.container_ip.to_canonical().to_string())
+        .bind(&container_ip)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -490,7 +502,7 @@ mod tests {
             session,
             agent,
             volume: volume(agent),
-            container_ip: "172.30.0.7".parse().unwrap(),
+            container_ip: IpAddr::from([172, 30, 0, byte]),
         }
     }
 
@@ -591,16 +603,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_token_from_an_address_replaces_the_one_bound_to_it() {
+        let store = memory_store().await;
+        let address: IpAddr = "172.30.0.7".parse().unwrap();
+        let key = volume(AgentId::new_v4());
+        let stale = NewCtlToken {
+            volume: key.clone(),
+            container_ip: address,
+            ..new_token(1, SessionId::new_v4())
+        };
+        let other = new_token(3, SessionId::new_v4());
+        store.put_ctl_token(&stale).await.unwrap();
+        store.put_ctl_token(&other).await.unwrap();
+        let holder = Holder::begin(&store, stale.hash).await;
+        holder.acquire(&store, 1_000).await.unwrap();
+        let probe = Holder::new(&store, 4, &key).await;
+        assert!(!free(&store, probe).await);
+
+        let fresh = NewCtlToken {
+            volume: key.clone(),
+            container_ip: address,
+            ..new_token(2, SessionId::new_v4())
+        };
+        assert_eq!(store.put_ctl_token(&fresh).await.unwrap(), vec![stale.hash]);
+        assert_eq!(store.ctl_token(&stale.hash).await.unwrap(), None);
+        assert_eq!(
+            store.ctl_token(&fresh.hash).await.unwrap().unwrap().session,
+            fresh.session
+        );
+        assert!(store.ctl_token(&other.hash).await.unwrap().is_some());
+        assert!(free(&store, probe).await, "the stale token's lease is gone");
+    }
+
+    #[tokio::test]
     async fn a_duplicate_hash_is_refused() {
         let store = memory_store().await;
         store
             .put_ctl_token(&new_token(1, SessionId::new_v4()))
             .await
             .unwrap();
-        let err = store
-            .put_ctl_token(&new_token(1, SessionId::new_v4()))
-            .await
-            .unwrap_err();
+        let elsewhere = NewCtlToken {
+            container_ip: IpAddr::from([172, 30, 0, 2]),
+            ..new_token(1, SessionId::new_v4())
+        };
+        let err = store.put_ctl_token(&elsewhere).await.unwrap_err();
         assert!(matches!(err, StoreError::Database(_)), "{err:?}");
     }
 
