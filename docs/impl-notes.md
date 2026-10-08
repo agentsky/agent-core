@@ -9491,11 +9491,17 @@ name an organization the copy's fields don't. Not reachable while T36a
 ignores outside requesters, but T36b would admit them.
 
 **Solution.** `SlackSurface::copy_sender_is_home` replaces
-`fill_sender_team` and answers a yes or no, never an `Outside`: `confirm`
-asks it only of a copy whose fields leave the sender home, and drops the
-message (`Ok(None)`, a debug line naming the binding and the workspace
-`users.info` named) for anything but `Membership::Home`, a refused lookup
-included; a transport error or a rate limit still fails the confirmation.
+`fill_sender_team` and answers a yes or no, never an `Outside`, and never
+yes for a copy whose fields set `outside`: `confirm` asks it only of a copy
+whose fields leave the sender home, and drops the message (`Ok(None)`) for
+anything but `Membership::Home`, a refused lookup included; a transport
+error or a rate limit still fails the confirmation. Each drop is warned of
+with its own reason (the sender isn't a member by Slack's lookup, naming
+the workspace `users.info` gave, or the lookup was refused, naming its
+error), at most once a minute per binding and reason
+(`TeamDirectory::note_drop`), and the pipeline's line for an unconfirmed
+message no longer says the platform doesn't have it, which read as a
+forgery.
 A copy's `outside` is now its own fields alone, which always name a team,
 so `core_types::Outside::team` is a plain `TeamId` (no producer lacked
 one: hops and Rocket.Chat set none, and the store refuses outside

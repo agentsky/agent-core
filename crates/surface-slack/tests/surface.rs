@@ -1575,6 +1575,14 @@ async fn a_sender_is_home_only_when_the_home_check_agrees() {
         6,
         "both answers are kept"
     );
+
+    let mut theirs = home_event_from(USER);
+    theirs.outside = outside_of(OUTSIDE_TEAM);
+    assert!(
+        !surface.copy_sender_is_home(&theirs).await.unwrap(),
+        "fields that say outside are never answered home"
+    );
+    assert_eq!(lookups(&server, "users.info").await.len(), 6);
 }
 
 #[tokio::test]
@@ -2167,8 +2175,47 @@ async fn an_event_naming_the_organization_only_the_lookup_gives_is_dropped() {
     )
     .await;
     mount_user(&server, USER, user_in(USER, Some(OUTSIDE_TEAM))).await;
+    let logs = testkit::Logs::global();
     assert_eq!(surface.confirm(&forged).await, Ok(None));
     assert_eq!(lookups(&server, "users.info").await.len(), 1);
+    let warned = logs
+        .snapshot()
+        .matching("isn't one of the workspace's members by Slack's lookup")
+        .matching(forged.binding.to_string().as_str())
+        .to_string();
+    assert!(warned.contains("WARN"), "{warned}");
+    assert!(warned.contains(OUTSIDE_TEAM), "{warned}");
+    assert!(!warned.contains(forged.text.as_str()), "{warned}");
+}
+
+#[tokio::test]
+async fn a_refused_home_lookup_drops_the_message_and_is_warned_of() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": event.text}]})),
+    )
+    .await;
+    mount_user(&server, USER, refused("missing_scope")).await;
+    let logs = testkit::Logs::global();
+    for _ in 0..2 {
+        assert_eq!(surface.confirm(&event).await, Ok(None));
+    }
+    assert_eq!(lookups(&server, "users.info").await.len(), 2, "not kept");
+    let warned = logs
+        .snapshot()
+        .matching("wouldn't say whether the sender is one of the workspace's members")
+        .matching(event.binding.to_string().as_str())
+        .to_string();
+    assert_eq!(
+        warned.lines().filter(|line| line.contains("WARN")).count(),
+        1,
+        "once a minute: {warned}"
+    );
+    assert!(warned.contains("missing_scope"), "{warned}");
 }
 
 #[tokio::test]

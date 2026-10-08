@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use std::collections::VecDeque;
 
-use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Throttle, UserId};
+use core_types::{
+    BindingId, ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Throttle, UserId,
+};
 use render::MentionDirectory;
 use tokio::time::Instant;
 
@@ -102,6 +104,7 @@ pub struct TeamDirectory {
     conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
     home_answers: Mutex<HomeAnswers>,
     lookup_notes: Throttle<&'static str>,
+    drop_notes: Throttle<(BindingId, &'static str)>,
     grid_noticed: AtomicBool,
 }
 
@@ -256,6 +259,7 @@ impl TeamDirectory {
             conv_infos: Mutex::new(HashMap::new()),
             home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
             lookup_notes: Throttle::new(LOOKUP_WARNING_INTERVAL),
+            drop_notes: Throttle::new(LOOKUP_WARNING_INTERVAL),
             grid_noticed: AtomicBool::new(false),
         }
     }
@@ -543,6 +547,16 @@ impl TeamDirectory {
         {
             tracing::warn!(team = %self.team, error = %err, failed_since_last_warning = quiet, "couldn't ask Slack whether a user is home; refusing whoever was asked about");
         }
+    }
+
+    /// Records that confirming a message `binding` received dropped it for
+    /// `reason`, and says whether to log it: how many such drops went
+    /// unlogged since the last one, at most once per
+    /// [`LOOKUP_WARNING_INTERVAL`] for each binding and reason, or `None`
+    /// to stay quiet.
+    pub fn note_drop(&self, binding: BindingId, reason: &'static str) -> Option<u64> {
+        self.drop_notes
+            .record((binding, reason), std::time::Instant::now())
     }
 
     /// Notes a `users.info` that said `user_not_visible`, at most once per
