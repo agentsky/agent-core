@@ -2882,19 +2882,21 @@ Not scheduled. Each needs a decision before it becomes a task.
   first, since refusing a path the CLI needs breaks turns. Methods are
   already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
   `DELETE` and `OPTIONS`.
-- **Killing leftover processes at turn end.** T18 unpoints the placeholder
-  when a turn ends, so a background process the model left running can't
-  spend credentials between turns. It can still spend turn N+1's
-  credential while turn N+1 runs, whoever its requester is. Two fixes
-  would remove that. Killing the processes a turn leaves behind when it
-  ends has no clean boundary: the sandbox kills a process by its pid
-  alone, which leaves its children running, and the model's background
-  jobs and the CLI's own children, such as stdio MCP servers, all descend
-  from the one CLI process. Recycling the container when the requester
-  changes is airtight, since only stopping the container ends its PID
-  namespace. It costs a container start only when consecutive turns in one
-  thread come from different members; a process left behind then spends
-  only the credential of the member whose turn left it.
+- **Processes a turn leaves running.** T18 unpoints the placeholder when a
+  turn ends, so a background process the model left running can't spend
+  credentials between turns. It can still spend turn N+1's credential
+  while turn N+1 runs, whoever its requester is. Killing what a turn leaves
+  behind has no clean boundary: the CLI stays running between turns, the
+  Bash tool's background shells are its children, a job started with `&`
+  is reparented to the container's init once its shell exits, and the
+  Docker sandbox kills a process by its pid alone. Stopping the container
+  ends its PID namespace and every process in it, so recycling the
+  container when the requester changes removes the cross-requester case.
+  It costs a container start and a CLI `--resume` whenever consecutive
+  turns of one session come from different requesters. A process left
+  behind then spends only the credentials of its own requester's later
+  turns, and can still use the egress allowlist between turns. Files a
+  turn leaves in the session's `work/` or `home/` outlive the container.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
