@@ -9473,6 +9473,9 @@ copy doesn't agree on whether the sender is from outside or of which
 organization, or that the sender couldn't be looked up: a home member whose
 `users.info` lookup was refused (`Api`, `Unauthorized`, `Forbidden`) gets a
 copy with `Outside { team: None }`, and is dropped under the same warning.
+(Superseded by "The home lookup never sets `outside`" below: the lookup no
+longer sets `outside` at all, a refused lookup drops the copy in
+`confirm`, and `Outside::team` is a plain `TeamId`.)
 Only a person's copy is compared (07 Oct review): a bot's own `outside`
 decides nothing, since a hop's requester takes it from the attribution, and
 comparing it dropped an agent's hop copy under that warning. At T36a the
@@ -9495,13 +9498,14 @@ ignores outside requesters, but T36b would admit them.
 yes for a copy whose fields set `outside`: `confirm` asks it only of a copy
 whose fields leave the sender home, and drops the message (`Ok(None)`) for
 anything but `Membership::Home`, a refused lookup included; a transport
-error or a rate limit still fails the confirmation. Each drop is warned of
-with its own reason (the sender isn't a member by Slack's lookup, naming
-the workspace `users.info` gave, or the lookup was refused, naming its
-error), at most once a minute per binding and reason
-(`TeamDirectory::note_drop`), and the pipeline's line for an unconfirmed
-message no longer says the platform doesn't have it, which read as a
-forgery.
+error or a rate limit still fails the confirmation. A sender who isn't a
+member by Slack's lookup is warned of with that reason, the binding and
+the workspace `users.info` gave, at most once a minute per binding and
+reason (`TeamDirectory::note_drop`, keyed by a `DropReason`); a refused
+lookup is warned of once, by the directory, as any failed home check is,
+and the surface's own line for it is debug. The pipeline's line for an
+unconfirmed message, which names the binding, no longer says the platform
+doesn't have it, which read as a forgery.
 A copy's `outside` is now its own fields alone, which always name a team,
 so `core_types::Outside::team` is a plain `TeamId` (no producer lacked
 one: hops and Rocket.Chat set none, and the store refuses outside
@@ -9523,10 +9527,11 @@ writes `outside: None` for every thread message it shows a session.
 `create_consent` and `set_ctl_turn` refuse a requester with `outside` set
 with `StoreError::Refused`, through one helper, `store::home_requester`.
 The T36b plan says so, and that admitting a listed organization rests on
-T36e: confirmation keeps the copy's own `outside`, from its fields or
-else the organization `users.info` names, and drops a message whose event
-and copy disagree on it, so an admitted outside message runs only when
-Slack's data and the event name the same organization.
+T36e: confirmation keeps the copy's own `outside`, from its own team
+fields alone (a copy they leave home is dropped unless `users.info` says
+home), and drops a message whose event and copy disagree on it, so an
+admitted outside message runs only when Slack's copy and the event name
+the same organization.
 
 Review round 2 found that the earlier wording here and in the plan, "no
 row reads back as home", was wrong: `record` writes a home requester for

@@ -2189,7 +2189,7 @@ async fn an_event_naming_the_organization_only_the_lookup_gives_is_dropped() {
 }
 
 #[tokio::test]
-async fn a_refused_home_lookup_drops_the_message_and_is_warned_of() {
+async fn a_refused_home_lookup_drops_the_message_and_only_the_directory_warns() {
     let event = event_from(testkit::slack::MESSAGE_MENTION);
     let ts = event.message.id.as_str();
     let (server, surface) = confirming_setup(public_channel()).await;
@@ -2205,17 +2205,18 @@ async fn a_refused_home_lookup_drops_the_message_and_is_warned_of() {
         assert_eq!(surface.confirm(&event).await, Ok(None));
     }
     assert_eq!(lookups(&server, "users.info").await.len(), 2, "not kept");
-    let warned = logs
+    let noted = logs
         .snapshot()
         .matching("wouldn't say whether the sender is one of the workspace's members")
         .matching(event.binding.to_string().as_str())
         .to_string();
+    let count = |level: &str| noted.lines().filter(|line| line.contains(level)).count();
     assert_eq!(
-        warned.lines().filter(|line| line.contains("WARN")).count(),
-        1,
-        "once a minute: {warned}"
+        (count("DEBUG"), count("WARN")),
+        (2, 0),
+        "the directory warns of the failed lookup: {noted}"
     );
-    assert!(warned.contains("missing_scope"), "{warned}");
+    assert!(noted.contains("missing_scope"), "{noted}");
 }
 
 #[tokio::test]

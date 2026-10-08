@@ -1130,7 +1130,7 @@ impl Pipeline {
             }
             Ok(_) => {
                 if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
-                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform didn't confirm this message as it arrived; dropped it");
+                    tracing::warn!(%agent, binding = %event.binding, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform didn't confirm this message as it arrived; dropped it");
                 }
                 None
             }

@@ -3751,10 +3751,15 @@ Deliverables:
   - Before it admits anyone, T36b defines one canonical id for an
     organization from what T36e item 9 records: the `E…` enterprise id
     when Slack names one, else the `T…` team id. The event's and the
-    copy's fields, `users.info`'s answer and the `teams` entries are all
-    read in that form, so an organization listed under one id can't
-    arrive under the other. T36a's `directory::organization` takes
-    `team_id` first, so T36b changes it to match.
+    copy's fields and the `teams` entries are all read in that form, so
+    an organization listed under one id can't arrive under the other.
+    T36a's `core_types::Outside::team` is a plain `TeamId`, from the
+    message's own team fields alone; `directory::organization` reads
+    `users.info`'s `team_id` alone, for logs. An `outside` derived from
+    `users.info` must not come back: a copy that took the lookup's
+    organization let a forged event naming it stand, which T36a closed
+    by dropping a copy whose fields leave its sender home unless the
+    lookup says home.
   - `hand_off`, `false` by default.
 - `router`:
   - `RouterView::outside_access(&Outside) -> Option<OutsideAccess { heard,
@@ -3781,7 +3786,7 @@ Deliverables:
   stored as `PolicyTarget::Outside`, with help text, and shown by the
   agent's rule listing.
 - `store`: a migration `…_slack_connect.sql` adds `requester_outside` (the
-  `Outside` as text: the team id, `?` for an unknown one, `NULL` for home)
+  `Outside` as text: the organization's id, `NULL` for home)
   to `message_refs` and `ctl_tokens`. The pipeline writes it with the
   requester and reads it back into attributions and `CtlTurn`, so a hop
   and an agentctl call know their requester's organization. Until then,

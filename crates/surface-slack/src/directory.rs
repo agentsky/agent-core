@@ -80,6 +80,20 @@ const NOT_HOME_CODES: &[&str] = &["user_not_found", "user_not_visible"];
 /// as a warning at most.
 pub const LOOKUP_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often confirmation's drop of a message for one binding and
+/// [`DropReason`] is logged as a warning at most.
+pub(crate) const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Why confirmation dropped a message after the home check, the key its
+/// warnings are throttled by with the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DropReason {
+    /// `users.info` doesn't have the sender as home.
+    NotHome,
+    /// The sender is keyed by another surface or workspace.
+    Elsewhere,
+}
+
 /// What `conversations.info` says about a conversation, as
 /// [`TeamDirectory::conv_info`] keeps it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +118,7 @@ pub struct TeamDirectory {
     conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
     home_answers: Mutex<HomeAnswers>,
     lookup_notes: Throttle<&'static str>,
-    drop_notes: Throttle<(BindingId, &'static str)>,
+    drop_notes: Throttle<(BindingId, DropReason)>,
     grid_noticed: AtomicBool,
 }
 
@@ -259,7 +273,7 @@ impl TeamDirectory {
             conv_infos: Mutex::new(HashMap::new()),
             home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
             lookup_notes: Throttle::new(LOOKUP_WARNING_INTERVAL),
-            drop_notes: Throttle::new(LOOKUP_WARNING_INTERVAL),
+            drop_notes: Throttle::new(DROP_WARNING_INTERVAL),
             grid_noticed: AtomicBool::new(false),
         }
     }
@@ -552,9 +566,9 @@ impl TeamDirectory {
     /// Records that confirming a message `binding` received dropped it for
     /// `reason`, and says whether to log it: how many such drops went
     /// unlogged since the last one, at most once per
-    /// [`LOOKUP_WARNING_INTERVAL`] for each binding and reason, or `None`
-    /// to stay quiet.
-    pub fn note_drop(&self, binding: BindingId, reason: &'static str) -> Option<u64> {
+    /// [`DROP_WARNING_INTERVAL`] for each binding and reason, or `None` to
+    /// stay quiet.
+    pub(crate) fn note_drop(&self, binding: BindingId, reason: DropReason) -> Option<u64> {
         self.drop_notes
             .record((binding, reason), std::time::Instant::now())
     }
@@ -1169,6 +1183,27 @@ mod tests {
         );
         assert!(!directory.listed_home(&"U2".into(), read));
         assert!(!TeamDirectory::new("T1".into()).listed_home(&ada, read));
+    }
+
+    #[test]
+    fn drops_are_warned_of_once_per_binding_and_reason() {
+        let directory = TeamDirectory::new("T1".into());
+        let pairs = [BindingId::new_v4(), BindingId::new_v4()]
+            .into_iter()
+            .flat_map(|binding| {
+                [DropReason::NotHome, DropReason::Elsewhere].map(|reason| (binding, reason))
+            });
+        let pairs: Vec<_> = pairs.collect();
+        for (binding, reason) in &pairs {
+            assert_eq!(
+                directory.note_drop(*binding, *reason),
+                Some(0),
+                "{binding} {reason:?}"
+            );
+        }
+        for (binding, reason) in &pairs {
+            assert_eq!(directory.note_drop(*binding, *reason), None);
+        }
     }
 
     #[test]

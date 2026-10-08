@@ -13,7 +13,7 @@ use render::MentionDirectory;
 use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
-use crate::directory::{MemberDirectory, Membership, TeamDirectory};
+use crate::directory::{DropReason, MemberDirectory, Membership, TeamDirectory};
 use crate::normalize::{self, Context, KEPT_SUBTYPES};
 use crate::web::{Message, PageRequest, Result, WebApi};
 
@@ -250,10 +250,12 @@ impl SlackSurface {
     /// nothing about the user ([`SurfaceError::Api`],
     /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), and a
     /// sender keyed by another surface or workspace, which this surface
-    /// can't vouch for. Each is warned of with its reason, the binding, and
-    /// the workspace `users.info` named or the lookup's error, at most once
-    /// a minute for each binding and reason
-    /// ([`TeamDirectory::note_drop`]); never the message.
+    /// can't vouch for. A sender `users.info` doesn't have as home, or keyed
+    /// elsewhere, is warned of with that reason, the binding and the
+    /// workspace `users.info` named, at most once a minute for each binding
+    /// and reason; a failed lookup is a debug line here, since the
+    /// directory warns of it ([Who is home](crate::directory#who-is-home)).
+    /// Never the message.
     ///
     /// The lookup's answer never becomes an
     /// [`Outside`](core_types::Outside): the pipeline lets a copy stand when
@@ -282,7 +284,7 @@ impl SlackSurface {
         }
         let binding = copy.binding;
         if copy.sender.surface != SurfaceKind::Slack || copy.sender.team != *self.directory.team() {
-            if let Some(quiet) = self.directory.note_drop(binding, "elsewhere") {
+            if let Some(quiet) = self.directory.note_drop(binding, DropReason::Elsewhere) {
                 tracing::warn!(%binding, dropped_since_last_warning = quiet, "Slack's copy of a message names a sender of another surface or workspace; dropped it");
             }
             return Ok(false);
@@ -294,16 +296,14 @@ impl SlackSurface {
         {
             Ok(Membership::Home) => Ok(true),
             Ok(Membership::Outside(team)) => {
-                if let Some(quiet) = self.directory.note_drop(binding, "not_home") {
+                if let Some(quiet) = self.directory.note_drop(binding, DropReason::NotHome) {
                     tracing::warn!(%binding, organization = team.as_ref().map_or("none", TeamId::as_str), dropped_since_last_warning = quiet, "the sender isn't one of the workspace's members by Slack's lookup; dropped it");
                 }
                 Ok(false)
             }
             Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => Err(err),
             Err(err) => {
-                if let Some(quiet) = self.directory.note_drop(binding, "refused") {
-                    tracing::warn!(%binding, error = %err, dropped_since_last_warning = quiet, "Slack's lookup wouldn't say whether the sender is one of the workspace's members; dropped it");
-                }
+                tracing::debug!(%binding, error = %err, "Slack's lookup wouldn't say whether the sender is one of the workspace's members; dropped it");
                 Ok(false)
             }
         }
