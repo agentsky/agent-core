@@ -3453,14 +3453,16 @@ Deliverables:
   - `Interaction` gains `sender_team`, the payload's `user.team_id` when it
     has one.
 - `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`, and
-  `User` keeps `team_id`, both leniently.
+  `User` keeps `team_id` and reads `enterprise_user.enterprise_id`, all
+  leniently.
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.
   - The sender's team fields are `user_team`, `source_team`,
     `user_profile.team` and `team`. One not shaped like a team id is
-    `Skip::Malformed`. `Context` gains `home_org`, the `enterprise_id`
-    `auth.test` gave at startup (T30's `App::open`), if any.
+    `Skip::Malformed`. `Context` gains `home_org`, the home organization
+    `ManagerIdentity` keeps (below), if any. `SlackSurface::confirm` takes
+    it from the directory, as it takes `team` today.
   - When a field names neither the workspace nor `home_org`, `outside` is
     `Some(Outside { team })` with the first such field, in that order.
     Otherwise it is `None`, which only the event's own first routing uses:
@@ -3478,20 +3480,27 @@ Deliverables:
   - `WebApi::conversation_info` reads the new fields leniently: a missing
     one is `false` or absent.
 - The home check:
-  - `TeamDirectory` keeps the ids of the `users.list` entries whose
-    `team_id` is the workspace, beside the names.
+  - `ManagerIdentity::look_up` (`crates/agentd/src/slack/manager.rs`, T30)
+    keeps the `enterprise_id` the manager's `auth.test` gives, if any,
+    beside its `team_id`: the home organization and the home workspace.
+    `SlackManager::with_identity` gives both to `TeamDirectory::new`, which
+    takes the workspace alone today. The directory keeps the ids of the
+    `users.list` entries whose `team_id` is the workspace, beside the names.
     `TeamDirectory::membership` answers from them, then from `users.info`
     (Tier 4) with the manager app's token, as T31 reads the member list. It
     returns `Membership::Home` only when the answer's `team_id` is the
-    workspace, `Membership::Outside(team)` for another `team_id`,
-    `user_not_found` or `user_not_visible`, where `team` is
-    `directory::organization`'s reading of the answer (its `team_id`, else
-    `enterprise_user.enterprise_id`, when that isn't home, and `None` for an
-    answer naming no user), and otherwise the lookup's error as it came,
-    whatever its variant, uncached. Both answers are cached for an hour,
-    with the organization, at most 4,096 of them, the oldest dropped first;
-    an answer dropped from the cache is looked up again, never taken as
-    home. A caller can ask it not to wait for a used-up quota
+    workspace. It returns `Membership::Outside(team)` for an answer with
+    another `team_id`, where `team` is `directory::organization`'s reading
+    of it: that `team_id`, or the answer's `enterprise_user.enterprise_id`
+    when that is the home organization, so a member of another of its
+    workspaces is named by the organization. It returns
+    `Membership::Outside(None)` for an answer that names the user but no
+    `team_id`, and for `user_not_found` or `user_not_visible`, since Slack
+    named no organization. Those are verdicts, cached for an hour with the
+    organization, at most 4,096 of them, the oldest dropped first; an
+    answer dropped from the cache is looked up again, never taken as home.
+    Any other failure is the lookup's error as it came, whatever its
+    variant, uncached. A caller can ask it not to wait for a used-up quota
     (`WebApi::without_waiting`). `TeamDirectory::home_user` is `membership`
     answering `Home`, for callers that need only that.
   - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
@@ -3499,13 +3508,16 @@ Deliverables:
     `sender_bot_user` set, whose `outside` decides nothing. When the fields
     left `outside` `None` and the lookup doesn't say home, it sets
     `Some(Outside { team })` and returns `Ok`, where `team` is the
-    organization `membership` gave, as Confirmation below takes it, and
-    `None` when Slack named none or the lookup failed with any error but
-    `Transport` or `RateLimited`. Those two it returns as they came,
-    leaving `outside` alone. Its one caller is
+    organization `membership` gave, and `None` when the lookup failed with
+    any error but `Transport` or `RateLimited`. Those two it returns as
+    they came, leaving `outside` alone. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
     real user; those two errors fail the confirmation as T31's lookups do,
-    and the thread gets the "try again" line.
+    and the thread gets the "try again" line. A copy it makes outside
+    always disagrees with the event, whose fields also left `outside`
+    `None`: the fields name home and the lookup doesn't, so confirmation
+    drops the message even if the organization the lookup names is listed
+    (T36b). That organization only names the log line and the drop reason.
 
     The event of an agent's app is never looked up: its first routing takes
     a sender the fields left `None` as home, and nothing acts on that
@@ -3520,11 +3532,13 @@ Deliverables:
     either.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): the copy's `outside`
   and organization come from Slack's data only, the copy's own team fields,
-  else the home lookup's `team_id` or `enterprise_user.enterprise_id`;
-  nothing of the event's is carried into the copy. `copy_stands`, which
-  lets a copy stand when only a limit's refusal differs, compares the
-  requester's `MemberKey` and `outside`, organization included, so an
-  event and a copy that disagree on it are dropped, in either direction.
+  else the home lookup's answer when that isn't home, with the organization
+  `membership` reads from it; nothing of the event's is carried into the
+  copy. A copy only the lookup makes outside is always dropped, as
+  `fill_sender_team` says. `copy_stands`, which lets a copy stand when only
+  a limit's refusal differs, compares the requester's `MemberKey` and
+  `outside`, organization included, so an event and a copy that disagree
+  on it are dropped, in either direction.
   It keeps ignoring the requester's `member`, which may be made for the
   identity between the two routings, as its rustdoc says (T27).
 - agentd (`crates/agentd/src/slack/mod.rs`):
@@ -3560,7 +3574,8 @@ Deliverables:
     `SurfaceError::Forbidden`.
   - A `home_user` error is passed on unchanged and isn't cached, whatever
     its variant (`Transport`, `RateLimited`, `Api`, `Unauthorized` for a
-    `missing_scope`, …).
+    `missing_scope`, …). `user_not_found` and `user_not_visible` aren't
+    errors but the cached verdict that the user isn't home.
   - Each caller handles either as it handles a failed `conversations.open`
     today: the sweepers' notices (consent cards, relink notices, token
     notices, install reminders) try again on their schedules, and the
@@ -3580,10 +3595,10 @@ Deliverables:
 - `testkit::slack`: fixtures for an outside member's message whose `team`
   is the installing team (shaped after bolt-python's
   `slack_connect_events_api_no_actor_team_requests`), one whose `team` is
-  theirs, a home member's message in a shared channel, a home-organization
-  `E…` field, an event without `authorizations`, and interactions with and
-  without `user.team_id`, all with made-up ids. T36e replaces them with
-  redacted captures.
+  theirs, a home member's message in a shared channel the home workspace
+  hosts, a home-organization `E…` field, an event without
+  `authorizations`, and interactions with and without `user.team_id`, all
+  with made-up ids. T36e replaces them with redacted captures.
 
 Acceptance:
 
@@ -3596,7 +3611,8 @@ Acceptance:
 - `the_first_foreign_field_names_the_organization`.
 - `a_sender_is_home_only_when_the_home_check_agrees`.
 - `a_home_member_in_a_shared_channel_is_home`.
-- `a_home_lookup_naming_another_organization_gives_it`.
+- `a_home_lookup_naming_another_organization_drops_the_message_and_names_it`.
+- `a_home_lookup_naming_no_team_is_outside_with_no_organization`.
 - `a_home_organization_field_with_a_home_lookup_is_home`.
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
@@ -3609,7 +3625,10 @@ Acceptance:
 - `a_teamless_manager_dm_from_outside_never_runs_a_command`.
 - `an_interaction_without_user_team_is_dropped`.
 - `no_dm_is_opened_with_an_outside_user`.
-- `a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached`.
+- `a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached`: a
+  transport error, a rate limit or another Slack error such as
+  `missing_scope`, while `user_not_found` and `user_not_visible` are
+  verdicts, `Outside(None)`, cached like any answer.
 - `a_bots_outside_never_makes_a_hop_ignored`.
 - `a_made_up_sender_costs_no_home_lookup`.
 - `a_bots_post_is_never_looked_up`.
@@ -3647,15 +3666,18 @@ Deliverables:
   what T36e recorded about `team` for a home member's message in a channel
   another organization hosts. The home lookup still decides who is home, so
   a home `user_team` alone admits no one. T36a's
-  `the_first_foreign_field_names_the_organization` and
-  `a_home_member_in_a_shared_channel_is_home` change to match.
+  `the_first_foreign_field_names_the_organization` becomes
+  `the_first_field_given_names_the_organization`.
 - `[slack_connect]` in the configuration, documented in
   `config/agentd.example.toml` and `README.md`:
   - `teams`: at most 100 ids shaped like Slack team ids (`T…` or `E…`),
     default empty. `App::open` refuses to start when one is the home
-    workspace, which it learns from `auth.test` (T30). It is operator
-    configuration, unlike the community admins' `/agent admin` choices,
-    and the README says so.
+    workspace, which it learns from `auth.test` (T30). An outside sender
+    is heard when the id their `Outside` names is listed, a workspace's
+    `T…` or an organization's `E…` alike. A sender only the home lookup
+    makes outside is dropped at confirmation whatever is listed (T36a). It
+    is operator configuration, unlike the community admins' `/agent admin`
+    choices, and the README says so.
   - `hand_off`, `false` by default.
 - `router`:
   - `RouterView::outside_access(&Outside) -> Option<OutsideAccess { heard,
@@ -3717,6 +3739,9 @@ Acceptance:
 - `allow_outside_admits_and_any_deny_wins`.
 - `a_member_rule_admits_one_outside_member`.
 - `a_home_sender_in_a_channel_another_organization_hosts_is_home`.
+- `the_first_field_given_names_the_organization`.
+- `a_workspace_or_an_organization_id_can_be_listed`.
+- `a_listed_organization_only_the_home_lookup_names_is_still_dropped`.
 - `a_ban_on_an_outside_member_applies`.
 - `outside_refusals_are_one_line_per_thread_per_day_and_name_no_reason`.
 - `allow_outside_on_an_open_agent_keeps_home_members_allowed`.
@@ -3890,8 +3915,9 @@ Deliverables:
      `user_team` as the sender's when the two differ.
   2. The same message read back with `conversations.history` and
      `conversations.replies` on a scratch app's token: the same fields,
-     and whether the first field that names another organization is the
-     same in the event and the copy.
+     and whether the field T36b takes the sender's team from, the first
+     given of `user_team`, `source_team`, `user_profile.team` and `team`,
+     is the same field in both and names the same team.
   3. `conversations.info` with a scratch app's token on the shared channel,
      and on a Slack Connect DM between an outside member and a scratch
      app's bot, if one can be opened.
