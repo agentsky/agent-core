@@ -3125,9 +3125,11 @@ Deliverables:
     `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
     for an answer whose record was held up past the pass. Recording any
     outcome from `sending` sets `notified_at`, since the command's reply
-    tells the member; recording `fired` or `rejected` from `unknown` sets it
-    too unless a notice claim's lease is live. Nothing retries a record
-    that failed.
+    tells the member, and so does recording `fired` or `rejected` from
+    `unknown`, so a `fired` or `rejected` row always has `notified_at` and a
+    notice whose claim failed isn't left owed by a row the due-notice index
+    no longer covers. A claim sending at that moment may still deliver its
+    notice besides the reply. Nothing retries a record that failed.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3275,7 +3277,11 @@ Deliverables:
 - `crates/agentd/src/app.rs` builds a `FireClient` when `[cloud]` is
   present and hands it to the command handlers.
 - Handlers in `crates/agentd/src/commands/cloud.rs`, through the one
-  command intake (T30), so commands run once and in order per member:
+  command intake (T30), so commands run once and in order per surface
+  identity (`MemberKey`). A deletion the intake doesn't order, such as
+  `logout` on another instance during a blue-green swap or a member Slack
+  reports gone, is caught by `put_cloud_routine`, which refuses inside its
+  transaction a member with no linked Claude account:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at

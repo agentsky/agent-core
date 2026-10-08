@@ -1086,7 +1086,9 @@ The member hears each outcome once:
 - An answer that arrives for a row already marked `unknown`, when recording
   it was held up, is still recorded: `unknown` becomes `fired` with the
   session's id and link, or `rejected` with its status, and a notice not
-  yet claimed is marked done. Nothing retries a record that failed: such a
+  yet sent is marked done, since the reply tells the member; one a claim is
+  sending at that moment may still arrive besides the reply. Nothing
+  retries a record that failed: such a
   row stays `unknown`, and the reply already said what happened.
 - The one exception: if the store fails to record a 200, the reply still
   carries the link, but the row stays `sending`, so the pass later marks it
