@@ -3427,6 +3427,14 @@ so does any later call to that method while it stays blocked, instead of
 sleeping silently. `Retry-After` is read as whole seconds and capped at a
 day so it can't overflow a deadline.
 
+The token-wide hold has costs. The client-side `chat.postMessage` quota
+allows a burst of 60 in a minute, well above Slack's limit of about one a
+second per channel, so a short burst to one busy channel can draw a
+per-channel 429, which now holds posts to every channel for the
+`Retry-After`. And when a hold ends, every caller waiting on it wakes at
+once and can draw another 429. Both are accepted: Slack asks callers to
+back off per method per token, and its `Retry-After` is usually short.
+
 ### Error codes Slack answers with HTTP 200
 
 **Issue.** Slack reports failures as `{"ok": false, "error": "<code>"}` with

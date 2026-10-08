@@ -304,6 +304,31 @@ mod tests {
     }
 
     #[test]
+    fn a_block_survives_the_idle_sweep_when_the_map_is_full() {
+        let limiter = Limiter::default();
+        let start = Instant::now();
+        for i in 0..MAX_BUCKETS - 1 {
+            let channel = i.to_string();
+            let key = bucket("chat.postMessage", Some(&channel));
+            assert_eq!(limiter.try_acquire(&key, Tier::PostMessage, start), None);
+        }
+        let until = start + 2 * WINDOW;
+        limiter.block(&bucket("chat.postMessage", Some("0")), until);
+        let later = start + WINDOW;
+        let fresh = bucket("users.list", None);
+        assert_eq!(limiter.try_acquire(&fresh, Tier::Tier2, later), None);
+        assert_eq!(limiter.lock().len(), 2);
+        assert_eq!(
+            limiter.try_acquire(
+                &bucket("chat.postMessage", Some("new")),
+                Tier::PostMessage,
+                later
+            ),
+            Some(Wait::Blocked(until))
+        );
+    }
+
+    #[test]
     fn idle_buckets_are_dropped_when_the_map_is_full() {
         let limiter = Limiter::default();
         let start = Instant::now();
