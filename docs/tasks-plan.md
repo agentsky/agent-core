@@ -2915,12 +2915,23 @@ Not scheduled. Each needs a decision before it becomes a task.
   first, since refusing a path the CLI needs breaks turns. Methods are
   already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
   `DELETE` and `OPTIONS`.
-- **Killing leftover processes at turn end.** T18 unpoints the placeholder
-  when a turn ends, so a background process the model left running can't
-  spend credentials between turns. It can still spend turn N+1's
-  credential while turn N+1 runs, whoever its requester is. Only killing
-  the processes a turn leaves behind in the container when it ends removes
-  that.
+- **Processes a turn leaves running.** T18 unpoints the placeholder when a
+  turn ends, so a background process the model left running can't spend
+  credentials between turns. It can still spend turn N+1's credential
+  while turn N+1 runs, whoever its requester is. Killing what a turn leaves
+  behind has no clean boundary: the CLI stays running between turns, the
+  Bash tool's background shells are its children, a job started with `&`
+  is reparented to the container's init once its shell exits, and the
+  Docker sandbox kills a process by its pid alone. Stopping the container
+  ends its PID namespace and every process in it, so recycling the
+  container when the requester changes removes the cross-requester case.
+  It costs a container start and a CLI `--resume` whenever consecutive
+  turns of one session come from different requesters. A process left
+  behind then spends only the credentials of its own requester's later
+  turns, and can still use the egress allowlist between turns. Files a
+  turn leaves in the session's `work/` or `home/` outlive the container, so
+  a later turn of another requester can still run something it left, such
+  as a git hook.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
