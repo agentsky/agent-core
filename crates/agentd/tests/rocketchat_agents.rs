@@ -1043,3 +1043,37 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
     );
     running.stop().await;
 }
+
+#[tokio::test]
+async fn a_rule_on_a_channel_archived_since_can_still_be_lifted() {
+    let chat = Chat::start().await;
+    let running = Running::start(&chat, "sqlite::memory:").await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+    chat.fake.add_room("OLD", "c", "old");
+    assert_eq!(
+        chat.command("alice", "deny helper #old").await,
+        "Everyone may use `helper`, except `#old`."
+    );
+    Mock::given(path("/api/v1/rooms.info"))
+        .and(query_param("roomName", "old"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "success": false,
+            "error": "The channel, old, is archived [error-room-archived]",
+            "errorType": "error-room-archived",
+        })))
+        .with_priority(1)
+        .mount(chat.fake.server())
+        .await;
+    assert_eq!(
+        chat.command("alice", "allow helper #old").await,
+        "Everyone may use `helper`.",
+        "the rule is found by the name the owner wrote"
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper #old").await,
+        "I don't know `#old`. Name a public channel agentd can see.",
+        "an archived channel is not a lookup failure"
+    );
+    running.stop().await;
+}

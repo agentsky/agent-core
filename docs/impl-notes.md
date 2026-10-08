@@ -6309,7 +6309,12 @@ exists, and can't be named in a new rule on Rocket.Chat yet. A room the
 lookup doesn't find is still matched against the agent's own room rules by
 the name the owner wrote (`#secret`), so a channel denied or allowed while
 public and made private since can be allowed or denied again; that tells
-the owner only what their own rules hold. Checking the asker's membership
+the owner only what their own rules hold. An archived channel is unknown
+too: `rooms.info` refuses it with 400 `error-room-archived` (its
+`findRoomByIdOrName` checks `archived`), which `map_error` takes as
+`Forbidden`, as Slack's `is_archived` is. Any other failure of the lookup,
+such as a 5xx, answers that something went wrong rather than that the
+channel is unknown. Checking the asker's membership
 of the group would take a lookup of another user's rooms the manager
 doesn't make yet. Rules that don't read refuse everyone, the owner too, as
 `PolicyUnavailable`, since the same row holds the hop cap, and `allow

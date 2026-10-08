@@ -218,15 +218,15 @@ impl RocketChatAgents {
     /// `general` for `#general`, or by id. `None` if the manager finds no
     /// such room, or finds one that isn't a public channel: the manager may
     /// read private groups the asker isn't in, so a group is `None` whether
-    /// or not it exists.
+    /// or not it exists. An archived channel is `None` too.
     ///
     /// # Errors
     ///
     /// Any other [`SurfaceError`] from `rooms.info`, such as
     /// [`SurfaceError::Api`] for a server or proxy failure: only
     /// [`SurfaceError::NotFound`] (an unknown room) and
-    /// [`SurfaceError::Forbidden`] (a private group the manager isn't in)
-    /// mean `None`.
+    /// [`SurfaceError::Forbidden`] (a private group the manager isn't in,
+    /// or an archived room) mean `None`.
     pub async fn public_channel(
         &self,
         room: &RoomRef,
