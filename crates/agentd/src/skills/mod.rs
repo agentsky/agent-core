@@ -223,6 +223,21 @@ fn refused(err: CheckError) -> Result<Result<Added, Refused>, SkillError> {
     }
 }
 
+/// Whether the pending row `waiting` waited longer than [`PENDING_TTL`].
+fn is_expired(waiting: &AgentSkill) -> bool {
+    waiting.added_at < OffsetDateTime::now_utc() - PENDING_TTL
+}
+
+/// What [`Skills::confirm`] answers for the pending row `waiting` once it
+/// is gone: that it expired, if it had, or that nothing waits.
+fn gone(waiting: &AgentSkill) -> Confirmed {
+    if is_expired(waiting) {
+        Confirmed::Expired
+    } else {
+        Confirmed::NotPending
+    }
+}
+
 /// What [`Skills::confirm`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirmed {
@@ -408,42 +423,63 @@ impl Skills {
     /// active, and only for files declaring its hosts: if the files declare
     /// others, they are left waiting, and if the row went or was replaced
     /// meanwhile, the files are put back; either way nothing is confirmed.
+    /// A row it finds expired or without files is dropped, unless the skill
+    /// was added again first: the row waiting now is then read and
+    /// confirmed instead, once.
     ///
     /// # Errors
     ///
     /// If the store or the disk fails.
     pub async fn confirm(&self, agent: AgentId, name: &str) -> Result<Confirmed, SkillError> {
-        let waiting = self
-            .inner
-            .store
-            .agent_skills(agent)
-            .await?
-            .into_iter()
-            .find(|skill| skill.name == name && skill.state == SkillState::Pending);
-        match waiting {
+        match self.waiting(agent, name).await? {
             Some(waiting) => self.confirm_row(&waiting).await,
             None => Ok(Confirmed::NotPending),
         }
     }
 
+    /// `agent`'s pending row for the skill `name`, if one waits.
+    async fn waiting(&self, agent: AgentId, name: &str) -> Result<Option<AgentSkill>, SkillError> {
+        Ok(self
+            .inner
+            .store
+            .agent_skills(agent)
+            .await?
+            .into_iter()
+            .find(|skill| skill.name == name && skill.state == SkillState::Pending))
+    }
+
     /// Confirms the pending row `waiting` as [`confirm`](Self::confirm)
-    /// read it. The files are first moved into a work directory, where
-    /// nothing else replaces them, so their inode and hosts are those of
-    /// the files that move into place.
+    /// read it, or the row waiting now, once, if that one was replaced
+    /// before it could be dropped.
     async fn confirm_row(&self, waiting: &AgentSkill) -> Result<Confirmed, SkillError> {
+        if let Some(confirmed) = self.try_confirm_row(waiting).await? {
+            return Ok(confirmed);
+        }
+        let current = self.waiting(waiting.agent, &waiting.name).await?;
+        Ok(match current {
+            Some(current) if current != *waiting => self
+                .try_confirm_row(&current)
+                .await?
+                .unwrap_or_else(|| gone(&current)),
+            _ => gone(waiting),
+        })
+    }
+
+    /// Confirms the pending row `waiting`, or drops it when it expired or
+    /// its files are gone. `None` when it couldn't be dropped because it is
+    /// no longer as `waiting` read it. The files are first moved into a
+    /// work directory, where nothing else replaces them, so their inode and
+    /// hosts are those of the files that move into place.
+    async fn try_confirm_row(&self, waiting: &AgentSkill) -> Result<Option<Confirmed>, SkillError> {
         let store = &self.inner.store;
         let (agent, name) = (waiting.agent, waiting.name.as_str());
         let pending = self.pending_dir(agent, name);
-        let expired = waiting.added_at < OffsetDateTime::now_utc() - PENDING_TTL;
-        if expired || !is_dir(&pending).await? {
-            if store.delete_pending_skill(waiting).await? {
-                remove_dir(&pending).await?;
+        if is_expired(waiting) || !is_dir(&pending).await? {
+            if !store.delete_pending_skill(waiting).await? {
+                return Ok(None);
             }
-            return Ok(if expired {
-                Confirmed::Expired
-            } else {
-                Confirmed::NotPending
-            });
+            remove_dir(&pending).await?;
+            return Ok(Some(gone(waiting)));
         }
         let work = self.work_dir().await?;
         let new = work.0.join("new");
@@ -454,7 +490,7 @@ impl Skills {
         if declared_hosts(&new).await.as_ref() != Some(&waiting.hosts) {
             wait_again(&new, &pending).await;
             tracing::info!(%agent, skill = name, "a skill's files don't declare its pending row's hosts; left it waiting");
-            return Ok(Confirmed::NotPending);
+            return Ok(Some(Confirmed::NotPending));
         }
         let live = self.live_dir(agent, name);
         if let Err(err) = move_into(&new, &live, &work.0).await {
@@ -464,16 +500,17 @@ impl Skills {
         let Some(skill) = store.confirm_skill(waiting).await? else {
             self.put_back(&live, moved, &work.0).await?;
             tracing::info!(%agent, skill = name, "a skill's pending row changed while it was confirmed; undid the move");
-            return Ok(Confirmed::NotPending);
+            return Ok(Some(Confirmed::NotPending));
         };
         tracing::info!(%agent, skill = name, hosts = skill.hosts.len(), "confirmed a skill's hosts");
-        Ok(Confirmed::Active(skill))
+        Ok(Some(Confirmed::Active(skill)))
     }
 
-    /// Undoes [`confirm_row`](Self::confirm_row)'s move into `live` once
-    /// its row is gone, unless something else has taken the place of the
-    /// files it moved, `moved` by inode: moves back the skill it set aside
-    /// in `aside`, or removes the files it moved when there was none.
+    /// Undoes [`try_confirm_row`](Self::try_confirm_row)'s move into
+    /// `live` once its row is gone, unless something else has taken the
+    /// place of the files it moved, `moved` by inode: moves back the skill
+    /// it set aside in `aside`, or removes the files it moved when there
+    /// was none.
     async fn put_back(
         &self,
         live: &Path,
@@ -525,7 +562,9 @@ impl Skills {
     ///
     /// # Errors
     ///
-    /// If the store or the disk fails.
+    /// If deleting the rows fails. A skill whose files can't be removed is
+    /// logged and left to startup's [`purge`](Self::purge), and the others
+    /// are still removed.
     pub async fn drop_expired(&self) -> Result<(), SkillError> {
         let before = OffsetDateTime::now_utc() - PENDING_TTL - SWEEP_INTERVAL;
         for (agent, name) in self
@@ -534,7 +573,9 @@ impl Skills {
             .delete_pending_skills_before(before)
             .await?
         {
-            self.drop_expired_files(agent, &name).await?;
+            if let Err(err) = self.drop_expired_files(agent, &name).await {
+                tracing::warn!(%agent, skill = name.as_str(), error = %err, "couldn't remove an expired skill's files; startup will");
+            }
         }
         Ok(())
     }
@@ -649,7 +690,7 @@ async fn declared_hosts(dir: &Path) -> Option<Vec<String>> {
         .map(|manifest| host_names(&manifest))
 }
 
-/// Moves a skill [`Skills::confirm_row`] took from `pending` back from
+/// Moves a skill [`Skills::try_confirm_row`] took from `pending` back from
 /// `new`, unless another has taken its place since.
 async fn wait_again(new: &Path, pending: &Path) {
     if let Err(err) = tokio::fs::rename(new, pending).await {

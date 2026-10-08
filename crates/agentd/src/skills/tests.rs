@@ -430,18 +430,12 @@ async fn a_confirmation_after_the_wait_finds_it_expired() {
     h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
         .await
         .unwrap();
-    assert_eq!(
-        h.skills.confirm_row(&expired).await.unwrap(),
-        Confirmed::Expired
-    );
-    assert!(
-        h.pending("gh").join("SKILL.md").is_file(),
-        "the skill added again keeps its files"
-    );
-    assert!(matches!(
-        h.skills.confirm(h.agent, "gh").await.unwrap(),
-        Confirmed::Active(_)
-    ));
+    let Confirmed::Active(row) = h.skills.confirm_row(&expired).await.unwrap() else {
+        panic!("confirms the skill added again");
+    };
+    assert!(row.added_at > expired.added_at);
+    assert!(h.live("gh").join("SKILL.md").is_file());
+    assert!(!h.pending("gh").exists());
     assert_eq!(h.hosts().await, ["api.github.com"]);
 }
 
@@ -581,6 +575,19 @@ async fn a_skill_added_again_while_its_expired_row_is_dropped_keeps_its_files() 
     ));
     assert!(h.live("gh").join("SKILL.md").is_file());
     assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn expired_files_that_cant_be_removed_leave_the_others_dropped() {
+    let h = harness().await;
+    h.expired("stuck").await;
+    h.expired("old").await;
+    std::fs::remove_dir_all(h.pending("stuck")).unwrap();
+    std::fs::write(h.pending("stuck"), "not a directory").unwrap();
+    h.skills.drop_expired().await.unwrap();
+    assert!(!h.pending("old").exists());
+    assert!(h.pending("stuck").is_file());
+    assert!(h.store.agent_skills(h.agent).await.unwrap().is_empty());
 }
 
 #[tokio::test]

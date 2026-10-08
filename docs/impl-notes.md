@@ -5749,16 +5749,33 @@ no pending row of that name exists once its row is deleted
 removal). A pending row is what owns the directory: an active row of the
 name may sit next to an expired update's files, and keeping them for it
 would leave them for good, since purge keeps every directory of a name
-with a row. `Store::delete_pending_skill` deletes the pending row a
-confirmation read only while its hosts and `added_at` are unchanged, as
-`confirm_skill` makes it active, and the confirmation removes the
-directory only when that delete removed the row; otherwise it still
-answers that the skill it read expired, or isn't waiting, and leaves the
-new one waiting. What remains is the gap between the sweeper's check and
-its removal: an add that records its row and moves its files in there
-still loses them. Closing it would need pending directories keyed by the
-row's identity, its `added_at` or an id stored on the row, so a removal
-could only ever reach the files of the row it deleted.
+with a row. A name whose files can't be removed, or whose rows can't be
+read, is logged and left to startup's purge; the other names are still
+removed, since their rows are already gone.
+
+`Store::delete_pending_skill` deletes the pending row a confirmation read
+only while its hosts and `added_at` are unchanged, as `confirm_skill` makes
+it active, and the confirmation removes the directory only when that
+delete removed the row. When it didn't, because the skill was added again
+meanwhile, the confirmation reads the pending row again and confirms the
+one waiting now, once, so the reply names what happened to the skill the
+owner has: in use with the new row's hosts, or, if that one can't be
+confirmed either, expired or not waiting. A row that is simply gone
+answers as before.
+
+Two windows remain, in the sweeper and in both of a confirmation's
+cleanups (an expired row, a row without files): an add that records its
+row and moves its files in between the delete, or the sweeper's check, and
+the directory's removal loses its files, and `skill confirm` then finds a
+row without them. And a confirmation that reads a new row before its add
+has moved the files in sees no files and deletes that row, leaving the
+files the add then moves in with no row, until purge removes them or the
+skill is added again. Either way nothing is granted: files in the pending
+directory are never mounted and no pending row's hosts are allowed, and
+the owner adds the skill again. Closing both would need pending
+directories keyed by the row's identity, its `added_at` or an id stored on
+the row, so a removal could only ever reach the files of the row it
+deleted.
 
 ## T26: Requester-pays routing
 
