@@ -76,8 +76,9 @@ enum Command {
     /// Run a command while holding this scope's `shared/` lock, for writes
     /// to `shared/`. Waits while another command holds it.
     Lock {
-        /// Give up after waiting this many seconds for the lock, at most a
-        /// day.
+        /// Give up after waiting this many seconds for the lock or for
+        /// agentd to answer, at most a day. A request sent near the end
+        /// still gets two seconds.
         #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_LOCK_TIMEOUT_SECS)]
         timeout: u64,
         /// The command and its arguments, after `--`. It is run directly,

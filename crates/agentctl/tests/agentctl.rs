@@ -562,6 +562,29 @@ async fn a_huge_lock_timeout_is_clamped_instead_of_panicking() {
 }
 
 #[tokio::test]
+async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let dir = TempDir::new("agentctl-test");
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        agentctl(&url, "tok", dir.path())
+            .args(["lock", "--timeout", "1", "--", "true"])
+            .output(),
+    )
+    .await
+    .expect("the acquire outlasted the lock timeout")
+    .unwrap();
+    Run::from(output).refused("gave up after 1s waiting for the shared/ lock; agentd at");
+}
+
+#[tokio::test]
 async fn the_lock_renews_while_the_command_runs() {
     let server = Server::with(|settings| settings.lease_ttl = Duration::from_secs(3)).await;
     let (_, token) = server.turn().await;

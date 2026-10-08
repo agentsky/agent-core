@@ -2569,6 +2569,13 @@ Review found that `--timeout 18446744073709551615` panicked on `Instant +
 Duration` overflow. The wait is now clamped to a day, which no turn
 outlasts, so any `u64` the model types gives a sane wait.
 
+Review also found that `--timeout` was only checked between attempts: an
+acquire sent to a stalled agentd waited out the 30-second request timeout,
+so `--timeout 1` took 30 seconds and the default could run past the Bash
+tool's 2 minutes. Each acquire is now bounded by the time left, but given
+at least two seconds so `--timeout 0` can still take a free lock, and a
+request that fails past the deadline reports that agentctl gave up.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With

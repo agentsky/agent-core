@@ -135,10 +135,17 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
     let mut told = false;
     loop {
         let sent = Instant::now();
-        let request = client.send(&LockRequest::Acquire);
+        let limit = give_up.saturating_duration_since(sent).max(ACQUIRE_GRACE);
+        let request = client.send_within(&LockRequest::Acquire, limit);
         tokio::pin!(request);
         let answer = tokio::select! {
-            answer = &mut request => answer?,
+            answer = &mut request => match answer {
+                Ok(answer) => answer,
+                Err(Failure::Transport(reason)) if Instant::now() >= give_up => {
+                    return Err(gave_up(timeout, &reason));
+                }
+                Err(err) => return Err(err.into()),
+            },
             signal = stop.recv() => {
                 if let Ok(Ok(LockResponse::Held { lease, .. })) =
                     tokio::time::timeout(ACQUIRE_GRACE, request).await
@@ -170,10 +177,7 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
             LockResponse::Busy | LockResponse::Released => {}
         }
         if Instant::now() + wait > give_up {
-            return Err(format!(
-                "gave up after {}s waiting for the shared/ lock; another command holds it",
-                timeout.as_secs()
-            ));
+            return Err(gave_up(timeout, "another command holds it"));
         }
         if !told {
             eprintln!("agentctl: waiting for the shared/ lock");
@@ -185,6 +189,14 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
         }
         wait = (wait * 2).min(MAX_RETRY);
     }
+}
+
+/// Why [`acquire`] gave up after waiting `timeout` for the lock.
+fn gave_up(timeout: Duration, why: &str) -> String {
+    format!(
+        "gave up after {}s waiting for the shared/ lock; {why}",
+        timeout.as_secs()
+    )
 }
 
 /// Waits for `child`, renewing `lease` about three times per lease period,
