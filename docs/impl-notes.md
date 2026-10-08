@@ -2530,13 +2530,13 @@ every member. Running each in its own task could swap one member's
 `logout` and `login`, or answer `me` before the `login <code>` sent just
 before it.
 
-**Solution.** Each command runs in its own task inside the intake's
-task, and waits for the previous command of the same `MemberKey` (one
-identity's key, not the member behind it) to finish first (a `oneshot` per
-`MemberKey`, pruned once finished). On shutdown the
-connections stop listening, and the intake runs the commands it already
-received (the store has recorded them as processed, so no other instance
-would) and waits for them within the drain timeout.
+**Solution.** Each command runs in its own task inside the intake's task,
+and waits for the previous command of the same `MemberKey` (one identity's
+key, not the member behind it) to finish first (a `oneshot` per `MemberKey`,
+pruned once finished). On shutdown the connections stop listening, and the
+intake runs the commands it already received (the store has recorded them as
+processed, so no other instance would) and waits for them within the drain
+timeout.
 
 One window is left. `listen` stops on the shutdown signal by dropping the
 surface's events future, and that future may be between the
@@ -5333,13 +5333,14 @@ the idle reaper stops the old container.
 ### A reset waits for the session's turns, the reply doesn't
 
 **Issue.** `SessionManager::reset` runs after the turns queued before it,
-which can take up to the turn timeout each, and it joins the session's
-queue only when its future is first polled. Resetting a few sessions at a
-time left the others out of their queues until an earlier reset ended, so a
+which can take up to the turn timeout each, and it joins the session's queue
+only when its future is first polled. Resetting a few sessions at a time
+left the others out of their queues until an earlier reset ended, so a
 message sent in one of them after `reset` ran on the old conversation and
 was then wiped. Waiting for every reset before replying also held up the
-owner's later commands, which the intake runs one at a time (T13), and
-could outlast a Slack `response_url`, which expires after 30 minutes.
+owner's later commands from that identity, which the intake runs one at a
+time per `MemberKey` (T13), and could outlast a Slack `response_url`, which
+expires after 30 minutes.
 
 **Solution.** Every reset is issued at once and polled once before the
 reply, so each is queued on its session before the owner reads
@@ -5540,9 +5541,10 @@ a local repository through `Git::serving_prefix_from_directory_for_tests`,
 which rewrites one `https://` prefix to a `file://` directory and skips the
 lookup; it and the `file://` configuration exist only in test builds.
 
-A clone runs inside the owner's command, and one member's commands run one
-at a time, so a clone that takes its full 2 minutes holds that owner's
-other commands for as long; other members aren't held up.
+A clone runs inside the owner's command, and one identity's commands (one
+`MemberKey`'s) run one at a time, so a clone that takes its full 2 minutes
+holds the owner's other commands from that identity for as long; other
+identities aren't held up, the owner's others included.
 
 ### The URL git gets names the host as the pin does
 

@@ -3115,8 +3115,9 @@ Deliverables:
     - `LimitReached` for a new label past 20 for the member, counted in
       the transaction.
     - `Unlinked` when the member no longer has a Claude link, checked in
-      the transaction, so a `logout` that unlinks first and then deletes
-      the member's routines (T35c) either finds the row or refuses it.
+      the transaction. Against a `logout` that unlinks and then deletes
+      the member's routines (T35c), the put either commits first, and the
+      delete finds its row, or comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id and the opened
     token. `cloud_routines(member)` lists labels, ids and times, never
     tokens.
@@ -3139,7 +3140,8 @@ Deliverables:
     notice whose claim failed isn't left owed by a row the partial index on
     `notice_next_attempt_at`, which covers only `unknown` rows, no longer
     finds. A claim sending at that moment may still deliver its notice
-    besides the reply. Nothing retries a record that failed.
+    besides the reply. Nothing retries a record that failed. Finishing a
+    row that `logout` deleted changes nothing and isn't an error.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3196,6 +3198,7 @@ Acceptance, as tests named after the rules:
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
   `rejected`).
+- `finishing_a_deleted_handoff_is_a_no_op`.
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3298,10 +3301,16 @@ Deliverables:
   `cloud add` and `CloudHandoffBegin::Unlinked` as an unlinked `cloud run`,
   having stored or sent nothing. A member Slack reports deleted keeps their
   link, so a `cloud add` that races that deletion can still store a
-  routine, which then stays until the member logs out: an accepted gap,
-  since it needs the member's own command to land in the moment Slack
-  deletes them, and only that member can fire the token, from another
-  identity they've linked; for a member only on Slack, nobody can:
+  routine, which then stays until the member logs out, and a racing
+  `cloud run` still writes and fires a hand-off, whose row goes at
+  `[cloud] retention_days`. A member only on Slack can't send `logout`
+  once Slack deleted them, so their routine stays sealed at rest
+  indefinitely, as their Claude link already does, and a store leaked with
+  its master key would yield its token, as the design's threat row on
+  routine tokens says. This is an accepted gap: it needs the member's own
+  command to land in the moment Slack deletes them, and through agentd
+  only that member can fire the token, from another of their identities;
+  for a member only on Slack, nobody can:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
@@ -3336,16 +3345,31 @@ Deliverables:
   `cloud add` or `cloud run` racing it then either commits before the
   unlink, and the delete finds its row, or checks the link after it and is
   refused; deleting first would let one pass the check between the delete
-  and the unlink and store a row after the delete.
+  and the unlink and store a row after the delete. The deletes run
+  whenever the member exists, whether or not `auth.logout` found a link, as
+  the Slack token delete does today, so a `logout` retried after a delete
+  failed still cleans up.
+- A `cloud run` whose `begin_cloud_handoff` committed before the unlink
+  may still fire after `logout` answers; its `finish_cloud_handoff` finds
+  the row deleted, which is a no-op, and its reply still says what
+  happened. `auth.logout` deletes the link and then awaits the revoke, so
+  a fresh `login` and `cloud add` from another of the member's identities
+  in that window is deleted by this `logout`: accepted, since the member
+  logged out and in at once and can add the routine again.
 - `slack-token` has the same race: its handler checks the link before it
   rotates the token with Slack, and `put_slack_config_token` doesn't check
   it again, so a token a racing `slack-token` stores after `logout`'s
   delete survives the logout, whether the delete runs before the unlink or
   after it. So `logout` deletes the Slack configuration tokens after
   `auth.logout` too, and `put_slack_config_token` checks the link in its
-  write, as `put_cloud_routine` does; the handler answers a refusal as it
-  answers an unlinked member, adding that checking the token used up its
-  refresh token.
+  write, as `put_cloud_routine` does, returning
+  `SlackConfigTokenPut::Stored(SlackConfigTokenRef)`, what it returns
+  today, or `SlackConfigTokenPut::Unlinked`. The handler answers
+  `Unlinked` as it answers an unlinked member, adding that checking the
+  token used up its refresh token. The store tests in
+  `crates/store/src/slack_config_tokens.rs`, which put tokens for members
+  with no link, seed a link first, as do any agentd tests that put a token
+  for an unlinked member.
 - A Slack task's tokens are rewritten to what Slack showed, as the design's
   [Command surface](design.md#command-surface) says: `<@U…|name>` to
   `@name`, `<#C…|name>` to `#name`, `<url>` and a `<url|label>` labelled
@@ -3389,13 +3413,17 @@ Acceptance, as pipeline and command tests named after the rules:
 - `a_late_answer_after_the_pass_is_recorded_as_fired`.
 - `a_replayed_slack_command_fires_once`.
 - `logout_drops_routines_and_handoffs`.
-- `a_slack_token_is_refused_without_a_claude_link`.
 - `a_member_slack_reports_deleted_loses_routines_from_every_surface`.
 - `slack_tokens_in_a_task_become_what_slack_showed`.
 - `a_link_label_other_than_its_url_is_shown_with_the_url`.
 - `cloud_notifier_uses_the_defaults_without_cloud_config`.
 - `a_routine_url_on_another_origin_is_refused`.
 - `the_link_is_never_posted_outside_the_private_reply`.
+
+And a store test in `crates/store/src/slack_config_tokens.rs`:
+
+- `a_slack_token_stored_after_the_unlink_is_refused` (seeds a link,
+  deletes it, then puts).
 
 Live check (manual): with a Pro or Max account, make a routine on a scratch
 repository with the design's prompt, register it, run a task, and open the
