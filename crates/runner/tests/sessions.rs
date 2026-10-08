@@ -1468,6 +1468,38 @@ async fn a_failed_process_stopping_after_a_failed_turn_finished_stops_the_contai
 }
 
 #[tokio::test]
+async fn a_failed_process_stopping_on_a_credential_change_replaces_the_container() {
+    let h = Harness::new(&[Turn::reply("one"), Turn::reply("two")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request("1")).await);
+    h.clear();
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    let mut community = request("2");
+    community.credential = CredentialRef::Community;
+    let report = h.run(id, community).await;
+    assert_eq!(reply(&report), "two");
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    let lifecycle: Vec<_> = h
+        .events()
+        .into_iter()
+        .filter(|event| !matches!(event, Event::TurnStarting(..) | Event::TurnFinished(..)))
+        .collect();
+    assert_eq!(
+        lifecycle,
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStarted(id),
+            Event::ProcessStarting(id, CredentialKind::ApiKey, 2),
+        ]
+    );
+    assert_eq!(h.transcript(&session), ["1", "2"]);
+    assert_eq!(h.sandbox.running(), 1);
+}
+
+#[tokio::test]
 async fn a_later_successful_process_stopping_takes_the_process_off_the_retry_list() {
     let h = Harness::new(&[Turn::reply("one")]).await;
     let id = h.thread_session("1.1").await.id;

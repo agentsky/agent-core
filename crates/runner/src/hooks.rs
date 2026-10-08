@@ -160,7 +160,8 @@ pub trait TurnHooks: Send + Sync + 'static {
     ///
     /// Any failure. The runner can't tell what is still pointed, so it
     /// stops the process (calling
-    /// [`process_stopping`](Self::process_stopping)). It does the same when
+    /// [`process_stopping`](Self::process_stopping)), and its container too
+    /// if that call fails. It does the same when
     /// this hook, `turn_starting` or the turn panicked, and the panic then
     /// fails the turn with [`RunnerError::TurnTask`](crate::RunnerError::TurnTask).
     async fn turn_finished(
@@ -176,10 +177,12 @@ pub trait TurnHooks: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Any failure. It is logged, and the stop goes ahead. Unless a later
-    /// call for the process succeeds, the runner calls it once more after
-    /// stopping its container, and only logs a second failure. A panic is
-    /// handled the same way.
+    /// Any failure. It is logged, and the stop goes ahead and takes the
+    /// process's container with it, so nothing left running there keeps
+    /// what the hook failed to revoke. Once the container is stopped the
+    /// runner calls the hook once more, unless a call for the process has
+    /// succeeded since, and only logs a second failure. A panic is handled
+    /// the same way.
     async fn process_stopping(
         &self,
         session: &Session,
