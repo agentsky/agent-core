@@ -3422,8 +3422,8 @@ Design: [Slack Connect](design.md#slack-connect), its
 Deliverables:
 
 - `core-types`:
-  - `Outside { team: Option<TeamId> }`: the sender's own organization, or
-    `None` when Slack named none.
+  - `Outside { team: TeamId }`: the sender's own organization, the team
+    field that made them outside.
   - `InboundEvent::outside: Option<Outside>` and
     `Requester::outside: Option<Outside>`, `None` for home members and on
     Rocket.Chat, with `#[serde(default)]` so stored requesters and agentctl
@@ -3455,20 +3455,24 @@ Deliverables:
 - `surface-slack` Web API (`web.rs`): `AuthTest` reads `enterprise_id`, and
   `User` keeps `team_id`, both leniently. `user_not_visible` joins
   `NOT_FOUND_CODES`, so it arrives as `SurfaceError::NotFound` like
-  `user_not_found`.
+  `user_not_found`. Every Web API call shares that list, so it does so
+  from any of them, `conversations.open` included, and their callers treat
+  `NotFound` as they treat `Api`.
 - `surface-slack` normalization (`normalize.rs`), for `message` and
   `read_back` alike:
   - The sender is `(slack, workspace, user)`.
   - The sender's team fields are `user_team`, `source_team`,
     `user_profile.team` and `team`. One not shaped like a team id is
-    `Skip::Malformed`. `Context` gains `home_org`, the home organization
-    `ManagerIdentity` keeps (below), if any. The ingress's `Context`
-    (`ingress.rs`) and `SlackSurface::confirm`'s take the home workspace's
-    and organization's ids from that same `ManagerIdentity`: the ingress
-    is given them where agentd builds it, and `confirm` takes them from the
-    directory, as it takes `team` today. So a home member whose field names
-    the home organization is home in the event and in the copy alike.
-  - When a field names neither the workspace nor `home_org`, `outside` is
+    `Skip::Malformed`. `Context::team` stays the installation's team, which
+    the other-workspace checks compare. `Context` gains `home_team` and
+    `home_org`, the home workspace and the home organization, if any, as
+    `ManagerIdentity` keeps them (below), used only to classify the team
+    fields. The ingress's `Context` (`ingress.rs`) and
+    `SlackSurface::confirm`'s take both from that same `ManagerIdentity`:
+    the ingress is given them where agentd builds it, and `confirm` takes
+    them from the directory. So a home member whose field names the home
+    organization is home in the event and in the copy alike.
+  - When a field names neither `home_team` nor `home_org`, `outside` is
     `Some(Outside { team })` with the first such field, in that order.
     Otherwise it is `None`, which only the event's own first routing uses:
     the home check below decides for the copy and for manager DMs before
@@ -3676,14 +3680,14 @@ Deliverables:
   - `teams`: at most 100 ids shaped like Slack team ids (`T…` or `E…`),
     default empty. `App::open` refuses to start when one is the home
     workspace or the home organization, both of which it learns through
-    `ManagerIdentity::look_up` (T30, T36a). An outside sender is heard
-    when the id their `Outside` names is listed, a workspace's `T…` or an
-    organization's `E…` alike. Only the sender's own team fields name it,
-    so an `E…` admits only a sender whose field carries that foreign
-    organization's id, and a member of another workspace of the home
-    organization is admitted by listing that workspace's `T…`. A sender
-    whose fields leave them home and whom the home lookup doesn't place
-    home is dropped at confirmation whatever is listed (T36a). It is
+    `ManagerIdentity::look_up` (T30, T36a). An outside sender is heard when
+    the id their `Outside` names is listed, a workspace's `T…` or an
+    organization's `E…` alike. Only the sender's own team fields name it, so
+    an `E…` admits only a sender whose first given team field (`user_team`,
+    then `source_team`, …) is that `E…`, and a member of another workspace
+    of the home organization is admitted by listing that workspace's `T…`. A
+    sender whose fields leave them home and whom the home lookup doesn't
+    place home is dropped at confirmation whatever is listed (T36a). It is
     operator configuration, unlike the community admins' `/agent admin`
     choices, and the README says so.
   - `hand_off`, `false` by default.
@@ -3691,9 +3695,9 @@ Deliverables:
   - `RouterView::outside_access(&Outside) -> Option<OutsideAccess { heard,
     hand_off }>`, `None` when the view can't say, which refuses with
     `PolicyUnavailable`. `IgnoreReason::Outside` now means the
-    organization isn't listed, or isn't known. The pipeline logs an
-    unlisted organization's id at info level, at most once a minute per
-    organization, so operators can find the id to list.
+    organization isn't listed. The pipeline logs an unlisted organization's
+    id at info level, at most once a minute per organization, so operators
+    can find the id to list.
   - `PolicyTarget::Outside`, covering every requester with `outside` set.
     `AgentPolicy::permits` admits an outside requester only when an
     `Outside` allow or a `Member` allow covers them; `Everyone` and `Room`
@@ -3712,7 +3716,7 @@ Deliverables:
   stored as `PolicyTarget::Outside`, with help text, and shown by the
   agent's rule listing.
 - `store`: a migration `…_slack_connect.sql` adds `requester_outside` (the
-  `Outside` as text: the team id, `?` for an unknown one, `NULL` for home)
+  `Outside` as text: the team id, `NULL` for home)
   to `message_refs` and `ctl_tokens`. The pipeline writes it with the
   requester and reads it back into attributions and `CtlTurn`, so a hop
   and an agentctl call know their requester's organization.
@@ -3738,7 +3742,6 @@ Deliverables:
 Acceptance:
 
 - `an_unlisted_organization_is_not_heard`.
-- `an_unknown_organization_is_not_heard`.
 - `a_listed_organization_runs_on_the_community_key`.
 - `an_outside_requester_without_a_community_key_is_refused_in_the_thread`.
 - `an_outside_requester_never_gets_a_link_prompt_or_a_dm`.
@@ -3922,10 +3925,10 @@ Deliverables:
      member's `message` in a channel the other organization hosts: Bolt's
      fixtures show a home member's `app_mention` whose `team` names the
      other organization while `user_team` names home, and the design takes
-     `user_team` as the sender's when the two differ. And whether any
-     field ever names an outside member's organization by a foreign `E…`
-     id rather than a workspace's `T…`, which is what listing an `E…`
-     admits.
+     `user_team` as the sender's when the two differ. And whether an
+     outside member's first given team field (`user_team`, then
+     `source_team`, …) is ever a foreign `E…` rather than a workspace's
+     `T…`, which is what listing an `E…` admits.
   2. The same message read back with `conversations.history` and
      `conversations.replies` on a scratch app's token: the same fields,
      and whether the field T36b takes the sender's team from, the first
