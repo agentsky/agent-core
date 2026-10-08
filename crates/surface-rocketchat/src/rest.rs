@@ -1416,10 +1416,11 @@ fn error_codes(body: &Value, bare: bool) -> impl Iterator<Item = &str> {
 /// - A code such as `error-not-allowed`, `error-action-not-allowed`,
 ///   `not-authorized`, `totp-required` or `error-room-archived` (an
 ///   archived room) is [`SurfaceError::Forbidden`] with the code, whatever
-///   the status, as Slack's `is_archived` is. Rocket.Chat reports missing permissions
-///   with HTTP 400 or 403 depending on the endpoint, and from 9.0 with 401
-///   for `error-unauthorized`. On a 401 only `errorType` and a `[code]`
-///   suffix count: a bare `error: "unauthorized"` there is a rejected token.
+///   the status, as Slack's `is_archived` is. Rocket.Chat reports missing
+///   permissions with HTTP 400 or 403 depending on the endpoint, and from
+///   9.0 with 401 for `error-unauthorized`. On a 401 only `errorType` and a
+///   `[code]` suffix count: a bare `error: "unauthorized"` there is a
+///   rejected token.
 /// - A code such as `error-room-not-found`, `error-invalid-room`,
 ///   `error-message-not-found` or `error-invalid-user` is
 ///   [`SurfaceError::NotFound`] with the code.
