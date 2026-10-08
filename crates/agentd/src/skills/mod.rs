@@ -436,10 +436,9 @@ impl Skills {
         let pending = self.pending_dir(agent, name);
         let expired = waiting.added_at < OffsetDateTime::now_utc() - PENDING_TTL;
         if expired || !is_dir(&pending).await? {
-            store
-                .delete_skill(agent, name, Some(SkillState::Pending))
-                .await?;
-            remove_dir(&pending).await?;
+            if store.delete_pending_skill(waiting).await? {
+                remove_dir(&pending).await?;
+            }
             return Ok(if expired {
                 Confirmed::Expired
             } else {
@@ -535,7 +534,25 @@ impl Skills {
             .delete_pending_skills_before(before)
             .await?
         {
-            remove_dir(&self.pending_dir(agent, &name)).await?;
+            self.drop_expired_files(agent, &name).await?;
+        }
+        Ok(())
+    }
+
+    /// Removes the files of `agent`'s skill `name` once
+    /// [`drop_expired`](Self::drop_expired) deleted its pending row, unless
+    /// the skill was added again since and waits under a new pending row:
+    /// the files waiting are then the new row's.
+    async fn drop_expired_files(&self, agent: AgentId, name: &str) -> Result<(), SkillError> {
+        let added_again = self
+            .inner
+            .store
+            .agent_skills(agent)
+            .await?
+            .iter()
+            .any(|skill| skill.name == name && skill.state == SkillState::Pending);
+        if !added_again {
+            remove_dir(&self.pending_dir(agent, name)).await?;
         }
         Ok(())
     }

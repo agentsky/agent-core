@@ -423,6 +423,26 @@ async fn a_confirmation_after_the_wait_finds_it_expired() {
     assert!(!h.pending("gh").exists());
     assert!(h.store.agent_skills(h.agent).await.unwrap().is_empty());
     assert!(h.hosts().await.is_empty());
+
+    h.waiting_since("gh", PENDING_TTL + Duration::from_secs(60))
+        .await;
+    let expired = h.store.agent_skills(h.agent).await.unwrap().remove(0);
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        h.skills.confirm_row(&expired).await.unwrap(),
+        Confirmed::Expired
+    );
+    assert!(
+        h.pending("gh").join("SKILL.md").is_file(),
+        "the skill added again keeps its files"
+    );
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
 }
 
 #[tokio::test]
@@ -500,6 +520,10 @@ impl Harness {
 async fn expired_pending_skills_are_dropped_with_their_files() {
     let h = harness().await;
     h.expired("old").await;
+    h.upload("SKILL.md", &skill_md("update", &[]))
+        .await
+        .unwrap();
+    h.expired("update").await;
     h.upload("SKILL.md", &skill_md("new", &["api.github.com"]))
         .await
         .unwrap();
@@ -507,6 +531,14 @@ async fn expired_pending_skills_are_dropped_with_their_files() {
         .await;
     h.skills.drop_expired().await.unwrap();
     assert!(!h.pending("old").exists());
+    assert!(
+        !h.pending("update").exists(),
+        "an active skill keeps only its own files"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.live("update").join("SKILL.md")).unwrap(),
+        skill_md("update", &[])
+    );
     assert!(h.pending("new").join("SKILL.md").is_file());
     assert!(
         h.pending("late").join("SKILL.md").is_file(),
@@ -514,13 +546,41 @@ async fn expired_pending_skills_are_dropped_with_their_files() {
     );
     let rows = h.store.agent_skills(h.agent).await.unwrap();
     assert_eq!(
-        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-        ["late", "new"]
+        rows.iter()
+            .map(|r| (r.name.as_str(), r.state))
+            .collect::<Vec<_>>(),
+        [
+            ("late", SkillState::Pending),
+            ("new", SkillState::Pending),
+            ("update", SkillState::Active)
+        ]
     );
     assert_eq!(
         h.skills.confirm(h.agent, "late").await.unwrap(),
         Confirmed::Expired
     );
+}
+
+#[tokio::test]
+async fn a_skill_added_again_while_its_expired_row_is_dropped_keeps_its_files() {
+    let h = harness().await;
+    h.expired("gh").await;
+    let before = OffsetDateTime::now_utc() - PENDING_TTL - SWEEP_INTERVAL;
+    assert_eq!(
+        h.store.delete_pending_skills_before(before).await.unwrap(),
+        [(h.agent, "gh".to_owned())]
+    );
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    h.skills.drop_expired_files(h.agent, "gh").await.unwrap();
+    assert!(h.pending("gh").join("SKILL.md").is_file());
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert!(h.live("gh").join("SKILL.md").is_file());
+    assert_eq!(h.hosts().await, ["api.github.com"]);
 }
 
 #[tokio::test]

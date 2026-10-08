@@ -5731,6 +5731,35 @@ never holds a descriptor open for writing it and none can be inherited.
 No lock is needed, in the tests or around production spawns. It is the
 agentd tests' only file written and then run.
 
+### Dropping an expired skill spares one added again
+
+**Issue.** The sweeper deleted expired pending rows in one statement, then
+removed each name's pending directory. The directory is keyed by agent and
+name only, and nothing orders `skill add` against the sweeper, this
+instance's or another's: an owner who added the skill again between the
+two had their new files removed, and `skill confirm` then found a row
+without files, deleted it and said nothing was waiting. A confirmation of
+an expired row did the same through its own cleanup, which deleted
+whatever pending row of the name it found, a new one included, and then
+its directory.
+
+**Solution.** `drop_expired` removes a name's pending directory only when
+no pending row of that name exists once its row is deleted
+(`drop_expired_files`, which a test drives between the delete and the
+removal). A pending row is what owns the directory: an active row of the
+name may sit next to an expired update's files, and keeping them for it
+would leave them for good, since purge keeps every directory of a name
+with a row. `Store::delete_pending_skill` deletes the pending row a
+confirmation read only while its hosts and `added_at` are unchanged, as
+`confirm_skill` makes it active, and the confirmation removes the
+directory only when that delete removed the row; otherwise it still
+answers that the skill it read expired, or isn't waiting, and leaves the
+new one waiting. What remains is the gap between the sweeper's check and
+its removal: an add that records its row and moves its files in there
+still loses them. Closing it would need pending directories keyed by the
+row's identity, its `added_at` or an id stored on the row, so a removal
+could only ever reach the files of the row it deleted.
+
 ## T26: Requester-pays routing
 
 ### The community key lives in one sealed row, read on every request
