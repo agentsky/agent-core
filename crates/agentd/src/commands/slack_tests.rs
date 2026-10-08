@@ -1613,9 +1613,24 @@ async fn a_long_slash_reply_whose_dm_fails_answers_with_its_start() {
     assert!(replies[0].contains("helper-000-with-a-longer-name"));
     assert_eq!(
         replies[reply::RESPONSE_URL_USES - 1],
-        "That reply is too long to show here in full, and I couldn't send it to you in a DM."
+        "That reply is too long to show here in full, and I couldn't send all of it to you in a \
+         DM."
     );
     assert!(h.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_slash_reply_of_as_many_chunks_as_its_response_url_takes_goes_there() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    public_agents(&h, alice, 200).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(replies.len(), reply::RESPONSE_URL_USES);
+    assert!(replies[0].starts_with("Agents:"), "{}", replies[0]);
+    assert!(replies[4].contains("helper-199-with-a-longer-name"));
+    assert!(h.posts().await.is_empty());
+    assert!(h.calls("conversations.open").await.is_empty());
 }
 
 #[tokio::test]

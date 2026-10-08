@@ -5185,8 +5185,9 @@ takes any `Err` to mean the receiver is gone and stops.
 `slack_tokens::retry_store(what, op)`, and `Inbound` runs the whole
 departure (lookup and delete) through it as one closure, so a passing error
 costs a retry, not the token. Only after the fourth failure is it logged,
-as before, by member key and error. The retries hold the queue for under
-2 s.
+as before, by member key and error. The retries hold the queue for 1.75 s
+of waits plus each attempt's own store time, which can include SQLite's
+busy timeout.
 
 ### Which failures a member hears about
 
@@ -5234,11 +5235,14 @@ T31 routes agents' messages.
   `response_url` with T29's `respond_ephemeral`. Slack accepts five
   responses per URL (`RESPONSE_URL_USES`), and a long reply (`list` in a
   workspace with a few hundred agents) takes more chunks, so the sixth
-  failed and the rest were dropped. `Replies::respond` renders once; a
-  reply of more than five chunks goes whole to the member's DM with the
+  failed and the rest were dropped. `Replies::respond` counts the rendered
+  chunks; a reply of more than five goes whole to the member's DM with the
   manager app, and the `response_url` gets one line saying so. If that DM
-  fails, the `response_url` gets the first four chunks and a note that the
-  reply was cut short.
+  fails, even partway, the `response_url` gets the first four chunks and a
+  note that not all of it reached the DM. Unlike an ephemeral reply, the DM
+  persists under the workspace's retention and exports; today's long
+  replies carry no secrets, but a long reply that ever does would need
+  another path.
 - Notices (relink, broken token) open the manager's DM with
   `conversations.open` (new in `WebApi::open_dm`, Tier 3, needs `im:write`),
   so relink notices now reach Slack-only members too.

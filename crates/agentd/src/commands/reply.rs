@@ -26,9 +26,9 @@ pub(crate) const RESPONSE_URL_USES: usize = 5;
 const LONG_REPLY_IN_DM: &str = "That reply is too long to show here, so I sent it to you in a DM.";
 
 /// The note after the start of a slash command reply that was too long
-/// for its `response_url` and couldn't be sent by DM either.
+/// for its `response_url` and couldn't be sent whole by DM either.
 const LONG_REPLY_CUT: &str =
-    "That reply is too long to show here in full, and I couldn't send it to you in a DM.";
+    "That reply is too long to show here in full, and I couldn't send all of it to you in a DM.";
 
 /// Why a private reply couldn't be sent. The message names no text.
 #[derive(Debug, thiserror::Error)]
@@ -89,12 +89,12 @@ impl ManagerBot {
         self.surface.render(text)
     }
 
-    /// Posts `chunks`, as [`render`](Self::render) returns them, in `room`.
+    /// Posts Markdown `text` in `room`, rendered and split for the surface.
     ///
     /// # Errors
     ///
     /// The first [`SurfaceError`]; chunks after it aren't posted.
-    pub async fn post(&self, room: &ConversationId, chunks: &[String]) -> Result<(), SurfaceError> {
+    pub async fn post(&self, room: &ConversationId, text: &str) -> Result<(), SurfaceError> {
         let to = ReplyTarget {
             conv: ConvRef {
                 surface: self.identity.surface,
@@ -103,21 +103,20 @@ impl ManagerBot {
             },
             thread_root: None,
         };
-        for chunk in chunks {
-            self.surface.post(&to, chunk).await?;
+        for chunk in self.surface.render(text) {
+            self.surface.post(&to, &chunk).await?;
         }
         Ok(())
     }
 
-    /// Sends `chunks`, as [`render`](Self::render) returns them, to
-    /// `member` in the manager bot's DM with them.
+    /// Sends Markdown `text` to `member` in the manager bot's DM with them.
     ///
     /// # Errors
     ///
     /// A [`SurfaceError`] if the DM can't be opened or posted to.
-    pub async fn dm(&self, member: &MemberKey, chunks: &[String]) -> Result<(), SurfaceError> {
+    pub async fn dm(&self, member: &MemberKey, text: &str) -> Result<(), SurfaceError> {
         let room = self.dms.open_dm(member).await?;
-        self.post(&room, chunks).await
+        self.post(&room, text).await
     }
 }
 
@@ -170,8 +169,9 @@ impl Replies {
     ///
     /// A reply in more chunks than [`RESPONSE_URL_USES`] goes to the
     /// member's DM with the manager app instead, and the `response_url`
-    /// says so. If that DM fails, the `response_url` gets the reply's first
-    /// chunks and a note that the rest is missing.
+    /// says so. If that DM fails, even after some of it was posted, the
+    /// `response_url` gets the reply's first chunks and a note that the
+    /// rest is missing.
     async fn respond(
         &self,
         member: &MemberKey,
@@ -186,9 +186,7 @@ impl Replies {
         let ephemeral: Vec<&str> = if chunks.len() <= RESPONSE_URL_USES {
             chunks.iter().map(String::as_str).collect()
         } else {
-            let dm =
-                async { Ok::<_, ReplyError>(self.bot_for(member)?.dm(member, &chunks).await?) };
-            match dm.await {
+            match self.dm(member, text).await {
                 Ok(()) => vec![LONG_REPLY_IN_DM],
                 Err(err) => {
                     tracing::warn!(%member, error = %err, "couldn't DM a slash command reply too long for its response_url; answered with its start");
@@ -232,8 +230,7 @@ impl Replies {
         match origin {
             Origin::SlackSlash { response_url } => self.respond(member, response_url, text).await,
             Origin::SlackDm { channel: room } | Origin::RocketChatDm { room } => {
-                let bot = self.bot_for(member)?;
-                Ok(bot.post(room, &bot.render(text)).await?)
+                Ok(self.bot_for(member)?.post(room, text).await?)
             }
             Origin::RocketChatChannel { .. } => self.dm(member, text).await,
         }
@@ -246,7 +243,6 @@ impl Replies {
     ///
     /// As for [`reply_private`](Self::reply_private).
     pub async fn dm(&self, member: &MemberKey, text: &str) -> Result<(), ReplyError> {
-        let bot = self.bot_for(member)?;
-        Ok(bot.dm(member, &bot.render(text)).await?)
+        Ok(self.bot_for(member)?.dm(member, text).await?)
     }
 }
