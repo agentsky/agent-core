@@ -21,16 +21,21 @@
 //! failed on agentd's side (an internal error, such as a busy database) or
 //! in transit is retried until the deadline.
 //!
+//! An acquire that failed the same ways is retried until `--timeout` runs
+//! out. Each is given the time left, but at least seven seconds, longer
+//! than agentd waits for a busy database, so agentctl doesn't stop waiting
+//! while agentd may still grant it a lease.
+//!
 //! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start. During an
 //! acquire, agentctl lets a request already sent finish, for up to two
-//! seconds, and gives back the lease if it was granted. While the command
-//! runs, agentctl passes the signal on to the command's process group,
-//! gives it up to two seconds to exit (never past the lease's deadline),
-//! then kills the group. Either way it releases the lease and exits with
-//! 128 plus the signal. A process that leaves the group (with `setsid`,
-//! say) escapes the kill, and one the command leaves running when it exits
-//! on its own is not stopped. An agentctl killed outright stops renewing,
-//! and the lease expires on its own.
+//! seconds but not past the time it was given, and gives back the lease if
+//! it was granted. While the command runs, agentctl passes the signal on to
+//! the command's process group, gives it up to two seconds to exit (never
+//! past the lease's deadline), then kills the group. Either way it releases
+//! the lease and exits with 128 plus the signal. A process that leaves the
+//! group (with `setsid`, say) escapes the kill, and one the command leaves
+//! running when it exits on its own is not stopped. An agentctl killed
+//! outright stops renewing, and the lease expires on its own.
 
 use std::ffi::OsString;
 use std::process::{ExitCode, ExitStatus};
@@ -62,8 +67,15 @@ const SAFETY_MARGIN: Duration = Duration::from_secs(1);
 /// [`ROUNDING`] and [`SAFETY_MARGIN`], a lease must last three seconds.
 const MIN_TIME_LEFT: Duration = Duration::from_millis(500);
 /// How long an acquire already sent may take to finish after a stop signal,
-/// so a lease it was granted can be given back.
+/// so a lease it was granted can be given back. It never extends the
+/// request past the time it was given (see [`ATTEMPT_FLOOR`]).
 const ACQUIRE_GRACE: Duration = Duration::from_secs(2);
+/// The least time each acquire is given, even past `--timeout`: longer
+/// than agentd's `store::BUSY_TIMEOUT` (five seconds) waiting for a busy
+/// database, so agentctl doesn't stop waiting while agentd may still grant
+/// a lease that nobody would then hold. With the default `--timeout`, it
+/// keeps `lock` under the Bash tool's two minutes.
+const ATTEMPT_FLOOR: Duration = Duration::from_secs(7);
 /// How long the command may take to exit after agentctl passes a stop
 /// signal on to it, before its process group is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -135,17 +147,11 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
     let mut told = false;
     loop {
         let sent = Instant::now();
-        let limit = give_up.saturating_duration_since(sent).max(ACQUIRE_GRACE);
+        let limit = give_up.saturating_duration_since(sent).max(ATTEMPT_FLOOR);
         let request = client.send_within(&LockRequest::Acquire, limit);
         tokio::pin!(request);
         let answer = tokio::select! {
-            answer = &mut request => match answer {
-                Ok(answer) => answer,
-                Err(Failure::Transport(reason)) if Instant::now() >= give_up => {
-                    return Err(gave_up(timeout, &reason));
-                }
-                Err(err) => return Err(err.into()),
-            },
+            answer = &mut request => answer,
             signal = stop.recv() => {
                 if let Ok(Ok(LockResponse::Held { lease, .. })) =
                     tokio::time::timeout(ACQUIRE_GRACE, request).await
@@ -155,12 +161,12 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
                 return Ok(Acquired::Stopped(signal));
             }
         };
-        match answer {
-            LockResponse::Held {
+        let why = match answer {
+            Ok(LockResponse::Held {
                 lease,
                 seconds_left,
                 ..
-            } => {
+            }) => {
                 let Some(deadline) = reliable_until(sent, seconds_left) else {
                     let _ = release(client, lease, stop).await;
                     return Err(format!("couldn't hold the shared/ lock ({TOO_LONG})"));
@@ -174,10 +180,21 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
                 }
                 return Ok(Acquired::Held { lease, deadline });
             }
-            LockResponse::Busy | LockResponse::Released => {}
-        }
+            Ok(LockResponse::Busy | LockResponse::Released) => {
+                "another command holds it".to_owned()
+            }
+            Err(Failure::Refused(err)) if err.code == CtlErrorCode::Internal => err.message,
+            Err(Failure::Refused(err)) => return Err(err.message),
+            Err(Failure::Transport(message)) => format!(
+                "{message}; a lease agentd granted after agentctl stopped waiting expires \
+                 within its TTL"
+            ),
+        };
         if Instant::now() + wait > give_up {
-            return Err(gave_up(timeout, "another command holds it"));
+            return Err(format!(
+                "gave up waiting for the shared/ lock after the {}s timeout; {why}",
+                timeout.as_secs()
+            ));
         }
         if !told {
             eprintln!("agentctl: waiting for the shared/ lock");
@@ -189,14 +206,6 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
         }
         wait = (wait * 2).min(MAX_RETRY);
     }
-}
-
-/// Why [`acquire`] gave up after waiting `timeout` for the lock.
-fn gave_up(timeout: Duration, why: &str) -> String {
-    format!(
-        "gave up after {}s waiting for the shared/ lock; {why}",
-        timeout.as_secs()
-    )
 }
 
 /// Waits for `child`, renewing `lease` about three times per lease period,
@@ -448,6 +457,13 @@ mod tests {
         let sent = Instant::now();
         assert!(reliable_until(sent, 3).unwrap() - sent >= MIN_TIME_LEFT);
         assert!(reliable_until(sent, 2).unwrap() - sent < MIN_TIME_LEFT);
+    }
+
+    #[test]
+    fn an_acquire_outlasts_agentds_busy_timeout_and_the_default_stays_under_two_minutes() {
+        assert!(ATTEMPT_FLOOR > store::BUSY_TIMEOUT);
+        let default = Duration::from_secs(crate::DEFAULT_LOCK_TIMEOUT_SECS);
+        assert!(default + ATTEMPT_FLOOR < Duration::from_secs(120));
     }
 
     #[test]

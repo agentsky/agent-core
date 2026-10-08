@@ -2558,7 +2558,7 @@ kill. agentctl then releases the lease and exits with 128 plus the signal.
 A signal while an acquire is in flight used to drop the request, and a
 lease agentd granted for it held the lock with nobody renewing it, for up
 to 30 seconds. agentctl now lets a request already sent finish, for up to
-two seconds, releases the lease if it was granted, and exits with 128 plus
+two seconds but not past the time the attempt was given, releases the lease if it was granted, and exits with 128 plus
 the signal without running the command. A signal between attempts exits at
 once. agentctl waits at most 100 seconds for the lock
 by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
@@ -2573,8 +2573,19 @@ Review also found that `--timeout` was only checked between attempts: an
 acquire sent to a stalled agentd waited out the 30-second request timeout,
 so `--timeout 1` took 30 seconds and the default could run past the Bash
 tool's 2 minutes. Each acquire is now bounded by the time left, but given
-at least two seconds so `--timeout 0` can still take a free lock, and a
-request that fails past the deadline reports that agentctl gave up.
+at least seven seconds. That floor lets `--timeout 0` take a free lock,
+and outlasts agentd's five-second SQLite busy timeout, so agentctl doesn't
+abandon an acquire that agentd then grants, leaving a lease nobody holds
+that blocks every session on the volume until its TTL runs out. The
+default 100 seconds plus the floor stays under 2 minutes.
+
+An acquire that failed in transit or with agentd's internal error (a busy
+database, say) used to fail `lock` at once; it is now retried until
+`--timeout` runs out, as renewals are. When that last attempt was busy,
+failed inside agentd, or failed in transit, `lock` reports that it gave up
+after the timeout with that reason; after a transport failure, which may
+be agentctl no longer waiting, it adds that a lease agentd granted anyway
+expires within its TTL. Any other refusal still fails at once.
 
 ### The command runs in its own process group
 

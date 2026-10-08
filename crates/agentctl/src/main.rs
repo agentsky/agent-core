@@ -78,7 +78,7 @@ enum Command {
     Lock {
         /// Give up after waiting this many seconds for the lock or for
         /// agentd to answer, at most a day. A request sent near the end
-        /// still gets two seconds.
+        /// still gets seven seconds.
         #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_LOCK_TIMEOUT_SECS)]
         timeout: u64,
         /// The command and its arguments, after `--`. It is run directly,

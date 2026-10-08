@@ -543,7 +543,8 @@ async fn lock_gives_up_after_its_timeout() {
     assert_eq!(
         out.stderr,
         "agentctl: waiting for the shared/ lock\n\
-         agentctl: gave up after 1s waiting for the shared/ lock; another command holds it\n"
+         agentctl: gave up waiting for the shared/ lock after the 1s timeout; another command \
+         holds it\n"
     );
     Run::from(holder.wait_with_output().await.unwrap()).ok();
 }
@@ -572,16 +573,48 @@ async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
         }
     });
     let dir = TempDir::new("agentctl-test");
+    let started = Instant::now();
     let output = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(15),
         agentctl(&url, "tok", dir.path())
             .args(["lock", "--timeout", "1", "--", "true"])
             .output(),
     )
     .await
-    .expect("the acquire outlasted the lock timeout")
+    .expect("the acquire waited out the 30-second request timeout")
     .unwrap();
-    Run::from(output).refused("gave up after 1s waiting for the shared/ lock; agentd at");
+    assert!(started.elapsed() >= Duration::from_secs(7));
+    let out = Run::from(output);
+    out.refused("gave up waiting for the shared/ lock after the 1s timeout; agentd at ");
+    assert!(
+        out.stderr.ends_with(
+            ": timed out; a lease agentd granted after agentctl stopped waiting expires within \
+             its TTL\n"
+        ),
+        "{out:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_acquire_agentd_failed_is_retried() {
+    let fake = FakeLock::start(30, 0, Renewals::FailOnce).await;
+    *fake.state.failed_acquires.lock().unwrap() = 1;
+    let dir = TempDir::new("agentctl-test");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "true"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.ok();
+    assert_eq!(*fake.state.failed_acquires.lock().unwrap(), 0);
+    assert_eq!(fake.granted().len(), 1);
+    assert_eq!(fake.released(), fake.granted());
 }
 
 #[tokio::test]
@@ -728,6 +761,8 @@ struct FakeState {
     skew: i64,
     renewals: Renewals,
     acquire_delay: Duration,
+    /// How many more acquires fail with agentd's internal error.
+    failed_acquires: Mutex<usize>,
     expires_at: Mutex<Option<SystemTime>>,
     granted: Mutex<Vec<LeaseId>>,
     renewed: Mutex<usize>,
@@ -748,6 +783,7 @@ impl FakeLock {
             skew,
             renewals,
             acquire_delay,
+            failed_acquires: Mutex::new(0),
             expires_at: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
             renewed: Mutex::new(0),
@@ -801,6 +837,18 @@ impl FakeState {
     }
 }
 
+/// agentd's answer when it fails, as on a busy database.
+fn internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(CtlError::new(
+            CtlErrorCode::Internal,
+            "agentd failed; try again",
+        )),
+    )
+        .into_response()
+}
+
 async fn fake_lock(
     State(state): State<Arc<FakeState>>,
     Json(request): Json<LockRequest>,
@@ -809,6 +857,15 @@ async fn fake_lock(
         LockRequest::Acquire => {
             state.acquiring.notify_one();
             tokio::time::sleep(state.acquire_delay).await;
+            let failing = {
+                let mut failed = state.failed_acquires.lock().unwrap();
+                let failing = *failed > 0;
+                *failed = failed.saturating_sub(1);
+                failing
+            };
+            if failing {
+                return internal_error();
+            }
             let lease = LeaseId::new_v4();
             state.granted.lock().unwrap().push(lease);
             state.held(lease)
@@ -832,14 +889,7 @@ async fn fake_lock(
                 *renewed == 1
             };
             if first {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(CtlError::new(
-                        CtlErrorCode::Internal,
-                        "agentd failed; try again",
-                    )),
-                )
-                    .into_response();
+                return internal_error();
             }
             state.held(lease)
         }
