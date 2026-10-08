@@ -10444,10 +10444,11 @@ copy (`a_change_settled_on_a_redirected_id_carries_the_denies_of_a_change_still_
 a give-up leaves it there
 (`a_change_given_up_after_a_later_one_settled_on_a_redirected_id_leaves_its_deny_there`).
 When Slack answers with C itself, the copy on C repeats a pending denial
-and is dropped the same way once A settles; if A settles elsewhere, the
-copy stays on an id the channel no longer has. A waiting change that
-settles concurrently has moved its rules off its old id, so the copy
-finds nothing there to copy.
+and is dropped the same way once A settles. A copy can outlive its
+change: if A settles elsewhere, or is given up, it stays where it was
+copied, on an id the channel may no longer have, refusing more rather
+than less. A waiting change that settles concurrently has moved its rules
+off its old id, so the copy finds nothing there to copy.
 
 Review of that fix: it covered only that order. With B→C settled on D
 first and A→B recorded after, or recorded after the settle read the
@@ -10456,13 +10457,22 @@ didn't say where it settled, so A's pending denials and a give-up reached
 only B and C. `channel_id_changes` now keeps `settled_to`, the id a
 change settled on (the table is this task's own, so its migration is
 edited in place, with a `CHECK` that a row has it exactly when it is
-settled). `later_ids`, and so the pending denials, the give-up's targets
-and the id a settle asks Slack about, follow it as they follow
-`new_channel`, and so does the eviction's walk of the chains a waiting
-change runs through
+settled). `later_ids`, and so the pending denials and the give-up's
+targets, follow it as they follow `new_channel`, and so does the
+eviction's walk of the chains a waiting change runs through
 (`a_change_recorded_after_a_later_one_settled_on_a_redirected_id_reaches_that_id`,
 `settled_changes_a_waiting_chain_runs_through_are_never_forgotten`). The
 copy at settle stays, for the moment between the rules' write and the
 row's. `ChannelChange::Moved::rules` and the settle's logs count copied
 denies as a change too, and `MAX_DENIES`'s rustdoc no longer says a real
 change copies at most one deny.
+
+A second review found that the id a settle asks Slack about, the last of
+`later_ids`, could be a stale one: a settled change's `settled_to` is a
+shortcut to the latest id at a shallow depth, so with B→C settled on D
+and C→X, X→D recorded, the walk from B ended on X. `policy::latest_id`
+now answers that question, taking a settled change only to its
+`settled_to`, Slack's own answer, while `later_ids` still returns every
+id for the denies; both walk the changes through one `reached` helper
+(`a_settled_change_leads_to_where_slack_found_the_channel`, with a cycle
+through a settled change).

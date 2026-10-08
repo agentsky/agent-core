@@ -1211,9 +1211,21 @@ async fn a_change_recorded_after_a_later_one_settled_on_a_redirected_id_reaches_
         h.agents.settle_channel_change(&first, &now).await.unwrap(),
         ChannelChange::Waiting
     );
+    let asked: Vec<String> = h
+        .requests("conversations.info")
+        .await
+        .iter()
+        .filter_map(|request| {
+            serde_urlencoded::from_bytes::<Vec<(String, String)>>(&request.body)
+                .unwrap()
+                .into_iter()
+                .find(|(key, _)| key == "channel")
+                .map(|(_, channel)| channel)
+        })
+        .collect();
     assert_eq!(
-        h.calls("conversations.info").await,
-        1,
+        asked,
+        [NEWEST],
         "it asks where the settled change found the channel"
     );
     for channel in [NEW, NEWER, NEWEST] {

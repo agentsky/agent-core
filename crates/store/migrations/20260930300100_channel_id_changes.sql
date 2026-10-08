@@ -12,8 +12,9 @@
 -- the id Slack said the channel had then (settled_to), which its chain
 -- goes on from as from new_channel, and is kept for a day after it was
 -- received, so a later change in a chain (old to new, then new to newer)
--- finds where the channel went, and a replay is known. A change still waiting a day after it was received is given up:
--- its denies on the old id are copied to the new one, and it is deleted.
+-- finds where the channel went, and a replay is known. A change still
+-- waiting a day after it was received is given up: its denies on the old
+-- id are copied to the new one, and it is deleted.
 
 CREATE TABLE channel_id_changes (
     binding_id TEXT NOT NULL REFERENCES agent_bindings (id) ON DELETE CASCADE,
