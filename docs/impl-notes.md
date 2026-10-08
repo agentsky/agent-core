@@ -2612,6 +2612,26 @@ outbox) in the same transaction it inserts the new one. A session runs one
 process at a time, so the newest process's token is the only one that
 works.
 
+### One token per container address too
+
+**Issue.** A token is accepted from its `container_ip`, and Docker gives a
+stopped container's address to the next one it starts. If revoking a
+token fails when its container stops (the store errors), the token
+survives, and the next container given that address can present it. For
+another session of the same agent and scope, that container mounts the
+same volume, where the old process may have left its `AGENTCTL_TOKEN`.
+
+**Solution.** `put_ctl_token` deletes every token bound to the new token's
+address, not only the session's, with their sessions' leases, in the same
+transaction it inserts the new one, and `issue_process_token` drops their
+outboxes. A container address holds one container at a time, so the
+newest process's token is the only one valid from it, and a stale token is
+dead before the new container's process can run anything. Tests that run
+two sessions at once give each its own address; agentctl's integration
+tests, whose connections all come from 127.0.0.1, serve the second session
+on a listener that presents its connections as coming from another
+address.
+
 ### Targets needed a grammar
 
 **Issue.** `PostRequest::to` and `ReactRequest::message` are "strings as
