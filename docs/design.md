@@ -1370,7 +1370,7 @@ for members of other organizations too, whose own organization is kept as
 | A member's pasted URL steers agentd's request and token to another host | Only the routine id is kept, from a URL whose path and origin must match; the URL is rebuilt from `[cloud] base_url`, and redirects aren't followed. |
 | A retried fire starts two sessions | A fire is recorded before it is sent and never retried. An outcome agentd can't know is reported as such, and the member decides. |
 | Members of another organization in a Slack Connect channel use agents, spend the community key or bill a member | Closed by default. agentd hears them only when `[slack_connect] teams` lists their organization, and an agent answers them only when its owner allows `outside` or the member by name; `everyone` and room allows don't, and an `outside` allow changes nothing for home members. Their turns run on the community key or not at all, never on a link or the owner's credential, and bans, deny rules and every cap apply. Hops on their behalf need a switch of their own, and they can never ask for a private task, which would run on the owner's credential. |
-| A message's organization is forged or misread, so an outside member passes as a home one | The event decides nothing: the copy read back with the agent's token is routed, and a sender is outside if the event or the copy says so. A sender is home only when every team field Slack gives (`user_team`, `source_team`, `user_profile.team`, `team`) names the home workspace or organization and the home member list or `users.info` on the manager's token says the user is in the home workspace. The check runs on the confirmed copy, never on an event's claim, and never on a bot's post. A made-up user id costs no lookup; a forged event naming a real message the bot can read from the last 15 minutes costs at most one per real sender, cached an hour, and the cost is unbounded only while the home member list can't be read. A lookup that says another workspace is outside, against fields that said home, so the message is dropped whatever is listed; one that fails with a transport error or a rate limit gets the "try again" line, and any other failure leaves the sender outside. Slash commands, which carry no sender team, rely on Slack running an app's commands only for its own workspace. The workspace an event came through is `authorizations[0].team_id`; an event without one is dropped, never judged by the envelope's `team_id`, and an installation elsewhere is dropped. Envelope fields an owner could sign (`is_ext_shared_channel`, `context_team_id`) are never read. |
+| A message's organization is forged or misread, so an outside member passes as a home one | The event decides nothing: the copy read back with the agent's token is routed, and a sender is outside if the event or the copy says so. A sender is home only when every team field Slack gives (`user_team`, `source_team`, `user_profile.team`, `team`) names the home workspace or organization and the home member list or `users.info` on the manager's token says the user is in the home workspace. The check runs on the confirmed copy, never on an event's claim, and never on a bot's post. A made-up user id costs no lookup; a forged event naming a real message the bot can read from the last 15 minutes costs at most one per real sender, cached an hour, and the cost is unbounded only while the home member list can't be read. When the fields say home, only a lookup that says home lets the message go on; any other answer drops it, whatever the event says and whatever is listed, except that a transport error or a rate limit gets the "try again" line. Slash commands, which carry no sender team, rely on Slack running an app's commands only for its own workspace. The workspace an event came through is `authorizations[0].team_id`; an event without one is dropped, never judged by the envelope's `team_id`, and an installation elsewhere is dropped. Envelope fields an owner could sign (`is_ext_shared_channel`, `context_team_id`) are never read. |
 | An outside member runs commands, decides a consent card, links an account, or is DMed | Slack routes `/agent` only for home members; agentd drops any interaction whose sender is outside or has no `user.team_id` before the intake, and runs no command from a manager DM whose sender is outside. The Slack path that opens a DM refuses a user the home check doesn't place in the home workspace, so no link prompt, relink notice, refusal or failure notice reaches one. Refusals reach them as one generic line in the thread, at most once per thread per agent per day, which names no ban; it does show that their organization is listed. Like anyone, they can still get the busy line, posted before routing, and the "try again" line, neither throttled per thread; neither says more than that the agent is busy or Slack failed. |
 | The owner's private work reaches another organization | Cards go to the owner's home DM, never the thread. A card says whether the thread is shared with other organizations, and which, read fresh; a result is withheld if the thread's sharing changed after approval, or can't be read, or its id changed. No turn whose requester is outside, a hop's included, can ask for a private task. An owner-side `agentctl post` into another externally shared conversation is refused. Accepted: sharing a conversation later shows its history, results and posts already in it included, to the new organization, as it shows everything members posted there. |
 | Other organizations read what agents say in a shared channel, and their members' messages steer turns | Accepted, as for any channel member: a home member who asks in a shared channel chooses that audience, and outside text reaches only public-side turns, whose sandboxes hold no owner secrets. |
@@ -1578,26 +1578,30 @@ member they name. The person's own organization is a separate field,
   actor's `app_mention` has `team` set to the installing team and names the
   actor's organization only in `user_team`, `source_team` and
   `user_profile.team`[^bolt-actor]. The lookup runs only for a sender the
-  fields left home, so one that says another workspace means the two
-  sources disagree: the sender is outside, and the message is dropped
-  ([below](#confirmation)) even if the organization the lookup names is
-  listed. That organization, the answer's `team_id`, or its
-  `enterprise_user.enterprise_id` for another workspace of the home
-  organization, only names the sender in the log line and the drop
-  reason. An answer that names the user but no `team_id`, and a lookup
-  Slack answers for no user (`user_not_found` or `user_not_visible`),
-  leave them outside with no known organization; these are verdicts,
-  cached like any other answer. A lookup that fails other than by a
-  transport error or a rate limit leaves them outside too, uncached.
+  copy's own fields left home, and only its saying home lets the message
+  go on. Any other answer means the two sources disagree, and the message
+  is dropped at confirmation, whatever the event says and even if the
+  organization the lookup names is listed: the lookup never gives an
+  outside sender an organization an event could match. That organization,
+  the answer's `team_id`, names only the log line and the drop reason. A
+  genuine message is dropped too when Slack's copy names an outside
+  sender's organization in none of its fields, such as a copy without
+  `user_team`; that fails closed, and T36e finds out whether it happens.
+  An answer that names the user but no `team_id`, and a lookup Slack
+  answers for no user (`user_not_found` or `user_not_visible`), say no
+  organization; these are verdicts, cached like any other answer. A
+  lookup that fails other than by a transport error or a rate limit drops
+  the message too, uncached.
 
   The check reads only senders Slack itself vouches for, never what an event
-  says, and never a bot: `fill_sender_team` skips a sender with a bot user,
-  whose `outside` decides nothing. On an agent's app, the event's own first
+  says, and never a bot: it skips a sender with a bot user, whose `outside`
+  decides nothing. On an agent's app, the event's own first
   routing takes a sender the fields don't rule out as home, and that decides
   nothing: nothing is acted on before confirmation (T31), not a turn, a link
   prompt or a refusal, and `private` and `ask-agent` exist only inside a
   turn. `Surface::confirm` then runs the check on Slack's copy, whose sender
-  is a real user; an outside copy routes to `Ignore(Outside)`, differs from
+  is a real user, and drops the message unless it says home; a copy whose
+  fields make the sender outside routes to `Ignore(Outside)`, differs from
   the event's decision, and is dropped. So a made-up user id costs no lookup
   on the manager's token. A forged event that names a real message the bot
   can read from the last 15 minutes costs at most one lookup per real
@@ -1606,7 +1610,7 @@ member they name. The person's own organization is a separate field,
   ([Security](#security)). The confirmation's lookups don't wait for a
   used-up quota, this one included: one that fails with a transport error or
   a rate limit gets the thread T31's "try again" line, like any confirmation
-  that can't be read, and any other failure leaves the sender outside. The
+  that can't be read, and any other failure drops the message. The
   manager app's own DMs, whose signing secret only the operators hold, are
   checked in the command intake's task for their sender, before the command
   runs and without waiting either. Every app's Slack requests pass through
@@ -1625,15 +1629,16 @@ member they name. The person's own organization is a separate field,
   an app's commands[^slack-connect-apps], plus the existing check that the
   payload's `team_id` is the home workspace.
 - **Enterprise Grid.** A member of another workspace in the home
-  workspace's own organization is outside, and heard only when the id that
-  names them, their workspace's or their organization's, is listed. They
-  are still heard in the usual case: `user_team` names their workspace in
-  the event itself and in Slack's copy, so the two agree, and listing its
-  `T…` id admits them. When their fields name only the home workspace or
-  the home organization, the independent source names another workspace:
-  the sources disagree, and the message is dropped even if that workspace
-  or the organization is listed, the lookup naming the organization's `E…`
-  id only in the log line. That also refuses a home member whose
+  workspace's own organization is outside, and heard only when their
+  workspace's `T…` id is listed. In the usual case that admits them:
+  `user_team` names their workspace in the event itself and in Slack's
+  copy, so the two agree. The home organization's `E…` can't be listed,
+  as the home workspace can't: a field naming it counts as home. An
+  `E…` in the list admits only a sender whose own team field carries
+  that foreign organization's id. When a sibling's fields name only the
+  home workspace or the home organization, the independent source names
+  another workspace: the sources disagree, and the message is dropped even
+  if that workspace is listed. That also refuses a home member whose
   `users.info` names another workspace of the same organization as their
   own, such as someone moved between workspaces; it fails closed, and T36e
   checks it on a Grid workspace if one is at hand. Both manifests keep
@@ -1700,23 +1705,22 @@ disagrees with the copy is dropped:
   owner-side post.
 - The sender is looked up as above, never taken as home from the fields
   alone.
-- Whether the sender is outside, and their organization, come from Slack's
-  data only: the copy's own team fields, else the lookup's answer when that
-  isn't home, with the organization it names as [above](#who-is-outside).
-  Nothing of the event's `outside` is carried into the copy. The pipeline's
-  `copy_stands` lets a copy stand when only a limit's refusal differs and
-  the requesters' keys match, and an outside member's key names the home
-  workspace like a home member's; so `copy_stands` also compares
-  `outside`, organization included, and the message is dropped when the
-  event and the copy disagree on it, in either direction, as T31 drops any
-  other difference. A copy only the lookup makes outside always disagrees,
-  since the same fields left the event's sender home, so it is dropped
-  whatever organization the lookup names. It still ignores the member a
-  key belongs to, which may be made between the two routings (T27). So an
-  owner who forges `outside`, or another organization, onto a home
-  member's message only gets it dropped: it can't move a home member's turn
-  to the community key, or pass an unlisted organization's member off as a
-  listed one.
+- Whether the sender is outside, and their organization, come from the
+  copy's own team fields only. A copy they leave home goes on only when the
+  lookup says home, and is dropped otherwise, whatever the event says
+  ([above](#who-is-outside)), so the lookup's answer never becomes an
+  `outside` an event could match. Nothing of the event's `outside` is
+  carried into the copy. The pipeline's `copy_stands` lets a copy stand when
+  only a limit's refusal differs and the requesters' keys match, and an
+  outside member's key names the home workspace like a home member's; so
+  `copy_stands` also compares `outside`, organization included, and the
+  message is dropped when the event and the copy disagree on it, in either
+  direction, as T31 drops any other difference. It still ignores the member
+  a key belongs to, which may be made between the two routings (T27). So an
+  owner who forges `outside`, or another organization, onto a home member's
+  message only gets it dropped: it can't move a home member's turn to the
+  community key, or pass an unlisted organization's member off as a listed
+  one.
 
 ### Audience
 
@@ -1725,11 +1729,11 @@ are closed by default:
 
 1. **The community.** `[slack_connect] teams`, in the operator's
    configuration file rather than an `/agent admin` command, lists the
-   organizations whose members agentd hears, by the id Slack names them
-   with, a workspace's `T…` or an organization's `E…` alike, which agentd
-   logs when it ignores one. A message from anyone else outside is ignored
-   without a word, as an unaddressed message is. An empty list, the
-   default, hears no one from outside.
+   organizations whose members agentd hears, by the id Slack names them with
+   in their own team fields, a workspace's `T…` or an organization's `E…`
+   alike, which agentd logs when it ignores one. A message from anyone else
+   outside is ignored without a word, as an unaddressed message is. An empty
+   list, the default, hears no one from outside.
 2. **The agent's owner.** `/agent allow <name> outside` admits members of
    listed organizations to that agent. `everyone` means everyone in the
    community and a `#room` allow means its home members, so neither admits
