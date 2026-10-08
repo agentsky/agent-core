@@ -2896,7 +2896,9 @@ Not scheduled. Each needs a decision before it becomes a task.
   turns of one session come from different requesters. A process left
   behind then spends only the credentials of its own requester's later
   turns, and can still use the egress allowlist between turns. Files a
-  turn leaves in the session's `work/` or `home/` outlive the container.
+  turn leaves in the session's `work/` or `home/` outlive the container, so
+  a later turn of another requester can still run something it left, such
+  as a git hook.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
