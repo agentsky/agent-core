@@ -3353,9 +3353,11 @@ Deliverables:
   may still fire after `logout` answers; its `finish_cloud_handoff` finds
   the row deleted, which is a no-op, and its reply still says what
   happened. `auth.logout` deletes the link and then awaits the revoke, so
-  a fresh `login` and `cloud add` from another of the member's identities
-  in that window is deleted by this `logout`: accepted, since the member
-  logged out and in at once and can add the routine again.
+  after a fresh `login` from another of the member's identities in that
+  window, anything stored from that identity (a routine, a hand-off or a
+  Slack configuration token, whose refresh token is already used up) is
+  deleted by this `logout`: accepted, since the member logged out and in
+  at once and can register it again.
 - `slack-token` has the same race: its handler checks the link before it
   rotates the token with Slack, and `put_slack_config_token` doesn't check
   it again, so a token a racing `slack-token` stores after `logout`'s
@@ -3365,8 +3367,10 @@ Deliverables:
   write, as `put_cloud_routine` does, returning
   `SlackConfigTokenPut::Stored(SlackConfigTokenRef)`, what it returns
   today, or `SlackConfigTokenPut::Unlinked`. The handler answers
-  `Unlinked` as it answers an unlinked member, adding that checking the
-  token used up its refresh token. The store tests in
+  `Unlinked` with new wording, not the unlinked reply, which ends "I
+  didn't use it": the member is no longer linked, and checking the token
+  used up its refresh token, so they should generate a new one after
+  linking again. The store tests in
   `crates/store/src/slack_config_tokens.rs`, which put tokens for members
   with no link, seed a link first, as do any agentd tests that put a token
   for an unlinked member.
