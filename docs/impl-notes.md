@@ -10415,3 +10415,56 @@ it after a rollback. Both are removed, which leaves the system simpler:
 - With the flag gone, round 5's rollback hazard is gone too.
 - The 100-rule line in T27's notes and the "Pending denials" figures are
   corrected.
+
+## T37: Rocket.Chat end to end in CI
+
+### The fake must share agentd's network namespace
+
+**Issue.** agentd accepts `[proxy] upstream` and the `[claude_oauth]` URLs
+only as `https://`, or as `http://` to a loopback address, so real
+credentials never cross a network in clear. In the Compose stack agentd's
+loopback is its container's own, so a fake on the host or in another
+container is out of reach, and the test can't give a fake a certificate
+agentd trusts without changing agentd's image.
+
+**Solution.** `fake-anthropic`, a `testkit` binary serving
+`fake_anthropic()` and the OAuth endpoints on a fixed address, runs with
+`docker run --network container:<agentd>` from the agentd image (the same
+Debian, so the binary built on the host finds its glibc), and listens on
+`127.0.0.1:18080` inside agentd's namespace. `FakeAnthropic` gained
+`start_on`, for a listener at a fixed address, and `register`, for the
+OAuth answers. agentd only calls the fake once a member logs in or a turn
+runs, so the fake can start after it.
+
+### A message posted before a bot subscribes to its room is lost
+
+**Issue.** A realtime connection subscribes to `stream-room-messages` for
+the rooms `subscriptions.get` lists when it connects, and to a room it is
+added to once `subscriptions-changed` says so (T12). Nothing fetches what
+was posted before the subscription was ready. A test that opens a direct
+message with the manager and posts `login` at once, or mentions a bot right
+after `!agent create` invites it, can lose that message: agentd never sees
+it, and the test times out waiting for a reply.
+
+**Solution.** Not fixed here; the Deferred work bullet on backfill after a
+reconnect now covers new rooms too. The test opens the direct messages
+before agentd starts, so the manager's first listing includes them, and
+waits, with the Rocket.Chat surface logging at debug level, for the
+manager's `realtime connection ready` and for the bot's `subscribing to a
+room` line for `#general` before posting.
+
+### A fresh Community Edition workspace refuses posts at first
+
+**Issue.** [The live check against 7.13.9](#the-live-check-against-7139)
+found `chat.postMessage` answering `restricted-workspace` on a workspace
+that had never reported statistics. 7.13.9 sends its first report at
+startup (`usageReportCron` in `apps/meteor/server/cron/usageReport.ts`),
+and only an answer from the collector's stats token lifts the restriction
+(`AirGappedRestriction.computeRestriction`), so a fresh container can't
+post until that report has gone through.
+
+**Solution.** The script waits, for up to five minutes, until the admin can
+post in `#general`, and fails saying why if Rocket.Chat still refuses. The
+GitHub runner reaches Rocket.Chat Cloud, so the restriction lifts once the
+report is sent. The test therefore depends on that service, which is why it
+is a workflow of its own rather than a job of `CI passed`.
