@@ -1562,6 +1562,73 @@ async fn a_checked_pair_is_stored_although_the_first_write_fails() {
     );
 }
 
+/// Answers `tooling.tokens.rotate` with `answer` after deleting every
+/// Claude link in the store at `url`, as a `logout` elsewhere would while
+/// the rotation is out.
+struct UnlinkingFirst {
+    url: String,
+    answer: ResponseTemplate,
+}
+
+impl wiremock::Respond for UnlinkingFirst {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let url = self.url.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(sql(&url, "DELETE FROM claude_links;"));
+        })
+        .join()
+        .unwrap();
+        self.answer.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_checked_pair_whose_member_was_unlinked_meanwhile_is_not_kept() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    let exp = in_hours(12);
+    Mock::given(method("POST"))
+        .and(path("/api/tooling.tokens.rotate"))
+        .respond_with(UnlinkingFirst {
+            url: url.clone(),
+            answer: ok(json!({
+                "token": "xoxe.xoxp-1-NEW-SECRET-token",
+                "refresh_token": "xoxe-1-NEW-SECRET-refresh",
+                "team_id": TEAM,
+                "user_id": "U0HUMAN01",
+                "iat": exp - 43_200,
+                "exp": exp,
+            })),
+        })
+        .expect(1)
+        .mount(&h.slack)
+        .await;
+
+    let replies = h
+        .slash(
+            "U0HUMAN01",
+            &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        )
+        .await;
+    assert!(
+        replies[0].starts_with(
+            "Your Claude account was unlinked while I checked that token, so I didn't keep it, \
+             and checking it used up its refresh token."
+        ),
+        "{replies:?}"
+    );
+    assert!(
+        replies[0].contains("generate a new configuration token"),
+        "{replies:?}"
+    );
+    assert_eq!(h.stored(alice).await, None);
+}
+
 #[tokio::test]
 async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     let (store, url, _dir) = file_store().await;

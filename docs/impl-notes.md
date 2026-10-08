@@ -9929,10 +9929,13 @@ it passes.
   (`CloudRoutinePut::Unlinked`, `CloudBegun::Unlinked`, through one
   `claude_links::linked` helper), and `put_slack_config_token`, which
   returns `None`, in its one `INSERT … SELECT … WHERE EXISTS` statement.
-  Each command answers that with its own "Link your Claude account first"
-  reply. `slack-token`'s says "I didn't use it", though checking the token
-  used up its refresh token by then; the race is rare enough to share the
-  unlinked reply.
+  `cloud add` and `cloud run` answer that with their "Link your Claude
+  account first" reply. `slack-token` has its own reply for it, since
+  checking the token used up its refresh token by then: the account was
+  unlinked meanwhile, so the token wasn't kept, and the member links again
+  and generates a new one
+  (`a_checked_pair_whose_member_was_unlinked_meanwhile_is_not_kept`, whose
+  mocked rotation deletes the link while it is out).
 - `put_slack_config_token` stays a single statement rather than a
   transaction because the tests that inject token write failures count
   them in a trigger, and a failed statement in an explicit transaction
@@ -9953,9 +9956,10 @@ it passes.
   helper in `slack_tests`; the routine helper asserts the routine was
   stored. The new store tests are `a_routine_is_refused_without_a_claude_link`,
   `a_handoff_is_refused_without_a_claude_link` and
-  `a_slack_token_stored_after_the_unlink_is_refused`. A command-level test
-  of the race would need a hook between the command's link check and the
-  store call, which there is none of.
+  `a_slack_token_stored_after_the_unlink_is_refused`. Only `slack-token`
+  has a command-level test of the race, through its Slack call; `cloud add`
+  and `cloud run` make no call between their link check and the store
+  call that a test could hook.
 - Slack's `member_left` handler deletes a deactivated member's routines,
   hand-offs and configuration token for the workspace without unlinking
   them, so the recheck doesn't cover a `cloud add` or `slack-token` that

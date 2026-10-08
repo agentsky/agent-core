@@ -103,7 +103,13 @@ impl Commands {
         }
         let member = match self.member(key).await? {
             Some(member) if self.inner.auth.status(member).await?.linked => member,
-            _ => return Ok(link_first(origin)),
+            _ => {
+                return Ok(format!(
+                    "Link your Claude account first with {}, then send the token again. I \
+                     didn't use it.",
+                    origin.command("login")
+                ));
+            }
         };
         let rotated = match slack.client().rotate_config_token(refresh).await {
             Ok(rotated) => rotated,
@@ -142,7 +148,13 @@ impl Commands {
             Ok(Some(_)) => {}
             Ok(None) => {
                 tracing::info!(%member, "a checked configuration token's member was unlinked meanwhile; stored nothing");
-                return Ok(link_first(origin));
+                return Ok(format!(
+                    "Your Claude account was unlinked while I checked that token, so I didn't \
+                     keep it, and checking it used up its refresh token. Link your account again \
+                     with {}, then generate a new configuration token at {TOKENS_PAGE} and send \
+                     it.",
+                    origin.command("login")
+                ));
             }
             Err(err) => {
                 tracing::warn!(%member, error = %err, "couldn't store a checked configuration token");
@@ -193,14 +205,6 @@ impl Commands {
             Some(_) => "Slack configuration token: registered, renewed automatically.".to_owned(),
         })
     }
-}
-
-/// The reply to `slack-token` from a member with no Claude link.
-fn link_first(origin: &Origin) -> String {
-    format!(
-        "Link your Claude account first with {}, then send the token again. I didn't use it.",
-        origin.command("login")
-    )
 }
 
 /// Runs `write`, which stores a pair `tooling.tokens.rotate` returned for
