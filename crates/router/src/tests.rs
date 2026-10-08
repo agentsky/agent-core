@@ -2046,16 +2046,16 @@ fn model_policy_configuration_needs_a_default_and_rejects_unknown_keys() {
     assert!(toml::from_str::<ModelPolicy>("default = \"a\"\nmodel = \"b\"").is_err());
 }
 
-fn from_outside(team: Option<&str>) -> Option<Outside> {
+fn from_outside(team: &str) -> Option<Outside> {
     Some(Outside {
-        team: team.map(TeamId::from),
+        team: TeamId::from(team),
     })
 }
 
 #[test]
 fn the_router_ignores_outside_requesters_until_admitted() {
     let mut w = World::new();
-    for outside in [from_outside(Some("T0THEIRS1")), from_outside(None)] {
+    for outside in [from_outside("T0THEIRS1"), from_outside("E0THEIRS1")] {
         for sender in [
             w.stranger_key.clone(),
             w.linked_key.clone(),
@@ -2078,7 +2078,7 @@ fn the_router_ignores_outside_requesters_until_admitted() {
     }
 
     let mut outside = w.mention(&w.linked_key);
-    outside.outside = from_outside(Some("T0THEIRS1"));
+    outside.outside = from_outside("T0THEIRS1");
     w.view.states.insert(w.a, AgentState::Paused);
     assert_eq!(w.route(&outside), ignored(IgnoreReason::Outside));
     w.view.states.insert(w.a, AgentState::Active);
@@ -2098,7 +2098,7 @@ fn the_router_ignores_outside_requesters_until_admitted() {
 
     let mut w = World::new();
     let theirs = Requester {
-        outside: from_outside(Some("T0THEIRS1")),
+        outside: from_outside("T0THEIRS1"),
         ..w.requester(&w.linked_key.clone())
     };
     let hop = w.b_mentions_a(theirs, Hop(1));
@@ -2118,7 +2118,7 @@ fn a_bots_outside_never_makes_a_hop_ignored() {
     let mut w = World::new();
     let requester = w.requester(&w.linked_key.clone());
     let mut event = w.b_mentions_a(requester.clone(), Hop(1));
-    event.outside = from_outside(Some("T0THEIRS1"));
+    event.outside = from_outside("T0THEIRS1");
     assert_eq!(
         w.route(&event),
         run(

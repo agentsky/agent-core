@@ -9479,6 +9479,30 @@ comparing it dropped an agent's hop copy under that warning. At T36a the
 event of an outside sender is ignored before confirmation, so the drop only
 replaces what `copy_stands` already did; it is there for T36b.
 
+### The home lookup never sets `outside`
+
+**Issue.** `fill_sender_team` set a copy's `outside` from the organization
+`users.info` named when the copy's own fields left the sender home, and the
+pipeline lets a copy stand when its `outside` equals the event's. An
+event's `outside` comes from team fields an agent's owner can sign for
+their own agent's app, so a forged event naming exactly the organization
+the lookup gives would stand, and so would a genuine event whose fields
+name an organization the copy's fields don't. Not reachable while T36a
+ignores outside requesters, but T36b would admit them.
+
+**Solution.** `SlackSurface::copy_sender_is_home` replaces
+`fill_sender_team` and answers a yes or no, never an `Outside`: `confirm`
+asks it only of a copy whose fields leave the sender home, and drops the
+message (`Ok(None)`, a debug line naming the binding and the workspace
+`users.info` named) for anything but `Membership::Home`, a refused lookup
+included; a transport error or a rate limit still fails the confirmation.
+A copy's `outside` is now its own fields alone, which always name a team,
+so `core_types::Outside::team` is a plain `TeamId` (no producer lacked
+one: hops and Rocket.Chat set none, and the store refuses outside
+requesters). `directory::organization` reads `team_id` alone, for logs,
+and `user_not_visible` is a `NotFound` code, so the home check matches
+`NotFound` only.
+
 ### The store refuses outside requesters until T36b
 
 **Issue.** `message_refs`, `consents` and `ctl_tokens` have no column for

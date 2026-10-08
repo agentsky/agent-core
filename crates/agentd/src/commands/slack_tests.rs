@@ -2539,7 +2539,7 @@ async fn outside_commands_dms_and_clicks_never_run() {
     let running = Running::start(&h);
     let mut dm = dm_event("U0OUTSID1", "me");
     dm.outside = Some(core_types::Outside {
-        team: Some(TeamId::new(OUTSIDE_TEAM)),
+        team: TeamId::new(OUTSIDE_TEAM),
     });
     running
         .send(SlackInbound::Message(Box::new(dm), InFlight::untracked()))

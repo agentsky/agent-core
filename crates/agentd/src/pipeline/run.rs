@@ -1029,7 +1029,7 @@ impl Pipeline {
             };
             let Some(copy) = agreeing_copy(copy, event) else {
                 if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
-                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message doesn't agree with it on whether its sender is from outside or of which organization, or the sender couldn't be looked up; dropped it");
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message doesn't agree with it on whether its sender is from outside or of which organization; dropped it");
                 }
                 return true;
             };
@@ -2018,8 +2018,8 @@ fn limited(decision: &Decision) -> bool {
 /// The platform's `copy` of `event`, if the two agree on whether the
 /// sender is from outside and of which organization
 /// ([`outside`](InboundEvent::outside)); `None` otherwise, and the message
-/// is dropped. The copy's `outside` comes from the platform's data alone,
-/// its own team fields or the platform's answer about the sender, so
+/// is dropped. The copy's `outside` comes from the platform's copy alone,
+/// its own team fields, never from the event or a lookup of the sender, so
 /// nothing an event says, an organization included, is carried into it.
 /// Only a person's copy is compared: a bot's own `outside` says nothing,
 /// as a hop takes its requester's from the attribution, so a bot's copy,
@@ -3009,9 +3009,7 @@ mod tests {
                 team: "T1".into(),
                 user: user.into(),
             },
-            outside: outside.map(|team| core_types::Outside {
-                team: (!team.is_empty()).then(|| team.into()),
-            }),
+            outside: outside.map(|team| core_types::Outside { team: team.into() }),
         }
     }
 
@@ -3036,7 +3034,7 @@ mod tests {
     fn copy_stands_compares_key_and_outside() {
         let home = asker("U1", None);
         let theirs = asker("U1", Some("T0THEIRS1"));
-        let unknown = asker("U1", Some(""));
+        let grid = asker("U1", Some("E0THEIRS1"));
         assert!(copy_stands(
             &capped_for(home.clone()),
             &run_for(home.clone())
@@ -3048,8 +3046,8 @@ mod tests {
         for (event, copy) in [
             (&home, &theirs),
             (&theirs, &home),
-            (&home, &unknown),
-            (&theirs, &unknown),
+            (&home, &grid),
+            (&theirs, &grid),
         ] {
             assert!(
                 !copy_stands(&capped_for(event.clone()), &run_for(copy.clone())),
@@ -3090,7 +3088,7 @@ mod tests {
     }
 
     /// A Slack channel message from U1, from outside with the organization
-    /// `outside` names (`""` for none known), or home for `None`.
+    /// `outside` names, or home for `None`.
     fn event_with_outside(outside: Option<&str>) -> InboundEvent {
         let conv = core_types::ConvRef {
             surface: core_types::SurfaceKind::Slack,
@@ -3123,18 +3121,18 @@ mod tests {
     fn an_event_and_its_copy_disagreeing_on_outside_is_dropped() {
         let theirs = event_with_outside(Some("T0THEIRS1"));
         let home = event_with_outside(None);
-        let unknown = event_with_outside(Some(""));
+        let grid = event_with_outside(Some("E0THEIRS1"));
         for (copy, event) in [
             (&home, &theirs),
             (&theirs, &home),
-            (&unknown, &theirs),
-            (&theirs, &unknown),
-            (&unknown, &home),
-            (&home, &unknown),
+            (&grid, &theirs),
+            (&theirs, &grid),
+            (&grid, &home),
+            (&home, &grid),
         ] {
             assert_eq!(agreeing_copy(copy.clone(), event), None, "{copy:?}");
         }
-        for copy in [&home, &theirs, &unknown] {
+        for copy in [&home, &theirs, &grid] {
             assert_eq!(agreeing_copy(copy.clone(), copy).as_ref(), Some(copy));
         }
     }
@@ -3152,7 +3150,7 @@ mod tests {
         for copy in [bot(None), agent(None)] {
             for event in [
                 event_with_outside(Some("T0THEIRS1")),
-                event_with_outside(Some("")),
+                event_with_outside(Some("E0THEIRS1")),
             ] {
                 assert_eq!(
                     agreeing_copy(copy.clone(), &event).as_ref(),

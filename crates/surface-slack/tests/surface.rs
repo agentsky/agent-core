@@ -11,7 +11,7 @@ use core_types::{
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::directory::ConvInfo;
+use surface_slack::directory::{ConvInfo, Membership};
 use surface_slack::normalize::{self, Context, MAX_ID_TAIL};
 use surface_slack::surface::CAPS;
 use surface_slack::web::MAX_CONNECTED_TEAMS;
@@ -1111,6 +1111,16 @@ async fn confirming_setup(kind: Value) -> (MockServer, SlackSurface) {
     (server, surface.with_bot_user(Some(BOT_USER.into())))
 }
 
+/// [`confirming_setup`], with `users.info` answering that the senders
+/// these tests read back, `USER` and `U0HUMAN02`, are home.
+async fn confirming_home_setup(kind: Value) -> (MockServer, SlackSurface) {
+    let (server, surface) = confirming_setup(kind).await;
+    for user in [USER, "U0HUMAN02"] {
+        mount_user(&server, user, user_in(user, Some(TEAM))).await;
+    }
+    (server, surface)
+}
+
 fn public_channel() -> Value {
     json!({"is_channel": true, "is_member": true})
 }
@@ -1156,7 +1166,7 @@ async fn a_top_level_message_is_confirmed_as_slack_has_it() {
         (json!([]), None),
     ];
     for (messages, expected) in cases {
-        let (server, surface) = confirming_setup(public_channel()).await;
+        let (server, surface) = confirming_home_setup(public_channel()).await;
         mount(
             &server,
             "conversations.history",
@@ -1192,7 +1202,7 @@ async fn nothing_but_slacks_copy_decides_what_the_event_is() {
     let mut forged = event_from(testkit::slack::MESSAGE_MENTION);
     forged.conv_kind = ConvKind::Dm;
     forged.files = vec![];
-    let (server, surface) = confirming_setup(public_channel()).await;
+    let (server, surface) = confirming_home_setup(public_channel()).await;
     let ts = forged.message.id.as_str();
     mount(
         &server,
@@ -1222,7 +1232,7 @@ async fn blocks_count_only_as_slack_has_them() {
     let blocks = json!([{"type": "rich_text", "elements": [
         {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT_USER}]},
     ]}]);
-    let (server, surface) = confirming_setup(public_channel()).await;
+    let (server, surface) = confirming_home_setup(public_channel()).await;
     mount(
         &server,
         "conversations.history",
@@ -1232,7 +1242,7 @@ async fn blocks_count_only_as_slack_has_them() {
     let copy = surface.confirm(&event).await.unwrap().unwrap();
     assert_eq!(copy.mentions, [UserId::from(BOT_USER)]);
 
-    let (server, surface) = confirming_setup(public_channel()).await;
+    let (server, surface) = confirming_home_setup(public_channel()).await;
     mount(
         &server,
         "conversations.history",
@@ -1251,7 +1261,7 @@ async fn the_conversation_kind_comes_from_conversations_info_once_an_hour() {
     let mut event = event_from(testkit::slack::MESSAGE_MENTION);
     event.conv_kind = ConvKind::Channel;
     let ts = event.message.id.as_str();
-    let (server, surface) = confirming_setup(json!({"is_im": true, "user": USER})).await;
+    let (server, surface) = confirming_home_setup(json!({"is_im": true, "user": USER})).await;
     mount(
         &server,
         "conversations.history",
@@ -1264,7 +1274,7 @@ async fn the_conversation_kind_comes_from_conversations_info_once_an_hour() {
     }
     assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
 
-    let (server, surface) = confirming_setup(json!({"is_mpim": true, "is_group": true})).await;
+    let (server, surface) = confirming_home_setup(json!({"is_mpim": true, "is_group": true})).await;
     let mention = format!("<@{BOT_USER}> in a group DM");
     mount(
         &server,
@@ -1301,7 +1311,7 @@ async fn a_thread_reply_is_confirmed_only_under_a_root_the_bot_may_have_posted()
         (json!("not a user"), true),
         (json!(USER), false),
     ] {
-        let (server, surface) = confirming_setup(public_channel()).await;
+        let (server, surface) = confirming_home_setup(public_channel()).await;
         mount(
             &server,
             "conversations.replies",
@@ -1323,7 +1333,7 @@ async fn a_thread_reply_is_confirmed_only_under_a_root_the_bot_may_have_posted()
 async fn a_thread_reply_is_read_back_in_the_thread_the_event_names() {
     let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
     let root = event.thread_root.clone().unwrap();
-    let (server, surface) = confirming_setup(public_channel()).await;
+    let (server, surface) = confirming_home_setup(public_channel()).await;
     mount(
         &server,
         "conversations.replies",
@@ -1511,14 +1521,8 @@ fn home_event_from(user: &str) -> InboundEvent {
     event
 }
 
-fn outside_unknown() -> Option<Outside> {
-    Some(Outside { team: None })
-}
-
 fn outside_of(team: &str) -> Option<Outside> {
-    Some(Outside {
-        team: Some(team.into()),
-    })
+    Some(Outside { team: team.into() })
 }
 
 #[tokio::test]
@@ -1540,70 +1544,112 @@ async fn a_sender_is_home_only_when_the_home_check_agrees() {
     .await;
     mount_user(&server, "U0ORGWIDE", user_in("U0ORGWIDE", Some(HOME_ORG))).await;
     mount_user(&server, "U0GONE001", refused("user_not_found")).await;
-    for (user, outside) in [
-        (USER, None),
-        ("U0HUMAN02", outside_of(OUTSIDE_TEAM)),
-        ("U0LOOKUP1", None),
-        ("U0NOTEAM1", outside_unknown()),
-        ("U0THEIRS1", outside_of(OUTSIDE_TEAM)),
-        ("U0ORGWIDE", outside_unknown()),
-        ("U0GONE001", outside_unknown()),
+    for (user, home) in [
+        (USER, true),
+        ("U0HUMAN02", false),
+        ("U0LOOKUP1", true),
+        ("U0NOTEAM1", false),
+        ("U0THEIRS1", false),
+        ("U0ORGWIDE", false),
+        ("U0GONE001", false),
     ] {
-        let mut event = home_event_from(user);
+        let event = home_event_from(user);
         assert_eq!(event.outside, None, "the fields all name home");
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside, "{user}");
+        assert_eq!(
+            surface.copy_sender_is_home(&event).await.unwrap(),
+            home,
+            "{user}"
+        );
     }
     let looked_up = lookups(&server, "users.info").await;
     assert_eq!(looked_up.len(), 6, "the listed home member costs no lookup");
 
     for user in ["U0HUMAN02", "U0LOOKUP1", "U0GONE001"] {
-        let mut event = home_event_from(user);
-        surface.fill_sender_team(&mut event).await.unwrap();
+        surface
+            .copy_sender_is_home(&home_event_from(user))
+            .await
+            .unwrap();
     }
     assert_eq!(
         lookups(&server, "users.info").await.len(),
         6,
         "both answers are kept"
     );
+}
 
-    let mut theirs = home_event_from("U0LOOKUP1");
-    theirs.outside = Some(Outside {
-        team: Some(OUTSIDE_TEAM.into()),
-    });
-    let before = theirs.clone();
-    surface.fill_sender_team(&mut theirs).await.unwrap();
+#[tokio::test]
+async fn a_home_lookup_naming_no_team_is_not_home() {
+    let (server, surface) = setup().await;
+    mount_user(&server, "U0NOTEAM1", user_in("U0NOTEAM1", None)).await;
     assert_eq!(
-        theirs, before,
-        "fields that say outside are kept as they are"
+        surface
+            .directory()
+            .membership(surface.api(), &"U0NOTEAM1".into())
+            .await,
+        Ok(Membership::Outside(None))
+    );
+    assert!(
+        !surface
+            .copy_sender_is_home(&home_event_from("U0NOTEAM1"))
+            .await
+            .unwrap()
     );
 }
 
 #[tokio::test]
-async fn a_sender_of_another_workspace_or_surface_is_outside_without_a_lookup() {
+async fn user_not_found_and_not_visible_are_cached_outside_verdicts() {
+    let (server, surface) = setup().await;
+    for (user, code) in [
+        ("U0GONE001", "user_not_found"),
+        ("U0HIDDEN1", "user_not_visible"),
+    ] {
+        mount_user(&server, user, refused(code)).await;
+        for _ in 0..2 {
+            assert_eq!(
+                surface
+                    .directory()
+                    .membership(surface.api(), &user.into())
+                    .await,
+                Ok(Membership::Outside(None)),
+                "{code}"
+            );
+        }
+    }
+    assert_eq!(
+        lookups(&server, "users.info").await.len(),
+        2,
+        "each verdict is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_sender_of_another_workspace_or_surface_is_not_home_without_a_lookup() {
     let (server, surface) = listing(&[(USER, TEAM)]).await;
     let mut elsewhere = home_event_from(USER);
     elsewhere.sender.team = OUTSIDE_TEAM.into();
-    surface.fill_sender_team(&mut elsewhere).await.unwrap();
-    assert_eq!(elsewhere.outside, outside_unknown(), "another workspace");
     let mut org = home_event_from(USER);
     org.sender.team = HOME_ORG.into();
-    surface.fill_sender_team(&mut org).await.unwrap();
-    assert_eq!(org.outside, outside_unknown(), "the organization itself");
     let mut other_surface = home_event_from(USER);
     other_surface.sender.surface = SurfaceKind::RocketChat;
-    surface.fill_sender_team(&mut other_surface).await.unwrap();
-    assert_eq!(other_surface.outside, outside_unknown(), "another surface");
+    for (event, what) in [
+        (elsewhere, "another workspace"),
+        (org, "the organization itself"),
+        (other_surface, "another surface"),
+    ] {
+        assert!(
+            !surface.copy_sender_is_home(&event).await.unwrap(),
+            "{what}"
+        );
+    }
     assert!(lookups(&server, "users.info").await.is_empty());
 }
 
 #[tokio::test]
 async fn a_home_member_in_a_shared_channel_is_home() {
     let (server, surface) = listing(&[(USER, TEAM)]).await;
-    let mut event = event_from(testkit::slack::MESSAGE_CONNECT_HOME);
+    let event = event_from(testkit::slack::MESSAGE_CONNECT_HOME);
     assert_eq!(event.conv.conversation.as_str(), SHARED_CHANNEL);
-    surface.fill_sender_team(&mut event).await.unwrap();
-    assert_eq!(event.outside, None);
+    assert!(surface.copy_sender_is_home(&event).await.unwrap());
     assert!(lookups(&server, "users.info").await.is_empty());
 }
 
@@ -1634,16 +1680,12 @@ async fn a_home_organization_field_with_a_home_lookup_is_home() {
     };
     let event = normalize::message(&context, &envelope["event"]).unwrap();
     assert_eq!(event.outside, None);
-    let mut home = event.clone();
-    surface.fill_sender_team(&mut home).await.unwrap();
-    assert_eq!(home.outside, None);
+    assert!(surface.copy_sender_is_home(&event).await.unwrap());
     let mut sibling = event.clone();
     sibling.sender.user = "U0ELSEWHR".into();
-    surface.fill_sender_team(&mut sibling).await.unwrap();
-    assert_eq!(
-        sibling.outside,
-        outside_of("T0SIBLING"),
-        "another workspace of the organization isn't home, and is named"
+    assert!(
+        !surface.copy_sender_is_home(&sibling).await.unwrap(),
+        "another workspace of the organization isn't home"
     );
 
     mount_user(
@@ -1658,34 +1700,34 @@ async fn a_home_organization_field_with_a_home_lookup_is_home() {
     .await;
     let mut member_of_both = event;
     member_of_both.sender.user = "U0GRIDMEM".into();
-    surface.fill_sender_team(&mut member_of_both).await.unwrap();
-    assert_eq!(
-        member_of_both.outside, None,
+    assert!(
+        surface.copy_sender_is_home(&member_of_both).await.unwrap(),
         "a Grid member whose workspaces include this one is home"
     );
 }
 
 #[tokio::test]
-async fn a_home_lookup_slack_refuses_is_outside() {
+async fn a_home_lookup_slack_refuses_is_not_home() {
     let (server, surface) = setup().await;
     for (user, code) in [
         ("U0SCOPE01", "missing_scope"),
         ("U0AUTH001", "invalid_auth"),
-        ("U0HIDDEN1", "user_not_visible"),
     ] {
         mount_user(&server, user, refused(code)).await;
-        let mut event = home_event_from(user);
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_unknown(), "{code}");
-        surface
-            .fill_sender_team(&mut home_event_from(user))
-            .await
-            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                !surface
+                    .copy_sender_is_home(&home_event_from(user))
+                    .await
+                    .unwrap(),
+                "{code}"
+            );
+        }
     }
     assert_eq!(
         lookups(&server, "users.info").await.len(),
-        5,
-        "a refusal is no answer and isn't kept; user_not_visible is one"
+        4,
+        "a refusal is no answer and isn't kept"
     );
 }
 
@@ -1703,8 +1745,10 @@ async fn user_not_visible_is_kept_and_noted_once_a_minute() {
         mount_user(&server, user, refused("user_not_visible")).await;
         let mut event = home_event_from(user);
         event.sender.team = HIDING.into();
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_unknown(), "{user}");
+        assert!(
+            !surface.copy_sender_is_home(&event).await.unwrap(),
+            "{user}"
+        );
     }
     assert_eq!(lookups(&server, "users.info").await.len(), 2, "kept");
     let noted = logs
@@ -1726,8 +1770,8 @@ async fn an_answer_about_someone_else_or_that_doesnt_read_is_no_answer_and_warne
     let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
     mount_user(&server, "U0ASKED01", user_in("U0SOMEONE", Some(TEAM))).await;
     mount_user(&server, "U0GARBLED", ok(json!({"user": "garbled"}))).await;
-    for (team, user, outside, warning) in [
-        ("T0WARNED2", "U0ASKED01", outside_unknown(), "another user"),
+    for (team, user, answer, warning) in [
+        ("T0WARNED2", "U0ASKED01", Some(false), "another user"),
         ("T0WARNED3", "U0GARBLED", None, "unexpected response"),
     ] {
         let surface = SlackSurface::new(
@@ -1737,9 +1781,8 @@ async fn an_answer_about_someone_else_or_that_doesnt_read_is_no_answer_and_warne
         for _ in 0..2 {
             let mut event = home_event_from(user);
             event.sender.team = team.into();
-            let filled = surface.fill_sender_team(&mut event).await;
-            assert_eq!(filled.is_ok(), outside.is_some(), "{user}: {filled:?}");
-            assert_eq!(event.outside, outside, "{user}");
+            let home = surface.copy_sender_is_home(&event).await;
+            assert_eq!(home.clone().ok(), answer, "{user}: {home:?}");
         }
         let warned = logs
             .snapshot()
@@ -1785,11 +1828,13 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
             .to_string();
         warned.lines().filter(|line| line.contains("WARN")).count()
     };
-    let look_up = async |user: &str, organization: &str| {
+    let look_up = async |user: &str| {
         let mut event = home_event_from(user);
         event.sender.team = LONE.into();
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_of(organization), "{user}");
+        assert!(
+            !surface.copy_sender_is_home(&event).await.unwrap(),
+            "{user}"
+        );
     };
     mount_user(
         &server,
@@ -1797,7 +1842,7 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
         grid_member("U0THEIRS1", OUTSIDE_TEAM, "E0THEIRS1"),
     )
     .await;
-    look_up("U0THEIRS1", OUTSIDE_TEAM).await;
+    look_up("U0THEIRS1").await;
     assert_eq!(
         warnings(),
         0,
@@ -1805,7 +1850,7 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
     );
     for user in ["U0GRIDMEM", "U0GRIDME2"] {
         mount_user(&server, user, grid_member(user, LONE, HOME_ORG)).await;
-        look_up(user, HOME_ORG).await;
+        look_up(user).await;
     }
     assert_eq!(warnings(), 1);
 
@@ -1829,8 +1874,10 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
         .await;
         let mut event = home_event_from(user);
         event.sender.team = lone.into();
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_of(team_id), "{user}");
+        assert!(
+            !surface.copy_sender_is_home(&event).await.unwrap(),
+            "{user}"
+        );
         let warned = logs
             .snapshot()
             .matching("auth.test gave the workspace none")
@@ -1845,7 +1892,7 @@ async fn a_grid_member_while_auth_test_named_no_organization_is_warned_of_once()
 }
 
 #[tokio::test]
-async fn slacks_passing_failures_ask_to_try_again_rather_than_say_outside() {
+async fn slacks_passing_failures_ask_to_try_again_rather_than_say_not_home() {
     let (server, surface) = setup().await;
     for (user, code) in [
         ("U0FATAL01", "fatal_error"),
@@ -1855,10 +1902,11 @@ async fn slacks_passing_failures_ask_to_try_again_rather_than_say_outside() {
     ] {
         mount_user(&server, user, refused(code)).await;
         for _ in 0..2 {
-            let mut event = home_event_from(user);
-            let err = surface.fill_sender_team(&mut event).await.unwrap_err();
-            assert_eq!(err, SurfaceError::Transport(code.to_owned()));
-            assert_eq!(event.outside, None, "{code}: no verdict");
+            let err = surface
+                .copy_sender_is_home(&home_event_from(user))
+                .await
+                .unwrap_err();
+            assert_eq!(err, SurfaceError::Transport(code.to_owned()), "{code}");
         }
     }
     assert_eq!(
@@ -1885,13 +1933,16 @@ async fn a_lookup_that_wont_pass_on_its_own_is_warned_of_once_a_minute() {
     };
     for user in ["U0SCOPE01", "U0SCOPE02", "U0SCOPE03"] {
         mount_user(&server, user, refused("missing_scope")).await;
-        let mut event = event_from(user);
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_unknown());
+        assert!(
+            !surface
+                .copy_sender_is_home(&event_from(user))
+                .await
+                .unwrap()
+        );
     }
     mount_user(&server, "U0DOWN001", ResponseTemplate::new(503)).await;
     surface
-        .fill_sender_team(&mut event_from("U0DOWN001"))
+        .copy_sender_is_home(&event_from("U0DOWN001"))
         .await
         .unwrap_err();
     let warned = logs
@@ -1926,9 +1977,12 @@ async fn deactivated_members_are_never_home() {
     )
     .await;
     for _ in 0..2 {
-        let mut event = home_event_from(USER);
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event.outside, outside_unknown());
+        assert!(
+            !surface
+                .copy_sender_is_home(&home_event_from(USER))
+                .await
+                .unwrap()
+        );
     }
     assert_eq!(
         lookups(&server, "users.info").await.len(),
@@ -1948,19 +2002,21 @@ async fn a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached() {
     )
     .await;
     for _ in 0..2 {
-        let mut event = home_event_from("U0DOWN001");
-        let err = surface.fill_sender_team(&mut event).await.unwrap_err();
+        let err = surface
+            .copy_sender_is_home(&home_event_from("U0DOWN001"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
-        assert_eq!(event.outside, None, "left alone");
     }
     assert_eq!(lookups(&server, "users.info").await.len(), 2);
 
     let started = std::time::Instant::now();
-    let mut event = home_event_from("U0BUSY001");
-    let err = surface.fill_sender_team(&mut event).await.unwrap_err();
+    let err = surface
+        .copy_sender_is_home(&home_event_from("U0BUSY001"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, SurfaceError::RateLimited { .. }), "{err:?}");
     assert!(started.elapsed() < Duration::from_secs(5), "never waits");
-    assert_eq!(event.outside, None);
 
     let (server, surface) = setup().await;
     mount_user(&server, "U0SCOPE01", refused("missing_scope")).await;
@@ -1982,10 +2038,8 @@ async fn a_bots_post_is_never_looked_up() {
     bot.sender_bot_user = Some("U0OTHERBT".into());
     let mut classic = bot_event();
     classic.sender_bot_user = None;
-    for mut event in [bot, classic] {
-        let before = event.clone();
-        surface.fill_sender_team(&mut event).await.unwrap();
-        assert_eq!(event, before);
+    for event in [bot, classic] {
+        assert!(surface.copy_sender_is_home(&event).await.unwrap());
     }
 
     let (server2, surface) = confirming_setup(public_channel()).await;
@@ -2059,19 +2113,17 @@ async fn confirm_reads_who_is_outside_from_slacks_copy() {
         (
             json!({"ts": ts, "user": USER, "text": event.text, "user_team": OUTSIDE_TEAM}),
             None,
-            Some(Outside {
-                team: Some(OUTSIDE_TEAM.into()),
-            }),
+            Some(outside_of(OUTSIDE_TEAM)),
         ),
         (
             json!({"ts": ts, "user": USER, "text": event.text, "team": TEAM}),
             Some(user_in(USER, Some(OUTSIDE_TEAM))),
-            outside_of(OUTSIDE_TEAM),
+            None,
         ),
         (
             json!({"ts": ts, "user": USER, "text": event.text, "team": TEAM}),
             Some(user_in(USER, Some(TEAM))),
-            None,
+            Some(None),
         ),
     ] {
         let (server, surface) = confirming_setup(public_channel()).await;
@@ -2085,11 +2137,38 @@ async fn confirm_reads_who_is_outside_from_slacks_copy() {
         if let Some(info) = info {
             mount_user(&server, USER, info).await;
         }
-        let confirmed = surface.confirm(&event).await.unwrap().unwrap();
-        assert_eq!(confirmed.outside, outside);
-        assert_eq!(confirmed.sender.team.as_str(), TEAM);
+        let confirmed = surface.confirm(&event).await.unwrap();
+        assert_eq!(
+            confirmed.as_ref().map(|copy| copy.outside.clone()),
+            outside,
+            "a copy its fields leave home is dropped unless the lookup says home"
+        );
+        assert!(confirmed.is_none_or(|copy| copy.sender.team.as_str() == TEAM));
         assert_eq!(lookups(&server, "users.info").await.is_empty(), !asks);
     }
+}
+
+#[tokio::test]
+async fn an_event_naming_the_organization_only_the_lookup_gives_is_dropped() {
+    let mut envelope: Value = serde_json::from_str(testkit::slack::MESSAGE_MENTION).unwrap();
+    envelope["event"]["user_team"] = json!(OUTSIDE_TEAM);
+    let forged = event_from(&envelope.to_string());
+    assert_eq!(
+        forged.outside,
+        outside_of(OUTSIDE_TEAM),
+        "its fields name X"
+    );
+    let ts = forged.message.id.as_str();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": forged.text, "team": TEAM}]})),
+    )
+    .await;
+    mount_user(&server, USER, user_in(USER, Some(OUTSIDE_TEAM))).await;
+    assert_eq!(surface.confirm(&forged).await, Ok(None));
+    assert_eq!(lookups(&server, "users.info").await.len(), 1);
 }
 
 #[tokio::test]

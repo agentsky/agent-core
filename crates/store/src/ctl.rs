@@ -574,7 +574,7 @@ mod tests {
         store.put_ctl_token(&new).await.unwrap();
         let mut outside = turn(TurnKind::Normal, Side::Public);
         outside.requester.outside = Some(core_types::Outside {
-            team: Some(core_types::TeamId::new("T0THEIRS1")),
+            team: core_types::TeamId::new("T0THEIRS1"),
         });
         let err = store
             .set_ctl_turn(&new.hash, Some(&outside))

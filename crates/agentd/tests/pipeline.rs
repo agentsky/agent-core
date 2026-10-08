@@ -2365,7 +2365,7 @@ async fn past_the_queue_an_outside_sender_gets_no_busy_line() {
     .await;
     let outside = |mut event: InboundEvent| {
         event.outside = Some(core_types::Outside {
-            team: Some("T0THEIRS1".into()),
+            team: "T0THEIRS1".into(),
         });
         event
     };

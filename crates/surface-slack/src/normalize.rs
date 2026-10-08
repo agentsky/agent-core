@@ -68,8 +68,9 @@
 //! first such field, in that order, as their organization. Otherwise
 //! [`InboundEvent::outside`] is `None`, which only the event's own first
 //! routing takes as home: the fields can make a sender outside, never
-//! home, and Slack's copy of the message is looked up before anything acts
-//! on it ([`SlackSurface::fill_sender_team`](crate::SlackSurface::fill_sender_team)).
+//! home, and Slack's copy of the message, when its own fields leave the
+//! sender home too, is kept only when the home check agrees
+//! ([`SlackSurface::copy_sender_is_home`](crate::SlackSurface::copy_sender_is_home)).
 //! Slack's fixtures disagree on which field names an outside actor, so
 //! every field counts and none alone.
 //!
@@ -256,9 +257,7 @@ impl MessageEvent {
                 *team != context.team.as_str()
                     && context.home_org.is_none_or(|org| *team != org.as_str())
             })
-            .map(|team| Outside {
-                team: Some(team.into()),
-            }))
+            .map(|team| Outside { team: team.into() }))
     }
 }
 
@@ -1459,9 +1458,7 @@ mod tests {
     }
 
     fn outside(team: &str) -> Option<Outside> {
-        Some(Outside {
-            team: Some(team.into()),
-        })
+        Some(Outside { team: team.into() })
     }
 
     #[test]
