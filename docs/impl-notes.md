@@ -4963,7 +4963,10 @@ failure is logged and given up on. Retrying only when it was called again
 missed manager-initiated stops: the process is taken from the session
 before the call, and a death event for a container already marked dead is
 ignored, so a failed revocation used to leave the agentctl token valid for
-the next container on the address.
+the next container on the address. A failed revocation also takes the
+container with it, even when the process was seen to exit, since leftover
+processes in the container could otherwise keep using the live token
+between turns.
 
 A panic in `process_starting` is taken for its failure, and one in
 `process_stopping` is logged and the stop goes ahead: otherwise a panic in

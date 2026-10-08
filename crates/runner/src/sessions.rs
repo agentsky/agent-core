@@ -119,7 +119,8 @@ enum AfterTurn {
 /// gone goes, and so does its container if the process wasn't seen to exit,
 /// so two processes never share a transcript. A process whose
 /// `turn_finished` failed goes too, since its placeholder may still be
-/// pointed.
+/// pointed. A stopped process can still take its container with it: see
+/// `SessionManager::stop_process`.
 fn after_turn(dead: bool, running: bool, may_be_alive: bool, finished_ok: bool) -> AfterTurn {
     if dead || (!running && may_be_alive) {
         AfterTurn::StopContainer
@@ -997,8 +998,9 @@ impl<H: TurnHooks> Inner<H> {
     }
 
     /// Stops the held process, if any, after `process_stopping`. Returns
-    /// whether the process may still be running, in which case the
-    /// container must be stopped before another process starts in it.
+    /// whether the container must be stopped before another process starts
+    /// in it: the process may still run, or a revocation failed, which only
+    /// stopping the container retries.
     async fn stop_process(&self, held: &mut Held<H>) -> bool {
         let Some(mut running) = held.process.take() else {
             return false;
@@ -1006,7 +1008,7 @@ impl<H: TurnHooks> Inner<H> {
         held.tracked.state().process = None;
         self.process_stopping(&held.tracked, &running.handle).await;
         running.process.stop().await;
-        running.process.may_be_alive()
+        running.process.may_be_alive() || !held.tracked.state().unrevoked.is_empty()
     }
 
     /// Calls `process_starting`, turning a panic into a failure.

@@ -1437,6 +1437,37 @@ async fn a_failed_process_stopping_runs_again_once_the_container_is_stopped() {
 }
 
 #[tokio::test]
+async fn a_failed_process_stopping_after_a_failed_turn_finished_stops_the_container() {
+    let h = Harness::new(&[Turn::reply("one")]).await;
+    let id = h.thread_session("1.1").await.id;
+    h.faults.fail_turn_finished.store(true, Ordering::SeqCst);
+    h.faults.fail_process_stopping.store(true, Ordering::SeqCst);
+    let report = h.run(id, request("1")).await;
+    assert_eq!(reply(&report), "one");
+    assert!(report.finished.is_err());
+    assert!(!h.manager.is_warm(id));
+    assert_eq!(h.sandbox.running(), 0);
+    let stops: Vec<_> = h
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                Event::ProcessStopping(..) | Event::ContainerStopped(..)
+            )
+        })
+        .collect();
+    assert_eq!(
+        stops,
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+            Event::ProcessStopping(id, 1),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_later_successful_process_stopping_takes_the_process_off_the_retry_list() {
     let h = Harness::new(&[Turn::reply("one")]).await;
     let id = h.thread_session("1.1").await.id;
