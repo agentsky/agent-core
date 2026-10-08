@@ -463,7 +463,7 @@ impl Skills {
             return Err(err);
         }
         let Some(skill) = store.confirm_skill(waiting).await? else {
-            self.put_back(&live, moved, &work.0).await?;
+            self.put_back(&live, moved, &pending, &work.0).await?;
             tracing::info!(%agent, skill = name, "a skill's pending row changed while it was confirmed; undid the move");
             return Ok(Confirmed::NotPending);
         };
@@ -474,23 +474,33 @@ impl Skills {
     /// Undoes [`confirm_row`](Self::confirm_row)'s move into `live`
     /// once its row is gone, unless something else has taken the place of
     /// the files it moved, `moved` by inode: moves back the skill it set
-    /// aside in `aside`, or removes the files it moved when there was none.
+    /// aside in `aside`, if there was one, and the files it moved back to
+    /// `pending`, where they may be a newer row's. If an add has put files
+    /// there since, they are that add's, which would have replaced the
+    /// ones moved, so those are left in a work directory, whose guard
+    /// removes them.
     async fn put_back(
         &self,
         live: &Path,
         moved: Option<u64>,
+        pending: &Path,
         aside: &Path,
     ) -> Result<(), SkillError> {
         if inode(live).await? != moved {
             return Ok(());
         }
         let old = aside.join("old");
+        let back = self.work_dir().await?;
+        let files = back.0.join("old");
         if is_dir(&old).await? {
-            let back = self.work_dir().await?;
-            move_into(&old, live, &back.0).await
-        } else {
-            remove_dir(live).await.map(drop)
+            move_into(&old, live, &back.0).await?;
+        } else if let Err(err) = tokio::fs::rename(live, &files).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(io("moving a skill aside")(err));
         }
+        wait_again(&files, pending).await;
+        Ok(())
     }
 
     /// Removes `agent`'s skill `name`, in use or waiting, with its hosts,
@@ -526,9 +536,12 @@ impl Skills {
     ///
     /// # Errors
     ///
-    /// If deleting the rows fails. A skill whose files can't be removed is
-    /// logged and left to startup's [`purge`](Self::purge), and the others
-    /// are still removed.
+    /// If deleting the rows fails. A name whose files can't be removed is
+    /// logged, and the others are still removed. Its pending files, which
+    /// are never mounted, stay on disk: until startup's
+    /// [`purge`](Self::purge) if no row has the name, or else, since purge
+    /// keeps every directory of a name with a row, until the name is next
+    /// added or removed.
     pub async fn drop_expired(&self) -> Result<(), SkillError> {
         let before = OffsetDateTime::now_utc() - PENDING_TTL - SWEEP_INTERVAL;
         for (agent, name) in self
@@ -538,7 +551,7 @@ impl Skills {
             .await?
         {
             if let Err(err) = self.drop_expired_files(agent, &name).await {
-                tracing::warn!(%agent, skill = name.as_str(), error = %err, "couldn't remove an expired skill's files; startup will");
+                tracing::warn!(%agent, skill = name.as_str(), error = %err, "couldn't remove an expired skill's pending files; they stay on disk, unmounted, until startup if no row has the name, or else until it is next added or removed");
             }
         }
         Ok(())

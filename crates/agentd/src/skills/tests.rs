@@ -713,29 +713,40 @@ async fn a_confirmation_whose_row_went_puts_back_only_what_it_moved() {
     let moved = h.data.join("moved");
     std::fs::create_dir_all(&moved).unwrap();
     std::fs::write(moved.join("SKILL.md"), "unconfirmed").unwrap();
+    std::fs::create_dir_all(h.pending("notes")).unwrap();
+    std::fs::write(h.pending("notes").join("SKILL.md"), "added since").unwrap();
     let work = h.skills.work_dir().await.unwrap();
     let ino = inode(&moved).await.unwrap();
     move_into(&moved, &h.live("notes"), &work.0).await.unwrap();
     h.skills
-        .put_back(&h.live("notes"), ino, &work.0)
+        .put_back(&h.live("notes"), ino, &h.pending("notes"), &work.0)
         .await
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(h.live("notes").join("SKILL.md")).unwrap(),
         skill_md("notes", &[])
     );
+    assert_eq!(
+        std::fs::read_to_string(h.pending("notes").join("SKILL.md")).unwrap(),
+        "added since"
+    );
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap().len(), 1);
     drop(work);
 
     std::fs::create_dir_all(&moved).unwrap();
+    std::fs::write(moved.join("SKILL.md"), "unconfirmed").unwrap();
     let work = h.skills.work_dir().await.unwrap();
     let ino = inode(&moved).await.unwrap();
     move_into(&moved, &h.live("new"), &work.0).await.unwrap();
     h.skills
-        .put_back(&h.live("new"), ino, &work.0)
+        .put_back(&h.live("new"), ino, &h.pending("new"), &work.0)
         .await
         .unwrap();
     assert!(!h.live("new").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.pending("new").join("SKILL.md")).unwrap(),
+        "unconfirmed"
+    );
     assert!(h.live("notes").join("SKILL.md").is_file());
     drop(work);
     assert!(h.work_is_empty());
@@ -757,13 +768,14 @@ async fn a_confirmation_leaves_files_that_replaced_the_ones_it_moved() {
     let other = h.skills.work_dir().await.unwrap();
     move_into(&newer, &h.live("notes"), &other.0).await.unwrap();
     h.skills
-        .put_back(&h.live("notes"), ino, &work.0)
+        .put_back(&h.live("notes"), ino, &h.pending("notes"), &work.0)
         .await
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(h.live("notes").join("SKILL.md")).unwrap(),
         "newer"
     );
+    assert!(!h.pending("notes").exists());
 }
 
 #[tokio::test]
@@ -791,6 +803,60 @@ async fn a_stale_confirmation_restores_the_active_skill_and_its_row() {
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
     assert!(h.hosts().await.is_empty());
     assert!(h.work_is_empty());
+    assert!(h.pending("gh").join("SKILL.md").is_file());
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn a_stale_confirmation_leaves_a_skill_added_again_waiting() {
+    let h = harness().await;
+    h.waiting_since("gh", Duration::from_secs(60)).await;
+    let read = h.store.agent_skills(h.agent).await.unwrap();
+    let again = format!("{}Added again.\n", skill_md("gh", &["api.github.com"]));
+    h.upload("SKILL.md", &again).await.unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_ne!(rows, read);
+    assert_eq!(
+        h.skills.confirm_row(&read[0]).await.unwrap(),
+        Confirmed::NotPending
+    );
+    assert!(!h.live("gh").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.pending("gh").join("SKILL.md")).unwrap(),
+        again
+    );
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert!(h.hosts().await.is_empty());
+    assert!(h.work_is_empty());
+
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(h.live("gh").join("SKILL.md")).unwrap(),
+        again
+    );
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn a_confirmation_that_cant_move_the_files_aside_fails_and_keeps_the_row() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    let agent_dir = h.pending("gh").parent().unwrap().to_owned();
+    std::fs::remove_dir_all(&agent_dir).unwrap();
+    std::fs::write(&agent_dir, "not a directory").unwrap();
+    assert!(h.skills.confirm(h.agent, "gh").await.is_err());
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert!(h.hosts().await.is_empty());
 }
 
 #[tokio::test]

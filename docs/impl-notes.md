@@ -5425,8 +5425,8 @@ with a `pending` row; the reply lists the hosts and asks for
 moves the files into the agent's skills and makes the row `active`, which is
 when its hosts count. A confirmation after the hour answers that the skill
 waited too long; the sweeper drops expired ones every minute, with their
-files, and startup too. The parser gained `SkillCommand::Confirm`, and the design's command
-table lists it.
+files, and startup too. The parser gained `SkillCommand::Confirm`, and the
+design's command table lists it.
 
 ### Skills are rows, their files are directories
 
@@ -5675,20 +5675,21 @@ files in, so a failure anywhere leaves either nothing waiting or a row
 without files, which `confirm` refuses. `Store::confirm_skill` takes the
 row `confirm` read and makes it active only while its hosts and `added_at`
 are unchanged. When it isn't, `confirm` undoes only its own move: the
-active skill it set aside goes back, or, with none, the files it moved are
-removed, unless something else has taken their place since (checked by
-inode). `confirm` first renames the pending directory into its own work
-directory, where no concurrent add can replace it, and takes the inode
-there. It also reads the moved `SKILL.md` again and confirms only when its
-hosts are the row's: two adds of one name racing can leave one's row with
-the other's files, and those go back to wait, unconfirmable, until the
-skill is added again or expires. A test confirms a stale copy of the row
-(`added_at` a second earlier) while an active version exists: reverting
-the undo to removing the skill by name fails it. The sweeper drops pending rows `PENDING_TTL` plus one
-`SWEEP_INTERVAL` after they were added, while `confirm` still calls a skill
-expired after `PENDING_TTL`. A test replaces a waiting skill with one
-declaring another host while the pending directory can't be written, then
-confirms: before the fix the confirmation made the new host active.
+active skill it set aside goes back, and the files it moved go back to the
+pending directory, unless something else has taken their place since
+(checked by inode). `confirm` first renames the pending directory into its
+own work directory, where no concurrent add can replace it, and takes the
+inode there. It also reads the moved `SKILL.md` again and confirms only
+when its hosts are the row's: two adds of one name racing can leave one's
+row with the other's files, and those go back to wait, unconfirmable, until
+the skill is added again or expires. A test confirms a stale copy of the
+row (`added_at` a second earlier) while an active version exists: reverting
+the undo to removing the skill by name fails it. The sweeper drops pending
+rows `PENDING_TTL` plus one `SWEEP_INTERVAL` after they were added, while
+`confirm` still calls a skill expired after `PENDING_TTL`. A test replaces
+a waiting skill with one declaring another host while the pending directory
+can't be written, then confirms: before the fix the confirmation made the
+new host active.
 
 Startup's purge keeps both directories of a name that has a row in either
 state, so it no longer depends on a rename updating the moved directory's
@@ -5760,11 +5761,24 @@ test drives between the delete and the removal). A pending row is what
 owns the directory: an active row of the name may sit next to an expired
 update's files, and keeping them for it would leave them for good, since
 purge keeps every directory of a name with a row. A name whose files can't
-be removed, or whose rows can't be read, is logged and left to startup's
-purge; the other names are still removed, since their rows are already
-gone.
+be removed, or whose rows can't be read, is logged, and the other names are
+still removed, since their rows are already gone. Its pending files stay on
+disk, never mounted: startup's purge removes them if no row has the name,
+but it keeps every directory of a name with a row, so next to an active row
+they stay until the name is next added or removed.
 
-One window remains, in the sweeper: an add that records its row and moves
+A confirmation whose row was replaced while it moved the files reached a
+skill added again the same way: the add may have moved its files into the
+pending directory before the confirmation moved them aside, and undoing the
+move removed them, leaving the new row without files. It now moves the
+files it moved back to the pending directory, as it does for files that
+declare other hosts, and puts back the skill they replaced; a confirmation
+of the new row meanwhile answers that nothing waits, and works once they
+are back. If an add has put files there since, they are that add's, whose
+move would have replaced the ones moved anyway, so those are left in the
+confirmation's work directory, whose guard removes them.
+
+That leaves one window, in the sweeper: an add that records its row and moves
 its files in between the sweeper's check and its removal loses its files,
 and `skill confirm` then answers that nothing waits until the skill is
 added again or the row expires. Nothing is granted meanwhile: files in the
