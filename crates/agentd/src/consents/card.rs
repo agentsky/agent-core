@@ -192,7 +192,11 @@ impl Card<'_> {
         }));
         Rich {
             markdown,
-            fallback: self.fallback(),
+            fallback: format!(
+                "{}, expires at {}.",
+                self.fallback(),
+                expiry(self.consent.expires_at)
+            ),
             blocks: Some(Value::Array(blocks)),
         }
     }
@@ -209,14 +213,19 @@ impl Card<'_> {
         }));
         Rich {
             markdown,
-            fallback: format!("{} {outcome}", self.fallback()),
+            fallback: format!("{}: {outcome}", self.fallback()),
             blocks: Some(Value::Array(blocks)),
         }
     }
 
-    /// The notification's text.
+    /// The start of the notification's text: the agent and who asked, as
+    /// the card names them.
     fn fallback(&self) -> String {
-        format!("Private task request for {}", self.agent)
+        format!(
+            "Private task request for {} from {}",
+            slack_safe(self.surface, self.agent),
+            self.requester()
+        )
     }
 
     /// Who asked, by a handle that stays the same: a mention on Slack for
@@ -602,6 +611,11 @@ mod tests {
         assert_eq!(actions["elements"][0]["value"], consent.id.to_string());
         assert!(open.markdown.contains(&format!("`approve {}`", consent.id)));
         assert!(open.markdown.contains("1970-01-02 00:00 UTC"));
+        assert_eq!(
+            open.fallback,
+            "Private task request for helper from <@U0BOB> (`U0BOB`), expires at 1970-01-02 \
+             00:00 UTC."
+        );
 
         consent.state = ConsentState::Approved;
         consent.decided_by = Some(consent.requester.key.clone());
@@ -615,6 +629,10 @@ mod tests {
             requester_name: None,
         }
         .closed();
+        assert_eq!(
+            closed.fallback,
+            "Private task request for helper from <@U0BOB> (`U0BOB`): Approved by <@U0BOB>."
+        );
         let text = closed.blocks.unwrap().to_string();
         assert!(!text.contains("actions"), "{text}");
         assert!(text.contains("Approved by <@U0BOB>."), "{text}");

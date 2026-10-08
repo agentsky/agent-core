@@ -8170,6 +8170,14 @@ buttons); on Rocket.Chat its one message is edited to the outcome. An
 update that fails on the way (a rate limit or a transport error) releases
 its claim and is tried on a later pass; one the platform refuses is not
 tried again, and the card's buttons answer that the task was settled.
+`claim_consent_card_close` sets `card_closed_at`, which is both the claim
+and the mark that the card was closed, so an instance that stops between
+the claim and `update_rich` (a crash, or a drain timeout aborting
+`close_cards` mid-update) leaves the card with live-looking buttons for
+good. Clicking them is refused safely: `Consents::decide` answers
+`Decided::Settled`. A lease apart from the done mark, as the relink notices
+got, would fix it, but needs a migration, which a cosmetic leftover isn't
+worth.
 
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a

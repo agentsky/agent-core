@@ -3144,3 +3144,20 @@ Not scheduled. Each needs a decision before it becomes a task.
   would need to miss it for a message to be lost, but a lone agent in a room,
   or an agentd restart, loses it. Fetching each room's history since the last
   message seen, through the same deduplication, would close the gap.
+- **Keeping a private task's result when its delivery fails.** Posting an
+  approved private task's reply is retried only after a rate limit, so a
+  transport error or a 5xx on the post loses it, and so does the agent's
+  bot being removed from the thread while the task ran, after
+  `run_private_task`'s `can_post` check; the thread is told only that part
+  of the reply couldn't be delivered, if that posts. `run_private_task`
+  still returns `Ran::Done`, so `finish_consent` stops the private
+  sessions and deletes their directories, which held the only copy of the
+  result left (the CLI's transcript, and what the task wrote in `work/`).
+  The requester has to ask again, which takes a new consent and a rerun
+  billed to the owner. Returning an error instead wouldn't help: the next
+  claim finds the session reached the model and tells the thread the task
+  was interrupted. A fix needs the result stored durably (the private
+  output in the database), a redelivery path with backoff, and
+  `consent_posted` redefined for a partial post, since any chunk posted
+  now counts as the consent's last word, all within T33's rule that every
+  path a consent's work takes ends in `finish_consent`.
