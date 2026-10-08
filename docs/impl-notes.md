@@ -8174,10 +8174,12 @@ tried again, and the card's buttons answer that the task was settled.
 and the mark that the card was closed, so an instance that stops between
 the claim and `update_rich` (a crash, or a drain timeout aborting
 `close_cards` mid-update) leaves the card with live-looking buttons for
-good. Clicking them is refused safely: `Consents::decide` answers
-`Decided::Settled`. A lease apart from the done mark, as the relink notices
-got, would fix it, but needs a migration, which a cosmetic leftover isn't
-worth.
+good. `close_cards` reads the agent before claiming, so a store error
+there leaves no claim behind. Clicking such buttons is refused safely:
+`Consents::decide` answers `Decided::Settled`, or `Decided::NotYours` once
+the agent is deleted. A lease apart from the done mark, as the relink
+notices got, would fix it, but needs a migration, which a cosmetic
+leftover isn't worth.
 
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a

@@ -213,7 +213,7 @@ impl Card<'_> {
         }));
         Rich {
             markdown,
-            fallback: format!("{}: {outcome}", self.fallback()),
+            fallback: format!("{}. {outcome}", self.fallback()),
             blocks: Some(Value::Array(blocks)),
         }
     }
@@ -631,11 +631,28 @@ mod tests {
         .closed();
         assert_eq!(
             closed.fallback,
-            "Private task request for helper from <@U0BOB> (`U0BOB`): Approved by <@U0BOB>."
+            "Private task request for helper from <@U0BOB> (`U0BOB`). Approved by <@U0BOB>."
         );
         let text = closed.blocks.unwrap().to_string();
         assert!(!text.contains("actions"), "{text}");
         assert!(text.contains("Approved by <@U0BOB>."), "{text}");
+
+        consent.state = ConsentState::Expired;
+        let expired = Card {
+            consent: &consent,
+            agent: "helper",
+            files: &files,
+            owners: false,
+            paused: false,
+            surface: consent.thread.conv.surface,
+            requester_name: None,
+        }
+        .closed();
+        assert_eq!(
+            expired.fallback,
+            "Private task request for helper from <@U0BOB> (`U0BOB`). Expired: nobody answered \
+             in time."
+        );
     }
 
     /// The body of the first code block Rocket.Chat's message parser
