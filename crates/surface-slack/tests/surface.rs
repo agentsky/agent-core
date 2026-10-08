@@ -2190,9 +2190,27 @@ async fn an_event_naming_the_organization_only_the_lookup_gives_is_dropped() {
 
 #[tokio::test]
 async fn a_refused_home_lookup_drops_the_message_and_only_the_directory_warns() {
-    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    const REFUSING: &str = "T0REFUSES";
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    event.conv.team = REFUSING.into();
+    event.message.conv.team = REFUSING.into();
+    event.sender.team = REFUSING.into();
     let ts = event.message.id.as_str();
-    let (server, surface) = confirming_setup(public_channel()).await;
+    let server = MockServer::start().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let surface = SlackSurface::new(
+        client.bot(SecretString::from(TOKEN)),
+        Arc::new(TeamDirectory::new(REFUSING.into())),
+    )
+    .with_bot_user(Some(BOT_USER.into()));
+    let mut channel = public_channel();
+    channel["id"] = json!(CHANNEL);
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": channel})),
+    )
+    .await;
     mount(
         &server,
         "conversations.history",
@@ -2214,9 +2232,20 @@ async fn a_refused_home_lookup_drops_the_message_and_only_the_directory_warns() 
     assert_eq!(
         (count("DEBUG"), count("WARN")),
         (2, 0),
-        "the directory warns of the failed lookup: {noted}"
+        "the surface's own line is debug: {noted}"
     );
     assert!(noted.contains("missing_scope"), "{noted}");
+    let warned = logs
+        .snapshot()
+        .matching("couldn't ask Slack whether a user is home")
+        .matching(REFUSING)
+        .to_string();
+    assert_eq!(
+        warned.lines().filter(|line| line.contains("WARN")).count(),
+        1,
+        "the directory warns once a minute: {warned}"
+    );
+    assert!(warned.contains("missing_scope"), "{warned}");
 }
 
 #[tokio::test]

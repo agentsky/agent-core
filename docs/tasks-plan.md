@@ -3512,8 +3512,11 @@ Design: [Slack Connect](design.md#slack-connect), its
 Deliverables:
 
 - `core-types`:
-  - `Outside { team: Option<TeamId> }`: the sender's own organization, or
-    `None` when Slack named none.
+  - `Outside { team: TeamId }`: the sender's own organization, as the
+    message's own team fields name it. (First planned as
+    `Option<TeamId>`, with `None` when Slack named none; superseded, see
+    the T36a entry "The home lookup never sets `outside`" in
+    `docs/impl-notes.md`.)
   - `InboundEvent::outside: Option<Outside>` and
     `Requester::outside: Option<Outside>`, `None` for home members and on
     Rocket.Chat, with `#[serde(default)]` so stored requesters and agentctl
@@ -3591,15 +3594,18 @@ Deliverables:
     dropped from the cache is looked up again, never taken as home. A
     caller can ask it not to wait for a used-up quota
     (`WebApi::without_waiting`).
-  - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
-    SurfaceError>` never waits for a used-up quota, and skips a bot sender
-    (`sender_is_bot` or `sender_bot_user` set), whose `outside` decides
-    nothing. When the fields
-    left `outside` `None` and `home_user` doesn't say home, it sets
-    `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
-    `Unauthorized` error too, and so it does for a sender keyed by another
-    surface or workspace. It returns `Transport` and `RateLimited` as they
-    came, leaving `outside` alone; Slack's `fatal_error`,
+  - `SlackSurface::copy_sender_is_home(&InboundEvent) -> Result<bool,
+    SurfaceError>` (first planned as `fill_sender_team`, which set
+    `Some(Outside { team: None })`; superseded, see the T36a entry "The
+    home lookup never sets `outside`" in `docs/impl-notes.md`) never waits
+    for a used-up quota, answers no for a copy whose fields set `outside`,
+    and yes for a bot sender (`sender_is_bot` or `sender_bot_user` set),
+    whose `outside` decides nothing. Otherwise it answers yes only when the
+    directory says home; `confirm` drops a copy its fields leave home when it
+    answers no, for any error but `Transport` and `RateLimited` too, and so
+    for a sender keyed by another surface or workspace. The lookup never sets
+    `outside`. It returns `Transport` and `RateLimited` as they
+    came; Slack's `fatal_error`,
     `internal_error`, `request_timeout` and `service_unavailable` are
     `Transport` (`web::map_error`), as an HTTP 5xx is. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
@@ -3619,11 +3625,11 @@ Deliverables:
     may be addressed to the agent (T28), so most traffic costs no lookup
     either.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): the copy's `outside`
-  and organization come from Slack's data only, the copy's own team fields,
-  else the home lookup's `team_id` or `enterprise_user.enterprise_id`;
-  nothing of the event's is carried into the copy. `agreeing_copy` drops
-  the message, before the copy is routed, when the event and a person's
-  copy disagree on `outside`, organization included, in either direction.
+  and organization come from the copy's own team fields only, never from the
+  home lookup, whose answer only keeps or drops a copy its fields leave home;
+  nothing of the event's is carried into the copy. `agreeing_copy` drops the
+  message, before the copy is routed, when the event and a person's copy
+  disagree on `outside`, organization included, in either direction.
   `copy_stands`, which lets a copy stand when only a limit's refusal
   differs, compares the requester's `MemberKey` and `outside` too, and
   keeps ignoring the requester's `member`, which may be made for the
@@ -3807,12 +3813,14 @@ Deliverables:
   the columns, and keeps it for `consents`, since a consent never has an
   outside requester.
   Whether a listed organization can be admitted at all rests on T36e:
-  confirmation keeps the copy's own `outside`, and for a copy whose fields
-  don't name the organization the home check names the one `users.info`
-  gives for the sender. `agreeing_copy` then agrees whenever the event's
-  field and that lookup name the same id, so what T36b must verify is that
-  the two use one id form (the canonical id above, from T36e item 9);
-  where they don't, every copy disagrees and is dropped.
+  confirmation keeps the copy's own `outside`, from its own team fields
+  only, and `agreeing_copy` agrees only when the event's fields and the
+  copy's name the same id; what T36b must verify is that both are read in
+  one id form (the canonical id above, from T36e item 9). A copy whose
+  fields don't name the organization is dropped unless the home check
+  says home; the organization `users.info` gives is for logs only and
+  must never become the copy's `outside`, which would let a forged event
+  naming it stand.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,

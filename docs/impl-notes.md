@@ -9501,11 +9501,12 @@ anything but `Membership::Home`, a refused lookup included; a transport
 error or a rate limit still fails the confirmation. A sender who isn't a
 member by Slack's lookup is warned of with that reason, the binding and
 the workspace `users.info` gave, at most once a minute per binding and
-reason (`TeamDirectory::note_drop`, keyed by a `DropReason`); a refused
-lookup is warned of once, by the directory, as any failed home check is,
-and the surface's own line for it is debug. The pipeline's line for an
-unconfirmed message, which names the binding, no longer says the platform
-doesn't have it, which read as a forgery.
+reason (`TeamDirectory::note_drop`, keyed by a `DropReason`). A refused
+lookup gives two warnings: the directory's failed-lookup warning, once a
+minute per workspace as for any home check, and the pipeline's general
+line for an unconfirmed message, throttled per agent; the surface's own
+line for it is debug. That pipeline line names the binding and no longer
+says the platform doesn't have the message, which read as a forgery.
 A copy's `outside` is now its own fields alone, which always name a team,
 so `core_types::Outside::team` is a plain `TeamId` (no producer lacked
 one: hops and Rocket.Chat set none, and the store refuses outside
@@ -9558,7 +9559,8 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
 ### Smaller fixes from review round 1
 
 - `fill_sender_team` sets a sender keyed by another surface or workspace
-  outside rather than leaving them home.
+  outside rather than leaving them home. (Superseded: `confirm` now drops
+  such a copy; see "The home lookup never sets `outside`".)
 - `member_who_left` needs the user's own `team_id` to be the workspace, so
   a member of another organization, or of another workspace of the
   organization, deactivated there deletes nothing here.
