@@ -22,6 +22,7 @@
 //!
 //! Neither token ever reaches a log line, an error or a reply.
 
+use std::fmt;
 use std::time::Duration;
 
 use core_types::{MemberKey, SurfaceError, SurfaceKind};
@@ -133,7 +134,7 @@ impl Commands {
             ));
         }
         let rotated = stored(rotated);
-        let kept = retry_store("storing a checked configuration token", || {
+        let kept = retry_store("storing a checked configuration token", member, || {
             self.inner
                 .store
                 .put_slack_config_token(member, &key.team, &rotated, now())
@@ -192,10 +193,13 @@ impl Commands {
 /// waiting a little longer after each failure, for store work a passing
 /// error mustn't lose: a pair `tooling.tokens.rotate` returned, which
 /// used up the old refresh token, or the deletion of a departed member's
-/// token, whose Slack event isn't delivered again. `what` names the work
-/// in the log.
+/// token, whose Slack event isn't delivered again. Only a database error
+/// is tried again; a value that can't be sealed, opened or parsed fails
+/// the same way every time. Each failure but the last is logged with
+/// `what`, naming the work, and `member`, an id of whose it is.
 pub(crate) async fn retry_store<T, F>(
     what: &'static str,
+    member: impl fmt::Display,
     mut op: impl FnMut() -> F,
 ) -> Result<T, StoreError>
 where
@@ -205,8 +209,8 @@ where
     let mut wait = STORE_RETRY_WAIT;
     loop {
         match op().await {
-            Err(err) if attempt < STORE_ATTEMPTS => {
-                tracing::warn!(what, attempt, error = %err, "a store operation failed; trying again");
+            Err(err @ StoreError::Database(_)) if attempt < STORE_ATTEMPTS => {
+                tracing::warn!(what, %member, attempt, error = %err, "a store operation failed; trying again");
                 tokio::time::sleep(wait).await;
                 attempt += 1;
                 wait *= 2;
@@ -340,7 +344,7 @@ impl ConfigTokenRotator {
         match rotation {
             Ok(rotated) => {
                 let rotated = stored(rotated);
-                let kept = retry_store("storing a renewed configuration token", || {
+                let kept = retry_store("storing a renewed configuration token", row.member, || {
                     self.store
                         .update_rotated_slack_config_token(row, &rotated, now())
                 })

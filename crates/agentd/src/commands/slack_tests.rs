@@ -972,6 +972,7 @@ fn departed() -> Value {
     envelope["event"].clone()
 }
 
+/// The `user_change` saying `U0HUMAN02` was deleted.
 fn departure() -> SlackInbound {
     user_change(departed())
 }
@@ -1539,6 +1540,15 @@ async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() 
     let logs = logs.snapshot();
     assert!(
         logs.contains("couldn't delete the configuration token of a member who left"),
+        "{logs}"
+    );
+    let retries: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("a store operation failed; trying again"))
+        .collect();
+    assert_eq!(retries.len(), 3, "{logs}");
+    assert!(
+        retries.iter().all(|line| line.contains("U0HUMAN02")),
         "{logs}"
     );
     assert!(!logs.contains("SECRET"));

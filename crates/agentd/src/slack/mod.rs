@@ -140,6 +140,7 @@ impl Inbound {
         let (store, key) = (&self.store, &key);
         let deleted = retry_store(
             "deleting a departed member's configuration token",
+            key,
             || async move {
                 match store.member_for_identity(key).await? {
                     Some(member) => store.delete_slack_config_token(member, &key.team).await,
