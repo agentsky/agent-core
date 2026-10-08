@@ -18,7 +18,10 @@
 //! `ctl_tokens`, with the session, agent, volume and container address it
 //! was issued for. [`purge`](Ctl::purge) deletes every token and scope lock
 //! at startup: the containers they belong to are reaped then, and Docker
-//! can give their addresses to new containers.
+//! can give their addresses to new containers. For the same reason, issuing
+//! a token replaces any other bound to the same address, so a token whose
+//! revocation failed when its container stopped can't be presented from the
+//! next container given that address.
 //!
 //! # Requests
 //!
@@ -231,8 +234,9 @@ impl Ctl {
     /// Mints the token of a new `claude` process, for its `AGENTCTL_TOKEN`.
     ///
     /// No turn is running on it yet. A token already issued for the same
-    /// session is revoked, with the session's leases: a session runs one
-    /// process at a time.
+    /// session, or bound to the same container address, is revoked, with
+    /// its session's leases and its turn's outbox: a session runs one
+    /// process at a time, and an address holds one container at a time.
     ///
     /// # Errors
     ///
