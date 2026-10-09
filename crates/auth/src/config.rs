@@ -24,7 +24,8 @@ pub struct OAuthConfig {
     pub redirect_uri: String,
     /// The OAuth client ID.
     pub client_id: String,
-    /// The scopes to request, separated by spaces.
+    /// The scopes to request, separated by spaces: a subset of
+    /// [`ALLOWED_SCOPES`].
     pub scopes: String,
     /// The account profile endpoint the plan is read from.
     pub profile_url: String,
@@ -44,6 +45,17 @@ impl Default for OAuthConfig {
     }
 }
 
+/// The only scopes [`OAuthConfig::scopes`] may name: the profile needs the
+/// first and the credential proxy the second. The proxy forwards any path,
+/// so a wider scope on a linked token, such as one that controls the
+/// member's cloud sessions, would be usable from every turn on that
+/// member's credential.
+pub const ALLOWED_SCOPES: [&str; 2] = ["user:profile", "user:inference"];
+
+/// Why `scopes` naming another scope is refused, naming each of
+/// [`ALLOWED_SCOPES`].
+const OTHER_SCOPES: &str = "may name only user:profile and user:inference";
+
 /// An invalid [`OAuthConfig`] value, named by its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("claude_oauth.{key}: {reason}")]
@@ -58,10 +70,13 @@ impl OAuthConfig {
     /// Checks every value.
     ///
     /// URLs must be absolute `https` URLs without credentials or a fragment.
-    /// Plain `http` is accepted only for a loopback host (`localhost`,
-    /// `127.0.0.1`, `[::1]`), for tests and local fakes, because tokens and
-    /// codes travel in these requests. The client ID and scopes must be
-    /// non-empty.
+    /// Plain `http` is accepted only for a loopback IP address (anything in
+    /// `127.0.0.0/8`, `[::1]`, or their IPv4-mapped forms), for tests and
+    /// local fakes, because tokens and codes travel in these requests.
+    /// `localhost` is a name that could resolve anywhere, so it is refused,
+    /// as for `[proxy] upstream` and `[cloud] base_url`. The client ID must be non-empty, and
+    /// the scopes must name at least one scope and none outside
+    /// [`ALLOWED_SCOPES`].
     ///
     /// # Errors
     ///
@@ -78,6 +93,15 @@ impl OAuthConfig {
             return Err(ConfigError {
                 key: "scopes",
                 reason: "must name at least one scope",
+            });
+        }
+        if self
+            .scope_list()
+            .any(|scope| !ALLOWED_SCOPES.contains(&scope))
+        {
+            return Err(ConfigError {
+                key: "scopes",
+                reason: OTHER_SCOPES,
             });
         }
         Ok(())
@@ -131,17 +155,7 @@ fn parse_url(key: &'static str, value: &str) -> Result<Url, ConfigError> {
 }
 
 fn is_loopback(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost")
-        || unbracketed
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+    url.host_str().is_some_and(core_types::is_loopback_ip_host)
 }
 
 #[cfg(test)]
@@ -238,15 +252,48 @@ mod tests {
     }
 
     #[test]
+    fn oauth_scopes_outside_profile_and_inference_are_refused() {
+        for scopes in [
+            "user:profile",
+            "user:inference",
+            "user:inference user:profile",
+            " user:profile\tuser:inference ",
+        ] {
+            assert_eq!(with("scopes", scopes).validate(), Ok(()), "{scopes}");
+        }
+        for scopes in [
+            "user:profile user:inference user:sessions:claude_code",
+            "user:sessions:claude_code",
+            "org:create_api_key user:profile",
+            "user:inference user:mcp_servers",
+            "User:Profile",
+            "user:profile,user:inference",
+        ] {
+            let err = with("scopes", scopes).validate().unwrap_err();
+            assert_eq!(err.key, "scopes", "{scopes}");
+            assert_eq!(err.reason, OTHER_SCOPES, "{scopes}");
+            for allowed in ALLOWED_SCOPES {
+                assert!(err.reason.contains(allowed), "{allowed}");
+            }
+            assert!(!err.to_string().contains("sessions"), "{scopes}");
+        }
+    }
+
+    #[test]
     fn plain_http_is_allowed_only_for_loopback() {
         for url in [
             "http://127.0.0.1:8080/token",
-            "http://localhost/token",
+            "http://127.9.9.9/token",
             "http://[::1]:9/token",
+            "http://[::ffff:127.0.0.1]:9/token",
         ] {
             assert_eq!(with("token_url", url).validate(), Ok(()), "{url}");
         }
-        for url in ["http://10.0.0.1/token", "http://localhost.example.com/"] {
+        for url in [
+            "http://10.0.0.1/token",
+            "http://localhost/token",
+            "http://localhost.example.com/",
+        ] {
             assert!(with("token_url", url).validate().is_err(), "{url}");
         }
     }
