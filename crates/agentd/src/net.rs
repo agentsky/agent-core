@@ -10,7 +10,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// How often [`RefuseSubnet`] logs a warning for one peer address. Further
 /// refusals from it within this window are logged at debug level, and
-/// counted in its next warning.
+/// counted in its next warning while the [`Throttle`] has room for the
+/// address ([`MAX_THROTTLE_KEYS`](core_types::throttle::MAX_THROTTLE_KEYS)).
 pub const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A TCP listener that drops every connection from one subnet as soon as it
