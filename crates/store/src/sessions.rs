@@ -315,6 +315,25 @@ impl Store {
         .await
     }
 
+    /// The sessions private tasks of consent `consent` ran in, oldest
+    /// first.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if a row doesn't parse.
+    pub async fn private_sessions_of(&self, consent: ConsentId) -> Result<Vec<Session>> {
+        let rows: Vec<Row> = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM sessions WHERE kind = 'private' AND consent_id = ? ORDER BY created_at, id"
+        ))
+        .bind(consent.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Row::into_session).collect()
+    }
+
     /// The session with id `id`, reset or not.
     ///
     /// # Errors

@@ -28,7 +28,7 @@ use runner::{PoolConfig, ProcessConfig};
 use sandbox::ProcessSandbox;
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use store::{AgentCreation, NewAgent, NewClaudeLink, Store, Visibility};
+use store::{AgentCreation, NewAgent, NewClaudeLink, Store, StoreError, Visibility};
 use testkit::{
     Call, FakeAnthropic, MockSurface, Op, TempDir, Turn, agentctl_path, fake_anthropic,
     fake_claude_path,
@@ -54,8 +54,12 @@ struct Mocks(Arc<MockSurface>);
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Mocks {
-    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        Some(self.0.clone())
+    async fn surface(
+        &self,
+        _agent: AgentId,
+        _conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        Ok(Some(self.0.clone()))
     }
 }
 

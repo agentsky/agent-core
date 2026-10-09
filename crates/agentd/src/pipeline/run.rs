@@ -1,4 +1,9 @@
-//! [`Pipeline`]: from an inbound message to the agents' replies.
+//! [`Pipeline`]: from an inbound message to the agents' replies, and
+//! private tasks' work ([`private`]).
+
+mod private;
+
+pub use private::{WORK_LEASE, WORK_MAX_ATTEMPTS, WORK_RETRY};
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -8,9 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use core_types::{
-    AgentId, Caps, ConvKind, CredentialRef, Hop, InboundEvent, MemberId, MemberKey, MsgRef,
-    ReplyTarget, Requester, ScopeKey, ScopeKind, SendError, Sender, Side, Sink, Surface,
-    SurfaceError, ThreadKey, Throttle, TurnId, TurnKind,
+    AgentId, Caps, ConsentId, ConvKind, ConvRef, CredentialRef, Hop, InboundEvent, MemberId,
+    MemberKey, MsgRef, ReplyTarget, Requester, ScopeKey, ScopeKind, SendError, Sender, SessionId,
+    Side, Sink, Surface, SurfaceError, ThreadKey, Throttle, TurnId, TurnKind,
 };
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
@@ -231,6 +236,8 @@ struct Inner {
     pending: Arc<Semaphore>,
     shares: Mutex<HashMap<MemberId, Share>>,
     tasks: Mutex<JoinSet<()>>,
+    private: Mutex<HashMap<ConsentId, private::Claim>>,
+    kills: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
     floods: Throttle<(AgentId, Flood)>,
@@ -382,6 +389,8 @@ impl Pipeline {
                 pending,
                 shares: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
+                private: Mutex::new(HashMap::new()),
+                kills: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
                 floods: Throttle::new(FLOOD_WARNING_INTERVAL),
@@ -409,6 +418,11 @@ impl Pipeline {
         }
     }
 
+    /// The manager bots the pipeline prompts and notifies through.
+    pub(crate) fn replies(&self) -> &Replies {
+        &self.inner.replies
+    }
+
     /// Stops taking messages: those sent from now on are dropped. It sets
     /// the flag under the lanes' lock, where queueing checks it, so a
     /// message is either queued before the close, and answered by the
@@ -422,7 +436,9 @@ impl Pipeline {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
-    /// Waits until every message taken is answered. Call it after
+    /// Waits until every message taken is answered, and the kills of
+    /// private tasks' turns cut short meanwhile have ended
+    /// ([`wait_for_kills`](Self::wait_for_kills)). Call it after
     /// [`close`](Self::close), or it may never end.
     ///
     /// Cancelling it leaves what is still running for
@@ -436,6 +452,7 @@ impl Pipeline {
             }
         }
         self.tell_cut().await;
+        self.wait_for_kills().await;
     }
 
     /// Closes the pipeline and drops every message still waiting or being
@@ -443,10 +460,15 @@ impl Pipeline {
     /// its working emoji taken off and its thread told to ask again
     /// ([`RESTARTING_TEXT`]), within a few seconds. Messages still waiting
     /// are dropped without a word: no decision was made about them yet.
+    /// The private tasks it drops are released for another instance, but
+    /// those whose turn had started are left to their kills, which
+    /// [`wait_for_kills`](Self::wait_for_kills) waits for: they release
+    /// the claim once the turn is billed.
     pub async fn cut_short(&self) {
         self.close();
         let mut tasks = std::mem::take(&mut *lock(&self.inner.tasks));
         tasks.shutdown().await;
+        self.release_cut_tasks().await;
         lock(&self.inner.lanes).clear();
         {
             let mut working = self.working();
@@ -670,7 +692,7 @@ impl Pipeline {
 
     async fn post_notice(&self, event: &InboundEvent, agent: AgentId, caps: Caps, notice: Notice) {
         let told = async {
-            let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+            let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
                 return Ok(());
             };
             if !surface.can_post(&event.conv).await? {
@@ -810,7 +832,13 @@ impl Pipeline {
     /// word.
     async fn confirmed(&self, job: &Job, agent: AgentId) -> Option<InboundEvent> {
         let (event, caps) = (job.event.as_ref(), job.caps);
-        let surface = self.inner.surfaces.surface(agent, &event.conv).await?;
+        let surface = match self.inner.surfaces.surface(agent, &event.conv).await {
+            Ok(surface) => surface?,
+            Err(err) => {
+                tracing::warn!(%agent, error = %err, "looking up an agent's surface failed");
+                return None;
+            }
+        };
         match surface.confirm(event).await {
             Ok(Some(copy))
                 if copy.message == event.message
@@ -894,7 +922,7 @@ impl Pipeline {
         requester: &Requester,
         text: fn(&str) -> String,
     ) -> Result<(), PipelineError> {
-        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             return Ok(());
         };
         if !surface.can_post(&event.conv).await? {
@@ -931,7 +959,7 @@ impl Pipeline {
             tracing::info!(%agent, message = %event.message.id, %reason, "refused a hop for its requester; told no one");
             return Ok(());
         }
-        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             return Ok(());
         };
         if !surface.can_post(&event.conv).await? {
@@ -1034,12 +1062,15 @@ impl Pipeline {
         for_owner: bool,
         outcome: &TurnOutcome,
     ) {
-        let store = &self.inner.store;
-        let now = (self.inner.settings.now)();
         let key = &turn.requester.key;
         let member = match turn.requester.member {
             Some(member) => member,
-            None => match store.ensure_member(key, key.user.as_str(), now).await {
+            None => match self
+                .inner
+                .store
+                .ensure_member(key, key.user.as_str(), (self.inner.settings.now)())
+                .await
+            {
                 Ok(member) => member,
                 Err(err) => {
                     tracing::warn!(%agent, requester = %key, error = %err, "couldn't find the member to bill a turn to");
@@ -1047,8 +1078,24 @@ impl Pipeline {
                 }
             },
         };
+        self.bill(member, agent, thread, for_owner, outcome).await;
+    }
+
+    /// Bills a turn of `agent` in `thread`, which ended as `outcome`, to
+    /// `member`, as [`meter`](Self::meter) does.
+    async fn bill(
+        &self,
+        member: MemberId,
+        agent: AgentId,
+        thread: &ThreadKey,
+        for_owner: bool,
+        outcome: &TurnOutcome,
+    ) {
+        let now = (self.inner.settings.now)();
         let usage = turn_usage(outcome);
-        if let Err(err) = store
+        if let Err(err) = self
+            .inner
+            .store
             .record_turn_usage(member, agent, thread, usage, for_owner, now)
             .await
         {
@@ -1075,7 +1122,7 @@ impl Pipeline {
         caps: Caps,
         turn: Run,
     ) -> Result<(), PipelineError> {
-        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
+        let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await? else {
             tracing::warn!(%agent, conv = %event.conv, "the agent has no surface in this conversation");
             return Ok(());
         };
@@ -1084,7 +1131,7 @@ impl Pipeline {
             return Ok(());
         }
         let target = reply_target(event, caps);
-        let (working, ran) = match self.prepare(agent, event, turn.credential).await {
+        let (working, ran) = match self.prepare(agent, &event.conv, turn.credential).await {
             Ok(None) => return Ok(()),
             Ok(Some(prepared)) => {
                 let owner = prepared.owner;
@@ -1111,13 +1158,13 @@ impl Pipeline {
                 let delivery = Delivery {
                     store: &self.inner.store,
                     surface: surface.as_ref(),
-                    session: &session,
+                    session: session.id,
                     agent,
                     requester: &turn.requester,
                     hop: turn.hop,
                     credential: turn.credential,
                     target,
-                    answered: &event.message,
+                    answering: Answering::Message(&event.message),
                 };
                 delivery.report(turn_id, report).await;
                 let their_own_dm = event.is_dm() && event.sender == turn.requester.key;
@@ -1141,19 +1188,19 @@ impl Pipeline {
         delivered
     }
 
-    /// What a turn of `agent` needs before its session: its bot's identity
-    /// and model, with the persona file and the bundled skill written.
-    /// `None` when the agent or its bot is gone.
+    /// What a turn of `agent` in `conv` needs before its session: its
+    /// bot's identity and model, with the persona file and the bundled
+    /// skill written. `None` when the agent or its bot is gone.
     async fn prepare(
         &self,
         agent: AgentId,
-        event: &InboundEvent,
+        conv: &ConvRef,
         credential: CredentialRef,
     ) -> Result<Option<Prepared>, PipelineError> {
         let Some(row) = self.inner.store.agent(agent).await? else {
             return Ok(None);
         };
-        let Some(bot) = self.bot_of(&row, event).await? else {
+        let Some(bot) = self.bot_of(&row, conv).await? else {
             return Ok(None);
         };
         runner::write_persona(&self.inner.settings.data_dir, agent, &row.persona).await?;
@@ -1323,12 +1370,8 @@ impl Pipeline {
         }
     }
 
-    /// The identity of `agent`'s bot on `event`'s surface and team.
-    async fn bot_of(
-        &self,
-        agent: &Agent,
-        event: &InboundEvent,
-    ) -> Result<Option<MemberKey>, StoreError> {
+    /// The identity of `agent`'s bot on `conv`'s surface and team.
+    async fn bot_of(&self, agent: &Agent, conv: &ConvRef) -> Result<Option<MemberKey>, StoreError> {
         Ok(self
             .inner
             .store
@@ -1336,14 +1379,14 @@ impl Pipeline {
             .await?
             .into_iter()
             .find(|binding| {
-                binding.surface == event.conv.surface
-                    && binding.team == event.conv.team
+                binding.surface == conv.surface
+                    && binding.team == conv.team
                     && binding.state == store::BindingState::Active
             })
             .and_then(|binding| binding.bot_user)
             .map(|user| MemberKey {
-                surface: event.conv.surface,
-                team: event.conv.team.clone(),
+                surface: conv.surface,
+                team: conv.team.clone(),
                 user,
             }))
     }
@@ -1629,13 +1672,34 @@ fn open_fence(text: &str) -> Option<&str> {
 struct Delivery<'a> {
     store: &'a Store,
     surface: &'a dyn Surface,
-    session: &'a Session,
+    session: SessionId,
     agent: AgentId,
     requester: &'a Requester,
     hop: Hop,
     credential: CredentialRef,
     target: ReplyTarget,
-    answered: &'a MsgRef,
+    answering: Answering<'a>,
+}
+
+/// What [`Delivery::post`] lost of a text; a lost chunk wins over a lost
+/// row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lost {
+    /// A chunk wasn't posted.
+    Chunk,
+    /// Every chunk was posted, but a chunk's `message_refs` row couldn't be
+    /// recorded.
+    Row,
+}
+
+/// What a delivered turn answers.
+#[derive(Clone, Copy)]
+enum Answering<'a> {
+    /// A message, which the reply's reactions go on.
+    Message(&'a MsgRef),
+    /// A private task's consent: its reply is headed with the consent's
+    /// id, and a failure on its credential names the owner's account.
+    PrivateTask(ConsentId),
 }
 
 impl Delivery<'_> {
@@ -1648,7 +1712,7 @@ impl Delivery<'_> {
         let (outbox, mut complete) = match report.finished {
             Ok(outbox) => (outbox, true),
             Err(err) => {
-                tracing::warn!(session = %self.session.id, error = %err, "the turn's outbox was lost");
+                tracing::warn!(session = %self.session, error = %err, "the turn's outbox was lost");
                 (None, false)
             }
         };
@@ -1665,16 +1729,31 @@ impl Delivery<'_> {
                 (capped(text), reactions)
             }
             TurnOutcome::Finished(_) => {
-                let text = CredentialFailure::of(&report.outcome)
-                    .map_or(FAILED_TEXT, |failure| failure.thread_text(self.credential));
+                let text =
+                    CredentialFailure::of(&report.outcome).map_or(
+                        FAILED_TEXT,
+                        |failure| match self.answering {
+                            Answering::Message(_) => failure.thread_text(self.credential),
+                            Answering::PrivateTask(_) => failure.private_task_text(),
+                        },
+                    );
                 (text.to_owned(), Vec::new())
             }
             TurnOutcome::Crashed { .. } => (FAILED_TEXT.to_owned(), Vec::new()),
             TurnOutcome::TimedOut { .. } => (TIMED_OUT_TEXT.to_owned(), Vec::new()),
         };
+        let reply = match self.answering {
+            Answering::PrivateTask(consent) => {
+                format!(
+                    "{}\n\n{reply}",
+                    crate::consents::card::result_heading(consent)
+                )
+            }
+            Answering::Message(_) => reply,
+        };
         tracing::info!(
             agent = %self.agent,
-            session = %self.session.id,
+            session = %self.session,
             %turn,
             success = report.outcome.is_success(),
             reply_len = reply.len(),
@@ -1687,12 +1766,14 @@ impl Delivery<'_> {
                 .upload(&self.target, outbox.attachments())
                 .await
         {
-            tracing::warn!(session = %self.session.id, error = %err, "uploading the turn's attachments failed");
+            tracing::warn!(session = %self.session, error = %err, "uploading the turn's attachments failed");
             complete = false;
         }
-        complete &= self.post(turn, &reply).await;
-        for emoji in reactions {
-            self.react(self.answered, &emoji).await;
+        complete &= self.post(Some(turn), &reply).await.is_ok();
+        if let Answering::Message(answered) = self.answering {
+            for emoji in reactions {
+                self.react(answered, &emoji).await;
+            }
         }
         if let Some(outbox) = &outbox {
             for reaction in outbox.reactions() {
@@ -1703,31 +1784,35 @@ impl Delivery<'_> {
                     target: queued.to.clone(),
                     ..*self
                 };
-                complete &= target.post(turn, &queued.text).await;
+                complete &= target.post(Some(turn), &queued.text).await.is_ok();
             }
         }
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
-            tracing::warn!(session = %self.session.id, error = %err, "couldn't say part of a reply was lost");
+            tracing::warn!(session = %self.session, error = %err, "couldn't say part of a reply was lost");
         }
     }
 
     /// Renders and posts Markdown `text` to the target, recording a
-    /// `message_refs` row for each chunk. A chunk that can't be posted is
-    /// skipped and the rest still go. Empty text posts nothing. False if a
-    /// chunk was lost, or posted without its row: unattributed, a mention
-    /// in it starts no hop, a reply to it reaches no agent, and the next
-    /// turn shows it again as history.
-    async fn post(&self, turn: TurnId, text: &str) -> bool {
+    /// `message_refs` row for each chunk, of `turn` if a turn made it. A
+    /// chunk that can't be posted is skipped and the rest still go. Empty
+    /// text posts nothing.
+    ///
+    /// # Errors
+    ///
+    /// What was lost ([`Lost`]): a chunk, or else a chunk's row, posted
+    /// unattributed, so a mention in it starts no hop, a reply to it reaches
+    /// no agent, and the next turn shows it again as history.
+    async fn post(&self, turn: Option<TurnId>, text: &str) -> Result<(), Lost> {
         if text.trim().is_empty() {
-            return true;
+            return Ok(());
         }
-        let mut complete = true;
+        let mut lost = None;
         for chunk in self.surface.render(text) {
             let posted = match post_chunk(self.surface, &self.target, &chunk).await {
                 Ok(posted) => posted,
                 Err(err) => {
-                    tracing::warn!(session = %self.session.id, conv = %self.target.conv, error = %err, "posting part of a reply failed");
-                    complete = false;
+                    tracing::warn!(session = %self.session, conv = %self.target.conv, error = %err, "posting part of a reply failed");
+                    lost = Some(Lost::Chunk);
                     continue;
                 }
             };
@@ -1735,28 +1820,32 @@ impl Delivery<'_> {
                 .store
                 .record_message_ref(
                     &NewMessageRef {
-                        session: self.session.id,
+                        session: self.session,
                         msg: &posted,
                         thread_root: self.target.thread_root.as_ref(),
                         agent: Some(self.agent),
-                        turn: Some(turn),
+                        turn,
                         requester: self.requester,
                         hop: self.hop,
+                        consent: match self.answering {
+                            Answering::PrivateTask(consent) => Some(consent),
+                            Answering::Message(_) => None,
+                        },
                     },
                     OffsetDateTime::now_utc(),
                 )
                 .await;
             if let Err(err) = recorded {
-                tracing::warn!(session = %self.session.id, msg = %posted.id, error = %err, "recording a posted message failed");
-                complete = false;
+                tracing::warn!(session = %self.session, msg = %posted.id, error = %err, "recording a posted message failed");
+                lost.get_or_insert(Lost::Row);
             }
         }
-        complete
+        lost.map_or(Ok(()), Err)
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) {
         if let Err(err) = self.surface.react(msg, emoji).await {
-            tracing::warn!(session = %self.session.id, error = %err, "adding a reaction failed");
+            tracing::warn!(session = %self.session, error = %err, "adding a reaction failed");
         }
     }
 }
@@ -1783,6 +1872,10 @@ enum PipelineError {
     Runner(#[from] RunnerError),
     #[error(transparent)]
     Surface(#[from] SurfaceError),
+    #[error("handing a private task its files: {0}")]
+    HandOver(std::io::Error),
+    #[error("a private task's outcome couldn't be posted")]
+    NotPosted,
 }
 
 /// The sink behind [`Pipeline::sink`].
@@ -1810,7 +1903,7 @@ mod tests {
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
     use crate::pipeline::TurnSettings;
-    use core_types::{BindingId, ConvRef, SessionId, SurfaceKind};
+    use core_types::{BindingId, ConvRef, SurfaceKind};
     use runner::{PoolConfig, ProcessConfig};
     use sandbox::ProcessSandbox;
     use testkit::TempDir;
@@ -2162,18 +2255,6 @@ mod tests {
         let surface = MockSurface::new();
         let key = lane_key();
         let event = event(&key);
-        let session = Session {
-            id: SessionId::new_v4(),
-            agent: key.0,
-            thread: key.1.clone(),
-            scope: ScopeKey::for_conversation(event.conv_kind, event.conv.clone()),
-            kind: runner::SessionKind::Normal,
-            started: true,
-            maybe_started: false,
-            created_at: event.received_at,
-            last_turn_at: None,
-            reset_at: None,
-        };
         let requester = Requester {
             member: None,
             key: event.sender.clone(),
@@ -2181,13 +2262,13 @@ mod tests {
         let delivery = Delivery {
             store,
             surface: &surface,
-            session: &session,
+            session: SessionId::new_v4(),
             agent: key.0,
             requester: &requester,
             hop: Hop::ZERO,
             credential: CredentialRef::Community,
             target: ReplyTarget::from(key.1),
-            answered: &event.message,
+            answering: Answering::Message(&event.message),
         };
         delivery.report(TurnId::new_v4(), report).await;
         surface.posts().into_iter().map(|(_, text)| text).collect()

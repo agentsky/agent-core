@@ -104,6 +104,10 @@ pub const DEFAULT_ATTACH_MAX_BYTES: u64 = 50 * 1024 * 1024;
 pub const DEFAULT_THREAD_TURNS_PER_HOUR: u32 = 30;
 /// The default for `limits.thread_tokens_per_day`.
 pub const DEFAULT_THREAD_TOKENS_PER_DAY: u64 = 2_000_000;
+/// The default for `limits.consent_ttl_secs`: a day.
+pub const DEFAULT_CONSENT_TTL_SECS: u64 = 24 * 60 * 60;
+/// The longest `limits.consent_ttl_secs` accepted: 30 days.
+pub const MAX_CONSENT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// The default for `slack.api_url`.
 pub const DEFAULT_SLACK_API_URL: &str = surface_slack::web::DEFAULT_BASE_URL;
 /// The default for `slack.install_reminder_secs`: an hour.
@@ -359,6 +363,17 @@ pub struct LimitsConfig {
     /// one thread in a day (UTC), input and output with cache reads left
     /// out, default [`DEFAULT_THREAD_TOKENS_PER_DAY`]. 0 means no budget.
     pub thread_tokens_per_day: u64,
+    /// `consent_ttl_secs`: how long a private task's consent card waits for
+    /// the owner's decision before it expires, from 1 to
+    /// [`MAX_CONSENT_TTL_SECS`], default [`DEFAULT_CONSENT_TTL_SECS`].
+    pub consent_ttl_secs: u64,
+}
+
+impl LimitsConfig {
+    /// [`consent_ttl_secs`](Self::consent_ttl_secs) as a [`Duration`].
+    pub fn consent_ttl(&self) -> Duration {
+        Duration::from_secs(self.consent_ttl_secs)
+    }
 }
 
 impl Default for LimitsConfig {
@@ -368,6 +383,7 @@ impl Default for LimitsConfig {
             max_hops: router::DEFAULT_MAX_HOPS.0,
             thread_turns_per_hour: DEFAULT_THREAD_TURNS_PER_HOUR,
             thread_tokens_per_day: DEFAULT_THREAD_TOKENS_PER_DAY,
+            consent_ttl_secs: DEFAULT_CONSENT_TTL_SECS,
         }
     }
 }
@@ -873,6 +889,12 @@ impl File {
         }
         if self.limits.attach_max_bytes == 0 {
             return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
+        }
+        if !(1..=MAX_CONSENT_TTL_SECS).contains(&self.limits.consent_ttl_secs) {
+            return Err(invalid(
+                "limits.consent_ttl_secs",
+                "must be from 1 to 2592000 (30 days)",
+            ));
         }
         if self.proxy.max_tunnels == 0 {
             return Err(invalid("proxy.max_tunnels", "must be at least 1"));
@@ -2054,6 +2076,21 @@ manager_user_id = "manager-id"
         assert_eq!(with(&text, env()).unwrap().limits.attach_max_bytes, 1024);
         let err = file_err(&format!("{MINIMAL}\n[limits]\nattach_max_bytes = 0\n"));
         assert_eq!(err.key(), Some("limits.attach_max_bytes"), "{err}");
+    }
+
+    #[test]
+    fn the_consent_ttl_defaults_to_a_day_and_is_bounded() {
+        let limits = with(MINIMAL, env()).unwrap().limits;
+        assert_eq!(limits.consent_ttl(), Duration::from_secs(86_400));
+        let text = format!("{MINIMAL}\n[limits]\nconsent_ttl_secs = 60\n");
+        assert_eq!(
+            with(&text, env()).unwrap().limits.consent_ttl(),
+            Duration::from_secs(60)
+        );
+        for bad in [0, MAX_CONSENT_TTL_SECS + 1] {
+            let err = file_err(&format!("{MINIMAL}\n[limits]\nconsent_ttl_secs = {bad}\n"));
+            assert_eq!(err.key(), Some("limits.consent_ttl_secs"), "{err}");
+        }
     }
 
     #[test]

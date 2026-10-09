@@ -121,6 +121,7 @@ impl Layout {
         let volume = VolumeRef {
             key: key.clone(),
             path: self.data_dir.join(&rel),
+            owner: self.owner,
         };
         let this = self.clone();
         let for_task = volume.clone();
