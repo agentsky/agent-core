@@ -2905,6 +2905,213 @@ flight count against the 10.
 **Solution.** The `agentctl-static` CI job checks for `INTERP` only, as the
 plan says.
 
+## T16: sandbox image and Compose
+
+### An internal network still reaches the host
+
+**Issue.** `internal: true` removes a network's route out, but Docker still
+gives the host the network's gateway address on the bridge. On Docker
+29.3.1, a container on an internal network connected to a listener that a
+host process had bound to `0.0.0.0`, through the gateway address. A sandbox
+could therefore reach anything listening on the host's wildcard address:
+sshd, a database, a development server. Published container ports were not
+reachable that way, and names outside the network didn't resolve.
+
+**Solution.** The `sandbox` network also sets the bridge driver option
+`com.docker.network.bridge.inhibit_ipv4: "true"`, so the host has no
+address on it; the same probe then fails, while agentd's address and its
+aliases on the network still answer. `scripts/ci/compose-test.sh` starts a
+listener on the host's wildcard address, shows it reachable through the
+`egress` gateway, and checks that a sandbox reaches it through neither
+gateway. Whatever creates the sandbox network outside this Compose file
+(a production deployment) needs the same option. The plan's network
+section says so.
+
+### Static addresses need an `ip_range`, and the range moves the gateway
+
+**Issue.** Compose starts containers in dependency order, and a container
+without a static address can take any free one. MongoDB started before
+agentd and took `172.31.0.2`, so agentd failed with "Address already in
+use". Limiting dynamic addresses with `ip_range` fixed that, but Docker
+then made the first address of the range, `172.31.0.128`, the gateway.
+
+**Solution.** Both networks set `ip_range` to the upper half of their
+subnet (`.128/25`) and name the gateway (`.1`) explicitly. agentd's static
+addresses stay in the lower half, so a container started earlier, or a
+sandbox started while agentd is recreated, can't take them. That leaves
+about 126 addresses for sandboxes on the default `/24`; a deployment that
+needs more running at once widens the subnet in both `compose.yaml` and
+`internal.sandbox_subnet`.
+
+### Custom roles need a Rocket.Chat Enterprise license
+
+**Issue.** The design gives the manager a custom role. On 7.13.9,
+`roles.create` is registered in `apps/meteor/ee/server/api/roles.ts` with
+`license: ['custom-roles']` and refuses without that license module.
+`roles.update` refuses too: [T11's live check](#the-live-check-against-7139)
+got the same `This is an enterprise feature` answer for the built-in `bot`
+role. The Community Edition, which the Compose stack runs, can only change
+which built-in roles hold a permission (`permissions.update`, which needs
+`access-permissions`).
+
+**Solution.** `deploy/compose/README.md` lists the permissions
+[T11's live check](#the-live-check-against-7139) settled, creates the
+custom role where a license allows it, and otherwise gives the manager the
+built-in `bot` and `app` roles, with the manager's permissions added to
+`app` and `create-personal-access-tokens` to `bot`. The manager is not an
+admin on either edition. The README also says the Community Edition must
+reach Rocket.Chat Cloud, or posts are refused with `restricted-workspace`.
+
+### The native installer isn't pinned
+
+**Issue.** `https://claude.ai/install.sh` redirects to
+`https://downloads.claude.ai/claude-code-releases/bootstrap.sh`, which
+downloads the latest build and runs `claude install <version>`: the pinned
+build goes to `~/.local/share/claude/versions/<version>`, linked from
+`~/.local/bin/claude`. The first image ran that as root, so whatever the
+latest script and build were at build time ran with root in the image,
+and nothing this repository pins said which bytes `<version>` was. Sessions
+also run with a `HOME` of their own on a read-only root, so nothing under
+the build's `HOME` is on their path.
+
+**Solution.** The image skips the installer and downloads
+`<releases>/<version>/<platform>/claude` itself, as `nobody` in a stage of
+its own, with `platform` `linux-x64` or `linux-arm64` from BuildKit's
+`TARGETARCH`, the layout the installer and the binary's updater use (the
+2.1.285 binary names `https://downloads.claude.ai/claude-code-releases` as
+its release base). The download must match `CLAUDE_CODE_SHA256_X64` or
+`CLAUDE_CODE_SHA256_ARM64`, pinned next to `CLAUDE_CODE_VERSION`, and print
+`<version> (Claude Code)`; only then is it copied to
+`/usr/local/bin/claude`, with `--chown=0:0`, since BuildKit keeps a
+stage-to-stage copy's ownership and the file would otherwise belong to
+`nobody` (harmless at mode 0755 on a read-only root, but `agentctl` is
+root's). The images job checks that both belong to root. The checksums are
+`platforms.<platform>.checksum` in the release's `manifest.json`; for
+2.1.285 the manifest was read from the release bucket, and the `linux-x64`
+binary downloaded from it hashed to the manifest's value and printed
+`2.1.285 (Claude Code)`. The CI build downloads it from
+`downloads.claude.ai` and `sha256sum` reports it OK. A copy outside
+`~/.local/bin` is left alone by the auto-updater, which
+`DISABLE_AUTOUPDATER=1` also turns off. `CLAUDE_CODE_VERSION` is still the
+only place the version is written: the CI check reads it from there.
+
+The base images (`rust`, `debian`, distroless `cc`) are pinned by the
+digests the CI build log printed for their tags. The Compose file's
+third-party images (Rocket.Chat, MongoDB, busybox) stay tags.
+
+### One init, Docker's
+
+**Issue.** The first image had `ENTRYPOINT ["/usr/bin/tini", "--"]`, and
+the sandbox crate's `container_config` sets `init: true` and the command
+`sleep infinity` without an entrypoint. A session container therefore ran
+Docker's init, which ran tini, which ran `sleep`.
+
+**Solution.** The crate's configuration is what production runs, so the
+image has no entrypoint and no `tini` package, and keeps `CMD ["sleep",
+"infinity"]` for a plain `docker run`. The Compose `sandbox` service sets
+`init: true` to match. The image check asserts that the image's entrypoint
+is empty and its command `sleep infinity`, and that PID 1 of a container
+started with `--init` is `/sbin/docker-init -- sleep infinity`.
+
+### agentd's data directory is created by root
+
+**Issue.** agentd runs as uid 10001, and Docker creates a missing bind
+mount source on the host owned by root, so agentd couldn't write its
+database.
+
+**Solution.** A one-shot `data-init` service (busybox) gives the directory
+to `10001:10001` with mode 0700 before agentd starts, through
+`depends_on` with `service_completed_successfully`. Only the top directory
+is changed; agentd owns what it creates inside.
+
+### Sandboxes on one network reach each other
+
+**Issue.** The first stack left inter-container traffic on for the
+`sandbox` network, and a reviewer showed a container on it connecting to a
+listener in another container there. Every sandbox shares that network, so
+a channel sandbox driven by any member's prompt could reach a private
+task's sandbox, or anything a session listens on. Turning inter-container
+traffic off (`com.docker.network.bridge.enable_icc: "false"`) stops that,
+but also stops sandboxes reaching agentd, which is on the same bridge.
+
+**Solution.** Both: `compose.yaml` turns inter-container traffic off and
+fixes the bridge's name (`com.docker.network.bridge.name: br-agent-sbx`),
+and `deploy/compose/isolate-sandbox.sh` adds a chain,
+`AGENT-CORE-SANDBOX`, jumped to from `DOCKER-USER` for traffic in and out
+of that bridge. It accepts new and established TCP connections to
+`172.30.0.2` on 8080 and 8081 and agentd's replies, and drops the rest.
+Docker evaluates `DOCKER-USER` before its own rules and never rewrites
+it, and an accept there skips Docker's inter-container drop. Without the
+rules the stack fails closed: sessions can't reach the credential proxy,
+rather than reaching each other. The chain is rebuilt on each run and the
+jump added once, so the script is idempotent, and `remove` takes both out.
+Bridged traffic only passes through iptables with `br_netfilter`
+(`net.bridge.bridge-nf-call-iptables=1`), which Docker turns on for a
+network with inter-container traffic off. The rules name the bridge, so
+they can go in before the network exists, but not survive a reboot.
+
+On Docker 29.3.1 with busybox stand-ins on a network built like `sandbox`:
+with inter-container traffic on and no rules a peer's listener answered;
+off and no rules, agentd's 8080 and 8081 didn't either; off with the rules,
+8080 and 8081 answered while agentd's 8443, the peer, and agentd
+connecting out to the peer didn't; on with the rules, the peer didn't
+answer either. `compose-test.sh`, run locally with stand-in images for
+agentd and the sandbox and the real Rocket.Chat and MongoDB, passed with
+the rules, and with inter-container traffic on and no rules failed exactly
+the new peer check. In CI (Docker 28.0.4 on ubuntu-24.04) the script
+adds the rules with `sudo` before the test and removes them after it, and
+the real stack passes. The plan's network section makes the same
+isolation a requirement for every deployment.
+
+### The sandbox bridge keeps an IPv6 link-local address
+
+**Issue.** The first test bound its host listener to IPv4 and checked
+nothing about IPv6. With `enable_ipv6: false`, Docker 28.0.4 on the CI
+runner still left the kernel's link-local address (`fe80::/64`, scope
+link) on the sandbox bridge, so "the host has no address on the network"
+holds for IPv4 only. No Compose or driver option removes it, and a
+host-wide sysctl to stop it would reach every interface.
+
+**Solution.** Docker turns IPv6 off on a container's interface on a
+network without IPv6 (`disable_ipv6` is 1 on `eth0`), and `/proc/sys` is
+read-only in a container without capabilities, so a sandbox has no IPv6
+address to reach the bridge's link-local one from. The test checks both
+sides: in a sandbox, `disable_ipv6` is 1 on `eth0` and
+`/proc/net/if_inet6` lists only `lo`; on the host, `ip addr` in the host's
+namespace shows no IPv4 address on the bridge and no IPv6 address but the
+link-local one. The host listener binds `::`, dual-stack, where the host
+has IPv6.
+
+### What the network test checks, and how
+
+**Issue.** Most "unreachable" checks pass trivially: a name on another
+network doesn't resolve from `sandbox`, and a stopped service refuses
+everyone.
+
+**Solution.** The test probes by address as well as by name, with bash's
+`/dev/tcp` under `timeout` as in T17's test, and runs every unreachable
+target once from the `egress` network first as a control. The stack uses
+the real images, so Rocket.Chat and MongoDB must be healthy (their Compose
+health checks) and agentd must answer `/healthz` before the probes run.
+The distroless agentd image has no shell or client for a health check, so
+the test polls `/healthz` with curl from a container on `egress`. The
+cloud metadata address `169.254.169.254` is checked as well, since the
+design blocks it.
+
+Three targets have no control, because nothing answers there by
+construction: agentd's sandbox address on 8443 (the public listener binds
+the egress address only), the sandbox gateway (the host has no address on
+the bridge, which the test checks with `ip addr` in the host's namespace),
+and the metadata address (runners have no metadata service to show). For
+sandbox-to-sandbox traffic a busybox listener starts on `egress`, answers a
+probe there, then moves to `sandbox` and must not answer the sandbox
+probe. The test overrides the networks' names
+(`AGENT_CORE_SANDBOX_NETWORK`, `AGENT_CORE_EGRESS_NETWORK`), which default
+to `sandbox` and `egress` as the plan and the sandbox crate's default
+expect. It sets `RC_ADMIN_PASS` and logs in as that admin through
+`/api/v1/login` from a container on `egress`, as README.md's step 2 does
+in a browser.
+
 ## T17: sandbox
 
 ### Docker can't signal an exec'd process
