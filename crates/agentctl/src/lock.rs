@@ -1,9 +1,10 @@
 //! `agentctl lock -- <command>`: run a command while holding the scope's
 //! `shared/` lock.
 //!
-//! agentctl acquires a lease, polling while another lease holds the lock,
-//! runs the command in a process group of its own, renews the lease while
-//! the command runs, and releases it when the command exits.
+//! agentctl picks a lease id and acquires the lock under it, polling while
+//! another lease holds the lock, runs the command in a process group of its
+//! own, renews the lease while the command runs, and releases it when the
+//! command exits.
 //!
 //! A lease is timed on agentctl's own monotonic clock, from when it sent the
 //! request that agentd answered with the lease's `seconds_left`, so skew
@@ -21,16 +22,36 @@
 //! failed on agentd's side (an internal error, such as a busy database) or
 //! in transit is retried until the deadline.
 //!
+//! An acquire that failed on agentd's side, or whose answer was lost (it
+//! timed out, was cut off, or couldn't be read), is retried until
+//! `--timeout` runs out. One that can't connect to agentd (its name doesn't
+//! resolve, the connection is refused, or connecting takes over five
+//! seconds) fails at once, so a wrong URL or an agentd that is down is
+//! reported straight away. A renewal that can't connect is retried like any
+//! other failed in transit: the command already runs under the lease, the
+//! deadline bounds the retries, and a brief outage shouldn't kill it.
+//!
+//! Each attempt is given the time left, at least seven seconds and at most
+//! thirty. Every attempt names the same lease, so one that agentd granted
+//! after agentctl stopped waiting for it is picked up by the next attempt
+//! instead of holding the lock against it. A grant can still land after
+//! agentctl has released the lease: a request held up in agentd past a
+//! later attempt that was granted, landing once the command ended, or once
+//! a lease too short or too long to hold, or a stop signal, made agentctl
+//! give it back. Nobody renews that lease, so it holds the lock for at most
+//! its TTL, thirty seconds by default.
+//!
 //! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start. During an
 //! acquire, agentctl lets a request already sent finish, for up to two
-//! seconds, and gives back the lease if it was granted. While the command
-//! runs, agentctl passes the signal on to the command's process group,
-//! gives it up to two seconds to exit (never past the lease's deadline),
-//! then kills the group. Either way it releases the lease and exits with
-//! 128 plus the signal. A process that leaves the group (with `setsid`,
-//! say) escapes the kill, and one the command leaves running when it exits
-//! on its own is not stopped. An agentctl killed outright stops renewing,
-//! and the lease expires on its own.
+//! seconds but not past the time it was given, then gives back the lease
+//! whether or not an answer said it was granted. While the
+//! command runs, agentctl passes the signal on to the command's process
+//! group, gives it up to two seconds to exit (never past the lease's
+//! deadline), then kills the group. Either way it releases the lease and
+//! exits with 128 plus the signal. A process that leaves the group (with
+//! `setsid`, say) escapes the kill, and one the command leaves running when
+//! it exits on its own is not stopped. An agentctl killed outright stops
+//! renewing, and the lease expires on its own.
 
 use std::ffi::OsString;
 use std::process::{ExitCode, ExitStatus};
@@ -61,9 +82,18 @@ const SAFETY_MARGIN: Duration = Duration::from_secs(1);
 /// it: enough to wait [`MIN_RENEW_WAIT`] and then renew it. With
 /// [`ROUNDING`] and [`SAFETY_MARGIN`], a lease must last three seconds.
 const MIN_TIME_LEFT: Duration = Duration::from_millis(500);
-/// How long an acquire already sent may take to finish after a stop signal,
-/// so a lease it was granted can be given back.
+/// How long an acquire already sent may take to finish after a stop signal
+/// before agentctl gives back the lease, so the release comes after a grant
+/// agentd is about to make. It never extends the request past the time it
+/// was given (see [`ATTEMPT_FLOOR`]).
 const ACQUIRE_GRACE: Duration = Duration::from_secs(2);
+/// The least time each acquire is given, even past `--timeout`; the
+/// client's request timeout caps it at thirty seconds. It outlasts agentd's
+/// `store::BUSY_TIMEOUT` (five seconds) waiting for a busy database, so the
+/// common slow answer isn't abandoned. A grant later still isn't lost
+/// either: the next attempt names the same lease and gets it back. With the
+/// default `--timeout`, it keeps `lock` under the Bash tool's two minutes.
+const ATTEMPT_FLOOR: Duration = Duration::from_secs(7);
 /// How long the command may take to exit after agentctl passes a stop
 /// signal on to it, before its process group is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -90,9 +120,10 @@ pub async fn run(
     command: &[OsString],
 ) -> Result<ExitCode, String> {
     let (program, args) = command.split_first().ok_or("lock needs a command")?;
+    let lease = LeaseId::new_v4();
     let mut stop = Stop::install();
-    let (lease, deadline) = match acquire(client, timeout, &mut stop).await? {
-        Acquired::Held { lease, deadline } => (lease, deadline),
+    let deadline = match acquire(client, lease, timeout, &mut stop).await? {
+        Acquired::Held { deadline } => deadline,
         Acquired::Stopped(signal) => return Ok(signal_code(signal)),
     };
     let mut child = tokio::process::Command::new(program);
@@ -122,38 +153,37 @@ enum Ended {
 
 /// How [`acquire`] ended, short of an error.
 enum Acquired {
-    /// agentctl holds `lease`, and may rely on it until `deadline`.
-    Held { lease: LeaseId, deadline: Instant },
+    /// agentctl holds the lease, and may rely on it until `deadline`.
+    Held { deadline: Instant },
     /// agentctl got this signal, and holds no lease.
     Stopped(i32),
 }
 
-async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<Acquired, String> {
+async fn acquire(
+    client: &Client,
+    lease: LeaseId,
+    timeout: Duration,
+    stop: &mut Stop,
+) -> Result<Acquired, String> {
     let timeout = timeout.min(MAX_WAIT);
     let give_up = Instant::now() + timeout;
+    let request = LockRequest::Acquire { lease };
     let mut wait = FIRST_RETRY;
     let mut told = false;
     loop {
         let sent = Instant::now();
-        let request = client.send(&LockRequest::Acquire);
-        tokio::pin!(request);
+        let limit = give_up.saturating_duration_since(sent).max(ATTEMPT_FLOOR);
+        let attempt = client.send_within(&request, limit);
+        tokio::pin!(attempt);
         let answer = tokio::select! {
-            answer = &mut request => answer?,
+            answer = &mut attempt => answer,
             signal = stop.recv() => {
-                if let Ok(Ok(LockResponse::Held { lease, .. })) =
-                    tokio::time::timeout(ACQUIRE_GRACE, request).await
-                {
-                    report_release(release(client, lease, stop).await);
-                }
-                return Ok(Acquired::Stopped(signal));
+                let _ = tokio::time::timeout(ACQUIRE_GRACE, attempt).await;
+                return Ok(stopped(client, lease, signal, stop).await);
             }
         };
-        match answer {
-            LockResponse::Held {
-                lease,
-                seconds_left,
-                ..
-            } => {
+        let why = match answer {
+            Ok(LockResponse::Held { seconds_left, .. }) => {
                 let Some(deadline) = reliable_until(sent, seconds_left) else {
                     let _ = release(client, lease, stop).await;
                     return Err(format!("couldn't hold the shared/ lock ({TOO_LONG})"));
@@ -165,13 +195,21 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
                          {seconds_left}s; agentctl needs at least 3s)"
                     ));
                 }
-                return Ok(Acquired::Held { lease, deadline });
+                return Ok(Acquired::Held { deadline });
             }
-            LockResponse::Busy | LockResponse::Released => {}
-        }
+            Ok(LockResponse::Busy | LockResponse::Released) => {
+                "another command holds it".to_owned()
+            }
+            Err(Failure::Refused(err)) if err.code == CtlErrorCode::Internal => err.message,
+            Err(err @ (Failure::Refused(_) | Failure::Unreachable(_))) => return Err(err.into()),
+            Err(Failure::Transport(message)) => format!(
+                "{message}; a lease agentd granted after agentctl stopped waiting expires \
+                 within its TTL"
+            ),
+        };
         if Instant::now() + wait > give_up {
             return Err(format!(
-                "gave up after {}s waiting for the shared/ lock; another command holds it",
+                "gave up waiting for the shared/ lock after the {}s timeout; {why}",
                 timeout.as_secs()
             ));
         }
@@ -181,10 +219,22 @@ async fn acquire(client: &Client, timeout: Duration, stop: &mut Stop) -> Result<
         }
         tokio::select! {
             () = tokio::time::sleep(wait) => {}
-            signal = stop.recv() => return Ok(Acquired::Stopped(signal)),
+            signal = stop.recv() => return Ok(stopped(client, lease, signal, stop).await),
         }
         wait = (wait * 2).min(MAX_RETRY);
     }
+}
+
+/// Gives back `lease`, which an acquire may have been granted without
+/// agentctl hearing of it, after `signal` stopped [`acquire`].
+async fn stopped(client: &Client, lease: LeaseId, signal: i32, stop: &mut Stop) -> Acquired {
+    if let Some(err) = release(client, lease, stop).await {
+        eprintln!(
+            "agentctl: couldn't give back the shared/ lock agentd may have granted ({err}); \
+             it expires on its own"
+        );
+    }
+    Acquired::Stopped(signal)
 }
 
 /// Waits for `child`, renewing `lease` about three times per lease period,
@@ -238,7 +288,7 @@ async fn hold(
                     continue;
                 }
                 Err(Failure::Refused(err)) => err.message,
-                Err(Failure::Transport(message)) => {
+                Err(Failure::Transport(message) | Failure::Unreachable(message)) => {
                     failure = Some(message);
                     continue;
                 }
@@ -436,6 +486,13 @@ mod tests {
         let sent = Instant::now();
         assert!(reliable_until(sent, 3).unwrap() - sent >= MIN_TIME_LEFT);
         assert!(reliable_until(sent, 2).unwrap() - sent < MIN_TIME_LEFT);
+    }
+
+    #[test]
+    fn an_acquire_outlasts_agentds_busy_timeout_and_the_default_stays_under_two_minutes() {
+        assert!(ATTEMPT_FLOOR > store::BUSY_TIMEOUT);
+        let default = Duration::from_secs(crate::DEFAULT_LOCK_TIMEOUT_SECS);
+        assert!(default + ATTEMPT_FLOOR < Duration::from_secs(120));
     }
 
     #[test]

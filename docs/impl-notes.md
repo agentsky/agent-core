@@ -2508,7 +2508,7 @@ whenever the agent's connection recorded it first, and one in a room or DM
 without the manager would never be heard.
 
 **Solution.** `commands::rocketchat::CommandIntake` owns the channel, the
-per-member ordering and the drain at shutdown, and knows nothing of any
+ordering per `MemberKey` and the drain at shutdown, and knows nothing of any
 connection. Each connection delivers through a `CommandFeed`'s
 `into_sender(onward)`, which runs `command_in` with the manager bot's
 binding on every event the connection won, sends commands to the one
@@ -2522,7 +2522,7 @@ an agent's bot is refused whichever connection heard it. The intake runs
 until every feed is dropped, so it finishes the commands it received after
 the connections stop.
 
-### A member's commands run in order, others' alongside
+### An identity's commands run in order, others' alongside
 
 **Issue.** A code exchange can take the token endpoint's 30-second timeout,
 so running commands one after another on the connection would hold up
@@ -2530,12 +2530,13 @@ every member. Running each in its own task could swap one member's
 `logout` and `login`, or answer `me` before the `login <code>` sent just
 before it.
 
-**Solution.** Each command runs in its own task inside the intake's
-task, and waits for the previous command of the same member to finish
-first (a `oneshot` per member, pruned once finished). On shutdown the
-connections stop listening, and the intake runs the commands it already
-received (the store has recorded them as processed, so no other instance
-would) and waits for them within the drain timeout.
+**Solution.** Each command runs in its own task inside the intake's task,
+and waits for the previous command of the same `MemberKey` (one identity's
+key, not the member behind it) to finish first (a `oneshot` per `MemberKey`,
+pruned once finished). On shutdown the connections stop listening, and the
+intake runs the commands it already received (the store has recorded them as
+processed, so no other instance would) and waits for them within the drain
+timeout.
 
 One window is left. `listen` stops on the shutdown signal by dropping the
 surface's events future, and that future may be between the
@@ -2934,6 +2935,26 @@ outbox) in the same transaction it inserts the new one. A session runs one
 process at a time, so the newest process's token is the only one that
 works.
 
+### One token per container address too
+
+**Issue.** A token is accepted from its `container_ip`, and Docker gives a
+stopped container's address to the next one it starts. If revoking a
+token fails when its container stops (the store errors), the token
+survives, and the next container given that address can present it. For
+another session of the same agent and scope, that container mounts the
+same volume, where the old process may have left its `AGENTCTL_TOKEN`.
+
+**Solution.** `put_ctl_token` deletes every token bound to the new token's
+address, not only the session's, with their sessions' leases, in the same
+transaction it inserts the new one, and `issue_process_token` drops their
+outboxes. A container address holds one container at a time, so the
+newest process's token is the only one valid from it, and a stale token is
+dead before the new container's process can run anything. Tests that run
+two sessions at once give each its own address; agentctl's integration
+tests, whose connections all come from 127.0.0.1, serve the second session
+on a listener that presents its connections as coming from another
+address.
+
 ### Targets needed a grammar
 
 **Issue.** `PostRequest::to` and `ReactRequest::message` are "strings as
@@ -3058,16 +3079,72 @@ kill. agentctl then releases the lease and exits with 128 plus the signal.
 A signal while an acquire is in flight used to drop the request, and a
 lease agentd granted for it held the lock with nobody renewing it, for up
 to 30 seconds. agentctl now lets a request already sent finish, for up to
-two seconds, releases the lease if it was granted, and exits with 128 plus
-the signal without running the command. A signal between attempts exits at
-once. agentctl waits at most 100 seconds for the lock
-by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
-a command by default, so the model sees why it failed rather than a killed
-command.
+two seconds but not past the time the attempt was given, gives back the
+lease (by its id, below, whether or not an answer said it was granted),
+and exits with 128 plus the signal without running the command. A signal
+between attempts gives back the lease and exits at once. A grant agentd
+makes after that release leaves a lease that expires within its TTL.
+agentctl waits at most 100 seconds for the lock by default (`--timeout`),
+below the 2 minutes Claude Code's Bash tool gives a command by default, so
+the model sees why it failed rather than a killed command.
 
 Review found that `--timeout 18446744073709551615` panicked on `Instant +
 Duration` overflow. The wait is now clamped to a day, which no turn
 outlasts, so any `u64` the model types gives a sane wait.
+
+Review also found that `--timeout` was only checked between attempts: an
+acquire sent to a stalled agentd waited out the 30-second request timeout,
+so `--timeout 1` took 30 seconds and the default could run past the Bash
+tool's 2 minutes. Each acquire is now given the time left, at least seven
+seconds and at most thirty. The floor lets `--timeout 0` take a free lock,
+and outlasts agentd's five-second SQLite busy timeout, so the common slow
+answer isn't abandoned. The default 100 seconds plus the floor stays under
+2 minutes.
+
+### The acquire is idempotent
+
+**Issue.** No floor guarantees agentd answers in time: an acquire takes a
+pool connection twice, to authorize and then to acquire, each waited for
+up to 30 seconds, on top of the busy timeout. An acquire agentctl stopped
+waiting for could still be granted, leaving a lease nobody held that
+blocked every session on the volume, the same session's next attempt
+included, until its TTL ran out. The retry then spun on `busy` and blamed
+"another command" for agentctl's own orphan.
+
+**Solution.** agentctl picks a `LeaseId` for each `lock` and sends it with
+every acquire attempt. agentd takes the lock when the current lease has
+expired, or when the volume's row already holds that lease for the same
+session, which it extends and returns again. So a retry picks up an
+earlier attempt's late grant. The id only ever matches the caller's own
+session's row on its own volume: another session naming a live lease gets
+`busy`, and an id that names another volume's lease grants and changes
+nothing, even over the caller's expired row. Renew and release name the same id, so a signal can
+release the lease even when no answer arrived.
+
+That picks up a late grant only while agentctl is still acquiring. One
+that lands after agentctl released the lease is still orphaned: say an
+attempt is held up in agentd for over 30 seconds, a later attempt is
+granted, the command runs and the lease is released, and then the first
+attempt lands. The same goes for a grant landing after a stop signal's
+release, or after agentctl gave back a lease too short or too long to
+hold. Nobody renews such a lease, so it holds the lock for at most its
+TTL, 30 seconds by default. This was already so before the id; it is
+just not solved by it.
+
+An acquire that failed with agentd's internal error (a busy database,
+say), or whose answer was lost (it timed out, was cut off, or couldn't be
+read), is retried until `--timeout` runs out, as renewals are. One that
+can't connect to agentd (a name that doesn't resolve, a refused
+connection, or the five-second connect timeout) never reached it, so
+`lock` fails at once with the same "can't connect" error as every other
+subcommand: a wrong URL or an agentd that is down is reported straight
+away. A renewal that can't connect is still retried until the deadline,
+since the command already runs under the lease and a brief outage
+shouldn't kill it. Any other refusal also fails at once. When `lock`
+gives up after the timeout, it names the last attempt's reason: busy,
+agentd's internal error, or the lost answer. Only after a lost answer
+does it add that a lease agentd granted anyway expires within its TTL,
+since no later attempt is left to pick it up.
 
 ### The command runs in its own process group
 
@@ -4395,7 +4472,10 @@ failure is logged and given up on. Retrying only when it was called again
 missed manager-initiated stops: the process is taken from the session
 before the call, and a death event for a container already marked dead is
 ignored, so a failed revocation used to leave the agentctl token valid for
-the next container on the address.
+the next container on the address. A failed revocation also takes the
+container with it, even when the process was seen to exit, since leftover
+processes in the container could otherwise keep using the live token
+between turns.
 
 A panic in `process_starting` is taken for its failure, and one in
 `process_stopping` is logged and the stop goes ahead: otherwise a panic in
@@ -5225,6 +5305,54 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
 
+### A lost outbox or attribution is a lost part
+
+**Issue.** Delivery told the thread only about parts it couldn't post.
+When `turn_finished` failed, as when `Ctl::end_turn` couldn't clear the
+token's turn in the store, the outbox was never taken and went with the
+process, so the turn's attachments, reactions and queued
+posts were lost without a word. When the platform accepted a chunk but its
+`message_refs` row couldn't be recorded, the post went unattributed: a
+mention of another agent in it is ignored as an unattributed managed bot's
+(the view's two-second wait can't find a row never written), a person's
+reply to it reaches no agent, and the next turn shows it again as history.
+
+**Solution.** Both count as a lost part, so the thread gets the one line
+saying part of the reply couldn't be delivered. Delivery can't tell
+whether a lost outbox held anything, so it says so whenever
+`turn_finished` failed. The line is the only signal: the post can't be
+attributed after the fact, since the store already failed once. A hook
+that panics fails the whole turn instead, which posts `FAILED_TEXT`, and a
+reaction Slack or Rocket.Chat refuses is only logged: a mistyped emoji
+loses nothing the thread needs to hear about.
+
+### A thread's messages are looked up one at a time
+
+**Issue.** The sink looked a message's candidates up, several store round
+trips, before queueing it in its lanes. A Rocket.Chat connection hands its
+messages over one at a time, but every connection in a room (the manager's
+and each bot's) may deliver a message, whichever records it in `Dedup`
+first, and the sinks of different connections run at once. Two messages
+of one thread delivered by different connections could reach the lane in
+the order their lookups ended rather than the order they were sent: the
+later one's turn then showed the earlier as history, and the earlier's
+turn ran anyway, answering it twice.
+
+**Solution.** `dispatch` takes a lock per thread (the lanes' thread, so a
+DM's or a thread-less channel's conversation) before the lookup and holds
+it until the message is queued for every candidate. Tokio's mutex grants
+in the order asked, so a thread's messages reach its lanes in the order
+their dispatches started; the busy lines are posted after the lock is
+released, so sending still waits only for the lookups of the thread's
+earlier messages, never for a turn. An entry lives only while a dispatch
+holds or waits for it, and a sender cancelled while waiting leaves none,
+as `auth`'s `KeyedLocks` does. That type is crate-private to `auth`, and
+a key-to-lock map isn't authentication, so agentd has its own copy next
+to the pipeline rather than importing it. The lock can't restore an order
+lost before `dispatch` starts: two connections that record two messages
+in `Dedup`, or reach the sink, in the opposite order of the messages are
+dispatched in that order.
+
 ## T24: Session commands
 
 ### Which sessions the commands act on
@@ -5332,13 +5460,14 @@ the idle reaper stops the old container.
 ### A reset waits for the session's turns, the reply doesn't
 
 **Issue.** `SessionManager::reset` runs after the turns queued before it,
-which can take up to the turn timeout each, and it joins the session's
-queue only when its future is first polled. Resetting a few sessions at a
-time left the others out of their queues until an earlier reset ended, so a
+which can take up to the turn timeout each, and it joins the session's queue
+only when its future is first polled. Resetting a few sessions at a time
+left the others out of their queues until an earlier reset ended, so a
 message sent in one of them after `reset` ran on the old conversation and
 was then wiped. Waiting for every reset before replying also held up the
-owner's later commands, which the intake runs one at a time (T13), and
-could outlast a Slack `response_url`, which expires after 30 minutes.
+owner's later commands from that identity, which the intake runs one at a
+time per `MemberKey` (T13), and could outlast a Slack `response_url`, which
+expires after 30 minutes.
 
 **Solution.** Every reset is issued at once and polled once before the
 reply, so each is queued on its session before the owner reads
@@ -5460,10 +5589,10 @@ kept outside what sandboxes mount (`<data>/skills-pending/<agent>/<name>/`)
 with a `pending` row; the reply lists the hosts and asks for
 `skill confirm <name> <skill>` within an hour (`PENDING_TTL`). Confirming
 moves the files into the agent's skills and makes the row `active`, which is
-when its hosts count. A confirmation after the hour finds the skill dropped;
-the sweeper drops expired ones every minute, with their files, and startup
-too. The parser gained `SkillCommand::Confirm`, and the design's command
-table lists it.
+when its hosts count. A confirmation after the hour answers that the skill
+waited too long; the sweeper drops expired ones every minute, with their
+files, and startup too. The parser gained `SkillCommand::Confirm`, and the
+design's command table lists it.
 
 ### Skills are rows, their files are directories
 
@@ -5473,32 +5602,33 @@ instance, so the hosts can't live in memory; parsing every agent's
 `SKILL.md` files at each `CONNECT` would trust files over the store.
 
 **Solution.** A migration adds `agent_skills` (`agent_id`, `name`, `state`
-of `pending` or `active`, `source`, `hosts`, `added_by`, `added_at`), keyed
-by agent, name and state, so a pending skill can wait next to the active
-one it would replace. `Store::skill_hosts_for_session` joins `sessions` and
-`agents` (deleted agents get none) and `SkillHosts` parses each host with
-`HostRule` again, so a row that no longer parses allows nothing. Files stay
-on disk, moved into place with a rename so a session sees a skill whole or
-not at all. Replacing one moves the old directory aside first, so a session
-starting between the two renames sees neither; `renameat2` with
-`RENAME_EXCHANGE` would close that, but needs a fallback for file systems
-without it, and the window is two renames.
+of `pending` or `active`, `source`, `hosts`, `digest`, `added_by`,
+`added_at`), keyed by agent, name and state, so a pending skill can wait
+next to the active one it would replace. `Store::active_skills_for_session`
+joins `sessions` and `agents` (deleted agents get none) and `SkillHosts`
+parses each host with `HostRule` again, so a row that no longer parses
+allows nothing. Files stay on disk, moved into place with a rename so a
+session sees a skill whole or not at all. Replacing one moves the old
+directory aside first, so a session starting between the two renames sees
+neither; `renameat2` with `RENAME_EXCHANGE` would close that, but needs a
+fallback for file systems without it, and the window is two renames.
 
-The row and the files change in the order that never grants hosts to files
-the owner didn't confirm them for. `skill add` records the row first: an
-active row carries no hosts and replaces any row that did, and a pending
-row's hosts don't count. `skill confirm` moves the files into place, then
-makes the row active; a failed move leaves it pending, and the old skill is
-moved back. `skill rm` deletes the rows, then the directories. A failure
-between the two steps can leave directories no row records, so startup
-removes work directories and skill directories, pending or live, whose name
-has no row in either state (the bundled one aside). A row of either state
-keeps both of its name's directories, so a confirmation moving one from
-pending to live on another instance is never taken for left over. Startup
-also leaves anything changed (by status change time) within `STALE_AFTER`,
-the clone timeout and three minutes, since in a blue-green deploy the old
-instance may still be cloning into a work directory. The 32-skill cap is
-checked inside `put_skill`'s transaction.
+The row and the files change in an order that keeps them matching where it
+can, and hosts are only granted for files that declare them ("Hosts are
+checked against the files in use" below). `skill add` records the row
+first: an active row carries no hosts and replaces any row that did, and a
+pending row's hosts don't count. `skill confirm` moves the files into
+place, then makes the row active; a failed move leaves it pending, and the
+old skill is moved back. `skill rm` deletes the rows, then the directories.
+A failure between the two steps can leave directories no row records, so
+startup removes work directories and skill directories, pending or live,
+whose name has no row in either state (the bundled one aside). A row of
+either state keeps both of its name's directories, so a confirmation moving
+one from pending to live on another instance is never taken for left over.
+Startup also leaves anything changed (by status change time) within
+`STALE_AFTER`, the clone timeout and three minutes, since in a blue-green
+deploy the old instance may still be cloning into a work directory. The
+32-skill cap is checked inside `put_skill`'s transaction.
 
 `skill rm` stops granting the skill's hosts at once, so new connections
 to them are refused unless the operator's allowlist or another active
@@ -5539,9 +5669,10 @@ a local repository through `Git::serving_prefix_from_directory_for_tests`,
 which rewrites one `https://` prefix to a `file://` directory and skips the
 lookup; it and the `file://` configuration exist only in test builds.
 
-A clone runs inside the owner's command, and one member's commands run one
-at a time, so a clone that takes its full 2 minutes holds that owner's
-other commands for as long; other members aren't held up.
+A clone runs inside the owner's command, and one identity's commands (one
+`MemberKey`'s) run one at a time, so a clone that takes its full 2 minutes
+holds the owner's other commands from that identity for as long; other
+identities aren't held up, the owner's others included.
 
 ### The URL git gets names the host as the pin does
 
@@ -5712,21 +5843,19 @@ removes its pending directory, then records the new row and moves the new
 files in, so a failure anywhere leaves either nothing waiting or a row
 without files, which `confirm` refuses. `Store::confirm_skill` takes the
 row `confirm` read and makes it active only while its hosts and `added_at`
-are unchanged. When it isn't, `confirm` undoes only its own move: the
-active skill it set aside goes back, or, with none, the files it moved are
-removed, unless something else has taken their place since (checked by
-inode). `confirm` first renames the pending directory into its own work
-directory, where no concurrent add can replace it, and takes the inode
-there. It also reads the moved `SKILL.md` again and confirms only when its
-hosts are the row's: two adds of one name racing can leave one's row with
-the other's files, and those go back to wait, unconfirmable, until the
-skill is added again or expires. A test confirms a stale copy of the row
-(`added_at` a second earlier) while an active version exists: reverting
-the undo to removing the skill by name fails it. The sweeper drops pending rows `PENDING_TTL` plus one
-`SWEEP_INTERVAL` after they were added, while `confirm` still calls a skill
-expired after `PENDING_TTL`. A test replaces a waiting skill with one
-declaring another host while the pending directory can't be written, then
-confirms: before the fix the confirmation made the new host active.
+are unchanged, and `confirm` moves only files whose `SKILL.md` declares the
+row's hosts. Since every change to a name holds its lease ("One change at a
+time to each skill" below), both only guard against a lease that ran out
+mid-change. When the row can't be made active, `confirm` undoes its move:
+the files go back to the pending directory, and the active skill it set
+aside goes back into place. A test confirms a stale copy of the row
+(`added_at` a second earlier) while an active version exists: reverting the
+undo to removing the skill by name fails it. The sweeper drops pending rows
+`PENDING_TTL` plus one `SWEEP_INTERVAL` after they were added, while
+`confirm` still calls a skill expired after `PENDING_TTL`. A test replaces
+a waiting skill with one declaring another host while the pending directory
+can't be written, then confirms: before the fix the confirmation made the
+new host active.
 
 Startup's purge keeps both directories of a name that has a row in either
 state, so it no longer depends on a rename updating the moved directory's
@@ -5768,6 +5897,158 @@ until it runs its own program, and running the script meanwhile fails with
 never holds a descriptor open for writing it and none can be inherited.
 No lock is needed, in the tests or around production spawns. It is the
 agentd tests' only file written and then run.
+
+### One change at a time to each skill
+
+**Issue.** A skill's directories are keyed by agent and name, and a
+blue-green deploy runs two agentd processes over the same directories and
+store, so nothing ordered `skill add`, `skill confirm`, `skill rm` and the
+sweeper for one name, on one instance or across two. Each fix of one
+interleaving left another: the sweeper removed the files of a skill added
+again between its delete and its removal; a confirmation's cleanup deleted
+a row being added again, or one a second confirmation was confirming; a
+confirmation whose row was replaced meanwhile undid its move by removing
+the new row's files; two confirmations of different rows raced on the swap
+into the live directory, and could leave one skill's files under another's
+hosts. A confirmation the store failed (`SQLITE_BUSY`, say) returned before
+undoing its move, so the update's files stayed live under the old skill's
+row, and the old files were removed with the work directory.
+
+**Solution.** `skill_leases`, in the skills migration, holds one lease per
+agent and name (`lease_id`, `expires_at`). Every add (from recording the
+row to moving the files in, after the clone and the checks), confirmation,
+removal and expiry takes the lease for its moves and row writes, so one
+runs at a time per name across instances. `acquire_skill_lease` is one
+upsert that takes the row only if its lease has ended, like the volume
+locks', and returns a new `LeaseId`, which is the holder: the sandbox
+`instance` name isn't unique (both sides of a deploy may keep the default),
+and a fresh id per acquisition needs none. An add, confirmation or removal
+waits up to `LEASE_WAIT` (two seconds) for another change to finish, then
+answers that one is in progress and changes nothing; an add only gets there
+after its clone and checks, so a busy name costs the owner a clone. The
+sweeper doesn't wait, and tries that name again at its next sweep.
+
+`Skills::leased` takes the lease, runs the change and releases the lease in
+a spawned task that the command only awaits, and runs the change in a task
+of its own, so the lease is released whether it returns or panics. Commands
+still running at the drain timeout, or when shutdown is forced, are aborted
+(`tasks.shutdown()`), which is every blue-green cutover that catches one;
+before, that could stop a confirmation between its move and its row write
+and remove the old skill with its work directory. The spawned task outlives
+the command, and each holds a read guard on a lock in `Skills` that
+`Skills::drain` takes for writing: unless shutdown was forced, `serve`
+waits for them, for what is left of the drain timeout but at least
+`SKILL_DRAIN_FLOOR` (a second), before closing the store; a change that
+starts after the store closed fails before taking a lease. A change still
+running after that fails its next store call and undoes its move as on any
+store failure. When `serve` returns, the runtime drops the task at its next
+await; unlike a crash, that runs its work directory's guard, so a skill a
+confirmation had set aside there is removed rather than left for startup's
+purge, and the lease ends on its own.
+
+The final writes are fenced on the lease: `put_skill`, `delete_skill`,
+`delete_pending_skill_before` and `confirm_skill` take the `LeaseId` and
+first check, inside their `BEGIN IMMEDIATE` transaction, that
+`skill_leases` holds it unexpired at the write's time, failing with
+`StoreError::SkillLeaseLost` otherwise; holding the write lock, no other
+instance can take the lease over before the transaction ends. A
+confirmation fenced out after its move doesn't undo it: whoever holds the
+lease now owns the name, and putting the old skill back could put it under
+their row, so the files stay as a crash would leave them, for the roll
+forward below. `LEASE_TTL` is two minutes: a change makes two store calls,
+each of which may wait the pool's 30-second acquire timeout and then the
+5-second busy timeout, about 70 seconds at worst, and a lease a crash left
+keeps the name busy for those two minutes. The sweeper deletes ended
+leases, so names nothing changes again don't keep rows.
+
+With changes serialized, `confirm` reads the pending `SKILL.md` in place
+and moves the directory straight into the live one; the move into a work
+directory, the inode check and the put-back of files a newer add replaced
+are gone, as is the sweeper's check for a skill added again, since the
+sweeper now deletes one name's expired row and removes its files under the
+name's lease (`delete_pending_skill_before`, which only deletes a row still
+older than the cutoff). `skill confirm` still never deletes a row: one that
+expired answers that it waited too long and stays for the sweeper, which
+drops it `PENDING_TTL` plus one to two `SWEEP_INTERVAL`s after it was
+added, and files that aren't waiting answer that nothing waits. When the
+row can't be made active, whether the row changed or the store failed,
+`confirm` puts its files back in the pending directory and the skill they
+replaced back into place before answering or returning the error. Files
+that can't go back move into the work directory instead, whose guard
+removes them; restoring the old skill is tried either way, and fails only
+if the files can't leave the live directory at all, when the old skill goes
+with the work directory. `move_into` logs a skill it set aside and couldn't
+move back. A test fails `confirm_skill` with a trigger and checks the old
+skill, its row and hosts, and the waiting files.
+
+What's left is a crash, agentd exiting, a cut-off change or a lapsed lease
+between a change's steps. A confirmation stopped after setting the live
+skill aside and before moving the new files in leaves no live files under
+the old row, and the next confirmation moves the waiting files in. One
+stopped after the move and before its row write leaves the update's files
+live under the old row and the pending directory empty. `agent_skills` now
+records a `digest` of each skill's files as added (SHA-256 over every
+file's path and bytes, which the package limits keep small), and the next
+`confirm` finishes such a confirmation, making the pending row active when
+its pending directory is absent and the live tree's digest is the row's.
+Only the owner's `confirm` does that, since it is consent to the pending
+row's hosts at that moment: the sweeper drops an expiring row as ever, and
+the grant check denies the live files the active row doesn't match. A
+sweeper that finished them could grant hosts nobody confirmed: a
+confirmation whose lease lapsed before its move can move a newer add's
+files in, and is then fenced out without undoing it. Matching the whole
+tree, not just the hosts, keeps a lost pending directory next to an active
+skill that declares the same hosts from recording an update that never
+arrived. One stopped in the middle of undoing its move can leave the old
+row without live files. Whatever a failed add or removal leaves, startup's
+purge removes. Purge takes no lease, so it still keeps both directories of
+a name with a row and leaves anything changed within `STALE_AFTER`, since
+the other side of a deploy may be mid-move or mid-clone. A pending
+directory `drop_expired` can't remove is logged; never mounted, it stays on
+disk until startup's purge if no row has the name, or else, since purge
+keeps every directory of a name with a row, until the name is next added or
+removed.
+
+File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
+row, and its release logs that the lease ran out, but its moves still
+happen: `skill rm` whose lease lapses after its row delete can remove a
+successor's files, and an add's or confirmation's move can land after a
+successor's.
+
+### Hosts are checked against the files in use
+
+**Issue.** Each fix to the lease, the undo and the order of the steps
+closed one way for a row's hosts to cover files that don't declare them,
+and reviews kept finding another: a crash, a cut-off change, or a move
+landing after a lapsed lease can leave any files under any active row.
+
+**Solution.** The grant itself checks. `SkillHosts` holds `Skills`, and
+`Skills::granted_hosts` reads the session's agent's active skills that
+declare hosts (`Store::active_skills_for_session`, which replaced
+`skill_hosts_for_session`) and grants each one's hosts only while its live
+`SKILL.md` declares exactly those hosts, parsed as `confirm` parses it. A
+skill whose files declare others, or are missing or unreadable, grants
+none, warned about with the agent, the skill and the counts at most once a
+minute per skill (`MISMATCH_WARN_INTERVAL`, through `core_types::Throttle`,
+which the public listener's refusal warnings use too), the rest at debug level. It
+runs at each `CONNECT` the configured allowlist doesn't already allow, and
+reads only the front matter of each active skill with hosts: the first
+`MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines among
+them, parsed with `parse_skill_file`. That constant is now the whole front
+matter's budget, a byte-order mark and both `---` lines with their trailing
+whitespace counted, not just the YAML's: a closing line padded with spaces
+passed the add's check and then failed the bounded read, so a skill could
+be added and never confirmed. With one budget, every file the add accepts
+reads the same at confirmation and at the grant. Whatever the disk holds,
+hosts never cover files that don't declare them; the lease, the order of
+the steps and the undo only keep rows and files matching, so that what the
+owner confirmed stays usable.
+
+The check compares the row's hosts, which `host_names` wrote at add time
+from `parse_skill_file` and `HostRule`'s `Display`, with what the same code
+gives for the files today. A change to how either normalizes a host must
+migrate the stored rows, or existing skills stop matching and lose their
+hosts: the check fails closed.
 
 ## T26: Requester-pays routing
 
@@ -6340,7 +6621,12 @@ exists, and can't be named in a new rule on Rocket.Chat yet. A room the
 lookup doesn't find is still matched against the agent's own room rules by
 the name the owner wrote (`#secret`), so a channel denied or allowed while
 public and made private since can be allowed or denied again; that tells
-the owner only what their own rules hold. Checking the asker's membership
+the owner only what their own rules hold. An archived channel is unknown
+too: `rooms.info` refuses it with 400 `error-room-archived` (its
+`findRoomByIdOrName` checks `archived`), which `map_error` takes as
+`Forbidden`, as Slack's `is_archived` is. Any other failure of the lookup,
+such as a 5xx, answers that something went wrong rather than that the
+channel is unknown. Checking the asker's membership
 of the group would take a lookup of another user's rooms the manager
 doesn't make yet. Rules that don't read refuse everyone, the owner too, as
 `PolicyUnavailable`, since the same row holds the hop cap, and `allow
@@ -6677,13 +6963,25 @@ the calls in the last minute, and a call waits while the quota is used up.
 It is in memory and per process, which is enough to stay under Slack's
 limits; Slack's 429 remains the authority.
 
-A 429, or `ok: false` with `ratelimited`, blocks that bucket until
-`Retry-After` has passed, so concurrent callers wait too. A call is retried
+A 429, or `ok: false` with `ratelimited`, blocks the method for that token
+until `Retry-After` has passed, so concurrent callers wait too. Slack limits
+`chat.postMessage` both per channel and per token, and a 429 doesn't say
+which limit it hit, so a 429 on a post to one channel holds posts to every
+channel; each channel's quota stays its own. A call is retried
 up to three times while the wait is at most `max_retry_wait` (60 s by
 default); a longer wait fails at once with `SurfaceError::RateLimited`, and
-so does any later call in that bucket while it stays blocked, instead of
+so does any later call to that method while it stays blocked, instead of
 sleeping silently. `Retry-After` is read as whole seconds and capped at a
 day so it can't overflow a deadline.
+
+Holding the method for the whole token has costs. The client-side
+`chat.postMessage` quota lets all 60 of a minute's posts to one channel go
+at once, where Slack allows about one a second, so a short burst to one
+busy channel can draw a per-channel 429, which holds posts to every
+channel for the `Retry-After`. And when a hold ends, every caller waiting
+on it wakes at once and can draw another 429. Both are accepted: Slack
+asks callers to back off per method per token, and its `Retry-After` is
+usually short.
 
 ### Error codes Slack answers with HTTP 200
 
@@ -6886,7 +7184,7 @@ register a new token. The encrypted columns' associated data is the row's
 Once Slack has rotated, the old refresh token is used up and the new pair
 exists only in memory, so a store write that fails once would lose the
 token. Both writers, `/agent slack-token` and the rotator, go through
-`store_rotated`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
+`retry_store`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
 250 ms, then 500 ms, then 1 s. If the last try fails, the command tells the
 member that the refresh token is used up and to generate a new one.
 
@@ -6900,6 +7198,33 @@ that works, so `update_rotated_slack_config_token` also clears `broken_at`,
 `notified_at` and `notice_attempts`, and the token is renewed again. A
 rotation whose row was replaced or deleted meanwhile (`/agent logout`, a
 `user_change`) stores nothing and drops its pair.
+
+### A departure lost to a passing store error
+
+**Issue.** A `user_change` saying a member was deleted reaches `Inbound`
+after the ingress acked it and recorded it as processed, so Slack never
+sends it again. A store error in looking the member up or deleting their
+token was only logged, and the rotator kept renewing the departed member's
+token. Returning the error from the sink isn't an option: `Queue::run`
+takes any `Err` to mean the receiver is gone and stops.
+
+**Solution.** The rotated pair's retry, `store_rotated`, became
+`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs the whole
+departure (lookup and delete) through it as one closure, so a passing error
+costs a retry, not the token. Every `StoreError` is retried, since even a
+sealing failure can pass (`SealError::Rng`) and the rotator can't afford to
+lose a pair. `retry_store` logs each failure but the last as a retry, with
+the member's id, and returns the last to its caller: `Inbound` logs that
+one, as before, by member key and error. It stays in `slack_tokens`, since
+agentd has no shared store or retry module.
+
+The retries run inline in the sink, so a failing departure holds the shared
+Slack event queue for 1.75 s of waits plus each attempt's own store time,
+which can include SQLite's busy timeout. Once agent apps land, that queue
+also carries agents' messages, which wait too. That is accepted: a store
+failing on writes stalls agent traffic anyway, the hold is bounded at four
+attempts, and handing the departure to a task instead would lose its order
+against later events for the same member.
 
 ### Which failures a member hears about
 
@@ -6927,16 +7252,16 @@ through a `CommandFeed` that knew the Rocket.Chat manager's binding, and
 the Slack queue, which `Routers::new` builds before `run`.
 
 **Solution.** `commands::intake::CommandIntake` takes `(member, text,
-origin)` through a `CommandSubmitter`, keeping T13's ordering per member and
-its drain at shutdown. `CommandFeed::new(submitter, binding)` is the
-Rocket.Chat side. `Routers` carries the intake and one submitter; the Slack
-queue's `slack::Inbound` sink holds another. `Server::run` runs the intake
-always, hands the submitter to the Rocket.Chat connection, and drops its own
-copy when shutdown starts, so the intake finishes what it received once the
-queue and the connection stop. `slack::Unrouted` is gone: `Inbound` passes
-the manager's slash commands and DMs to the intake, deletes the token of a
-member a `user_change` says was deleted, and drops everything else until
-T31 routes agents' messages.
+origin)` through a `CommandSubmitter`, keeping T13's ordering per
+`MemberKey` and its drain at shutdown. `CommandFeed::new(submitter,
+binding)` is the Rocket.Chat side. `Routers` carries the intake and one
+submitter; the Slack queue's `slack::Inbound` sink holds another.
+`Server::run` runs the intake always, hands the submitter to the Rocket.Chat
+connection, and drops its own copy when shutdown starts, so the intake
+finishes what it received once the queue and the connection stop.
+`slack::Unrouted` is gone: `Inbound` passes the manager's slash commands and
+DMs to the intake, deletes the token of a member a `user_change` says was
+deleted, and drops everything else until T31 routes agents' messages.
 
 ### Slack replies and entities
 
@@ -6945,7 +7270,16 @@ T31 routes agents' messages.
   (`login <code>`), as on Rocket.Chat.
 - A slash command's reply is the rendered Markdown, each chunk sent to its
   `response_url` with T29's `respond_ephemeral`. Slack accepts five
-  responses per URL; command replies are one chunk.
+  responses per URL (`RESPONSE_URL_USES`), and a long reply (`list` in a
+  workspace with a few hundred agents) takes more chunks, so the sixth
+  failed and the rest were dropped. `Replies::respond` counts the rendered
+  chunks; a reply of more than five goes whole to the member's DM with the
+  manager app, and the `response_url` gets one line saying so. If that DM
+  fails, even partway, the `response_url` gets the first four chunks and a
+  note that not all of it reached the DM. Unlike an ephemeral reply, the DM
+  persists under the workspace's retention and exports; today's long
+  replies carry no secrets, but a long reply that ever does would need
+  another path.
 - Notices (relink, broken token) open the manager's DM with
   `conversations.open` (new in `WebApi::open_dm`, Tier 3, needs `im:write`),
   so relink notices now reach Slack-only members too.
@@ -7865,6 +8199,27 @@ would let a bot post in any public channel, is off unless
   codes are `SecretString`s; a captured-log test at `trace` through a whole
   create, install and delete finds none of them.
 
+### Rows from the previous binary during a blue-green swap
+
+**Issue.** T31's migration adds `processed_events.expires_at` with a
+default of 0, and the sweeper deletes rows whose `expires_at` has passed.
+During a blue-green swap the previous binary still records events on the
+same store ([Connections follow the store](#connections-follow-the-store))
+and inserts only `source`, `event_id` and `seen_at`, so its rows got 0 and
+were swept within a minute: an event it recorded and redelivered later
+would run twice. SQLite refuses an expression such as `seen_at + 604800` as
+the default of an added column.
+
+**Solution.** The migration adds an `AFTER INSERT` trigger that sets
+`expires_at` to `seen_at` plus a week, the retention every row had before,
+for a row inserted with 0, matched by the table's key (`source`,
+`event_id`). An insert that `ON CONFLICT DO NOTHING` skips fires no
+trigger, and the trigger's update doesn't count in the insert's
+`rows_affected`, so the old binary's duplicate check is unchanged. A store
+test inserts a row in the old shape and checks it survives a sweep an hour
+and a week later, is swept a second after that, and that a row recorded
+with an explicit 30-day `expires_at` is left alone. A later migration can
+drop the trigger once no binary from before T31 can run against the store.
 ## T33: Consent cards and private tasks
 
 ### What `--file` names, and how files cross in
@@ -8194,6 +8549,16 @@ buttons); on Rocket.Chat its one message is edited to the outcome. An
 update that fails on the way (a rate limit or a transport error) releases
 its claim and is tried on a later pass; one the platform refuses is not
 tried again, and the card's buttons answer that the task was settled.
+`claim_consent_card_close` sets `card_closed_at`, which is both the claim
+and the mark that the card was closed, so an instance that stops between
+the claim and `update_rich` (a crash, or a drain timeout aborting
+`close_cards` mid-update) leaves the card with live-looking buttons for
+good. `close_cards` reads the agent before claiming, so a store error
+there leaves no claim behind. Clicking such buttons is refused safely:
+`Consents::decide` answers `Decided::Settled`, or `Decided::NotYours` once
+the agent is deleted. A lease apart from the done mark, as the relink
+notices got, would fix it, but needs a migration, which a cosmetic
+leftover isn't worth.
 
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a
@@ -8703,12 +9068,114 @@ the requester's own or public, so the agent can tell which it meant. It
 is refused outside a channel or group DM, for the calling agent itself,
 for an agent the turn asked already (it would take one turn anyway; the
 check and the queueing are one critical section on the outbox, so two
-asks at once can't both pass), past the turn's ten queued posts, and, as
-before, inside a private task. It doesn't check what the
-router will decide (the other agent's rules, the hop cap, its limits):
+asks at once can't both pass), past `MAX_HAND_OFFS` asks (see [At most
+two hand-offs per turn](#at-most-two-hand-offs-per-turn)), past the
+turn's ten queued posts, and, as before, inside a private task. It
+doesn't check what the router will decide (the other agent's rules, the
+hop cap, its limits):
 those depend on the requester and the thread, and the router says them
 when the hand-off runs, so the skill tells the agent not to promise an
 answer.
+
+### At most two hand-offs per turn
+
+**Issue.** A security review of the requester-pays work found that one
+message can cascade into many turns billed to its requester: each turn
+of a chain may mention every other agent, each of those turns may do the
+same, and every hop inherits the requester. The hop cap bounds only the
+depth, and design.md claimed it bounded the cost. Capping the hand-offs
+in `Delivery::mentioned` alone would not hold either: the platform's copy
+of a post that mentions an agent past the cap routes as a hop of its own
+and would claim that agent's hop, which nothing had claimed.
+
+**Solution.** `ctl::MAX_HAND_OFFS` (2) agents per turn. The delivery
+carries `Handing`: the hand-offs so far and the agents the turn's
+`ask-agent` posts ask, taken from the outbox. `mentioned` gives an asked
+agent its place always, and any other only when a place is left besides
+those the asked agents not handed to yet keep, so an accepted
+`ask-agent` is never crowded out by an earlier casual mention; the rest
+are passed over with an info log of their ids and the post's id. No line
+goes to the thread: it would be one more bot post in a chain, and the
+skill tells agents. `ask-agent` refuses an agent past `MAX_HAND_OFFS`
+asks, in the same critical section as its other checks, so its count and
+the delivery's agree. Before a post's row is recorded, `pass_over`
+claims the hops to the agents it passes over in `processed_events`
+(`hop`, the same key `candidate` claims), and the platform's copy takes a
+hop only once that row gives it an attribution, so it finds the claim
+and is dropped. Nothing new is stored: the outbox and `Handing` live for
+one turn's delivery, which a restart cuts and never repeats, and what
+does outlive it, the `hand_offs` rows (at most two per turn) and the
+claims, is already durable. With the default hop cap of 3 a turn an
+agent runs for a requester can start 2 + 4 + 8 = 14 more on that
+requester's account; how many such turns a person's one message starts
+is bounded by `MAX_MENTIONS` and the pipeline's places instead, since the
+thread's hourly cap counts turns only once they end.
+
+A review then found the rule this rests on could break: a mentioned
+agent whose lookup failed was neither placed nor claimed, yet the post's
+row was recorded with its attribution, so the platform's copy could run
+that agent's hop past the cap. `Delivery::plan` now holds the rule that
+every managed agent a recorded, attributed post mentions is handed the
+post in its row's transaction, or had its hop claimed before the row, or
+was handed or passed over by an earlier post of the turn. When it can't
+make sure (a lookup fails, the hand-off doesn't encode, or a claim can't
+be written) the post is left unrecorded, so neither copy hands anything
+off from it, and the delivery is incomplete. The agents a turn passed
+over and claimed are kept in `Handing::passed`: a later post neither
+claims them again nor gives one of them a place whose hop, claimed
+already, could never run, which a claim that succeeded for one agent
+before another's failed would otherwise do. A test pins the claim before
+the row: the platform's copy is dispatched while the post is still held,
+so it gets past `dispatch`'s check without the row and decides once the
+row is there (the harness can't tell whether its job was already waiting
+for it, and detection doesn't depend on that), and a trigger records, in
+a table the test asserts is empty, any hop claim first inserted once the
+post's row exists for an agent no `hand_offs` row holds. It only
+records, so the code under test still decides: without `pass_over` the
+copy runs the passed-over agent and the test's hops fail, and with
+`pass_over` after the row the late claim is recorded.
+
+A later review found the delivery and the router reading a mention
+differently: `mentioned` looked agents up by an active bot
+(`agent_for_bot`), while the router's `mentions` takes a bot in any
+state as its agent's (`agent_of_bot_user`). On Rocket.Chat, where
+`candidates` also adds the thread root's poster, a post mentioning an
+agent's old, inactive bot in a thread that agent started let the
+platform's copy run it as a hand-off the cap never counted.
+`mentioned` now reads a mention as the router does, and an agent
+mentioned through a bot that isn't active is passed over, its hop
+claimed, unless the turn asked it with `ask-agent`: an accepted ask is
+never passed over, whatever bot a post mentions it through, and keeps
+its place for its ask post. A post's mention of an asked agent's
+inactive bot is then neither handed nor claimed, but the agent's hop
+runs once for the turn whichever copy takes it, inside the place kept
+for it.
+
+### A chunk posted but not recorded
+
+**Issue.** The requester-pays delivery counted a reply whose
+`message_refs` row failed to record as incomplete, but `post_to` here
+logged a failed `record_post` and went on as if the chunk were
+delivered, though it hands nothing off, no short id names it, and its
+thread was never told. Separately, a failed upload skipped the reply's
+post: `uploaded && self.post(..)` short-circuited.
+
+**Solution.** The reply is posted whatever the upload did, and `post_to`
+returns `Sent { posted, handed_off }`; a turn's delivery is complete only
+when the upload and every post succeeded and every chunk with hand-offs
+to make was recorded with them, and otherwise says
+`DELIVERY_FAILED_TEXT`. A chunk that hands off to no one and can't be
+recorded is only logged: the person saw all of it, and a line saying
+part was lost would only have them pay for the turn again; what it loses
+is a short id. That goes for a private task's result too: the thread
+saw it, but without its row `consent_posted` can't tell it was posted,
+so if agentd stops before the task's work is finished, the next attempt
+says the task was interrupted rather than finishing quietly. A reply
+posted after a failed upload may still say it attached the file; the
+failure line follows it. A private task's outcome
+(`tell_thread`) needs only `posted`: its record is what `consent_posted`
+reads to mark the outcome posted, so treating an unrecorded outcome as
+unposted would post it again on each retry.
 
 ### Smaller choices
 
@@ -9473,11 +9940,46 @@ copy doesn't agree on whether the sender is from outside or of which
 organization, or that the sender couldn't be looked up: a home member whose
 `users.info` lookup was refused (`Api`, `Unauthorized`, `Forbidden`) gets a
 copy with `Outside { team: None }`, and is dropped under the same warning.
+(Superseded by "The home lookup never sets `outside`" below: the lookup no
+longer sets `outside` at all, a refused lookup drops the copy in
+`confirm`, and `Outside::team` is a plain `TeamId`.)
 Only a person's copy is compared (07 Oct review): a bot's own `outside`
 decides nothing, since a hop's requester takes it from the attribution, and
 comparing it dropped an agent's hop copy under that warning. At T36a the
 event of an outside sender is ignored before confirmation, so the drop only
 replaces what `copy_stands` already did; it is there for T36b.
+
+### The home lookup never sets `outside`
+
+**Issue.** `fill_sender_team` set a copy's `outside` from the organization
+`users.info` named when the copy's own fields left the sender home, and the
+pipeline lets a copy stand when its `outside` equals the event's. An
+event's `outside` comes from team fields an agent's owner can sign for
+their own agent's app, so a forged event naming exactly the organization
+the lookup gives would stand, and so would a genuine event whose fields
+name an organization the copy's fields don't. Not reachable while T36a
+ignores outside requesters, but T36b would admit them.
+
+**Solution.** `SlackSurface::copy_sender_is_home` replaces
+`fill_sender_team` and answers a yes or no, never an `Outside`, and never
+yes for a copy whose fields set `outside`: `confirm` asks it only of a copy
+whose fields leave the sender home, and drops the message (`Ok(None)`) for
+anything but `Membership::Home`, a refused lookup included; a transport
+error or a rate limit still fails the confirmation. A sender who isn't a
+member by Slack's lookup is warned of with that reason, the binding and
+the workspace `users.info` gave, at most once a minute per binding and
+reason (`TeamDirectory::note_drop`, keyed by a `DropReason`). A refused
+lookup gives two warnings: the directory's failed-lookup warning, once a
+minute per workspace as for any home check, and the pipeline's general
+line for an unconfirmed message, throttled per agent; the surface's own
+line for it is debug. That pipeline line names the binding and no longer
+says the platform doesn't have the message, which read as a forgery.
+A copy's `outside` is now its own fields alone, which always name a team,
+so `core_types::Outside::team` is a plain `TeamId` (no producer lacked
+one: hops and Rocket.Chat set none, and the store refuses outside
+requesters). `directory::organization` reads `team_id` alone, for logs,
+and `user_not_visible` is a `NotFound` code, so the home check matches
+`NotFound` only.
 
 ### The store refuses outside requesters until T36b
 
@@ -9493,10 +9995,11 @@ writes `outside: None` for every thread message it shows a session.
 `create_consent` and `set_ctl_turn` refuse a requester with `outside` set
 with `StoreError::Refused`, through one helper, `store::home_requester`.
 The T36b plan says so, and that admitting a listed organization rests on
-T36e: confirmation keeps the copy's own `outside`, from its fields or
-else the organization `users.info` names, and drops a message whose event
-and copy disagree on it, so an admitted outside message runs only when
-Slack's data and the event name the same organization.
+T36e: confirmation keeps the copy's own `outside`, from its own team
+fields alone (a copy they leave home is dropped unless `users.info` says
+home), and drops a message whose event and copy disagree on it, so an
+admitted outside message runs only when Slack's copy and the event name
+the same organization.
 
 Review round 2 found that the earlier wording here and in the plan, "no
 row reads back as home", was wrong: `record` writes a home requester for
@@ -9523,7 +10026,8 @@ once per binding and `WARNING_INTERVAL`. `slack::Inbound` keeps its check.
 ### Smaller fixes from review round 1
 
 - `fill_sender_team` sets a sender keyed by another surface or workspace
-  outside rather than leaving them home.
+  outside rather than leaving them home. (Superseded: `confirm` now drops
+  such a copy; see "The home lookup never sets `outside`".)
 - `member_who_left` needs the user's own `team_id` to be the workspace, so
   a member of another organization, or of another workspace of the
   organization, deactivated there deletes nothing here.

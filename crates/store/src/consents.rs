@@ -1506,7 +1506,9 @@ mod tests {
         let fx = fixture().await;
         let thread = thread(None);
         let requester = Requester {
-            outside: Some(core_types::Outside { team: None }),
+            outside: Some(core_types::Outside {
+                team: core_types::TeamId::new("T0THEIRS1"),
+            }),
             ..requester(None)
         };
         let id = ConsentId::new_v4();

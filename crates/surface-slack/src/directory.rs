@@ -34,7 +34,9 @@ use std::time::Duration;
 
 use std::collections::VecDeque;
 
-use core_types::{ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Throttle, UserId};
+use core_types::{
+    BindingId, ConvKind, ConversationId, Sharing, SurfaceError, TeamId, Throttle, UserId,
+};
 use render::MentionDirectory;
 use tokio::time::Instant;
 
@@ -69,13 +71,28 @@ pub const HOME_ANSWER_TTL: Duration = Duration::from_secs(60 * 60);
 /// once; past it, the oldest is dropped.
 pub const MAX_HOME_ANSWERS: usize = 4096;
 
-/// The `users.info` error codes that answer for no user the bot may see,
-/// which the home check takes, and keeps, for "not home".
+/// The `users.info` [`SurfaceError::NotFound`] codes that answer for no
+/// user the bot may see, which the home check takes, and keeps, for "not
+/// home". Any other `NotFound` says nothing about the user.
 const NOT_HOME_CODES: &[&str] = &["user_not_found", "user_not_visible"];
 
 /// How often a home check's failure that won't pass on its own is logged
 /// as a warning at most.
 pub const LOOKUP_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often confirmation's drop of a message for one binding and
+/// [`DropReason`] is logged as a warning at most.
+pub(crate) const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Why confirmation dropped a message after the home check, the key its
+/// warnings are throttled by with the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DropReason {
+    /// `users.info` doesn't have the sender as home.
+    NotHome,
+    /// The sender is keyed by another surface or workspace.
+    Elsewhere,
+}
 
 /// What `conversations.info` says about a conversation, as
 /// [`TeamDirectory::conv_info`] keeps it.
@@ -101,18 +118,21 @@ pub struct TeamDirectory {
     conv_infos: Mutex<HashMap<ConversationId, (ConvInfo, Instant)>>,
     home_answers: Mutex<HomeAnswers>,
     lookup_notes: Throttle<&'static str>,
+    drop_notes: Throttle<(BindingId, DropReason)>,
     grid_noticed: AtomicBool,
 }
 
 /// What Slack says of a user's place in the workspace: one of its own
-/// accounts, or from outside it, with the organization `users.info` named
-/// for them when it named one that isn't home.
+/// accounts, or not, with the workspace `users.info` named for them when it
+/// named one that isn't home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Membership {
     /// One of the workspace's own accounts ([`is_home`]).
     Home,
-    /// From outside the workspace, of the organization given, if Slack
-    /// named one ([`organization`]).
+    /// Not one of the workspace's own accounts, of the workspace given, if
+    /// Slack named one ([`organization`]). It is for logs only, never an
+    /// [`Outside`](core_types::Outside): see
+    /// [`SlackSurface::copy_sender_is_home`](crate::SlackSurface::copy_sender_is_home).
     Outside(Option<TeamId>),
 }
 
@@ -253,6 +273,7 @@ impl TeamDirectory {
             conv_infos: Mutex::new(HashMap::new()),
             home_answers: Mutex::new(HomeAnswers::new(MAX_HOME_ANSWERS)),
             lookup_notes: Throttle::new(LOOKUP_WARNING_INTERVAL),
+            drop_notes: Throttle::new(DROP_WARNING_INTERVAL),
             grid_noticed: AtomicBool::new(false),
         }
     }
@@ -466,7 +487,7 @@ impl TeamDirectory {
         Ok(self.membership(api, user).await? == Membership::Home)
     }
 
-    /// What [`home_user`](Self::home_user) decides, with the organization
+    /// What [`home_user`](Self::home_user) decides, with the workspace
     /// `users.info` named for a user who isn't home ([`organization`]):
     /// [`Membership::Outside`] with none when Slack named none that isn't
     /// home, or answered `user_not_found` or `user_not_visible`.
@@ -493,12 +514,10 @@ impl TeamDirectory {
                 if is_home(&info, &self.team, self.home_org.as_ref()) {
                     Membership::Home
                 } else {
-                    Membership::Outside(organization(&info, &self.team, self.home_org.as_ref()))
+                    Membership::Outside(organization(&info, &self.team))
                 }
             }
-            Err(SurfaceError::NotFound(code) | SurfaceError::Api(code))
-                if NOT_HOME_CODES.contains(&code.as_str()) =>
-            {
+            Err(SurfaceError::NotFound(code)) if NOT_HOME_CODES.contains(&code.as_str()) => {
                 if code == "user_not_visible" {
                     self.not_visible();
                 }
@@ -542,6 +561,16 @@ impl TeamDirectory {
         {
             tracing::warn!(team = %self.team, error = %err, failed_since_last_warning = quiet, "couldn't ask Slack whether a user is home; refusing whoever was asked about");
         }
+    }
+
+    /// Records that confirming a message `binding` received dropped it for
+    /// `reason`, and says whether to log it: how many such drops went
+    /// unlogged since the last one, at most once per
+    /// [`DROP_WARNING_INTERVAL`] for each binding and reason, or `None` to
+    /// stay quiet.
+    pub(crate) fn note_drop(&self, binding: BindingId, reason: DropReason) -> Option<u64> {
+        self.drop_notes
+            .record((binding, reason), std::time::Instant::now())
     }
 
     /// Notes a `users.info` that said `user_not_visible`, at most once per
@@ -873,25 +902,14 @@ pub fn is_home(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> bool {
             .is_none_or(names_home)
 }
 
-/// The organization Slack's `user` belongs to when it isn't home: their
-/// `team_id` if it is shaped like a workspace's id (`T…`), else their
-/// `enterprise_user.enterprise_id` if it is shaped like an organization's
-/// id (`E…`), either only when it is neither `team` nor `home_org`. `None`
-/// when neither is, so a `team_id` shaped like an organization's id names
-/// nothing on its own.
-pub fn organization(user: &User, team: &TeamId, home_org: Option<&TeamId>) -> Option<TeamId> {
-    let foreign = |id: &str| id != team.as_str() && home_org.is_none_or(|org| id != org.as_str());
+/// The workspace Slack's `user` belongs to when it isn't home, for logs:
+/// their `team_id` alone, if it is shaped like a workspace's id (`T…`) and
+/// isn't `team`. `enterprise_user` isn't read for it.
+pub fn organization(user: &User, team: &TeamId) -> Option<TeamId> {
     user.team_id
         .as_ref()
-        .filter(|id| is_workspace_id(id.as_str()) && foreign(id.as_str()))
+        .filter(|id| is_workspace_id(id.as_str()) && *id != team)
         .cloned()
-        .or_else(|| {
-            user.enterprise_user
-                .as_ref()
-                .and_then(|grid| grid.enterprise_id.as_deref())
-                .filter(|id| is_enterprise_id(id) && foreign(id))
-                .map(TeamId::from)
-        })
 }
 
 /// Lowercases and collapses white space.
@@ -1165,6 +1183,47 @@ mod tests {
         );
         assert!(!directory.listed_home(&"U2".into(), read));
         assert!(!TeamDirectory::new("T1".into()).listed_home(&ada, read));
+    }
+
+    #[test]
+    fn drops_are_warned_of_once_per_binding_and_reason() {
+        let directory = TeamDirectory::new("T1".into());
+        let pairs = [BindingId::new_v4(), BindingId::new_v4()]
+            .into_iter()
+            .flat_map(|binding| {
+                [DropReason::NotHome, DropReason::Elsewhere].map(|reason| (binding, reason))
+            });
+        let pairs: Vec<_> = pairs.collect();
+        for (binding, reason) in &pairs {
+            assert_eq!(
+                directory.note_drop(*binding, *reason),
+                Some(0),
+                "{binding} {reason:?}"
+            );
+        }
+        for (binding, reason) in &pairs {
+            assert_eq!(directory.note_drop(*binding, *reason), None);
+        }
+    }
+
+    #[test]
+    fn the_organization_is_the_answers_team_id_alone() {
+        let team = TeamId::from("T1");
+        let mut theirs = user("U2", "Zoe", "Zoe Outside", "zoe");
+        theirs.team_id = Some("T2".into());
+        theirs.enterprise_user = grid("E2", &["T2"]);
+        assert_eq!(organization(&theirs, &team), Some("T2".into()));
+        theirs.team_id = None;
+        assert_eq!(
+            organization(&theirs, &team),
+            None,
+            "enterprise_user names no organization"
+        );
+        theirs.team_id = Some("E2".into());
+        assert_eq!(organization(&theirs, &team), None);
+        let mut gone = user("U3", "Old", "Old Timer", "old");
+        gone.deleted = true;
+        assert_eq!(organization(&gone, &team), None);
     }
 
     fn grid(org: &str, teams: &[&str]) -> Option<EnterpriseUser> {

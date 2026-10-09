@@ -48,9 +48,10 @@ pub struct InboundEvent {
     /// Whether the sender is from outside the workspace agentd serves, and
     /// from which organization; `None` for a member of the workspace, and
     /// always on Rocket.Chat. On Slack it is what the message's own team
-    /// fields say, and for Slack's copy of it also what a lookup said; the
-    /// pipeline acts only on a copy whose `outside` is the event's. A bot's
-    /// says nothing, since the router never takes a bot for a requester.
+    /// fields say, for the event and for Slack's copy of it alike, never what
+    /// a lookup said; the pipeline acts only on a copy whose `outside` is the
+    /// event's. A bot's says nothing, since the router never takes a bot for
+    /// a requester.
     #[serde(default)]
     pub outside: Option<Outside>,
     /// Whether the sender is a bot, managed by agentd or not.
@@ -134,9 +135,7 @@ mod tests {
                 team: "T1".into(),
                 user: "U1".into(),
             },
-            outside: Some(Outside {
-                team: Some("T9".into()),
-            }),
+            outside: Some(Outside { team: "T9".into() }),
             sender_is_bot: false,
             sender_bot_user: None,
             conv: conv.clone(),

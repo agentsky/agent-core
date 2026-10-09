@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, MemberKey, Msg, MsgRef, OutFile,
-    Outside, Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
+    Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, TeamId, ThreadKey, UserId,
 };
 use render::MentionDirectory;
 use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
 use time::OffsetDateTime;
 
-use crate::directory::{MemberDirectory, Membership, TeamDirectory};
+use crate::directory::{DropReason, MemberDirectory, Membership, TeamDirectory};
 use crate::normalize::{self, Context, KEPT_SUBTYPES};
 use crate::web::{Message, PageRequest, Result, WebApi};
 
@@ -85,9 +85,9 @@ pub const CLIENT_URL: &str = "https://app.slack.com/client/";
 /// - [`post`](Surface::post) sends one chunk with `chat.postMessage`.
 /// - A bot message without a `user` names its sender by bot id until
 ///   [`fill_bot_sender`](Self::fill_bot_sender) looks the bot up.
-/// - [`confirm`](Surface::confirm) decides whether Slack's copy of a
-///   message is from outside the workspace with
-///   [`fill_sender_team`](Self::fill_sender_team).
+/// - [`confirm`](Surface::confirm) keeps Slack's copy of a message whose
+///   own team fields leave its sender home only when
+///   [`copy_sender_is_home`](Self::copy_sender_is_home) agrees.
 ///
 /// Every conversation it is given must be a Slack conversation in its
 /// workspace; any other is refused with [`SurfaceError::Api`] before
@@ -240,57 +240,73 @@ impl SlackSurface {
             .await
     }
 
-    /// Decides whether `event`'s sender is from outside the workspace when
-    /// its team fields left [`outside`](InboundEvent::outside) `None`: a
-    /// sender the directory doesn't say is home is set outside, of the
-    /// organization `users.info` named for them
-    /// ([`directory::organization`](crate::directory::organization)), or of
-    /// none known. A failed lookup that says
-    /// nothing about the user does that too ([`SurfaceError::Api`],
-    /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), so
-    /// the fields alone never make a sender home; the directory logs it
-    /// ([Who is home](crate::directory#who-is-home)). So is a sender
-    /// keyed by another surface or workspace, which this surface can't
-    /// vouch for.
+    /// Whether Slack's `copy` of a message is from a home sender, which
+    /// [`confirm`](Surface::confirm) asks of a copy whose own team fields
+    /// left [`outside`](InboundEvent::outside) `None` and drops it unless
+    /// so. A copy whose fields set `outside` is never home. Otherwise only
+    /// the directory saying the sender is home ([`Membership::Home`]) makes
+    /// them so. Anything else drops the message, whatever its event says: a
+    /// sender `users.info` doesn't have as home, a failed lookup that says
+    /// nothing about the user ([`SurfaceError::Api`],
+    /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), and a
+    /// sender keyed by another surface or workspace, which this surface
+    /// can't vouch for. A sender `users.info` doesn't have as home, or keyed
+    /// elsewhere, is warned of with that reason, the binding and the
+    /// workspace `users.info` named, at most once a minute for each binding
+    /// and reason; a failed lookup is a debug line here, since the
+    /// directory warns of it ([Who is home](crate::directory#who-is-home)).
+    /// Never the message.
     ///
-    /// A bot sender is never looked up: its `outside` decides nothing,
-    /// since the router takes no bot for a requester. Neither is a sender
-    /// already outside. The only caller is [`confirm`](Surface::confirm),
-    /// on Slack's copy of a message, so a made-up user id in a forged event
-    /// costs no lookup.
+    /// The lookup's answer never becomes an
+    /// [`Outside`](core_types::Outside): the pipeline lets a copy stand when
+    /// its `outside` matches the event's, and an event's comes from team
+    /// fields an agent's owner can sign, so a forged event naming the
+    /// organization the lookup gives would stand, and so would a genuine
+    /// one naming an organization the copy's fields don't.
+    ///
+    /// A bot sender is never looked up and may be kept: its `outside`
+    /// decides nothing, since the router takes no bot for a requester.
+    /// [`confirm`](Surface::confirm) asks this of Slack's copy, never of the
+    /// event, so a made-up user id in a forged event costs no lookup.
     ///
     /// # Errors
     ///
     /// [`SurfaceError::Transport`] (Slack unreachable, or saying it
     /// couldn't answer this time) and [`SurfaceError::RateLimited`], as
-    /// they came, leaving `outside` alone: Slack may answer later, and the
-    /// confirmation fails as any lookup it can't make does.
-    pub async fn fill_sender_team(&self, event: &mut InboundEvent) -> Result<()> {
-        if event.outside.is_some() || event.sender_is_bot || event.sender_bot_user.is_some() {
-            return Ok(());
+    /// they came: Slack may answer later, and the confirmation fails as any
+    /// lookup it can't make does.
+    pub async fn copy_sender_is_home(&self, copy: &InboundEvent) -> Result<bool> {
+        if copy.outside.is_some() {
+            return Ok(false);
         }
-        if event.sender.surface == SurfaceKind::Slack && event.sender.team == *self.directory.team()
+        if copy.sender_is_bot || copy.sender_bot_user.is_some() {
+            return Ok(true);
+        }
+        let binding = copy.binding;
+        if copy.sender.surface != SurfaceKind::Slack || copy.sender.team != *self.directory.team() {
+            if let Some(quiet) = self.directory.note_drop(binding, DropReason::Elsewhere) {
+                tracing::warn!(%binding, dropped_since_last_warning = quiet, "Slack's copy of a message names a sender of another surface or workspace; dropped it");
+            }
+            return Ok(false);
+        }
+        match self
+            .directory
+            .membership(&self.members_api.without_waiting(), &copy.sender.user)
+            .await
         {
-            match self
-                .directory
-                .membership(&self.members_api.without_waiting(), &event.sender.user)
-                .await
-            {
-                Ok(Membership::Home) => return Ok(()),
-                Ok(Membership::Outside(team)) => {
-                    event.outside = Some(Outside { team });
-                    return Ok(());
+            Ok(Membership::Home) => Ok(true),
+            Ok(Membership::Outside(team)) => {
+                if let Some(quiet) = self.directory.note_drop(binding, DropReason::NotHome) {
+                    tracing::warn!(%binding, organization = team.as_ref().map_or("none", TeamId::as_str), dropped_since_last_warning = quiet, "the sender isn't one of the workspace's members by Slack's lookup; dropped it");
                 }
-                Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => {
-                    return Err(err);
-                }
-                Err(err) => {
-                    tracing::debug!(binding = %event.binding, error = %err, "Slack wouldn't say whether a sender is home; taking them as outside");
-                }
+                Ok(false)
+            }
+            Err(err @ (SurfaceError::Transport(_) | SurfaceError::RateLimited { .. })) => Err(err),
+            Err(err) => {
+                tracing::debug!(%binding, error = %err, "Slack's lookup wouldn't say whether the sender is one of the workspace's members; dropped it");
+                Ok(false)
             }
         }
-        event.outside = Some(Outside { team: None });
-        Ok(())
     }
 
     /// Shows `text` (mrkdwn) to `user` alone, in `to`'s conversation and
@@ -606,10 +622,11 @@ impl Surface for SlackSurface {
     ///    a one-to-one DM, a mention of the bot or a thread reply under its
     ///    root. A bot known only by its bot id is named by its user, as
     ///    [`fill_bot_sender`](Self::fill_bot_sender) names it.
-    /// 4. Whether the sender is from outside the workspace: its team fields,
-    ///    then, unless they say so already,
-    ///    [`fill_sender_team`](Self::fill_sender_team), so a sender is home
-    ///    only when the member list or `users.info` agrees.
+    /// 4. Whether the sender is from outside the workspace: its team fields
+    ///    alone. A copy they leave home is kept only when
+    ///    [`copy_sender_is_home`](Self::copy_sender_is_home) agrees, and is
+    ///    otherwise `None`, so a sender is home only when the member list or
+    ///    `users.info` agrees, and the lookup never sets `outside`.
     ///
     /// None of the lookups [waits](WebApi::without_waiting) for its
     /// token's quota: past it, or while a 429 holds it, confirming fails
@@ -617,8 +634,8 @@ impl Surface for SlackSurface {
     /// hold the caller's place behind the owner's token.
     ///
     /// The binding, event id and arrival time are the event's. `None` when
-    /// Slack doesn't have the message, or has it in a form the ingress
-    /// would drop.
+    /// Slack doesn't have the message, has it in a form the ingress would
+    /// drop, or has it from a sender step 4 doesn't find home.
     async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
         let channel = self.channel(&event.conv)?;
         if !within_window(event.message.id.as_str(), event.received_at) {
@@ -649,7 +666,9 @@ impl Surface for SlackSurface {
             }
         };
         self.fill_bot_sender(&mut copy).await?;
-        self.fill_sender_team(&mut copy).await?;
+        if copy.outside.is_none() && !self.copy_sender_is_home(&copy).await? {
+            return Ok(None);
+        }
         Ok(Some(copy))
     }
 
