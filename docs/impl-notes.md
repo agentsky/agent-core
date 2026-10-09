@@ -5753,13 +5753,36 @@ runs at a time per name across instances. `acquire_skill_lease` is one
 upsert that takes the row only if its lease has ended, like the volume
 locks', and returns a new `LeaseId`, which is the holder: the sandbox
 `instance` name isn't unique (both sides of a deploy may keep the default),
-and a fresh id per acquisition needs none. `Skills::leased` releases it
-however the change ends, and warns if it had run out. `LEASE_TTL` is a
-minute, well past a few renames and row writes that each wait at most the
-store's five-second busy timeout; a lease a crash left ends then. An add,
-confirmation or removal waits up to `LEASE_WAIT` (two seconds) for another
-change to finish, then answers that one is in progress and changes nothing;
-the sweeper doesn't wait, and tries that name again at its next sweep.
+and a fresh id per acquisition needs none. An add, confirmation or removal
+waits up to `LEASE_WAIT` (two seconds) for another change to finish, then
+answers that one is in progress and changes nothing; an add only gets there
+after its clone and checks, so a busy name costs the owner a clone. The
+sweeper doesn't wait, and tries that name again at its next sweep.
+
+`Skills::leased` takes the lease, runs the change and releases the lease in
+a spawned task that the command only awaits, and runs the change in a task
+of its own, so the lease is released whether it returns or panics. Commands
+still running at the drain timeout, or when shutdown is forced, are aborted
+(`tasks.shutdown()`), which is every blue-green cutover that catches one;
+before, that could stop a confirmation between its move and its row write
+and remove the old skill with its work directory. The spawned task outlives
+the command. The store closes once its connections come back, so a change
+still running then fails its next store call and undoes its move as on any
+store failure; when `serve` returns, the runtime drops the task at its next
+await, as a crash would, and the lease ends on its own.
+
+The final writes are fenced on the lease: `put_skill`, `delete_skill`,
+`delete_pending_skill_before` and `confirm_skill` take the `LeaseId` and
+first check, inside their `BEGIN IMMEDIATE` transaction, that
+`skill_leases` holds it unexpired at the write's time, failing with
+`StoreError::SkillLeaseLost` otherwise; holding the write lock, no other
+instance can take the lease over before the transaction ends. A fenced-out
+`confirm_skill` undoes its move like any failed one. `LEASE_TTL` is two
+minutes: a change makes two store calls, each of which may wait the pool's
+30-second acquire timeout and then the 5-second busy timeout, about 70
+seconds at worst, and a lease a crash left keeps the name busy for those
+two minutes. The sweeper deletes ended leases, so names nothing changes
+again don't keep rows.
 
 With changes serialized, `confirm` reads the pending `SKILL.md` in place
 and moves the directory straight into the live one; the move into a work
@@ -5773,24 +5796,39 @@ drops it `PENDING_TTL` plus one to two `SWEEP_INTERVAL`s after it was
 added, and files that aren't waiting answer that nothing waits. When the
 row can't be made active, whether the row changed or the store failed,
 `confirm` puts its files back in the pending directory and the skill they
-replaced back into place before answering or returning the error; files
-that can't go back are removed rather than left under the old row. A test
-fails `confirm_skill` with a trigger and checks the old skill, its row and
-hosts, and the waiting files.
+replaced back into place before answering or returning the error. Files
+that can't go back move into the work directory instead, whose guard
+removes them, so the old skill always gets its place back; `move_into` logs
+a skill it set aside and couldn't move back. A test fails `confirm_skill`
+with a trigger and checks the old skill, its row and hosts, and the waiting
+files.
 
-What's left is a crash or a failure between a change's steps, which the
-order of the steps covers: a crash between `confirm`'s move and its row
-write leaves the update's files live under the old row, whose hosts the
-owner confirmed, until the skill is confirmed again or removed, and
-whatever a failed add or removal leaves, startup's purge removes. Purge
-takes no lease, so it still keeps both directories of a name with a row and
-leaves anything changed within `STALE_AFTER`, since the other side of a
-deploy may be mid-move or mid-clone. A pending directory `drop_expired`
-can't remove is logged; never mounted, it stays on disk until startup's
-purge if no row has the name, or else, since purge keeps every directory of
-a name with a row, until the name is next added or removed. A change that
-outlives `LEASE_TTL` loses the exclusion, and its release logs that; the
-hosts check and `confirm_skill`'s match are what remain then.
+What's left is a crash, or agentd exiting, between a change's steps. A
+confirmation stopped after setting the live skill aside and before moving
+the new files in leaves no live files under the old row, which grants
+nothing more than before, and the next confirmation moves the waiting files
+in. One stopped after the move and before its row write leaves the update's
+files live under the old row, whose hosts the owner confirmed, and the
+pending directory empty: the next `confirm` finishes it, making the pending
+row active when its pending directory is absent and the live `SKILL.md`
+declares exactly its hosts, which grants just what the files in use
+declare. One stopped in the middle of undoing its move can leave the old
+row without live files. Whatever a failed add or removal leaves, startup's
+purge removes. Purge takes no lease, so it still keeps both directories of
+a name with a row and leaves anything changed within `STALE_AFTER`, since
+the other side of a deploy may be mid-move or mid-clone. A pending
+directory `drop_expired` can't remove is logged; never mounted, it stays on
+disk until startup's purge if no row has the name, or else, since purge
+keeps every directory of a name with a row, until the name is next added or
+removed.
+
+File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
+row, and its release logs that the lease ran out, but its moves still
+happen: `skill rm` whose lease lapses after its row delete can remove a
+successor's files, and an add's or confirmation's move can land after a
+successor's. None of that grants a host: rows are only written under the
+lease, `confirm` moves only files declaring the row's hosts, and a pending
+row's hosts never count.
 
 ## T26: Requester-pays routing
 

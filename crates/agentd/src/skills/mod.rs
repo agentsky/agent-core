@@ -66,7 +66,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use core_types::{AgentId, MemberId, SessionId};
+use core_types::{AgentId, LeaseId, MemberId, SessionId};
 use cred_proxy::{EgressExtension, HostRule};
 use store::{AgentSkill, NewSkill, SkillState, Store, StoreError};
 use time::OffsetDateTime;
@@ -93,10 +93,12 @@ pub const WORK_DIR: &str = "skills-work";
 /// How long since it last changed before startup takes a directory no row
 /// records as left over: longer than any clone, with a margin.
 pub const STALE_AFTER: Duration = Duration::from_secs(git::CLONE_TIMEOUT.as_secs() + 180);
-/// How long a skill's lease lasts unless released: well past the moves and
-/// row writes it covers, each write waiting at most the store's busy
-/// timeout. A lease a crash left ends then.
-pub const LEASE_TTL: Duration = Duration::from_secs(60);
+/// How long a skill's lease lasts unless released: past the moves and the
+/// two store calls a change makes, each of which may wait the pool's
+/// 30-second acquire timeout and then the store's 5-second busy timeout.
+/// A lease a crash left keeps the name busy that long. The store writes
+/// check the lease, so a change that outlives it writes nothing.
+pub const LEASE_TTL: Duration = Duration::from_secs(120);
 /// How long an add, confirmation or removal waits for another change to
 /// the same skill to finish before saying one is in progress.
 pub const LEASE_WAIT: Duration = Duration::from_secs(2);
@@ -374,74 +376,77 @@ impl Skills {
             Ok(found) => found,
             Err(err) => return refused(err),
         };
-        let name = manifest.name.clone();
         let recorded = source.recorded();
+        let name = manifest.name.as_str().to_owned();
         let added = self
-            .leased(
-                agent,
-                name.as_str(),
-                LEASE_WAIT,
-                self.put_added(agent, &dir, &work.0, manifest, &recorded, by),
-            )
+            .leased(agent, &name, LEASE_WAIT, move |skills, lease| async move {
+                let hosts = host_names(&manifest);
+                let new = NewSkill {
+                    agent,
+                    name: manifest.name.as_str(),
+                    source: &recorded,
+                    hosts: &hosts,
+                    added_by: by,
+                };
+                let put = skills.put_added(&new, &dir, &work.0, lease).await?;
+                Ok(if !put {
+                    Err(Refused::TooMany)
+                } else if hosts.is_empty() {
+                    Ok(Added::Active(manifest))
+                } else {
+                    Ok(Added::Pending(manifest))
+                })
+            })
             .await?;
         Ok(added.unwrap_or(Err(Refused::Busy)))
     }
 
-    /// Records the skill `manifest` describes, checked in `dir`, from
-    /// `recorded`, and moves its files from `dir` into place, under the
-    /// skill's lease. `work` is the add's work directory, on the same file
-    /// system.
+    /// Records the skill `new` and moves its files from `dir` into place,
+    /// under the skill's `lease`, and returns whether it recorded it: not
+    /// when the agent has as many skills as it may. `work` is the add's
+    /// work directory, on the same file system.
     async fn put_added(
         &self,
-        agent: AgentId,
+        new: &NewSkill<'_>,
         dir: &Path,
         work: &Path,
-        manifest: Manifest,
-        recorded: &str,
-        by: MemberId,
-    ) -> Result<Result<Added, Refused>, SkillError> {
-        let name = manifest.name.as_str();
-        let hosts = host_names(&manifest);
-        let new = NewSkill {
-            agent,
-            name,
-            source: recorded,
-            hosts: &hosts,
-            added_by: by,
-        };
-        let state = if hosts.is_empty() {
+        lease: LeaseId,
+    ) -> Result<bool, SkillError> {
+        let (agent, name) = (new.agent, new.name);
+        let store = &self.inner.store;
+        let state = if new.hosts.is_empty() {
             SkillState::Active
         } else {
             SkillState::Pending
         };
         let pending = self.pending_dir(agent, name);
         if state == SkillState::Pending {
-            self.inner
-                .store
-                .delete_skill(agent, name, Some(SkillState::Pending))
+            store
+                .delete_skill(
+                    agent,
+                    name,
+                    Some(SkillState::Pending),
+                    lease,
+                    OffsetDateTime::now_utc(),
+                )
                 .await?;
             remove_dir(&pending).await?;
         }
         let now = OffsetDateTime::now_utc();
-        if !self
-            .inner
-            .store
-            .put_skill(&new, state, MAX_SKILLS, now)
-            .await?
-        {
-            return Ok(Err(Refused::TooMany));
+        if !store.put_skill(new, state, MAX_SKILLS, now, lease).await? {
+            return Ok(false);
         }
         if state == SkillState::Pending {
             move_into(dir, &pending, work).await?;
-            tracing::info!(%agent, skill = name, hosts = hosts.len(), "a skill waits for its hosts to be confirmed");
-            return Ok(Ok(Added::Pending(manifest)));
+            tracing::info!(%agent, skill = name, hosts = new.hosts.len(), "a skill waits for its hosts to be confirmed");
+            return Ok(true);
         }
         move_into(dir, &self.live_dir(agent, name), work).await?;
         if let Err(err) = remove_dir(&pending).await {
             tracing::warn!(%agent, skill = name, error = %err, "couldn't remove a superseded pending skill; adding or removing it again will");
         }
         tracing::info!(%agent, skill = name, "added a skill");
-        Ok(Ok(Added::Active(manifest)))
+        Ok(true)
     }
 
     /// Puts `agent`'s skill `name`, waiting for confirmation, in use with
@@ -459,13 +464,21 @@ impl Skills {
     ///
     /// If the store or the disk fails.
     pub async fn confirm(&self, agent: AgentId, name: &str) -> Result<Confirmed, SkillError> {
+        let owned = name.to_owned();
         let confirmed = self
-            .leased(agent, name, LEASE_WAIT, self.confirm_leased(agent, name))
+            .leased(agent, name, LEASE_WAIT, move |skills, lease| async move {
+                skills.confirm_leased(agent, &owned, lease).await
+            })
             .await?;
         Ok(confirmed.unwrap_or(Confirmed::Busy))
     }
 
-    async fn confirm_leased(&self, agent: AgentId, name: &str) -> Result<Confirmed, SkillError> {
+    async fn confirm_leased(
+        &self,
+        agent: AgentId,
+        name: &str,
+        lease: LeaseId,
+    ) -> Result<Confirmed, SkillError> {
         let waiting = self
             .inner
             .store
@@ -474,30 +487,51 @@ impl Skills {
             .into_iter()
             .find(|skill| skill.name == name && skill.state == SkillState::Pending);
         match waiting {
-            Some(waiting) => self.confirm_row(&waiting).await,
+            Some(waiting) => self.confirm_row(&waiting, lease).await,
             None => Ok(Confirmed::NotPending),
         }
     }
 
     /// Confirms the pending row `waiting` as [`confirm`](Self::confirm)
-    /// read it. Files that aren't in the pending directory, because an add
-    /// failed or died before moving them in, or that declare other hosts
-    /// than the row, leave nothing to confirm. If the row can't be made
-    /// active, the move is undone ([`put_back`]) before saying so.
-    async fn confirm_row(&self, waiting: &AgentSkill) -> Result<Confirmed, SkillError> {
+    /// read it, under the skill's `lease`. Files that aren't in the pending
+    /// directory, because an add failed or died before moving them in, or
+    /// that declare other hosts than the row, leave nothing to confirm. If
+    /// the row can't be made active, the move is undone ([`put_back`])
+    /// before saying so.
+    ///
+    /// With no pending directory and live files declaring exactly the row's
+    /// hosts, a confirmation stopped after its move and before its row
+    /// write is finished: the row becomes active for the files in use.
+    async fn confirm_row(
+        &self,
+        waiting: &AgentSkill,
+        lease: LeaseId,
+    ) -> Result<Confirmed, SkillError> {
         if waiting.added_at < OffsetDateTime::now_utc() - PENDING_TTL {
             return Ok(Confirmed::Expired);
         }
+        let store = &self.inner.store;
         let (agent, name) = (waiting.agent, waiting.name.as_str());
         let pending = self.pending_dir(agent, name);
+        let live = self.live_dir(agent, name);
+        if !is_dir(&pending).await? && declared_hosts(&live).await.as_ref() == Some(&waiting.hosts)
+        {
+            let confirmed = store
+                .confirm_skill(waiting, lease, OffsetDateTime::now_utc())
+                .await?;
+            tracing::info!(%agent, skill = name, confirmed = confirmed.is_some(), "finished a confirmation stopped after its move");
+            return Ok(confirmed.map_or(Confirmed::NotPending, Confirmed::Active));
+        }
         if declared_hosts(&pending).await.as_ref() != Some(&waiting.hosts) {
             tracing::info!(%agent, skill = name, "no files declaring a pending skill's hosts wait for it; confirmed nothing");
             return Ok(Confirmed::NotPending);
         }
-        let live = self.live_dir(agent, name);
         let work = self.work_dir().await?;
         move_into(&pending, &live, &work.0).await?;
-        match self.inner.store.confirm_skill(waiting).await {
+        match store
+            .confirm_skill(waiting, lease, OffsetDateTime::now_utc())
+            .await
+        {
             Ok(Some(skill)) => {
                 tracing::info!(%agent, skill = name, hosts = skill.hosts.len(), "confirmed a skill's hosts");
                 Ok(Confirmed::Active(skill))
@@ -526,14 +560,26 @@ impl Skills {
         if name == BUNDLED_NAME {
             return Ok(Removed::Bundled);
         }
+        let owned = name.to_owned();
         let removed = self
-            .leased(agent, name, LEASE_WAIT, self.remove_leased(agent, name))
+            .leased(agent, name, LEASE_WAIT, move |skills, lease| async move {
+                skills.remove_leased(agent, &owned, lease).await
+            })
             .await?;
         Ok(removed.unwrap_or(Removed::Busy))
     }
 
-    async fn remove_leased(&self, agent: AgentId, name: &str) -> Result<Removed, SkillError> {
-        let rows = self.inner.store.delete_skill(agent, name, None).await?;
+    async fn remove_leased(
+        &self,
+        agent: AgentId,
+        name: &str,
+        lease: LeaseId,
+    ) -> Result<Removed, SkillError> {
+        let rows = self
+            .inner
+            .store
+            .delete_skill(agent, name, None, lease, OffsetDateTime::now_utc())
+            .await?;
         let live = remove_dir(&self.live_dir(agent, name)).await?;
         let pending = remove_dir(&self.pending_dir(agent, name)).await?;
         tracing::info!(%agent, skill = name, rows = rows.len(), live, pending, "removed a skill");
@@ -550,51 +596,63 @@ impl Skills {
     }
 
     /// Deletes skills that waited too long for confirmation, with their
-    /// files, each under its lease. The sweeper calls it every
-    /// [`SWEEP_INTERVAL`], and startup once. It lets a skill wait that long
-    /// past [`PENDING_TTL`], so a confirmation shortly after the deadline
-    /// answers that the skill waited too long.
+    /// files, each under its lease, and then the leases that ended, such as
+    /// those a crash left on names nothing changes again. The sweeper calls
+    /// it every [`SWEEP_INTERVAL`], and startup once. It lets a skill wait
+    /// that long past [`PENDING_TTL`], so a confirmation shortly after the
+    /// deadline answers that the skill waited too long.
     ///
     /// # Errors
     ///
-    /// If listing the expired skills fails. A name whose lease is held is
-    /// skipped until the next sweep, and one whose lease or row can't be
-    /// read or written is logged and tried again then; the others still go.
-    /// Files whose row was deleted but that can't be removed are logged too:
-    /// never mounted, they stay on disk until startup's
-    /// [`purge`](Self::purge) if no row has the name, or else, since purge
-    /// keeps every directory of a name with a row, until the name is next
-    /// added or removed.
+    /// If listing the expired skills or deleting the ended leases fails. A
+    /// name whose lease is held is skipped until the next sweep, and one
+    /// whose lease or row can't be read or written is logged and tried
+    /// again then; the others still go. Files whose row was deleted but
+    /// that can't be removed are logged too: never mounted, they stay on
+    /// disk until startup's [`purge`](Self::purge) if no row has the name,
+    /// or else, since purge keeps every directory of a name with a row,
+    /// until the name is next added or removed.
     pub async fn drop_expired(&self) -> Result<(), SkillError> {
+        let store = &self.inner.store;
         let before = OffsetDateTime::now_utc() - PENDING_TTL - SWEEP_INTERVAL;
-        for (agent, name) in self.inner.store.pending_skills_before(before).await? {
+        for (agent, name) in store.pending_skills_before(before).await? {
+            let owned = name.clone();
             let dropped = self
                 .leased(
                     agent,
                     &name,
                     Duration::ZERO,
-                    self.drop_expired_skill(agent, &name, before),
+                    move |skills, lease| async move {
+                        skills
+                            .drop_expired_skill(agent, &owned, before, lease)
+                            .await
+                    },
                 )
                 .await;
             if let Err(err) = dropped {
                 tracing::warn!(%agent, skill = name.as_str(), error = %err, "couldn't drop an expired skill or its files");
             }
         }
+        store
+            .delete_ended_skill_leases(OffsetDateTime::now_utc())
+            .await?;
         Ok(())
     }
 
-    /// Deletes `agent`'s pending skill `name`, under its lease, if it was
+    /// Deletes `agent`'s pending skill `name`, under its `lease`, if it was
     /// added before `before`, and then its files.
     async fn drop_expired_skill(
         &self,
         agent: AgentId,
         name: &str,
         before: OffsetDateTime,
+        lease: LeaseId,
     ) -> Result<(), SkillError> {
+        let now = OffsetDateTime::now_utc();
         if self
             .inner
             .store
-            .delete_pending_skill_before(agent, name, before)
+            .delete_pending_skill_before(agent, name, before, lease, now)
             .await?
         {
             remove_dir(&self.pending_dir(agent, name)).await?;
@@ -602,46 +660,65 @@ impl Skills {
         Ok(())
     }
 
-    /// Runs `work` holding the lease on `agent`'s skill `name`, which keeps
-    /// every other add, confirmation, removal and expiry of that name, on
-    /// any instance, waiting until it is done. Waits up to `wait` for the
-    /// lease, and returns `None` without running `work` if it is still
-    /// held. The lease is released however `work` ends, or ends on its own
-    /// after [`LEASE_TTL`] if agentd dies first.
-    async fn leased<T>(
+    /// Runs the change `work` makes, given the lease on `agent`'s skill
+    /// `name`, which keeps every other add, confirmation, removal and
+    /// expiry of that name, on any instance, waiting until it is done.
+    /// Waits up to `wait` for the lease, and returns `None` without running
+    /// `work` if it is still held.
+    ///
+    /// The lease is taken, `work` run and the lease released in a task of
+    /// their own, which the caller only awaits: a command aborted at
+    /// shutdown leaves it running, so a change's moves and row writes
+    /// aren't cut apart there. The lease is released whether `work`
+    /// returns or panics; if agentd exits first, the runtime drops the
+    /// task at its next await, as a crash would stop it, and the lease
+    /// ends after [`LEASE_TTL`].
+    async fn leased<T, F, W>(
         &self,
         agent: AgentId,
         name: &str,
         wait: Duration,
-        work: impl Future<Output = Result<T, SkillError>>,
-    ) -> Result<Option<T>, SkillError> {
-        let store = &self.inner.store;
-        let deadline = tokio::time::Instant::now() + wait;
-        let lease = loop {
-            let now = OffsetDateTime::now_utc();
-            if let Some(lease) = store
-                .acquire_skill_lease(agent, name, now, LEASE_TTL)
-                .await?
-            {
-                break lease;
+        work: W,
+    ) -> Result<Option<T>, SkillError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, SkillError>> + Send + 'static,
+        W: FnOnce(Skills, LeaseId) -> F + Send + 'static,
+    {
+        let skills = self.clone();
+        let name = name.to_owned();
+        tokio::spawn(async move {
+            let store = &skills.inner.store;
+            let deadline = tokio::time::Instant::now() + wait;
+            let lease = loop {
+                let now = OffsetDateTime::now_utc();
+                if let Some(lease) = store
+                    .acquire_skill_lease(agent, &name, now, LEASE_TTL)
+                    .await?
+                {
+                    break lease;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    tracing::info!(%agent, skill = name.as_str(), "another change to a skill holds its lease; changed nothing");
+                    return Ok(None);
+                }
+                tokio::time::sleep(LEASE_RETRY).await;
+            };
+            let done = tokio::spawn(work(skills.clone(), lease)).await;
+            match store.release_skill_lease(agent, &name, lease).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(%agent, skill = name.as_str(), "a skill's lease ran out before its change finished");
+                }
+                Err(err) => {
+                    tracing::warn!(%agent, skill = name.as_str(), error = %err, "couldn't release a skill's lease; it ends on its own");
+                }
             }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::info!(%agent, skill = name, "another change to a skill holds its lease; changed nothing");
-                return Ok(None);
-            }
-            tokio::time::sleep(LEASE_RETRY).await;
-        };
-        let result = work.await;
-        match store.release_skill_lease(agent, name, lease).await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(%agent, skill = name, "a skill's lease ran out before its change finished");
-            }
-            Err(err) => {
-                tracing::warn!(%agent, skill = name, error = %err, "couldn't release a skill's lease; it ends on its own");
-            }
-        }
-        result.map(Some)
+            done.map_err(|err| SkillError::Task(err.to_string()))?
+                .map(Some)
+        })
+        .await
+        .map_err(|err| SkillError::Task(err.to_string()))?
     }
 
     /// Cleans up at startup: deletes skills that waited too long for
@@ -738,12 +815,15 @@ async fn declared_hosts(dir: &Path) -> Option<Vec<String>> {
 
 /// Undoes [`Skills::confirm_row`]'s move of the files in `pending` into
 /// `live`: moves them back, and the skill they replaced, which the move set
-/// aside in `aside`, back into `live`. Files that can't move back are
-/// removed, so the old skill's row never covers them.
+/// aside in `aside`, back into `live`. Files that can't move back are moved
+/// into `aside`, whose guard removes them, so the old skill can still take
+/// their place and its row never covers them.
 async fn put_back(live: &Path, pending: &Path, aside: &Path) -> Result<(), SkillError> {
     let back = tokio::fs::rename(live, pending).await;
     if back.is_err() {
-        remove_dir(live).await?;
+        tokio::fs::rename(live, aside.join("new"))
+            .await
+            .map_err(io("moving a skill aside"))?;
     }
     let old = aside.join("old");
     if is_dir(&old).await? {
@@ -771,8 +851,8 @@ async fn move_into(from: &Path, to: &Path, aside: &Path) -> Result<(), SkillErro
         Err(err) => return Err(io("moving a skill aside")(err)),
     };
     if let Err(err) = tokio::fs::rename(from, to).await {
-        if replaced {
-            let _ = tokio::fs::rename(&old, to).await;
+        if replaced && let Err(restore) = tokio::fs::rename(&old, to).await {
+            tracing::warn!(dir = %to.display(), error = %restore, "couldn't move back the skill a failed move set aside; it goes with the work directory");
         }
         return Err(io("moving a skill into place")(err));
     }

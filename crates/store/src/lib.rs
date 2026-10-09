@@ -115,6 +115,10 @@ pub enum StoreError {
         /// The column.
         column: &'static str,
     },
+    /// A write made under a skill's lease found the lease ended or taken
+    /// over, and changed nothing.
+    #[error("the skill's lease ended before the write")]
+    SkillLeaseLost,
 }
 
 /// A `Result` whose error is [`StoreError`].
