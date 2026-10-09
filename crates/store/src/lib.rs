@@ -16,8 +16,10 @@
 //!
 //! Repository methods are grouped by table: [`members`](Store::ensure_member),
 //! [`claude_links`](Store::put_claude_link),
-//! [`pending_logins`](Store::put_pending_login) and
-//! [`processed_events`](Store::mark_event_processed).
+//! [`pending_logins`](Store::put_pending_login),
+//! [`processed_events`](Store::mark_event_processed),
+//! [`ctl_tokens`](Store::put_ctl_token) and
+//! [`scope_locks`](Store::acquire_scope_lock).
 
 #![warn(missing_docs)]
 
@@ -30,12 +32,14 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePo
 use time::OffsetDateTime;
 
 mod claude_links;
+mod ctl;
 mod events;
 mod members;
 mod pending_logins;
 mod seal;
 
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
+pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
 pub use seal::{KeyError, SealError, Sealer};
@@ -308,9 +312,11 @@ mod tests {
                 "_sqlx_migrations",
                 "claude_link_generations",
                 "claude_links",
+                "ctl_tokens",
                 "members",
                 "pending_logins",
                 "processed_events",
+                "scope_locks",
                 "surface_identities",
             ]
         );
