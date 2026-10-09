@@ -4471,7 +4471,10 @@ thread; a requester's own run of turns keeps the warm process.
 turn, a community-key one included, replaces the container, and that the same
 requester and a hop carrying it keep it. A leftover can still use its own
 requester's later turns and the egress allowlist between turns, and files left
-in the session's `work/` or `home/` outlive the container.
+in the session's `work/` or `home/` outlive the container. Only one
+requester's turns now share a warm process, so the case the T20 note on
+`total_cost_usd` gives, of other members' turns on a shared warm process
+([T20](#total_cost_usd-is-the-processs-running-total)), no longer arises.
 
 ### How turns queue and survive their caller
 
