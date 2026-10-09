@@ -4319,6 +4319,316 @@ serde_json's default float parser is not correctly rounded (its
 literal, and the differences carry such errors too. That stays far below
 a cent in T27's daily sums; the fixture test compares with a tolerance.
 
+## T21: runner sessions, queue and warm pool
+
+### The hooks name the process, not only the session
+
+**Issue.** The plan's `process_stopping(session)` and `turn_finished(session,
+turn)` name only the session. The pool calls `process_stopping` from the
+sandbox's event stream when a container dies, without the session's lock,
+since a turn may be running for many minutes. A death reported for a
+session's old container could then land after the session had stopped it
+and started a new process, and revoke the new process's placeholder and
+agentctl token. T23 would also have had to keep a map from session to
+token to hand the turn's outbox back.
+
+**Solution.** `TurnHooks` has two associated types. `process_starting`
+returns `(ProcessEnv, Self::Process)`, and every later call for that
+process gets the `Process` back, so agentd can keep the placeholder's id
+and the agentctl token in it and a late call for an old process never
+touches a new one. `turn_finished` returns `Self::Finished`, which
+`run_turn` hands to the caller in `TurnReport::finished`: T23 returns the
+turn's `Outbox` there. `SessionManager` is generic over its hooks rather
+than holding a `dyn TurnHooks`.
+
+A death revokes the process at once even while a turn runs in it:
+`a_container_killed_mid_turn_has_its_process_revoked_before_the_turn_ends`
+kills the container under a running turn and holds that turn's
+`turn_finished` until `process_stopping` has run, so the test fails if the
+revocation waits for the turn.
+
+### A turn cut off before its outcome was recorded
+
+**Issue.** A session is marked started after a turn whose `init_seen` is
+true. If agentd dies after the CLI read an unstarted session's first
+message but before that was recorded, the next process starts with
+`--session-id`, which the CLI refuses because the transcript exists, and
+every later turn fails the same way: nothing would ever mark it started.
+
+**Solution.** `sessions` has a `maybe_started` column. It is set in the
+store before a turn goes to an unstarted session's CLI, and cleared when
+the turn's outcome says what happened (`init_seen`, or a refused
+`--resume`). A session with it set starts its next process with
+`--resume`; if there is no transcript after all the CLI refuses, and the
+plan's rerun with `--session-id` takes over. A `--session-id` start that
+crashes without `init_seen` leaves it set too, so a transcript that
+existed after all is resumed next time.
+
+### `lookup_or_create` needs the scope
+
+**Issue.** `lookup_or_create(agent, thread_key)` has no scope to record,
+and a `ThreadKey` can't give one: the router decides that the owner's DM is
+`Private` and another member's is `Dm`. If a thread's session were found
+whatever scope it was made on, a DM that stopped being the owner's (the
+agent changed hands) would keep running on the agent's `Private` volume.
+
+**Solution.** `lookup_or_create(agent, thread, scope)`. A thread's live
+session on another scope is reset and replaced in the same transaction,
+and its warm container stopped in the background, so a session never
+changes volume.
+
+### `create_private` needs the thread
+
+**Issue.** `create_private(agent, consent)` names no thread, but the row's
+thread columns are not null, and T33 posts the task's result to the thread
+recorded with the consent, whose table doesn't exist yet.
+
+**Solution.** `create_private(agent, consent, thread)`, and a `consent_id`
+column, set exactly for `private` rows. The thread columns of a private
+row hold where its result goes; the partial unique index covers normal
+rows only, so they never collide with the thread's own session. A private
+session takes only `TurnKind::PrivateTask` with its own consent, and a
+normal session only `TurnKind::Normal`.
+
+### Idle containers hold places under the caps
+
+**Issue.** With one warm container per active session, idle containers
+fill a scope's cap, and a new session would wait up to the idle timeout
+for the reaper.
+
+**Solution.** A session that needs a container when a cap is full first
+stops an idle one under that cap (a dead one first, then the one idle
+longest), and otherwise waits on the cap's semaphore until a place frees
+up or a turn ends and a container becomes idle. A container is idle when
+its session's lock is free; the pool takes it with `try_lock`, so it never
+waits on another session. The scope cap is per volume, `(agent, scope)`,
+so two agents in one channel don't share one. The global cap defaults to
+32; the Compose sandbox network leaves about 126 addresses.
+
+### Mounts come from the turn's side
+
+**Issue.** A container's mounts are fixed when it starts, and the plan
+doesn't say what decides them: `shared/` read-write or read-only, and
+whether `memory/` is mounted.
+
+**Solution.** The turn's `Side`, on the agent's `Private` volume: the
+owner's side gets `shared/` read-write and `memory/`, the public side (a
+private task a non-owner asked for) `shared/` read-only and no `memory/`.
+Every other volume mounts `shared/` read-write and no `memory/`. A turn
+whose mounts differ from the warm container's stops the container, like a
+credential kind or model change stops the process.
+
+### Another requester's turn gets a new container
+
+**Issue.** A warm container is reused across turns of one session, and a
+background process a turn leaves running, such as a `&` job or a Bash-tool
+background shell, survives in it. `turn_starting` points the container's
+placeholder at each turn's credential and records the turn on the agentctl
+token, so a process left from requester A's turn could spend requester B's
+credential, or act through `agentctl`, while B's turn runs. Restarting the
+process on a credential kind change doesn't help: the leftover isn't the CLI,
+and two members' subscriptions are the same kind.
+
+**Solution.** `Held` records the `Requester` whose turn started the container,
+and `ensure_process` stops the whole container, as it does a dead one or one
+with other mounts, when a turn's requester differs, before it looks at the
+process. Stopping the container ends its PID namespace and every process in
+it; stopping only the CLI would leave the leftovers running. It compares the
+full `Requester`, not the `CredentialRef`: a community-key turn of another
+requester also gets the agentctl token, so it gets a new container too. An
+agent-to-agent hop runs as the requester it inherits, so it keeps a container
+started for that requester. The cost is a container start and a `--resume` of
+the transcript whenever consecutive turns of one session come from different
+requesters, as in a busy channel thread; a requester's own run of turns keeps
+the warm process. Only one requester's turns now share a warm process, so the
+case the T20 note on `total_cost_usd` gives, of other members' turns on a
+shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
+no longer arises. `a_requester_change_replaces_the_container` checks that
+another requester's turn, a community-key one included, replaces the
+container, and that the same requester and a hop carrying it keep it.
+
+It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
+are the session's `home/`, `tmp/` and `claude/` on its volume, the working
+directory is `work/`, and every container of the session mounts them, with the
+volume's `shared/` (read-only on the public side of `Private`). Only
+`claude/settings.json` and the `claude/skills` entry are rewritten before each
+start, and in the Docker sandbox only `/tmp`, a tmpfs of the container's own,
+goes with the container. So a turn can leave a file that runs or instructs code
+in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
+a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
+`work/` or `shared/`, or text in the transcript. A leftover process can also
+still use its own requester's later turns, and the egress allowlist between
+turns. The plan's Deferred work ("Killing leftover processes at turn end")
+records both, with a way to narrow the files' part.
+
+### How turns queue and survive their caller
+
+**Issue.** The plan asks for a keyed queue in arrival order, and for
+`turn_finished` to finish before the slot is released even when the caller
+is cancelled. A task spawned per turn and then queued would queue in
+whatever order tokio runs the tasks.
+
+**Solution.** Each session's slot is a tokio mutex, which hands the lock
+out in the order it was asked for. `run_turn` asks for it in the caller's
+future, as its first await, and once it has it runs the turn in a spawned
+task that owns the lock guard, so dropping the caller no longer cancels
+anything; the lock is released only after `turn_finished` returns. A
+caller that stops waiting while its turn is still queued leaves the queue
+and its turn never runs. `reset` and `stop` queue the same way, so a reset
+runs after the turns queued before it; turns queued after it fail with
+`RunnerError::SessionReset`.
+
+### Hook failures
+
+**Issue.** The plan doesn't say what a failing hook does.
+
+**Solution.** A failed `process_starting` fails the turn and stops the
+container, and so does a process that fails to start. A failed
+`turn_starting` fails it without sending it, and `turn_finished` is still
+called, since the placeholder may have been pointed. A failed
+`turn_finished` is logged and returned in `TurnReport::finished`, and the
+process is stopped (with `process_stopping`), since the runner can't tell
+whether the placeholder is still pointed. A failed `process_stopping` is
+logged and the stop goes ahead, and unless a later call for that process
+succeeds it runs once more after the container is stopped; a second
+failure is logged and given up on. Retrying only when it was called again
+missed manager-initiated stops: the process is taken from the session
+before the call, and a death event for a container already marked dead is
+ignored, so a failed revocation used to leave the agentctl token valid for
+the next container on the address. A failed revocation also takes the
+container with it, even when the process was seen to exit, since leftover
+processes in the container could otherwise keep using the live token
+between turns.
+
+A panic in `process_starting` is taken for its failure, and one in
+`process_stopping` is logged and the stop goes ahead: otherwise a panic in
+`process_stopping` left the process it was stopping running, taken out of
+the session, and the next turn started a second process in the same
+container. It would also have ended the event follower or the reaper for
+good. A process that panics while starting has `process_stopping` called
+and its container stopped, since it may have been started, and the turn
+fails with `RunnerError::TurnTask`.
+
+A panic in a turn is caught at the turn: one in `turn_starting` or the send
+still has `turn_finished` called, and after any panic, `turn_finished`'s
+included, the turn is recorded if it has an outcome and the process is
+stopped as after a failed `turn_finished`. Only then does the panic resume,
+failing the turn with `RunnerError::TurnTask`. Otherwise the next turn would
+reuse a process whose placeholder may still be pointed, and the store would
+keep `maybe_started` for a turn whose outcome was known. The slot's release
+wakes waiters for an idle container from a drop guard, so a panic doesn't
+leave a session waiting on the caps until the idle timeout.
+
+### A container that fails to stop
+
+**Issue.** When `Sandbox::stop` failed, the pool forgot the container and
+freed its places under the caps, though it may still have been running with
+its process in it. The next turn of the session then started another
+container and another process on the same transcript, past the caps, and
+nothing tried the stop again.
+
+**Solution.** A container whose stop fails stays its session's, marked
+dead, with its places under the caps. A turn that finds it, and `reset`,
+try the stop again and fail with `RunnerError::Sandbox` if it still fails,
+so no second process resumes the transcript. The reaper tries every dead
+container each round, and eviction under a full cap tries it first. A
+container's address is read when a process starts in it, after the
+container is held, so a container whose address can't be read goes the
+same way.
+
+### A normal stop reported as a death
+
+**Issue.** Stopping a container makes the sandbox report it dead, and the
+event can arrive while `Sandbox::stop` is still returning. The pool forgot
+the container only once the stop returned, so the event follower found it
+still tracked and alive, and logged a container death, with a warning, on
+nearly every normal stop.
+
+**Solution.** A session marks its container dead before it stops it. The
+follower takes a dead container's death as already handled, and a stop that
+fails leaves the container marked dead, as before.
+
+### The death-log test missed its own events
+
+**Issue.** `a_normal_stop_is_not_logged_as_a_death` failed once in CI with
+no "stopped a session container" line and nothing captured at all. It
+captured logs with `tracing::subscriber::set_default`. With that one scoped
+subscriber the only dispatcher registered, `tracing-core` works out a
+callsite's interest, the first time the callsite is hit, from the dispatcher
+of the thread that hits it. Another test of the binary, on its own thread
+with no subscriber, that stopped a container first after this test had set
+its subscriber registered the callsite with "never", for every thread, and
+the test's own event was dropped. The same could turn off "a session
+container died" and make the test pass whatever the pool logged. The pool
+was right: the test failed only when another test's thread hit the
+callsite first.
+
+**Solution.** Every harness installs one global subscriber for the test
+binary, once, before any test reaches the pool, and the test reads only the
+lines naming its own session, as the egress log test does.
+
+The other log captures, in agentd's sweeper, command and telemetry tests,
+runner's log test and cred-proxy's logging and egress tests, had the same
+flaw or the same ad hoc fix. Every capture now goes through the shared
+`testkit::Logs`: one global subscriber per test binary (`Logs::global`, or
+`Logs::install` with the binary's own, as agentd installs its JSON one),
+read per test by a field only that test logs (`Logged::matching`) or by a
+span it enters on its own thread (`Logs::tag`). agentd's capture formats only
+events inside such a span, so tests that capture nothing aren't slowed down.
+`Logged::assert_lacks` refuses an empty capture, and every absence check
+sits next to a presence check on the line it expects. The telemetry tests
+check subscribers themselves, so they still set one per test, through
+`Logs::scoped` on the global capture: with the global subscriber registered
+first there are always two dispatchers, and `tracing-core` then asks each of
+them about a new callsite, whichever thread hits it.
+
+A tag keeps only the lines whose span parents lead back to it: a line
+inside a span made before the tag, such as a task's own `instrument` span,
+or logged on another thread, such as by `spawn_blocking`, is missing from
+it. So an absence check reads `Logged::matching` a unique id or the whole
+snapshot, never a tag. `Logs::install` rebuilds the interest cache once
+`set_global_default` has installed the subscriber, since `Dispatch::new`
+rebuilt it before the global dispatcher was set and a callsite first hit in
+between stays off; and it panics when a later call passes a different
+`make`, which would otherwise be ignored. agentd's capture is the lib test
+binary's global subscriber, so `telemetry::init` fails in a lib test that
+reaches it; such a test runs `agentd` as a process, as `tests/binary.rs`
+does.
+
+### A refused `--resume` is known only on a resumed process
+
+**Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
+its shape: an `error_during_execution` error result before `system`/`init`.
+Acting on that shape for any process would mark a session unstarted, and
+run its turn again, after a `--session-id` start or a warm process's later
+turn ended that way for some other reason.
+
+**Solution.** The runner treats it as a refusal only on the first turn sent
+to a process started with `SessionStart::Resume`. Any other turn with that
+outcome is recorded like any turn without `init_seen`, which leaves
+`maybe_started` as it was. The process remembers that nothing was sent to it
+yet, and the send clears it: a resumed process whose first turn failed in
+`turn_starting` is kept warm, and the refusal comes on the next turn, which
+didn't start the process. Judged by whether the turn started the process,
+that refusal came back as an error result, the turn didn't run again, and
+its message was lost.
+
+If the store fails to mark the session unstarted, the turn fails with
+`RunnerError::Store` instead of running again: the session still reads as
+started, so the second run would `--resume` and be refused again.
+
+### What is durable
+
+**Issue.** Queued and in-flight state must survive a restart if anything
+reads it back.
+
+**Solution.** What the runner reads back lives in `sessions`: the ids,
+`started`, `maybe_started`, `last_turn_at` and `reset_at`. The queue of
+waiting turns belongs to its callers' futures, and the warm pool to
+running processes and containers, neither of which survives a restart:
+agentd reaps every sandbox at startup (T17) and purges agentctl tokens
+(T15), and placeholders live in memory (T18). They stay in memory.
+
 ## T22: router
 
 ### The plan and the design name no order for the checks
@@ -4904,312 +5214,242 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
 
-## T21: runner sessions, queue and warm pool
+## T30: Slack manager app and configuration token
 
-### The hooks name the process, not only the session
+Slack's documentation site wasn't reachable, so the shapes below were read
+from Slack's SDKs: `tooling.tokens.rotate` from `slackapi/python-slack-sdk`
+(`slack_sdk/web/client.py`, which sends `refresh_token` as a form field) and
+`slackapi/java-slack-sdk` (`ToolingTokensRotateResponse`, `RequestFormBuilder`,
+`MethodsRateLimits`), and the manifest's keys from the Java SDK's
+`AppManifest`. None of it has run against real Slack yet.
 
-**Issue.** The plan's `process_stopping(session)` and `turn_finished(session,
-turn)` name only the session. The pool calls `process_stopping` from the
-sandbox's event stream when a container dies, without the session's lock,
-since a turn may be running for many minutes. A death reported for a
-session's old container could then land after the session had stopped it
-and started a new process, and revoke the new process's placeholder and
-agentctl token. T23 would also have had to keep a map from session to
-token to hand the turn's outbox back.
+### One agentd serves one workspace
 
-**Solution.** `TurnHooks` has two associated types. `process_starting`
-returns `(ProcessEnv, Self::Process)`, and every later call for that
-process gets the `Process` back, so agentd can keep the placeholder's id
-and the agentctl token in it and a late call for an old process never
-touches a new one. `turn_finished` returns `Self::Finished`, which
-`run_turn` hands to the caller in `TurnReport::finished`: T23 returns the
-turn's `Outbox` there. `SessionManager` is generic over its hooks rather
-than holding a `dyn TurnHooks`.
+**Issue.** The plan says to install the manager app "once per workspace",
+but its secrets are configuration: one signing secret, one bot token, and the
+fixed binding `manager`. Nothing in the plan said which workspace that is,
+and identities and replies need its team id.
 
-A death revokes the process at once even while a turn runs in it:
-`a_container_killed_mid_turn_has_its_process_revoked_before_the_turn_ends`
-kills the container under a running turn and holds that turn's
-`turn_finished` until `process_stopping` has run, so the test fails if the
-revocation waits for the turn.
+**Solution.** agentd serves the workspace the bot token belongs to. The
+signing secret now requires `AGENTD_SLACK_MANAGER_BOT_TOKEN` and the other
+way round, and `App::open` asks Slack who the token is before serving:
+`auth.test` gives the team, the bot user and the bot, and `bots.info` on the
+bot gives the app's id and name (T29's note said `auth.test` names no app).
+If Slack refuses or can't be reached, agentd doesn't start; the error names
+the variable, never the token. A new, optional `[slack]` section has one key,
+`api_url`, so tests can point agentd at a fake Web API. The ingress now keeps
+channel messages that mention the manager's bot user, which no longer
+matters to the manager app itself, since it subscribes only to `message.im`.
 
-### A turn cut off before its outcome was recorded
+A signed request only proves it came through the manager app, which a
+workspace admin elsewhere could install from the same manifest. So
+`slack::Inbound` drops, with a debug line, any command, message or event
+whose workspace (`SlackInbound::team`: the sender's, the conversation's or
+the envelope's `team_id`) isn't the manager's, or that names none; before,
+a slash command from another workspace could register a configuration
+token there.
 
-**Issue.** A session is marked started after a turn whose `init_seen` is
-true. If agentd dies after the CLI read an unstarted session's first
-message but before that was recorded, the next process starts with
-`--session-id`, which the CLI refuses because the transcript exists, and
-every later turn fails the same way: nothing would ever mark it started.
+### A configuration token is checked by rotating it
 
-**Solution.** `sessions` has a `maybe_started` column. It is set in the
-store before a turn goes to an unstarted session's CLI, and cleared when
-the turn's outcome says what happened (`init_seen`, or a refused
-`--resume`). A session with it set starts its next process with
-`--resume`; if there is no transcript after all the CLI refuses, and the
-plan's rerun with `--session-id` takes over. A `--session-id` start that
-crashes without `init_seen` leaves it set too, so a transcript that
-existed after all is resumed next time.
+**Issue.** The plan offers two checks, `auth.test` with the configuration
+token or `tooling.tokens.rotate` at once. Whether `auth.test` accepts a
+configuration token isn't in the SDKs, and it wouldn't show that the
+refresh token works.
 
-### `lookup_or_create` needs the scope
+**Solution.** `/agent slack-token` rotates at once with the refresh token,
+which proves it works and returns a fresh pair valid for 12 hours, and stores
+that pair; the token the member typed is never used or stored. The call
+sends no `Authorization` header and the refresh token only in the form body.
+The answer's `team_id` and `user_id` must be the sender's own workspace and
+user, since agentd would otherwise create apps as someone else or in another
+workspace. A mismatch has already used up the refresh token, so the reply
+says to generate a new one. Only a linked member on Slack may register a
+token. `ConfigToken` and the store's token types keep both tokens as
+`SecretString`, and a captured-log test at `trace` finds neither, nor the
+`response_url`.
 
-**Issue.** `lookup_or_create(agent, thread_key)` has no scope to record,
-and a `ThreadKey` can't give one: the router decides that the owner's DM is
-`Private` and another member's is `Dm`. If a thread's session were found
-whatever scope it was made on, a DM that stopped being the owner's (the
-agent changed hands) would keep running on the agent's `Private` volume.
+`tooling.tokens.rotate` is Tier 1 in the Java SDK ("special" per its own
+comment). The limiter's new `Tier1` allows 5 calls a minute per bucket, and
+a rotation's bucket is keyed by its refresh token, which is single use, so
+the limiter never delays two different tokens.
 
-**Solution.** `lookup_or_create(agent, thread, scope)`. A thread's live
-session on another scope is reset and replaced in the same transaction,
-and its warm container stopped in the background, so a session never
-changes volume.
+### Rotation is leased and versioned
 
-### `create_private` needs the thread
+**Issue.** Refresh tokens are single use. Two instances rotating the same
+token would leave one with a refused refresh token, and a rotation finishing
+after the member registered a new token would overwrite it with the old
+grant's successor, as a stale Claude refresh could (T09).
 
-**Issue.** `create_private(agent, consent)` names no thread, but the row's
-thread columns are not null, and T33 posts the task's result to the thread
-recorded with the consent, whose table doesn't exist yet.
+**Solution.** `slack_config_tokens` has the plan's columns plus `version`,
+`updated_at`, `lease_until`, `broken_at`, `notified_at` and
+`notice_attempts`. Every write of the tokens sets a new random `version`,
+and every call that acts on a row read earlier takes the version it read
+(`SlackConfigTokenRef`), so it changes nothing once the member registered
+again. A random value rather than a counter, because a counter per row
+starts over when the row is deleted and stored again. The rotator claims a
+due token with a conditional `UPDATE` that sets a 5-minute lease
+(`ROTATION_LEASE`), rotates, and stores the new pair, which ends the lease.
+A process that dies after Slack rotated but before the store was updated
+loses the new pair; the next rotation is refused, and the member is told to
+register a new token. The encrypted columns' associated data is the row's
+`member_id:team_id`.
 
-**Solution.** `create_private(agent, consent, thread)`, and a `consent_id`
-column, set exactly for `private` rows. The thread columns of a private
-row hold where its result goes; the partial unique index covers normal
-rows only, so they never collide with the thread's own session. A private
-session takes only `TurnKind::PrivateTask` with its own consent, and a
-normal session only `TurnKind::Normal`.
+Once Slack has rotated, the old refresh token is used up and the new pair
+exists only in memory, so a store write that fails once would lose the
+token. Both writers, `/agent slack-token` and the rotator, go through
+`retry_store`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
+250 ms, then 500 ms, then 1 s. If the last try fails, the command tells the
+member that the refresh token is used up and to generate a new one.
 
-### Idle containers hold places under the caps
+Nothing fences a write after the claim's lease ran out, so the rotator
+keeps within it: `tooling.tokens.rotate` gets `ROTATE_TIMEOUT` (2 minutes,
+rate-limit waits included), after which the claim counts as a failed
+renewal. Should a rotation still finish after its lease, a second instance
+has claimed the same row and, with the used refresh token, marked it broken
+(the version doesn't change on a break). The late writer's pair is the one
+that works, so `update_rotated_slack_config_token` also clears `broken_at`,
+`notified_at` and `notice_attempts`, and the token is renewed again. A
+rotation whose row was replaced or deleted meanwhile (`/agent logout`, a
+`user_change`) stores nothing and drops its pair.
 
-**Issue.** With one warm container per active session, idle containers
-fill a scope's cap, and a new session would wait up to the idle timeout
-for the reaper.
+### A departure lost to a passing store error
 
-**Solution.** A session that needs a container when a cap is full first
-stops an idle one under that cap (a dead one first, then the one idle
-longest), and otherwise waits on the cap's semaphore until a place frees
-up or a turn ends and a container becomes idle. A container is idle when
-its session's lock is free; the pool takes it with `try_lock`, so it never
-waits on another session. The scope cap is per volume, `(agent, scope)`,
-so two agents in one channel don't share one. The global cap defaults to
-32; the Compose sandbox network leaves about 126 addresses.
+**Issue.** A `user_change` saying a member was deleted reaches `Inbound`
+after the ingress acked it and recorded it as processed, so Slack never
+sends it again. A store error in looking the member up or deleting their
+token was only logged, and the rotator kept renewing the departed member's
+token. Returning the error from the sink isn't an option: `Queue::run`
+takes any `Err` to mean the receiver is gone and stops.
 
-### Mounts come from the turn's side
+**Solution.** The rotated pair's retry, `store_rotated`, became
+`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs the whole
+departure (lookup and delete) through it as one closure, so a passing error
+costs a retry, not the token. Every `StoreError` is retried, since even a
+sealing failure can pass (`SealError::Rng`) and the rotator can't afford to
+lose a pair. `retry_store` logs each failure but the last as a retry, with
+the member's id, and returns the last to its caller: `Inbound` logs that
+one, as before, by member key and error. It stays in `slack_tokens`, since
+agentd has no shared store or retry module.
 
-**Issue.** A container's mounts are fixed when it starts, and the plan
-doesn't say what decides them: `shared/` read-write or read-only, and
-whether `memory/` is mounted.
+The retries run inline in the sink, so a failing departure holds the shared
+Slack event queue for 1.75 s of waits plus each attempt's own store time,
+which can include SQLite's busy timeout. Once agent apps land, that queue
+also carries agents' messages, which wait too. That is accepted: a store
+failing on writes stalls agent traffic anyway, the hold is bounded at four
+attempts, and handing the departure to a task instead would lose its order
+against later events for the same member.
 
-**Solution.** The turn's `Side`, on the agent's `Private` volume: the
-owner's side gets `shared/` read-write and `memory/`, the public side (a
-private task a non-owner asked for) `shared/` read-only and no `memory/`.
-Every other volume mounts `shared/` read-write and no `memory/`. A turn
-whose mounts differ from the warm container's stops the container, like a
-credential kind or model change stops the process.
+### Which failures a member hears about
 
-### Another requester's turn gets a new container
+**Issue.** The plan says the rotation loop "DMs the member on failure". Most
+failures (a timeout, a 5xx, a rate limit) say nothing about the token, and a
+DM for each would come every few minutes.
 
-**Issue.** A warm container is reused across turns of one session, and a
-background process a turn leaves running, such as a `&` job or a Bash-tool
-background shell, survives in it. `turn_starting` points the container's
-placeholder at each turn's credential and records the turn on the agentctl
-token, so a process left from requester A's turn could spend requester B's
-credential, or act through `agentctl`, while B's turn runs. Restarting the
-process on a credential kind change doesn't help: the leftover isn't the CLI,
-and two members' subscriptions are the same kind.
+**Solution.** Only a refused refresh token breaks the token:
+`invalid_refresh_token`, which now maps to `SurfaceError::Unauthorized`, or
+any other code that does. The row is marked broken, and its member is owed
+one DM from the manager app, claimed with a 10-minute lease
+(`NOTICE_LEASE`) and tried at most 20 times, like the relink notice; a
+member no manager bot reaches waits unclaimed. Any other failure keeps the
+claim's lease, so the token is tried again when it ends, well within the
+2 hours it still has. `/agent me` shows whether the token is registered,
+renewed automatically, refused, or expired because renewing it keeps
+failing; the last says agentd keeps trying and to register a new token if
+it lasts.
 
-**Solution.** `Held` records the `Requester` whose turn started the container,
-and `ensure_process` stops the whole container, as it does a dead one or one
-with other mounts, when a turn's requester differs, before it looks at the
-process. Stopping the container ends its PID namespace and every process in
-it; stopping only the CLI would leave the leftovers running. It compares the
-full `Requester`, not the `CredentialRef`: a community-key turn of another
-requester also gets the agentctl token, so it gets a new container too. An
-agent-to-agent hop runs as the requester it inherits, so it keeps a container
-started for that requester. The cost is a container start and a `--resume` of
-the transcript whenever consecutive turns of one session come from different
-requesters, as in a busy channel thread; a requester's own run of turns keeps
-the warm process. Only one requester's turns now share a warm process, so the
-case the T20 note on `total_cost_usd` gives, of other members' turns on a
-shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
-no longer arises. `a_requester_change_replaces_the_container` checks that
-another requester's turn, a community-key one included, replaces the
-container, and that the same requester and a hop carrying it keep it.
+### One command intake for every surface
 
-It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
-are the session's `home/`, `tmp/` and `claude/` on its volume, the working
-directory is `work/`, and every container of the session mounts them, with the
-volume's `shared/` (read-only on the public side of `Private`). Only
-`claude/settings.json` and the `claude/skills` entry are rewritten before each
-start, and in the Docker sandbox only `/tmp`, a tmpfs of the container's own,
-goes with the container. So a turn can leave a file that runs or instructs code
-in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
-a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
-`work/` or `shared/`, or text in the transcript. A leftover process can also
-still use its own requester's later turns, and the egress allowlist between
-turns. The plan's Deferred work ("Killing leftover processes at turn end")
-records both, with a way to narrow the files' part.
+**Issue.** T13's `CommandIntake` took commands only from Rocket.Chat events,
+through a `CommandFeed` that knew the Rocket.Chat manager's binding, and
+`Server::run` built it only with `[rocketchat]`. Slack's commands come from
+the Slack queue, which `Routers::new` builds before `run`.
 
-### How turns queue and survive their caller
+**Solution.** `commands::intake::CommandIntake` takes `(member, text,
+origin)` through a `CommandSubmitter`, keeping T13's ordering per member and
+its drain at shutdown. `CommandFeed::new(submitter, binding)` is the
+Rocket.Chat side. `Routers` carries the intake and one submitter; the Slack
+queue's `slack::Inbound` sink holds another. `Server::run` runs the intake
+always, hands the submitter to the Rocket.Chat connection, and drops its own
+copy when shutdown starts, so the intake finishes what it received once the
+queue and the connection stop. `slack::Unrouted` is gone: `Inbound` passes
+the manager's slash commands and DMs to the intake, deletes the token of a
+member a `user_change` says was deleted, and drops everything else until
+T31 routes agents' messages.
 
-**Issue.** The plan asks for a keyed queue in arrival order, and for
-`turn_finished` to finish before the slot is released even when the caller
-is cancelled. A task spawned per turn and then queued would queue in
-whatever order tokio runs the tasks.
+### Slack replies and entities
 
-**Solution.** Each session's slot is a tokio mutex, which hands the lock
-out in the order it was asked for. `run_turn` asks for it in the caller's
-future, as its first await, and once it has it runs the turn in a spawned
-task that owns the lock guard, so dropping the caller no longer cancels
-anything; the lock is released only after `turn_finished` returns. A
-caller that stops waiting while its turn is still queued leaves the queue
-and its turn never runs. `reset` and `stop` queue the same way, so a reset
-runs after the turns queued before it; turns queued after it fail with
-`RunnerError::SessionReset`.
+- `Origin::SlackDm { channel }` is new: a DM to the manager app is private
+  and answered in the same DM, and replies there name commands bare
+  (`login <code>`), as on Rocket.Chat.
+- A slash command's reply is the rendered Markdown, each chunk sent to its
+  `response_url` with T29's `respond_ephemeral`. Slack accepts five
+  responses per URL (`RESPONSE_URL_USES`), and a long reply (`list` in a
+  workspace with a few hundred agents) takes more chunks, so the sixth
+  failed and the rest were dropped. `Replies::respond` counts the rendered
+  chunks; a reply of more than five goes whole to the member's DM with the
+  manager app, and the `response_url` gets one line saying so. If that DM
+  fails, even partway, the `response_url` gets the first four chunks and a
+  note that not all of it reached the DM. Unlike an ephemeral reply, the DM
+  persists under the workspace's retention and exports; today's long
+  replies carry no secrets, but a long reply that ever does would need
+  another path.
+- Notices (relink, broken token) open the manager's DM with
+  `conversations.open` (new in `WebApi::open_dm`, Tier 3, needs `im:write`),
+  so relink notices now reach Slack-only members too.
+- `surface_slack::normalize::unescape` decodes `&amp;`, `&lt;` and `&gt;`
+  in one pass. It is applied to command text only (slash commands and
+  manager DMs), before `commands::parse`, as T08's note expected. Message
+  text for turns stays escaped: decoding it would make a literal `<@U…>`
+  a member typed look like a mention token to anything that reads mentions
+  from text later.
+- A `user_change` deletes the token for the event's workspace only (the
+  envelope's `team_id`, which must be the manager's), since the member may
+  still be in another workspace; `/agent logout` deletes the
+  member's tokens in every workspace. Neither revokes the token at Slack:
+  the SDKs have no revoke method for configuration tokens, and whether
+  `auth.revoke` accepts one is unverified.
 
-### Hook failures
+### Files in the manager DM
 
-**Issue.** The plan doesn't say what a failing hook does.
+**Issue.** The plan says files attached to a manager DM feed `persona`
+(T14's upload rule) and `skill add` (T25), downloaded with the manager's bot
+token. `persona` was in place but read files only in the Rocket.Chat manager
+DM, so a Slack member who attached `persona.md` was told to attach it.
 
-**Solution.** A failed `process_starting` fails the turn and stops the
-container, and so does a process that fails to start. A failed
-`turn_starting` fails it without sending it, and `turn_finished` is still
-called, since the placeholder may have been pointed. A failed
-`turn_finished` is logged and returned in `TurnReport::finished`, and the
-process is stopped (with `process_stopping`), since the runner can't tell
-whether the placeholder is still pointed. A failed `process_stopping` is
-logged and the stop goes ahead, and unless a later call for that process
-succeeds it runs once more after the container is stopped; a second
-failure is logged and given up on. Retrying only when it was called again
-missed manager-initiated stops: the process is taken from the session
-before the call, and a death event for a container already marked dead is
-ignored, so a failed revocation used to leave the agentctl token valid for
-the next container on the address. A failed revocation also takes the
-container with it, even when the process was seen to exit, since leftover
-processes in the container could otherwise keep using the live token
-between turns.
+**Solution.** T30 adds the download, `WebApi::download_file(file,
+max_bytes)`: it sends the bot token only to an `https` URL on `slack.com` or
+a subdomain (or the API URL's own origin, for tests), follows no redirects
+(Slack redirects a request it refuses to its sign-in page), checks the
+declared size and the `Content-Length` before reading, and stops reading
+past the limit with `SurfaceError::TooLarge`, as Rocket.Chat's download
+does. `dm_command` passes the DM's files with the command, and
+`Commands::download` reads a file attached in either manager DM with that
+surface's manager credentials, so `persona` takes a `persona.md` on Slack
+under the same 64 KB cap. A slash command carries no files. `skill add`
+(T25) isn't in this stack yet; it can use the same download.
 
-A panic in `process_starting` is taken for its failure, and one in
-`process_stopping` is logged and the stop goes ahead: otherwise a panic in
-`process_stopping` left the process it was stopping running, taken out of
-the session, and the next turn started a second process in the same
-container. It would also have ended the event follower or the reaper for
-good. A process that panics while starting has `process_stopping` called
-and its container stopped, since it may have been started, and the turn
-fails with `RunnerError::TurnTask`.
+### The manager's events URL before its secret is set
 
-A panic in a turn is caught at the turn: one in `turn_starting` or the send
-still has `turn_finished` called, and after any panic, `turn_finished`'s
-included, the turn is recorded if it has an outcome and the process is
-stopped as after a failed `turn_finished`. Only then does the panic resume,
-failing the turn with `RunnerError::TurnTask`. Otherwise the next turn would
-reuse a process whose placeholder may still be pointed, and the store would
-keep `maybe_started` for a turn whose outcome was known. The slot's release
-wakes waiters for an idle container from a drop guard, so a panic doesn't
-leave a session waiting on the caps until the idle timeout.
+**Issue.** Slack verifies the events request URL when the app is created
+from the manifest, but agentd knows the `manager` binding only once
+`AGENTD_SLACK_MANAGER_SIGNING_SECRET` is set (T28), which Slack shows only
+after creation, so the first challenge gets 404.
 
-### A container that fails to stop
+**Solution.** The README's install steps say to retry the verification
+under "Event Subscriptions" once agentd runs with the secrets. Whether
+Slack's "From a manifest" flow creates the app anyway and leaves the URL
+unverified, as expected, is part of the live check.
 
-**Issue.** When `Sandbox::stop` failed, the pool forgot the container and
-freed its places under the caps, though it may still have been running with
-its process in it. The next turn of the session then started another
-container and another process on the same transcript, past the caps, and
-nothing tried the stop again.
+### The manifest template
 
-**Solution.** A container whose stop fails stays its session's, marked
-dead, with its places under the caps. A turn that finds it, and `reset`,
-try the stop again and fail with `RunnerError::Sandbox` if it still fails,
-so no second process resumes the transcript. The reaper tries every dead
-container each round, and eviction under a full cap tries it first. A
-container's address is read when a process starts in it, after the
-container is held, so a container whose address can't be read goes the
-same way.
-
-### A normal stop reported as a death
-
-**Issue.** Stopping a container makes the sandbox report it dead, and the
-event can arrive while `Sandbox::stop` is still returning. The pool forgot
-the container only once the stop returned, so the event follower found it
-still tracked and alive, and logged a container death, with a warning, on
-nearly every normal stop.
-
-**Solution.** A session marks its container dead before it stops it. The
-follower takes a dead container's death as already handled, and a stop that
-fails leaves the container marked dead, as before.
-
-### The death-log test missed its own events
-
-**Issue.** `a_normal_stop_is_not_logged_as_a_death` failed once in CI with
-no "stopped a session container" line and nothing captured at all. It
-captured logs with `tracing::subscriber::set_default`. With that one scoped
-subscriber the only dispatcher registered, `tracing-core` works out a
-callsite's interest, the first time the callsite is hit, from the dispatcher
-of the thread that hits it. Another test of the binary, on its own thread
-with no subscriber, that stopped a container first after this test had set
-its subscriber registered the callsite with "never", for every thread, and
-the test's own event was dropped. The same could turn off "a session
-container died" and make the test pass whatever the pool logged. The pool
-was right: the test failed only when another test's thread hit the
-callsite first.
-
-**Solution.** Every harness installs one global subscriber for the test
-binary, once, before any test reaches the pool, and the test reads only the
-lines naming its own session, as the egress log test does.
-
-The other log captures, in agentd's sweeper, command and telemetry tests,
-runner's log test and cred-proxy's logging and egress tests, had the same
-flaw or the same ad hoc fix. Every capture now goes through the shared
-`testkit::Logs`: one global subscriber per test binary (`Logs::global`, or
-`Logs::install` with the binary's own, as agentd installs its JSON one),
-read per test by a field only that test logs (`Logged::matching`) or by a
-span it enters on its own thread (`Logs::tag`). agentd's capture formats only
-events inside such a span, so tests that capture nothing aren't slowed down.
-`Logged::assert_lacks` refuses an empty capture, and every absence check
-sits next to a presence check on the line it expects. The telemetry tests
-check subscribers themselves, so they still set one per test, through
-`Logs::scoped` on the global capture: with the global subscriber registered
-first there are always two dispatchers, and `tracing-core` then asks each of
-them about a new callsite, whichever thread hits it.
-
-A tag keeps only the lines whose span parents lead back to it: a line
-inside a span made before the tag, such as a task's own `instrument` span,
-or logged on another thread, such as by `spawn_blocking`, is missing from
-it. So an absence check reads `Logged::matching` a unique id or the whole
-snapshot, never a tag. `Logs::install` rebuilds the interest cache once
-`set_global_default` has installed the subscriber, since `Dispatch::new`
-rebuilt it before the global dispatcher was set and a callsite first hit in
-between stays off; and it panics when a later call passes a different
-`make`, which would otherwise be ignored. agentd's capture is the lib test
-binary's global subscriber, so `telemetry::init` fails in a lib test that
-reaches it; such a test runs `agentd` as a process, as `tests/binary.rs`
-does.
-
-### A refused `--resume` is known only on a resumed process
-
-**Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
-its shape: an `error_during_execution` error result before `system`/`init`.
-Acting on that shape for any process would mark a session unstarted, and
-run its turn again, after a `--session-id` start or a warm process's later
-turn ended that way for some other reason.
-
-**Solution.** The runner treats it as a refusal only on the first turn sent
-to a process started with `SessionStart::Resume`. Any other turn with that
-outcome is recorded like any turn without `init_seen`, which leaves
-`maybe_started` as it was. The process remembers that nothing was sent to it
-yet, and the send clears it: a resumed process whose first turn failed in
-`turn_starting` is kept warm, and the refusal comes on the next turn, which
-didn't start the process. Judged by whether the turn started the process,
-that refusal came back as an error result, the turn didn't run again, and
-its message was lost.
-
-If the store fails to mark the session unstarted, the turn fails with
-`RunnerError::Store` instead of running again: the session still reads as
-started, so the second run would `--resume` and be refused again.
-
-### What is durable
-
-**Issue.** Queued and in-flight state must survive a restart if anything
-reads it back.
-
-**Solution.** What the runner reads back lives in `sessions`: the ids,
-`started`, `maybe_started`, `last_turn_at` and `reset_at`. The queue of
-waiting turns belongs to its callers' futures, and the warm pool to
-running processes and containers, neither of which survives a restart:
-agentd reaps every sandbox at startup (T17) and purges agentctl tokens
-(T15), and placeholders live in memory (T18). They stay in memory.
+`deploy/slack/manager-manifest.yaml` uses `${PUBLIC_URL}` as its only
+placeholder, which is a valid YAML plain scalar (a `{{…}}` placeholder would
+start a flow mapping) and fills in with `envsubst '$PUBLIC_URL'`. Besides
+the plan's scopes and events it turns the app home's messages tab on and
+its read-only mode off, or members couldn't DM the app, and sets
+`should_escape: true` on `/agent`, which delivers mentions as `<@U…|name>`
+tokens that T08's parser reads. agentd's image build context leaves out
+`deploy/`, so agentd doesn't embed the template; the tests read it with
+`include_str!` and parse it with `serde_norway` (MIT OR Apache-2.0, a
+maintained fork of the deprecated `serde_yaml`; with `unsafe-libyaml-norway`,
+MIT, it is a dev-dependency of agentd only).
