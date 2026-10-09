@@ -526,15 +526,15 @@ async fn each_turn_in_a_thread_runs_on_its_requesters_account_or_the_community_k
     assert_eq!(pids.len(), 5, "{pids:?}");
     assert_ne!(
         pids[0], pids[1],
-        "a subscription turn, then a community-key turn: the process restarts"
+        "a subscription turn, then a community-key turn, or another requester: the process restarts"
     );
     assert_ne!(
         pids[1], pids[2],
-        "a community-key turn, then a subscription turn: the process restarts"
+        "a community-key turn, then a subscription turn, or another requester: the process restarts"
     );
     assert_ne!(
         pids[2], pids[3],
-        "another plan's model: the process restarts"
+        "another plan's model, or another requester: the process restarts"
     );
     assert_ne!(pids[3], pids[4]);
     let argvs = stack.argvs();
@@ -546,7 +546,7 @@ async fn each_turn_in_a_thread_runs_on_its_requesters_account_or_the_community_k
     for restarted in &argvs[1..] {
         assert!(
             restarted.contains(&format!("--resume {session}")),
-            "a restart for another credential or model resumes the session: {argvs:?}"
+            "a restart for another credential, model or requester resumes the session: {argvs:?}"
         );
         assert!(!restarted.contains("--session-id"), "{argvs:?}");
     }
@@ -592,7 +592,7 @@ async fn another_requester_gets_a_new_process_and_the_same_one_keeps_it() {
     assert_eq!(pids.len(), 3);
     assert_ne!(
         pids[0], pids[1],
-        "another requester on the same kind and model: the container is recycled"
+        "another requester on the same kind and model: the process is replaced"
     );
     assert_eq!(
         pids[1], pids[2],
