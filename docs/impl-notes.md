@@ -3846,11 +3846,14 @@ placeholder revoked by `process_stopping` before the turn's `turn_finished`
 runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
-What remains: a background process left from turn N can still spend turn
-N+1's credential while N+1 runs, whoever its requester is. Killing what a
-turn leaves behind has no clean boundary, and recycling the container when
-the requester changes removes the cross-requester case; the plan's Deferred
-work ("Processes a turn leaves running") has both.
+T21 recycles the session's container when the requester changes, which
+ends every process a turn left running, so a leftover never spends another
+requester's credential
+([T21](#another-requesters-turn-gets-a-new-container)). What remains: a
+background process left from turn N can still spend the credential of a
+later turn of the same requester while that turn runs. Killing what a turn
+leaves behind has no clean boundary; the plan's Deferred work ("Processes a
+turn leaves running") records it.
 
 ### Headers the proxy changes besides the credential
 
@@ -4077,8 +4080,9 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Processes a turn leaves running" entry records it; recycling the container
-when the requester changes doesn't close it). Resolving the name with a
+"Processes a turn leaves running" entry records it; T21 recycles the
+container only when the requester changes, so the process keeps it until
+then). Resolving the name with a
 trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
 allowed host to a fixed address there; pin it in DNS instead.
 
@@ -4423,6 +4427,34 @@ private task a non-owner asked for) `shared/` read-only and no `memory/`.
 Every other volume mounts `shared/` read-write and no `memory/`. A turn
 whose mounts differ from the warm container's stops the container, like a
 credential kind or model change stops the process.
+
+### Another requester's turn gets a new container
+
+**Issue.** A warm container is reused across turns of one session, and a
+background process a turn leaves running, such as a `&` job or a Bash-tool
+background shell, survives in it. `turn_starting` points the container's
+placeholder at each turn's credential and records the turn on the agentctl
+token, so a process left from requester A's turn could spend requester B's
+credential, or act through `agentctl`, while B's turn runs. Restarting the
+process on a credential kind change doesn't help: the leftover isn't the CLI,
+and two members' subscriptions are the same kind.
+
+**Solution.** `Held` records the `Requester` whose turn started the container,
+and `ensure_process` stops the whole container, as it does a dead one or one
+with other mounts, when a turn's requester differs, before it looks at the
+process. Stopping the container ends its PID namespace and every process in
+it; stopping only the CLI would leave the leftovers running. It compares the
+full `Requester`, not the `CredentialRef`: a community-key turn of another
+requester also gets the agentctl token, so it gets a new container too. An
+agent-to-agent hop inherits its requester, so it keeps the container. The cost
+is a container start and a `--resume` of the transcript whenever consecutive
+turns of one session come from different requesters, as in a busy channel
+thread; a requester's own run of turns keeps the warm process.
+`a_requester_change_replaces_the_container` checks that another requester's
+turn, a community-key one included, replaces the container, and that the same
+requester and a hop carrying it keep it. A leftover can still use its own
+requester's later turns and the egress allowlist between turns, and files left
+in the session's `work/` or `home/` outlive the container.
 
 ### How turns queue and survive their caller
 
@@ -6162,10 +6194,12 @@ says which process ran a turn: every process of a session sends the same
 
 **Solution.** The tests' scripted turns run `sh -c 'echo $PPID >> pids'`
 through `fake-claude`, which records the pid of the `claude` process that
-ran each turn. A change of credential kind or model shows as a new pid,
-and a test with two linked members on one model shows the same pid for
-both turns, with each turn's own bearer token upstream: the warm process's
-placeholder follows the requester.
+ran each turn. A change of credential kind or model shows as a new pid.
+A test with two linked members on one model shows a new pid for the
+second member's turn, with each turn's own bearer token upstream, since
+T21 recycles the container when the requester changes
+([T21](#another-requesters-turn-gets-a-new-container)), and the same pid
+for that member's next turn.
 
 ### A broken link asks for a new login, never the community key
 
