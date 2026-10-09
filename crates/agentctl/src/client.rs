@@ -23,11 +23,13 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(300);
 pub enum Failure {
     /// agentd answered with a refusal or an error.
     Refused(CtlError),
-    /// The request failed some way other than a refusal or no connection:
-    /// it timed out, or agentd's answer was cut off or couldn't be read, so
-    /// it may have reached agentd.
+    /// The request failed some other way: it timed out, or agentd's answer
+    /// was cut off or couldn't be read, so it may have reached agentd; or,
+    /// for an upload, the file couldn't be read.
     Transport(String),
-    /// agentd couldn't be connected to, so the request never reached it.
+    /// agentd couldn't be connected to: its name didn't resolve, the
+    /// connection was refused, or connecting took over [`CONNECT_TIMEOUT`].
+    /// The request never reached it.
     Unreachable(String),
 }
 
@@ -82,7 +84,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Failure::Refused`] with agentd's reason, or [`Failure::Transport`].
+    /// [`Failure::Refused`] with agentd's reason, [`Failure::Unreachable`] if
+    /// agentd can't be connected to, or [`Failure::Transport`].
     pub async fn send<R: CtlRequest>(&self, request: &R) -> Result<R::Response, Failure> {
         self.send_within(request, REQUEST_TIMEOUT).await
     }

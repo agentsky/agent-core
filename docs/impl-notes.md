@@ -2584,10 +2584,11 @@ answer isn't abandoned. The default 100 seconds plus the floor stays under
 
 **Issue.** No floor guarantees agentd answers in time: an acquire takes a
 pool connection twice, to authorize and then to acquire, each waited for
-up to 30 seconds, on top of the busy timeout. An acquire agentctl stopped waiting for could still be granted,
-leaving a lease nobody held that blocked every session on the volume, the
-same session's next attempt included, until its TTL ran out. The retry then
-spun on `busy` and blamed "another command" for agentctl's own orphan.
+up to 30 seconds, on top of the busy timeout. An acquire agentctl stopped
+waiting for could still be granted, leaving a lease nobody held that
+blocked every session on the volume, the same session's next attempt
+included, until its TTL ran out. The retry then spun on `busy` and blamed
+"another command" for agentctl's own orphan.
 
 **Solution.** agentctl picks a `LeaseId` for each `lock` and sends it with
 every acquire attempt. agentd takes the lock when the current lease has
@@ -2595,19 +2596,34 @@ expired, or when the volume's row already holds that lease for the same
 session, which it extends and returns again. So a retry picks up an
 earlier attempt's late grant. The id only ever matches the caller's own
 session's row on its own volume: another session naming a live lease gets
-`busy`, and an id that names a lease on another volume grants nothing.
-Renew and release name the same id, so a signal can release the lease
-even when no answer arrived.
+`busy`, and an id that names another volume's lease grants and changes
+nothing, even over the caller's expired row. Renew and release name the same id, so a signal can
+release the lease even when no answer arrived.
+
+That picks up a late grant only while agentctl is still acquiring. One
+that lands after agentctl released the lease is still orphaned: say an
+attempt is held up in agentd for over 30 seconds, a later attempt is
+granted, the command runs and the lease is released, and then the first
+attempt lands. The same goes for a grant landing after a stop signal's
+release, or after agentctl gave back a lease too short or too long to
+hold. Nobody renews such a lease, so it holds the lock for at most its
+TTL, 30 seconds by default. This was already so before the id; it is
+just not solved by it.
 
 An acquire that failed with agentd's internal error (a busy database,
 say), or whose answer was lost (it timed out, was cut off, or couldn't be
 read), is retried until `--timeout` runs out, as renewals are. One that
-can't connect to agentd never reached it, so `lock` fails at once with the
-same "can't connect" error as every other subcommand. Any other refusal
-also fails at once. When `lock` gives up after the timeout, it names the
-last attempt's reason: busy, agentd's internal error, or the lost answer.
-Only after a lost answer does it add that a lease agentd granted anyway
-expires within its TTL, since no later attempt is left to pick it up.
+can't connect to agentd (a name that doesn't resolve, a refused
+connection, or the five-second connect timeout) never reached it, so
+`lock` fails at once with the same "can't connect" error as every other
+subcommand: a wrong URL or an agentd that is down is reported straight
+away. A renewal that can't connect is still retried until the deadline,
+since the command already runs under the lease and a brief outage
+shouldn't kill it. Any other refusal also fails at once. When `lock`
+gives up after the timeout, it names the last attempt's reason: busy,
+agentd's internal error, or the lost answer. Only after a lost answer
+does it add that a lease agentd granted anyway expires within its TTL,
+since no later attempt is left to pick it up.
 
 ### The command runs in its own process group
 

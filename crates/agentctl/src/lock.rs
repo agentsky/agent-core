@@ -24,17 +24,27 @@
 //!
 //! An acquire that failed on agentd's side, or whose answer was lost (it
 //! timed out, was cut off, or couldn't be read), is retried until
-//! `--timeout` runs out; one that can't connect to agentd fails at once.
+//! `--timeout` runs out. One that can't connect to agentd (its name doesn't
+//! resolve, the connection is refused, or connecting takes over five
+//! seconds) fails at once, so a wrong URL or an agentd that is down is
+//! reported straight away. A renewal that can't connect is retried like any
+//! other failed in transit: the command already runs under the lease, the
+//! deadline bounds the retries, and a brief outage shouldn't kill it.
+//!
 //! Each attempt is given the time left, at least seven seconds and at most
 //! thirty. Every attempt names the same lease, so one that agentd granted
 //! after agentctl stopped waiting for it is picked up by the next attempt
-//! instead of holding the lock against it.
+//! instead of holding the lock against it. A grant can still land after
+//! agentctl has released the lease: a request held up in agentd past a
+//! later attempt that was granted, landing once the command ended, or once
+//! a lease too short or too long to hold, or a stop signal, made agentctl
+//! give it back. Nobody renews that lease, so it holds the lock for at most
+//! its TTL, thirty seconds by default.
 //!
 //! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start. During an
 //! acquire, agentctl lets a request already sent finish, for up to two
 //! seconds but not past the time it was given, then gives back the lease
-//! whether or not an answer said it was granted. A grant agentd makes after
-//! that release leaves a lease that expires within its TTL. While the
+//! whether or not an answer said it was granted. While the
 //! command runs, agentctl passes the signal on to the command's process
 //! group, gives it up to two seconds to exit (never past the lease's
 //! deadline), then kills the group. Either way it releases the lease and
@@ -218,7 +228,12 @@ async fn acquire(
 /// Gives back `lease`, which an acquire may have been granted without
 /// agentctl hearing of it, after `signal` stopped [`acquire`].
 async fn stopped(client: &Client, lease: LeaseId, signal: i32, stop: &mut Stop) -> Acquired {
-    report_release(release(client, lease, stop).await);
+    if let Some(err) = release(client, lease, stop).await {
+        eprintln!(
+            "agentctl: couldn't give back the shared/ lock agentd may have granted ({err}); \
+             it expires on its own"
+        );
+    }
     Acquired::Stopped(signal)
 }
 

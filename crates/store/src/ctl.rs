@@ -370,8 +370,10 @@ impl Store {
     /// It is one statement: an insert, from the token's row only while it
     /// records `turn`, that on the volume's unique key takes over the
     /// existing row only if it has expired or is the same session's under
-    /// `lease`. So an acquire authorized under a turn that has since been
-    /// replaced or ended grants nothing, even when it lands after
+    /// `lease`, and never when `lease` names another volume's row, which
+    /// it leaves alone rather than failing on the lease's own key. So an
+    /// acquire authorized under a turn that has since been replaced or ended
+    /// grants nothing, even when it lands after
     /// [`set_ctl_turn`](Self::set_ctl_turn) deleted the session's leases.
     /// Times are whole seconds, and `ttl` is at least one.
     ///
@@ -393,8 +395,10 @@ impl Store {
              SELECT ?, volume_key, session_id, ? FROM ctl_tokens WHERE hash = ? AND turn_id = ? \
              ON CONFLICT (volume_key) DO UPDATE SET lease_id = excluded.lease_id, \
              holder_session = excluded.holder_session, expires_at = excluded.expires_at \
-             WHERE scope_locks.expires_at <= ? OR (scope_locks.lease_id = excluded.lease_id \
-             AND scope_locks.holder_session = excluded.holder_session) \
+             WHERE (scope_locks.expires_at <= ? OR (scope_locks.lease_id = excluded.lease_id \
+             AND scope_locks.holder_session = excluded.holder_session)) \
+             AND NOT EXISTS (SELECT 1 FROM scope_locks AS other \
+             WHERE other.lease_id = excluded.lease_id AND other.volume_key <> excluded.volume_key) \
              ON CONFLICT DO NOTHING \
              RETURNING expires_at",
         )
@@ -931,6 +935,21 @@ mod tests {
             a.acquire_as(&store, lease, 1_070).await,
             Some(at(1_100)),
             "a free lock"
+        );
+        let theirs = elsewhere.acquire(&store, 1_090).await.unwrap();
+        assert_eq!(
+            a.acquire_as(&store, theirs, 1_100).await,
+            None,
+            "a lease of another volume, over this volume's expired row"
+        );
+        assert_eq!(
+            elsewhere.renew(&store, theirs, 1_100).await,
+            Some(at(1_130)),
+            "the other volume's lease is untouched"
+        );
+        assert!(
+            a.release(&store, lease).await,
+            "this volume's row is unchanged"
         );
     }
 

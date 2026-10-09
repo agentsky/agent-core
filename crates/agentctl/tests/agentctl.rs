@@ -621,16 +621,13 @@ async fn an_acquire_that_failed_or_lost_its_answer_is_retried_under_the_same_lea
 
 #[tokio::test]
 async fn an_acquire_that_cant_connect_fails_at_once() {
-    let url = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        format!("http://{}", listener.local_addr().unwrap())
-    };
+    let url = "http://127.0.0.1:1";
     let dir = TempDir::new("agentctl-test");
     let started = Instant::now();
     let out = Run::from(
         tokio::time::timeout(
             WAIT,
-            agentctl(&url, "tok", dir.path())
+            agentctl(url, "tok", dir.path())
                 .args(["lock", "--", "true"])
                 .output(),
         )
@@ -638,7 +635,7 @@ async fn an_acquire_that_cant_connect_fails_at_once() {
         .unwrap()
         .unwrap(),
     );
-    assert!(started.elapsed() < Duration::from_secs(1), "{out:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{out:?}");
     out.refused("can't connect");
     assert_eq!(
         out.stderr,
@@ -805,6 +802,8 @@ struct FakeState {
     hiccups: Mutex<Vec<Hiccup>>,
     expires_at: Mutex<Option<SystemTime>>,
     granted: Mutex<Vec<LeaseId>>,
+    /// The lease each acquire named, recorded as it arrives.
+    asked: Mutex<Vec<LeaseId>>,
     renewed: Mutex<usize>,
     released: Mutex<Vec<LeaseId>>,
     acquiring: Notify,
@@ -826,6 +825,7 @@ impl FakeLock {
             hiccups: Mutex::new(Vec::new()),
             expires_at: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
             renewed: Mutex::new(0),
             released: Mutex::new(Vec::new()),
             acquiring: Notify::new(),
@@ -895,6 +895,7 @@ async fn fake_lock(
 ) -> axum::response::Response {
     match request {
         LockRequest::Acquire { lease } => {
+            state.asked.lock().unwrap().push(lease);
             state.acquiring.notify_one();
             tokio::time::sleep(state.acquire_delay).await;
             let hiccup = state.hiccups.lock().unwrap().pop();
@@ -1056,6 +1057,33 @@ async fn a_signal_during_acquire_gives_back_the_lease_it_was_granted() {
     assert!(!marker.exists(), "{out:?}");
     assert_eq!(fake.granted().len(), 1, "{out:?}");
     assert_eq!(fake.released(), fake.granted(), "{out:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_during_an_unanswered_acquire_still_gives_back_its_lease() {
+    let fake = FakeLock::delayed(30, 0, Renewals::Grant, Duration::from_secs(4)).await;
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
+    let holder = agentctl(&fake.url, "tok", dir.path())
+        .args(["lock", "--", "touch", marker.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(WAIT, fake.state.acquiring.notified())
+        .await
+        .expect("agentctl never acquired");
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    assert!(!marker.exists(), "{out:?}");
+    let asked = fake.state.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{out:?}");
+    assert_eq!(fake.released(), asked, "{out:?}");
 }
 
 #[cfg(unix)]
