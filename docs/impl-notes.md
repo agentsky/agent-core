@@ -8197,6 +8197,7 @@ test inserts a row in the old shape and checks it survives a sweep an hour
 and a week later, is swept a second after that, and that a row recorded
 with an explicit 30-day `expires_at` is left alone. A later migration can
 drop the trigger once no binary from before T31 can run against the store.
+
 ## T33: Consent cards and private tasks
 
 ### What `--file` names, and how files cross in
@@ -8400,7 +8401,9 @@ so a task never runs twice. A claim that finds anything already posted
 for the consent (a `message_refs` row naming it: its result, or any
 outcome, each its last word) just finishes, as after a delivery whose
 finish failed, so nothing is posted twice; posting an outcome checks the
-same. The `private` map of claims a
+same. An outcome posted without its row (`Lost::Row`) still counts as
+posted, since a retry would find no row and post it again. The `private`
+map of claims a
 shutdown releases drops an entry only for its own attempt, so an old
 attempt can't drop a newer one's. A store error on the way, such as looking up the agent's
 surface (`SurfaceLookup::surface` now returns the error rather than

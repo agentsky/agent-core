@@ -1681,6 +1681,17 @@ struct Delivery<'a> {
     answering: Answering<'a>,
 }
 
+/// What [`Delivery::post`] lost of a text; a lost chunk wins over a lost
+/// row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lost {
+    /// A chunk wasn't posted.
+    Chunk,
+    /// Every chunk was posted, but a chunk's `message_refs` row couldn't be
+    /// recorded.
+    Row,
+}
+
 /// What a delivered turn answers.
 #[derive(Clone, Copy)]
 enum Answering<'a> {
@@ -1758,7 +1769,7 @@ impl Delivery<'_> {
             tracing::warn!(session = %self.session, error = %err, "uploading the turn's attachments failed");
             complete = false;
         }
-        complete &= self.post(Some(turn), &reply).await;
+        complete &= self.post(Some(turn), &reply).await.is_ok();
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
                 self.react(answered, &emoji).await;
@@ -1773,7 +1784,7 @@ impl Delivery<'_> {
                     target: queued.to.clone(),
                     ..*self
                 };
-                complete &= target.post(Some(turn), &queued.text).await;
+                complete &= target.post(Some(turn), &queued.text).await.is_ok();
             }
         }
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
@@ -1784,20 +1795,24 @@ impl Delivery<'_> {
     /// Renders and posts Markdown `text` to the target, recording a
     /// `message_refs` row for each chunk, of `turn` if a turn made it. A
     /// chunk that can't be posted is skipped and the rest still go. Empty
-    /// text posts nothing. False if a chunk was lost, or posted without its
-    /// row: unattributed, a mention in it starts no hop, a reply to it
-    /// reaches no agent, and the next turn shows it again as history.
-    async fn post(&self, turn: Option<TurnId>, text: &str) -> bool {
+    /// text posts nothing.
+    ///
+    /// # Errors
+    ///
+    /// What was lost ([`Lost`]): a chunk, or else a chunk's row, posted
+    /// unattributed, so a mention in it starts no hop, a reply to it reaches
+    /// no agent, and the next turn shows it again as history.
+    async fn post(&self, turn: Option<TurnId>, text: &str) -> Result<(), Lost> {
         if text.trim().is_empty() {
-            return true;
+            return Ok(());
         }
-        let mut complete = true;
+        let mut lost = None;
         for chunk in self.surface.render(text) {
             let posted = match post_chunk(self.surface, &self.target, &chunk).await {
                 Ok(posted) => posted,
                 Err(err) => {
                     tracing::warn!(session = %self.session, conv = %self.target.conv, error = %err, "posting part of a reply failed");
-                    complete = false;
+                    lost = Some(Lost::Chunk);
                     continue;
                 }
             };
@@ -1822,10 +1837,10 @@ impl Delivery<'_> {
                 .await;
             if let Err(err) = recorded {
                 tracing::warn!(session = %self.session, msg = %posted.id, error = %err, "recording a posted message failed");
-                complete = false;
+                lost.get_or_insert(Lost::Row);
             }
         }
-        complete
+        lost.map_or(Ok(()), Err)
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) {
@@ -1888,7 +1903,7 @@ mod tests {
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
     use crate::pipeline::TurnSettings;
-    use core_types::{BindingId, ConvRef, SessionId, SurfaceKind};
+    use core_types::{BindingId, ConvRef, SurfaceKind};
     use runner::{PoolConfig, ProcessConfig};
     use sandbox::ProcessSandbox;
     use testkit::TempDir;
