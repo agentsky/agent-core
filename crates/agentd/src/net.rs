@@ -1,6 +1,5 @@
 //! The public listener's [`RefuseSubnet`] guard.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -8,6 +7,8 @@ use std::time::{Duration, Instant};
 use axum::serve::Listener;
 use core_types::Cidr;
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::throttle::Throttle;
 
 /// How often [`RefuseSubnet`] logs a warning for one peer address. Further
 /// refusals from it within this window are logged at debug level, and
@@ -26,7 +27,7 @@ pub const REFUSAL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 pub struct RefuseSubnet {
     inner: TcpListener,
     refused: Cidr,
-    log: RefusalLog,
+    log: Throttle<IpAddr>,
 }
 
 impl RefuseSubnet {
@@ -35,44 +36,8 @@ impl RefuseSubnet {
         Self {
             inner,
             refused,
-            log: RefusalLog::new(REFUSAL_WARN_INTERVAL),
+            log: Throttle::new(REFUSAL_WARN_INTERVAL),
         }
-    }
-}
-
-/// Decides which refusals are worth a warning: the first from a peer
-/// address, then the first after each `interval`.
-#[derive(Debug)]
-struct RefusalLog {
-    interval: Duration,
-    /// For each peer warned about within `interval`: when, and how many of
-    /// its refusals have been logged at debug level since.
-    peers: HashMap<IpAddr, (Instant, u64)>,
-}
-
-impl RefusalLog {
-    fn new(interval: Duration) -> Self {
-        Self {
-            interval,
-            peers: HashMap::new(),
-        }
-    }
-
-    /// Records a refusal from `ip` at `now`. Returns how many refusals from
-    /// it went without a warning since the last one if this one deserves a
-    /// warning, and `None` if it doesn't.
-    fn record(&mut self, ip: IpAddr, now: Instant) -> Option<u64> {
-        if let Some((warned, quiet)) = self.peers.get_mut(&ip)
-            && now.duration_since(*warned) < self.interval
-        {
-            *quiet += 1;
-            return None;
-        }
-        let quiet = self.peers.remove(&ip).map_or(0, |(_, quiet)| quiet);
-        self.peers
-            .retain(|_, (warned, _)| now.duration_since(*warned) < self.interval);
-        self.peers.insert(ip, (now, 0));
-        Some(quiet)
     }
 }
 
@@ -115,31 +80,6 @@ mod tests {
 
     fn cidr(s: &str) -> Cidr {
         s.parse().unwrap()
-    }
-
-    fn ip(s: &str) -> IpAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn refusals_warn_once_per_peer_per_interval() {
-        let interval = Duration::from_secs(60);
-        let mut log = RefusalLog::new(interval);
-        let (a, b) = (ip("172.30.0.2"), ip("172.30.0.3"));
-        let start = Instant::now();
-        assert_eq!(log.record(a, start), Some(0));
-        assert_eq!(log.record(a, start + Duration::from_secs(1)), None);
-        assert_eq!(log.record(a, start + Duration::from_secs(59)), None);
-        assert_eq!(log.record(b, start + Duration::from_secs(2)), Some(0));
-        assert_eq!(log.record(b, start + Duration::from_secs(3)), None);
-        assert_eq!(log.record(a, start + interval), Some(2));
-        assert_eq!(log.record(a, start + interval), None);
-        assert_eq!(log.record(b, start + Duration::from_secs(200)), Some(1));
-        assert_eq!(
-            log.peers.len(),
-            1,
-            "peers warned about long ago are dropped"
-        );
     }
 
     async fn accept_one(listener: &mut RefuseSubnet) -> Option<SocketAddr> {

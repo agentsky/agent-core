@@ -59,6 +59,9 @@ use crate::sweeper::{self, SWEEP_INTERVAL};
 
 /// How long `/healthz` waits for the store before reporting it unavailable.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+/// The least time shutdown gives skill changes still running before it
+/// closes the store, even once the drain timeout has passed.
+pub const SKILL_DRAIN_FLOOR: Duration = Duration::from_secs(1);
 
 /// The routes each listener serves, and the workers behind them.
 #[derive(Debug)]
@@ -282,9 +285,11 @@ impl Server {
     ///    and the idle reaper they keep alive runs until the process exits.
     ///    The next start purges the tokens and reaps the containers.
     /// 5. The pipeline is dropped. Skill changes still running, which an
-    ///    aborted command leaves to finish in their own task, get up to
-    ///    [`DRAIN_TIMEOUT`](crate::skills::DRAIN_TIMEOUT), unless shutdown
-    ///    was forced, and the store is closed.
+    ///    aborted command leaves to finish in their own task, get what is
+    ///    left of the same timeout, but at least
+    ///    [`SKILL_DRAIN_FLOOR`], unless shutdown was forced
+    ///    ([`Skills::drain`](crate::skills::Skills::drain)), and the store
+    ///    is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -500,8 +505,9 @@ impl Server {
         }
         drop(pipeline);
         if !forced {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             let drained = tokio::select! {
-                drained = app.skills().drain() => drained,
+                drained = app.skills().drain(left.max(SKILL_DRAIN_FLOOR)) => drained,
                 () = abort.as_mut() => false,
             };
             if !drained {

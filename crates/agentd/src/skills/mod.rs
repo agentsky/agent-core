@@ -67,8 +67,8 @@ pub mod package;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use core_types::{AgentId, LeaseId, MemberId, SessionId};
@@ -83,6 +83,7 @@ pub use package::{BUNDLED_NAME, Manifest, Problem};
 use package::CheckError;
 
 use crate::sweeper::SWEEP_INTERVAL;
+use crate::throttle::Throttle;
 
 /// The bundled skill's `SKILL.md`, documenting `agentctl`.
 pub const BUNDLED_SKILL: &str = include_str!("../../assets/skills/agentctl/SKILL.md");
@@ -110,9 +111,12 @@ pub const LEASE_TTL: Duration = Duration::from_secs(120);
 pub const LEASE_WAIT: Duration = Duration::from_secs(2);
 /// How often a change waiting for a skill's lease tries again.
 const LEASE_RETRY: Duration = Duration::from_millis(100);
-/// How long shutdown waits for skill changes still running before the
-/// store closes ([`Skills::drain`]).
-pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a skill whose files in use don't declare its hosts is warned
+/// about; the denials between are logged at debug level, and counted.
+pub const MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// The most of a `SKILL.md` read for its hosts: the largest front matter
+/// with room for a byte-order mark and its two `---` lines.
+const FRONT_MATTER_READ: u64 = package::MAX_FRONT_MATTER_BYTES as u64 + 16;
 
 /// Writes the bundled skill into `agent`'s skills directory under
 /// `data_dir`, if it isn't there as it should be. Returns whether it
@@ -279,6 +283,7 @@ struct Inner {
     data_dir: PathBuf,
     git: Git,
     changes: Arc<RwLock<()>>,
+    mismatches: Mutex<Throttle<(AgentId, String)>>,
 }
 
 impl fmt::Debug for Skills {
@@ -300,6 +305,7 @@ impl Skills {
                 data_dir,
                 git,
                 changes: Arc::default(),
+                mismatches: Mutex::new(Throttle::new(MISMATCH_WARN_INTERVAL)),
             }),
         }
     }
@@ -528,7 +534,11 @@ impl Skills {
         let store = &self.inner.store;
         let (agent, name) = (waiting.agent, waiting.name.as_str());
         if self.moved_in(waiting).await? {
-            return self.finish_moved_in(waiting, lease).await;
+            let confirmed = store
+                .confirm_skill(waiting, lease, OffsetDateTime::now_utc())
+                .await?;
+            tracing::info!(%agent, skill = name, confirmed = confirmed.is_some(), "finished a confirmation stopped after its move");
+            return Ok(confirmed.map_or(Confirmed::NotPending, Confirmed::Active));
         }
         let pending = self.pending_dir(agent, name);
         if declared_hosts(&pending).await.as_ref() != Some(&waiting.hosts) {
@@ -576,22 +586,6 @@ impl Skills {
         let live = self.live_dir(agent, name);
         let digest = blocking(move || package::tree_digest(&live)).await?;
         Ok(digest.is_ok_and(|digest| digest == waiting.digest))
-    }
-
-    /// Makes `waiting` active for the files [`moved_in`](Self::moved_in)
-    /// found in use, under the skill's `lease`.
-    async fn finish_moved_in(
-        &self,
-        waiting: &AgentSkill,
-        lease: LeaseId,
-    ) -> Result<Confirmed, SkillError> {
-        let confirmed = self
-            .inner
-            .store
-            .confirm_skill(waiting, lease, OffsetDateTime::now_utc())
-            .await?;
-        tracing::info!(agent = %waiting.agent, skill = waiting.name.as_str(), confirmed = confirmed.is_some(), "finished a confirmation stopped after its move");
-        Ok(confirmed.map_or(Confirmed::NotPending, Confirmed::Active))
     }
 
     /// Removes `agent`'s skill `name`, in use or waiting, with its hosts,
@@ -684,10 +678,11 @@ impl Skills {
     }
 
     /// Deletes `agent`'s pending skill `name`, under its `lease`, if it was
-    /// added before `before`, and then its files; or, when a confirmation
-    /// of it stopped after its move ([`moved_in`](Self::moved_in)),
-    /// finishes that confirmation instead, so the files in use get the row
-    /// they were confirmed with.
+    /// added before `before`, and then its files. A confirmation stopped
+    /// after its move is never finished here: only the owner's `confirm`
+    /// consents to the pending row's hosts, and the grant check
+    /// ([`granted_hosts`](Self::granted_hosts)) already denies live files
+    /// the active row doesn't match.
     async fn drop_expired_skill(
         &self,
         agent: AgentId,
@@ -695,19 +690,10 @@ impl Skills {
         before: OffsetDateTime,
         lease: LeaseId,
     ) -> Result<(), SkillError> {
-        let store = &self.inner.store;
-        let expired = store.agent_skills(agent).await?.into_iter().find(|skill| {
-            skill.name == name && skill.state == SkillState::Pending && skill.added_at < before
-        });
-        let Some(expired) = expired else {
-            return Ok(());
-        };
-        if self.moved_in(&expired).await? {
-            self.finish_moved_in(&expired, lease).await?;
-            return Ok(());
-        }
         let now = OffsetDateTime::now_utc();
-        if store
+        if self
+            .inner
+            .store
             .delete_pending_skill_before(agent, name, before, lease, now)
             .await?
         {
@@ -780,11 +766,13 @@ impl Skills {
         .map_err(|err| SkillError::Task(err.to_string()))?
     }
 
-    /// Waits up to [`DRAIN_TIMEOUT`] for the skill changes running to
-    /// finish, as shutdown does before closing the store, and returns
-    /// whether they did. Changes that start meanwhile wait for it.
-    pub async fn drain(&self) -> bool {
-        tokio::time::timeout(DRAIN_TIMEOUT, self.inner.changes.write())
+    /// Waits up to `timeout` for the skill changes running to finish, as
+    /// shutdown does before closing the store, and returns whether they
+    /// did. A change that starts while it waits waits for it; one that
+    /// starts after shutdown has closed the store fails before taking a
+    /// lease.
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.inner.changes.write())
             .await
             .is_ok()
     }
@@ -794,7 +782,14 @@ impl Skills {
     /// declares exactly those hosts. This is what keeps hosts from ever
     /// covering files that don't declare them, whatever a crash, an
     /// aborted change or a lapsed lease left on disk; a skill whose files
-    /// declare others, or can't be read, grants none, and is logged.
+    /// declare others, or can't be read, grants none, and is warned about
+    /// at most once every [`MISMATCH_WARN_INTERVAL`].
+    ///
+    /// Only the front matter is read, so each skill costs a bounded read.
+    /// The row's hosts were written by [`host_names`] at add time, and are
+    /// compared with what it gives for the files today: a change to how
+    /// [`package::parse_skill_file`] or [`HostRule`] normalizes a host must
+    /// migrate the stored rows, or existing skills lose their hosts.
     ///
     /// # Errors
     ///
@@ -805,8 +800,22 @@ impl Skills {
             let declared = declared_hosts(&self.live_dir(skill.agent, &skill.name)).await;
             if declared.as_ref() == Some(&skill.hosts) {
                 hosts.extend(skill.hosts);
-            } else {
-                tracing::warn!(agent = %skill.agent, skill = skill.name.as_str(), hosts = skill.hosts.len(), declared = ?declared.as_ref().map(Vec::len), "a skill's files in use don't declare its hosts; granted none of them");
+                continue;
+            }
+            let declared = declared.as_ref().map(Vec::len);
+            let warn = self
+                .inner
+                .mismatches
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record((skill.agent, skill.name.clone()), Instant::now());
+            match warn {
+                Some(quiet) => {
+                    tracing::warn!(agent = %skill.agent, skill = skill.name.as_str(), hosts = skill.hosts.len(), ?declared, denied_since_last_warning = quiet, "a skill's files in use don't declare its hosts; granted none of them")
+                }
+                None => {
+                    tracing::debug!(agent = %skill.agent, skill = skill.name.as_str(), hosts = skill.hosts.len(), ?declared, "a skill's files in use don't declare its hosts; granted none of them")
+                }
             }
         }
         hosts.sort();
@@ -896,12 +905,25 @@ fn host_names(manifest: &Manifest) -> Vec<String> {
 }
 
 /// The hosts the `SKILL.md` in the skill directory `dir` declares, or
-/// `None` if it can't be read as one.
+/// `None` if it can't be read as one. Only the first
+/// [`FRONT_MATTER_READ`] bytes are read, as much as front matter may take,
+/// and only their UTF-8 prefix is parsed, so a character cut at the end of
+/// the read never counts.
 async fn declared_hosts(dir: &Path) -> Option<Vec<String>> {
-    let text = tokio::fs::read_to_string(dir.join(package::SKILL_FILE))
+    use tokio::io::AsyncReadExt as _;
+    let file = tokio::fs::File::open(dir.join(package::SKILL_FILE))
         .await
         .ok()?;
-    package::parse_skill_file(&text)
+    let mut bytes = Vec::new();
+    file.take(FRONT_MATTER_READ)
+        .read_to_end(&mut bytes)
+        .await
+        .ok()?;
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(err) => std::str::from_utf8(&bytes[..err.valid_up_to()]).ok()?,
+    };
+    package::parse_skill_file(text)
         .ok()
         .map(|manifest| host_names(&manifest))
 }

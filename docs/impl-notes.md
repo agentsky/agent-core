@@ -5769,12 +5769,14 @@ before, that could stop a confirmation between its move and its row write
 and remove the old skill with its work directory. The spawned task outlives
 the command, and each holds a read guard on a lock in `Skills` that
 `Skills::drain` takes for writing: unless shutdown was forced, `serve`
-waits up to `DRAIN_TIMEOUT` (ten seconds) for them before closing the
-store. A change still running after that fails its next store call and
-undoes its move as on any store failure. When `serve` returns, the runtime
-drops the task at its next await; unlike a crash, that runs its work
-directory's guard, so a skill a confirmation had set aside there is removed
-rather than left for startup's purge, and the lease ends on its own.
+waits for them, for what is left of the drain timeout but at least
+`SKILL_DRAIN_FLOOR` (a second), before closing the store; a change that
+starts after the store closed fails before taking a lease. A change still
+running after that fails its next store call and undoes its move as on any
+store failure. When `serve` returns, the runtime drops the task at its next
+await; unlike a crash, that runs its work directory's guard, so a skill a
+confirmation had set aside there is removed rather than left for startup's
+purge, and the lease ends on its own.
 
 The final writes are fenced on the lease: `put_skill`, `delete_skill`,
 `delete_pending_skill_before` and `confirm_skill` take the `LeaseId` and
@@ -5820,19 +5822,23 @@ live under the old row and the pending directory empty. `agent_skills` now
 records a `digest` of each skill's files as added (SHA-256 over every
 file's path and bytes, which the package limits keep small), and the next
 `confirm` finishes such a confirmation, making the pending row active when
-its pending directory is absent and the live tree's digest is the row's;
-the sweeper does the same for an expiring row instead of dropping it, so
-the state doesn't outlive `PENDING_TTL`. Matching the whole tree, not just
-the hosts, keeps a lost pending directory next to an active skill that
-declares the same hosts from recording an update that never arrived. One
-stopped in the middle of undoing its move can leave the old row without
-live files. Whatever a failed add or removal leaves, startup's purge
-removes. Purge takes no lease, so it still keeps both directories of a name
-with a row and leaves anything changed within `STALE_AFTER`, since the
-other side of a deploy may be mid-move or mid-clone. A pending directory
-`drop_expired` can't remove is logged; never mounted, it stays on disk
-until startup's purge if no row has the name, or else, since purge keeps
-every directory of a name with a row, until the name is next added or
+its pending directory is absent and the live tree's digest is the row's.
+Only the owner's `confirm` does that, since it is consent to the pending
+row's hosts at that moment: the sweeper drops an expiring row as ever, and
+the grant check denies the live files the active row doesn't match. A
+sweeper that finished them could grant hosts nobody confirmed: a
+confirmation whose lease lapsed before its move can move a newer add's
+files in, and is then fenced out without undoing it. Matching the whole
+tree, not just the hosts, keeps a lost pending directory next to an active
+skill that declares the same hosts from recording an update that never
+arrived. One stopped in the middle of undoing its move can leave the old
+row without live files. Whatever a failed add or removal leaves, startup's
+purge removes. Purge takes no lease, so it still keeps both directories of
+a name with a row and leaves anything changed within `STALE_AFTER`, since
+the other side of a deploy may be mid-move or mid-clone. A pending
+directory `drop_expired` can't remove is logged; never mounted, it stays on
+disk until startup's purge if no row has the name, or else, since purge
+keeps every directory of a name with a row, until the name is next added or
 removed.
 
 File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
@@ -5854,12 +5860,22 @@ declare hosts (`Store::active_skills_for_session`, which replaced
 `skill_hosts_for_session`) and grants each one's hosts only while its live
 `SKILL.md` declares exactly those hosts, parsed as `confirm` parses it. A
 skill whose files declare others, or are missing or unreadable, grants
-none, logged with the agent, the skill and the counts. It runs at each
-`CONNECT` the configured allowlist doesn't already allow, reading one small
-file per active skill with hosts, within the extension's timeout. Whatever
-the disk holds, hosts never cover files that don't declare them; the lease,
-the order of the steps and the undo only keep rows and files matching, so
-that what the owner confirmed stays usable.
+none, warned about with the agent, the skill and the counts at most once a
+minute per skill (`MISMATCH_WARN_INTERVAL`, through the `Throttle` the
+public listener's refusal warnings now share), the rest at debug level. It
+runs at each `CONNECT` the configured allowlist doesn't already allow, and
+reads only the front matter of each active skill with hosts: at most
+`MAX_FRONT_MATTER_BYTES` and its delimiters, parsing the UTF-8 prefix of
+what it read with `parse_skill_file`. Whatever the disk holds, hosts never
+cover files that don't declare them; the lease, the order of the steps and
+the undo only keep rows and files matching, so that what the owner
+confirmed stays usable.
+
+The check compares the row's hosts, which `host_names` wrote at add time
+from `parse_skill_file` and `HostRule`'s `Display`, with what the same code
+gives for the files today. A change to how either normalizes a host must
+migrate the stored rows, or existing skills stop matching and lose their
+hosts: the check fails closed.
 
 ## T26: Requester-pays routing
 

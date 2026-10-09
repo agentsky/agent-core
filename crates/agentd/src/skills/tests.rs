@@ -1020,7 +1020,7 @@ async fn a_confirmation_that_lost_its_lease_leaves_its_files_for_the_next() {
 }
 
 #[tokio::test]
-async fn the_sweeper_finishes_a_confirmation_stopped_after_its_move() {
+async fn the_sweeper_never_finishes_a_confirmation_nobody_made() {
     let h = harness().await;
     h.expired("gh").await;
     let work = h.skills.work_dir().await.unwrap();
@@ -1029,13 +1029,26 @@ async fn the_sweeper_finishes_a_confirmation_stopped_after_its_move() {
         .unwrap();
     drop(work);
     h.skills.drop_expired().await.unwrap();
-    let rows = h.store.agent_skills(h.agent).await.unwrap();
-    assert_eq!(
-        rows.iter().map(|row| row.state).collect::<Vec<_>>(),
-        [SkillState::Active]
+    assert!(h.store.agent_skills(h.agent).await.unwrap().is_empty());
+    assert!(h.hosts().await.is_empty());
+}
+
+#[tokio::test]
+async fn hosts_are_read_from_the_front_matter_alone() {
+    let h = harness().await;
+    let dir = h.data.join("long");
+    std::fs::create_dir_all(&dir).unwrap();
+    let text = format!(
+        "{}{}",
+        skill_md("gh", &["api.github.com"]),
+        "\u{e9}".repeat(package::MAX_SKILL_MD_BYTES as usize / 4)
     );
-    assert!(h.live("gh").join("SKILL.md").is_file());
-    assert_eq!(h.hosts().await, ["api.github.com"]);
+    std::fs::write(dir.join("SKILL.md"), &text).unwrap();
+    assert!(text.len() as u64 > FRONT_MATTER_READ);
+    assert_eq!(
+        declared_hosts(&dir).await,
+        Some(vec!["api.github.com".to_owned()])
+    );
 }
 
 #[tokio::test]
@@ -1078,7 +1091,7 @@ async fn a_change_that_panics_releases_the_lease() {
 }
 
 #[tokio::test]
-async fn shutdown_waits_for_a_change_running_and_stops_waiting() {
+async fn shutdown_waits_for_a_change_running_until_its_timeout() {
     let h = harness().await;
     let gate = Arc::new(tokio::sync::Notify::new());
     let opened = gate.clone();
@@ -1095,9 +1108,13 @@ async fn shutdown_waits_for_a_change_running_and_stops_waiting() {
         }
     });
     tokio::time::sleep(LEASE_RETRY).await;
+    assert!(
+        !h.skills.drain(LEASE_RETRY).await,
+        "gives up at its timeout"
+    );
     let drain = tokio::spawn({
         let skills = h.skills.clone();
-        async move { skills.drain().await }
+        async move { skills.drain(LEASE_WAIT).await }
     });
     tokio::time::sleep(LEASE_RETRY).await;
     assert!(!drain.is_finished(), "waits for the change");

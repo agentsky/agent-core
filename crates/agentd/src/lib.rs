@@ -41,6 +41,7 @@ pub mod skills;
 pub mod slack;
 pub mod sweeper;
 pub mod telemetry;
+mod throttle;
 
 pub use app::App;
 pub use config::Config;
