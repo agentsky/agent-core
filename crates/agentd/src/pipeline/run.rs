@@ -2321,7 +2321,7 @@ impl Handing {
     /// Whether `agent` has a place among the turn's [`MAX_HAND_OFFS`],
     /// with the agents handed to and those in `also`: an agent the turn
     /// asks always has one, and any other only when one is left besides
-    /// those the asked agents neither handed to nor passed over yet keep.
+    /// those the asked agents not handed to yet keep.
     fn has_place(&self, agent: AgentId, also: &[Agent]) -> bool {
         if self.asked.contains(&agent) {
             return true;
@@ -2329,11 +2329,7 @@ impl Handing {
         let kept = self
             .asked
             .iter()
-            .filter(|asked| {
-                !self.handed_to(**asked)
-                    && !self.passed.contains(asked)
-                    && also.iter().all(|seen| seen.id != **asked)
-            })
+            .filter(|asked| !self.handed_to(**asked) && also.iter().all(|seen| seen.id != **asked))
             .count();
         self.handed.len() + also.len() + kept < MAX_HAND_OFFS
     }
@@ -2613,8 +2609,10 @@ impl Delivery<'_> {
     /// off. Every managed agent its row will attribute a mention of is
     /// handed the chunk, in that row's transaction, or has its hop claimed
     /// before ([`pass_over`](Self::pass_over)), or was dealt with by an
-    /// earlier chunk, so no mention in the row is left for the platform's
-    /// copy to run as a hop of its own. `None`, logged, when that can't be
+    /// earlier chunk, or is one the turn asked, whose place among the
+    /// turn's [`MAX_HAND_OFFS`] is kept for it whichever copy runs its hop,
+    /// so no mention in the row is left for the platform's copy to run as
+    /// a hop past the cap. `None`, logged, when that can't be
     /// made sure: an agent it mentions couldn't be looked up, the hand-off
     /// couldn't be encoded, or a claim couldn't be recorded. The chunk is
     /// then left unrecorded, so it hands off nothing, by either copy.
@@ -2664,7 +2662,9 @@ impl Delivery<'_> {
     /// and those to pass over. A mention is of an agent when any of its
     /// bots, in any state, is the user mentioned, as the router reads it,
     /// so an agent mentioned through a bot that isn't active is passed
-    /// over, and its hop claimed, rather than left for the platform's copy.
+    /// over, and its hop claimed, rather than left for the platform's copy;
+    /// unless the turn asked it, when it is left for its ask post, which
+    /// mentions its active bot, so an accepted ask is never passed over.
     ///
     /// # Errors
     ///
@@ -2698,6 +2698,7 @@ impl Delivery<'_> {
                 Some((agent, _)) if agent.id == id && handing.has_place(id, &mentioned) => {
                     mentioned.push(agent);
                 }
+                _ if handing.asked.contains(&id) => {}
                 _ => over.push(id),
             }
         }
@@ -2707,12 +2708,12 @@ impl Delivery<'_> {
     /// Claims the hops from `turn` to the agents `over`, which `msg`
     /// mentions but the turn doesn't hand off to, past its
     /// [`MAX_HAND_OFFS`] or through a bot that isn't active, before
-    /// `msg`'s row is recorded: the platform's copy of `msg` takes a hop only once that
-    /// row is there, and then finds these claimed. Each agent claimed goes
-    /// in `handing`'s passed, so a later chunk neither claims it again nor
-    /// gives it a place whose hop could never run. Returns false when a
-    /// claim couldn't be recorded; the row is then left out, so `msg`
-    /// hands off nothing, by either copy.
+    /// `msg`'s row is recorded: the platform's copy of `msg` takes a hop
+    /// only once that row is there, and then finds these claimed. Each
+    /// agent claimed goes in `handing`'s passed, so a later chunk neither
+    /// claims it again nor gives it a place whose hop could never run.
+    /// Returns false when a claim couldn't be recorded; the row is then
+    /// left out, so `msg` hands off nothing, by either copy.
     async fn pass_over(
         &self,
         over: &[AgentId],
@@ -3304,6 +3305,27 @@ mod tests {
             "an agent mentioned through a bot that isn't active is passed over, so the router, \
              which reads that bot as the agent's, finds its hop claimed"
         );
+
+        let turn = TurnId::new_v4();
+        let mut handing = Handing {
+            asked: vec![ghost],
+            ..Handing::default()
+        };
+        assert!(
+            delivery
+                .post(Some(turn), "@U5 @U2 @U3 all of you", &mut handing)
+                .await
+                .complete()
+        );
+        let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
+        assert_eq!(handed, unasked[..MAX_HAND_OFFS - 1]);
+        assert_eq!(
+            claimed(&[ghost, writer, scout], turn).await,
+            unasked[MAX_HAND_OFFS - 1..],
+            "an agent the turn asked is never passed over, whatever bot a post mentions it \
+             through, and keeps its place for its ask post"
+        );
+        assert!(!handing.passed.contains(&ghost));
     }
 
     #[test]

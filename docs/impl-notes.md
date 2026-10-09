@@ -8760,13 +8760,15 @@ over and claimed are kept in `Handing::passed`: a later post neither
 claims them again nor gives one of them a place whose hop, claimed
 already, could never run, which a claim that succeeded for one agent
 before another's failed would otherwise do. A test pins the claim before
-the row: the platform's copy is queued while the post is still held, so
-it waits for the attribution, and a trigger records, in a table the test
-asserts is empty, any hop claim first inserted once the post's row
-exists for an agent no `hand_offs` row holds. It only records, so the
-code under test still decides: without `pass_over` the copy runs the
-passed-over agent and the test's hops fail, and with `pass_over` after
-the row the late claim is recorded.
+the row: the platform's copy is dispatched while the post is still held,
+so it gets past `dispatch`'s check without the row and decides once the
+row is there (the harness can't tell whether its job was already waiting
+for it, and detection doesn't depend on that), and a trigger records, in
+a table the test asserts is empty, any hop claim first inserted once the
+post's row exists for an agent no `hand_offs` row holds. It only
+records, so the code under test still decides: without `pass_over` the
+copy runs the passed-over agent and the test's hops fail, and with
+`pass_over` after the row the late claim is recorded.
 
 A later review found the delivery and the router reading a mention
 differently: `mentioned` looked agents up by an active bot
@@ -8777,7 +8779,12 @@ agent's old, inactive bot in a thread that agent started let the
 platform's copy run it as a hand-off the cap never counted.
 `mentioned` now reads a mention as the router does, and an agent
 mentioned through a bot that isn't active is passed over, its hop
-claimed.
+claimed, unless the turn asked it with `ask-agent`: an accepted ask is
+never passed over, whatever bot a post mentions it through, and keeps
+its place for its ask post. A post's mention of an asked agent's
+inactive bot is then neither handed nor claimed, but the agent's hop
+runs once for the turn whichever copy takes it, inside the place kept
+for it.
 
 ### A chunk posted but not recorded
 
