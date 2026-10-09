@@ -2217,6 +2217,71 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
     stack.stop().await;
 }
 
+/// Each Rocket.Chat connection in a room may deliver a message, so two
+/// messages of a thread can be sent at once from two connections. The
+/// first sent is answered first even when its lookup is the slower one:
+/// it mentions forty people, each looked up as a possible agent's bot.
+#[tokio::test]
+async fn messages_of_a_thread_sent_at_once_from_two_connections_keep_their_order() {
+    let stack = start().await;
+    let first = stack.answered_root("r1", "First.").await;
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT hello"),
+            said(first.id.as_str(), BOT, "First."),
+            said("q2", "alice", "@UBOT question two"),
+            said("q3", "alice", "@UBOT question three"),
+        ],
+    );
+    let upstream = stack.fake.message_requests().await.len();
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Answer."));
+    let people: Vec<String> = (0..40).map(|n| format!("UPERSON{n}")).collect();
+    let mut slow: Vec<&str> = people.iter().map(String::as_str).collect();
+    slow.push(BOT);
+    let mut two = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "q2",
+        Some("r1"),
+        &slow,
+    );
+    two.text = "@UBOT question two".to_owned();
+    let mut three = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "q3",
+        Some("r1"),
+        &[BOT],
+    );
+    three.text = "@UBOT question three".to_owned();
+    let one = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    let other = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    let (sent_two, sent_three) = tokio::join!(one.send(two), other.send(three));
+    sent_two.unwrap();
+    sent_three.unwrap();
+    wait_until("both are answered", || {
+        posts(&stack.calls_since(before)).len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(posts(&stack.calls_since(before)).len(), 2);
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 2, "one turn each");
+    assert!(bodies[0].contains("question two"), "{}", bodies[0]);
+    assert!(!bodies[0].contains("question three"), "{}", bodies[0]);
+    assert!(bodies[1].contains("question three"), "{}", bodies[1]);
+    assert!(
+        !bodies[1].contains("question two"),
+        "the first message was answered by its own turn: {}",
+        bodies[1]
+    );
+    stack.stop().await;
+}
+
 #[tokio::test]
 async fn a_failed_reply_post_still_delivers_the_rest_and_says_so() {
     let stack = start().await;

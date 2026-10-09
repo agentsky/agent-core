@@ -23,15 +23,21 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(300);
 pub enum Failure {
     /// agentd answered with a refusal or an error.
     Refused(CtlError),
-    /// agentd couldn't be reached, or its answer couldn't be read.
+    /// The request failed some other way: it timed out, or agentd's answer
+    /// was cut off or couldn't be read, so it may have reached agentd; or,
+    /// for an upload, the file couldn't be read.
     Transport(String),
+    /// agentd couldn't be connected to: its name didn't resolve, the
+    /// connection was refused, or connecting took over [`CONNECT_TIMEOUT`].
+    /// The request never reached it.
+    Unreachable(String),
 }
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Refused(err) => f.write_str(&err.message),
-            Self::Transport(message) => f.write_str(message),
+            Self::Transport(message) | Self::Unreachable(message) => f.write_str(message),
         }
     }
 }
@@ -78,7 +84,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// [`Failure::Refused`] with agentd's reason, or [`Failure::Transport`].
+    /// [`Failure::Refused`] with agentd's reason, [`Failure::Unreachable`] if
+    /// agentd can't be connected to, or [`Failure::Transport`].
     pub async fn send<R: CtlRequest>(&self, request: &R) -> Result<R::Response, Failure> {
         self.send_within(request, REQUEST_TIMEOUT).await
     }
@@ -146,10 +153,11 @@ impl Client {
     }
 
     fn transport(&self, err: &reqwest::Error) -> Failure {
+        if err.is_connect() {
+            return Failure::Unreachable(format!("agentd at {}: can't connect", self.base));
+        }
         let what = if err.is_timeout() {
             "timed out"
-        } else if err.is_connect() {
-            "can't connect"
         } else {
             "the request failed"
         };
@@ -228,5 +236,6 @@ mod tests {
         let refused = Failure::Refused(CtlError::new(CtlErrorCode::NoTurn, "no turn"));
         assert_eq!(refused.to_string(), "no turn");
         assert_eq!(Failure::Transport("down".into()).to_string(), "down");
+        assert_eq!(Failure::Unreachable("gone".into()).to_string(), "gone");
     }
 }

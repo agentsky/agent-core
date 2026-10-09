@@ -74,11 +74,12 @@ impl Commands {
                         "`{name}` has no skill `{skill}` waiting for you to confirm its hosts."
                     ),
                     Confirmed::Expired => format!(
-                        "The skill `{skill}` waited more than {} minutes, so I dropped it. Add \
-                         it again with {}.",
+                        "The skill `{skill}` waited more than {} minutes for you to confirm \
+                         its hosts. Add it again with {}.",
                         PENDING_TTL.as_secs() / 60,
                         origin.command(&format!("skill add {name}"))
                     ),
+                    Confirmed::Busy => busy(skill.as_str()),
                 })
             }
             SkillCommand::Rm { skill, .. } => {
@@ -112,6 +113,7 @@ impl Commands {
                             "`{BUNDLED_NAME}` is built into every agent and can't be removed."
                         ));
                     }
+                    Removed::Busy => return Ok(busy(skill.as_str())),
                     Removed::NotFound => {}
                 }
                 let names: Vec<String> = skills
@@ -191,6 +193,11 @@ fn pending_reply(agent: &str, manifest: &Manifest, origin: &Origin) -> String {
         confirm = origin.command(&format!("skill confirm {agent} {}", manifest.name)),
         minutes = PENDING_TTL.as_secs() / 60,
     )
+}
+
+/// The reply when another change to `skill` holds it.
+fn busy(skill: &str) -> String {
+    format!("Another change to the skill `{skill}` is in progress. Try again in a moment.")
 }
 
 /// `bytes` in MB when it is a whole number of them, else in KB.

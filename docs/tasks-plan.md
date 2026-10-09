@@ -1777,12 +1777,14 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails. If the kill fails, the container is stopped
-  instead, since nothing was signalled
-  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
-  `ClaudeProcess::may_be_alive` says whether a killed process was seen to
-  exit: a kill can fail, and under Docker signal nothing
-  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  is killed and the turn fails. A kill doesn't always end the process: it
+  can fail, and under Docker signal nothing
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)). So if
+  the exit isn't seen within the 5-second grace period, the process stays
+  `may_be_alive()` ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  The process has no way to stop its container; T21 calls
+  `process_stopping` and stops the container for the session before
+  starting another process.
 - Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
   `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
   starts a new process with `--resume`. `TurnStats::init_seen` says whether
@@ -3187,3 +3189,20 @@ Not scheduled. Each needs a decision before it becomes a task.
   would need to miss it for a message to be lost, but a lone agent in a room,
   or an agentd restart, loses it. Fetching each room's history since the last
   message seen, through the same deduplication, would close the gap.
+- **Keeping a private task's result when its delivery fails.** Posting an
+  approved private task's reply is retried only after a rate limit, so a
+  transport error or a 5xx on the post loses it, and so does the agent's
+  bot being removed from the thread while the task ran, after
+  `run_private_task`'s `can_post` check; the thread is told only that part
+  of the reply couldn't be delivered, if that posts. `run_private_task`
+  still returns `Ran::Done`, so `finish_consent` stops the private
+  sessions and deletes their directories, which held the only copy of the
+  result left (the CLI's transcript, and what the task wrote in `work/`).
+  The requester has to ask again, which takes a new consent and a rerun
+  billed to the owner. Returning an error instead wouldn't help: the next
+  claim finds the session reached the model and tells the thread the task
+  was interrupted. A fix needs the result stored durably (the private
+  output in the database), a redelivery path with backoff, and
+  `consent_posted` redefined for a partial post, since any chunk posted
+  now counts as the consent's last word, all within T33's rule that every
+  path a consent's work takes ends in `finish_consent`.

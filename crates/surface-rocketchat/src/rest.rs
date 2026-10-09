@@ -88,12 +88,14 @@ const USER_NOT_FOUND: &str = "User not found.";
 /// the user is gone.
 pub const USER_GONE_CODES: &[&str] = &["error-invalid-user", "error-user-not-found"];
 
-/// Error codes that mean the caller may not do this.
+/// Error codes that mean the caller may not do this, such as
+/// `error-room-archived` for anything an archived room refuses.
 const FORBIDDEN_CODES: &[&str] = &[
     "error-action-not-allowed",
     "error-forbidden",
     "error-not-allowed",
     "error-not-authorized",
+    "error-room-archived",
     "error-unauthorized",
     "forbidden",
     "not-allowed",
@@ -1412,11 +1414,13 @@ fn error_codes(body: &Value, bare: bool) -> impl Iterator<Item = &str> {
 /// Maps a failed response to a [`SurfaceError`].
 ///
 /// - A code such as `error-not-allowed`, `error-action-not-allowed`,
-///   `not-authorized` or `totp-required` is [`SurfaceError::Forbidden`] with
-///   the code, whatever the status. Rocket.Chat reports missing permissions
-///   with HTTP 400 or 403 depending on the endpoint, and from 9.0 with 401
-///   for `error-unauthorized`. On a 401 only `errorType` and a `[code]`
-///   suffix count: a bare `error: "unauthorized"` there is a rejected token.
+///   `not-authorized`, `totp-required` or `error-room-archived` (an
+///   archived room) is [`SurfaceError::Forbidden`] with the code, whatever
+///   the status, as Slack's `is_archived` is. Rocket.Chat reports missing
+///   permissions with HTTP 400 or 403 depending on the endpoint, and from
+///   9.0 with 401 for `error-unauthorized`. On a 401 only `errorType` and a
+///   `[code]` suffix count: a bare `error: "unauthorized"` there is a
+///   rejected token.
 /// - A code such as `error-room-not-found`, `error-invalid-room`,
 ///   `error-message-not-found` or `error-invalid-user` is
 ///   [`SurfaceError::NotFound`] with the code.
