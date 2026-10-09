@@ -226,16 +226,20 @@ manager app's name so members can notice a hijack.
 
 Loop protection is mandatory because bots hear each other: a per-thread cap on
 agent turns per hour, a per-thread token budget per day, both counting every
-agent in the thread, a cap on the hops of a chain, agents ignore bot messages
-that do not mention them, and only mentions from agentd-managed agents are
-honored (see [Agent-to-agent attribution](#agent-to-agent-attribution)). A
-one-to-one DM holds one agent, so its caps don't apply there. The token
-budget and the usage meter read the CLI's own figures, which the agent can
-falsify: it runs as the CLI's user and can write to its stdout and its
-transcript. So the turn caps and the hop cap, which count turns agentd
-starts, are the hard bounds on a loop, and the token budget stops agents
-that loop by mistake. The meter also keeps each turn's cost as the CLI
-reckons it, but only as a record: no limit reads it.
+agent in the thread, a cap on the hops of a chain, a cap on the agents one turn
+hands off to, agents ignore bot messages that do not mention them, and only
+mentions from agentd-managed agents are honored (see [Agent-to-agent
+attribution](#agent-to-agent-attribution)). A one-to-one DM holds one agent, so
+its caps don't apply there. The token budget and the usage meter read the CLI's
+own figures, which the agent can falsify: it runs as the CLI's user and can
+write to its stdout and its transcript. So the turn caps, the hop cap and the
+per-turn hand-off cap, which count turns agentd starts, are the bounds on a
+loop agentd keeps whatever the CLI reports, and the token budget stops agents
+that loop by mistake. The turn caps count turns once they end, so they slow a
+loop rather than stop a burst of turns that start together (see
+[Agent-to-agent attribution](#agent-to-agent-attribution)). The meter also
+keeps each turn's cost as the CLI reckons it, but only as a record: no limit
+reads it.
 
 ### Rocket.Chat
 
@@ -353,26 +357,43 @@ message mentions another agent, the new turn inherits that requester and the hop
 count. `agentctl ask-agent` posts the task in the thread as the calling agent,
 mentioning the target, so it is recorded and handed off like any other agent
 message. Mentions from bot users that agentd does not manage are ignored. That
-keeps an unmanaged or prompt-injected bot from spending anyone's subscription,
-and the hop cap bounds what one request can cost its requester.
+keeps an unmanaged or prompt-injected bot from spending anyone's subscription.
+
+The hop cap alone bounds only how deep a chain goes, not how wide: every turn
+of it can mention several agents, each of whose turns can mention several
+more, all on the same requester's account. So a turn also hands off to at most
+K agents (`MAX_HAND_OFFS`, 2): the agents it asks with `ask-agent` keep their
+places, the agents its other posts mention take what is left in the order the
+posts go out, and the rest are passed over. Together the per-turn cap and the
+hop cap h bound the hand-offs one turn can cascade into at K + K² + … + K^h
+turns: with the default hop cap of 3, a turn an agent runs for a requester
+starts at most 2 + 4 + 8 = 14 more on that requester's account, 1 + 14 in
+all.[^session-reset] The first wave is a different matter: a person's message
+starts one turn for each agent it mentions, each with its own cascade, and
+those are bounded by `MAX_MENTIONS` (100) and the pipeline's places (per
+owner and in all), not by the thread's hourly turn cap. That cap counts turns
+metered once they end, so turns that start together all pass it.
 
 agentd delivers those mentions itself rather than waiting for the platform to
 deliver its own bots' posts back. Once a turn's posts are out, each one in the
 thread the turn answered, outside a one-to-one DM, that the platform reads as
 mentioning other managed agents, is queued for those agents as the posting
-bot's message, each agent once for the turn. It then goes through routing
-like any message, so the requester and hop come only from the post's own
-record, and the hop cap, the thread's caps and each agent's rules apply. Only
-those posts carry the turn's attribution: a post in another thread or
-channel, or a private task's result, hands nothing off by either delivery.
-Each hand-off is recorded in the store with its post, in one transaction,
-and kept until a job settles it; the instance that holds it keeps it leased,
-through a drain too, so a shutdown or crash before its hop is claimed delays
-it rather than losing it. The
-platform may deliver the same post as well: Rocket.Chat does, and on Slack it
-is unverified. A claim on the mentioned agent and the posting turn, in the
-store, lets one hop run for each turn and agent, however many of the turn's
-posts mention it and whichever copy arrives first.
+bot's message, each agent once for the turn and at most K agents for the turn.
+It then goes through routing like any message, so the requester and hop come
+only from the post's own record, and the hop cap, the thread's caps and each
+agent's rules apply. Only those posts carry the turn's attribution: a post in
+another thread or channel, or a private task's result, hands nothing off by
+either delivery. Each hand-off is recorded in the store with its post, in one
+transaction, and kept until a job settles it; the instance that holds it keeps
+it leased, through a drain too, so a shutdown or crash before its hop is
+claimed delays it rather than losing it. The platform may deliver the same post
+as well: Rocket.Chat does, and on Slack it is unverified. A claim on the
+mentioned agent and the posting turn, in the store, lets one hop run for each
+turn and agent, however many of the turn's posts mention it and whichever copy
+arrives first. The hop to an agent a post mentions past the per-turn cap is
+claimed before the post is recorded, and the platform's copy can take a hop
+only once the post's record is there, so that copy finds it claimed and runs
+nothing the cap passed over.
 
 ### Private tasks
 
@@ -917,11 +938,12 @@ private tasks on purpose:
   agent is taught to write one out.
 
 A member can still paste text from elsewhere, an agent's reply included.
-So a `cloud run` task gets the checks a consent card's task gets (T33): the presentation selectors and joiners that only change how a
-character is drawn are dropped, and a task with control or invisible
-characters, deep indentation, wide runs of blanks, many blank lines in a row
-or stacked combining marks is refused, so what the member sees in their own
-message is what the session reads.
+So a `cloud run` task gets the checks a consent card's task gets (T33): the
+presentation selectors and joiners that only change how a character is
+drawn are dropped, and a task with control or invisible characters, deep
+indentation, wide runs of blanks, many blank lines in a row or stacked
+combining marks is refused, so what the member sees in their own message is
+what the session reads.
 
 ### Credential and billing
 
@@ -1065,6 +1087,30 @@ Two tables, both in the store:
   shows each task's first line, cut to 60 characters, as literal text. Rows
   are deleted 90 days after they were asked (`[cloud] retention_days`), and
   with the member's routines on `logout`.
+
+Commands run in order per identity, not per member, so a `logout` sent from
+the member's other identity, or run on another instance during a
+blue-green swap, can race a `cloud add` or `cloud run`. Storing a routine
+and writing a hand-off check, in the same transaction, that the member
+still has a Claude link, and `logout` deletes the member's routines and
+hand-offs only after it unlinks them, so a racing row is either deleted by
+the `logout` or refused. Storing a Slack configuration token checks the
+link in the same statement as its write, and `logout` deletes those tokens
+after unlinking too, so a token a racing `slack-token` stores is deleted or
+refused, and `/agent logout` deletes it as Security's row on those tokens
+promises.
+
+A member Slack reports deleted keeps their link, so a routine that a racing
+`cloud add` stores after the deletion stays until the member logs out, and
+a racing `cloud run` still writes and fires a hand-off, whose row goes at
+`retention_days`. A member only on Slack can't send `logout` once Slack
+deleted them, so their routine stays sealed at rest indefinitely, as their
+Claude link already does, and a store leaked with its master key would
+yield its token, as [Security](#security)'s row on a leaked routine token
+or store says. This is an accepted gap: it needs the member's own command
+to land in the moment Slack deletes them, and through agentd only that
+member can fire the token, from another of their identities; for a member
+only on Slack, nobody can.
 
 Sealed columns use their table, column and row as associated data, like
 every sealed column, and the member as well: a token also with its routine
@@ -1382,7 +1428,7 @@ for members of other organizations too, whose own organization is kept as
 | Model exfiltrates the real token | The real token never enters the sandbox. |
 | A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, name each host (no wildcards), apply to that agent only, and pass the same checks as configured rules. The `Skill` tool also loads `$CLAUDE_CONFIG_DIR/commands/*.md`, which the session may write, so an agent can plant commands for its own session; it can already write `CLAUDE.md` and `settings.json` there, so that grants nothing new. Under `--setting-sources user`, the working directory's `.claude/skills` and `CLAUDE.md` are not loaded. |
 | A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
-| Agents loop on each other | Hop cap per chain, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
+| Agents loop on each other | Hop cap per chain, two hand-offs per turn, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Dedicated roles (a custom role with a license, or the built-in `bot` and `app` roles on the Community Edition) instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
@@ -1511,7 +1557,7 @@ community and owners open the door.
 - **Outside member**: a Slack member whose own workspace or organization
   isn't the home workspace, seen in a shared channel, a shared group DM or a
   DM with an agent's bot. Their organization is the team id Slack names for
-  them (`T…`, or `E…` for an Enterprise Grid organization), or unknown.
+  them (`T…`, or `E…` for an Enterprise Grid organization).
 - **Shared conversation**: one whose `conversations.info` has `is_shared`.
   It is **externally shared** when it also has `is_ext_shared`, which is when
   another organization is in it; `is_org_shared` alone means only other
@@ -1650,9 +1696,10 @@ member they name. The person's own organization is a separate field,
   slow one holds up only that member's commands. A transport error or a rate
   limit answers "try again" in that DM, which the event names, so nothing is
   opened, and any other failure drops the command with a throttled warning.
-  Answers from `users.info` are cached for an hour, at most 4,096 of them,
-  the oldest dropped first, and an answer dropped from the cache is looked
-  up again, never taken as home.
+  Answers from `users.info`, `user_not_found` and `user_not_visible`
+  included, are cached for an hour, at most 4,096 of them, the oldest
+  dropped first, and an answer dropped from the cache is looked up again,
+  never taken as home.
 
   No message takes a sender as home from the fields alone. A slash command
   carries no sender team at all, so its guard is Slack's own rule that only
@@ -1765,10 +1812,12 @@ are closed by default:
 
 1. **The community.** `[slack_connect] teams`, in the operator's
    configuration file rather than an `/agent admin` command, lists the
-   organizations whose members agentd hears, by the id Slack names them
-   with (`T…` or `E…`), which agentd logs when it ignores one. A message
-   from anyone else outside is ignored without a word, as an unaddressed
-   message is. An empty list, the default, hears no one from outside.
+   organizations whose members agentd hears, by the id their first given
+   team field names (`user_team`, then `source_team`, …), a workspace's `T…`
+   or an organization's `E…` alike, which agentd logs when it ignores one. A
+   message from anyone else outside is ignored without a word, as an
+   unaddressed message is. An empty list, the default, hears no one from
+   outside.
 2. **The agent's owner.** `/agent allow <name> outside` admits members of
    listed organizations to that agent. `everyone` means everyone in the
    community and a `#room` allow means its home members, so neither admits
@@ -2083,6 +2132,7 @@ Direct calls would also need our own agent loop.
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
 [^rc-stream]: [stream-room-messages](https://developer.rocket.chat/api/realtime-api/subscriptions/stream-room-messages).
 [^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace. Since T34, hand-off doesn't depend on it: agentd delivers an agent's post itself to the managed agents the post mentions, in the thread its turn answered, and once an agent's hop from that turn ran, any other copy, agentd's or the platform's, is dropped. T32's live check now only shows whether Slack delivers that duplicate.
+[^session-reset]: A turn the runner refuses with a session reset, before it reaches the model, runs once more on the session looked up again, as a new turn for the same message. The first attempt posts nothing, so it starts no hop and isn't billed twice.
 [^slack-approval]: [Manage app approval for your workspace](https://slack.com/help/articles/222386767-Manage-app-approval-for-your-workspace).
 [^rc-create]: [Rocket.Chat Create User](https://developer.rocket.chat/reference/api/rest-api/endpoints/user-management/users-endpoints/create-user).
 [^slack-free]: [Feature limitations on the free version of Slack](https://slack.com/help/articles/27204752526611-Feature-limitations-on-the-free-version-of-Slack).

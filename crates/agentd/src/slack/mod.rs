@@ -54,6 +54,7 @@ use tokio::task::JoinSet;
 use crate::app::App;
 use crate::commands::intake::CommandSubmitter;
 use crate::commands::slack::{consent_action, dm_command, member_who_left, slash_command};
+use crate::commands::slack_tokens::retry_store;
 use bots::SlackBots;
 use manager::ManagerIdentity;
 
@@ -399,8 +400,9 @@ impl Dedup for StoreDedup {
 /// - To the manager app: an `/agent` slash command, a DM to the app, or a
 ///   click on a consent card's button goes to the command intake, and a
 ///   `user_change` whose user is `deleted` deletes that member's
-///   configuration token for the workspace. Only home members' commands
-///   go on (see the design's Slack Connect "Commands"):
+///   configuration token for the workspace, with the store tried a few
+///   times since Slack doesn't send the event again. Only home members'
+///   commands go on (see the design's Slack Connect "Commands"):
 ///   - A DM whose sender's own team fields make them outside is dropped
 ///     here, without touching the network; the rest are checked against
 ///     the member list or `users.info` in the member's own intake task
@@ -467,15 +469,18 @@ impl Inbound {
         let Some(key) = member_who_left(event, home_org) else {
             return;
         };
-        let deleted = match self.store.member_for_identity(&key).await {
-            Ok(Some(member)) => {
-                self.store
-                    .delete_slack_config_token(member, &key.team)
-                    .await
-            }
-            Ok(None) => Ok(false),
-            Err(err) => Err(err),
-        };
+        let (store, key) = (&self.store, &key);
+        let deleted = retry_store(
+            "deleting a departed member's configuration token",
+            key,
+            || async move {
+                match store.member_for_identity(key).await? {
+                    Some(member) => store.delete_slack_config_token(member, &key.team).await,
+                    None => Ok(false),
+                }
+            },
+        )
+        .await;
         match deleted {
             Ok(true) => {
                 tracing::info!(member = %key, "a member left the workspace; deleted their configuration token")
