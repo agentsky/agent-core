@@ -7,6 +7,8 @@
 //!   [`claude::Turn`]. [`claude`] documents what it checks and prints.
 //!   [`agentctl_path`] builds `agentctl` for scripts that run it.
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
+//!   The `fake-anthropic` binary serves it at a fixed address with Claude's
+//!   OAuth endpoints, for `scripts/ci/rocketchat-e2e.sh`.
 //! - [`child`]: whether dropping a child's handles killed it before closing
 //!   its stdin.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.

@@ -1,0 +1,93 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Skips the end-to-end test when every changed file is documentation, as
+  # the `changes` job in ci.yml does for the build and test jobs.
+  changes:
+    name: Classify changes
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Classify
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=
+          case "$EVENT" in
+            pull_request) base=HEAD^1 ;;
+            push) if git fetch -q --depth=1 origin "$BEFORE"; then base=$BEFORE; fi ;;
+          esac
+          if [ -n "$base" ] && sh scripts/ci/docs-only.sh "$base" HEAD; then
+            echo "Only documentation changed; skipping the end-to-end test."
+            echo code=false >> "$GITHUB_OUTPUT"
+          else
+            echo code=true >> "$GITHUB_OUTPUT"
+          fi
+
+  # scripts/ci/rocketchat-e2e.sh (T37 in docs/tasks-plan.md): the real
+  # Rocket.Chat, agentd and sandbox images and the real Claude Code CLI, with
+  # only Anthropic faked by fake-anthropic. It is a workflow of its own, not
+  # a job of `CI passed`, because Rocket.Chat's Community Edition refuses
+  # posts until it has reported to Rocket.Chat Cloud, so the test needs that
+  # service to be up.
+  rocketchat:
+    name: Rocket.Chat end to end
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Show Docker
+        run: |
+          docker version
+          docker compose version
+
+      - name: Build the images
+        run: |
+          DOCKER_GID="$(stat -c %g /var/run/docker.sock)" \
+            docker compose -f deploy/compose/compose.yaml --profile sandbox build
+
+      - name: Build fake-anthropic
+        run: cargo build --locked -p testkit --bin fake-anthropic
+
+      - name: Add the sandbox isolation rules
+        run: sudo sh deploy/compose/isolate-sandbox.sh
+
+      - name: Run the end-to-end test
+        run: sh scripts/ci/rocketchat-e2e.sh
+
+      - name: Remove the sandbox isolation rules
+        if: always()
+        run: sudo sh deploy/compose/isolate-sandbox.sh remove

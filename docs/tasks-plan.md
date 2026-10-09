@@ -396,6 +396,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T36c](#t36c) | Slack Connect: private work in shared conversations | `slack-connect-private` | T36b | M7 |
 | [T36d](#t36d) | Slack Connect: channel ids that change | `slack-channel-id-changed` | T36a | M7 |
 | [T36e](#t36e) | Verify Slack Connect payloads | `slack-connect-check` | T36 | M7 gate |
+| [T37](#t37) | Rocket.Chat end to end in CI | `rocketchat-e2e` | T16, T26 | M3 |
 
 Progress:
 
@@ -444,6 +445,7 @@ Progress:
 - [ ] T36c Slack Connect: private work in shared conversations
 - [ ] T36d Slack Connect: channel ids that change
 - [ ] T36e Verify Slack Connect payloads
+- [ ] T37 Rocket.Chat end to end in CI
 
 The design's milestone 3 (requester-pays) moves ahead of milestone 4 (Slack)
 as the design orders it. The Slack surface (T28, T29) needs only T05, T07 and
@@ -524,6 +526,8 @@ graph TD
     T36a --> T36d
     T36 --> T36e
     T36e --> T36b
+    T16 --> T37
+    T26 --> T37
 ```
 
 ## Parallel lanes
@@ -543,6 +547,7 @@ is a suggestion, not an owner: pick any unblocked task.
 | Integration | T23 to T27, T33, T34 | `crates/agentd` pipeline, `crates/router` |
 | Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `crates/agentd/src/commands/mod.rs` (`logout`), `crates/agentd/src/commands/slack_tokens.rs`, `config/agentd.example.toml` |
 | Slack Connect | T36e (live, any time), T36a, T36d, then T36b, T36c | `crates/surface-slack` (ingress, normalize, directory, web, manifest), `crates/router`, `crates/store` (migrations), `crates/commands`, `crates/testkit` (Slack fixtures), `crates/agentd` Slack wiring, sweeper, pipeline, commands, consents and ctl |
+| End to end | T37 | `scripts/ci`, `.github/workflows/e2e.yml`, `crates/testkit` |
 
 ## Phase 0: foundation
 
@@ -4259,6 +4264,76 @@ Acceptance: the redacted fixtures are under
 what each showed, the scratch apps are deleted, and the design and this
 plan are updated.
 
+## End to end
+
+### T37
+
+**Rocket.Chat end to end in CI.** Branch `rocketchat-e2e`. Depends on T26
+and T16.
+
+Every other test runs agentd against `testkit`'s `FakeRest` and `FakeDdp`,
+and `scripts/ci/compose-test.sh` brings the real Rocket.Chat up only to log
+in as its admin. This one drives the real Rocket.Chat container from
+`deploy/compose`, the real agentd and sandbox images and the real Claude
+Code CLI, with only Anthropic faked, through what milestones 1 to 3 promise:
+link an account, create an agent, mention it and get its answer in the
+thread, on the owner's account and on the community key.
+
+Deliverables:
+
+- A `testkit` binary, `fake-anthropic`: `fake_anthropic()` on a given
+  address, with Claude's OAuth token, revoke and profile endpoints added. A
+  token answer grants `user:profile user:inference`, and the profile names
+  a Claude Max plan. It prints one line per request with its method, its
+  path and which credential it carried (the access token it issued, the
+  community key it is given, another value, or none), never a value.
+- `scripts/ci/rocketchat-e2e.sh`, in the style of `compose-test.sh`, with a
+  Compose project of its own (`agent-core-e2e`):
+  1. Starts MongoDB and Rocket.Chat, and waits until the admin can post: a
+     Community Edition workspace answers `restricted-workspace` until it
+     has reported statistics to Rocket.Chat Cloud, which it does at startup
+     when it can reach it.
+  2. Does step 2 of `deploy/compose/README.md` through the REST API: the
+     `bot` and `app` permissions, the manager with those roles and a
+     personal access token that bypasses two-factor authentication, and
+     two members, alice and bob.
+  3. Starts agentd with the example configuration, a `[rocketchat]`
+     section for the manager, the admin as community admin, `[proxy]
+     upstream` and the `[claude_oauth]` URLs on `http://127.0.0.1:18080`,
+     and `[sandbox]` on the project's network with `host_data_dir` and an
+     `instance` of its own. agentd's realtime connections don't fetch what
+     was posted in a room before they subscribed to it, and a new direct
+     message with the manager is a room no connection is in yet, so the
+     members' direct messages with the manager are opened before agentd
+     starts, and the script waits for the Rocket.Chat surface's debug line
+     saying the manager's connection has sent its subscriptions before
+     posting.
+  4. Runs `fake-anthropic` in agentd's network namespace (`docker run
+     --network container:<agentd>`), from the agentd image, since the
+     upstream and the OAuth URLs may only be plain HTTP to a loopback
+     address.
+  5. As alice, in a direct message to the manager: `login`, then `login
+     <code>#<state>` with the state from the login link. In `#general`:
+     `!agent create helper`, then a mention of the bot, which must answer
+     in the mention's thread with `fake_anthropic`'s reply. The admin sets
+     the community key with `admin api-key set`, and bob, who has no linked
+     account, mentions the bot and gets the same answer.
+  6. Checks the fake's log: a `/v1/messages` request on the access token it
+     issued, one on the community key, and none carrying another value, so
+     every turn went through the credential proxy's swap.
+  It removes everything it created on exit, the sandboxes agentd started
+  (by their `agentd.instance` label) included, and prints agentd's, the
+  fake's and Rocket.Chat's logs when a step fails.
+- `.github/workflows/e2e.yml`: on pull requests, pushes to `main` and
+  manual dispatch, skipped when only documentation changed
+  (`scripts/ci/docs-only.sh`). It builds the images through Compose and
+  `fake-anthropic` with Cargo, adds `isolate-sandbox.sh`'s rules, runs the
+  script and takes the rules out again. It is a workflow of its own, not a
+  job of `CI passed`, because it needs Rocket.Chat Cloud to be reachable.
+
+Acceptance: the workflow passes on the pull request, and a failing step
+names what it waited for and prints the logs above.
+
 ## Deferred work
 
 Not scheduled. Each needs a decision before it becomes a task.
@@ -4396,8 +4471,14 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Backfill after a Rocket.Chat reconnect.** A realtime connection that
   drops misses what was posted until it is back (T12). Every bot in a room
   would need to miss it for a message to be lost, but a lone agent in a room,
-  or an agentd restart, loses it. Fetching each room's history since the last
-  message seen, through the same deduplication, would close the gap.
+  or an agentd restart, loses it. So does a room no agentd connection was in
+  yet: what is posted there before a connection's subscription is ready,
+  such as a member's first command the moment they open a direct message
+  with the manager, or a mention the moment a bot is invited by hand into a
+  room no other agentd bot is in, is missed too (found by T37, which opens
+  its direct messages before agentd starts). Fetching each room's history
+  since the last message seen, or since the subscription for a new room,
+  through the same deduplication, would close the gap.
 - **Keeping a private task's result when its delivery fails.** Posting an
   approved private task's reply is retried only after a rate limit, so a
   transport error or a 5xx on the post loses it, and so does the agent's
