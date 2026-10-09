@@ -3837,13 +3837,15 @@ runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
 T21 recycles the session's container when the requester changes, which
-ends every process a turn left running, so a leftover never spends another
-requester's credential
-([T21](#another-requesters-turn-gets-a-new-container)). What remains: a
-background process left from turn N can still spend the credential of a
-later turn of the same requester while that turn runs. Killing what a turn
-leaves behind has no clean boundary; the plan's Deferred work ("Processes a
-turn leaves running") records it.
+ends every process a turn left running
+([T21](#another-requesters-turn-gets-a-new-container)), so a background
+process left from turn N spends only the credentials of its own
+requester's later turns while they run. Killing what a turn leaves behind
+has no clean boundary. Files outlive the container, though: what a turn
+leaves in the session's `home/`, `tmp/`, `claude/` or `work/`, in
+`shared/`, or in the transcript can run or instruct code in a later
+requester's process, which then spends that requester's credential. The
+plan's Deferred work ("Processes a turn leaves running") records both.
 
 ### Headers the proxy changes besides the credential
 
@@ -4458,7 +4460,7 @@ in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
 a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 `work/` or `shared/`, or text in the transcript. A leftover process can also
 still use its own requester's later turns, and the egress allowlist between
-turns. The plan's Deferred work ("Killing leftover processes at turn end")
+turns. The plan's Deferred work ("Processes a turn leaves running")
 records both, with a way to narrow the files' part.
 
 ### How turns queue and survive their caller
