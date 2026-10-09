@@ -5709,10 +5709,12 @@ says which process ran a turn: every process of a session sends the same
 
 **Solution.** The tests' scripted turns run `sh -c 'echo $PPID >> pids'`
 through `fake-claude`, which records the pid of the `claude` process that
-ran each turn. A change of credential kind or model shows as a new pid,
-and a test with two linked members on one model shows the same pid for
-both turns, with each turn's own bearer token upstream: the warm process's
-placeholder follows the requester.
+ran each turn. A change of credential kind or model shows as a new pid.
+A test with two linked members on one model shows a new pid for the
+second member's turn, with each turn's own bearer token upstream, since
+T21 recycles the container when the requester changes
+([T21](#another-requesters-turn-gets-a-new-container)), and the same pid
+for that member's next turn.
 
 ### A broken link asks for a new login, never the community key
 

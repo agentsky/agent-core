@@ -569,7 +569,7 @@ async fn each_turn_in_a_thread_runs_on_its_requesters_account_or_the_community_k
 }
 
 #[tokio::test]
-async fn the_same_credential_and_model_keep_the_process_and_repoint_its_placeholder() {
+async fn another_requester_gets_a_new_process_and_the_same_one_keeps_it() {
     let stack = start(Duration::from_secs(86_400)).await;
     let (_, _, first) = stack
         .answer(stack.mention("alice", "GENERAL", "s1", None))
@@ -578,15 +578,26 @@ async fn the_same_credential_and_model_keep_the_process_and_repoint_its_placehol
     let (_, _, second) = stack
         .answer(stack.mention("erin", "GENERAL", "s2", Some("s1")))
         .await;
+    let (_, _, third) = stack
+        .answer(stack.mention("erin", "GENERAL", "s3", Some("s1")))
+        .await;
     assert_eq!(first, bearer("token-of-alice", DEFAULT_MODEL));
     assert_eq!(
         second,
         bearer("token-of-erin", DEFAULT_MODEL),
-        "a warm process's placeholder follows the turn's requester"
+        "each turn runs on its own requester's account"
     );
+    assert_eq!(third, second);
     let pids = stack.pids();
-    assert_eq!(pids.len(), 2);
-    assert_eq!(pids[0], pids[1], "same kind, same model: the process stays");
+    assert_eq!(pids.len(), 3);
+    assert_ne!(
+        pids[0], pids[1],
+        "another requester on the same kind and model: the container is recycled"
+    );
+    assert_eq!(
+        pids[1], pids[2],
+        "the same requester, kind and model: the process stays"
+    );
     stack.stop().await;
 }
 
