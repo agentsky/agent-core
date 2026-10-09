@@ -537,6 +537,7 @@ impl Consents {
             let Some(posted) = consent.card.clone() else {
                 continue;
             };
+            let agent = store.agent(consent.agent).await?;
             let claimed_at = Self::now();
             if !store
                 .claim_consent_card_close(consent.id, claimed_at)
@@ -544,7 +545,6 @@ impl Consents {
             {
                 continue;
             }
-            let agent = store.agent(consent.agent).await?;
             let files = attachments(&consent);
             let name = replies.name_of(&consent.requester.key).await;
             let card = Card {
