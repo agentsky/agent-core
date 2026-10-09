@@ -346,6 +346,7 @@ impl Stack {
             reply_to: root.map(|root| msg(conv_id, root)),
             files: vec![],
             received_at: OffsetDateTime::now_utc(),
+            outside: None,
         }
     }
 

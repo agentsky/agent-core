@@ -671,6 +671,7 @@ impl Stack {
             reply_to: root.map(|root| msg(conv_id, root)),
             files: vec![],
             received_at: OffsetDateTime::now_utc(),
+            outside: None,
         }
     }
 
@@ -1190,6 +1191,7 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
                 requester: &core_types::Requester {
                     member: bob,
                     key: key("bob"),
+                    outside: None,
                 },
                 hop: core_types::Hop(1),
                 consent: None,
@@ -1541,6 +1543,7 @@ async fn writers_post_for_bob(
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: key("bob"),
+                    outside: None,
                 },
                 hop: core_types::Hop(1),
                 consent: None,
@@ -2491,6 +2494,73 @@ async fn past_the_queue_bounds_a_message_gets_one_busy_line() {
     stack.stop().await;
 }
 
+#[tokio::test]
+async fn past_the_queue_an_outside_sender_gets_no_busy_line() {
+    let stack = start_with(Setup {
+        pipeline: |settings| {
+            settings.queue_per_thread = 0;
+            settings.max_pending = 2;
+        },
+        ..Setup::default()
+    })
+    .await;
+    stack.next_turn(Turn::reply("Done.").with_delay(Duration::from_millis(1500)));
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("the first turn runs", || {
+        stack.mock.calls().contains(&working_on("b1"))
+    })
+    .await;
+    let outside = |mut event: InboundEvent| {
+        event.outside = Some(core_types::Outside {
+            team: "T0THEIRS1".into(),
+        });
+        event
+    };
+    sink.send(outside(stack.event(
+        "zoe",
+        "GENERAL",
+        ConvKind::Channel,
+        "b2",
+        Some("b1"),
+        &[BOT],
+    )))
+    .await
+    .unwrap();
+    sink.send(stack.event("alice", "GENERAL", ConvKind::Channel, "b3", None, &[BOT]))
+        .await
+        .unwrap();
+    sink.send(outside(stack.event(
+        "zoe",
+        "GENERAL",
+        ConvKind::Channel,
+        "b4",
+        None,
+        &[BOT],
+    )))
+    .await
+    .unwrap();
+    wait_until("the two messages taken are answered", || {
+        stack
+            .mock
+            .posts()
+            .iter()
+            .filter(|(_, text)| text == "Done.")
+            .count()
+            == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        stack.busy_lines("helper"),
+        0,
+        "nothing is posted for a sender from outside, not even a busy line"
+    );
+    stack.stop().await;
+}
+
 impl Stack {
     async fn bob(&self) -> MemberId {
         self.store()
@@ -2785,6 +2855,7 @@ async fn only_an_attributed_post_of_the_bot_is_shown_as_from_outside_the_session
                 requester: &core_types::Requester {
                     member: alice,
                     key: key("alice"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 consent: None,
@@ -3357,6 +3428,7 @@ async fn a_mention_slack_may_show_as_code_hands_off_by_neither_delivery() {
             binding: BindingId::new_v4(),
             bot_user: Some(&writers_bot),
             team: &team,
+            home_org: None,
             event_id: "Ev1",
             received_at: pinned_now(),
         },
@@ -4200,6 +4272,7 @@ async fn a_hop_whose_posting_turn_cant_be_read_waits_rather_than_risk_running_tw
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: key("bob"),
+                    outside: None,
                 },
                 hop: core_types::Hop(1),
                 consent: None,

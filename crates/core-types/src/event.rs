@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, UserId};
+use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, Outside, UserId};
 
 /// The most mentions an [`InboundEvent`] carries: a surface keeps the first
 /// this many different users a message mentions. The router looks each one
@@ -45,6 +45,15 @@ pub struct InboundEvent {
     /// Who sent the message. For a bot, its user id when known, or else its
     /// bot id; see [Bot senders](#bot-senders).
     pub sender: MemberKey,
+    /// Whether the sender is from outside the workspace agentd serves, and
+    /// from which organization; `None` for a member of the workspace, and
+    /// always on Rocket.Chat. On Slack it is what the message's own team
+    /// fields say, for the event and for Slack's copy of it alike, never what
+    /// a lookup said; the pipeline acts only on a copy whose `outside` is the
+    /// event's. A bot's says nothing, since the router never takes a bot for
+    /// a requester.
+    #[serde(default)]
+    pub outside: Option<Outside>,
     /// Whether the sender is a bot, managed by agentd or not.
     pub sender_is_bot: bool,
     /// The sender's bot user id, when the sender is a bot and its user id is
@@ -81,6 +90,7 @@ impl fmt::Debug for InboundEvent {
             .field("event_id", &self.event_id)
             .field("binding", &self.binding)
             .field("sender", &self.sender)
+            .field("outside", &self.outside)
             .field("sender_is_bot", &self.sender_is_bot)
             .field("sender_bot_user", &self.sender_bot_user)
             .field("conv", &self.conv)
@@ -125,6 +135,7 @@ mod tests {
                 team: "T1".into(),
                 user: "U1".into(),
             },
+            outside: Some(Outside { team: "T9".into() }),
             sender_is_bot: false,
             sender_bot_user: None,
             conv: conv.clone(),
@@ -156,6 +167,15 @@ mod tests {
         let json = json_round_trip(&sample_event(ConvKind::Channel));
         assert_eq!(json["received_at"], "2026-09-30T12:34:56.789Z");
         assert_eq!(json["conv_kind"], "channel");
+        assert_eq!(json["outside"], serde_json::json!({"team": "T9"}));
+    }
+
+    #[test]
+    fn an_event_stored_before_outside_existed_reads_as_home() {
+        let mut json = serde_json::to_value(sample_event(ConvKind::Channel)).unwrap();
+        json.as_object_mut().unwrap().remove("outside");
+        let event: InboundEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(event.outside, None);
     }
 
     #[test]
@@ -166,6 +186,7 @@ mod tests {
         assert!(!debug.contains("secret plan"), "{debug}");
         assert!(debug.contains("text_len: 15"), "{debug}");
         assert!(debug.contains("Ev01"), "{debug}");
+        assert!(debug.contains("T9"), "the outside organization: {debug}");
     }
 
     #[test]

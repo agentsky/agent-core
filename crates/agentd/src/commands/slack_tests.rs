@@ -2,6 +2,7 @@
 //! through `response_url`, manager DMs, `/agent slack-token`, the
 //! configuration token rotator, and members who leave.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +63,7 @@ fn identity() -> ManagerIdentity {
         bot_id: "B0MANAGER".to_owned(),
         app_id: "A0MANAGER".to_owned(),
         app_name: Some("agent-core".to_owned()),
+        enterprise: None,
     }
 }
 
@@ -111,6 +113,11 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
     Mock::given(method("POST"))
         .and(path("/api/users.list"))
         .respond_with(ok(json!({"members": []})))
+        .mount(&slack)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .respond_with(home_member)
         .mount(&slack)
         .await;
     Mock::given(method("POST"))
@@ -791,6 +798,11 @@ async fn a_notice_nobody_can_send_is_tried_a_bounded_number_of_times() {
         .unwrap();
     h.slack.reset().await;
     Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .respond_with(home_member)
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("POST"))
         .and(path("/api/conversations.open"))
         .respond_with(ResponseTemplate::new(503))
         .mount(&h.slack)
@@ -830,7 +842,7 @@ impl Running {
 
     async fn stop(self) {
         drop(self.inbound);
-        tokio::time::timeout(Duration::from_secs(10), self.intake)
+        tokio::time::timeout(Duration::from_secs(20), self.intake)
             .await
             .unwrap()
             .unwrap();
@@ -861,6 +873,7 @@ fn dm_event(sender: &str, text: &str) -> InboundEvent {
         reply_to: None,
         files: Vec::new(),
         received_at: OffsetDateTime::now_utc(),
+        outside: None,
     }
 }
 
@@ -999,7 +1012,7 @@ impl SlackHarness {
 fn user_change(event: Value) -> SlackInbound {
     SlackInbound::Event(SlackEvent {
         binding: BindingRef::MANAGER_ID,
-        team: Some(TeamId::new(TEAM)),
+        team: TeamId::new(TEAM),
         event_id: "Ev0USERCHG1".to_owned(),
         event_type: "user_change".to_owned(),
         event,
@@ -1180,44 +1193,71 @@ async fn a_persona_sent_in_a_manager_dm_arrives_decoded() {
 #[test]
 fn only_a_deleted_user_in_a_user_change_has_left() {
     let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
-    let event = |event_type: &str, team: Option<&str>, value: Value| SlackEvent {
+    let event = |event_type: &str, value: Value| SlackEvent {
         binding: BindingRef::MANAGER_ID,
-        team: team.map(TeamId::new),
+        team: TeamId::new(TEAM),
         event_id: "Ev1".to_owned(),
         event_type: event_type.to_owned(),
         event: value,
         received_at: OffsetDateTime::now_utc(),
     };
+    let left_of = |value: Value| member_who_left(&event("user_change", value), None);
     let left = envelope["event"].clone();
+    assert_eq!(left_of(left.clone()), Some(slack_key("U0HUMAN02")));
     assert_eq!(
-        member_who_left(&event("user_change", Some(TEAM), left.clone())),
-        Some(slack_key("U0HUMAN02"))
-    );
-    assert_eq!(
-        member_who_left(&event("user_change", None, left.clone())),
-        None,
-        "only the envelope's team_id counts"
-    );
-    assert_eq!(
-        member_who_left(&event("team_join", Some(TEAM), left.clone())),
+        member_who_left(&event("team_join", left.clone()), None),
         None
     );
     let mut active = left.clone();
     active["user"]["deleted"] = json!(false);
-    assert_eq!(
-        member_who_left(&event("user_change", Some(TEAM), active)),
-        None
-    );
-    let mut nameless = left;
+    assert_eq!(left_of(active), None);
+    let mut nameless = left.clone();
     nameless["user"]["id"] = json!("");
+    assert_eq!(left_of(nameless), None);
+    assert_eq!(left_of(json!({})), None);
+    for team in [
+        json!("T0THEIRS1"),
+        json!("E0HOMEORG"),
+        json!(null),
+        json!(7),
+    ] {
+        let mut elsewhere = left.clone();
+        elsewhere["user"]["team_id"] = team.clone();
+        assert_eq!(left_of(elsewhere), None, "deactivated in {team}, not here");
+    }
+    let mut teamless = left.clone();
+    teamless["user"].as_object_mut().unwrap().remove("team_id");
+    assert_eq!(left_of(teamless), None);
+}
+
+#[test]
+fn a_grid_member_of_the_workspace_homed_in_a_sibling_has_left() {
+    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
+    let org = TeamId::new("E0HOMEORG");
+    let left_of = |grid: Value, home_org: Option<&TeamId>| {
+        let mut value = envelope["event"].clone();
+        value["user"]["team_id"] = json!("T0SIBLING");
+        value["user"]["enterprise_user"] = grid;
+        let event = SlackEvent {
+            binding: BindingRef::MANAGER_ID,
+            team: TeamId::new(TEAM),
+            event_id: "Ev1".to_owned(),
+            event_type: "user_change".to_owned(),
+            event: value,
+            received_at: OffsetDateTime::now_utc(),
+        };
+        member_who_left(&event, home_org)
+    };
+    let member = json!({"enterprise_id": "E0HOMEORG", "teams": ["T0SIBLING", TEAM]});
     assert_eq!(
-        member_who_left(&event("user_change", Some(TEAM), nameless)),
-        None
+        left_of(member.clone(), Some(&org)),
+        Some(slack_key("U0HUMAN02"))
     );
-    assert_eq!(
-        member_who_left(&event("user_change", Some(TEAM), json!({}))),
-        None
-    );
+    assert_eq!(left_of(member, None), None, "no organization at home");
+    let sibling_only = json!({"enterprise_id": "E0HOMEORG", "teams": ["T0SIBLING"]});
+    assert_eq!(left_of(sibling_only, Some(&org)), None);
+    let other_org = json!({"enterprise_id": "E0THEIRS1", "teams": ["T0SIBLING", TEAM]});
+    assert_eq!(left_of(other_org, Some(&org)), None);
 }
 
 #[tokio::test]
@@ -1355,18 +1395,16 @@ async fn requests_from_another_workspace_are_dropped() {
         .await;
 
     let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
-    for team in [Some(other.clone()), None] {
-        running
-            .send(SlackInbound::Event(SlackEvent {
-                binding: BindingRef::MANAGER_ID,
-                team,
-                event_id: "Ev0USERCHG1".to_owned(),
-                event_type: "user_change".to_owned(),
-                event: envelope["event"].clone(),
-                received_at: OffsetDateTime::now_utc(),
-            }))
-            .await;
-    }
+    running
+        .send(SlackInbound::Event(SlackEvent {
+            binding: BindingRef::MANAGER_ID,
+            team: other.clone(),
+            event_id: "Ev0USERCHG1".to_owned(),
+            event_type: "user_change".to_owned(),
+            event: envelope["event"].clone(),
+            received_at: OffsetDateTime::now_utc(),
+        }))
+        .await;
     running.stop().await;
 
     assert!(h.requests().await.is_empty(), "nothing reached Slack");
@@ -1879,6 +1917,7 @@ fn click(user: &str, action: &str, value: &str, response_url: SecretString) -> I
         binding: BindingRef::MANAGER_ID,
         kind: "block_actions".to_owned(),
         sender: Some(slack_key(user)),
+        sender_team: Some(TeamId::new(TEAM)),
         response_url: Some(response_url),
         payload,
         received_at: OffsetDateTime::now_utc(),
@@ -1920,6 +1959,7 @@ async fn approved_with_a_card(h: &SlackHarness) -> core_types::ConsentId {
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: slack_key("U0BOB"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 task: "Read my notes",
@@ -2105,6 +2145,7 @@ async fn only_owner_can_decide() {
                 requester: &core_types::Requester {
                     member: Some(bob),
                     key: slack_key("U0BOB"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 task: "Read my *notes* <!channel>",
@@ -2227,6 +2268,379 @@ async fn only_owner_can_decide() {
     assert!(
         !text.contains("consent_approve"),
         "the buttons are gone: {text}"
+    );
+}
+
+const OUTSIDE_TEAM: &str = "T0THEIRS1";
+
+/// `users.info`'s answer that whoever was asked about is a member of the
+/// workspace.
+fn home_member(request: &Request) -> ResponseTemplate {
+    let form: HashMap<String, String> =
+        serde_urlencoded::from_bytes(&request.body).unwrap_or_default();
+    let user = form.get("user").cloned().unwrap_or_default();
+    ok(json!({"user": {"id": user, "team_id": TEAM}}))
+}
+
+/// Answers `users.info` for `user` alone with `response`, ahead of the
+/// harness's answer for everyone else.
+async fn mount_user_info(h: &SlackHarness, user: &str, response: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .and(path("/api/users.info"))
+        .and(body_string_contains(format!("user={user}").as_str()))
+        .respond_with(response)
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+}
+
+fn user_in(user: &str, team: &str) -> ResponseTemplate {
+    ok(json!({"user": {"id": user, "team_id": team}}))
+}
+
+fn slack_refused(code: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"ok": false, "error": code}))
+}
+
+/// `users.info` calls about `user`.
+async fn looked_up(h: &SlackHarness, user: &str) -> usize {
+    h.calls("users.info")
+        .await
+        .iter()
+        .filter(|request| String::from_utf8_lossy(&request.body).contains(&format!("user={user}")))
+        .count()
+}
+
+fn dm_in(sender: &str, channel: &str, text: &str) -> SlackInbound {
+    let mut event = dm_event(sender, text);
+    event.conv.conversation = channel.into();
+    event.message.conv.conversation = channel.into();
+    SlackInbound::Message(Box::new(event), InFlight::untracked())
+}
+
+/// Sends a DM from a home member and waits for its answer, which the
+/// intake runs after whatever it received before.
+async fn answered_marker(h: &SlackHarness, running: &Running) {
+    running.send(dm_in("U0HUMAN01", "D0MARKER1", "me")).await;
+    wait_for(async || {
+        h.posts()
+            .await
+            .into_iter()
+            .find(|(channel, _)| channel == "D0MARKER1")
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_teamless_manager_dm_from_outside_never_runs_a_command() {
+    let logs = global_logs().tag();
+    let h = slack_harness().await;
+    mount_user_info(&h, "U0OUTSID1", user_in("U0OUTSID1", OUTSIDE_TEAM)).await;
+    mount_user_info(&h, "U0NOTEAM1", ok(json!({"user": {"id": "U0NOTEAM1"}}))).await;
+    mount_user_info(&h, "U0GONE001", slack_refused("user_not_found")).await;
+    mount_user_info(&h, "U0SCOPE01", slack_refused("missing_scope")).await;
+    mount_user_info(&h, "U0SCOPE02", slack_refused("missing_scope")).await;
+    let running = Running::start(&h);
+    for user in [
+        "U0OUTSID1",
+        "U0NOTEAM1",
+        "U0GONE001",
+        "U0SCOPE01",
+        "U0SCOPE02",
+    ] {
+        let dm = dm_event(user, "me");
+        assert_eq!(dm.outside, None, "no field says where they are from");
+        running
+            .send(SlackInbound::Message(Box::new(dm), InFlight::untracked()))
+            .await;
+    }
+    answered_marker(&h, &running).await;
+    running.stop().await;
+    let posts = h.posts().await;
+    assert_eq!(
+        posts.len(),
+        1,
+        "only the home member's command ran: {posts:?}"
+    );
+    for user in [
+        "U0OUTSID1",
+        "U0NOTEAM1",
+        "U0GONE001",
+        "U0SCOPE01",
+        "U0SCOPE02",
+    ] {
+        assert_eq!(looked_up(&h, user).await, 1, "{user}");
+        assert!(
+            h.store
+                .member_for_identity(&slack_key(user))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(h.calls("conversations.open").await.is_empty());
+    let failed = logs
+        .snapshot()
+        .matching("couldn't ask Slack whether a user is home");
+    assert_eq!(
+        failed
+            .to_string()
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .count(),
+        1,
+        "warned once a minute at most:\n{failed}"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_manager_dm_lookup_asks_the_dm_to_try_again() {
+    let h = slack_harness().await;
+    mount_user_info(&h, "U0DOWN001", ResponseTemplate::new(503)).await;
+    mount_user_info(
+        &h,
+        "U0BUSY001",
+        ResponseTemplate::new(429).insert_header("retry-after", "30"),
+    )
+    .await;
+    let running = Running::start(&h);
+    running.send(dm_in("U0DOWN001", "D0DOWN001", "me")).await;
+    let (_, text) = wait_for(async || {
+        h.posts()
+            .await
+            .into_iter()
+            .find(|(channel, _)| channel == "D0DOWN001")
+    })
+    .await;
+    assert_eq!(text, crate::pipeline::UNCONFIRMED_TEXT);
+    let started = std::time::Instant::now();
+    running.send(dm_in("U0BUSY001", "D0BUSY001", "me")).await;
+    let (_, text) = wait_for(async || {
+        h.posts()
+            .await
+            .into_iter()
+            .find(|(channel, _)| channel == "D0BUSY001")
+    })
+    .await;
+    assert_eq!(text, crate::pipeline::UNCONFIRMED_TEXT);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "never waits for the quota"
+    );
+    running.stop().await;
+    assert_eq!(h.posts().await.len(), 2, "no command ran");
+    assert!(
+        h.calls("conversations.open").await.is_empty(),
+        "the try-again line goes into the DM the event named"
+    );
+}
+
+#[tokio::test]
+async fn a_manager_dm_lookup_never_holds_up_the_slack_queue() {
+    let h = slack_harness().await;
+    mount_user_info(
+        &h,
+        "U0SLOW001",
+        user_in("U0SLOW001", TEAM).set_delay(Duration::from_secs(7)),
+    )
+    .await;
+    let running = Running::start(&h);
+    let started = std::time::Instant::now();
+    running.send(dm_in("U0SLOW001", "D0SLOW001", "me")).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the queue handed the DM on without looking anyone up"
+    );
+    answered_marker(&h, &running).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(3500),
+        "another member's command didn't wait for the slow lookup"
+    );
+    assert!(
+        !h.posts()
+            .await
+            .iter()
+            .any(|(channel, _)| channel == "D0SLOW001")
+    );
+    running.stop().await;
+    assert!(
+        h.posts()
+            .await
+            .iter()
+            .any(|(channel, _)| channel == "D0SLOW001"),
+        "the slow member's command ran once Slack answered"
+    );
+}
+
+#[tokio::test]
+async fn an_interaction_without_user_team_is_dropped() {
+    let h = slack_harness().await;
+    let running = Running::start(&h);
+    let id = core_types::ConsentId::new_v4().to_string();
+    let mut hooks = Vec::new();
+    for sender_team in [None, Some(TeamId::new(OUTSIDE_TEAM))] {
+        let (url, hook) = h.response_url();
+        let mut interaction = click("U0OWNER", crate::consents::card::APPROVE_ACTION, &id, url);
+        interaction.sender_team = sender_team;
+        running.send(SlackInbound::Interaction(interaction)).await;
+        hooks.push(hook);
+    }
+    let (url, answered) = h.response_url();
+    running
+        .send(SlackInbound::Interaction(click(
+            "U0OWNER",
+            crate::consents::card::APPROVE_ACTION,
+            &id,
+            url,
+        )))
+        .await;
+    wait_for(async || {
+        h.requests()
+            .await
+            .into_iter()
+            .find(|request| request.url.path() == answered)
+    })
+    .await;
+    running.stop().await;
+    for hook in hooks {
+        assert!(
+            !h.requests()
+                .await
+                .iter()
+                .any(|request| request.url.path() == hook),
+            "a click from no or another team ran nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_dm_is_opened_with_an_outside_user() {
+    let h = slack_harness().await;
+    mount_user_info(&h, "U0OUTSID1", user_in("U0OUTSID1", OUTSIDE_TEAM)).await;
+    mount_user_info(&h, "U0GONE001", slack_refused("user_not_found")).await;
+    mount_user_info(&h, "U0DOWN001", ResponseTemplate::new(503)).await;
+    mount_user_info(&h, "U0SCOPE01", slack_refused("missing_scope")).await;
+    let replies = h.commands.replies();
+    for user in ["U0OUTSID1", "U0GONE001"] {
+        let err = replies.dm(&slack_key(user), "hello").await.unwrap_err();
+        assert!(
+            matches!(err, ReplyError::Surface(SurfaceError::Forbidden(_))),
+            "{user}: {err:?}"
+        );
+        let err = replies.dm_room(&slack_key(user)).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ReplyError::Surface(SurfaceError::Forbidden(_))
+        ));
+        let err = h
+            .manager
+            .manager_bot()
+            .dm(&slack_key(user), "hello")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Forbidden(_)), "{err:?}");
+    }
+    let err = replies
+        .dm(&slack_key("U0DOWN001"), "hello")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ReplyError::Surface(SurfaceError::Transport(_))),
+        "a failed lookup is passed on as it came: {err:?}"
+    );
+    let err = replies
+        .dm(&slack_key("U0SCOPE01"), "hello")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ReplyError::Surface(SurfaceError::Forbidden(code)) if code == "missing_scope"),
+        "Slack's own refusal, as it came: {err:?}"
+    );
+    replies
+        .dm(&slack_key("U0DOWN001"), "hello")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        looked_up(&h, "U0DOWN001").await,
+        2,
+        "a failed lookup isn't kept"
+    );
+    assert!(h.calls("conversations.open").await.is_empty());
+    assert!(h.posts().await.is_empty());
+
+    replies.dm(&slack_key("U0HUMAN01"), "hello").await.unwrap();
+    assert_eq!(h.calls("conversations.open").await.len(), 1);
+}
+
+#[tokio::test]
+async fn outside_commands_dms_and_clicks_never_run() {
+    let h = slack_harness().await;
+    let running = Running::start(&h);
+    let mut dm = dm_event("U0OUTSID1", "me");
+    dm.outside = Some(core_types::Outside {
+        team: TeamId::new(OUTSIDE_TEAM),
+    });
+    running
+        .send(SlackInbound::Message(Box::new(dm), InFlight::untracked()))
+        .await;
+    let (url, click_hook) = h.response_url();
+    let mut outside_click = click(
+        "U0OUTSID1",
+        crate::consents::card::APPROVE_ACTION,
+        &core_types::ConsentId::new_v4().to_string(),
+        url,
+    );
+    outside_click.sender_team = Some(TeamId::new(OUTSIDE_TEAM));
+    running.send(SlackInbound::Interaction(outside_click)).await;
+    let (url, slash_hook) = h.response_url();
+    let mut command = slash("me", url);
+    command.sender = MemberKey {
+        team: TeamId::new(OUTSIDE_TEAM),
+        ..slack_key("U0OUTSID1")
+    };
+    command.conv.team = TeamId::new(OUTSIDE_TEAM);
+    running.send(SlackInbound::Command(command)).await;
+    running.stop().await;
+    let requests = h.requests().await;
+    assert!(
+        requests.is_empty(),
+        "nothing reached Slack, not even a lookup: {:?}",
+        requests
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        h.store
+            .member_for_identity(&slack_key("U0OUTSID1"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let running = Running::start(&h);
+    let (url, home_hook) = h.response_url();
+    running.send(SlackInbound::Command(slash("me", url))).await;
+    running.stop().await;
+    assert!(
+        h.requests()
+            .await
+            .iter()
+            .any(|request| request.url.path() == home_hook),
+        "a slash command naming this workspace runs"
+    );
+    let requests = h.requests().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| [click_hook.as_str(), slash_hook.as_str()].contains(&request.url.path())),
+        "nothing answered the outsider's click or command"
+    );
+    assert!(
+        h.calls("users.info").await.is_empty(),
+        "a slash command carries no sender team and costs no lookup: its guard is \
+         Slack's own rule that only the installing workspace's members run an app's \
+         commands, and its team_id must be this workspace"
     );
 }
 

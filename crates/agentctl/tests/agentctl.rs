@@ -338,6 +338,7 @@ fn turn(side: Side) -> Turn {
                 team: "T1".into(),
                 user: "U1".into(),
             },
+            outside: None,
         },
         hop: Hop::ZERO,
         kind: TurnKind::Normal,

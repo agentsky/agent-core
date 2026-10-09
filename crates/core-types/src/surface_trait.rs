@@ -88,8 +88,9 @@ pub trait Surface: Send + Sync {
     /// can speak on returns `event` itself without asking. One whose events
     /// someone else could forge, such as Slack's, where an agent's owner
     /// holds the app's signing secret, reads the message back from the
-    /// platform. The pipeline asks before acting on a message for anyone
-    /// but the agent's owner, and routes the copy instead of the event.
+    /// platform. The pipeline asks before acting on any message it didn't
+    /// build itself, whoever sent it, and routes the copy instead of the
+    /// event.
     async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>>;
 
     /// Converts Markdown to the surface's format and splits it into
@@ -258,7 +259,9 @@ pub enum SurfaceError {
     /// The platform answered with another error.
     #[error("platform error: {0}")]
     Api(String),
-    /// The platform couldn't be reached, or its answer couldn't be read.
+    /// The platform couldn't be reached, said it couldn't answer this time,
+    /// or answered in a way that couldn't be read. The call may have partly
+    /// taken effect, so a write that failed so isn't retried blindly.
     #[error("transport error: {0}")]
     Transport(String),
 }
@@ -423,6 +426,7 @@ mod tests {
             reply_to: None,
             files: vec![],
             received_at: datetime!(2026-09-30 00:00 UTC),
+            outside: None,
         }
     }
 

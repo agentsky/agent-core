@@ -740,6 +740,7 @@ mod tests {
                 team: "chat.example".into(),
                 user: "alice".into(),
             },
+            outside: None,
         };
         let new = store::NewConsent {
             id: ConsentId::new_v4(),
