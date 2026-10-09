@@ -25,7 +25,7 @@ use tokio::time::Instant;
 use crate::hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
 use crate::{
     ClaudeProcess, LaunchSpec, PoolConfig, ProcessConfig, Result, RunnerError, SessionStart,
-    TurnOutcome, persona_dir,
+    TurnOutcome, persona_dir, skills_dir,
 };
 
 /// How long the event follower waits before subscribing again when a
@@ -48,7 +48,7 @@ pub struct SessionConfig {
     /// The sandbox image, normally `[sandbox] image`.
     pub image: String,
     /// agentd's data directory, which holds each agent's persona directory
-    /// ([`persona_dir`]).
+    /// ([`persona_dir`]) and skills directory ([`skills_dir`]).
     pub data_dir: PathBuf,
 }
 
@@ -872,6 +872,13 @@ impl<H: TurnHooks> Inner<H> {
         );
         spec.shared = mounts.shared;
         spec.memory = mounts.memory;
+        let skills = skills_dir(&self.config.data_dir, session.agent);
+        if tokio::fs::metadata(&skills)
+            .await
+            .is_ok_and(|meta| meta.is_dir())
+        {
+            spec.skills_dir = Some(skills);
+        }
         let container = self.sandbox.start(&spec).await?;
         let tracked = Arc::new(Tracked {
             container: container.id().clone(),

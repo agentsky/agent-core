@@ -5584,6 +5584,480 @@ need the failure DM held back until the reply is out, and the resets task
 aborted with the intake at shutdown, which isn't worth a delay of one
 reply.
 
+## T25: Skills and the agentctl skill
+
+### Hosts are confirmed with a command of their own
+
+**Issue.** The plan says the owner confirms a skill's `allowed-hosts` when
+adding it, but `/agent` has no dialog: a reply can't ask and wait. Adding the
+skill at once with its files but without its hosts would leave a skill that
+fails when used, and asking the owner to run `skill add` again means
+uploading or cloning twice.
+
+**Solution.** A skill that declares hosts is fetched and checked once, and
+kept outside what sandboxes mount (`<data>/skills-pending/<agent>/<name>/`)
+with a `pending` row; the reply lists the hosts and asks for
+`skill confirm <name> <skill>` within an hour (`PENDING_TTL`). Confirming
+moves the files into the agent's skills and makes the row `active`, which is
+when its hosts count. A confirmation after the hour answers that the skill
+waited too long; the sweeper drops expired ones every minute, with their
+files, and startup too. The parser gained `SkillCommand::Confirm`, and the
+design's command table lists it.
+
+### Skills are rows, their files are directories
+
+**Issue.** The egress extension reads a session's hosts at every `CONNECT`,
+and `skill rm` has to find what to remove, after restarts and on every
+instance, so the hosts can't live in memory; parsing every agent's
+`SKILL.md` files at each `CONNECT` would trust files over the store.
+
+**Solution.** A migration adds `agent_skills` (`agent_id`, `name`, `state`
+of `pending` or `active`, `source`, `hosts`, `digest`, `added_by`,
+`added_at`), keyed by agent, name and state, so a pending skill can wait
+next to the active one it would replace. `Store::active_skills_for_session`
+joins `sessions` and `agents` (deleted agents get none) and `SkillHosts`
+parses each host with `HostRule` again, so a row that no longer parses
+allows nothing. Files stay on disk, moved into place with a rename so a
+session sees a skill whole or not at all. Replacing one moves the old
+directory aside first, so a session starting between the two renames sees
+neither; `renameat2` with `RENAME_EXCHANGE` would close that, but needs a
+fallback for file systems without it, and the window is two renames.
+
+The row and the files change in an order that keeps them matching where it
+can, and hosts are only granted for files that declare them ("Hosts are
+checked against the files in use" below). `skill add` records the row
+first: an active row carries no hosts and replaces any row that did, and a
+pending row's hosts don't count. `skill confirm` moves the files into
+place, then makes the row active; a failed move leaves it pending, and the
+old skill is moved back. `skill rm` deletes the rows, then the directories.
+A failure between the two steps can leave directories no row records, so
+startup removes work directories and skill directories, pending or live,
+whose name has no row in either state (the bundled one aside). A row of
+either state keeps both of its name's directories, so a confirmation moving
+one from pending to live on another instance is never taken for left over.
+Startup also leaves anything changed (by status change time) within
+`STALE_AFTER`, the clone timeout and three minutes, since in a blue-green
+deploy the old instance may still be cloning into a work directory. The
+32-skill cap is checked inside `put_skill`'s transaction.
+
+`skill rm` stops granting the skill's hosts at once, so new connections
+to them are refused unless the operator's allowlist or another active
+skill allows the same host (a session's allowlist is the union of those).
+The egress proxy has no hook to close one agent's tunnels to one host,
+and revoking the agent's sessions would restart its conversations, so
+tunnels already open end on their own, within the 5-minute idle timeout or
+the 1-hour lifetime, and the reply says so. It names hosts only when the
+skill had any.
+
+### A clone reaches agentd's own network unless the host is checked
+
+**Issue.** T08's parser keeps options, other transports and credentials out
+of the source, but not its host: `https://169.254.169.254/…`,
+`https://10.0.0.5/…` or `https://rocketchat:3000/…` (a single-label Compose
+name) parse, and agentd clones from its own network, next to Rocket.Chat and
+MongoDB. `git` would also follow a redirect anywhere, and resolve the name
+again after any check.
+
+**Solution.** The host must be a DNS name (`cred_proxy::normalize_host`:
+two labels or more, no IP forms). agentd resolves it itself (5 seconds) and
+refuses it if any address is one the egress proxy never reaches, reusing
+`EgressPolicy::unreachable`, now public, with agentd's own addresses and the
+sandbox subnet. `git` is then pinned to the checked addresses with
+`http.curloptResolve` (Git 2.37 or later), follows no redirect
+(`http.followRedirects=false`; a moved repository has to be given by its new
+URL), may use only `https` (`protocol.allow=never`,
+`protocol.https.allow=always`), and runs with an empty environment, no
+system or global configuration, no credential helper or prompt, no hooks or
+templates, no bundle URIs (`transfer.bundleURI=false`, `fetch.bundleURI=`)
+or file system monitor, `transfer.fsckObjects`, and `core.symlinks=false`.
+The empty environment also means an operator's `HTTPS_PROXY` never reaches
+a clone: it connects directly, from agentd's own network. The clone is
+`--depth=1 --single-branch --no-recurse-submodules --no-tags`, the ref only
+as `--branch=<ref>` and the URL after `--`. It runs in its own process group,
+killed whole after 2 minutes or once its directory passes 40 MB. Tests serve
+a local repository through `Git::serving_prefix_from_directory_for_tests`,
+which rewrites one `https://` prefix to a `file://` directory and skips the
+lookup; it and the `file://` configuration exist only in test builds.
+
+A clone runs inside the owner's command, and one member's commands run one
+at a time, so a clone that takes its full 2 minutes holds that owner's
+other commands for as long; other members aren't held up.
+
+### The URL git gets names the host as the pin does
+
+**Issue.** agentd checked and pinned the normalized host, but gave `git`
+the URL as the owner wrote it. curl matches `http.curloptResolve` entries
+by name, without dropping a trailing dot, so `https://evil.example./r`
+missed the pin for `evil.example`, and curl resolved the name again,
+reopening DNS rebinding into agentd's network.
+
+**Solution.** `git` gets a URL rebuilt from what was checked,
+`https://<normalized host>:<port><path>`, so its host and port are exactly
+the pin's; a test runs a stand-in `git` and compares the two, `GitHub.com.`
+included. The egress proxy has no such gap: it connects to the addresses it
+checked, never to a name.
+
+### Measuring a clone's directory can't stop one file
+
+**Issue.** The 40 MB cap was checked by measuring the directory every
+250 ms. A small pack of a highly compressible blob checks out hundreds of
+megabytes between two measurements, onto the volume that also holds the
+store; a test cloning an 8 MB blob of zeros under a 1 MB cap finished
+before any measurement saw it.
+
+**Solution.** No file `git` or its helpers write may pass 40 MB:
+`RLIMIT_FSIZE`. The workspace forbids `unsafe`, so `pre_exec` can't set it,
+and `prlimit` on the child's pid after `spawn` races `git` starting
+`git-remote-https`, which would not inherit it. `git` starts through
+`/bin/sh -c 'ulimit -f "$1" && shift && exec "$@"'`, which sets the limit
+before `exec`, so every process of the clone has it; `compose-test.sh`
+checks that the image runs `git` that way. A write past the limit kills
+the writer with `SIGXFSZ`, and `git` killed by it is `TooLarge`. When a
+helper such as `index-pack` is the one killed, `git` exits with an error
+and removes the clone, and the owner gets the generic "Git couldn't clone
+that" reply. The directory is still measured, for the total.
+
+### The agentd image needs git
+
+**Issue.** agentd clones skills itself, on the egress network, as the plan
+says, and the distroless image has no `git`. A Rust Git client would be a
+large dependency for one shallow clone.
+
+**Solution.** The runtime stage is `debian:trixie-slim` (the digest the
+sandbox image pins) with `git` and `ca-certificates`, and Debian's `/bin/sh`
+for `ulimit -f`; it still runs as 10001. Trixie's Git is 2.47, above the 2.37 `http.curloptResolve` needs.
+`compose-test.sh` checks that `git` runs in the image. The image couldn't be
+built here (Debian's mirror is blocked); CI builds it.
+
+### What a skill package may hold
+
+**Issue.** The plan asks for a size cap and a `SKILL.md` with `name` and
+`description`. An upload or a repository is the owner's, fetched from
+anywhere, and ends up mounted into sandboxes.
+
+**Solution.** `skills::package` checks every skill the same way, whatever
+it came from: at most 10 MB of files, 1,000 files and directories, 16
+levels and paths of 1,024 bytes (so a deep tree of long names is refused
+before the file system answers `ENAMETOOLONG`); names without an empty, `.`
+or `..` part, `\`, control or invisible formatting characters; only regular
+files and directories (a symlink or a special file in a zip is refused; a
+clone checks symlinks out as plain files holding their targets, and a
+symlink found in any tree is refused); modes rewritten to
+`0755` for directories and `0644`, or `0755` with an execute bit, for files.
+A `.zip` is read with the `zip` crate (MIT) with only
+`deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`
+and `typed-path`: stored or deflated entries, none encrypted, each counted
+as it inflates against its declared size, so a small archive can't unpack
+past the cap. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
+top or in the only top-level directory (anything else, a lone file at the
+top included, is "no SKILL.md"), at most 256 KB of UTF-8; its front
+matter, at most 16 KB between `---` lines (YAML's `...` doesn't close it), is read with `serde_norway`
+(now a normal dependency of agentd) into the three keys agentd needs, so
+other keys are skipped rather than built: a "billion laughs" document under
+a key agentd doesn't read parses at once, and one under `allowed-hosts` or
+`description` fails on its type. The name follows Claude Code's
+`[a-z0-9-]{1,64}` and can't be `agentctl`; the description has 1 to 1,024
+characters; `allowed-hosts` is a list or a comma-separated line of at most
+16 `HostRule`s, so `api.anthropic.com`, IP addresses and single labels are
+refused before the owner is asked. A skill may not declare a wildcard: a
+built-in list of public suffixes would always miss some (`*.github.io`,
+`*.herokuapp.com` and the rest of the Public Suffix List's private
+section), any agent's owner can add a skill, and naming each host costs a
+skill little within 16 entries. Hosts on a port other than 443 are named
+again in the reply that asks for confirmation. Error replies are fixed sentences that
+never repeat the content. An agent has at most 32 skills besides
+`agentctl`.
+
+### The bundled skill and the mount
+
+**Issue.** The bundled skill must always be present, and Docker refuses a
+bind mount whose source doesn't exist, while the runner's own tests start
+sessions for agents agentd never prepared.
+
+**Solution.** The pipeline writes `<data>/skills/<agent>/agentctl/SKILL.md`
+before every turn, next to the persona and with the same
+write-only-when-changed helper (`runner::write_if_changed`, which
+`write_persona` now uses), so an upgrade of agentd updates it. The runner
+sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
+directory exists as the container starts. Sandboxes mount the agent's
+skills directory itself (the process backend links it), so a skill added,
+replaced or removed changes in running sandboxes at once: a removal's
+`remove_dir_all` takes the files away from a running conversation too.
+What a running Claude Code has already loaded is up to it, so the replies
+say only that a conversation already running may not see the change until
+its process next starts, unlike a persona, which is read at start.
+
+### `skill add` reads its attachment like `persona`
+
+**Issue.** The plan has `skill add` take a `SKILL.md` or `.zip` attached in
+a manager DM, and the file passing it needs is T30's: `dm_command` returns
+the DM's files, the Slack inbound submits them with the command,
+`Commands::download` reads an attachment from either manager's DM, and
+`download_file` answers `TooLarge` past its limit
+([Files in the manager DM](#files-in-the-manager-dm)).
+
+**Solution.** `skill add` with no Git URL takes exactly one attachment
+through `Commands::download`, with its own caps (256 KB for a `.md`, 10 MB
+for a `.zip`), so it works in either manager DM as `persona` does. A file
+over the cap is refused with the limit, and a command without exactly one
+attachment, or one sent outside a manager DM, is told how to add a skill.
+
+### Skills reach the model only with the Skill tool
+
+**Issue.** The launch flags gave `--tools "Bash,Read,Edit,Write,Glob,Grep"`.
+Claude Code 2.1.285 lists the skills it finds in
+`$CLAUDE_CONFIG_DIR/skills` to the model only when the `Skill` tool is
+among the enabled tools; a probe against a fake API showed a mounted skill
+never appeared in the request without it. Every skill, the bundled
+`agentctl` one included, was mounted and never seen.
+
+**Solution.** `runner`'s `TOOLS`, and the design's launch flags, add
+`Skill`. A runner test fails if `--tools` lacks it, and the fakes and
+tests that spell the flags out follow.
+
+With `Skill` enabled, Claude Code also loads
+`$CLAUDE_CONFIG_DIR/commands/*.md` as commands, and `CLAUDE_CONFIG_DIR`
+(`sessions/<id>/claude`) is the session's to write, so an agent can plant
+commands that last for that session; that grants nothing new, since it can
+already write `CLAUDE.md` and `settings.json` there. Under
+`--setting-sources user` a project's `.claude/skills` and `CLAUDE.md` in
+the working directory are not loaded.
+
+### Commands always have skills
+
+**Issue.** `Commands` took its `Skills` through an optional
+`with_skills`, only so that tests could build one without it, which needed
+`Arc::make_mut` and a "not available" branch agentd never took.
+
+**Solution.** `Commands::new` takes the `Skills`. Tests that never run a
+skill command pass one over a data directory that doesn't exist, which
+nothing reads until a skill command runs.
+
+### Replacing a waiting skill drops the old one first
+
+**Issue.** `skill add` of a skill with hosts upserted the pending row (the
+new hosts and source) before moving the new files into
+`skills-pending/<agent>/<name>`. If that move failed, or agentd died in
+between, the owner got an error, not a prompt naming the new hosts, and a
+later `skill confirm` meant for the first prompt made the new hosts active
+on the old files. `confirm` also made active whatever pending row of the
+name it found at the end, which another instance could have replaced since
+`confirm` read it; and when that row was gone it removed the whole skill,
+an unrelated active version included. The sweeper could drop a pending row
+in the middle of a confirmation that began just before the hour was up.
+
+**Solution.** A pending add first deletes the name's pending row and
+removes its pending directory, then records the new row and moves the new
+files in, so a failure anywhere leaves either nothing waiting or a row
+without files, which `confirm` refuses. `Store::confirm_skill` takes the
+row `confirm` read and makes it active only while its hosts and `added_at`
+are unchanged, and `confirm` moves only files whose `SKILL.md` declares the
+row's hosts. Since every change to a name holds its lease ("One change at a
+time to each skill" below), both only guard against a lease that ran out
+mid-change. When the row can't be made active, `confirm` undoes its move:
+the files go back to the pending directory, and the active skill it set
+aside goes back into place. A test confirms a stale copy of the row
+(`added_at` a second earlier) while an active version exists: reverting the
+undo to removing the skill by name fails it. The sweeper drops pending rows
+`PENDING_TTL` plus one `SWEEP_INTERVAL` after they were added, while
+`confirm` still calls a skill expired after `PENDING_TTL`. A test replaces
+a waiting skill with one declaring another host while the pending directory
+can't be written, then confirms: before the fix the confirmation made the
+new host active.
+
+Startup's purge keeps both directories of a name that has a row in either
+state, so it no longer depends on a rename updating the moved directory's
+status change time. A pending directory an active add failed to remove is
+then left until the skill is next added or removed.
+
+### Tests stop the processes they hold
+
+**Issue.** Declaring `child` before `stdin` in `ClaudeProcess` and
+`ChildIo` stopped a drop from closing a process's input before killing
+it, but a drop still sends `SIGKILL` to a child `try_wait` reports as
+running. A child that is already exiting, as `fake-claude` is while it
+writes its coverage profile, can still be cut short and leave a truncated
+`.profraw`. Two runner tests dropped a warm `ClaudeProcess` at their end.
+
+**Solution.** Every test that holds a `ClaudeProcess` stops it before
+dropping it: `stop()` closes its stdin and waits up to `EXIT_GRACE`, so
+`fake-claude` exits on end of input and writes its whole profile. The
+runner reaps every exit it sees, a crash, a refused resume or a failed
+write, before the turn returns. What is left for a drop to kill is a
+warm process a `SessionManager` holds when a test ends, which waits for
+input and has nothing to write; the tests wait for the stops they start,
+and agentd's graceful drain for the turns in flight. A drain timeout or a
+second signal returns without waiting for the turns it cuts short, which
+run on in the runner's own tasks, so a test that cuts turns short calls
+`stop_all` on the sessions before it returns. `ProcessChild::drop` keeps
+killing at once: waiting there would block a runtime thread.
+
+### A stand-in `git` is written by a child process
+
+**Issue.** A `git` stand-in test wrote an executable script with
+`std::fs::write` and then ran it, while other tests in the agentd library
+binary spawn processes (`git` for fixture repositories, clones). A
+process forked during the write inherits the descriptor open for writing
+until it runs its own program, and running the script meanwhile fails with
+`ETXTBSY`, as the runner's tests did on aarch64.
+
+**Solution.** `stand_in` has `/bin/sh` write the script, so this binary
+never holds a descriptor open for writing it and none can be inherited.
+No lock is needed, in the tests or around production spawns. It is the
+agentd tests' only file written and then run.
+
+### One change at a time to each skill
+
+**Issue.** A skill's directories are keyed by agent and name, and a
+blue-green deploy runs two agentd processes over the same directories and
+store, so nothing ordered `skill add`, `skill confirm`, `skill rm` and the
+sweeper for one name, on one instance or across two. Each fix of one
+interleaving left another: the sweeper removed the files of a skill added
+again between its delete and its removal; a confirmation's cleanup deleted
+a row being added again, or one a second confirmation was confirming; a
+confirmation whose row was replaced meanwhile undid its move by removing
+the new row's files; two confirmations of different rows raced on the swap
+into the live directory, and could leave one skill's files under another's
+hosts. A confirmation the store failed (`SQLITE_BUSY`, say) returned before
+undoing its move, so the update's files stayed live under the old skill's
+row, and the old files were removed with the work directory.
+
+**Solution.** `skill_leases`, in the skills migration, holds one lease per
+agent and name (`lease_id`, `expires_at`). Every add (from recording the
+row to moving the files in, after the clone and the checks), confirmation,
+removal and expiry takes the lease for its moves and row writes, so one
+runs at a time per name across instances. `acquire_skill_lease` is one
+upsert that takes the row only if its lease has ended, like the volume
+locks', and returns a new `LeaseId`, which is the holder: the sandbox
+`instance` name isn't unique (both sides of a deploy may keep the default),
+and a fresh id per acquisition needs none. An add, confirmation or removal
+waits up to `LEASE_WAIT` (two seconds) for another change to finish, then
+answers that one is in progress and changes nothing; an add only gets there
+after its clone and checks, so a busy name costs the owner a clone. The
+sweeper doesn't wait, and tries that name again at its next sweep.
+
+`Skills::leased` takes the lease, runs the change and releases the lease in
+a spawned task that the command only awaits, and runs the change in a task
+of its own, so the lease is released whether it returns or panics. Commands
+still running at the drain timeout, or when shutdown is forced, are aborted
+(`tasks.shutdown()`), which is every blue-green cutover that catches one;
+before, that could stop a confirmation between its move and its row write
+and remove the old skill with its work directory. The spawned task outlives
+the command, and each holds a read guard on a lock in `Skills` that
+`Skills::drain` takes for writing: unless shutdown was forced, `serve`
+waits for them, for what is left of the drain timeout but at least
+`SKILL_DRAIN_FLOOR` (a second), before closing the store; a change that
+starts after the store closed fails before taking a lease. A change still
+running after that fails its next store call and undoes its move as on any
+store failure. When `serve` returns, the runtime drops the task at its next
+await; unlike a crash, that runs its work directory's guard, so a skill a
+confirmation had set aside there is removed rather than left for startup's
+purge, and the lease ends on its own.
+
+The final writes are fenced on the lease: `put_skill`, `delete_skill`,
+`delete_pending_skill_before` and `confirm_skill` take the `LeaseId` and
+first check, inside their `BEGIN IMMEDIATE` transaction, that
+`skill_leases` holds it unexpired at the write's time, failing with
+`StoreError::SkillLeaseLost` otherwise; holding the write lock, no other
+instance can take the lease over before the transaction ends. A
+confirmation fenced out after its move doesn't undo it: whoever holds the
+lease now owns the name, and putting the old skill back could put it under
+their row, so the files stay as a crash would leave them, for the roll
+forward below. `LEASE_TTL` is two minutes: a change makes two store calls,
+each of which may wait the pool's 30-second acquire timeout and then the
+5-second busy timeout, about 70 seconds at worst, and a lease a crash left
+keeps the name busy for those two minutes. The sweeper deletes ended
+leases, so names nothing changes again don't keep rows.
+
+With changes serialized, `confirm` reads the pending `SKILL.md` in place
+and moves the directory straight into the live one; the move into a work
+directory, the inode check and the put-back of files a newer add replaced
+are gone, as is the sweeper's check for a skill added again, since the
+sweeper now deletes one name's expired row and removes its files under the
+name's lease (`delete_pending_skill_before`, which only deletes a row still
+older than the cutoff). `skill confirm` still never deletes a row: one that
+expired answers that it waited too long and stays for the sweeper, which
+drops it `PENDING_TTL` plus one to two `SWEEP_INTERVAL`s after it was
+added, and files that aren't waiting answer that nothing waits. When the
+row can't be made active, whether the row changed or the store failed,
+`confirm` puts its files back in the pending directory and the skill they
+replaced back into place before answering or returning the error. Files
+that can't go back move into the work directory instead, whose guard
+removes them; restoring the old skill is tried either way, and fails only
+if the files can't leave the live directory at all, when the old skill goes
+with the work directory. `move_into` logs a skill it set aside and couldn't
+move back. A test fails `confirm_skill` with a trigger and checks the old
+skill, its row and hosts, and the waiting files.
+
+What's left is a crash, agentd exiting, a cut-off change or a lapsed lease
+between a change's steps. A confirmation stopped after setting the live
+skill aside and before moving the new files in leaves no live files under
+the old row, and the next confirmation moves the waiting files in. One
+stopped after the move and before its row write leaves the update's files
+live under the old row and the pending directory empty. `agent_skills` now
+records a `digest` of each skill's files as added (SHA-256 over every
+file's path and bytes, which the package limits keep small), and the next
+`confirm` finishes such a confirmation, making the pending row active when
+its pending directory is absent and the live tree's digest is the row's.
+Only the owner's `confirm` does that, since it is consent to the pending
+row's hosts at that moment: the sweeper drops an expiring row as ever, and
+the grant check denies the live files the active row doesn't match. A
+sweeper that finished them could grant hosts nobody confirmed: a
+confirmation whose lease lapsed before its move can move a newer add's
+files in, and is then fenced out without undoing it. Matching the whole
+tree, not just the hosts, keeps a lost pending directory next to an active
+skill that declares the same hosts from recording an update that never
+arrived. One stopped in the middle of undoing its move can leave the old
+row without live files. Whatever a failed add or removal leaves, startup's
+purge removes. Purge takes no lease, so it still keeps both directories of
+a name with a row and leaves anything changed within `STALE_AFTER`, since
+the other side of a deploy may be mid-move or mid-clone. A pending
+directory `drop_expired` can't remove is logged; never mounted, it stays on
+disk until startup's purge if no row has the name, or else, since purge
+keeps every directory of a name with a row, until the name is next added or
+removed.
+
+File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
+row, and its release logs that the lease ran out, but its moves still
+happen: `skill rm` whose lease lapses after its row delete can remove a
+successor's files, and an add's or confirmation's move can land after a
+successor's.
+
+### Hosts are checked against the files in use
+
+**Issue.** Each fix to the lease, the undo and the order of the steps
+closed one way for a row's hosts to cover files that don't declare them,
+and reviews kept finding another: a crash, a cut-off change, or a move
+landing after a lapsed lease can leave any files under any active row.
+
+**Solution.** The grant itself checks. `SkillHosts` holds `Skills`, and
+`Skills::granted_hosts` reads the session's agent's active skills that
+declare hosts (`Store::active_skills_for_session`, which replaced
+`skill_hosts_for_session`) and grants each one's hosts only while its live
+`SKILL.md` declares exactly those hosts, parsed as `confirm` parses it. A
+skill whose files declare others, or are missing or unreadable, grants
+none, warned about with the agent, the skill and the counts at most once a
+minute per skill (`MISMATCH_WARN_INTERVAL`, through the `Throttle` the
+public listener's refusal warnings now share), the rest at debug level. It
+runs at each `CONNECT` the configured allowlist doesn't already allow, and
+reads only the front matter of each active skill with hosts: the first
+`MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines among
+them, parsed with `parse_skill_file`. That constant is now the whole front
+matter's budget, a byte-order mark and both `---` lines with their trailing
+whitespace counted, not just the YAML's: a closing line padded with spaces
+passed the add's check and then failed the bounded read, so a skill could
+be added and never confirmed. With one budget, every file the add accepts
+reads the same at confirmation and at the grant. Whatever the disk holds,
+hosts never cover files that don't declare them; the lease, the order of
+the steps and the undo only keep rows and files matching, so that what the
+owner confirmed stays usable.
+
+The check compares the row's hosts, which `host_names` wrote at add time
+from `parse_skill_file` and `HostRule`'s `Display`, with what the same code
+gives for the files today. A change to how either normalizes a host must
+migrate the stored rows, or existing skills stop matching and lose their
+hosts: the check fails closed.
+
 ## T26: Requester-pays routing
 
 ### The community key lives in one sealed row, read on every request
@@ -6372,7 +6846,7 @@ does. `dm_command` passes the DM's files with the command, and
 `Commands::download` reads a file attached in either manager DM with that
 surface's manager credentials, so `persona` takes a `persona.md` on Slack
 under the same 64 KB cap. A slash command carries no files. `skill add`
-(T25) isn't in this stack yet; it can use the same download.
+(T25) reads its attachment with the same download.
 
 ### The manager's events URL before its secret is set
 

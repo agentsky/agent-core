@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn only_the_given_tools_are_named() {
         let value = |text: &str| Value::String(text.to_owned());
-        for tool in ["Bash", "Read", "Edit", "Write", "Glob", "Grep"] {
+        for tool in ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "Skill"] {
             assert_eq!(tool_name(Some(&value(tool))), tool);
         }
         for other in ["bash", "Task", "sk-ant-api03-secret", "", "Bash,Read"] {

@@ -164,6 +164,7 @@ async fn a_crash_then_a_resume() {
         "a new process counts its cost from 0"
     );
     assert_eq!(h.transcript_user_messages(), ["one", "two", "three"]);
+    resumed.stop().await;
 }
 
 #[tokio::test]
@@ -212,6 +213,7 @@ async fn a_timeout_kills_the_process_and_fails_the_turn() {
     let mut resumed = h.start(h.launch(SessionStart::Resume)).await;
     let result = finished(resumed.send_turn("three").await.unwrap());
     assert_eq!(result.result.as_deref(), Some("resumed"));
+    resumed.stop().await;
 }
 
 #[tokio::test]

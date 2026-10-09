@@ -6,7 +6,7 @@
 //!   back through its `response_url`.
 //! - A direct message to the manager app (`message.im`), parsed as a whole,
 //!   as on Rocket.Chat. Its reply goes to the same DM, and the files
-//!   attached to it go with the command, for `persona`.
+//!   attached to it go with the command, for `persona` and `skill add`.
 //! - A `user_change` event whose user is `deleted`: the member left the
 //!   workspace, and their configuration token for it is deleted.
 //!
@@ -44,7 +44,7 @@ pub fn slash_command(command: SlashCommand) -> Option<(MemberKey, String, Origin
 /// The member, command text, origin and attached files of a direct message
 /// to the manager app, which `manager` is; `None` for a message from a bot
 /// or the manager itself, or one that isn't in a one-to-one DM. The files
-/// feed `persona`.
+/// feed `persona` and `skill add`.
 pub fn dm_command(
     event: &InboundEvent,
     manager: &ManagerIdentity,

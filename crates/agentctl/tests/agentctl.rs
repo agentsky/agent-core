@@ -1161,7 +1161,7 @@ fn fake_claude(
             "stream-json",
             "--verbose",
             "--tools",
-            "Bash,Read,Edit,Write,Glob,Grep",
+            "Bash,Read,Edit,Write,Glob,Grep,Skill",
             "--strict-mcp-config",
             "--setting-sources",
             "user",

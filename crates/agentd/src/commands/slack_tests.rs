@@ -70,6 +70,7 @@ fn ok(body: Value) -> ResponseTemplate {
 
 struct SlackHarness {
     store: Store,
+    data: TempDir,
     commands: Commands,
     slack: MockServer,
     manager: SlackManager,
@@ -122,15 +123,20 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
         identity(),
     );
     let replies = Replies::new(None).with_slack(Arc::new(manager.manager_bot()), client);
+    let data = TempDir::new("agentd-slack");
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(store.clone(), data.path().to_owned(), git);
     let commands = Commands::new(
         store.clone(),
         Arc::clone(&auth),
         replies,
         None,
         Some(manager.clone()),
+        skills,
     );
     SlackHarness {
         store,
+        data,
         commands,
         slack,
         manager,
@@ -485,7 +491,9 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
             .await
             .unwrap();
     let auth = Arc::new(Auth::new(OAuthConfig::default(), store.clone()).unwrap());
-    let commands = Commands::new(store, auth, Replies::default(), None, None);
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let skills = crate::skills::Skills::new(store.clone(), "/nonexistent/agentd".into(), git);
+    let commands = Commands::new(store, auth, Replies::default(), None, None, skills);
     let (reply, _) = commands
         .run(
             &slack_key("U0HUMAN01"),
@@ -1515,6 +1523,114 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     logs.snapshot()
         .assert_has("couldn't store a checked configuration token");
     global_logs().snapshot().assert_lacks("SECRET");
+}
+
+#[tokio::test]
+async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
+    let h = slack_harness().await;
+    let data = &h.data;
+    let commands = h.commands.clone();
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let skill = "---\nname: notes\ndescription: Keep notes.\n---\nWrite them down.\n";
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F1/download/SKILL.md"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            format!("Bearer {BOT_TOKEN}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(skill))
+        .mount(&h.slack)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/files-pri/T0TEAM001-F2/download/persona.md"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("You are brief.\n"))
+        .mount(&h.slack)
+        .await;
+    let file = |id: &str, name: &str, size: usize| core_types::InFile {
+        id: id.into(),
+        name: name.into(),
+        mime_type: None,
+        size: Some(u64::try_from(size).unwrap()),
+        url: format!("{}/files-pri/T0TEAM001-{id}/download/{name}", h.slack.uri()),
+    };
+    let dm = Origin::SlackDm {
+        channel: "D0DM00001".into(),
+    };
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("skill add helper").unwrap(),
+            &dm,
+            &[file("F1", "SKILL.md", skill.len())],
+        )
+        .await;
+    assert_eq!(
+        reply,
+        "Added the skill `notes` to `helper`. Its files are in its sandboxes now, though a \
+         conversation already running may not use it until it next starts."
+    );
+    let installed = runner::skills_dir(data.path(), agent.id).join("notes/SKILL.md");
+    assert_eq!(std::fs::read_to_string(installed).unwrap(), skill);
+
+    let too_big = file("F3", "SKILL.md", 10 * 1024 * 1024);
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("skill add helper").unwrap(),
+            &dm,
+            &[too_big],
+        )
+        .await;
+    assert_eq!(reply, "That file is over the 256 KB limit.");
+
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("persona helper").unwrap(),
+            &dm,
+            &[file("F2", "persona.md", 15)],
+        )
+        .await;
+    assert!(reply.starts_with("Replaced `helper`'s persona."), "{reply}");
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "You are brief.\n");
+
+    let (response_url, _) = h.response_url();
+    let (reply, _) = commands
+        .run(
+            &slack_key("U0HUMAN01"),
+            commands::parse("skill add helper").unwrap(),
+            &Origin::SlackSlash {
+                response_url,
+                conv: slack_channel("C0CHAN001"),
+            },
+            &[file("F1", "SKILL.md", skill.len())],
+        )
+        .await;
+    assert!(
+        reply.starts_with("Give the skill's https:// Git URL"),
+        "a slash command carries no files: {reply}"
+    );
 }
 
 #[tokio::test]

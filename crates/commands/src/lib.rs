@@ -196,6 +196,14 @@ pub enum SkillCommand {
         /// the message.
         source: Option<String>,
     },
+    /// `skill confirm <name> <skill>`: adds a skill that `skill add` held
+    /// back because it asks to reach hosts, with those hosts.
+    Confirm {
+        /// The agent.
+        name: AgentName,
+        /// The skill waiting for confirmation.
+        skill: SkillName,
+    },
     /// `skill rm <name> <skill>`.
     Rm {
         /// The agent.
@@ -287,6 +295,7 @@ impl Command {
             Command::Create { .. } => "create",
             Command::Persona { .. } => "persona",
             Command::Skill(SkillCommand::Add { .. }) => "skill add",
+            Command::Skill(SkillCommand::Confirm { .. }) => "skill confirm",
             Command::Skill(SkillCommand::Rm { .. }) => "skill rm",
             Command::Allow { .. } => "allow",
             Command::Deny { .. } => "deny",
