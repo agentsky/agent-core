@@ -463,6 +463,16 @@ Claude Code's, not a published contract. Switching the model
 over the stream-json control channel instead of restarting is a later
 optimization.
 
+A warm container serves one requester. A background process a turn leaves
+running survives in the container, and each turn points the placeholder at its
+own credential and authorizes the agentctl token for itself, so a process left
+from one requester's turn could spend the next requester's credential or act
+through `agentctl` while their turn runs. The runner therefore stops the
+container, which ends every process in it, and starts another, resuming from
+the transcript, when the next turn's requester differs from the one whose turn
+started it. An agent-to-agent hop inherits its requester, so it keeps the
+container.
+
 `claude` runs as a non-root user in the image. On Linux the CLI refuses
 `bypassPermissions` as root or under sudo outside a recognized
 sandbox[^cc-bypass].
