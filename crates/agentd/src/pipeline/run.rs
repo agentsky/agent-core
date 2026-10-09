@@ -2321,7 +2321,7 @@ impl Handing {
     /// Whether `agent` has a place among the turn's [`MAX_HAND_OFFS`],
     /// with the agents handed to and those in `also`: an agent the turn
     /// asks always has one, and any other only when one is left besides
-    /// those the asked agents not handed to yet keep.
+    /// those the asked agents neither handed to nor passed over yet keep.
     fn has_place(&self, agent: AgentId, also: &[Agent]) -> bool {
         if self.asked.contains(&agent) {
             return true;
@@ -2329,7 +2329,11 @@ impl Handing {
         let kept = self
             .asked
             .iter()
-            .filter(|asked| !self.handed_to(**asked) && also.iter().all(|seen| seen.id != **asked))
+            .filter(|asked| {
+                !self.handed_to(**asked)
+                    && !self.passed.contains(asked)
+                    && also.iter().all(|seen| seen.id != **asked)
+            })
             .count();
         self.handed.len() + also.len() + kept < MAX_HAND_OFFS
     }
@@ -2653,11 +2657,14 @@ impl Delivery<'_> {
         }
     }
 
-    /// The managed agents `posted` mentions whose bot is active on the
-    /// conversation's surface and team, other than the poster and the
-    /// agents handed to or passed over already, each once: those with a
+    /// The managed agents `posted` mentions, other than the poster and the
+    /// agents handed to or passed over already, each once: those whose bot
+    /// is active on the conversation's surface and team and that have a
     /// place among the turn's [`MAX_HAND_OFFS`] ([`Handing::has_place`]),
-    /// and those past them.
+    /// and those to pass over. A mention is of an agent when any of its
+    /// bots, in any state, is the user mentioned, as the router reads it,
+    /// so an agent mentioned through a bot that isn't active is passed
+    /// over, and its hop claimed, rather than left for the platform's copy.
     ///
     /// # Errors
     ///
@@ -2676,26 +2683,31 @@ impl Delivery<'_> {
                 team: target.conv.team.clone(),
                 user: user.clone(),
             };
-            if let Some((agent, _)) = self.store.agent_for_bot(&key).await?
-                && agent.id != self.agent
-                && !handing.handed_to(agent.id)
-                && !handing.passed.contains(&agent.id)
-                && mentioned.iter().all(|seen| seen.id != agent.id)
-                && !over.contains(&agent.id)
+            let Some(id) = self.store.agent_of_bot_user(&key).await? else {
+                continue;
+            };
+            if id == self.agent
+                || handing.handed_to(id)
+                || handing.passed.contains(&id)
+                || mentioned.iter().any(|seen| seen.id == id)
+                || over.contains(&id)
             {
-                if handing.has_place(agent.id, &mentioned) {
+                continue;
+            }
+            match self.store.agent_for_bot(&key).await? {
+                Some((agent, _)) if agent.id == id && handing.has_place(id, &mentioned) => {
                     mentioned.push(agent);
-                } else {
-                    over.push(agent.id);
                 }
+                _ => over.push(id),
             }
         }
         Ok((mentioned, over))
     }
 
     /// Claims the hops from `turn` to the agents `over`, which `msg`
-    /// mentions past the turn's [`MAX_HAND_OFFS`], before `msg`'s row is
-    /// recorded: the platform's copy of `msg` takes a hop only once that
+    /// mentions but the turn doesn't hand off to, past its
+    /// [`MAX_HAND_OFFS`] or through a bot that isn't active, before
+    /// `msg`'s row is recorded: the platform's copy of `msg` takes a hop only once that
     /// row is there, and then finds these claimed. Each agent claimed goes
     /// in `handing`'s passed, so a later chunk neither claims it again nor
     /// gives it a place whose hop could never run. Returns false when a
@@ -2709,7 +2721,7 @@ impl Delivery<'_> {
         msg: &MsgRef,
         handing: &mut Handing,
     ) -> bool {
-        tracing::info!(agent = %self.agent, %turn, msg = %msg.id, ?over, "a post mentions more agents than its turn hands off to; not handing it to these");
+        tracing::info!(agent = %self.agent, %turn, msg = %msg.id, ?over, "a post mentions agents its turn doesn't hand off to; not handing it to these");
         for agent in over {
             if let Err(err) = self
                 .store
@@ -2927,6 +2939,21 @@ mod tests {
     /// An agent of a new owner whose bot, `bot`, is active on Slack's team
     /// `T1`.
     async fn bot_agent(store: &Store, name: &str, bot: &str) -> (AgentId, BindingId) {
+        let (agent, binding) = inactive_bot_agent(store, name, bot).await;
+        store
+            .activate_binding(
+                binding,
+                &secrecy::SecretString::from("t"),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        (agent, binding)
+    }
+
+    /// An agent of a new owner whose bot, `bot`, on Slack's team `T1`,
+    /// isn't active.
+    async fn inactive_bot_agent(store: &Store, name: &str, bot: &str) -> (AgentId, BindingId) {
         let now = OffsetDateTime::now_utc();
         let owner = store
             .ensure_member(
@@ -2960,10 +2987,6 @@ mod tests {
         };
         store
             .set_binding_bot_user(binding, &bot.into(), name)
-            .await
-            .unwrap();
-        store
-            .activate_binding(binding, &secrecy::SecretString::from("t"), now)
             .await
             .unwrap();
         (agent.id, binding)
@@ -3262,6 +3285,25 @@ mod tests {
             "the agent the turn asks keeps its place from the mentions before its task"
         );
         assert_eq!(claimed(&everyone, turn).await, unasked[MAX_HAND_OFFS - 1..]);
+
+        let (ghost, _) = inactive_bot_agent(&store, "ghost", "U5").await;
+        surface.name_user("U5", core_types::UserId::from("U5"));
+        let turn = TurnId::new_v4();
+        let mut handing = Handing::default();
+        assert!(
+            delivery
+                .post(Some(turn), "@U5 @U2 both of you", &mut handing)
+                .await
+                .complete()
+        );
+        let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
+        assert_eq!(handed, [writer]);
+        assert_eq!(
+            claimed(&[ghost, writer], turn).await,
+            [ghost],
+            "an agent mentioned through a bot that isn't active is passed over, so the router, \
+             which reads that bot as the agent's, finds its hop claimed"
+        );
     }
 
     #[test]

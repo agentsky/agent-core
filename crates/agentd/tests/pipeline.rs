@@ -3159,14 +3159,15 @@ async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_mo
     let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
         .await
         .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER claimed_after_the_row BEFORE INSERT ON processed_events \
+    sqlx::raw_sql(
+        "CREATE TABLE late_claims (event_id TEXT NOT NULL); \
+         CREATE TRIGGER claimed_after_the_row BEFORE INSERT ON processed_events \
          WHEN NEW.source = 'hop' \
          AND EXISTS (SELECT 1 FROM message_refs WHERE platform_ref = 'm1') \
          AND NOT EXISTS (SELECT 1 FROM processed_events p \
              WHERE p.source = NEW.source AND p.event_id = NEW.event_id) \
          AND NOT EXISTS (SELECT 1 FROM hand_offs h WHERE NEW.event_id LIKE h.agent_id || '/%') \
-         BEGIN SELECT RAISE(ABORT, 'a hop no hand-off holds was first claimed after its post was recorded'); END",
+         BEGIN INSERT INTO late_claims (event_id) VALUES (NEW.event_id); END;",
     )
     .execute(&mut db)
     .await
@@ -3175,26 +3176,15 @@ async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_mo
     stack.next_turn(Turn::reply(reply));
     let gate = Gate::closed();
     stack.holds.posts_of(reply, &gate);
-    let copy = tokio::spawn({
-        let (pipeline, post) = (
-            stack.pipeline.clone(),
-            stack.agents_post(BOT, first, "c1", &bots),
-        );
-        async move { pipeline.handle(post, MockSurface::DEFAULT_CAPS).await }
-    });
-    stack
-        .pipeline
-        .sink(MockSurface::DEFAULT_CAPS)
-        .send(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
         .await
         .unwrap();
     wait_until("helper's reply waits to be posted", || gate.waiting() == 1).await;
-    assert!(
-        !copy.is_finished(),
-        "the platform's copy, which arrived before the post, waits for its attribution"
-    );
+    sink.send(stack.agents_post(BOT, first, "c1", &bots))
+        .await
+        .unwrap();
     gate.open();
-    copy.await.unwrap();
     let unreacted = Call::Unreact {
         msg: msg("GENERAL", "c1"),
         emoji: "hourglass".into(),
@@ -3207,10 +3197,6 @@ async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_mo
     stack.pipeline.drain().await;
     let sent = posts(&stack.mock.calls());
     assert_eq!(sent[0].2.id.as_str(), first);
-    assert!(
-        !sent.iter().any(|(_, text, _)| text == DELIVERY_FAILED_TEXT),
-        "the passed-over hops were claimed before the post's row was there"
-    );
     let mut ran = Vec::new();
     for agent in &agents {
         ran.push(stack.writers_hops(*agent).await);
@@ -3221,6 +3207,18 @@ async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_mo
     assert_eq!(
         ran, expected,
         "the first agents the post mentions run its hop, and the platform's copy runs no other"
+    );
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    let late: Vec<(String,)> = sqlx::query_as("SELECT event_id FROM late_claims")
+        .fetch_all(&mut db)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    assert!(
+        late.is_empty(),
+        "every hop no hand-off holds was claimed before the post's row was there: {late:?}"
     );
     stack.stop().await;
 }

@@ -8760,9 +8760,24 @@ over and claimed are kept in `Handing::passed`: a later post neither
 claims them again nor gives one of them a place whose hop, claimed
 already, could never run, which a claim that succeeded for one agent
 before another's failed would otherwise do. A test pins the claim before
-the row: the platform's copy arrives first and waits for the
-attribution, and a trigger aborts a passed-over agent's claim first
-inserted once the post's row exists.
+the row: the platform's copy is queued while the post is still held, so
+it waits for the attribution, and a trigger records, in a table the test
+asserts is empty, any hop claim first inserted once the post's row
+exists for an agent no `hand_offs` row holds. It only records, so the
+code under test still decides: without `pass_over` the copy runs the
+passed-over agent and the test's hops fail, and with `pass_over` after
+the row the late claim is recorded.
+
+A later review found the delivery and the router reading a mention
+differently: `mentioned` looked agents up by an active bot
+(`agent_for_bot`), while the router's `mentions` takes a bot in any
+state as its agent's (`agent_of_bot_user`). On Rocket.Chat, where
+`candidates` also adds the thread root's poster, a post mentioning an
+agent's old, inactive bot in a thread that agent started let the
+platform's copy run it as a hand-off the cap never counted.
+`mentioned` now reads a mention as the router does, and an agent
+mentioned through a bot that isn't active is passed over, its hop
+claimed.
 
 ### A chunk posted but not recorded
 
@@ -8780,8 +8795,12 @@ to make was recorded with them, and otherwise says
 `DELIVERY_FAILED_TEXT`. A chunk that hands off to no one and can't be
 recorded is only logged: the person saw all of it, and a line saying
 part was lost would only have them pay for the turn again; what it loses
-is a short id. A reply posted after a failed upload may still say it
-attached the file; the failure line follows it. A private task's outcome
+is a short id. That goes for a private task's result too: the thread
+saw it, but without its row `consent_posted` can't tell it was posted,
+so if agentd stops before the task's work is finished, the next attempt
+says the task was interrupted rather than finishing quietly. A reply
+posted after a failed upload may still say it attached the file; the
+failure line follows it. A private task's outcome
 (`tell_thread`) needs only `posted`: its record is what `consent_posted`
 reads to mark the outcome posted, so treating an unrecorded outcome as
 unposted would post it again on each retry.
