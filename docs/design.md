@@ -583,6 +583,16 @@ Claude Code's, not a published contract. Switching the model
 over the stream-json control channel instead of restarting is a later
 optimization.
 
+A warm container serves one requester. A background process a turn leaves
+running survives in the container, and each turn points the placeholder at its
+own credential and authorizes the agentctl token for itself, so a process left
+from one requester's turn could spend the next requester's credential or act
+through `agentctl` while their turn runs. The runner therefore stops the
+container, which ends every process in it, and starts another, resuming from
+the transcript, when the next turn's requester differs from the one whose turn
+started it. An agent-to-agent hop inherits its requester, so it keeps the
+container.
+
 `claude` runs as a non-root user in the image. On Linux the CLI refuses
 `bypassPermissions` as root or under sudo outside a recognized
 sandbox[^cc-bypass].
@@ -1382,7 +1392,7 @@ for Rocket.Chat bindings.
 | Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and only after a consent card unless the owner asked for it in their own one-to-one DM with the agent: a channel or group-DM turn reads text anyone can write, even when the owner started it. Persona prompt treats others' text as data. |
 | Leaked placeholder token | One per CLI process and container, bound to the container's network identity, revoked when the container is reaped, swapped only for the configured upstream header of its own kind. |
 | One session reads another session's placeholder or `agentctl` token | One container per session, so sessions share neither a PID namespace nor process environments. Tokens are bound to their container. |
-| One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. |
+| One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. A container serves one requester: another requester's turn gets a new one, which ends every process an earlier turn left running. |
 | Agent-to-agent hops billed to the wrong person | A hop inherits the requester of the turn that posted the mention. Mentions from unmanaged bots are ignored. |
 | Private task leaks the owner's DM context to a non-owner | Each private task runs in a fresh session. Only the consented task text and explicit attachments cross in, only the reply and attachments cross out. Private tasks cannot call `ask-agent` or `private`. |
 | A pending consent holds resources | `agentctl private` returns at once. The channel turn ends, and the result is posted later as a new message. Unanswered cards expire. |
