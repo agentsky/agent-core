@@ -111,7 +111,9 @@ pub const LEASE_WAIT: Duration = Duration::from_secs(2);
 /// How often a change waiting for a skill's lease tries again.
 const LEASE_RETRY: Duration = Duration::from_millis(100);
 /// How often a skill whose files in use don't declare its hosts is warned
-/// about; the denials between are logged at debug level, and counted.
+/// about; the denials between are logged at debug level, and counted while
+/// the [`Throttle`] has room for the skill
+/// ([`MAX_THROTTLE_KEYS`](core_types::throttle::MAX_THROTTLE_KEYS)).
 pub const MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Writes the bundled skill into `agent`'s skills directory under
