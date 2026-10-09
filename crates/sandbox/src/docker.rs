@@ -564,9 +564,18 @@ impl Sandbox for DockerSandbox {
         };
         let (reader, mut writer) = tokio::io::duplex(64 * 1024);
         let (pid_tx, pid_rx) = watch::channel(None);
+        let id = container.id.clone();
         let pump = tokio::spawn(async move {
             let mut splitter = PidSplitter::default();
-            while let Some(Ok(item)) = output.next().await {
+            while let Some(item) = output.next().await {
+                let item = match item {
+                    Ok(item) => item,
+                    Err(err) => {
+                        let error = docker_err("read exec output", false)(err);
+                        tracing::warn!(container = %id, %error, "the exec's output stream failed; ending its stdout");
+                        break;
+                    }
+                };
                 let LogOutput::StdOut { message } = item else {
                     continue;
                 };

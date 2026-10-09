@@ -89,16 +89,6 @@ pub struct CtlTurn {
     pub trigger: Option<MessageId>,
 }
 
-/// A lease on a volume's `shared/` lock, as
-/// [`Store::acquire_scope_lock`] grants it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScopeLease {
-    /// The lease, to renew and release.
-    pub lease: LeaseId,
-    /// When it runs out unless renewed.
-    pub expires_at: OffsetDateTime,
-}
-
 /// What [`Store::purge_ctl`] deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CtlPurged {
@@ -205,36 +195,48 @@ fn ttl_seconds(ttl: Duration) -> i64 {
 impl Store {
     /// Stores the token of a new `claude` process, with no turn running.
     ///
-    /// A session runs one process at a time, so a token already stored for
-    /// the same session is deleted in the same transaction: the newest
-    /// process's token is the only one that works. The session's leases go
-    /// with the old token, whose process can no longer renew them. Returns
-    /// the digests of the tokens it replaced.
+    /// A session runs one process at a time, and a container address holds
+    /// one container at a time, so every token already stored for the same
+    /// session or the same `container_ip` is deleted in the same
+    /// transaction: the newest process's token is the only one that works
+    /// for its session and from its address. A token whose revocation failed
+    /// when its container stopped can't be presented from a new container
+    /// Docker gives the address to. The leases of the replaced tokens'
+    /// sessions go with them, since their processes can no longer renew
+    /// them. Returns the digests of the tokens it replaced.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, including when `hash` is
     /// already stored.
     pub async fn put_ctl_token(&self, token: &NewCtlToken) -> Result<Vec<TokenHash>> {
+        let session = token.session.to_string();
+        let container_ip = token.container_ip.to_canonical().to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query("DELETE FROM scope_locks WHERE holder_session = ?")
-            .bind(token.session.to_string())
-            .execute(&mut *tx)
-            .await?;
-        let replaced: Vec<Vec<u8>> =
-            sqlx::query_scalar("DELETE FROM ctl_tokens WHERE session_id = ? RETURNING hash")
-                .bind(token.session.to_string())
-                .fetch_all(&mut *tx)
-                .await?;
+        sqlx::query(
+            "DELETE FROM scope_locks WHERE holder_session = ? OR holder_session IN \
+             (SELECT session_id FROM ctl_tokens WHERE container_ip = ?)",
+        )
+        .bind(&session)
+        .bind(&container_ip)
+        .execute(&mut *tx)
+        .await?;
+        let replaced: Vec<Vec<u8>> = sqlx::query_scalar(
+            "DELETE FROM ctl_tokens WHERE session_id = ? OR container_ip = ? RETURNING hash",
+        )
+        .bind(&session)
+        .bind(&container_ip)
+        .fetch_all(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO ctl_tokens (hash, session_id, agent_id, volume_key, container_ip) \
              VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&token.hash.0[..])
-        .bind(token.session.to_string())
+        .bind(&session)
         .bind(token.agent.to_string())
         .bind(token.volume.to_string())
-        .bind(token.container_ip.to_canonical().to_string())
+        .bind(&container_ip)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -354,17 +356,26 @@ impl Store {
     }
 
     /// Takes the `shared/` lock of the volume of the token with digest
-    /// `token` for its session, under a new lease until `now + ttl`, if
-    /// `turn` is still the token's turn and no unexpired lease holds the
-    /// lock. Returns `None` otherwise, whichever session the lease holding
-    /// it belongs to, the token's own included.
+    /// `token` for its session, under `lease` until `now + ttl`, if `turn`
+    /// is still the token's turn and either no unexpired lease holds the
+    /// lock or the session already holds it under `lease`, which is then
+    /// extended. Returns the new expiry, or `None`, changing nothing,
+    /// otherwise: another lease holds the lock, whichever session it
+    /// belongs to, the token's own included, or `lease` names a lease of
+    /// another session or volume.
+    ///
+    /// The caller picks `lease`, so an acquire it retries after losing the
+    /// answer gets back the lease an earlier attempt was granted.
     ///
     /// It is one statement: an insert, from the token's row only while it
     /// records `turn`, that on the volume's unique key takes over the
-    /// existing row only if it has expired. So an acquire authorized under a
-    /// turn that has since been replaced or ended grants nothing, even when
-    /// it lands after [`set_ctl_turn`](Self::set_ctl_turn) deleted the
-    /// session's leases. Times are whole seconds, and `ttl` is at least one.
+    /// existing row only if it has expired or is the same session's under
+    /// `lease`, and never when `lease` names another volume's row, which
+    /// it leaves alone rather than failing on the lease's own key. So an
+    /// acquire authorized under a turn that has since been replaced or ended
+    /// grants nothing, even when it lands after
+    /// [`set_ctl_turn`](Self::set_ctl_turn) deleted the session's leases.
+    /// Times are whole seconds, and `ttl` is at least one.
     ///
     /// # Errors
     ///
@@ -373,19 +384,23 @@ impl Store {
         &self,
         token: &TokenHash,
         turn: TurnId,
+        lease: LeaseId,
         now: OffsetDateTime,
         ttl: Duration,
-    ) -> Result<Option<ScopeLease>> {
-        let lease = LeaseId::new_v4();
+    ) -> Result<Option<OffsetDateTime>> {
         let now = to_unix(now);
         let expires_at = now.saturating_add(ttl_seconds(ttl));
-        let granted: Option<String> = sqlx::query_scalar(
+        let granted: Option<i64> = sqlx::query_scalar(
             "INSERT INTO scope_locks (lease_id, volume_key, holder_session, expires_at) \
              SELECT ?, volume_key, session_id, ? FROM ctl_tokens WHERE hash = ? AND turn_id = ? \
              ON CONFLICT (volume_key) DO UPDATE SET lease_id = excluded.lease_id, \
              holder_session = excluded.holder_session, expires_at = excluded.expires_at \
-             WHERE scope_locks.expires_at <= ? \
-             RETURNING lease_id",
+             WHERE (scope_locks.expires_at <= ? OR (scope_locks.lease_id = excluded.lease_id \
+             AND scope_locks.holder_session = excluded.holder_session)) \
+             AND NOT EXISTS (SELECT 1 FROM scope_locks AS other \
+             WHERE other.lease_id = excluded.lease_id AND other.volume_key <> excluded.volume_key) \
+             ON CONFLICT DO NOTHING \
+             RETURNING expires_at",
         )
         .bind(lease.to_string())
         .bind(expires_at)
@@ -394,13 +409,9 @@ impl Store {
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        match granted {
-            None => Ok(None),
-            Some(granted) => Ok(Some(ScopeLease {
-                lease: parse_column(&granted, LOCKS, "lease_id")?,
-                expires_at: from_unix(expires_at, LOCKS, "expires_at")?,
-            })),
-        }
+        granted
+            .map(|at| from_unix(at, LOCKS, "expires_at"))
+            .transpose()
     }
 
     /// Extends `lease` to `now + ttl`, if `turn` is still the turn of the
@@ -490,7 +501,7 @@ mod tests {
             session,
             agent,
             volume: volume(agent),
-            container_ip: "172.30.0.7".parse().unwrap(),
+            container_ip: IpAddr::from([172, 30, 0, byte]),
         }
     }
 
@@ -591,16 +602,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_new_token_from_an_address_replaces_the_one_bound_to_it() {
+        let store = memory_store().await;
+        let address: IpAddr = "172.30.0.7".parse().unwrap();
+        let key = volume(AgentId::new_v4());
+        let stale = NewCtlToken {
+            volume: key.clone(),
+            container_ip: address,
+            ..new_token(1, SessionId::new_v4())
+        };
+        let other = new_token(3, SessionId::new_v4());
+        store.put_ctl_token(&stale).await.unwrap();
+        store.put_ctl_token(&other).await.unwrap();
+        let holder = Holder::begin(&store, stale.hash).await;
+        holder.acquire(&store, 1_000).await.unwrap();
+        let probe = Holder::new(&store, 4, &key).await;
+        assert!(!free(&store, probe).await);
+
+        let fresh = NewCtlToken {
+            volume: key.clone(),
+            container_ip: address,
+            ..new_token(2, SessionId::new_v4())
+        };
+        assert_eq!(store.put_ctl_token(&fresh).await.unwrap(), vec![stale.hash]);
+        assert_eq!(store.ctl_token(&stale.hash).await.unwrap(), None);
+        assert_eq!(
+            store.ctl_token(&fresh.hash).await.unwrap().unwrap().session,
+            fresh.session
+        );
+        assert!(store.ctl_token(&other.hash).await.unwrap().is_some());
+        assert!(free(&store, probe).await, "the stale token's lease is gone");
+    }
+
+    #[tokio::test]
     async fn a_duplicate_hash_is_refused() {
         let store = memory_store().await;
         store
             .put_ctl_token(&new_token(1, SessionId::new_v4()))
             .await
             .unwrap();
-        let err = store
-            .put_ctl_token(&new_token(1, SessionId::new_v4()))
-            .await
-            .unwrap_err();
+        let elsewhere = NewCtlToken {
+            container_ip: IpAddr::from([172, 30, 0, 2]),
+            ..new_token(1, SessionId::new_v4())
+        };
+        let err = store.put_ctl_token(&elsewhere).await.unwrap_err();
         assert!(matches!(err, StoreError::Database(_)), "{err:?}");
     }
 
@@ -643,9 +688,20 @@ mod tests {
             }
         }
 
-        async fn acquire(self, store: &Store, now: i64) -> Option<ScopeLease> {
+        /// Acquires under a new lease, and returns it if granted.
+        async fn acquire(self, store: &Store, now: i64) -> Option<LeaseId> {
+            let lease = LeaseId::new_v4();
+            self.acquire_as(store, lease, now).await.map(|_| lease)
+        }
+
+        async fn acquire_as(
+            self,
+            store: &Store,
+            lease: LeaseId,
+            now: i64,
+        ) -> Option<OffsetDateTime> {
             store
-                .acquire_scope_lock(&self.hash, self.turn, at(now), TTL)
+                .acquire_scope_lock(&self.hash, self.turn, lease, at(now), TTL)
                 .await
                 .unwrap()
         }
@@ -666,7 +722,7 @@ mod tests {
     /// 1,000 s. It gives the lock back if it can.
     async fn free(store: &Store, probe: Holder) -> bool {
         match probe.acquire(store, 1_000).await {
-            Some(lease) => probe.release(store, lease.lease).await,
+            Some(lease) => probe.release(store, lease).await,
             None => false,
         }
     }
@@ -708,7 +764,7 @@ mod tests {
         assert!(store.delete_ctl_token(&second.hash).await.unwrap());
         assert!(free(&store, probe).await, "revoked");
         assert!(
-            elsewhere.renew(&store, kept.lease, 1_010).await.is_some(),
+            elsewhere.renew(&store, kept, 1_010).await.is_some(),
             "another session's lease is untouched"
         );
     }
@@ -734,19 +790,16 @@ mod tests {
 
         let held = second.acquire(&store, 1_000).await.unwrap();
         let third = Holder::begin(&store, first.hash).await;
-        assert_eq!(second.renew(&store, held.lease, 1_010).await, None);
-        assert_eq!(third.renew(&store, held.lease, 1_010).await, None);
+        assert_eq!(second.renew(&store, held, 1_010).await, None);
+        assert_eq!(third.renew(&store, held, 1_010).await, None);
 
         let held = third.acquire(&store, 1_000).await.unwrap();
         assert_eq!(
-            second.renew(&store, held.lease, 1_010).await,
+            second.renew(&store, held, 1_010).await,
             None,
             "a renewal authorized under an earlier turn"
         );
-        assert_eq!(
-            third.renew(&store, held.lease, 1_010).await,
-            Some(at(1_040))
-        );
+        assert_eq!(third.renew(&store, held, 1_010).await, Some(at(1_040)));
         assert!(store.set_ctl_turn(&first.hash, None).await.unwrap());
         assert_eq!(third.acquire(&store, 1_000).await, None, "between turns");
     }
@@ -832,16 +885,72 @@ mod tests {
             Holder::new(&store, 1, &key).await,
             Holder::new(&store, 2, &key).await,
         );
-        let held = a.acquire(&store, 1_000).await.unwrap();
-        assert_eq!(held.expires_at, at(1_030));
+        let held = LeaseId::new_v4();
+        assert_eq!(a.acquire_as(&store, held, 1_000).await, Some(at(1_030)));
         for holder in [a, b] {
             assert_eq!(holder.acquire(&store, 1_029).await, None);
         }
         let elsewhere = Holder::new(&store, 3, &volume(AgentId::new_v4())).await;
         assert!(elsewhere.acquire(&store, 1_000).await.is_some());
-        assert!(a.release(&store, held.lease).await);
-        let next = a.acquire(&store, 1_001).await.unwrap();
-        assert_ne!(next.lease, held.lease);
+        assert!(a.release(&store, held).await);
+        assert!(a.acquire(&store, 1_001).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_acquire_repeated_under_its_lease_by_its_session_holds_it_again() {
+        let store = memory_store().await;
+        let key = volume(AgentId::new_v4());
+        let (a, b) = (
+            Holder::new(&store, 1, &key).await,
+            Holder::new(&store, 2, &key).await,
+        );
+        let elsewhere = Holder::new(&store, 3, &volume(AgentId::new_v4())).await;
+        let lease = LeaseId::new_v4();
+        assert_eq!(a.acquire_as(&store, lease, 1_000).await, Some(at(1_030)));
+        assert_eq!(
+            a.acquire_as(&store, lease, 1_010).await,
+            Some(at(1_040)),
+            "the same lease and session hold it again, for longer"
+        );
+        assert_eq!(
+            b.acquire_as(&store, lease, 1_020).await,
+            None,
+            "another session naming the lease"
+        );
+        assert_eq!(
+            elsewhere.acquire_as(&store, lease, 1_020).await,
+            None,
+            "a session on another volume naming the lease"
+        );
+        assert_eq!(a.acquire(&store, 1_020).await, None, "another lease");
+        assert_eq!(a.renew(&store, lease, 1_039).await, Some(at(1_069)));
+        let taken = b.acquire(&store, 1_069).await.unwrap();
+        assert_eq!(
+            a.acquire_as(&store, lease, 1_070).await,
+            None,
+            "an expired lease taken over"
+        );
+        assert!(b.release(&store, taken).await);
+        assert_eq!(
+            a.acquire_as(&store, lease, 1_070).await,
+            Some(at(1_100)),
+            "a free lock"
+        );
+        let theirs = elsewhere.acquire(&store, 1_090).await.unwrap();
+        assert_eq!(
+            a.acquire_as(&store, theirs, 1_100).await,
+            None,
+            "a lease of another volume, over this volume's expired row"
+        );
+        assert_eq!(
+            elsewhere.renew(&store, theirs, 1_100).await,
+            Some(at(1_130)),
+            "the other volume's lease is untouched"
+        );
+        assert!(
+            a.release(&store, lease).await,
+            "this volume's row is unchanged"
+        );
     }
 
     #[tokio::test]
@@ -854,14 +963,14 @@ mod tests {
         );
         let dead = a.acquire(&store, 1_000).await.unwrap();
         assert_eq!(
-            a.renew(&store, dead.lease, 1_030).await,
+            a.renew(&store, dead, 1_030).await,
             None,
             "an expired lease can't be renewed"
         );
         let live = b.acquire(&store, 1_030).await.unwrap();
-        assert!(!a.release(&store, dead.lease).await);
-        assert_eq!(a.renew(&store, dead.lease, 1_031).await, None);
-        assert_eq!(b.renew(&store, live.lease, 1_040).await, Some(at(1_070)));
+        assert!(!a.release(&store, dead).await);
+        assert_eq!(a.renew(&store, dead, 1_031).await, None);
+        assert_eq!(b.renew(&store, live, 1_040).await, Some(at(1_070)));
         assert_eq!(a.acquire(&store, 1_069).await, None, "the renewal held");
     }
 
@@ -874,7 +983,7 @@ mod tests {
         let other = Holder::new(&store, 3, &volume(AgentId::new_v4())).await;
         let held = a.acquire(&store, 1_000).await.unwrap();
         let stranger = LeaseId::new_v4();
-        for (holder, lease) in [(a, stranger), (b, held.lease), (other, held.lease)] {
+        for (holder, lease) in [(a, stranger), (b, held), (other, held)] {
             assert_eq!(holder.renew(&store, lease, 1_010).await, None);
             assert!(!holder.release(&store, lease).await);
         }
@@ -890,11 +999,16 @@ mod tests {
         let store = memory_store().await;
         let holder = Holder::new(&store, 1, &volume(AgentId::new_v4())).await;
         let held = store
-            .acquire_scope_lock(&holder.hash, holder.turn, at(1_000), Duration::ZERO)
+            .acquire_scope_lock(
+                &holder.hash,
+                holder.turn,
+                LeaseId::new_v4(),
+                at(1_000),
+                Duration::ZERO,
+            )
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(held.expires_at, at(1_001));
+        assert_eq!(held, Some(at(1_001)));
     }
 
     #[tokio::test]
@@ -909,7 +1023,7 @@ mod tests {
             let store = store.clone();
             tasks.push(tokio::spawn(async move {
                 store
-                    .acquire_scope_lock(&holder.hash, holder.turn, now, TTL)
+                    .acquire_scope_lock(&holder.hash, holder.turn, LeaseId::new_v4(), now, TTL)
                     .await
                     .unwrap()
             }));

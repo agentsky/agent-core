@@ -55,7 +55,7 @@ pub use agents::{
     NewAgent, PendingRetirement, Visibility,
 };
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
-pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
+pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use message_refs::{MessageRef, NewMessageRef};
 pub use pending_logins::PendingLogin;
