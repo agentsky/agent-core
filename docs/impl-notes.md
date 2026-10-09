@@ -3837,13 +3837,15 @@ runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
 T21 recycles the session's container when the requester changes, which
-ends every process a turn left running, so a leftover never spends another
-requester's credential
-([T21](#another-requesters-turn-gets-a-new-container)). What remains: a
-background process left from turn N can still spend the credential of a
-later turn of the same requester while that turn runs. Killing what a turn
-leaves behind has no clean boundary; the plan's Deferred work ("Processes a
-turn leaves running") records it.
+ends every process a turn left running
+([T21](#another-requesters-turn-gets-a-new-container)), so a background
+process left from turn N spends only the credentials of its own
+requester's later turns while they run. Killing what a turn leaves behind
+has no clean boundary. Files outlive the container, though: what a turn
+leaves in the session's `home/`, `tmp/`, `claude/` or `work/`, in
+`shared/`, or in the transcript can run or instruct code in a later
+requester's process, which then spends that requester's credential. The
+plan's Deferred work ("Processes a turn leaves running") records both.
 
 ### Headers the proxy changes besides the credential
 
@@ -4436,18 +4438,30 @@ process. Stopping the container ends its PID namespace and every process in
 it; stopping only the CLI would leave the leftovers running. It compares the
 full `Requester`, not the `CredentialRef`: a community-key turn of another
 requester also gets the agentctl token, so it gets a new container too. An
-agent-to-agent hop inherits its requester, so it keeps the container. The cost
-is a container start and a `--resume` of the transcript whenever consecutive
-turns of one session come from different requesters, as in a busy channel
-thread; a requester's own run of turns keeps the warm process.
-`a_requester_change_replaces_the_container` checks that another requester's
-turn, a community-key one included, replaces the container, and that the same
-requester and a hop carrying it keep it. A leftover can still use its own
-requester's later turns and the egress allowlist between turns, and files left
-in the session's `work/` or `home/` outlive the container. Only one
-requester's turns now share a warm process, so the case the T20 note on
-`total_cost_usd` gives, of other members' turns on a shared warm process
-([T20](#total_cost_usd-is-the-processs-running-total)), no longer arises.
+agent-to-agent hop runs as the requester it inherits, so it keeps a container
+started for that requester. The cost is a container start and a `--resume` of
+the transcript whenever consecutive turns of one session come from different
+requesters, as in a busy channel thread; a requester's own run of turns keeps
+the warm process. Only one requester's turns now share a warm process, so the
+case the T20 note on `total_cost_usd` gives, of other members' turns on a
+shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
+no longer arises. `a_requester_change_replaces_the_container` checks that
+another requester's turn, a community-key one included, replaces the
+container, and that the same requester and a hop carrying it keep it.
+
+It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
+are the session's `home/`, `tmp/` and `claude/` on its volume, the working
+directory is `work/`, and every container of the session mounts them, with the
+volume's `shared/` (read-only on the public side of `Private`). Only
+`claude/settings.json` and the `claude/skills` entry are rewritten before each
+start, and in the Docker sandbox only `/tmp`, a tmpfs of the container's own,
+goes with the container. So a turn can leave a file that runs or instructs code
+in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
+a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
+`work/` or `shared/`, or text in the transcript. A leftover process can also
+still use its own requester's later turns, and the egress allowlist between
+turns. The plan's Deferred work ("Processes a turn leaves running")
+records both, with a way to narrow the files' part.
 
 ### How turns queue and survive their caller
 
