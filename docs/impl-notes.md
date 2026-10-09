@@ -1788,7 +1788,10 @@ peer every `REFUSAL_WARN_INTERVAL` (a minute); the refusals in between are
 logged at debug level and counted in the next warning's
 `refused_since_last_warning`. Entries older than the interval are dropped
 whenever a warning is logged, so the map holds only recently active peers.
-A unit test drives it with explicit instants.
+A unit test drives it with explicit instants. `RefusalLog` was later
+replaced by `core_types::Throttle`, which keeps keys until it holds
+`MAX_THROTTLE_KEYS` (4096) and only then forgets those warned about more
+than an interval ago.
 
 ### A second signal during the drain was swallowed
 
@@ -5342,16 +5345,17 @@ turn ran anyway, answering it twice.
 DM's or a thread-less channel's conversation) before the lookup and holds
 it until the message is queued for every candidate. Tokio's mutex grants
 in the order asked, so a thread's messages reach its lanes in the order
-their dispatches started; the busy lines are posted after the lock is
-released, so sending still waits only for the lookups of the thread's
-earlier messages, never for a turn. An entry lives only while a dispatch
-holds or waits for it, and a sender cancelled while waiting leaves none,
-as `auth`'s `KeyedLocks` does. That type is crate-private to `auth`, and
-a key-to-lock map isn't authentication, so agentd has its own copy next
-to the pipeline rather than importing it. The lock can't restore an order
-lost before `dispatch` starts: two connections that record two messages
-in `Dedup`, or reach the sink, in the opposite order of the messages are
-dispatched in that order.
+their dispatches started. A busy line is a notice, posted in a task of its
+own (see "Owners can forge their agents' events" under T31), so the lock
+never waits for one, and sending still waits only for the lookups of the
+thread's earlier messages, never for a turn or a post. An entry lives only
+while a dispatch holds or waits for it, and a sender cancelled while
+waiting leaves none, as `auth`'s `KeyedLocks` does. That type is
+crate-private to `auth`, and a key-to-lock map isn't authentication, so
+agentd has its own copy next to the pipeline rather than importing it. The
+lock can't restore an order lost before `dispatch` starts: two connections
+that record two messages in `Dedup`, or reach the sink, in the opposite
+order of the messages are dispatched in that order.
 
 ## T24: Session commands
 
@@ -6030,19 +6034,19 @@ declare hosts (`Store::active_skills_for_session`, which replaced
 skill whose files declare others, or are missing or unreadable, grants
 none, warned about with the agent, the skill and the counts at most once a
 minute per skill (`MISMATCH_WARN_INTERVAL`, through `core_types::Throttle`,
-which the public listener's refusal warnings use too), the rest at debug level. It
-runs at each `CONNECT` the configured allowlist doesn't already allow, and
-reads only the front matter of each active skill with hosts: the first
-`MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines among
-them, parsed with `parse_skill_file`. That constant is now the whole front
-matter's budget, a byte-order mark and both `---` lines with their trailing
-whitespace counted, not just the YAML's: a closing line padded with spaces
-passed the add's check and then failed the bounded read, so a skill could
-be added and never confirmed. With one budget, every file the add accepts
-reads the same at confirmation and at the grant. Whatever the disk holds,
-hosts never cover files that don't declare them; the lease, the order of
-the steps and the undo only keep rows and files matching, so that what the
-owner confirmed stays usable.
+which the public listener's refusal warnings use too), the rest at debug
+level. It runs at each `CONNECT` the configured allowlist doesn't already
+allow, and reads only the front matter of each active skill with hosts: the
+first `MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines
+among them, parsed with `parse_skill_file`. That constant is now the whole
+front matter's budget, a byte-order mark and both `---` lines with their
+trailing whitespace counted, not just the YAML's: a closing line padded
+with spaces passed the add's check and then failed the bounded read, so a
+skill could be added and never confirmed. With one budget, every file the
+add accepts reads the same at confirmation and at the grant. Whatever the
+disk holds, hosts never cover files that don't declare them; the lease, the
+order of the steps and the undo only keep rows and files matching, so that
+what the owner confirmed stays usable.
 
 The check compares the row's hosts, which `host_names` wrote at add time
 from `parse_skill_file` and `HostRule`'s `Display`, with what the same code
@@ -7211,22 +7215,25 @@ token. Returning the error from the sink isn't an option: `Queue::run`
 takes any `Err` to mean the receiver is gone and stops.
 
 **Solution.** The rotated pair's retry, `store_rotated`, became
-`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs the whole
-departure (lookup and delete) through it as one closure, so a passing error
-costs a retry, not the token. Every `StoreError` is retried, since even a
-sealing failure can pass (`SealError::Rng`) and the rotator can't afford to
-lose a pair. `retry_store` logs each failure but the last as a retry, with
-the member's id, and returns the last to its caller: `Inbound` logs that
-one, as before, by member key and error. It stays in `slack_tokens`, since
-agentd has no shared store or retry module.
+`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs each step
+of the departure through it as its own closure, the lookup and token
+delete, then the lookup and the deletion of the member's cloud routines and
+hand-offs, so a passing error costs a retry, not the token, and a failed
+first step doesn't skip the second. Every `StoreError` is retried, since
+even a sealing failure can pass (`SealError::Rng`) and the rotator can't
+afford to lose a pair. `retry_store` logs each failure but the last as a
+retry, with the member's id, and returns the last to its caller: `Inbound`
+logs that one, as before, by member key and error. It stays in
+`slack_tokens`, since agentd has no shared store or retry module.
 
 The retries run inline in the sink, so a failing departure holds the shared
-Slack event queue for 1.75 s of waits plus each attempt's own store time,
-which can include SQLite's busy timeout. Once agent apps land, that queue
-also carries agents' messages, which wait too. That is accepted: a store
-failing on writes stalls agent traffic anyway, the hold is bounded at four
-attempts, and handing the departure to a task instead would lose its order
-against later events for the same member.
+Slack event queue for up to 3.5 s of waits, 1.75 s per step, plus each
+attempt's own store time, which can include SQLite's busy timeout. Once
+agent apps land, that queue also carries agents' messages, which wait too.
+That is accepted: a store failing on writes stalls agent traffic anyway,
+the hold is bounded at four attempts per step, and handing the departure to
+a task instead would lose its order against later events for the same
+member.
 
 ### Which failures a member hears about
 
@@ -8222,6 +8229,7 @@ test inserts a row in the old shape and checks it survives a sweep an hour
 and a week later, is swept a second after that, and that a row recorded
 with an explicit 30-day `expires_at` is left alone. A later migration can
 drop the trigger once no binary from before T31 can run against the store.
+
 ## T33: Consent cards and private tasks
 
 ### What `--file` names, and how files cross in
@@ -8425,7 +8433,9 @@ so a task never runs twice. A claim that finds anything already posted
 for the consent (a `message_refs` row naming it: its result, or any
 outcome, each its last word) just finishes, as after a delivery whose
 finish failed, so nothing is posted twice; posting an outcome checks the
-same. The `private` map of claims a
+same. An outcome posted without its row (`Lost::Row`) still counts as
+posted, since a retry would find no row and post it again. The `private`
+map of claims a
 shutdown releases drops an entry only for its own attempt, so an old
 attempt can't drop a newer one's. A store error on the way, such as looking up the agent's
 surface (`SurfaceLookup::surface` now returns the error rather than
@@ -9163,21 +9173,24 @@ thread was never told. Separately, a failed upload skipped the reply's
 post: `uploaded && self.post(..)` short-circuited.
 
 **Solution.** The reply is posted whatever the upload did, and `post_to`
-returns `Sent { posted, handed_off }`; a turn's delivery is complete only
-when the upload and every post succeeded and every chunk with hand-offs
-to make was recorded with them, and otherwise says
-`DELIVERY_FAILED_TEXT`. A chunk that hands off to no one and can't be
-recorded is only logged: the person saw all of it, and a line saying
-part was lost would only have them pay for the turn again; what it loses
-is a short id. That goes for a private task's result too: the thread
-saw it, but without its row `consent_posted` can't tell it was posted,
-so if agentd stops before the task's work is finished, the next attempt
-says the task was interrupted rather than finishing quietly. A reply
-posted after a failed upload may still say it attached the file; the
-failure line follows it. A private task's outcome
-(`tell_thread`) needs only `posted`: its record is what `consent_posted`
-reads to mark the outcome posted, so treating an unrecorded outcome as
-unposted would post it again on each retry.
+returns what it lost, `Lost::Chunk` or `Lost::Row`, a lost chunk
+winning. A chunk posted without its row costs more than a short id: the
+row is what attributes the post, so a person's reply to it that mentions
+no agent reaches none (`is_reply_to_agent` reads the row), a mention in
+it starts no hop, and the next turn shows it again as history. So it
+counts as a lost part whether or not it carried hand-offs, and a turn's
+delivery is complete only when the upload and every post succeeded and
+every chunk was recorded; otherwise it says `DELIVERY_FAILED_TEXT`. A
+chunk that was to hand off loses those hand-offs with its row, which is
+the same `Lost::Row`, and no agent's hop runs from it. A reply posted
+after a failed upload may still say it attached the file; the failure
+line follows it. A private task's outcome (`tell_thread`) counts a lost
+row as posted: its record is what `consent_posted` reads to mark the
+outcome posted, so treating an unrecorded outcome as unposted would post
+it again on each retry. Without its row `consent_posted` can't tell it
+was posted either, so if agentd stops before the task's work is
+finished, the next attempt says the task was interrupted rather than
+finishing quietly.
 
 ### Smaller choices
 
