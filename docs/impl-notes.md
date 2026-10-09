@@ -1788,7 +1788,10 @@ peer every `REFUSAL_WARN_INTERVAL` (a minute); the refusals in between are
 logged at debug level and counted in the next warning's
 `refused_since_last_warning`. Entries older than the interval are dropped
 whenever a warning is logged, so the map holds only recently active peers.
-A unit test drives it with explicit instants.
+A unit test drives it with explicit instants. `RefusalLog` was later
+replaced by `core_types::Throttle`, which keeps keys until it holds
+`MAX_THROTTLE_KEYS` (4096) and only then forgets those warned about more
+than an interval ago.
 
 ### A second signal during the drain was swallowed
 
@@ -5341,16 +5344,17 @@ turn ran anyway, answering it twice.
 DM's or a thread-less channel's conversation) before the lookup and holds
 it until the message is queued for every candidate. Tokio's mutex grants
 in the order asked, so a thread's messages reach its lanes in the order
-their dispatches started; the busy lines are posted after the lock is
-released, so sending still waits only for the lookups of the thread's
-earlier messages, never for a turn. An entry lives only while a dispatch
-holds or waits for it, and a sender cancelled while waiting leaves none,
-as `auth`'s `KeyedLocks` does. That type is crate-private to `auth`, and
-a key-to-lock map isn't authentication, so agentd has its own copy next
-to the pipeline rather than importing it. The lock can't restore an order
-lost before `dispatch` starts: two connections that record two messages
-in `Dedup`, or reach the sink, in the opposite order of the messages are
-dispatched in that order.
+their dispatches started. A busy line is a notice, posted in a task of its
+own (see "Owners can forge their agents' events" under T31), so the lock
+never waits for one, and sending still waits only for the lookups of the
+thread's earlier messages, never for a turn or a post. An entry lives only
+while a dispatch holds or waits for it, and a sender cancelled while
+waiting leaves none, as `auth`'s `KeyedLocks` does. That type is
+crate-private to `auth`, and a key-to-lock map isn't authentication, so
+agentd has its own copy next to the pipeline rather than importing it. The
+lock can't restore an order lost before `dispatch` starts: two connections
+that record two messages in `Dedup`, or reach the sink, in the opposite
+order of the messages are dispatched in that order.
 
 ## T24: Session commands
 
@@ -6027,19 +6031,19 @@ declare hosts (`Store::active_skills_for_session`, which replaced
 skill whose files declare others, or are missing or unreadable, grants
 none, warned about with the agent, the skill and the counts at most once a
 minute per skill (`MISMATCH_WARN_INTERVAL`, through `core_types::Throttle`,
-which the public listener's refusal warnings use too), the rest at debug level. It
-runs at each `CONNECT` the configured allowlist doesn't already allow, and
-reads only the front matter of each active skill with hosts: the first
-`MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines among
-them, parsed with `parse_skill_file`. That constant is now the whole front
-matter's budget, a byte-order mark and both `---` lines with their trailing
-whitespace counted, not just the YAML's: a closing line padded with spaces
-passed the add's check and then failed the bounded read, so a skill could
-be added and never confirmed. With one budget, every file the add accepts
-reads the same at confirmation and at the grant. Whatever the disk holds,
-hosts never cover files that don't declare them; the lease, the order of
-the steps and the undo only keep rows and files matching, so that what the
-owner confirmed stays usable.
+which the public listener's refusal warnings use too), the rest at debug
+level. It runs at each `CONNECT` the configured allowlist doesn't already
+allow, and reads only the front matter of each active skill with hosts: the
+first `MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines
+among them, parsed with `parse_skill_file`. That constant is now the whole
+front matter's budget, a byte-order mark and both `---` lines with their
+trailing whitespace counted, not just the YAML's: a closing line padded
+with spaces passed the add's check and then failed the bounded read, so a
+skill could be added and never confirmed. With one budget, every file the
+add accepts reads the same at confirmation and at the grant. Whatever the
+disk holds, hosts never cover files that don't declare them; the lease, the
+order of the steps and the undo only keep rows and files matching, so that
+what the owner confirmed stays usable.
 
 The check compares the row's hosts, which `host_names` wrote at add time
 from `parse_skill_file` and `HostRule`'s `Display`, with what the same code
@@ -8217,6 +8221,7 @@ test inserts a row in the old shape and checks it survives a sweep an hour
 and a week later, is swept a second after that, and that a row recorded
 with an explicit 30-day `expires_at` is left alone. A later migration can
 drop the trigger once no binary from before T31 can run against the store.
+
 ## T33: Consent cards and private tasks
 
 ### What `--file` names, and how files cross in
@@ -8420,7 +8425,9 @@ so a task never runs twice. A claim that finds anything already posted
 for the consent (a `message_refs` row naming it: its result, or any
 outcome, each its last word) just finishes, as after a delivery whose
 finish failed, so nothing is posted twice; posting an outcome checks the
-same. The `private` map of claims a
+same. An outcome posted without its row (`Lost::Row`) still counts as
+posted, since a retry would find no row and post it again. The `private`
+map of claims a
 shutdown releases drops an entry only for its own attempt, so an old
 attempt can't drop a newer one's. A store error on the way, such as looking up the agent's
 surface (`SurfaceLookup::surface` now returns the error rather than

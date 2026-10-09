@@ -14,7 +14,7 @@ pub const MAX_THROTTLE_KEYS: usize = 4096;
 /// the binding or agent a warning is about. At most [`MAX_THROTTLE_KEYS`]
 /// are remembered: when that many are, those let through more than an
 /// interval ago are forgotten, and while that many are still recent a new
-/// key's events stay quiet.
+/// key's events stay quiet, uncounted.
 #[derive(Debug)]
 pub struct Throttle<K = ()> {
     interval: Duration,

@@ -465,7 +465,8 @@ impl Pipeline {
     /// Posts Markdown `text` about `consent` in the thread that asked, as
     /// its agent's bot, recorded in `message_refs` like a private task's
     /// reply under a session id that is the consent's own. Done when it is
-    /// posted, or when the agent can't post there any more.
+    /// posted, even if its row couldn't be recorded, since posting it again
+    /// would post it twice, or when the agent can't post there any more.
     ///
     /// # Errors
     ///

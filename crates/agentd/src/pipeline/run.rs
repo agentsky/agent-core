@@ -2821,7 +2821,7 @@ mod tests {
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
     use crate::pipeline::TurnSettings;
-    use core_types::{BindingId, ConvRef, SessionId, SurfaceKind};
+    use core_types::{BindingId, ConvRef, SurfaceKind};
     use runner::{PoolConfig, ProcessConfig};
     use sandbox::ProcessSandbox;
     use testkit::TempDir;
