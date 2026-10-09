@@ -276,8 +276,10 @@ jobs:
       - name: Show the Docker daemon
         run: docker version
 
-      # docker_real_claude_starts in crates/agentd runs the real `claude`
-      # from the sandbox image, under this tag.
+      # docker_real_claude_starts in crates/agentd and
+      # docker_the_pinned_cli_restores_whatever_total_the_runner_reads in
+      # crates/runner run the real `claude` from the sandbox image, under
+      # this tag.
       - name: Build the sandbox image
         run: docker build -f images/sandbox/Dockerfile -t agent-core/sandbox:dev .
 

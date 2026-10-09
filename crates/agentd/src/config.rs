@@ -100,6 +100,10 @@ pub const MAX_DRAIN_TIMEOUT_SECS: u64 = 3600;
 pub const DEFAULT_LOG_FILTER: &str = "info";
 /// The default for `limits.attach_max_bytes`: 50 MiB.
 pub const DEFAULT_ATTACH_MAX_BYTES: u64 = 50 * 1024 * 1024;
+/// The default for `limits.thread_turns_per_hour`.
+pub const DEFAULT_THREAD_TURNS_PER_HOUR: u32 = 30;
+/// The default for `limits.thread_tokens_per_day`.
+pub const DEFAULT_THREAD_TOKENS_PER_DAY: u64 = 2_000_000;
 /// The default for `slack.api_url`.
 pub const DEFAULT_SLACK_API_URL: &str = surface_slack::web::DEFAULT_BASE_URL;
 /// The default for `slack.install_reminder_secs`: an hour.
@@ -343,12 +347,27 @@ impl SlackConfig {
 pub struct LimitsConfig {
     /// `attach_max_bytes`: the largest file `agentctl attach` may stage.
     pub attach_max_bytes: u64,
+    /// `max_hops`: the global cap on agent-to-agent hops, default
+    /// [`router::DEFAULT_MAX_HOPS`]. An agent's own `hops` limit can only
+    /// lower it; 0 turns hand-offs off.
+    pub max_hops: u8,
+    /// `thread_turns_per_hour`: the most turns agents may take in one
+    /// thread in an hour (UTC), every agent counted, default
+    /// [`DEFAULT_THREAD_TURNS_PER_HOUR`]. 0 means no cap.
+    pub thread_turns_per_hour: u32,
+    /// `thread_tokens_per_day`: the most tokens agents' turns may use in
+    /// one thread in a day (UTC), input and output with cache reads left
+    /// out, default [`DEFAULT_THREAD_TOKENS_PER_DAY`]. 0 means no budget.
+    pub thread_tokens_per_day: u64,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             attach_max_bytes: DEFAULT_ATTACH_MAX_BYTES,
+            max_hops: router::DEFAULT_MAX_HOPS.0,
+            thread_turns_per_hour: DEFAULT_THREAD_TURNS_PER_HOUR,
+            thread_tokens_per_day: DEFAULT_THREAD_TOKENS_PER_DAY,
         }
     }
 }
@@ -1995,6 +2014,38 @@ manager_user_id = "manager-id"
         assert_eq!(err.key(), Some("store.data_dir"), "{err}");
         let err = file_err(&replace("data_dir = \"/nonexistent/agentd\"\n", ""));
         assert_eq!(err.key(), Some("store.data_dir"), "{err}");
+    }
+
+    #[test]
+    fn the_thread_and_hop_caps_have_defaults_and_can_be_changed() {
+        let limits = with(MINIMAL, env()).unwrap().limits;
+        assert_eq!(
+            (
+                limits.max_hops,
+                limits.thread_turns_per_hour,
+                limits.thread_tokens_per_day
+            ),
+            (
+                3,
+                DEFAULT_THREAD_TURNS_PER_HOUR,
+                DEFAULT_THREAD_TOKENS_PER_DAY
+            )
+        );
+        let text = format!(
+            "{MINIMAL}\n[limits]\nmax_hops = 0\nthread_turns_per_hour = 0\n\
+             thread_tokens_per_day = 5\n"
+        );
+        let limits = with(&text, env()).unwrap().limits;
+        assert_eq!(
+            (
+                limits.max_hops,
+                limits.thread_turns_per_hour,
+                limits.thread_tokens_per_day
+            ),
+            (0, 0, 5)
+        );
+        let err = file_err(&format!("{MINIMAL}\n[limits]\nmax_hops = 256\n"));
+        assert_eq!(err.key(), Some("limits.max_hops"), "{err}");
     }
 
     #[test]

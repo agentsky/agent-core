@@ -1828,6 +1828,37 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
 }
 
 #[tokio::test]
+async fn a_slack_channel_token_is_a_rule_shown_by_its_name() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    h.store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        h.slash("U0HUMAN01", "allow helper <#C0CHAN002|general>")
+            .await,
+        ["Only you and `#general` may use `helper`."]
+    );
+    assert_eq!(
+        h.slash("U0HUMAN01", "deny helper <#C0CHAN003>").await,
+        ["Only you and `#general` may use `helper`, except `#C0CHAN003`."]
+    );
+}
+
+#[tokio::test]
 async fn a_departed_members_token_is_deleted_although_the_first_deletes_fail() {
     let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;

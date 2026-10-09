@@ -123,13 +123,34 @@ pub enum UserRef {
 /// A channel named in a command.
 ///
 /// Members type `#name`. Slack rewrites a channel it recognizes into a
-/// `<#C123|name>` or `<#C123>` token, which becomes [`RoomRef::Id`].
+/// `<#C123|name>` or `<#C123>` token, which becomes [`RoomRef::Id`]. On
+/// Rocket.Chat such a token is only ever typed, so its id is looked up
+/// like a name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RoomRef {
     /// A channel name as typed, without the `#`.
     Name(String),
     /// A platform channel id, from a Slack `<#…>` token.
-    Id(String),
+    Id {
+        /// The id.
+        id: String,
+        /// The channel's name the token carries after `|`, for replies to
+        /// show, if it has a plain one.
+        name: Option<String>,
+    },
+}
+
+impl RoomRef {
+    /// How a reply shows the channel: its name, or its id without one.
+    pub fn shown(&self) -> &str {
+        match self {
+            Self::Name(name)
+            | Self::Id {
+                name: Some(name), ..
+            }
+            | Self::Id { id: name, .. } => name,
+        }
+    }
 }
 
 /// Who `allow` and `deny` apply to.
@@ -179,7 +200,11 @@ fn user_ref(s: &str) -> Option<Result<UserRef, Reason>> {
 fn room_ref(s: &str) -> Option<Result<RoomRef, Reason>> {
     const ROOM_RULE: Reason = Reason("A channel is written #name.");
     if let Some(id) = slack_token(s, '#') {
-        return Some(id.map(RoomRef::Id).ok_or(ROOM_RULE));
+        let name = s
+            .trim_end_matches('>')
+            .split_once('|')
+            .and_then(|(_, name)| plain_name(name));
+        return Some(id.map(|id| RoomRef::Id { id, name }).ok_or(ROOM_RULE));
     }
     let name = s.strip_prefix('#')?;
     Some(plain_name(name).map(RoomRef::Name).ok_or(ROOM_RULE))
@@ -296,6 +321,13 @@ fn unwrap_slack_link(s: &str) -> &str {
 mod tests {
     use super::*;
 
+    fn room(id: &str, name: Option<&str>) -> RoomRef {
+        RoomRef::Id {
+            id: id.into(),
+            name: name.map(Into::into),
+        }
+    }
+
     #[test]
     fn agent_names_follow_the_rule() {
         for ok in ["ab", "code-helper", "a1", "--", &"x".repeat(32)] {
@@ -344,9 +376,9 @@ mod tests {
             ("<@U123>", Target::Member(UserRef::Id("U123".into()))),
             ("<@W9|bob>", Target::Member(UserRef::Id("W9".into()))),
             ("#general", Target::Room(RoomRef::Name("general".into()))),
-            ("<#C42|general>", Target::Room(RoomRef::Id("C42".into()))),
-            ("<#G7|>", Target::Room(RoomRef::Id("G7".into()))),
-            ("<#C42>", Target::Room(RoomRef::Id("C42".into()))),
+            ("<#C42|general>", Target::Room(room("C42", Some("general")))),
+            ("<#G7|>", Target::Room(room("G7", None))),
+            ("<#C42>", Target::Room(room("C42", None))),
             ("everyone", Target::Everyone),
             ("Everyone", Target::Everyone),
             ("@everyone", Target::Everyone),

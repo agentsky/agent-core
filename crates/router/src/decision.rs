@@ -47,8 +47,32 @@ pub enum Decision {
         /// when `scope` is [`ScopeKind::Private`].
         side: Side,
     },
-    /// Don't run, and tell the thread why in one line.
-    Refuse(RefuseReason),
+    /// Don't run, and say why: to `requester` privately when the refusal
+    /// is of them ([`RefuseReason::Banned`] and [`RefuseReason::Denied`])
+    /// and they sent the message, to no one for such a refusal on a hop,
+    /// and otherwise to the thread, in one line.
+    Refuse {
+        /// Why.
+        reason: RefuseReason,
+        /// Whose request is refused, as for [`Decision::LinkPrompt`]. Its
+        /// member is `None` when the view couldn't say which member the
+        /// requester is.
+        requester: Requester,
+    },
+}
+
+impl Decision {
+    /// Whose request the decision answers: who pays for a turn, who is
+    /// prompted or refused. `None` for [`Decision::Ignore`].
+    pub fn requester(&self) -> Option<&Requester> {
+        match self {
+            Self::Ignore(_) => None,
+            Self::LinkPrompt { requester }
+            | Self::RelinkPrompt { requester }
+            | Self::Run { requester, .. }
+            | Self::Refuse { requester, .. } => Some(requester),
+        }
+    }
 }
 
 /// Why the router ignored an event. Ignored events get no reply.
@@ -106,6 +130,10 @@ impl fmt::Display for IgnoreReason {
 
 /// Why the router refused an addressed event. The pipeline renders each as a
 /// one-line notice.
+///
+/// [`Banned`](Self::Banned) and [`Denied`](Self::Denied) are about the
+/// requester, so the pipeline tells them privately; see
+/// [`is_personal`](Self::is_personal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefuseReason {
     /// The owner paused the agent.
@@ -120,6 +148,21 @@ pub enum RefuseReason {
         /// The largest hop the agent accepts.
         max: Hop,
     },
+    /// The agent has taken the turns its owner allows it a day.
+    DailyCap {
+        /// The turns it takes a day for anyone but its owner.
+        max: u32,
+    },
+    /// Agents have taken the most turns a thread allows in an hour.
+    ThreadTurns {
+        /// The turns agents may take in a thread in an hour.
+        max: u32,
+    },
+    /// Agents' turns have used the thread's token budget for the day.
+    ThreadTokens {
+        /// The tokens agents' turns may use in a thread in a day.
+        max: u64,
+    },
     /// The view couldn't say which member the requester is, whether they
     /// are banned, or what the agent's rules are, so the router refuses
     /// rather than assume the requester is allowed or a stranger.
@@ -127,6 +170,12 @@ pub enum RefuseReason {
 }
 
 impl RefuseReason {
+    /// Whether the refusal is about who the requester is, not about the
+    /// agent, the chain or the thread, so only the requester is told.
+    pub const fn is_personal(self) -> bool {
+        matches!(self, Self::Banned | Self::Denied)
+    }
+
     /// A short, stable description for logs.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -134,6 +183,9 @@ impl RefuseReason {
             Self::Banned => "requester banned",
             Self::Denied => "denied by agent policy",
             Self::HopCap { .. } => "hop cap reached",
+            Self::DailyCap { .. } => "daily turn cap reached",
+            Self::ThreadTurns { .. } => "thread turn cap reached",
+            Self::ThreadTokens { .. } => "thread token budget used up",
             Self::PolicyUnavailable => "agent policy unavailable",
         }
     }

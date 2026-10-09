@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use commands::RoomRef;
 use core_types::{BindingId, ConversationId, SurfaceError, SurfaceKind, TeamId, UserId};
 use store::{Store, StoreError};
 use surface_rocketchat::rest::{
@@ -211,6 +212,35 @@ impl RocketChatAgents {
             .user_by_username(username)
             .await?
             .map(|user| user.id))
+    }
+
+    /// The id of the public channel `room` names: by name, such as
+    /// `general` for `#general`, or by id. `None` if the manager finds no
+    /// such room, or finds one that isn't a public channel: the manager may
+    /// read private groups the asker isn't in, so a group is `None` whether
+    /// or not it exists. An archived channel is `None` too.
+    ///
+    /// # Errors
+    ///
+    /// Any other [`SurfaceError`] from `rooms.info`, such as
+    /// [`SurfaceError::Api`] for a server or proxy failure: only
+    /// [`SurfaceError::NotFound`] (an unknown room) and
+    /// [`SurfaceError::Forbidden`] (a private group the manager isn't in,
+    /// or an archived room) mean `None`.
+    pub async fn public_channel(
+        &self,
+        room: &RoomRef,
+    ) -> Result<Option<ConversationId>, SurfaceError> {
+        let rest = &self.inner.rest;
+        let found = match room {
+            RoomRef::Name(name) => rest.room_by_name(name).await,
+            RoomRef::Id { id, .. } => rest.room_info(&ConversationId::new(id.as_str())).await,
+        };
+        match found {
+            Ok(room) if room.room_type == RoomType::Channel => Ok(Some(room.id)),
+            Ok(_) | Err(SurfaceError::NotFound(_) | SurfaceError::Forbidden(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     /// Downloads the file `id` named `name` from a message the manager

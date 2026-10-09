@@ -777,7 +777,10 @@ async fn commands_reach_the_intake_through_whichever_connection_hears_them() {
     let mut dm = [FakeRest::MANAGER_ID.to_owned(), chat.alice.clone()];
     dm.sort();
     let dm = dm.concat();
-    let linked = "Claude account: linked. Plan: unknown.";
+    let linked = concat!(
+        "Claude account: linked. Plan: unknown.",
+        "\nUsage billed to you today: 0 turns, 0 tokens. This month: 0 turns, 0 tokens (days start at midnight UTC)."
+    );
     let command = |room: &str, text: &str| {
         let id = chat.fake.seed_message(room, &chat.alice, text, None);
         let mut message = realtime_message(&id, room, (&chat.alice, "alice"), text);
@@ -933,5 +936,144 @@ async fn session_commands_work_as_agent_in_a_room_only_the_agents_bot_is_in() {
     for room in ["GENERAL", "AGENTS", "SECRET"] {
         assert!(chat.posted(room).await.is_empty(), "{room}");
     }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name() {
+    let chat = Chat::start().await;
+    let admin = format!(
+        "[community]\nadmins = [\"rocketchat:{TEAM}:{}\"]\n",
+        chat.bob
+    );
+    let running = Running::start_with(&chat, chat.config_with("sqlite::memory:", &admin)).await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+    let helper = running.agent(&chat.alice, "helper").await.unwrap().id;
+    let store = running.app.store();
+
+    assert_eq!(
+        chat.command("alice", "allow helper #general").await,
+        "Only you and `#general` may use `helper`."
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper @bob").await,
+        "Only you and `#general` may use `helper`, except `@bob`."
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper #nowhere").await,
+        "I don't know `#nowhere`. Name a public channel agentd can see."
+    );
+    Mock::given(path("/api/v1/rooms.info"))
+        .and(query_param("roomName", "flaky"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(chat.fake.server())
+        .await;
+    assert_eq!(
+        chat.command("alice", "deny helper #flaky").await,
+        "Something went wrong on my side. Please try again in a minute.",
+        "a failed lookup is not an unknown channel"
+    );
+    chat.fake.add_room("HIDDEN", "p", "hidden");
+    chat.fake.add_member("HIDDEN", FakeRest::MANAGER_ID);
+    for text in ["allow helper #hidden", "allow helper <#HIDDEN>"] {
+        assert!(
+            chat.command("alice", text)
+                .await
+                .starts_with("I don't know `#"),
+            "a private group is never found, though the manager can read it: {text}"
+        );
+    }
+    assert_eq!(
+        chat.command("alice", "deny helper <#MADEUP>").await,
+        "I don't know `#MADEUP`. Name a public channel agentd can see.",
+        "an id typed on Rocket.Chat is looked up, not taken as it is"
+    );
+    assert_eq!(
+        chat.command("alice", "allow helper <#GENERAL>").await,
+        "Only you and `#general` may use `helper`, except `@bob`.",
+        "a public channel's id finds it, and is the same rule as its name"
+    );
+    assert_eq!(
+        chat.command("alice", "allow helper @nobody").await,
+        "I don't know `@nobody`."
+    );
+    let policy = agentd::policy::agent_policy(
+        &store.agent_settings(helper).await.unwrap(),
+        &agentd::policy::Limits::default(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        policy.allow,
+        [router::PolicyTarget::Room(ConvRef {
+            surface: SurfaceKind::RocketChat,
+            team: TEAM.into(),
+            conversation: "GENERAL".into(),
+        })]
+    );
+    assert_eq!(
+        policy.deny,
+        [router::PolicyTarget::Member {
+            key: key(&chat.bob),
+            member: store.member_for_identity(&key(&chat.bob)).await.unwrap(),
+        }]
+    );
+
+    assert_eq!(
+        chat.command("bob", "admin ban @alice too many agents")
+            .await,
+        "Banned `@alice`. Agents refuse their requests, and they can only run `me`, \
+         `logout`, and `pause` or `delete` their agents. Undo it with `admin unban`."
+    );
+    assert!(
+        chat.command("alice", "limits helper turns=3")
+            .await
+            .starts_with("A community admin banned you")
+    );
+    assert_eq!(
+        chat.command("bob", "admin unban @alice").await,
+        "Unbanned `@alice`."
+    );
+    assert!(
+        chat.command("alice", "limits helper turns=3")
+            .await
+            .starts_with("`helper` takes at most 3 requests a day")
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_rule_on_a_channel_archived_since_can_still_be_lifted() {
+    let chat = Chat::start().await;
+    let running = Running::start(&chat, "sqlite::memory:").await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+    chat.fake.add_room("OLD", "c", "old");
+    assert_eq!(
+        chat.command("alice", "deny helper #old").await,
+        "Everyone may use `helper`, except `#old`."
+    );
+    Mock::given(path("/api/v1/rooms.info"))
+        .and(query_param("roomName", "old"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "success": false,
+            "error": "The channel, old, is archived [error-room-archived]",
+            "errorType": "error-room-archived",
+        })))
+        .with_priority(1)
+        .mount(chat.fake.server())
+        .await;
+    assert_eq!(
+        chat.command("alice", "allow helper #old").await,
+        "Everyone may use `helper`.",
+        "the rule is found by the name the owner wrote"
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper #old").await,
+        "I don't know `#old`. Name a public channel agentd can see.",
+        "an archived channel is not a lookup failure"
+    );
     running.stop().await;
 }

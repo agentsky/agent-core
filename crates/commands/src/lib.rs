@@ -122,15 +122,16 @@ pub enum Command {
         /// Who is denied.
         target: Target,
     },
-    /// `limits <name> [turns=N/day] [hops=N]`, the settings in either order.
-    /// At least one is present; a missing one keeps its current value.
+    /// `limits <name> [turns=N/day] [hops=N]`, the settings in either order,
+    /// each a number or `off`. At least one is present; a missing one keeps
+    /// its current value.
     Limits {
         /// The agent.
         name: AgentName,
-        /// Turns per day, from `turns=N/day` (or `turns=N`).
-        turns_per_day: Option<u32>,
-        /// The agent-to-agent hop limit, from `hops=N`.
-        hops: Option<u8>,
+        /// Turns per day, from `turns=N/day` (or `turns=N`, or `turns=off`).
+        turns_per_day: Option<Setting<u32>>,
+        /// The agent-to-agent hop limit, from `hops=N` (or `hops=off`).
+        hops: Option<Setting<u8>>,
     },
     /// `pause <name>`.
     Pause {
@@ -179,6 +180,15 @@ pub enum Command {
         /// The consent being decided.
         consent: ConsentId,
     },
+}
+
+/// A new value for one of `limits`' settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Setting<T> {
+    /// The limit becomes this.
+    To(T),
+    /// The agent has no limit of its own: `turns=off` or `hops=off`.
+    Off,
 }
 
 /// `skill add` and `skill rm`.

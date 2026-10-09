@@ -414,6 +414,30 @@ async fn room_info_reads_the_type_and_members() {
 }
 
 #[tokio::test]
+async fn a_room_is_found_by_its_name() {
+    let fake = FakeRest::start().await;
+    fake.add_room("C1", "c", "general");
+    fake.add_room("G1", "p", "secret");
+    let client = manager(&fake);
+    let info = client.room_by_name("general").await.unwrap();
+    assert_eq!(info.id.as_str(), "C1");
+    assert_eq!(info.room_type, RoomType::Channel);
+    assert_eq!(
+        client.room_by_name("nope").await,
+        Err(SurfaceError::NotFound("error-room-not-found".into()))
+    );
+    let as_bot = bot(&client, "helper").await;
+    assert!(matches!(
+        as_bot.room_by_name("secret").await,
+        Err(SurfaceError::Forbidden(_))
+    ));
+    assert_eq!(
+        as_bot.room_by_name("general").await.unwrap().id.as_str(),
+        "C1"
+    );
+}
+
+#[tokio::test]
 async fn room_info_not_allowed_is_forbidden() {
     let fake = FakeRest::start().await;
     fake.add_room("G1", "p", "secret");

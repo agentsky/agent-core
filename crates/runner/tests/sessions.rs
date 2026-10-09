@@ -13,8 +13,8 @@ use core_types::{
 };
 use futures::stream::{BoxStream, StreamExt};
 use runner::{
-    HookError, PoolConfig, ProcessConfig, ProcessEnv, RunnerError, Session, SessionConfig,
-    SessionManager, SessionStart, TurnHooks, TurnOutcome, TurnReport, TurnRequest,
+    CostUnknown, HookError, PoolConfig, ProcessConfig, ProcessEnv, RunnerError, Session,
+    SessionConfig, SessionManager, SessionStart, TurnHooks, TurnOutcome, TurnReport, TurnRequest,
 };
 use sandbox::{
     ChildIo, Container, ContainerEvent, ContainerId, ManagedContainer, ProcessSandbox, Sandbox,
@@ -23,6 +23,7 @@ use sandbox::{
 use secrecy::SecretString;
 use sqlx::Connection as _;
 use store::{Sealer, Store};
+use testkit::claude::REPLY_COST_USD;
 use testkit::{FakeAnthropic, Logs, TempDir, Turn};
 use tokio::sync::Notify;
 
@@ -454,6 +455,13 @@ fn request(message: &str) -> TurnRequest {
     }
 }
 
+fn result(report: &TurnReport<TurnId>) -> &runner::TurnResult {
+    match &report.outcome {
+        TurnOutcome::Finished(result) => result,
+        other => panic!("expected a result, got {other:?}"),
+    }
+}
+
 fn reply(report: &TurnReport<TurnId>) -> &str {
     match &report.outcome {
         TurnOutcome::Finished(result) if !result.is_error => result.result.as_deref().unwrap(),
@@ -674,6 +682,79 @@ async fn an_idle_reap_then_a_message_resumes_and_keeps_the_transcript() {
     assert_eq!(reply(&second), "second");
     assert_eq!(second.process_start, Some(SessionStart::Resume));
     assert_eq!(h.transcript(&session), ["one", "two"]);
+}
+
+#[tokio::test]
+async fn a_resumed_process_bills_its_first_turn_without_the_restored_total() {
+    let h = Harness::with(
+        &[
+            Turn::reply("first"),
+            Turn::reply("second"),
+            Turn::crash(),
+            Turn::reply("fourth"),
+        ],
+        |_, pool| pool.idle_timeout_secs = 1,
+    )
+    .await;
+    let session = h.thread_session("1.1").await;
+    let first = h.run(session.id, request("one")).await;
+    assert_eq!(result(&first).cost_usd, Ok(REPLY_COST_USD));
+    eventually("the idle container is reaped", || {
+        !h.manager.is_warm(session.id)
+    })
+    .await;
+
+    let second = h.run(session.id, request("two")).await;
+    assert_eq!(second.process_start, Some(SessionStart::Resume));
+    let resumed = result(&second);
+    assert_eq!(
+        resumed.process_total_cost_usd,
+        Some(2.0 * REPLY_COST_USD),
+        "the CLI restored the total its first process saved when it stopped"
+    );
+    assert_eq!(
+        resumed.cost_usd,
+        Ok(REPLY_COST_USD),
+        "the turn is billed only its own cost"
+    );
+
+    let crashed = h.run(session.id, request("three")).await;
+    assert!(matches!(crashed.outcome, TurnOutcome::Crashed { .. }));
+    eventually("the idle container is reaped", || {
+        !h.manager.is_warm(session.id)
+    })
+    .await;
+    let fourth = h.run(session.id, request("four")).await;
+    assert_eq!(fourth.process_start, Some(SessionStart::Resume));
+    let after_crash = result(&fourth);
+    assert_eq!(
+        after_crash.process_total_cost_usd,
+        Some(2.0 * REPLY_COST_USD),
+        "a crashed process saves nothing, so the first process's total is restored again"
+    );
+    assert_eq!(after_crash.cost_usd, Ok(REPLY_COST_USD));
+}
+
+#[tokio::test]
+async fn a_resume_in_a_container_kept_from_an_earlier_process_has_no_cost() {
+    let h = Harness::new(&[Turn::reply("first"), Turn::crash(), Turn::reply("third")]).await;
+    let session = h.thread_session("1.1").await;
+    let first = h.run(session.id, request("one")).await;
+    assert_eq!(result(&first).cost_usd, Ok(REPLY_COST_USD));
+    let crashed = h.run(session.id, request("two")).await;
+    assert!(matches!(crashed.outcome, TurnOutcome::Crashed { .. }));
+    let third = h.run(session.id, request("three")).await;
+    assert_eq!(third.process_start, Some(SessionStart::Resume));
+    assert!(
+        !h.events().contains(&Event::ContainerStopped(session.id)),
+        "the container outlived the crashed process"
+    );
+    assert_eq!(
+        result(&third).cost_usd,
+        Err(CostUnknown::ReusedContainer),
+        "a process the agent left in the container could have changed the transcript after \
+         the runner read it"
+    );
 }
 
 #[tokio::test]
