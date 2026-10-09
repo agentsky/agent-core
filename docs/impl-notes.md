@@ -498,6 +498,12 @@ forever.
 The plan-after-lock test waits for the profile request and checks 2 s after
 it.
 
+agentd's `a_stalled_body_does_not_hold_up_shutdown` slept 200 ms and
+assumed its client had sent its partial request by then; a client thread
+that started late found the listener closed. The test layers the public
+routes with a hook that signals each request, and stops agentd once the
+request has reached them.
+
 ## T05: store
 
 ### The key reaches the store through `open`
@@ -3202,3 +3208,186 @@ must map a store error to `None`, never to `Some(None)`. The test of the
 thread-starter half of the hop billing rule now attributes the thread root
 to the linked owner's turn, so billing the thread starter would run on the
 owner's credential instead of giving the link prompt.
+
+## T28: Slack ingress
+
+### The manager binding needs a `BindingId`
+
+**Issue.** `InboundEvent::binding` is a `BindingId`, a UUID, but the plan
+gives the manager app the fixed path segment `manager`, and the manager has no
+row in `agent_bindings` (its secret comes from configuration).
+
+**Solution.** `surface_slack::BindingRef` is `Manager` or `Agent(BindingId)`,
+parsed from the path: `manager`, or a binding id in canonical lowercase form;
+anything else is 404 without a lookup. Manager events carry
+`BindingRef::MANAGER_ID`, the nil UUID, which agentd never mints for an agent
+(the parser refuses it as an agent path too). Deduplication sources use the
+path form, so the manager's are `slack:manager…`.
+
+### Signing secret and bot user come from one lookup
+
+**Issue.** The plan's `SigningSecrets` trait returns a secret, but
+normalization also needs the binding's bot user id to keep channel messages
+that mention it, and T31 needs a binding in state `creating` to answer
+`url_verification` before any secret exists.
+
+**Solution.** `SigningSecrets::lookup(BindingRef)` returns
+`Option<SlackApp { signing_secret: Option<SecretString>, bot_user:
+Option<UserId> }>`. `None` is 404. A known binding without a secret answers
+only the challenge, and everything else gets 401. Without a bot user, channel
+messages pass only as thread replies; the manager has none until T30 reads it
+with `auth.test`, which doesn't matter while it subscribes only to
+`message.im`. agentd's `ConfigSigningSecrets` knows only the manager; T31
+adds the store-backed agent bindings in front of it.
+
+### Where the ack ends and processing begins
+
+**Issue.** The plan says handlers enqueue and return 200 at once, and
+deduplicate through the store. A store write before the ack could wait up to
+SQLite's 5-second `busy_timeout` and miss Slack's 3 seconds, and the plan
+doesn't say what a full queue does.
+
+**Solution.** The handler does only what needs no I/O beyond the secret
+lookup: read the body (at most 1 MiB), verify, parse, and `try_send` into a
+bounded queue. A full or closed queue answers 503; Slack retries an event
+that gets one, but not a slash command or an interaction, whose user sees
+Slack's error. The handler never waits for the queue. `Queue::run` then
+deduplicates through the `Dedup` trait (agentd's `StoreDedup` over
+`mark_event_processed`), normalizes, and sends `SlackInbound` items, one at
+a time and in order, to a `core_types::Sender`. A failed dedup write drops
+the request rather than risk a duplicate turn. Until T29 and T30 consume
+it, agentd's sink (`Unrouted`) logs each item's binding and kind and drops
+it. agentd runs the queue as a `server::Worker` next to the listeners:
+`Routers` gained a `workers` field, and the queue ends once the public
+listener's router is dropped, so every acknowledged request still queued
+at shutdown is passed to the sink within the drain timeout, unless the
+timeout runs out first. That doesn't make it answered: a sink that has
+stopped taking work by then drops it, as the turn pipeline does once it is
+closed (T23). An acknowledged request is lost if agentd dies before
+handling it, or if it reaches a sink that no longer takes it; Slack won't
+retry it.
+
+### Replays inside the five-minute window
+
+**Issue.** Signature verification with a five-minute window still lets a
+captured request be replayed within those minutes. Events are covered by
+`event_id` deduplication, but slash commands and interactivity have no id.
+
+**Solution.** Commands and interactions are deduplicated by their signature,
+lowercased (the verifier accepts either hex case, so an uppercased copy would
+otherwise pass), under `slack:<binding>:request`. Slack doesn't retry them, so
+a second copy is never legitimate. Timestamps are also refused when more than
+five minutes in the future, not only in the past.
+
+That Slack never retries an interactivity payload is unverified live. A
+retry would be signed again with a new timestamp, so its signature differs
+and it would run twice. T31's live check records whether Slack retries one.
+
+### Current Slack apps post without a subtype
+
+**Issue.** The plan ignores every subtype but `file_share` and
+`thread_broadcast`, and describes bot events without a `user` field. In the
+payloads of Slack's SDK test suites (`slackapi/bolt-python`
+`tests/scenario_tests/test_message_bot.py`), a current app's bot post has no
+subtype, with `bot_id`, `bot_profile` and its bot user in `user`; the
+`bot_message` subtype, without `user`, is for classic integrations and
+`response_url` posts.
+
+**Solution.** Kept as the plan says: agent posts arrive with no subtype and a
+`user`, and `bot_message` is ignored. The "no `user`" rule still applies to a
+bot event that passes the subtype filter (a fixture covers one). T32 should
+record which shape another agent's post has.
+
+### Mentions typed inside a rich-text block
+
+**Issue.** "Mentions come from `<@U…>` tokens in the text and in `blocks`"
+could be read as scanning every string in the blocks. In a `rich_text` block,
+a member who types `<@U123>` literally gets a `text` element holding it,
+while a real mention is a `user` element (and the message `text` escapes the
+literal as `&lt;@U123&gt;`).
+
+**Solution.** Mentions are the tokens in `text`, the `user` elements of
+`rich_text` blocks, and the tokens in `mrkdwn` text objects (section and
+context blocks, which bots post). `plain_text` and rich-text `text` elements
+are not scanned. Each user appears once, in order of first appearance; the
+ids already seen are kept in a `HashSet`, since a 40,000-character message
+can carry thousands of mentions.
+
+### A misspelled manager secret went unnoticed
+
+**Issue.** T10 accepts any `AGENTD_SLACK_MANAGER_<NAME>`, so a misspelled
+`…_SIGNING_SECRET` would silently leave the manager binding unknown.
+
+**Solution.** When any `AGENTD_SLACK_MANAGER_*` variable is set,
+`AGENTD_SLACK_MANAGER_SIGNING_SECRET` must be too; the error asks whether one
+is misspelled. The manager is known exactly when the secret is set, and
+agentd logs at startup which it is.
+
+T10's rule for other `AGENTD_*` variables still applies around it: near
+misses of the prefix are refused, and names nobody reads land in
+`Config::unknown_env`. Kubernetes service links are now recognized before
+the Slack prefix, because a Service named `agentd-slack-manager` would set
+`AGENTD_SLACK_MANAGER_PORT` and `…_SERVICE_HOST`; read as secrets, those
+would fail this check (or become junk entries next to the signing secret).
+No Slack secret's name ends like a service link.
+
+### Slack's `ssl_check` is unsigned
+
+**Issue.** The plan lets only `url_verification` skip the signature. Slack
+also posts `ssl_check=1` (with the legacy verification token) to a slash
+command's URL to check its certificate, unsigned; agentd answered it 401, or
+400 when signed, since it isn't a command form. Bolt for JavaScript and for
+Python answer it with 200 before verifying.
+
+**Solution.** On `/commands`, a known binding answers a form whose
+`ssl_check` is exactly `1` with an empty 200 before the signature check,
+reading nothing else and queueing nothing, like the challenge echo. The
+design's transport bullet and the plan name it as the second exception.
+
+### Unaddressed messages cost a store write each
+
+**Issue.** Agent apps receive every message in their channels, and
+`Queue::run` recorded each event's `event_id` in `processed_events` (kept for
+seven days) before normalization dropped the unaddressed ones: a store write
+per channel message per agent.
+
+**Solution.** `message` events are normalized first, which is pure, and a
+dropped one costs no I/O. A kept message is deduplicated only by
+`<channel>:<ts>` under `slack:<binding>:message`, which catches Slack's
+retries as well as the event_id key did, so messages no longer write an
+`event_id` row. Other events are still deduplicated by `event_id`.
+
+### A slow body held up shutdown
+
+**Issue.** Nothing bounded the secret lookup or the body read before the
+ack. A client that sent headers and then trickled or withheld the body kept
+its connection in flight, so a graceful shutdown waited the whole drain
+timeout for it.
+
+**Solution.** The handler every route goes through gives the lookup and the
+body read one shared deadline, `PRE_ACK_TIMEOUT` (2 seconds, inside Slack's
+3): 503 if the lookup is still running, 408 if the body hasn't arrived.
+
+### Refusals before verification are throttled in the log
+
+**Issue.** Anyone can send unsigned or forged requests and challenges, and
+each was logged at warn or info, so a flood of them floods the log.
+
+**Solution.** Like agentd's `RefuseSubnet`, the ingress logs such refusals
+(bad signature, no secret yet, body refused or too slow) as a warning at most
+once per `WARNING_INTERVAL` (a minute), with how many went quiet since, and
+the rest at debug level. Answered challenges are throttled the same way at
+info level. `ssl_check` is logged at debug level only.
+
+### A trailing newline in a secret failed every request
+
+**Issue.** T10's `secret()` refused only empty or all-white-space values. A
+signing secret mounted from a file with a trailing newline was accepted, and
+every Slack request then failed verification with 401.
+
+**Solution.** Every secret read from the environment (`AGENTD_MASTER_KEY`,
+`AGENTD_RC_MANAGER_TOKEN` and `AGENTD_SLACK_MANAGER_*`) is refused at startup
+when it starts or ends with white space; the error names the variable, never
+the value. That includes the master key, whose base64 decoding (T05) would
+have ignored the newline: the rule is simpler kept the same for all secrets,
+and `export AGENTD_MASTER_KEY="$(agentd gen-key)"` strips the newline anyway.
