@@ -18,7 +18,10 @@
 //! `ctl_tokens`, with the session, agent, volume and container address it
 //! was issued for. [`purge`](Ctl::purge) deletes every token and scope lock
 //! at startup: the containers they belong to are reaped then, and Docker
-//! can give their addresses to new containers.
+//! can give their addresses to new containers. For the same reason, issuing
+//! a token replaces any other bound to the same address, so a token whose
+//! revocation failed when its container stopped can't be presented from the
+//! next container given that address.
 //!
 //! # Requests
 //!
@@ -61,7 +64,9 @@ use store::{CtlPurged, CtlTurn, NewCtlToken, Store, StoreError, TokenHash};
 use crate::consents::{ConsentSettings, Consents};
 
 pub use api::{DEFAULT_HISTORY_LIMIT, JSON_BODY_LIMIT, MAX_HISTORY_LIMIT};
-pub use outbox::{MAX_ATTACHMENTS, MAX_POSTS, MAX_REACTIONS, Outbox, QueuedPost, QueuedReaction};
+pub use outbox::{
+    MAX_ATTACHMENTS, MAX_HAND_OFFS, MAX_POSTS, MAX_REACTIONS, Outbox, QueuedPost, QueuedReaction,
+};
 pub use store::CtlTurn as Turn;
 pub use token::ProcessToken;
 
@@ -272,8 +277,9 @@ impl Ctl {
     /// Mints the token of a new `claude` process, for its `AGENTCTL_TOKEN`.
     ///
     /// No turn is running on it yet. A token already issued for the same
-    /// session is revoked, with the session's leases: a session runs one
-    /// process at a time.
+    /// session, or bound to the same container address, is revoked, with
+    /// its session's leases and its turn's outbox: a session runs one
+    /// process at a time, and an address holds one container at a time.
     ///
     /// # Errors
     ///
@@ -337,8 +343,10 @@ impl Ctl {
     }
 
     /// Clears the token's turn, so it authorizes nothing until the next
-    /// [`begin_turn`](Self::begin_turn), and returns what the turn queued.
-    /// `None` if no turn was running, or the token was revoked.
+    /// [`begin_turn`](Self::begin_turn), and returns what the turn queued
+    /// whenever it still holds the outbox, even if the token was revoked
+    /// concurrently. `None` if no turn was running, or a revocation already
+    /// dropped the outbox.
     ///
     /// Requests still in flight when it returns are refused, and what they
     /// staged is deleted. The session's `shared/` leases are deleted with

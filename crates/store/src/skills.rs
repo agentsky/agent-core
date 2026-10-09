@@ -1,10 +1,14 @@
 //! `agent_skills`: the skills owners added to their agents, and the hosts
-//! each lets the agent's sandboxes reach.
+//! each lets the agent's sandboxes reach; and `skill_leases`, which keep
+//! one writer at a time on each agent's skill name.
 
-use core_types::{AgentId, MemberId, SessionId};
+use std::time::Duration;
+
+use core_types::{AgentId, LeaseId, MemberId, SessionId};
+use sqlx::SqliteConnection;
 use time::OffsetDateTime;
 
-use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
+use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix, ttl_seconds};
 
 const TABLE: &str = "agent_skills";
 
@@ -52,6 +56,8 @@ pub struct AgentSkill {
     pub source: String,
     /// The host rules its sandboxes may reach, as written.
     pub hosts: Vec<String>,
+    /// A digest of its files as added.
+    pub digest: String,
     /// The member who added it.
     pub added_by: MemberId,
     /// When it was added.
@@ -70,6 +76,8 @@ pub struct NewSkill<'a> {
     /// The host rules its sandboxes may reach. None of them may hold a line
     /// break.
     pub hosts: &'a [String],
+    /// A digest of its files.
+    pub digest: &'a str,
     /// The member adding it.
     pub added_by: MemberId,
 }
@@ -81,6 +89,7 @@ struct Row {
     state: String,
     source: String,
     hosts: String,
+    digest: String,
     added_by: String,
     added_at: i64,
 }
@@ -93,6 +102,7 @@ impl Row {
             state: SkillState::parse(&self.state)?,
             source: self.source,
             hosts: split_hosts(&self.hosts),
+            digest: self.digest,
             added_by: parse_column(&self.added_by, TABLE, "added_by")?,
             added_at: from_unix(self.added_at, TABLE, "added_at")?,
         })
@@ -107,10 +117,34 @@ fn split_hosts(hosts: &str) -> Vec<String> {
         .collect()
 }
 
+/// Fails with [`StoreError::SkillLeaseLost`] unless `lease` is the lease
+/// on the agent's skill `name`, unexpired at `now`. Run first in a
+/// `BEGIN IMMEDIATE` transaction, it holds for the transaction's writes:
+/// no other connection can take the lease over until it ends.
+async fn hold_lease(
+    conn: &mut SqliteConnection,
+    agent: &str,
+    name: &str,
+    lease: LeaseId,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let held: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM skill_leases \
+         WHERE agent_id = ? AND name = ? AND lease_id = ? AND expires_at > ?",
+    )
+    .bind(agent)
+    .bind(name)
+    .bind(lease.to_string())
+    .bind(to_unix(now))
+    .fetch_optional(conn)
+    .await?;
+    held.map(drop).ok_or(StoreError::SkillLeaseLost)
+}
+
 /// The columns every query reads, in [`Row`]'s order.
 macro_rules! columns {
     () => {
-        "agent_id, name, state, source, hosts, added_by, added_at"
+        "agent_id, name, state, source, hosts, digest, added_by, added_at"
     };
 }
 
@@ -124,13 +158,16 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::Database`] if the agent or member doesn't exist, a
-    /// host holds a line break, or the query fails.
+    /// host holds a line break, or the query fails;
+    /// [`StoreError::SkillLeaseLost`] unless `lease` is the skill's lease,
+    /// unexpired at `now`.
     pub async fn put_skill(
         &self,
         skill: &NewSkill<'_>,
         state: SkillState,
         max_skills: usize,
         now: OffsetDateTime,
+        lease: LeaseId,
     ) -> Result<bool> {
         if skill.hosts.iter().any(|host| host.contains(['\n', '\r'])) {
             return Err(StoreError::Database(sqlx::Error::Protocol(
@@ -139,6 +176,7 @@ impl Store {
         }
         let agent = skill.agent.to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        hold_lease(&mut tx, &agent, skill.name, lease, now).await?;
         let others: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT name) FROM agent_skills WHERE agent_id = ? AND name <> ?",
         )
@@ -157,16 +195,19 @@ impl Store {
                 .await?;
         }
         sqlx::query(
-            "INSERT INTO agent_skills (agent_id, name, state, source, hosts, added_by, added_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+            "INSERT INTO agent_skills \
+             (agent_id, name, state, source, hosts, digest, added_by, added_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (agent_id, name, state) DO UPDATE SET source = excluded.source, \
-             hosts = excluded.hosts, added_by = excluded.added_by, added_at = excluded.added_at",
+             hosts = excluded.hosts, digest = excluded.digest, added_by = excluded.added_by, \
+             added_at = excluded.added_at",
         )
         .bind(&agent)
         .bind(skill.name)
         .bind(state.as_str())
         .bind(skill.source)
         .bind(skill.hosts.join("\n"))
+        .bind(skill.digest)
         .bind(skill.added_by.to_string())
         .bind(to_unix(now))
         .execute(&mut *tx)
@@ -182,10 +223,18 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails.
-    pub async fn confirm_skill(&self, shown: &AgentSkill) -> Result<Option<AgentSkill>> {
+    /// [`StoreError::Database`] if the query fails;
+    /// [`StoreError::SkillLeaseLost`] unless `lease` is the skill's lease,
+    /// unexpired at `now`.
+    pub async fn confirm_skill(
+        &self,
+        shown: &AgentSkill,
+        lease: LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<Option<AgentSkill>> {
         let agent = shown.agent.to_string();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        hold_lease(&mut tx, &agent, &shown.name, lease, now).await?;
         let matched: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM agent_skills \
              WHERE agent_id = ? AND name = ? AND state = 'pending' AND hosts = ? AND added_at = ?",
@@ -227,24 +276,31 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
-    /// if a row doesn't parse.
+    /// if a row doesn't parse, [`StoreError::SkillLeaseLost`] unless
+    /// `lease` is the skill's lease, unexpired at `now`.
     pub async fn delete_skill(
         &self,
         agent: AgentId,
         name: &str,
         state: Option<SkillState>,
+        lease: LeaseId,
+        now: OffsetDateTime,
     ) -> Result<Vec<AgentSkill>> {
+        let agent = agent.to_string();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        hold_lease(&mut tx, &agent, name, lease, now).await?;
         let rows: Vec<Row> = sqlx::query_as(concat!(
             "DELETE FROM agent_skills WHERE agent_id = ? AND name = ? \
              AND (? IS NULL OR state = ?) RETURNING ",
             columns!()
         ))
-        .bind(agent.to_string())
+        .bind(&agent)
         .bind(name)
         .bind(state.map(SkillState::as_str))
         .bind(state.map(SkillState::as_str))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         let mut deleted = rows
             .into_iter()
             .map(Row::into_skill)
@@ -271,43 +327,42 @@ impl Store {
         rows.into_iter().map(Row::into_skill).collect()
     }
 
-    /// The host rules of the active skills of `session`'s agent, as
-    /// written: what the egress proxy adds to that session's allowlist.
-    /// Empty for an unknown session or a deleted agent.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::Database`] if the query fails.
-    pub async fn skill_hosts_for_session(&self, session: SessionId) -> Result<Vec<String>> {
-        let hosts: Vec<String> = sqlx::query_scalar(
-            "SELECT k.hosts FROM agent_skills k \
-             JOIN sessions s ON s.agent_id = k.agent_id \
-             JOIN agents a ON a.id = k.agent_id \
-             WHERE s.id = ? AND k.state = 'active' AND a.state <> 'deleted' AND k.hosts <> ''",
-        )
-        .bind(session.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        let mut rules: Vec<String> = hosts.iter().flat_map(|h| split_hosts(h)).collect();
-        rules.sort();
-        rules.dedup();
-        Ok(rules)
-    }
-
-    /// Deletes every pending skill added before `before`, and returns which
-    /// agent and name each was.
+    /// The active skills of `session`'s agent that declare hosts: what the
+    /// egress proxy may add to that session's allowlist. Empty for an
+    /// unknown session or a deleted agent.
     ///
     /// # Errors
     ///
     /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
     /// if a row doesn't parse.
-    pub async fn delete_pending_skills_before(
+    pub async fn active_skills_for_session(&self, session: SessionId) -> Result<Vec<AgentSkill>> {
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT k.agent_id, k.name, k.state, k.source, k.hosts, k.digest, k.added_by, \
+             k.added_at FROM agent_skills k \
+             JOIN sessions s ON s.agent_id = k.agent_id \
+             JOIN agents a ON a.id = k.agent_id \
+             WHERE s.id = ? AND k.state = 'active' AND a.state <> 'deleted' AND k.hosts <> '' \
+             ORDER BY k.name",
+        )
+        .bind(session.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Row::into_skill).collect()
+    }
+
+    /// The agent and name of every pending skill added before `before`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if a row doesn't parse.
+    pub async fn pending_skills_before(
         &self,
         before: OffsetDateTime,
     ) -> Result<Vec<(AgentId, String)>> {
         let rows: Vec<(String, String)> = sqlx::query_as(
-            "DELETE FROM agent_skills WHERE state = 'pending' AND added_at < ? \
-             RETURNING agent_id, name",
+            "SELECT agent_id, name FROM agent_skills WHERE state = 'pending' AND added_at < ? \
+             ORDER BY agent_id, name",
         )
         .bind(to_unix(before))
         .fetch_all(&self.pool)
@@ -315,6 +370,107 @@ impl Store {
         rows.into_iter()
             .map(|(agent, name)| Ok((parse_column(&agent, TABLE, "agent_id")?, name)))
             .collect()
+    }
+
+    /// Deletes the agent's pending skill `name` if it was added before
+    /// `before`, and returns whether it did.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails,
+    /// [`StoreError::SkillLeaseLost`] unless `lease` is the skill's lease,
+    /// unexpired at `now`.
+    pub async fn delete_pending_skill_before(
+        &self,
+        agent: AgentId,
+        name: &str,
+        before: OffsetDateTime,
+        lease: LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        let agent = agent.to_string();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        hold_lease(&mut tx, &agent, name, lease, now).await?;
+        let result = sqlx::query(
+            "DELETE FROM agent_skills \
+             WHERE agent_id = ? AND name = ? AND state = 'pending' AND added_at < ?",
+        )
+        .bind(&agent)
+        .bind(name)
+        .bind(to_unix(before))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Takes the lease on the agent's skill `name` at `now`, until
+    /// `now + ttl`, unless another lease on it runs past `now`. Returns the
+    /// lease, to release, or `None` if it is held.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn acquire_skill_lease(
+        &self,
+        agent: AgentId,
+        name: &str,
+        now: OffsetDateTime,
+        ttl: Duration,
+    ) -> Result<Option<LeaseId>> {
+        let lease = LeaseId::new_v4();
+        let now = to_unix(now);
+        let granted: Option<String> = sqlx::query_scalar(
+            "INSERT INTO skill_leases (agent_id, name, lease_id, expires_at) VALUES (?, ?, ?, ?) \
+             ON CONFLICT (agent_id, name) DO UPDATE SET lease_id = excluded.lease_id, \
+             expires_at = excluded.expires_at WHERE skill_leases.expires_at <= ? \
+             RETURNING lease_id",
+        )
+        .bind(agent.to_string())
+        .bind(name)
+        .bind(lease.to_string())
+        .bind(now.saturating_add(ttl_seconds(ttl)))
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(granted.map(|_| lease))
+    }
+
+    /// Deletes every skill lease that ended by `now`, such as those a crash
+    /// left on names nothing changes again, and returns how many.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn delete_ended_skill_leases(&self, now: OffsetDateTime) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM skill_leases WHERE expires_at <= ?")
+            .bind(to_unix(now))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Gives up `lease` on the agent's skill `name`. Returns false,
+    /// changing nothing, if it isn't the lease held on it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn release_skill_lease(
+        &self,
+        agent: AgentId,
+        name: &str,
+        lease: LeaseId,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM skill_leases WHERE agent_id = ? AND name = ? AND lease_id = ?",
+        )
+        .bind(agent.to_string())
+        .bind(name)
+        .bind(lease.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -325,12 +481,29 @@ mod tests {
     use super::*;
     use crate::test_util::{agent, at, member_key, memory_store};
 
+    /// Takes the lease on `agent`'s skill `name` from whoever holds it,
+    /// for every write a test makes at the times it uses.
+    async fn lease(store: &Store, agent: AgentId, name: &str) -> LeaseId {
+        sqlx::query("DELETE FROM skill_leases WHERE agent_id = ? AND name = ?")
+            .bind(agent.to_string())
+            .bind(name)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store
+            .acquire_skill_lease(agent, name, at(0), Duration::from_secs(1 << 20))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     fn skill<'a>(agent: AgentId, name: &'a str, hosts: &'a [String], by: MemberId) -> NewSkill<'a> {
         NewSkill {
             agent,
             name,
             source: "https://git.example/s.git",
             hosts,
+            digest: "d1",
             added_by: by,
         }
     }
@@ -351,6 +524,7 @@ mod tests {
                 SkillState::Active,
                 32,
                 at(10),
+                lease(&store, a, "gh").await,
             )
             .await
             .unwrap();
@@ -360,6 +534,7 @@ mod tests {
                 SkillState::Pending,
                 32,
                 at(20),
+                lease(&store, a, "gh").await,
             )
             .await
             .unwrap();
@@ -382,17 +557,45 @@ mod tests {
                 ..shown.clone()
             },
         ] {
-            assert_eq!(store.confirm_skill(&replaced).await.unwrap(), None);
+            assert_eq!(
+                store
+                    .confirm_skill(
+                        &replaced,
+                        lease(&store, replaced.agent, &replaced.name).await,
+                        at(30)
+                    )
+                    .await
+                    .unwrap(),
+                None
+            );
         }
         assert_eq!(store.agent_skills(a).await.unwrap(), rows);
-        let confirmed = store.confirm_skill(&shown).await.unwrap().unwrap();
+        let confirmed = store
+            .confirm_skill(
+                &shown,
+                lease(&store, shown.agent, &shown.name).await,
+                at(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(confirmed.state, SkillState::Active);
         assert_eq!(confirmed.hosts, hosts);
         let rows = store.agent_skills(a).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, SkillState::Active);
         assert_eq!(rows[0].hosts, hosts);
-        assert_eq!(store.confirm_skill(&shown).await.unwrap(), None);
+        assert_eq!(
+            store
+                .confirm_skill(
+                    &shown,
+                    lease(&store, shown.agent, &shown.name).await,
+                    at(30)
+                )
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -410,11 +613,18 @@ mod tests {
                 SkillState::Pending,
                 32,
                 at(10),
+                lease(&store, a, "gh").await,
             )
             .await
             .unwrap();
         store
-            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, 32, at(11))
+            .put_skill(
+                &skill(a, "gh", &[], owner),
+                SkillState::Active,
+                32,
+                at(11),
+                lease(&store, a, "gh").await,
+            )
             .await
             .unwrap();
         let rows = store.agent_skills(a).await.unwrap();
@@ -438,11 +648,23 @@ mod tests {
         let pypi = vec!["pypi.org".to_owned(), "api.github.com".to_owned()];
         let secret = vec!["secret.example".to_owned()];
         store
-            .put_skill(&skill(a, "gh", &gh, owner), SkillState::Active, 32, at(1))
+            .put_skill(
+                &skill(a, "gh", &gh, owner),
+                SkillState::Active,
+                32,
+                at(1),
+                lease(&store, a, "gh").await,
+            )
             .await
             .unwrap();
         store
-            .put_skill(&skill(a, "py", &pypi, owner), SkillState::Active, 32, at(1))
+            .put_skill(
+                &skill(a, "py", &pypi, owner),
+                SkillState::Active,
+                32,
+                at(1),
+                lease(&store, a, "py").await,
+            )
             .await
             .unwrap();
         store
@@ -451,6 +673,7 @@ mod tests {
                 SkillState::Pending,
                 32,
                 at(1),
+                lease(&store, a, "wait").await,
             )
             .await
             .unwrap();
@@ -460,6 +683,7 @@ mod tests {
                 SkillState::Active,
                 32,
                 at(1),
+                lease(&store, b, "b").await,
             )
             .await
             .unwrap();
@@ -477,13 +701,21 @@ mod tests {
             .unwrap()
             .session
             .id;
+        let granted = store.active_skills_for_session(session).await.unwrap();
         assert_eq!(
-            store.skill_hosts_for_session(session).await.unwrap(),
-            ["api.github.com", "pypi.org", "uploads.github.com"]
+            granted
+                .iter()
+                .map(|skill| (
+                    skill.name.as_str(),
+                    skill.hosts.clone(),
+                    skill.digest.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("gh", gh.clone(), "d1"), ("py", pypi.clone(), "d1")]
         );
         assert!(
             store
-                .skill_hosts_for_session(SessionId::new_v4())
+                .active_skills_for_session(SessionId::new_v4())
                 .await
                 .unwrap()
                 .is_empty()
@@ -491,7 +723,7 @@ mod tests {
         assert!(store.delete_agent(a, at(3)).await.unwrap());
         assert!(
             store
-                .skill_hosts_for_session(session)
+                .active_skills_for_session(session)
                 .await
                 .unwrap()
                 .is_empty()
@@ -508,7 +740,13 @@ mod tests {
         let a = agent(&store, owner, "helper").await;
         let hosts = vec!["api.github.com".to_owned()];
         store
-            .put_skill(&skill(a, "gh", &[], owner), SkillState::Active, 32, at(1))
+            .put_skill(
+                &skill(a, "gh", &[], owner),
+                SkillState::Active,
+                32,
+                at(1),
+                lease(&store, a, "gh").await,
+            )
             .await
             .unwrap();
         store
@@ -517,6 +755,7 @@ mod tests {
                 SkillState::Pending,
                 32,
                 at(5),
+                lease(&store, a, "gh").await,
             )
             .await
             .unwrap();
@@ -526,21 +765,49 @@ mod tests {
                 SkillState::Pending,
                 32,
                 at(50),
+                lease(&store, a, "late").await,
             )
             .await
             .unwrap();
         assert_eq!(
-            store.delete_pending_skills_before(at(10)).await.unwrap(),
+            store.pending_skills_before(at(10)).await.unwrap(),
             [(a, "gh".to_owned())]
         );
         assert!(
+            !store
+                .delete_pending_skill_before(
+                    a,
+                    "late",
+                    at(10),
+                    lease(&store, a, "late").await,
+                    at(60)
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
             store
-                .delete_skill(a, "gh", Some(SkillState::Pending))
+                .delete_pending_skill_before(a, "gh", at(10), lease(&store, a, "gh").await, at(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .delete_skill(
+                    a,
+                    "gh",
+                    Some(SkillState::Pending),
+                    lease(&store, a, "gh").await,
+                    at(60)
+                )
                 .await
                 .unwrap()
                 .is_empty()
         );
-        let deleted = store.delete_skill(a, "gh", None).await.unwrap();
+        let deleted = store
+            .delete_skill(a, "gh", None, lease(&store, a, "gh").await, at(60))
+            .await
+            .unwrap();
         assert_eq!(
             deleted
                 .iter()
@@ -548,9 +815,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(SkillState::Active, 0)]
         );
-        assert!(store.delete_skill(a, "gh", None).await.unwrap().is_empty());
+        assert!(
+            store
+                .delete_skill(a, "gh", None, lease(&store, a, "gh").await, at(60))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let deleted = store
-            .delete_skill(a, "late", Some(SkillState::Pending))
+            .delete_skill(
+                a,
+                "late",
+                Some(SkillState::Pending),
+                lease(&store, a, "late").await,
+                at(60),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -558,6 +837,143 @@ mod tests {
             [SkillState::Pending]
         );
         assert!(store.agent_skills(a).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_skill_lease_has_one_holder_until_released_or_expired() {
+        let store = memory_store().await;
+        let owner = store
+            .ensure_member(&member_key("o"), "o", at(1))
+            .await
+            .unwrap();
+        let a = agent(&store, owner, "helper").await;
+        let b = agent(&store, owner, "other").await;
+        let ttl = Duration::from_secs(60);
+        let first = store
+            .acquire_skill_lease(a, "gh", at(100), ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .acquire_skill_lease(a, "gh", at(159), ttl)
+                .await
+                .unwrap(),
+            None,
+            "held"
+        );
+        for (agent, name) in [(a, "py"), (b, "gh")] {
+            assert!(
+                store
+                    .acquire_skill_lease(agent, name, at(100), ttl)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{name}: one lease per agent and name"
+            );
+        }
+        assert!(
+            !store
+                .release_skill_lease(a, "gh", LeaseId::new_v4())
+                .await
+                .unwrap()
+        );
+        assert!(store.release_skill_lease(a, "gh", first).await.unwrap());
+        let second = store
+            .acquire_skill_lease(a, "gh", at(101), ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        let third = store
+            .acquire_skill_lease(a, "gh", at(161), ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(second, third, "an expired lease is taken over");
+        assert!(!store.release_skill_lease(a, "gh", second).await.unwrap());
+        assert!(store.release_skill_lease(a, "gh", third).await.unwrap());
+        assert_eq!(store.delete_ended_skill_leases(at(159)).await.unwrap(), 0);
+        assert_eq!(store.delete_ended_skill_leases(at(160)).await.unwrap(), 2);
+        assert!(
+            store
+                .acquire_skill_lease(a, "py", at(100), ttl)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_to_a_skill_need_its_unexpired_lease() {
+        let store = memory_store().await;
+        let owner = store
+            .ensure_member(&member_key("o"), "o", at(1))
+            .await
+            .unwrap();
+        let a = agent(&store, owner, "helper").await;
+        let hosts = vec!["api.github.com".to_owned()];
+        let new = skill(a, "gh", &hosts, owner);
+        let ttl = Duration::from_secs(60);
+        let held = store
+            .acquire_skill_lease(a, "gh", at(100), ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = store
+            .acquire_skill_lease(a, "py", at(100), ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        for lease in [LeaseId::new_v4(), other] {
+            assert!(matches!(
+                store
+                    .put_skill(&new, SkillState::Pending, 32, at(100), lease)
+                    .await,
+                Err(StoreError::SkillLeaseLost)
+            ));
+        }
+        assert!(
+            store
+                .put_skill(&new, SkillState::Pending, 32, at(100), held)
+                .await
+                .unwrap()
+        );
+        let rows = store.agent_skills(a).await.unwrap();
+        let shown = rows[0].clone();
+        assert!(matches!(
+            store.confirm_skill(&shown, held, at(160)).await,
+            Err(StoreError::SkillLeaseLost)
+        ));
+        assert!(matches!(
+            store.delete_skill(a, "gh", None, held, at(160)).await,
+            Err(StoreError::SkillLeaseLost)
+        ));
+        assert!(matches!(
+            store
+                .delete_pending_skill_before(a, "gh", at(200), held, at(160))
+                .await,
+            Err(StoreError::SkillLeaseLost)
+        ));
+        let successor = store
+            .acquire_skill_lease(a, "gh", at(160), ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                store.confirm_skill(&shown, held, at(150)).await,
+                Err(StoreError::SkillLeaseLost)
+            ),
+            "taken over"
+        );
+        assert_eq!(store.agent_skills(a).await.unwrap(), rows);
+        assert!(
+            store
+                .confirm_skill(&shown, successor, at(161))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -577,7 +993,13 @@ mod tests {
         ] {
             assert!(
                 store
-                    .put_skill(&skill(a, name, hosts, owner), state, 2, at(1))
+                    .put_skill(
+                        &skill(a, name, hosts, owner),
+                        state,
+                        2,
+                        at(1),
+                        lease(&store, a, name).await
+                    )
                     .await
                     .unwrap(),
                 "{name} {state:?}"
@@ -585,7 +1007,13 @@ mod tests {
         }
         assert!(
             !store
-                .put_skill(&skill(a, "three", &[], owner), SkillState::Active, 2, at(1))
+                .put_skill(
+                    &skill(a, "three", &[], owner),
+                    SkillState::Active,
+                    2,
+                    at(1),
+                    lease(&store, a, "three").await
+                )
                 .await
                 .unwrap()
         );
@@ -603,7 +1031,13 @@ mod tests {
         let hosts = vec!["a.example\nb.example".to_owned()];
         assert!(
             store
-                .put_skill(&skill(a, "x", &hosts, owner), SkillState::Active, 32, at(1))
+                .put_skill(
+                    &skill(a, "x", &hosts, owner),
+                    SkillState::Active,
+                    32,
+                    at(1),
+                    lease(&store, a, "x").await
+                )
                 .await
                 .is_err()
         );

@@ -120,19 +120,26 @@ pub struct HistoryResponse {
 /// `agentctl lock -- <command>`: one step of holding the scope's `shared/`
 /// lock while a command runs.
 ///
-/// The lock is a lease. [`LockRequest::Acquire`] grants a new lease with its
-/// own [`LeaseId`] when the lock is free; agentctl renews that lease while
-/// the command runs and releases it when the command exits. Renew and
-/// release name the lease, and only the current lease matches, so a second
-/// `agentctl lock` in the same session (Claude Code runs tool calls in
-/// parallel) waits like any other holder, and a stale release never frees
-/// the lock under someone else. A holder that dies stops renewing, and the
-/// lease expires.
+/// The lock is a lease. agentctl picks a new [`LeaseId`] for each `lock`
+/// and sends it with every [`LockRequest::Acquire`], which grants that
+/// lease when the lock is free or already held under it by the caller's
+/// session. So an attempt that agentd granted after agentctl stopped
+/// waiting for it is picked up by the next attempt instead of blocking it.
+/// agentctl renews the lease while the command runs and releases it when
+/// the command exits. Renew and release name the lease, and only the
+/// current lease matches, so a second `agentctl lock` in the same session
+/// (Claude Code runs tool calls in parallel) waits like any other holder,
+/// and a stale release never frees the lock under someone else. A holder
+/// that dies stops renewing, and the lease expires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum LockRequest {
-    /// Take the lock if it is free, under a new lease.
-    Acquire,
+    /// Take the lock under `lease` if it is free, or hold it again if the
+    /// caller's session already holds it under `lease`.
+    Acquire {
+        /// The lease agentctl picked for this `lock`.
+        lease: LeaseId,
+    },
     /// Extend a lease.
     Renew {
         /// The lease from [`LockResponse::Held`].
@@ -397,8 +404,8 @@ mod tests {
     fn lock_round_trips() {
         let lease: LeaseId = "67e55044-10b1-426f-9247-bb680e5fe0c8".parse().unwrap();
         assert_eq!(
-            json_round_trip(&LockRequest::Acquire),
-            json!({"op": "acquire"})
+            json_round_trip(&LockRequest::Acquire { lease }),
+            json!({"op": "acquire", "lease": lease.to_string()})
         );
         assert_eq!(
             json_round_trip(&LockRequest::Renew { lease }),

@@ -29,12 +29,14 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use commands::SkillName;
 use cred_proxy::HostRule;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 use crate::ctl::is_plain_file_name;
 
@@ -48,7 +50,11 @@ pub const MAX_DEPTH: usize = 16;
 pub const MAX_PATH_BYTES: usize = 1024;
 /// The largest `SKILL.md`.
 pub const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
-/// The largest front matter in a `SKILL.md`.
+/// The most bytes a `SKILL.md`'s front matter may take, from the start of
+/// the file through its closing `---` line, with a byte-order mark and both
+/// delimiter lines, their trailing whitespace and line ends counted. It is
+/// also all agentd reads of a skill's `SKILL.md` for its hosts once added,
+/// so every file the checks accept reads the same then.
 pub const MAX_FRONT_MATTER_BYTES: usize = 16 * 1024;
 /// The most hosts a skill may declare.
 pub const MAX_HOSTS: usize = 16;
@@ -205,20 +211,22 @@ enum Hosts {
 ///
 /// The [`Problem`] with it.
 pub fn parse_skill_file(text: &str) -> Result<Manifest, Problem> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.split_inclusive('\n');
-    if lines.next().map(str::trim_end) != Some("---") {
+    let first = lines.next().ok_or(Problem::NoFrontMatter)?;
+    if first.strip_prefix('\u{feff}').unwrap_or(first).trim_end() != "---" {
         return Err(Problem::NoFrontMatter);
     }
+    let mut used = first.len();
     let mut yaml = String::new();
     let mut closed = false;
     for line in lines {
+        used += line.len();
+        if used > MAX_FRONT_MATTER_BYTES {
+            return Err(Problem::NoFrontMatter);
+        }
         if line.trim_end() == "---" {
             closed = true;
             break;
-        }
-        if yaml.len() + line.len() > MAX_FRONT_MATTER_BYTES {
-            return Err(Problem::NoFrontMatter);
         }
         yaml.push_str(line);
     }
@@ -468,6 +476,49 @@ pub fn check_tree(root: &Path) -> Result<(), CheckError> {
         }
     }
     Ok(())
+}
+
+/// A digest of the skill directory `dir`, in hex: SHA-256 over each file's
+/// path within `dir`, in sorted order, and its bytes, each prefixed with
+/// its length. A tree [`check_tree`] passed holds only directories and
+/// plain files, and stays small enough to read whole.
+///
+/// # Errors
+///
+/// An I/O failure, such as `dir` missing.
+pub fn tree_digest(dir: &Path) -> Result<String, CheckError> {
+    let mut files = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(within) = stack.pop() {
+        for entry in fs::read_dir(dir.join(&within)).map_err(io("reading a skill's directory"))? {
+            let entry = entry.map_err(io("reading a skill's directory"))?;
+            let path = within.join(entry.file_name());
+            if entry
+                .file_type()
+                .map_err(io("reading a skill's file"))?
+                .is_dir()
+            {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        let bytes = fs::read(dir.join(&file)).map_err(io("reading a skill's file"))?;
+        let name = file.as_os_str().as_bytes();
+        for part in [name, &bytes[..]] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part);
+        }
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Finds the skill in `root`, a tree [`check_tree`] passed: `root` itself

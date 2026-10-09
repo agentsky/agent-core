@@ -106,6 +106,27 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_keys_each_count_their_own_quiet_events() {
+        let interval = Duration::from_secs(60);
+        let throttle = Throttle::new(interval);
+        let start = Instant::now();
+        assert_eq!(throttle.record("a", start), Some(0));
+        assert_eq!(throttle.record("a", start + Duration::from_secs(1)), None);
+        assert_eq!(throttle.record("a", start + Duration::from_secs(59)), None);
+        assert_eq!(
+            throttle.record("b", start + Duration::from_secs(2)),
+            Some(0)
+        );
+        assert_eq!(throttle.record("b", start + Duration::from_secs(3)), None);
+        assert_eq!(throttle.record("a", start + interval), Some(2));
+        assert_eq!(throttle.record("a", start + interval), None);
+        assert_eq!(
+            throttle.record("b", start + Duration::from_secs(200)),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn new_keys_stay_quiet_while_the_remembered_ones_are_all_recent() {
         let throttle = Throttle::new(Duration::from_secs(60));
         let start = Instant::now();
