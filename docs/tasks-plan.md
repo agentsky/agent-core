@@ -3144,8 +3144,9 @@ Deliverables:
       (T35c), the put either commits first, and the delete finds its row, or
       comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id, the URL origin
-    and the opened token. `cloud_routines(member)` lists labels, ids and
-    times, never tokens.
+    and the opened token, and from T35c the registration it read, which
+    `begin_cloud_handoff` checks is still stored. `cloud_routines(member)`
+    lists labels, ids and times, never tokens.
   - `delete_cloud_routine(member, label)`, and
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
@@ -3209,7 +3210,7 @@ Deliverables:
 Acceptance, as tests named after the rules:
 
 - `cloud_add_is_secret_bearing`.
-- `cloud_add_debug_redacts_the_token`.
+- `cloud_debug_names_the_command_and_holds_no_token_or_task`.
 - `a_cloud_add_that_fails_to_parse_is_secret_bearing`.
 - `routine_url_must_be_the_fire_endpoint` (user info, a query, a fragment,
   `.` and `..` segments, `%2e`, a missing `trig_`, other characters in the
@@ -3219,46 +3220,48 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
-- `a_routine_is_refused_without_a_claude_link`.
-- `a_handoff_is_refused_without_a_claude_link`.
+- `a_routine_is_refused_without_a_claude_link` (from T35c).
+- `a_handoff_is_refused_without_a_claude_link` (from T35c).
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`).
-- `finishing_a_deleted_handoff_is_a_no_op`.
+  `rejected`, and from T35c `Gone` for a deleted hand-off).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
 - `a_handoff_notice_is_given_up_after_a_day`.
 - `old_handoffs_are_purged`.
 
-Decided in T35a ([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
-`finish_cloud_handoff` takes a row that is `sending`, or `unknown` because
-the pass gave up on it (`unknown_reason` `no_answer`), once, and marks the
-notice done if it hasn't gone out; a late `unknown` keeps the row with its
-own reason. It refuses an `Unknown` whose reason is `NoAnswer` with
-`StoreError::Refused`, since only the pass sets it. `cloud_routines` also
-keeps the fire URL's origin (`url_origin`), which `put_cloud_routine`
-takes and T35c compares with `base_url`'s before each fire, parsing the
-stored origin rather than comparing strings. Sealed values are bound to
-the member as well as the row, and a token to its routine id, label and
-origin too; a label can't hold `:`. T35c answers a stored token that reads
-as `Corrupt` (one that no longer passes `RoutineToken::parse`) by asking
-the member to `cloud add` the routine again, which replaces the row
-without reading the old token. `cloud add`'s token must start with
-`sk-ant-` and be printable ASCII, checked once by
-`core_types::RoutineToken::parse`. `purge_cloud_handoffs(before, now)`
-keeps a row whose notice is still owed, and a `sending` row. The shared
-types are `core_types::RoutineId`, `RoutineToken`, `CloudRoutineId` and
-`CloudHandoffId`, and the store's `CloudOrigin`, `CloudHandoffState`,
-`CloudOutcome` (`retry_after_secs` a `u32`, and
-`Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
-`unknown_reason` column. T35b's `fire` takes a `RoutineId` and a
-`&RoutineToken` and can compare the opened routine's `url_origin` with
-`base_url`'s; T35c maps `FireOutcome` onto `CloudOutcome`.
-`RoutineUrl::origin()` is a `url::Origin`. A notice's mark needs a claim
-that was made, not the latest one; its deferral needs the latest.
+Decided in T35a
+([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
+`finish_cloud_handoff` takes a row that is `sending`, or `unknown`
+because the pass gave up on it (`unknown_reason` `no_answer`), once, and
+marks the notice done if it hasn't gone out; a late `unknown` keeps the
+row with its own reason. It refuses an `Unknown` whose reason is
+`NoAnswer` with `StoreError::Refused`, since only the pass sets it.
+`cloud_routines` also keeps the fire URL's origin (`url_origin`), which
+`put_cloud_routine` takes and T35c compares with `base_url`'s before
+each fire, parsing the stored origin rather than comparing strings.
+Sealed values are bound to the member as well as the row, and a token to
+its routine id, label and origin too; a label can't hold `:`. T35c
+answers a stored token that reads as `Corrupt` (one that no longer
+passes `RoutineToken::parse`) by asking the member to `cloud add` the
+routine again, which replaces the row without reading the old token.
+`cloud add`'s token must start with `sk-ant-` and be printable ASCII,
+checked once by `core_types::RoutineToken::parse`.
+`purge_cloud_handoffs(before, now)` keeps a row whose notice is still
+owed, and a `sending` row. The shared types are `core_types::RoutineId`,
+`RoutineToken`, `CloudRoutineId` and `CloudHandoffId`, and the store's
+`CloudOrigin`, `CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a
+`u32`, and `Unknown { status, reason }`) and `CloudUnknownReason`,
+stored in its own `unknown_reason` column. T35b's `fire` takes a
+`RoutineId` and a `&RoutineToken` and can compare the opened routine's
+`url_origin` with `base_url`'s; T35c maps `FireOutcome` onto
+`CloudOutcome`. The link checks (`CloudRoutinePut::Unlinked`,
+`CloudBegun`), the `per_hour` cap and the registration check land with
+T35c. `RoutineUrl::origin()` is a `url::Origin`. A notice's mark needs a
+claim that was made, not the latest one; its deferral needs the latest.
 `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the task, and
 the store hands a task back only as a `SecretString`. agentd's
 public-secret refusal has its `cloud add` arm already; the other `cloud`
