@@ -406,10 +406,21 @@ async fn bots_and_bindings_lead_to_their_agent() {
         Some("token-of-bot1".to_owned())
     );
 
+    assert_eq!(
+        store.agent_of_bot_user(&bot("bot1")).await.unwrap(),
+        Some(helper.id)
+    );
+    assert_eq!(store.agent_of_bot_user(&elsewhere).await.unwrap(), None);
+
     assert!(store.delete_agent(helper.id, at(1_100)).await.unwrap());
     assert_eq!(store.agent_for_bot(&bot("bot1")).await.unwrap(), None);
     assert_eq!(store.agent_for_binding(binding).await.unwrap(), None);
     assert!(store.bot_token(binding).await.unwrap().is_none());
+    assert_eq!(
+        store.agent_of_bot_user(&bot("bot1")).await.unwrap(),
+        Some(helper.id),
+        "a deleted agent's bot is still its"
+    );
 }
 
 #[tokio::test]

@@ -490,8 +490,15 @@ sandbox[^cc-bypass].
   fixed layout is for predictability and backups, not a resume requirement.
 - `cleanupPeriodDays` is raised from its 30-day default in each session's
   `settings.json` so idle threads keep their transcripts.
-- Each turn's user message carries only what the transcript lacks: thread
-  messages the agent did not answer, who is present, and surface hints. The
+- Each turn's user message carries only what the transcript lacks: the
+  thread's recent messages it hasn't been shown or posted, those said while
+  an earlier turn ran included,
+  messages agentd posted as the agent in the same thread from other sessions
+  (a private task's result, and its declined or expired outcomes, which
+  never enter the channel session's transcript; found in `MESSAGE_REF` by
+  agent, thread and another session, so other threads of the channel stay
+  out), who is present, and surface hints. Each message shown gets a short
+  id in the session, which is how the model names it to `agentctl`. The
   system prompt stays byte-identical across turns so prompt caching keeps
   working.
 - Volumes are snapshotted. Mirroring transcripts to the store is a later option
@@ -794,6 +801,8 @@ pub trait Surface: Send + Sync {
     async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef>;
     async fn edit(&self, msg: &MsgRef, text: &str) -> Result<()>;
     async fn react(&self, msg: &MsgRef, emoji: &str) -> Result<()>;
+    async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<()>;
+    async fn can_post(&self, conv: &ConvRef) -> Result<bool>;
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()>;
     async fn history(&self, thread: &ThreadKey, before: Option<Cursor>, limit: usize) -> Result<Vec<Msg>>;
     fn render(&self, markdown: &str) -> Vec<String>;
@@ -804,6 +813,11 @@ pub trait Surface: Send + Sync {
 `history` reads one thread (or a DM's top level), because both of its
 callers, the per-turn message and `agentctl history`, need a thread's
 messages, and neither platform can list a thread's replies without its root.
+`unreact` takes back the reaction that shows a turn is running. `can_post`
+says whether the bot may post in a conversation as it is: on Rocket.Chat,
+posting to a public channel joins the poster to it, so a bot posts, and
+uploads, only where it is a member already, and a mentioned agent whose bot
+isn't in the room doesn't answer there.
 
 Everything after `InboundEvent` is shared. Behavior differences go through
 `caps()` (buttons, edits, message size), never through surface-name checks in

@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    AgentId, BindingId, Cursor, InboundEvent, MemberKey, MessageId, MsgRef, ReplyTarget, ThreadKey,
+    AgentId, BindingId, ConvRef, Cursor, InboundEvent, MemberKey, MessageId, MsgRef, ReplyTarget,
+    ThreadKey,
 };
 
 /// The result type of [`Surface`] methods.
@@ -41,6 +42,19 @@ pub trait Surface: Send + Sync {
 
     /// Adds a reaction, named without colons (`eyes`).
     async fn react(&self, msg: &MsgRef, emoji: &str) -> Result<()>;
+
+    /// Removes a reaction the bot added, named without colons. Removing
+    /// one that isn't there succeeds.
+    async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<()>;
+
+    /// Whether the bot may post in `conv` as it is: whether it is a member
+    /// already. A platform where posting to a conversation joins the poster
+    /// to it (Rocket.Chat's public channels) checks membership, and
+    /// [`post`](Self::post) and [`upload`](Self::upload) refuse such a
+    /// conversation with [`SurfaceError::Forbidden`], so a bot never joins
+    /// a conversation it wasn't added to. Where posting never joins, the
+    /// platform refuses a post itself, and this answers true.
+    async fn can_post(&self, conv: &ConvRef) -> Result<bool>;
 
     /// Uploads files to a conversation or thread.
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()>;
@@ -396,6 +410,14 @@ mod tests {
             Err(SurfaceError::NotFound(msg.id.to_string()))
         }
 
+        async fn unreact(&self, _msg: &MsgRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
+            Ok(conv.conversation.as_str() != "elsewhere")
+        }
+
         async fn upload(&self, _to: &ReplyTarget, files: &[OutFile]) -> Result<()> {
             match files {
                 [] => Err(SurfaceError::Api("no_file_data".into())),
@@ -472,6 +494,11 @@ mod tests {
             ready(surface.react(&posted, "eyes")),
             Err(SurfaceError::NotFound(_))
         ));
+        assert_eq!(ready(surface.unreact(&posted, "eyes")), Ok(()));
+        assert_eq!(ready(surface.can_post(&conv())), Ok(true));
+        let mut other = conv();
+        other.conversation = "elsewhere".into();
+        assert_eq!(ready(surface.can_post(&other)), Ok(false));
         let file = OutFile {
             name: "a.txt".into(),
             path: PathBuf::from("/tmp/a.txt"),

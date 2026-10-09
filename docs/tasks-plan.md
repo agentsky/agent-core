@@ -1271,7 +1271,8 @@ Deliverables:
   and retries deactivations that failed
   ([impl-notes](impl-notes.md#connections-follow-the-store),
   [impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
-- Until T23, what isn't a command goes to `Acknowledge`: each active agent a
+- Until T23, and from then on when agentd runs no turns (no `[sandbox]`),
+  what isn't a command goes to `Acknowledge`: each active agent a
   person's message addresses reacts with `:eyes:`
   ([impl-notes](impl-notes.md#before-turns-a-bot-reacts-instead-of-replying)).
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
@@ -2345,7 +2346,8 @@ Deliverables:
   `cost_usd` holds the restored total too. This task takes it off, from that
   line read without following links and with its size capped, or from a
   total the runner keeps in `sessions` when a process exits cleanly
-  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)).
+  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)),
+  and makes `fake-claude` restore the total as the real CLI does.
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
@@ -2890,23 +2892,30 @@ Not scheduled. Each needs a decision before it becomes a task.
   first, since refusing a path the CLI needs breaks turns. Methods are
   already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
   `DELETE` and `OPTIONS`.
-- **Killing leftover processes at turn end.** T18 unpoints the placeholder
-  when a turn ends, so a background process the model left running can't
-  spend credentials between turns, and T21 recycles the session's container
-  when the requester changes, which ends every process running in it
+- **Processes a turn leaves running.** T18 unpoints the placeholder when a
+  turn ends, so a background process the model left running can't spend
+  credentials between turns, and T21 recycles the session's container when
+  the requester changes, which ends every process running in it
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
-  A leftover can still spend the credentials of its own requester's later
-  turns while they run; only killing the processes a turn leaves behind in
-  the container when it ends removes that. Files outlive the container: a
-  turn can leave something in the session's `home/`, `tmp/` or `claude/`
-  (a `.bashrc` the Bash tool's shells source, a `CLAUDE.md` the CLI loads
-  as user memory; `settings.json` is rewritten before each start), in
-  `work/` or `shared/`, or in the transcript, that runs or instructs code
-  in a later requester's process. Clearing `home/`, `tmp/` and everything
-  in `claude/` but the transcript and `settings.json` on a requester
-  change would close the first three, and putting `HOME` and `TMPDIR` on a
-  tmpfs of the container's own would close `home/` and `tmp/`; `work/`,
-  `shared/` and the transcript would still carry over.
+  What remains:
+  - A process left behind can still spend the credentials of its own
+    requester's later turns while they run, and act through `agentctl` on
+    them, and it can use the egress allowlist between turns. Killing what
+    a turn leaves behind has no clean boundary: the CLI stays running
+    between turns, the Bash tool's background shells are its children, a
+    job started with `&` is reparented to the container's init once its
+    shell exits, and the Docker sandbox kills a process by its pid alone.
+  - Files outlive the container. A turn can leave something in the
+    session's `home/`, `tmp/` or `claude/` (a `.bashrc` the Bash tool's
+    shells source, a `CLAUDE.md` the CLI loads as user memory;
+    `settings.json` is rewritten before each start), in `work/` or
+    `shared/`, such as a git hook, or in the transcript, that runs or
+    instructs code in a later requester's process. Clearing `home/`,
+    `tmp/` and everything in `claude/` but the transcript and
+    `settings.json` on a requester change would close the first three,
+    and putting `HOME` and `TMPDIR` on a tmpfs of the container's own
+    would close `home/` and `tmp/`; `work/`, `shared/` and the transcript
+    would still carry over.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
@@ -2920,6 +2929,17 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Steering** a running turn with a new message, instead of queueing it.
 - **Switching models over the stream-json control channel** instead of
   restarting the process.
+- **A refusal in the thread when a link read fails.** `StoreView::load`
+  (T23) propagates a failed `claude_links` read, so the whole load aborts:
+  nothing runs and a log line records the store error, but the thread gets
+  no answer. Having the view's link lookup (`is_linked`, `link_state` from
+  T26) answer `None` for a failed read, refused as `PolicyUnavailable` like
+  `member_for`, `is_banned` and `policy`, would answer the thread instead.
+  It changes the `RouterView` interface (T22) and its implementations in
+  T23 and T26 for a reply only, since the request already fails closed. A
+  failed read must never count as "not linked": from T26 a non-owner's turn
+  would then run on the community key when one is configured, and a broken
+  link would skip the relink prompt.
 - **Per-scope container cap tuning** from real usage (T21 sets a default).
 - **Fairness at the per-scope cap**, a follow-up to T21's pool. A session
   keeps its container while it has turns, so a busy session can hold its
