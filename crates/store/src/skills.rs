@@ -56,6 +56,8 @@ pub struct AgentSkill {
     pub source: String,
     /// The host rules its sandboxes may reach, as written.
     pub hosts: Vec<String>,
+    /// A digest of its files as added.
+    pub digest: String,
     /// The member who added it.
     pub added_by: MemberId,
     /// When it was added.
@@ -74,6 +76,8 @@ pub struct NewSkill<'a> {
     /// The host rules its sandboxes may reach. None of them may hold a line
     /// break.
     pub hosts: &'a [String],
+    /// A digest of its files.
+    pub digest: &'a str,
     /// The member adding it.
     pub added_by: MemberId,
 }
@@ -85,6 +89,7 @@ struct Row {
     state: String,
     source: String,
     hosts: String,
+    digest: String,
     added_by: String,
     added_at: i64,
 }
@@ -97,6 +102,7 @@ impl Row {
             state: SkillState::parse(&self.state)?,
             source: self.source,
             hosts: split_hosts(&self.hosts),
+            digest: self.digest,
             added_by: parse_column(&self.added_by, TABLE, "added_by")?,
             added_at: from_unix(self.added_at, TABLE, "added_at")?,
         })
@@ -138,7 +144,7 @@ async fn hold_lease(
 /// The columns every query reads, in [`Row`]'s order.
 macro_rules! columns {
     () => {
-        "agent_id, name, state, source, hosts, added_by, added_at"
+        "agent_id, name, state, source, hosts, digest, added_by, added_at"
     };
 }
 
@@ -189,16 +195,19 @@ impl Store {
                 .await?;
         }
         sqlx::query(
-            "INSERT INTO agent_skills (agent_id, name, state, source, hosts, added_by, added_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+            "INSERT INTO agent_skills \
+             (agent_id, name, state, source, hosts, digest, added_by, added_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (agent_id, name, state) DO UPDATE SET source = excluded.source, \
-             hosts = excluded.hosts, added_by = excluded.added_by, added_at = excluded.added_at",
+             hosts = excluded.hosts, digest = excluded.digest, added_by = excluded.added_by, \
+             added_at = excluded.added_at",
         )
         .bind(&agent)
         .bind(skill.name)
         .bind(state.as_str())
         .bind(skill.source)
         .bind(skill.hosts.join("\n"))
+        .bind(skill.digest)
         .bind(skill.added_by.to_string())
         .bind(to_unix(now))
         .execute(&mut *tx)
@@ -318,27 +327,27 @@ impl Store {
         rows.into_iter().map(Row::into_skill).collect()
     }
 
-    /// The host rules of the active skills of `session`'s agent, as
-    /// written: what the egress proxy adds to that session's allowlist.
-    /// Empty for an unknown session or a deleted agent.
+    /// The active skills of `session`'s agent that declare hosts: what the
+    /// egress proxy may add to that session's allowlist. Empty for an
+    /// unknown session or a deleted agent.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if the query fails.
-    pub async fn skill_hosts_for_session(&self, session: SessionId) -> Result<Vec<String>> {
-        let hosts: Vec<String> = sqlx::query_scalar(
-            "SELECT k.hosts FROM agent_skills k \
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if a row doesn't parse.
+    pub async fn active_skills_for_session(&self, session: SessionId) -> Result<Vec<AgentSkill>> {
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT k.agent_id, k.name, k.state, k.source, k.hosts, k.digest, k.added_by, \
+             k.added_at FROM agent_skills k \
              JOIN sessions s ON s.agent_id = k.agent_id \
              JOIN agents a ON a.id = k.agent_id \
-             WHERE s.id = ? AND k.state = 'active' AND a.state <> 'deleted' AND k.hosts <> ''",
+             WHERE s.id = ? AND k.state = 'active' AND a.state <> 'deleted' AND k.hosts <> '' \
+             ORDER BY k.name",
         )
         .bind(session.to_string())
         .fetch_all(&self.pool)
         .await?;
-        let mut rules: Vec<String> = hosts.iter().flat_map(|h| split_hosts(h)).collect();
-        rules.sort();
-        rules.dedup();
-        Ok(rules)
+        rows.into_iter().map(Row::into_skill).collect()
     }
 
     /// The agent and name of every pending skill added before `before`.
@@ -511,6 +520,7 @@ mod tests {
             name,
             source: "https://git.example/s.git",
             hosts,
+            digest: "d1",
             added_by: by,
         }
     }
@@ -708,13 +718,21 @@ mod tests {
             .unwrap()
             .session
             .id;
+        let granted = store.active_skills_for_session(session).await.unwrap();
         assert_eq!(
-            store.skill_hosts_for_session(session).await.unwrap(),
-            ["api.github.com", "pypi.org", "uploads.github.com"]
+            granted
+                .iter()
+                .map(|skill| (
+                    skill.name.as_str(),
+                    skill.hosts.clone(),
+                    skill.digest.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("gh", gh.clone(), "d1"), ("py", pypi.clone(), "d1")]
         );
         assert!(
             store
-                .skill_hosts_for_session(SessionId::new_v4())
+                .active_skills_for_session(SessionId::new_v4())
                 .await
                 .unwrap()
                 .is_empty()
@@ -722,7 +740,7 @@ mod tests {
         assert!(store.delete_agent(a, at(3)).await.unwrap());
         assert!(
             store
-                .skill_hosts_for_session(session)
+                .active_skills_for_session(session)
                 .await
                 .unwrap()
                 .is_empty()

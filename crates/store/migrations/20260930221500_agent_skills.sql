@@ -12,7 +12,9 @@
 --
 -- `hosts` holds the host rules one per line, `''` for none. `source` is
 -- the Git URL the skill was cloned from, or `upload:` and the name of the
--- file the owner attached.
+-- file the owner attached. `digest` is a SHA-256 of the skill's files as
+-- added, in hex, so a confirmation stopped after moving them can tell they
+-- are the ones in use.
 
 CREATE TABLE agent_skills (
     agent_id TEXT NOT NULL REFERENCES agents (id),
@@ -20,6 +22,7 @@ CREATE TABLE agent_skills (
     state TEXT NOT NULL CHECK (state IN ('pending', 'active')),
     source TEXT NOT NULL,
     hosts TEXT NOT NULL,
+    digest TEXT NOT NULL,
     added_by TEXT NOT NULL REFERENCES members (id),
     added_at INTEGER NOT NULL,
     PRIMARY KEY (agent_id, name, state)

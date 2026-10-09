@@ -5436,32 +5436,33 @@ instance, so the hosts can't live in memory; parsing every agent's
 `SKILL.md` files at each `CONNECT` would trust files over the store.
 
 **Solution.** A migration adds `agent_skills` (`agent_id`, `name`, `state`
-of `pending` or `active`, `source`, `hosts`, `added_by`, `added_at`), keyed
-by agent, name and state, so a pending skill can wait next to the active
-one it would replace. `Store::skill_hosts_for_session` joins `sessions` and
-`agents` (deleted agents get none) and `SkillHosts` parses each host with
-`HostRule` again, so a row that no longer parses allows nothing. Files stay
-on disk, moved into place with a rename so a session sees a skill whole or
-not at all. Replacing one moves the old directory aside first, so a session
-starting between the two renames sees neither; `renameat2` with
-`RENAME_EXCHANGE` would close that, but needs a fallback for file systems
-without it, and the window is two renames.
+of `pending` or `active`, `source`, `hosts`, `digest`, `added_by`,
+`added_at`), keyed by agent, name and state, so a pending skill can wait
+next to the active one it would replace. `Store::active_skills_for_session`
+joins `sessions` and `agents` (deleted agents get none) and `SkillHosts`
+parses each host with `HostRule` again, so a row that no longer parses
+allows nothing. Files stay on disk, moved into place with a rename so a
+session sees a skill whole or not at all. Replacing one moves the old
+directory aside first, so a session starting between the two renames sees
+neither; `renameat2` with `RENAME_EXCHANGE` would close that, but needs a
+fallback for file systems without it, and the window is two renames.
 
-The row and the files change in the order that never grants hosts to files
-the owner didn't confirm them for. `skill add` records the row first: an
-active row carries no hosts and replaces any row that did, and a pending
-row's hosts don't count. `skill confirm` moves the files into place, then
-makes the row active; a failed move leaves it pending, and the old skill is
-moved back. `skill rm` deletes the rows, then the directories. A failure
-between the two steps can leave directories no row records, so startup
-removes work directories and skill directories, pending or live, whose name
-has no row in either state (the bundled one aside). A row of either state
-keeps both of its name's directories, so a confirmation moving one from
-pending to live on another instance is never taken for left over. Startup
-also leaves anything changed (by status change time) within `STALE_AFTER`,
-the clone timeout and three minutes, since in a blue-green deploy the old
-instance may still be cloning into a work directory. The 32-skill cap is
-checked inside `put_skill`'s transaction.
+The row and the files change in an order that keeps them matching where it
+can, and hosts are only granted for files that declare them ("Hosts are
+checked against the files in use" below). `skill add` records the row
+first: an active row carries no hosts and replaces any row that did, and a
+pending row's hosts don't count. `skill confirm` moves the files into
+place, then makes the row active; a failed move leaves it pending, and the
+old skill is moved back. `skill rm` deletes the rows, then the directories.
+A failure between the two steps can leave directories no row records, so
+startup removes work directories and skill directories, pending or live,
+whose name has no row in either state (the bundled one aside). A row of
+either state keeps both of its name's directories, so a confirmation moving
+one from pending to live on another instance is never taken for left over.
+Startup also leaves anything changed (by status change time) within
+`STALE_AFTER`, the clone timeout and three minutes, since in a blue-green
+deploy the old instance may still be cloning into a work directory. The
+32-skill cap is checked inside `put_skill`'s transaction.
 
 `skill rm` stops granting the skill's hosts at once, so new connections
 to them are refused unless the operator's allowlist or another active
@@ -5766,23 +5767,29 @@ still running at the drain timeout, or when shutdown is forced, are aborted
 (`tasks.shutdown()`), which is every blue-green cutover that catches one;
 before, that could stop a confirmation between its move and its row write
 and remove the old skill with its work directory. The spawned task outlives
-the command. The store closes once its connections come back, so a change
-still running then fails its next store call and undoes its move as on any
-store failure; when `serve` returns, the runtime drops the task at its next
-await, as a crash would, and the lease ends on its own.
+the command, and each holds a read guard on a lock in `Skills` that
+`Skills::drain` takes for writing: unless shutdown was forced, `serve`
+waits up to `DRAIN_TIMEOUT` (ten seconds) for them before closing the
+store. A change still running after that fails its next store call and
+undoes its move as on any store failure. When `serve` returns, the runtime
+drops the task at its next await; unlike a crash, that runs its work
+directory's guard, so a skill a confirmation had set aside there is removed
+rather than left for startup's purge, and the lease ends on its own.
 
 The final writes are fenced on the lease: `put_skill`, `delete_skill`,
 `delete_pending_skill_before` and `confirm_skill` take the `LeaseId` and
 first check, inside their `BEGIN IMMEDIATE` transaction, that
 `skill_leases` holds it unexpired at the write's time, failing with
 `StoreError::SkillLeaseLost` otherwise; holding the write lock, no other
-instance can take the lease over before the transaction ends. A fenced-out
-`confirm_skill` undoes its move like any failed one. `LEASE_TTL` is two
-minutes: a change makes two store calls, each of which may wait the pool's
-30-second acquire timeout and then the 5-second busy timeout, about 70
-seconds at worst, and a lease a crash left keeps the name busy for those
-two minutes. The sweeper deletes ended leases, so names nothing changes
-again don't keep rows.
+instance can take the lease over before the transaction ends. A
+confirmation fenced out after its move doesn't undo it: whoever holds the
+lease now owns the name, and putting the old skill back could put it under
+their row, so the files stay as a crash would leave them, for the roll
+forward below. `LEASE_TTL` is two minutes: a change makes two store calls,
+each of which may wait the pool's 30-second acquire timeout and then the
+5-second busy timeout, about 70 seconds at worst, and a lease a crash left
+keeps the name busy for those two minutes. The sweeper deletes ended
+leases, so names nothing changes again don't keep rows.
 
 With changes serialized, `confirm` reads the pending `SKILL.md` in place
 and moves the directory straight into the live one; the move into a work
@@ -5798,37 +5805,61 @@ row can't be made active, whether the row changed or the store failed,
 `confirm` puts its files back in the pending directory and the skill they
 replaced back into place before answering or returning the error. Files
 that can't go back move into the work directory instead, whose guard
-removes them, so the old skill always gets its place back; `move_into` logs
-a skill it set aside and couldn't move back. A test fails `confirm_skill`
-with a trigger and checks the old skill, its row and hosts, and the waiting
-files.
+removes them; restoring the old skill is tried either way, and fails only
+if the files can't leave the live directory at all, when the old skill goes
+with the work directory. `move_into` logs a skill it set aside and couldn't
+move back. A test fails `confirm_skill` with a trigger and checks the old
+skill, its row and hosts, and the waiting files.
 
-What's left is a crash, or agentd exiting, between a change's steps. A
-confirmation stopped after setting the live skill aside and before moving
-the new files in leaves no live files under the old row, which grants
-nothing more than before, and the next confirmation moves the waiting files
-in. One stopped after the move and before its row write leaves the update's
-files live under the old row, whose hosts the owner confirmed, and the
-pending directory empty: the next `confirm` finishes it, making the pending
-row active when its pending directory is absent and the live `SKILL.md`
-declares exactly its hosts, which grants just what the files in use
-declare. One stopped in the middle of undoing its move can leave the old
-row without live files. Whatever a failed add or removal leaves, startup's
-purge removes. Purge takes no lease, so it still keeps both directories of
-a name with a row and leaves anything changed within `STALE_AFTER`, since
-the other side of a deploy may be mid-move or mid-clone. A pending
-directory `drop_expired` can't remove is logged; never mounted, it stays on
-disk until startup's purge if no row has the name, or else, since purge
-keeps every directory of a name with a row, until the name is next added or
+What's left is a crash, agentd exiting, a cut-off change or a lapsed lease
+between a change's steps. A confirmation stopped after setting the live
+skill aside and before moving the new files in leaves no live files under
+the old row, and the next confirmation moves the waiting files in. One
+stopped after the move and before its row write leaves the update's files
+live under the old row and the pending directory empty. `agent_skills` now
+records a `digest` of each skill's files as added (SHA-256 over every
+file's path and bytes, which the package limits keep small), and the next
+`confirm` finishes such a confirmation, making the pending row active when
+its pending directory is absent and the live tree's digest is the row's;
+the sweeper does the same for an expiring row instead of dropping it, so
+the state doesn't outlive `PENDING_TTL`. Matching the whole tree, not just
+the hosts, keeps a lost pending directory next to an active skill that
+declares the same hosts from recording an update that never arrived. One
+stopped in the middle of undoing its move can leave the old row without
+live files. Whatever a failed add or removal leaves, startup's purge
+removes. Purge takes no lease, so it still keeps both directories of a name
+with a row and leaves anything changed within `STALE_AFTER`, since the
+other side of a deploy may be mid-move or mid-clone. A pending directory
+`drop_expired` can't remove is logged; never mounted, it stays on disk
+until startup's purge if no row has the name, or else, since purge keeps
+every directory of a name with a row, until the name is next added or
 removed.
 
 File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
 row, and its release logs that the lease ran out, but its moves still
 happen: `skill rm` whose lease lapses after its row delete can remove a
 successor's files, and an add's or confirmation's move can land after a
-successor's. None of that grants a host: rows are only written under the
-lease, `confirm` moves only files declaring the row's hosts, and a pending
-row's hosts never count.
+successor's.
+
+### Hosts are checked against the files in use
+
+**Issue.** Each fix to the lease, the undo and the order of the steps
+closed one way for a row's hosts to cover files that don't declare them,
+and reviews kept finding another: a crash, a cut-off change, or a move
+landing after a lapsed lease can leave any files under any active row.
+
+**Solution.** The grant itself checks. `SkillHosts` holds `Skills`, and
+`Skills::granted_hosts` reads the session's agent's active skills that
+declare hosts (`Store::active_skills_for_session`, which replaced
+`skill_hosts_for_session`) and grants each one's hosts only while its live
+`SKILL.md` declares exactly those hosts, parsed as `confirm` parses it. A
+skill whose files declare others, or are missing or unreadable, grants
+none, logged with the agent, the skill and the counts. It runs at each
+`CONNECT` the configured allowlist doesn't already allow, reading one small
+file per active skill with hosts, within the extension's timeout. Whatever
+the disk holds, hosts never cover files that don't declare them; the lease,
+the order of the steps and the undo only keep rows and files matching, so
+that what the owner confirmed stays usable.
 
 ## T26: Requester-pays routing
 

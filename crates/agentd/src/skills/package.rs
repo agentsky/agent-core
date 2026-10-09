@@ -29,12 +29,14 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use commands::SkillName;
 use cred_proxy::HostRule;
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 
 /// The most bytes of files a skill may hold, unpacked.
 pub const MAX_SKILL_BYTES: u64 = 10 * 1024 * 1024;
@@ -492,6 +494,49 @@ pub fn check_tree(root: &Path) -> Result<(), CheckError> {
         }
     }
     Ok(())
+}
+
+/// A digest of the skill directory `dir`, in hex: SHA-256 over each file's
+/// path within `dir`, in sorted order, and its bytes, each prefixed with
+/// its length. A tree [`check_tree`] passed holds only directories and
+/// plain files, and stays small enough to read whole.
+///
+/// # Errors
+///
+/// An I/O failure, such as `dir` missing.
+pub fn tree_digest(dir: &Path) -> Result<String, CheckError> {
+    let mut files = Vec::new();
+    let mut stack = vec![PathBuf::new()];
+    while let Some(within) = stack.pop() {
+        for entry in fs::read_dir(dir.join(&within)).map_err(io("reading a skill's directory"))? {
+            let entry = entry.map_err(io("reading a skill's directory"))?;
+            let path = within.join(entry.file_name());
+            if entry
+                .file_type()
+                .map_err(io("reading a skill's file"))?
+                .is_dir()
+            {
+                stack.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut hash = Sha256::new();
+    for file in files {
+        let bytes = fs::read(dir.join(&file)).map_err(io("reading a skill's file"))?;
+        let name = file.as_os_str().as_bytes();
+        for part in [name, &bytes[..]] {
+            hash.update((part.len() as u64).to_le_bytes());
+            hash.update(part);
+        }
+    }
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// Finds the skill in `root`, a tree [`check_tree`] passed: `root` itself

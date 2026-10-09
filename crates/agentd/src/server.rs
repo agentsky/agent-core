@@ -122,7 +122,7 @@ impl Routers {
         .with_egress(
             app.config()
                 .egress_proxy()?
-                .with_extension(Arc::new(SkillHosts(app.store().clone()))),
+                .with_extension(Arc::new(SkillHosts(app.skills().clone()))),
         );
         Ok(Self {
             public: public_router(app.clone()).merge(slack_routes),
@@ -281,7 +281,10 @@ impl Server {
     ///    fail once the store is closed, which the runner logs as giving up,
     ///    and the idle reaper they keep alive runs until the process exits.
     ///    The next start purges the tokens and reaps the containers.
-    /// 5. The pipeline is dropped, and the store is closed.
+    /// 5. The pipeline is dropped. Skill changes still running, which an
+    ///    aborted command leaves to finish in their own task, get up to
+    ///    [`DRAIN_TIMEOUT`](crate::skills::DRAIN_TIMEOUT), unless shutdown
+    ///    was forced, and the store is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -485,7 +488,10 @@ impl Server {
                     stopped = tokio::time::timeout_at(deadline, pipeline.stop_sessions()) => {
                         stopped.is_err().then_some("drain timeout elapsed")
                     }
-                    () = abort.as_mut() => Some("shutdown forced"),
+                    () = abort.as_mut() => {
+                        forced = true;
+                        Some("shutdown forced")
+                    }
                 };
                 if let Some(reason) = left {
                     tracing::warn!("{reason}; leaving warm sandboxes for the next start to reap");
@@ -493,6 +499,17 @@ impl Server {
             }
         }
         drop(pipeline);
+        if !forced {
+            let drained = tokio::select! {
+                drained = app.skills().drain() => drained,
+                () = abort.as_mut() => false,
+            };
+            if !drained {
+                tracing::warn!(
+                    "skill changes still running at shutdown; the next change or start tidies what they leave"
+                );
+            }
+        }
         app.store().close().await;
         tracing::info!("stopped");
         failure.map_or(Ok(()), Err)

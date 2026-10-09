@@ -177,7 +177,7 @@ impl Harness {
             .unwrap()
             .session
             .id;
-        SkillHosts(self.store.clone())
+        SkillHosts(self.skills.clone())
             .rules(session)
             .await
             .iter()
@@ -471,11 +471,13 @@ impl Harness {
             .unwrap();
         let hosts = vec!["api.github.com".to_owned()];
         let old = OffsetDateTime::now_utc() - ago;
+        let digest = package::tree_digest(&self.pending(name)).unwrap();
         let new = NewSkill {
             agent: self.agent,
             name,
             source: "upload:SKILL.md",
             hosts: &hosts,
+            digest: &digest,
             added_by: self.owner,
         };
         let lease = self.lease(name).await;
@@ -884,7 +886,10 @@ async fn a_confirmation_stopped_after_its_move_is_finished_by_the_next() {
         .await
         .unwrap();
     drop(work);
-    assert_eq!(h.hosts().await, ["a.example"]);
+    assert!(
+        h.hosts().await.is_empty(),
+        "the old row's hosts don't cover the new files"
+    );
 
     let Confirmed::Active(row) = h.skills.confirm(h.agent, "gh").await.unwrap() else {
         panic!()
@@ -963,6 +968,142 @@ async fn a_change_whose_caller_is_aborted_still_runs_to_the_end() {
     }
     assert!(h.live("gh").join("SKILL.md").is_file());
     assert!(!h.pending("gh").exists());
+}
+
+#[tokio::test]
+async fn hosts_are_granted_only_while_the_files_in_use_declare_them() {
+    let h = harness().await;
+    for (name, host) in [("gh", "a.example"), ("py", "b.example")] {
+        h.upload("SKILL.md", &skill_md(name, &[host]))
+            .await
+            .unwrap();
+        h.skills.confirm(h.agent, name).await.unwrap();
+    }
+    assert_eq!(h.hosts().await, ["a.example", "b.example"]);
+    std::fs::write(
+        h.live("gh").join("SKILL.md"),
+        skill_md("gh", &["a.example", "c.example"]),
+    )
+    .unwrap();
+    assert_eq!(h.hosts().await, ["b.example"]);
+    std::fs::remove_file(h.live("gh").join("SKILL.md")).unwrap();
+    assert_eq!(h.hosts().await, ["b.example"]);
+    std::fs::write(
+        h.live("gh").join("SKILL.md"),
+        skill_md("gh", &["a.example"]),
+    )
+    .unwrap();
+    assert_eq!(h.hosts().await, ["a.example", "b.example"]);
+}
+
+#[tokio::test]
+async fn a_confirmation_that_lost_its_lease_leaves_its_files_for_the_next() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert!(matches!(
+        h.skills.confirm_row(&rows[0], LeaseId::new_v4()).await,
+        Err(SkillError::Store(StoreError::SkillLeaseLost))
+    ));
+    assert!(h.live("gh").join("SKILL.md").is_file());
+    assert!(!h.pending("gh").exists());
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert!(h.hosts().await.is_empty());
+
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn the_sweeper_finishes_a_confirmation_stopped_after_its_move() {
+    let h = harness().await;
+    h.expired("gh").await;
+    let work = h.skills.work_dir().await.unwrap();
+    move_into(&h.pending("gh"), &h.live("gh"), &work.0)
+        .await
+        .unwrap();
+    drop(work);
+    h.skills.drop_expired().await.unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.state).collect::<Vec<_>>(),
+        [SkillState::Active]
+    );
+    assert!(h.live("gh").join("SKILL.md").is_file());
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
+async fn an_update_whose_files_never_arrived_isnt_taken_for_the_skill_in_use() {
+    let h = harness().await;
+    h.upload("SKILL.md", &skill_md("gh", &["api.github.com"]))
+        .await
+        .unwrap();
+    h.skills.confirm(h.agent, "gh").await.unwrap();
+    let update = format!("{}Updated.\n", skill_md("gh", &["api.github.com"]));
+    h.upload("SKILL.md", &update).await.unwrap();
+    std::fs::remove_dir_all(h.pending("gh")).unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    assert_eq!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::NotPending
+    );
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert_eq!(
+        std::fs::read_to_string(h.live("gh").join("SKILL.md")).unwrap(),
+        skill_md("gh", &["api.github.com"])
+    );
+}
+
+async fn panicking() -> Result<(), SkillError> {
+    panic!("a skill change panicked")
+}
+
+#[tokio::test]
+async fn a_change_that_panics_releases_the_lease() {
+    let h = harness().await;
+    assert!(matches!(
+        h.skills
+            .leased(h.agent, "gh", Duration::ZERO, |_, _| panicking())
+            .await,
+        Err(SkillError::Task(_))
+    ));
+    let lease = h.lease("gh").await;
+    h.release("gh", lease).await;
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_a_change_running_and_stops_waiting() {
+    let h = harness().await;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let opened = gate.clone();
+    let change = tokio::spawn({
+        let skills = h.skills.clone();
+        let agent = h.agent;
+        async move {
+            skills
+                .leased(agent, "gh", Duration::ZERO, move |_, _| async move {
+                    opened.notified().await;
+                    Ok(())
+                })
+                .await
+        }
+    });
+    tokio::time::sleep(LEASE_RETRY).await;
+    let drain = tokio::spawn({
+        let skills = h.skills.clone();
+        async move { skills.drain().await }
+    });
+    tokio::time::sleep(LEASE_RETRY).await;
+    assert!(!drain.is_finished(), "waits for the change");
+    gate.notify_one();
+    assert!(drain.await.unwrap());
+    assert_eq!(change.await.unwrap().unwrap(), Some(()));
 }
 
 #[tokio::test]
@@ -1046,7 +1187,7 @@ async fn a_failing_store_allows_no_hosts() {
     let h = harness().await;
     h.store.close().await;
     assert!(
-        SkillHosts(h.store.clone())
+        SkillHosts(h.skills.clone())
             .rules(SessionId::new_v4())
             .await
             .is_empty()
