@@ -11,3 +11,20 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+bollard.workspace = true
+core-types.workspace = true
+futures.workspace = true
+rustix = { workspace = true, features = ["std"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+store.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+testkit.workspace = true
+toml.workspace = true
