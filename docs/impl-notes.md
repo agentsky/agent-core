@@ -7213,22 +7213,25 @@ token. Returning the error from the sink isn't an option: `Queue::run`
 takes any `Err` to mean the receiver is gone and stops.
 
 **Solution.** The rotated pair's retry, `store_rotated`, became
-`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs the whole
-departure (lookup and delete) through it as one closure, so a passing error
-costs a retry, not the token. Every `StoreError` is retried, since even a
-sealing failure can pass (`SealError::Rng`) and the rotator can't afford to
-lose a pair. `retry_store` logs each failure but the last as a retry, with
-the member's id, and returns the last to its caller: `Inbound` logs that
-one, as before, by member key and error. It stays in `slack_tokens`, since
-agentd has no shared store or retry module.
+`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs each step
+of the departure through it as its own closure, the lookup and token
+delete, then the lookup and the deletion of the member's cloud routines and
+hand-offs, so a passing error costs a retry, not the token, and a failed
+first step doesn't skip the second. Every `StoreError` is retried, since
+even a sealing failure can pass (`SealError::Rng`) and the rotator can't
+afford to lose a pair. `retry_store` logs each failure but the last as a
+retry, with the member's id, and returns the last to its caller: `Inbound`
+logs that one, as before, by member key and error. It stays in
+`slack_tokens`, since agentd has no shared store or retry module.
 
 The retries run inline in the sink, so a failing departure holds the shared
-Slack event queue for 1.75 s of waits plus each attempt's own store time,
-which can include SQLite's busy timeout. Once agent apps land, that queue
-also carries agents' messages, which wait too. That is accepted: a store
-failing on writes stalls agent traffic anyway, the hold is bounded at four
-attempts, and handing the departure to a task instead would lose its order
-against later events for the same member.
+Slack event queue for up to 3.5 s of waits, 1.75 s per step, plus each
+attempt's own store time, which can include SQLite's busy timeout. Once
+agent apps land, that queue also carries agents' messages, which wait too.
+That is accepted: a store failing on writes stalls agent traffic anyway,
+the hold is bounded at four attempts per step, and handing the departure to
+a task instead would lose its order against later events for the same
+member.
 
 ### Which failures a member hears about
 
