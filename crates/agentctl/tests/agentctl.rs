@@ -543,7 +543,8 @@ async fn lock_gives_up_after_its_timeout() {
     assert_eq!(
         out.stderr,
         "agentctl: waiting for the shared/ lock\n\
-         agentctl: gave up after 1s waiting for the shared/ lock; another command holds it\n"
+         agentctl: gave up waiting for the shared/ lock after the 1s timeout; another command \
+         holds it\n"
     );
     Run::from(holder.wait_with_output().await.unwrap()).ok();
 }
@@ -559,6 +560,87 @@ async fn a_huge_lock_timeout_is_clamped_instead_of_panicking() {
         )
         .await
         .ok();
+}
+
+#[tokio::test]
+async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let dir = TempDir::new("agentctl-test");
+    let started = Instant::now();
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        agentctl(&url, "tok", dir.path())
+            .args(["lock", "--timeout", "1", "--", "true"])
+            .output(),
+    )
+    .await
+    .expect("the acquire waited out the 30-second request timeout")
+    .unwrap();
+    assert!(started.elapsed() >= Duration::from_secs(7));
+    let out = Run::from(output);
+    out.refused("gave up waiting for the shared/ lock after the 1s timeout; agentd at ");
+    assert!(
+        out.stderr.ends_with(
+            ": timed out; a lease agentd granted after agentctl stopped waiting expires within \
+             its TTL\n"
+        ),
+        "{out:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_acquire_that_failed_or_lost_its_answer_is_retried_under_the_same_lease() {
+    for hiccup in [Hiccup::Internal, Hiccup::Garbled] {
+        let fake = FakeLock::start(30, 0, Renewals::Grant).await;
+        fake.state.hiccups.lock().unwrap().push(hiccup);
+        let dir = TempDir::new("agentctl-test");
+        let out = Run::from(
+            tokio::time::timeout(
+                WAIT,
+                agentctl(&fake.url, "tok", dir.path())
+                    .args(["lock", "--", "true"])
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+        out.ok();
+        assert!(fake.state.hiccups.lock().unwrap().is_empty(), "{hiccup:?}");
+        assert_eq!(fake.granted().len(), 1, "{hiccup:?}");
+        assert_eq!(fake.released(), fake.granted(), "{hiccup:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_acquire_that_cant_connect_fails_at_once() {
+    let url = "http://127.0.0.1:1";
+    let dir = TempDir::new("agentctl-test");
+    let started = Instant::now();
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(url, "tok", dir.path())
+                .args(["lock", "--", "true"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "{out:?}");
+    out.refused("can't connect");
+    assert_eq!(
+        out.stderr,
+        format!("agentctl: agentd at {url}: can't connect\n")
+    );
 }
 
 #[tokio::test]
@@ -690,6 +772,17 @@ enum Renewals {
     FailOnce,
     /// It grants renewals with more seconds left than a clock can hold.
     Endless,
+    /// It grants every renewal.
+    Grant,
+}
+
+/// How [`FakeLock`] answers an acquire instead of simply granting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hiccup {
+    /// It fails with agentd's internal error, granting nothing.
+    Internal,
+    /// It grants the lease, then answers with something unreadable.
+    Garbled,
 }
 
 /// A fake ctl API whose lock grants leases of `ttl` seconds, with whole
@@ -705,8 +798,12 @@ struct FakeState {
     skew: i64,
     renewals: Renewals,
     acquire_delay: Duration,
+    /// The hiccups to answer the next acquires with, last first.
+    hiccups: Mutex<Vec<Hiccup>>,
     expires_at: Mutex<Option<SystemTime>>,
     granted: Mutex<Vec<LeaseId>>,
+    /// The lease each acquire named, recorded as it arrives.
+    asked: Mutex<Vec<LeaseId>>,
     renewed: Mutex<usize>,
     released: Mutex<Vec<LeaseId>>,
     acquiring: Notify,
@@ -725,8 +822,10 @@ impl FakeLock {
             skew,
             renewals,
             acquire_delay,
+            hiccups: Mutex::new(Vec::new()),
             expires_at: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
             renewed: Mutex::new(0),
             released: Mutex::new(Vec::new()),
             acquiring: Notify::new(),
@@ -778,16 +877,40 @@ impl FakeState {
     }
 }
 
+/// agentd's answer when it fails, as on a busy database.
+fn internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(CtlError::new(
+            CtlErrorCode::Internal,
+            "agentd failed; try again",
+        )),
+    )
+        .into_response()
+}
+
 async fn fake_lock(
     State(state): State<Arc<FakeState>>,
     Json(request): Json<LockRequest>,
 ) -> axum::response::Response {
     match request {
-        LockRequest::Acquire => {
+        LockRequest::Acquire { lease } => {
+            state.asked.lock().unwrap().push(lease);
             state.acquiring.notify_one();
             tokio::time::sleep(state.acquire_delay).await;
-            let lease = LeaseId::new_v4();
-            state.granted.lock().unwrap().push(lease);
+            let hiccup = state.hiccups.lock().unwrap().pop();
+            if hiccup == Some(Hiccup::Internal) {
+                return internal_error();
+            }
+            {
+                let mut granted = state.granted.lock().unwrap();
+                if !granted.contains(&lease) {
+                    granted.push(lease);
+                }
+            }
+            if hiccup == Some(Hiccup::Garbled) {
+                return "garbled".into_response();
+            }
             state.held(lease)
         }
         LockRequest::Renew { lease } => {
@@ -808,15 +931,8 @@ async fn fake_lock(
                 *renewed += 1;
                 *renewed == 1
             };
-            if first {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(CtlError::new(
-                        CtlErrorCode::Internal,
-                        "agentd failed; try again",
-                    )),
-                )
-                    .into_response();
+            if first && state.renewals == Renewals::FailOnce {
+                return internal_error();
             }
             state.held(lease)
         }
@@ -941,6 +1057,33 @@ async fn a_signal_during_acquire_gives_back_the_lease_it_was_granted() {
     assert!(!marker.exists(), "{out:?}");
     assert_eq!(fake.granted().len(), 1, "{out:?}");
     assert_eq!(fake.released(), fake.granted(), "{out:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_during_an_unanswered_acquire_still_gives_back_its_lease() {
+    let fake = FakeLock::delayed(30, 0, Renewals::Grant, Duration::from_secs(4)).await;
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
+    let holder = agentctl(&fake.url, "tok", dir.path())
+        .args(["lock", "--", "touch", marker.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(WAIT, fake.state.acquiring.notified())
+        .await
+        .expect("agentctl never acquired");
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    assert!(!marker.exists(), "{out:?}");
+    let asked = fake.state.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{out:?}");
+    assert_eq!(fake.released(), asked, "{out:?}");
 }
 
 #[cfg(unix)]
