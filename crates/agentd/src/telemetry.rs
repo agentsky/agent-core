@@ -328,44 +328,30 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use std::io;
-    use std::sync::{Arc, Mutex};
+
+    use testkit::{Logged, Logs};
 
     use super::*;
 
-    /// A writer that collects everything written to it.
-    #[derive(Clone, Default)]
-    pub(crate) struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl Captured {
-        pub(crate) fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
+    /// The test binary's global log capture: agentd's JSON lines, redacted
+    /// and capped, of every event inside a [`Logs::tag`] span, at every
+    /// level. Events outside one aren't formatted at all, so tests that
+    /// capture nothing aren't slowed down. It is the binary's global
+    /// subscriber, so [`init`] fails in a test that reaches it, as
+    /// `cli::main` does with a valid configuration: such a test runs
+    /// `agentd` as its own process, as `tests/binary.rs` does.
+    pub(crate) fn global_logs() -> &'static Logs {
+        Logs::install(|logs| subscriber(LogFormat::Json, EnvFilter::new("[test]=trace"), logs))
     }
 
-    impl io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+    fn capture(format: LogFormat, f: impl FnOnce()) -> Logged {
+        capture_filtered(format, "trace", f)
     }
 
-    impl<'w> MakeWriter<'w> for Captured {
-        type Writer = Self;
-
-        fn make_writer(&'w self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    fn capture(format: LogFormat, f: impl FnOnce()) -> String {
-        let captured = Captured::default();
-        let subscriber = subscriber(format, EnvFilter::new("trace"), captured.clone());
-        tracing::subscriber::with_default(subscriber, f);
-        captured.text()
+    fn capture_filtered(format: LogFormat, filter: &str, f: impl FnOnce()) -> Logged {
+        let logs = Logs::default();
+        global_logs().scoped(subscriber(format, EnvFilter::new(filter), logs.clone()), f);
+        logs.snapshot()
     }
 
     fn emit_everything() {
@@ -401,27 +387,24 @@ pub(crate) mod tests {
     #[test]
     fn every_listed_name_is_redacted_in_human_output() {
         let out = capture(LogFormat::Human { ansi: false }, emit_everything);
-        for secret in SECRETS {
-            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        for secret in SECRETS.into_iter().chain(["span-verifier"]) {
+            out.assert_lacks(secret);
         }
-        assert!(!out.contains("span-verifier"), "{out}");
-        for name in REDACTED_FIELDS.iter().filter(|n| **n != "verifier") {
-            assert!(out.contains(&format!("{name}={REDACTED}")), "{name}: {out}");
+        for name in REDACTED_FIELDS {
+            out.assert_has(&format!("{name}={REDACTED}"));
         }
-        assert!(out.contains(&format!("verifier={REDACTED}")), "{out}");
-        assert!(out.contains("scope_key=\"dm:slack:T1:D1\""), "{out}");
-        assert!(out.contains("token_count=7"), "{out}");
-        assert!(out.contains("later=\"recorded-later\""), "{out}");
-        assert!(out.contains("handled a request"), "{out}");
+        out.assert_has("scope_key=\"dm:slack:T1:D1\"")
+            .assert_has("token_count=7")
+            .assert_has("later=\"recorded-later\"")
+            .assert_has("handled a request");
     }
 
     #[test]
     fn every_listed_name_is_redacted_in_json_output() {
         let out = capture(LogFormat::Json, emit_everything);
-        for secret in SECRETS {
-            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        for secret in SECRETS.into_iter().chain(["span-verifier"]) {
+            out.assert_lacks(secret);
         }
-        assert!(!out.contains("span-verifier"), "{out}");
         let line: Value = serde_json::from_str(out.trim()).unwrap();
         let fields = &line["fields"];
         for name in REDACTED_FIELDS.iter().filter(|n| **n != "verifier") {
@@ -472,8 +455,8 @@ pub(crate) mod tests {
         let out = capture(LogFormat::Human { ansi: false }, || {
             tracing::info!(log.target = "sqlx::query", kept = 1, "from log");
         });
-        assert!(out.contains("from log kept=1"), "{out}");
-        assert!(!out.contains("sqlx::query"), "{out}");
+        out.assert_has("from log kept=1")
+            .assert_lacks("sqlx::query");
     }
 
     #[test]
@@ -482,8 +465,8 @@ pub(crate) mod tests {
             tracing::info!(name = ?"a\nb", "line one\nforged \u{1b}[31m");
         });
         assert_eq!(out.lines().count(), 1, "{out}");
-        assert!(out.contains("line one\\nforged \\u{1b}[31m"), "{out}");
-        assert!(!out.contains('\u{1b}'), "{out}");
+        out.assert_has("line one\\nforged \\u{1b}[31m")
+            .assert_lacks("\u{1b}");
     }
 
     #[test]
@@ -500,14 +483,11 @@ pub(crate) mod tests {
 
     #[test]
     fn the_filter_applies() {
-        let captured = Captured::default();
-        let subscriber = subscriber(LogFormat::Json, EnvFilter::new("warn"), captured.clone());
-        tracing::subscriber::with_default(subscriber, || {
+        let out = capture_filtered(LogFormat::Json, "warn", || {
             tracing::info!("hidden");
             tracing::warn!("shown");
         });
-        let out = captured.text();
-        assert!(!out.contains("hidden") && out.contains("shown"), "{out}");
+        out.assert_has("shown").assert_lacks("hidden");
     }
 
     #[test]
@@ -524,9 +504,7 @@ pub(crate) mod tests {
         let formats = [LogFormat::Human { ansi: false }, LogFormat::Json];
         for filter in filters {
             for format in formats {
-                let captured = Captured::default();
-                let subscriber = subscriber(format, EnvFilter::new(filter), captured.clone());
-                tracing::subscriber::with_default(subscriber, || {
+                let out = capture_filtered(format, filter, || {
                     let span = tracing::info_span!("turn");
                     let _entered = span.enter();
                     log::debug!(
@@ -537,12 +515,17 @@ pub(crate) mod tests {
                     tracing::debug!(target: "bollard::docker", "agentctl-secret");
                     log::info!(target: "bollard::docker", "bollard-info");
                     log::debug!(target: "sandbox::probe", "other-debug");
+                    log::trace!(target: "sandbox::probe", "other-trace");
+                    tracing::debug!(target: "sandbox::probe", "other-tracing-debug");
                 });
-                let out = captured.text();
-                assert!(!out.contains("agentctl-secret"), "{filter}: {out}");
-                assert!(out.contains("bollard-info"), "{filter}: {out}");
+                out.assert_has("bollard-info")
+                    .assert_lacks("agentctl-secret");
                 if matches!(filter, "trace" | "debug" | "[turn]=trace") {
-                    assert!(out.contains("other-debug"), "{filter}: {out}");
+                    out.assert_has("other-debug")
+                        .assert_has("other-tracing-debug");
+                }
+                if matches!(filter, "trace" | "[turn]=trace") {
+                    out.assert_has("other-trace");
                 }
             }
         }

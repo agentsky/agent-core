@@ -34,6 +34,5 @@ bytes.workspace = true
 futures.workspace = true
 testkit.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber.workspace = true
 uuid.workspace = true
 wiremock.workspace = true

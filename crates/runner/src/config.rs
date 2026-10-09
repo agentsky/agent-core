@@ -1,5 +1,6 @@
 //! [`ProcessConfig`]: how `claude` processes are started and how long a
-//! turn may take.
+//! turn may take. [`PoolConfig`]: how many containers stay warm, and for
+//! how long.
 
 use std::time::Duration;
 
@@ -18,6 +19,21 @@ pub const DEFAULT_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// The longest [`ProcessConfig::turn_timeout_secs`] allowed: a day.
 const MAX_TURN_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// The default [`PoolConfig::idle_timeout_secs`]: 15 minutes.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 15 * 60;
+
+/// The default [`PoolConfig::scope_container_cap`].
+pub const DEFAULT_SCOPE_CONTAINER_CAP: usize = 4;
+
+/// The default [`PoolConfig::global_container_cap`].
+pub const DEFAULT_GLOBAL_CONTAINER_CAP: usize = 32;
+
+/// The longest [`PoolConfig::idle_timeout_secs`] allowed: a day.
+const MAX_IDLE_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// The largest container cap allowed.
+const MAX_CONTAINER_CAP: usize = 4096;
 
 /// Settings for starting `claude` processes, deserializable from TOML.
 ///
@@ -132,9 +148,128 @@ impl ProcessConfig {
     }
 }
 
+/// How the warm pool keeps containers, deserializable from TOML.
+///
+/// Every key has a default, and unknown keys are errors.
+/// [`validate`](Self::validate) checks what serde can't.
+///
+/// ```
+/// let config: runner::PoolConfig = toml::from_str("scope_container_cap = 2")?;
+/// config.validate()?;
+/// assert_eq!(config.scope_container_cap, 2);
+/// assert_eq!(config.idle_timeout(), std::time::Duration::from_secs(900));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolConfig {
+    /// How long a session's container and process stay warm after its last
+    /// turn, in seconds, before they are reaped. The next turn resumes from
+    /// the transcript.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// How many containers one scope of one agent (one volume) may have at
+    /// once. A session that needs another waits, after an idle container of
+    /// the scope is reaped for it if there is one.
+    #[serde(default = "default_scope_container_cap")]
+    pub scope_container_cap: usize,
+    /// How many containers may run at once in all.
+    #[serde(default = "default_global_container_cap")]
+    pub global_container_cap: usize,
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_SECS
+}
+
+fn default_scope_container_cap() -> usize {
+    DEFAULT_SCOPE_CONTAINER_CAP
+}
+
+fn default_global_container_cap() -> usize {
+    DEFAULT_GLOBAL_CONTAINER_CAP
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_idle_timeout_secs(),
+            scope_container_cap: default_scope_container_cap(),
+            global_container_cap: default_global_container_cap(),
+        }
+    }
+}
+
+impl PoolConfig {
+    /// [`idle_timeout_secs`](Self::idle_timeout_secs) as a [`Duration`].
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_secs)
+    }
+
+    /// Checks what serde can't: an idle timeout from one second to a day,
+    /// and caps from 1 to 4096.
+    ///
+    /// # Errors
+    ///
+    /// The first [`ConfigError`] found.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key, reason| Err(ConfigError { key, reason });
+        if !(1..=MAX_IDLE_TIMEOUT_SECS).contains(&self.idle_timeout_secs) {
+            return bad(
+                "idle_timeout_secs",
+                "must be from 1 second to 86400 (a day)",
+            );
+        }
+        for (key, cap) in [
+            ("scope_container_cap", self.scope_container_cap),
+            ("global_container_cap", self.global_container_cap),
+        ] {
+            if !(1..=MAX_CONTAINER_CAP).contains(&cap) {
+                return bad(key, "must be from 1 to 4096");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_defaults_match_the_plan() {
+        let config: PoolConfig = toml::from_str("").unwrap();
+        assert_eq!(config, PoolConfig::default());
+        assert_eq!(config.idle_timeout(), Duration::from_secs(900));
+        assert_eq!(config.scope_container_cap, 4);
+        assert_eq!(config.global_container_cap, 32);
+        config.validate().unwrap();
+        assert!(toml::from_str::<PoolConfig>("idle_timeout = 5").is_err());
+    }
+
+    #[test]
+    fn pool_validation_names_the_key() {
+        type Change = fn(&mut PoolConfig);
+        let cases: [(&str, Change); 6] = [
+            ("idle_timeout_secs", |c| c.idle_timeout_secs = 0),
+            ("idle_timeout_secs", |c| c.idle_timeout_secs = 86_401),
+            ("scope_container_cap", |c| c.scope_container_cap = 0),
+            ("scope_container_cap", |c| c.scope_container_cap = 4097),
+            ("global_container_cap", |c| c.global_container_cap = 0),
+            ("global_container_cap", |c| c.global_container_cap = 4097),
+        ];
+        for (key, change) in cases {
+            let mut config = PoolConfig::default();
+            change(&mut config);
+            assert_eq!(config.validate().unwrap_err().key(), key);
+        }
+        let edge = PoolConfig {
+            idle_timeout_secs: 86_400,
+            scope_container_cap: 4096,
+            global_container_cap: 1,
+        };
+        edge.validate().unwrap();
+    }
 
     #[test]
     fn defaults_match_the_design() {
