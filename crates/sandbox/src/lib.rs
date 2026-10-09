@@ -312,7 +312,8 @@ pub struct ChildIo {
     pub child: ChildHandle,
     /// The process's stdin. Shutting it down closes the stream.
     pub stdin: Pin<Box<dyn AsyncWrite + Send>>,
-    /// The process's stdout. It ends when the process exits.
+    /// The process's stdout. It ends when the process exits, or earlier if
+    /// Docker's attach stream fails.
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
 }
 

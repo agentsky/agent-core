@@ -492,7 +492,10 @@ fn walk_blocks(value: &Value, found: &mut Vec<UserId>) {
     }
 }
 
-/// Collects the ids of `<@U…>` and `<@U…|label>` tokens.
+/// Collects the ids of `<@U…>` and `<@U…|label>` tokens, reading each byte
+/// about once, so a body costs time linear in its size. A label ends at the
+/// first `>`; Slack writes a typed `<` or `>` as `&lt;` or `&gt;`, so a `<`
+/// before that `>` leaves the token unclosed.
 fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
     let mut rest = text;
     while let Some(at) = rest.find("<@") {
@@ -501,15 +504,23 @@ fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(rest.len());
         let id = &rest[..end];
-        let closed = match rest[end..].chars().next() {
-            Some('>') => true,
-            Some('|') => rest[end..].contains('>'),
-            _ => false,
+        rest = &rest[end..];
+        let closed = if let Some(after) = rest.strip_prefix('>') {
+            rest = after;
+            true
+        } else if let Some(label) = rest.strip_prefix('|') {
+            let Some(stop) = label.find(['<', '>']) else {
+                return;
+            };
+            let closes = label[stop..].starts_with('>');
+            rest = &label[stop + usize::from(closes)..];
+            closes
+        } else {
+            false
         };
         if closed && is_user_id(id) {
             found.push(UserId::from(id));
         }
-        rest = &rest[end..];
     }
 }
 
@@ -627,19 +638,30 @@ mod tests {
             "<@U1> <@W2|ada> <@U3 <@u4> <@B5> <@U6|no close <!here> <#C1> <@> <@U7>",
             &mut found,
         );
-        assert_eq!(
-            found,
-            [
-                UserId::from("U1"),
-                UserId::from("W2"),
-                "U6".into(),
-                "U7".into()
-            ]
-        );
+        assert_eq!(found, [UserId::from("U1"), UserId::from("W2"), "U7".into()]);
+        let mut found = Vec::new();
+        scan_tokens("<@U1|a<@U2> <@U3|b>c>", &mut found);
+        assert_eq!(found, [UserId::from("U2"), "U3".into()]);
         let mut found = Vec::new();
         scan_tokens("<@U8", &mut found);
         scan_tokens("<@U9é>", &mut found);
+        scan_tokens("<@U4|", &mut found);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_unclosed_label_is_scanned_in_linear_time() {
+        let units = crate::ingress::MAX_BODY_BYTES / 6;
+        for (text, expected) in [
+            ("<@|".repeat(units * 2), vec![]),
+            ("<@U1|x".repeat(units) + ">", vec![UserId::from("U1")]),
+        ] {
+            let blocks = json!([{"type": "section", "text": {"type": "mrkdwn", "text": text}}]);
+            let started = std::time::Instant::now();
+            let found = mentions("", Some(&blocks));
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(found, expected);
+        }
     }
 
     #[test]

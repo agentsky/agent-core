@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 
 use super::Turns;
 use super::billing::{CredentialFailure, FAILURE_DM_INTERVAL};
+use super::keyed::KeyedLocks;
 use super::message;
 use super::view::{StoreView, ViewContext};
 use crate::commands::Replies;
@@ -127,7 +128,9 @@ pub struct PipelineSettings {
 /// 2. **Queues.** Each candidate's messages in a thread are answered one
 ///    at a time, in the order they arrived, in a task of the pipeline's
 ///    own, so a turn never holds up the connection that delivered the
-///    message, or another agent or thread. At most
+///    message, or another agent or thread. A thread's messages are looked
+///    up and queued one at a time, in the order their sending started,
+///    even when different connections deliver them at once. At most
 ///    [`queue_per_thread`](PipelineSettings::queue_per_thread) messages
 ///    wait for one agent in one thread,
 ///    [`max_pending_per_owner`](PipelineSettings::max_pending_per_owner)
@@ -172,17 +175,19 @@ pub struct PipelineSettings {
 ///    for every chunk with the turn's requester and hop; then the
 ///    directives' reactions, and the reactions and posts the turn queued
 ///    with agentctl. Each goes out even when another failed, and then the
-///    thread is told part of the reply was lost. A failed turn posts a
-///    short message that says why when the runner could tell. A usage
-///    limit or a refused login names whose account it was, the
-///    requester's or the community key's, and the requester alone is also
-///    told privately by the manager bot, unless the thread is their own DM
-///    with the agent or they were told about the same kind of failure
-///    within [`FAILURE_DM_INTERVAL`]; the agent's owner never is, unless
-///    they asked. A turn that ran out of time after the CLI read its
-///    message posts [`TIMED_OUT_TEXT`]; any other failure, including a
-///    crash or a timeout before the CLI read the message, posts
-///    [`FAILED_TEXT`].
+///    thread is told part of the reply was lost (a refused reaction is
+///    only logged); so it is when a chunk was posted but its row couldn't
+///    be recorded, or the turn's outbox was lost because `turn_finished`
+///    failed. A failed turn posts a short message that says why when the
+///    runner could tell. A usage limit or a refused login names whose
+///    account it was, the requester's or the community key's, and the
+///    requester alone is also told privately by the manager bot, unless
+///    the thread is their own DM with the agent or they were told about
+///    the same kind of failure within [`FAILURE_DM_INTERVAL`]; the agent's
+///    owner never is, unless they asked. A turn that ran out of time after
+///    the CLI read its message posts [`TIMED_OUT_TEXT`]; any other
+///    failure, including a crash or a timeout before the CLI read the
+///    message, posts [`FAILED_TEXT`].
 /// 7. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
 ///    one saying their link stopped working and how to link it again, when
@@ -222,6 +227,7 @@ struct Inner {
     replies: Replies,
     settings: PipelineSettings,
     lanes: Mutex<HashMap<LaneKey, VecDeque<Job>>>,
+    dispatching: KeyedLocks<ThreadKey>,
     pending: Arc<Semaphore>,
     shares: Mutex<HashMap<MemberId, Share>>,
     tasks: Mutex<JoinSet<()>>,
@@ -372,6 +378,7 @@ impl Pipeline {
                 replies,
                 settings,
                 lanes: Mutex::new(HashMap::new()),
+                dispatching: KeyedLocks::default(),
                 pending,
                 shares: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
@@ -384,7 +391,8 @@ impl Pipeline {
 
     /// Where a surface with `caps` delivers its messages. Sending looks up
     /// the message's candidates and queues it for each, or tells the
-    /// thread an agent is busy, and never waits for a turn.
+    /// thread an agent is busy. It may wait for the lookup of a message
+    /// sent before in the same thread, never for a turn.
     pub fn sink(&self, caps: Caps) -> Sender<InboundEvent> {
         Sender::new(PipelineSink {
             pipeline: self.clone(),
@@ -488,11 +496,21 @@ impl Pipeline {
 
     /// Queues `event` for each of its candidates, and returns what
     /// completes when each is done with.
+    ///
+    /// The dispatches of one thread look up and queue one at a time, in
+    /// the order they started, under the thread's lock: each Rocket.Chat
+    /// connection in a room may deliver a message, and two of a thread's
+    /// messages delivered by different connections at once would
+    /// otherwise reach the lanes in the order their lookups ended. The
+    /// busy lines are posted in tasks of their own, so the lock never
+    /// waits for one.
     async fn dispatch(&self, event: InboundEvent, caps: Caps) -> Vec<oneshot::Receiver<()>> {
         if self.is_closed() {
             tracing::info!(message = %event.message.id, "shutting down: not handling a message");
             return Vec::new();
         }
+        let thread = thread_of(&event, caps);
+        let in_order = self.inner.dispatching.lock(thread.clone()).await;
         let (candidates, from_bot) = match self.candidates(&event, caps).await {
             Ok(found) => found,
             Err(err) => {
@@ -501,7 +519,6 @@ impl Pipeline {
             }
         };
         let event = Arc::new(event);
-        let thread = thread_of(&event, caps);
         let mut waiting = Vec::new();
         for (agent, owner) in candidates {
             let (done, finished) = oneshot::channel();
@@ -530,6 +547,7 @@ impl Pipeline {
                 waiting.push(finished);
             }
         }
+        drop(in_order);
         waiting
     }
 
@@ -1623,14 +1641,15 @@ struct Delivery<'a> {
 impl Delivery<'_> {
     /// Delivers `report`: the attachments, then the reply or the failure's
     /// message, then the reactions, then the queued posts. Each part goes
-    /// out whatever happened to the others; if any couldn't, the thread is
-    /// told with [`DELIVERY_FAILED_TEXT`].
+    /// out whatever happened to the others; if any but a reaction couldn't,
+    /// or the turn's outbox was lost because `turn_finished` failed, the
+    /// thread is told with [`DELIVERY_FAILED_TEXT`].
     async fn report(&self, turn: TurnId, report: TurnReport<Option<Outbox>>) {
-        let outbox = match report.finished {
-            Ok(outbox) => outbox,
+        let (outbox, mut complete) = match report.finished {
+            Ok(outbox) => (outbox, true),
             Err(err) => {
                 tracing::warn!(session = %self.session.id, error = %err, "the turn's outbox was lost");
-                None
+                (None, false)
             }
         };
         let (reply, reactions) = match &report.outcome {
@@ -1661,7 +1680,6 @@ impl Delivery<'_> {
             reply_len = reply.len(),
             "a turn ended"
         );
-        let mut complete = true;
         if let Some(outbox) = &outbox
             && !outbox.attachments().is_empty()
             && let Err(err) = self
@@ -1696,7 +1714,9 @@ impl Delivery<'_> {
     /// Renders and posts Markdown `text` to the target, recording a
     /// `message_refs` row for each chunk. A chunk that can't be posted is
     /// skipped and the rest still go. Empty text posts nothing. False if a
-    /// chunk was lost.
+    /// chunk was lost, or posted without its row: unattributed, a mention
+    /// in it starts no hop, a reply to it reaches no agent, and the next
+    /// turn shows it again as history.
     async fn post(&self, turn: TurnId, text: &str) -> bool {
         if text.trim().is_empty() {
             return true;
@@ -1728,6 +1748,7 @@ impl Delivery<'_> {
                 .await;
             if let Err(err) = recorded {
                 tracing::warn!(session = %self.session.id, msg = %posted.id, error = %err, "recording a posted message failed");
+                complete = false;
             }
         }
         complete
@@ -1789,7 +1810,7 @@ mod tests {
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
     use crate::pipeline::TurnSettings;
-    use core_types::{BindingId, ConvRef, SurfaceKind};
+    use core_types::{BindingId, ConvRef, SessionId, SurfaceKind};
     use runner::{PoolConfig, ProcessConfig};
     use sandbox::ProcessSandbox;
     use testkit::TempDir;
@@ -2100,6 +2121,97 @@ mod tests {
         }
         assert_eq!(checked, 3 * 3 * 4 * 2 * 3 * 2 * 4);
         assert_eq!(private, 1, "exactly one combination is the owner's own DM");
+    }
+
+    async fn store() -> Store {
+        let config = Config::parse(MINIMAL, env()).unwrap();
+        Store::open_in_memory(config.sealer().unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The report of a turn that replied `text`, with what `turn_finished`
+    /// returned.
+    fn replied(
+        text: &str,
+        finished: Result<Option<Outbox>, runner::HookError>,
+    ) -> TurnReport<Option<Outbox>> {
+        TurnReport {
+            outcome: TurnOutcome::Finished(runner::TurnResult {
+                is_error: false,
+                error_kind: None,
+                subtype: Some("success".to_owned()),
+                result: Some(text.to_owned()),
+                terminal_reason: None,
+                api_error_status: None,
+                usage: None,
+                cost_usd: Err(runner::CostUnknown::NoTotal),
+                process_total_cost_usd: None,
+                session_id: None,
+                stats: runner::TurnStats::default(),
+            }),
+            finished,
+            process_start: None,
+            reran: false,
+        }
+    }
+
+    /// Delivers `report` in a thread through `store`, and returns the texts
+    /// posted.
+    async fn delivered(store: &Store, report: TurnReport<Option<Outbox>>) -> Vec<String> {
+        let surface = MockSurface::new();
+        let key = lane_key();
+        let event = event(&key);
+        let session = Session {
+            id: SessionId::new_v4(),
+            agent: key.0,
+            thread: key.1.clone(),
+            scope: ScopeKey::for_conversation(event.conv_kind, event.conv.clone()),
+            kind: runner::SessionKind::Normal,
+            started: true,
+            maybe_started: false,
+            created_at: event.received_at,
+            last_turn_at: None,
+            reset_at: None,
+        };
+        let requester = Requester {
+            member: None,
+            key: event.sender.clone(),
+        };
+        let delivery = Delivery {
+            store,
+            surface: &surface,
+            session: &session,
+            agent: key.0,
+            requester: &requester,
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            target: ReplyTarget::from(key.1),
+            answered: &event.message,
+        };
+        delivery.report(TurnId::new_v4(), report).await;
+        surface.posts().into_iter().map(|(_, text)| text).collect()
+    }
+
+    #[tokio::test]
+    async fn a_lost_outbox_is_reported_as_an_incomplete_delivery() {
+        let lost = replied("Here.", Err("the store is down".into()));
+        assert_eq!(
+            delivered(&store().await, lost).await,
+            ["Here.", DELIVERY_FAILED_TEXT]
+        );
+        let kept = replied("Here.", Ok(None));
+        assert_eq!(delivered(&store().await, kept).await, ["Here."]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_posted_without_its_attribution_is_reported_as_incomplete() {
+        let store = store().await;
+        store.close().await;
+        assert_eq!(
+            delivered(&store, replied("Here.", Ok(None))).await,
+            ["Here.", DELIVERY_FAILED_TEXT]
+        );
     }
 
     #[test]
