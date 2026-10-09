@@ -17,8 +17,8 @@ use crate::cloud::FireClient;
 use crate::commands::rocketchat::command_in;
 use crate::commands::slack::dm_command;
 use crate::commands::slack_tests::{
-    Running, SlackHarness, dm_event, file_store, identity, json_body, slack_channel, slack_harness,
-    slack_harness_on, slack_key, sql,
+    Running, SlackHarness, dm_event, file_store, identity, json_body, link, slack_channel,
+    slack_harness, slack_harness_on, slack_key, sql,
 };
 use crate::commands::tests::{Harness, conv, dm_room, harness, key, serve};
 use crate::config::CloudConfig;
@@ -137,10 +137,11 @@ fn second() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp()).unwrap()
 }
 
+/// Registers routine [`LABEL`] for `member`, who must be linked.
 async fn put_routine(store: &Store, member: MemberId, url_origin: &str, added_by: &MemberKey) {
     let token = RoutineToken::parse(SecretString::from(TOKEN)).unwrap();
     let routine_id: RoutineId = ROUTINE.parse().unwrap();
-    store
+    let put = store
         .put_cloud_routine(
             &NewCloudRoutine {
                 member,
@@ -154,6 +155,13 @@ async fn put_routine(store: &Store, member: MemberId, url_origin: &str, added_by
         )
         .await
         .unwrap();
+    assert!(
+        matches!(
+            put,
+            CloudRoutinePut::Added(_) | CloudRoutinePut::Replaced(_)
+        ),
+        "{put:?}"
+    );
 }
 
 async fn begin(
@@ -352,7 +360,9 @@ async fn an_unlinked_member_cannot_add_or_run() {
     );
     assert!(c.h.store.cloud_routines(alice).await.unwrap().is_empty());
 
+    link(&c.h.store, alice).await;
     put_routine(&c.h.store, alice, &c.endpoint.uri(), &key("alice")).await;
+    assert!(c.h.store.delete_claude_link(alice).await.unwrap());
     let ran = c.run("alice", "Fix the flaky test").await;
     assert!(ran.starts_with("Link your Claude account first"), "{ran}");
     assert!(handoffs(&c.h.store, alice).await.is_empty());
@@ -650,6 +660,7 @@ async fn a_notice_no_manager_bot_reaches_waits_and_a_failed_one_is_deferred() {
         .ensure_member(&slack, "U0HUMAN01", OffsetDateTime::now_utc())
         .await
         .unwrap();
+    link(&h.store, member).await;
     let t0 = second();
     begin(&h.store, member, &slack, t0).await;
     let notifier = CloudNotifier::new(h.store.clone(), h.commands.replies().clone(), None);
@@ -1261,6 +1272,9 @@ async fn a_new_token_replaces_the_routine_and_a_routine_is_registered_once() {
     assert_eq!(token.expose_secret(), NEW_TOKEN);
     logs.snapshot()
         .assert_has("registered a cloud routine")
+        .assert_has("replaced a cloud routine")
+        .assert_has("refused a cloud routine registered under another label")
+        .assert_has("refused a cloud routine past the per-member cap")
         .assert_lacks(NEW_TOKEN)
         .assert_lacks(TOKEN);
 }

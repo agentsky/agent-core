@@ -38,9 +38,9 @@ pub const MAX_RULES: usize = 100;
 
 /// The most rules an agent's deny list holds with the denies copied from
 /// channels' old ids ([`Rules::copy_denies`]): a copy past it denies
-/// everyone instead. A real channel id change copies at most one deny, so
-/// only a flood of forged changes, which only the agent's owner can send,
-/// takes a list there.
+/// everyone instead. A real channel id change copies a deny for each of the
+/// few ids its chain runs through at most, so only a flood of forged
+/// changes, which only the agent's owner can send, takes a list there.
 pub const MAX_DENIES: usize = 2 * MAX_RULES;
 
 /// The community's caps, from `[limits]`.
@@ -356,12 +356,43 @@ fn add(rules: &mut Vec<Rule>, rule: Rule) -> Change {
 
 /// The ids a channel that was `start` had since, as `binding`'s recorded
 /// channel id changes in `changes` say, waiting or settled: those it was
-/// changed to, then those they were changed to, and so on, each once, the
-/// last the latest a chain reaches.
+/// changed to, and those a settled change found it at, then those they
+/// were changed to, and so on, each once.
 pub fn later_ids(
     changes: &[KnownChannelIdChange],
     binding: BindingId,
     start: &ConversationId,
+) -> Vec<ConversationId> {
+    reached(changes, binding, start, |known| {
+        std::iter::once(&known.change.new).chain(&known.settled_to)
+    })
+}
+
+/// The id to ask Slack about for a channel that was `start`: the last a
+/// chain of `binding`'s recorded changes in `changes` reaches, taking a
+/// settled change to where Slack found the channel rather than to its new
+/// id, since that answer is later than the event; `start` if none leads
+/// on from it.
+pub fn latest_id(
+    changes: &[KnownChannelIdChange],
+    binding: BindingId,
+    start: &ConversationId,
+) -> ConversationId {
+    reached(changes, binding, start, |known| {
+        std::iter::once(known.settled_to.as_ref().unwrap_or(&known.change.new))
+    })
+    .pop()
+    .unwrap_or_else(|| start.clone())
+}
+
+/// The ids reached from `start`, breadth first and each once, through
+/// `binding`'s changes in `changes`, each leading from its old id to the
+/// ids `onward_of` gives.
+fn reached<'a, I: IntoIterator<Item = &'a ConversationId>>(
+    changes: &'a [KnownChannelIdChange],
+    binding: BindingId,
+    start: &'a ConversationId,
+    onward_of: impl Fn(&'a KnownChannelIdChange) -> I,
 ) -> Vec<ConversationId> {
     let mut onward: HashMap<&ConversationId, Vec<&ConversationId>> = HashMap::new();
     for known in changes
@@ -371,7 +402,7 @@ pub fn later_ids(
         onward
             .entry(&known.change.old)
             .or_default()
-            .push(&known.change.new);
+            .extend(onward_of(known));
     }
     let mut seen = HashSet::from([start]);
     let mut order = vec![start];
@@ -385,6 +416,24 @@ pub fn later_ids(
         }
     }
     order.into_iter().skip(1).cloned().collect()
+}
+
+/// The old ids of `binding`'s waiting changes in `changes` whose chain
+/// reaches `id` ([`later_ids`]): those whose denies apply to `id` while
+/// they wait ([`pending_denials`]).
+pub fn waiting_before<'a>(
+    changes: &'a [KnownChannelIdChange],
+    binding: BindingId,
+    id: &'a ConversationId,
+) -> impl Iterator<Item = &'a ConversationId> {
+    changes
+        .iter()
+        .filter(move |known| {
+            known.waiting
+                && known.change.binding == binding
+                && later_ids(changes, binding, &known.change.old).contains(id)
+        })
+        .map(|known| &known.change.old)
 }
 
 /// The conversations whose denies apply to others too while `changes`, an
@@ -768,6 +817,7 @@ mod tests {
             },
             team: "T1".into(),
             waiting,
+            settled_to: (!waiting).then(|| new.into()),
         }
     }
 
@@ -789,6 +839,48 @@ mod tests {
         assert_eq!(ids("G1"), ["C2", "C3"], "in any order, and a cycle ends");
         assert_eq!(ids("C3"), ["G1", "C2"]);
         assert!(ids("C9").is_empty());
+    }
+
+    fn settled_on(binding: BindingId, old: &str, new: &str, to: &str) -> KnownChannelIdChange {
+        KnownChannelIdChange {
+            settled_to: Some(to.into()),
+            ..known(binding, old, new, false)
+        }
+    }
+
+    #[test]
+    fn a_settled_change_leads_to_where_slack_found_the_channel() {
+        let binding = BindingId::new_v4();
+        let changes = [
+            settled_on(binding, "C2", "C3", "C5"),
+            known(binding, "C3", "C4", true),
+            known(binding, "C4", "C5", true),
+            known(binding, "G1", "C2", true),
+        ];
+        let start = "G1".into();
+        let later: Vec<String> = later_ids(&changes, binding, &start)
+            .into_iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(later, ["C2", "C3", "C5", "C4"], "every id, for the denies");
+        assert_eq!(
+            latest_id(&changes, binding, &start).as_str(),
+            "C5",
+            "Slack's answer, not the deepest id"
+        );
+        assert_eq!(latest_id(&changes, binding, &"C9".into()).as_str(), "C9");
+
+        let cycle = [
+            known(binding, "G1", "C2", true),
+            settled_on(binding, "C2", "C3", "G1"),
+        ];
+        let ids: Vec<String> = later_ids(&cycle, binding, &start)
+            .into_iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids, ["C2", "C3"], "a cycle through a settled change ends");
+        assert_eq!(latest_id(&cycle, binding, &start).as_str(), "C2");
+        assert_eq!(latest_id(&cycle, binding, &"C2".into()).as_str(), "G1");
     }
 
     #[test]

@@ -175,8 +175,8 @@ impl FromStr for MemberKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Outside {
     /// The sender's own organization, a Slack team (`T…`) or Enterprise
-    /// Grid organization (`E…`), or `None` when Slack named none.
-    pub team: Option<TeamId>,
+    /// Grid organization (`E…`), as the message's own team fields name it.
+    pub team: TeamId,
 }
 
 /// Whether a conversation is shared beyond the workspace agentd serves, as
@@ -510,14 +510,11 @@ mod tests {
     fn outside_serde_round_trips() {
         assert_eq!(
             json_round_trip(&Outside {
-                team: Some("E0ORG".into())
+                team: "E0ORG".into()
             }),
             serde_json::json!({"team": "E0ORG"})
         );
-        assert_eq!(
-            json_round_trip(&Outside { team: None }),
-            serde_json::json!({"team": null})
-        );
+        assert!(serde_json::from_value::<Outside>(serde_json::json!({"team": null})).is_err());
     }
 
     #[test]

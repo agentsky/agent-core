@@ -4,7 +4,7 @@ use core_types::{CloudRoutineId, MemberKey, RoutineToken, SurfaceKind, TeamId, U
 use secrecy::SecretString;
 use serde_json::json;
 use store::{
-    CloudBegun, CloudFinished, CloudHandoffState, CloudOrigin, CloudRoutineVersion,
+    CloudBegun, CloudFinished, CloudHandoffState, CloudOrigin, CloudRoutineVersion, NewClaudeLink,
     NewCloudHandoff, NewCloudRoutine, Sealer, Store,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -922,6 +922,20 @@ async fn every_outcome_is_recorded_as_it_is() {
     };
     let now = time::OffsetDateTime::now_utc();
     let member = store.ensure_member(&key, "Ada", now).await.unwrap();
+    store
+        .put_claude_link(
+            member,
+            &NewClaudeLink {
+                access_token: SecretString::from("access"),
+                refresh_token: SecretString::from("refresh"),
+                expires_at: now + time::Duration::hours(8),
+                plan: None,
+                rate_limit_tier: None,
+            },
+            now,
+        )
+        .await
+        .unwrap();
     let routine_id: RoutineId = ROUTINE.parse().unwrap();
     store
         .put_cloud_routine(

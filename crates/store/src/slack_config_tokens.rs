@@ -100,33 +100,37 @@ fn attempt(value: i64) -> Result<u32> {
 impl Store {
     /// Stores `member`'s configuration token for `team` at `now`, replacing
     /// any they had there, with a new version and no lease, break or notice.
-    /// Then ends the leases and lifts the blocks of the manifest updates of
-    /// `member`'s Slack apps in `team`, so the new token tries them at once:
-    /// a block may be the old token's refusal, and one that isn't is set
-    /// again by the next try. That is best effort: a failure there is
-    /// logged, and the token still counts as stored, since a lease left
-    /// behind only delays an update by its hour.
+    /// `None`, storing nothing, if the member has no Claude link. The check
+    /// and the write are one statement, so a `logout`, which unlinks before
+    /// it deletes the member's tokens, either finds the token to delete or
+    /// comes first and nothing is stored. Once the token is stored, ends the
+    /// leases and lifts the blocks of the manifest updates of `member`'s
+    /// Slack apps in `team`, so the new token tries them at once: a block
+    /// may be the old token's refusal, and one that isn't is set again by
+    /// the next try. That is best effort: a failure there is logged, and the
+    /// token still counts as stored, since a lease left behind only delays
+    /// an update by its hour.
     ///
     /// # Errors
     ///
     /// [`StoreError::Seal`] if a token can't be sealed,
-    /// [`StoreError::Database`] if the member doesn't exist or the query
-    /// fails.
+    /// [`StoreError::Database`] if the query fails.
     pub async fn put_slack_config_token(
         &self,
         member: MemberId,
         team: &TeamId,
         token: &NewSlackConfigToken,
         now: OffsetDateTime,
-    ) -> Result<SlackConfigTokenRef> {
+    ) -> Result<Option<SlackConfigTokenRef>> {
         let key = aad_key(member, team);
         let token_enc = self.seal(aad(TOKEN, &key), &token.token)?;
         let refresh_enc = self.seal(aad(REFRESH_TOKEN, &key), &token.refresh_token)?;
         let version = new_version();
-        sqlx::query(
+        let stored = sqlx::query(
             "INSERT INTO slack_config_tokens \
              (member_id, team_id, token_enc, refresh_token_enc, expires_at, version, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
+             WHERE EXISTS (SELECT 1 FROM claude_links WHERE member_id = ?1) \
              ON CONFLICT (member_id, team_id) DO UPDATE SET \
              token_enc = excluded.token_enc, refresh_token_enc = excluded.refresh_token_enc, \
              expires_at = excluded.expires_at, version = excluded.version, \
@@ -141,7 +145,11 @@ impl Store {
         .bind(&version)
         .bind(to_unix(now))
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if stored == 0 {
+            return Ok(None);
+        }
         if let Err(err) = sqlx::query(
             "UPDATE agent_bindings SET manifest_lease_until = NULL, manifest_blocked_version = NULL \
              WHERE surface = 'slack' AND team_id = ? \
@@ -155,11 +163,11 @@ impl Store {
         {
             tracing::warn!(%member, error = %err, "stored a configuration token but couldn't end its member's manifest update leases and blocks; their apps are updated once the leases end");
         }
-        Ok(SlackConfigTokenRef {
+        Ok(Some(SlackConfigTokenRef {
             member,
             team: team.clone(),
             version,
-        })
+        }))
     }
 
     /// `member`'s configuration token for `team`, decrypted, broken or not.
@@ -553,6 +561,7 @@ mod tests {
 
     use super::*;
     use crate::SealError;
+    use crate::claude_links::tests::new_link;
     use crate::test_util::*;
 
     const MAX: u32 = 3;
@@ -569,11 +578,67 @@ mod tests {
         }
     }
 
+    /// A member with a Claude link, as `slack-token` needs.
     async fn member(store: &Store, user: &str) -> MemberId {
-        store
+        let member = store
             .ensure_member(&member_key(user), user, at(1_000))
             .await
+            .unwrap();
+        store
+            .put_claude_link(member, &new_link("a", "r"), at(1_000))
+            .await
+            .unwrap();
+        member
+    }
+
+    fn other_team() -> TeamId {
+        TeamId::new("T0OTHER01")
+    }
+
+    #[tokio::test]
+    async fn a_slack_token_stored_after_the_unlink_is_refused() {
+        let store = memory_store().await;
+        let ada = member(&store, "ada").await;
+        store
+            .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 50_000), at(1_000))
+            .await
             .unwrap()
+            .unwrap();
+        assert!(store.delete_claude_link(ada).await.unwrap());
+        assert!(
+            store
+                .put_slack_config_token(ada, &team(), &tokens("xoxe.b", 60_000), at(1_100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let kept = store
+            .slack_config_token(ada, &team())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.token.expose_secret(), "xoxe.a");
+        assert!(
+            store
+                .slack_config_token(ada, &other_team())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .put_slack_config_token(ada, &other_team(), &tokens("xoxe.c", 60_000), at(1_100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .slack_config_token(ada, &other_team())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -586,6 +651,7 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 50_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         let read = usable(49_999).await.unwrap().unwrap();
         assert_eq!(read.token.expose_secret(), "xoxe.a");
@@ -614,6 +680,7 @@ mod tests {
         let put = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 50_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         let read = store
             .slack_config_token(ada, &team())
@@ -658,10 +725,12 @@ mod tests {
         store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 50_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .put_slack_config_token(bob, &team(), &tokens("xoxe.b", 50_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         sqlx::query(
             "UPDATE slack_config_tokens SET token_enc = \
@@ -694,6 +763,7 @@ mod tests {
         let first = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 2_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         assert!(
             store
@@ -704,6 +774,7 @@ mod tests {
         let second = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.b", 60_000), at(1_600))
             .await
+            .unwrap()
             .unwrap();
         assert_ne!(first.version, second.version);
         let status = store
@@ -736,10 +807,12 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .put_slack_config_token(bob, &team(), &tokens("xoxe.b", 90_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
 
         let due = store
@@ -807,6 +880,7 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .claim_slack_config_token(&row, at(3_000), at(3_300))
@@ -836,6 +910,7 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .claim_slack_config_token(&row, at(3_000), at(3_300))
@@ -845,6 +920,7 @@ mod tests {
         store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.new", 50_000), at(3_100))
             .await
+            .unwrap()
             .unwrap();
         assert!(
             store
@@ -874,6 +950,7 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .claim_slack_config_token(&row, at(3_000), at(3_300))
@@ -942,6 +1019,7 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .claim_slack_config_token(&row, at(3_000), at(3_300))
@@ -1009,6 +1087,7 @@ mod tests {
         let row = store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         store
             .mark_slack_config_token_broken(&row, at(3_000))
@@ -1050,6 +1129,7 @@ mod tests {
             store
                 .put_slack_config_token(who, &team, &tokens("xoxe.x", 5_000), at(1_000))
                 .await
+                .unwrap()
                 .unwrap();
         }
         assert!(store.delete_slack_config_token(ada, &other).await.unwrap());
@@ -1072,6 +1152,7 @@ mod tests {
         store
             .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 5_000), at(1_000))
             .await
+            .unwrap()
             .unwrap();
         sqlx::query("DELETE FROM members WHERE id = ?")
             .bind(ada.to_string())

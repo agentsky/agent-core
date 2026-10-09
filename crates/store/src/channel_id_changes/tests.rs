@@ -108,13 +108,13 @@ async fn a_try_is_claimed_once_until_its_retry_is_due_and_a_settled_change_stays
     assert!(claim(1_300).await.unwrap());
     assert!(
         store
-            .settle_channel_id_change(&changed, at(1_310))
+            .settle_channel_id_change(&changed, &changed.new, at(1_310))
             .await
             .unwrap()
     );
     assert!(
         !store
-            .settle_channel_id_change(&changed, at(1_320))
+            .settle_channel_id_change(&changed, &changed.new, at(1_320))
             .await
             .unwrap()
     );
@@ -150,7 +150,7 @@ async fn waiting_changes_received_long_ago_expire_and_settled_ones_are_purged_af
         store.record_channel_id_change(changed, 64).await.unwrap();
     }
     store
-        .settle_channel_id_change(&settled, at(1_001))
+        .settle_channel_id_change(&settled, &settled.new, at(1_001))
         .await
         .unwrap();
     assert_eq!(
@@ -213,7 +213,7 @@ async fn the_earliest_settled_changes_make_room_and_waiting_ones_fill_it() {
             "change {n}"
         );
         store
-            .settle_channel_id_change(&changed, at(1_000 + n))
+            .settle_channel_id_change(&changed, &changed.new, at(1_000 + n))
             .await
             .unwrap();
         recorded.push(changed);
@@ -276,7 +276,7 @@ async fn a_new_change_keeps_the_settled_ones_its_own_chain_runs_through() {
         );
         assert!(
             store
-                .settle_channel_id_change(changed, changed.received_at)
+                .settle_channel_id_change(changed, &changed.new, changed.received_at)
                 .await
                 .unwrap()
         );
@@ -328,7 +328,7 @@ async fn a_known_change_or_a_full_binding_is_refused_without_the_write_lock() {
     drop(lock);
     assert!(
         store
-            .settle_channel_id_change(&waiting, at(1_002))
+            .settle_channel_id_change(&waiting, &waiting.new, at(1_002))
             .await
             .unwrap()
     );
@@ -348,14 +348,19 @@ async fn settled_changes_a_waiting_chain_runs_through_are_never_forgotten() {
         async |changed: &ChannelIdChange| store.record_channel_id_change(changed, 4).await.unwrap();
     let waiting = change(helper, "G0CHAIN0A", "C0CHAIN0B", 1_000);
     let onward = change(helper, "C0CHAIN0B", "C0CHAIN0C", 1_001);
-    let further = change(helper, "C0CHAIN0C", "C0CHAIN0D", 1_002);
+    let found: ConversationId = "C0CHAIN0D".into();
+    let further = change(helper, "C0CHAIN0D", "C0CHAIN0E", 1_002);
     let other = change(helper, "G0OTHER01", "C0OTHER01", 1_003);
     assert_eq!(record(&waiting).await, Recorded);
-    for changed in [&onward, &further, &other] {
+    for (changed, to) in [
+        (&onward, &found),
+        (&further, &further.new),
+        (&other, &other.new),
+    ] {
         assert_eq!(record(changed).await, Recorded);
         assert!(
             store
-                .settle_channel_id_change(changed, changed.received_at)
+                .settle_channel_id_change(changed, to, changed.received_at)
                 .await
                 .unwrap()
         );
@@ -381,7 +386,8 @@ async fn settled_changes_a_waiting_chain_runs_through_are_never_forgotten() {
             further.clone(),
             first.clone()
         ],
-        "the earliest settled change off the waiting chain made room"
+        "the earliest settled change off the waiting chain made room, and the chain runs \
+         on from where Slack found a channel"
     );
 
     let second = change(helper, "G0NEW0002", "C0NEW0002", 1_005);
@@ -390,7 +396,7 @@ async fn settled_changes_a_waiting_chain_runs_through_are_never_forgotten() {
 
     assert!(
         store
-            .settle_channel_id_change(&waiting, at(1_006))
+            .settle_channel_id_change(&waiting, &waiting.new, at(1_006))
             .await
             .unwrap()
     );
@@ -417,7 +423,7 @@ async fn an_agents_changes_name_their_workspace_and_whether_they_wait() {
         store.record_channel_id_change(changed, 64).await.unwrap();
     }
     store
-        .settle_channel_id_change(&first, at(1_050))
+        .settle_channel_id_change(&first, &first.new, at(1_050))
         .await
         .unwrap();
     let agent = store.binding(helper).await.unwrap().unwrap().agent;
@@ -425,6 +431,7 @@ async fn an_agents_changes_name_their_workspace_and_whether_they_wait() {
         store.channel_id_changes_of_agent(agent).await.unwrap(),
         [
             KnownChannelIdChange {
+                settled_to: Some(first.new.clone()),
                 change: first,
                 team: TeamId::new("T0TEAM001"),
                 waiting: false,
@@ -433,6 +440,7 @@ async fn an_agents_changes_name_their_workspace_and_whether_they_wait() {
                 change: second,
                 team: TeamId::new("T0TEAM001"),
                 waiting: true,
+                settled_to: None,
             },
         ]
     );

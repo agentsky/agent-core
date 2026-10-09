@@ -137,6 +137,7 @@ const NOT_FOUND_CODES: &[&str] = &[
     "no_reaction",
     "thread_not_found",
     "user_not_found",
+    "user_not_visible",
     "users_not_found",
 ];
 
@@ -1710,7 +1711,8 @@ impl WebApi {
     ///
     /// # Errors
     ///
-    /// See [`map_error`]; `user_not_found` is [`SurfaceError::NotFound`].
+    /// See [`map_error`]; `user_not_found` and `user_not_visible` are
+    /// [`SurfaceError::NotFound`].
     pub async fn user_info(&self, user: &UserId) -> Result<User> {
         let form = vec![("user", user.to_string())];
         let info: UserResponse = self.call(Method::UsersInfo, Body::Form(form), None).await?;

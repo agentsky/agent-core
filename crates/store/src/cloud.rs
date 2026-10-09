@@ -31,6 +31,7 @@ use core_types::{CloudHandoffId, CloudRoutineId, MemberId, MemberKey, RoutineId,
 use secrecy::SecretString;
 use time::OffsetDateTime;
 
+use crate::claude_links::linked;
 use crate::{Aad, Result, Store, StoreError, from_unix, parse_column, to_unix};
 
 const ROUTINES: &str = "cloud_routines";
@@ -174,6 +175,9 @@ pub enum CloudRoutinePut {
     /// Nothing was stored: the label is new and the member holds
     /// [`MAX_CLOUD_ROUTINES`] routines already.
     Full,
+    /// Nothing was stored: the member has no Claude link, as after a
+    /// `logout` that ran since the command checked for one.
+    Unlinked,
 }
 
 /// What [`Store::begin_cloud_handoff`] did.
@@ -188,6 +192,9 @@ pub enum CloudBegun {
     /// Nothing was recorded: the member asked for the cap's worth of
     /// hand-offs within [`CLOUD_HANDOFF_WINDOW`] already.
     TooMany,
+    /// Nothing was recorded: the member has no Claude link, as after a
+    /// `logout` that ran since the command checked for one.
+    Unlinked,
 }
 
 /// What [`Store::finish_cloud_handoff`] did.
@@ -583,9 +590,12 @@ impl Store {
     /// keeps its id and takes the new routine id, token, identity and time,
     /// which is how a member registers a new token. A routine id the member
     /// registered under another label is refused, and so is a new label once
-    /// the member holds [`MAX_CLOUD_ROUTINES`]. The checks and the write are
-    /// one `BEGIN IMMEDIATE` transaction, so concurrent calls never pass
-    /// them together.
+    /// the member holds [`MAX_CLOUD_ROUTINES`], and so is any routine while
+    /// the member has no Claude link. The checks and the write are one
+    /// `BEGIN IMMEDIATE` transaction, so concurrent calls never pass them
+    /// together, and a `logout`, which unlinks before it deletes the
+    /// member's routines, either finds the routine to delete or comes
+    /// first and nothing is stored.
     ///
     /// # Errors
     ///
@@ -605,6 +615,9 @@ impl Store {
             added_by,
         } = *routine;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if !linked(&mut tx, member).await? {
+            return Ok(CloudRoutinePut::Unlinked);
+        }
         let taken: Option<String> = sqlx::query_scalar(
             "SELECT label FROM cloud_routines WHERE member_id = ? AND routine_id = ? \
              AND label <> ?",
@@ -779,14 +792,16 @@ impl Store {
     }
 
     /// Records `handoff`, asked at `now`, as `sending`, with its task sealed
-    /// to its row, unless the member's routine is gone or no longer the
-    /// registration `handoff` names (its token replaced since it was
-    /// read, under the same label and routine id), or they asked for
-    /// `per_hour` hand-offs or more within [`CLOUD_HANDOFF_WINDOW`] before
-    /// `now`. Write it before the request is sent. The checks and the write
-    /// are one transaction, so a deletion of the member's routines either
-    /// comes first and nothing is recorded, or comes after and deletes the
-    /// row, and concurrent hand-offs never pass the cap together.
+    /// to its row, unless the member has no Claude link, their routine is
+    /// gone or no longer the registration `handoff` names (its token
+    /// replaced since it was read, under the same label and routine id), or
+    /// they asked for `per_hour` hand-offs or more within
+    /// [`CLOUD_HANDOFF_WINDOW`] before `now`. Write it before the request is
+    /// sent. The checks and the write are one transaction, so a deletion of
+    /// the member's routines either comes first and nothing is recorded, or
+    /// comes after and deletes the row, a `logout`, which unlinks first,
+    /// stops the hand-off once it has unlinked, and concurrent hand-offs
+    /// never pass the cap together.
     ///
     /// # Errors
     ///
@@ -802,6 +817,9 @@ impl Store {
         let key = task_key(handoff.member, &id.to_string());
         let task = self.seal(task_aad(&key), &SecretString::from(handoff.task))?;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if !linked(&mut tx, handoff.member).await? {
+            return Ok(CloudBegun::Unlinked);
+        }
         let routine: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM cloud_routines WHERE member_id = ? AND label = ? AND routine_id = ? \
              AND token_enc = ?",

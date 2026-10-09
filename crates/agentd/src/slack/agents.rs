@@ -108,7 +108,7 @@ use super::bots::SlackBots;
 use super::manager::SlackManager;
 use crate::agents::CREATION_LEASE;
 use crate::config::Config;
-use crate::policy::{Rules, later_ids};
+use crate::policy::{Rules, later_ids, latest_id, waiting_before};
 
 /// How often the sweeper looks for creations to abandon and reminders to
 /// send.
@@ -261,9 +261,11 @@ pub struct SweepPass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelChange {
     /// Slack said where the channel is now, with the bot in it, and the
-    /// agent's rules on the old id, if it had any, moved there.
+    /// agent's rules on the old id, if it had any, moved there, with the
+    /// denies of changes still waiting before it.
     Moved {
-        /// Whether the agent had rules on the old id.
+        /// Whether the agent's rules changed: its rules on the old id moved,
+        /// or denies of changes still waiting before it were copied.
         rules: bool,
         /// Where the channel is now.
         to: ConversationId,
@@ -1228,19 +1230,15 @@ impl SlackAgents {
             change: change.clone(),
             team: row.team.clone(),
             waiting: false,
+            settled_to: None,
         });
         let room = |conversation: &ConversationId| ConvRef {
             surface: SurfaceKind::Slack,
             team: row.team.clone(),
             conversation: conversation.clone(),
         };
-        let upstream = known.iter().filter(|other| {
-            other.waiting
-                && other.change.binding == binding
-                && later_ids(&known, binding, &other.change.old).contains(&change.old)
-        });
         let sources: Vec<ConvRef> = std::iter::once(&change.old)
-            .chain(upstream.map(|other| &other.change.old))
+            .chain(waiting_before(&known, binding, &change.old))
             .map(room)
             .collect();
         let targets: Vec<ConvRef> = later_ids(&known, binding, &change.old)
@@ -1296,11 +1294,18 @@ impl SlackAgents {
     }
 
     /// Tries to settle `change`, if this call claims the try: follows the
-    /// binding's recorded changes from the new id to the last id they name,
-    /// asks Slack with the binding's bot token where that channel is now,
-    /// and, if Slack answers with the bot in it, moves the agent's rules on
-    /// the old id there. Any other answer leaves it waiting for its next
-    /// try.
+    /// binding's recorded changes from the new id to the last id they reach
+    /// ([`latest_id`]), asks Slack with the binding's bot token where that
+    /// channel is now, and, if Slack answers with the bot in it, moves the
+    /// agent's rules on the old id there, then marks the change settled
+    /// there, which chains through it follow from then on ([`later_ids`]).
+    /// In the same write as the move it copies there the denies on the old
+    /// id of each waiting change whose chain reaches this one's old id
+    /// ([`waiting_before`]), since their pending denies reach the id Slack
+    /// named only once the change is marked; a duplicate is dropped when
+    /// such a change moves its rules there in turn, and a copy can outlive
+    /// its change otherwise, refusing more rather than less. Any other
+    /// answer leaves it waiting for its next try.
     ///
     /// # Errors
     ///
@@ -1328,9 +1333,7 @@ impl SlackAgents {
         };
         let (old, new) = (&change.old, &change.new);
         let known = store.channel_id_changes_of_agent(row.agent).await?;
-        let last = later_ids(&known, binding, new)
-            .pop()
-            .unwrap_or_else(|| new.clone());
+        let last = latest_id(&known, binding, new);
         let to = match surface.channel_now(&last).await {
             Ok(Some(to)) => to,
             Ok(None) => {
@@ -1352,31 +1355,33 @@ impl SlackAgents {
             conversation: conversation.clone(),
         };
         let (from, into) = (room(old), room(&to));
-        let moved = store
+        let upstream: Vec<ConvRef> = waiting_before(&known, binding, old).map(room).collect();
+        let changed = store
             .update_agent_settings(row.agent, |settings| {
                 let mut rules = Rules::read(settings).ok()?;
                 let moved = rules.move_room(&from, &into);
-                if moved {
+                let copied = rules.copy_denies(upstream.iter().map(|source| (source, &into)));
+                if moved || copied {
                     rules.write(settings);
                 }
-                Some(moved)
+                Some((moved, copied))
             })
             .await?;
-        store.settle_channel_id_change(change, now()).await?;
+        store.settle_channel_id_change(change, &to, now()).await?;
         surface.directory().forget_conv(old);
-        match moved {
-            Some(true) => {
-                tracing::info!(%binding, agent = %row.agent, %old, %new, %to, "a channel changed its id; moved the agent's rules on it to the id it has now");
+        match changed {
+            Some((moved, copied)) if moved || copied => {
+                tracing::info!(%binding, agent = %row.agent, %old, %new, %to, moved, denies_copied = copied, "a channel changed its id; the agent's rules on it moved to the id it has now, or the denies of changes still waiting before it were copied there");
             }
-            Some(false) => {
-                tracing::debug!(%binding, %old, %new, %to, "a channel changed its id; the agent had no rules on it");
+            Some(_) => {
+                tracing::debug!(%binding, %old, %new, %to, "a channel changed its id; the agent had no rules on it to move, and no denies of changes still waiting before it that the id it has now lacked");
             }
             None => {
                 tracing::warn!(%binding, agent = %row.agent, %old, %new, "a channel changed its id, but the agent's rules don't read, so none moved; they refuse everyone until its owner sets them again");
             }
         }
         Ok(ChannelChange::Moved {
-            rules: moved == Some(true),
+            rules: changed.is_some_and(|(moved, copied)| moved || copied),
             to,
         })
     }

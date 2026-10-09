@@ -1,12 +1,13 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, header};
 use core_types::{
-    ConsentId, Hop, MemberKey, MessageId, Msg, MsgRef, ReplyTarget, Requester, ScopeKey, Side,
-    SurfaceKind, ThreadKey, TurnKind,
+    ConsentId, Hop, LeaseId, MemberKey, MessageId, Msg, MsgRef, ReplyTarget, Requester, ScopeKey,
+    Side, SurfaceKind, ThreadKey, TurnKind,
 };
 use http_body_util::BodyExt as _;
 use secrecy::ExposeSecret as _;
@@ -50,6 +51,9 @@ struct Fixture {
     store: Store,
     surface: Arc<MockSurface>,
     dir: TempDir,
+    /// The last octet of the next process's container address. The first
+    /// process is at [`CONTAINER`].
+    next_address: AtomicU8,
 }
 
 fn sealer() -> store::Sealer {
@@ -84,7 +88,30 @@ impl Fixture {
             store,
             surface,
             dir,
+            next_address: AtomicU8::new(7),
         }
+    }
+
+    /// A container address no other process of the fixture has.
+    fn address(&self) -> IpAddr {
+        IpAddr::from([
+            172,
+            30,
+            0,
+            self.next_address.fetch_add(1, Ordering::Relaxed),
+        ])
+    }
+
+    /// The address `token` is bound to, or [`CONTAINER`] once it is revoked.
+    async fn peer(&self, token: &ProcessToken) -> String {
+        self.store
+            .ctl_token(&token.hash())
+            .await
+            .unwrap()
+            .map_or_else(
+                || CONTAINER.to_owned(),
+                |stored| stored.container_ip.to_string(),
+            )
     }
 
     async fn process(&self) -> (ProcessInfo, ProcessToken) {
@@ -96,18 +123,19 @@ impl Fixture {
                 agent,
                 scope: ScopeKey::Channel(conv("C1")),
             },
-            container_ip: CONTAINER.parse().unwrap(),
+            container_ip: self.address(),
         };
         let token = self.ctl.issue_process_token(info.clone()).await.unwrap();
         (info, token)
     }
 
-    /// A second process in the same volume, as another session of the same
-    /// channel would be.
+    /// A second process in the same volume, in its own container, as
+    /// another session of the same channel would be.
     async fn sibling(&self, of: &ProcessInfo) -> ProcessToken {
         self.ctl
             .issue_process_token(ProcessInfo {
                 session: SessionId::new_v4(),
+                container_ip: self.address(),
                 ..of.clone()
             })
             .await
@@ -116,7 +144,11 @@ impl Fixture {
 
     async fn call(&self, token: Option<&ProcessToken>, path: &str, body: Value) -> (u16, Value) {
         let body = Body::from(serde_json::to_vec(&body).unwrap());
-        self.send(token.map(bearer), CONTAINER, path, body).await
+        let peer = match token {
+            Some(token) => self.peer(token).await,
+            None => CONTAINER.to_owned(),
+        };
+        self.send(token.map(bearer), &peer, path, body).await
     }
 
     async fn send(
@@ -148,9 +180,10 @@ impl Fixture {
 
     async fn attach(&self, token: &ProcessToken, name: &str, bytes: &[u8]) -> (u16, Value) {
         let path = format!("/v1/attach?name={name}");
+        let peer = self.peer(token).await;
         self.send(
             Some(bearer(token)),
-            CONTAINER,
+            &peer,
             &path,
             Body::from(bytes.to_vec()),
         )
@@ -349,15 +382,34 @@ async fn a_new_process_token_replaces_the_sessions_old_one() {
 }
 
 #[tokio::test]
+async fn a_new_process_token_replaces_any_token_bound_to_its_address() {
+    let fixture = Fixture::new().await;
+    let (info, stale) = fixture.process().await;
+    fixture.ctl.begin_turn(&stale, public()).await.unwrap();
+    let fresh = fixture
+        .ctl
+        .issue_process_token(ProcessInfo {
+            session: SessionId::new_v4(),
+            ..info
+        })
+        .await
+        .unwrap();
+    let (status, _) = fixture.call(Some(&stale), "/v1/post", post("here")).await;
+    assert_eq!(status, 401);
+    assert!(fixture.ctl.end_turn(&stale).await.unwrap().is_none());
+    fixture.ctl.begin_turn(&fresh, public()).await.unwrap();
+    let (status, _) = fixture.call(Some(&fresh), "/v1/post", post("here")).await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
 async fn startup_purge_deletes_every_token_lock_and_staged_file() {
     let fixture = Fixture::new().await;
     let (info, token) = fixture.process().await;
     let other = fixture.sibling(&info).await;
     fixture.ctl.begin_turn(&token, public()).await.unwrap();
     assert_eq!(fixture.attach(&token, "a.txt", b"hi").await.0, 200);
-    let (_, held) = fixture
-        .call(Some(&token), "/v1/lock", json!({"op": "acquire"}))
-        .await;
+    let (_, held) = fixture.call(Some(&token), "/v1/lock", acquire()).await;
     assert_eq!(held["state"], "held");
 
     let purged = fixture.ctl.purge().await.unwrap();
@@ -387,7 +439,7 @@ async fn only_attach_is_available_inside_a_private_task() {
         ("/v1/post", post("here")),
         ("/v1/react", json!({"emoji": "eyes", "message": null})),
         ("/v1/history", json!({"before": null, "limit": null})),
-        ("/v1/lock", json!({"op": "acquire"})),
+        ("/v1/lock", acquire()),
         ("/v1/ask-agent", json!({"agent": "b", "task": "t"})),
         ("/v1/private", json!({"task": "t", "files": []})),
     ] {
@@ -530,6 +582,8 @@ async fn malformed_and_oversized_requests_are_refused() {
         ("/v1/history", json!({"limit": MAX_HISTORY_LIMIT + 1}), 400),
         ("/v1/history", json!({"before": "a b"}), 400),
         ("/v1/lock", json!({"op": "steal"}), 400),
+        ("/v1/lock", json!({"op": "acquire"}), 400),
+        ("/v1/lock", json!({"op": "acquire", "lease": "a b"}), 400),
         ("/v1/nope", json!({}), 404),
     ];
     for (path, body, expected) in cases {
@@ -916,6 +970,45 @@ async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn ask_agent_refuses_an_agent_past_the_turns_hand_offs() {
+    let fixture = Fixture::new().await;
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    let asked = [
+        ("reviewer", "U0REVIEW"),
+        ("scout", "U0SCOUT"),
+        ("critic", "U0CRITIC"),
+    ];
+    for (name, bot) in asked {
+        fixture.bot_agent("U0OWNER", name, bot, public).await;
+    }
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    for (name, _) in &asked[..MAX_HAND_OFFS] {
+        let (status, value) = fixture.ask(&token, name, "t").await;
+        assert_eq!(status, 200, "{name}: {value}");
+    }
+    let (name, _) = asked[MAX_HAND_OFFS];
+    let (status, value) = fixture.ask(&token, name, "t").await;
+    assert_eq!(status, 403, "{value}");
+    assert_eq!(code(&value), "refused");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("as many agents as one turn hands off to"),
+        "{value}"
+    );
+    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+    assert_eq!(
+        outbox.posts().len(),
+        MAX_HAND_OFFS,
+        "the refused ask queues nothing"
+    );
 }
 
 #[tokio::test]
@@ -1411,6 +1504,11 @@ async fn private_refuses_a_task_with_characters_the_card_wouldnt_show() {
     );
 }
 
+/// An acquire under a new lease.
+fn acquire() -> Value {
+    json!({"op": "acquire", "lease": LeaseId::new_v4()})
+}
+
 async fn lock(fixture: &Fixture, token: &ProcessToken, body: Value) -> Value {
     let (status, value) = fixture.call(Some(token), "/v1/lock", body).await;
     assert_eq!(status, 200, "{value}");
@@ -1425,17 +1523,28 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
     }
-    let held = lock(&fixture, &a, json!({"op": "acquire"})).await;
+    let held = lock(&fixture, &a, acquire()).await;
     assert_eq!(held["state"], "held");
     assert_eq!(held["seconds_left"], DEFAULT_LEASE_TTL.as_secs());
     let lease = held["lease"].clone();
     assert_eq!(
-        lock(&fixture, &b, json!({"op": "acquire"})).await,
+        lock(&fixture, &b, acquire()).await,
         json!({"state": "busy"}),
         "a second session waits"
     );
     assert_eq!(
-        lock(&fixture, &a, json!({"op": "acquire"})).await,
+        lock(&fixture, &b, json!({"op": "acquire", "lease": lease})).await,
+        json!({"state": "busy"}),
+        "another session can't take the lease by naming it"
+    );
+    let again = lock(&fixture, &a, json!({"op": "acquire", "lease": lease})).await;
+    assert_eq!(
+        again["state"], "held",
+        "an acquire repeated under the lease"
+    );
+    assert_eq!(again["lease"], lease);
+    assert_eq!(
+        lock(&fixture, &a, acquire()).await,
         json!({"state": "busy"}),
         "a second lock in the same session waits too"
     );
@@ -1448,7 +1557,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
         json!({"state": "released"})
     );
     assert_eq!(
-        lock(&fixture, &b, json!({"op": "acquire"})).await,
+        lock(&fixture, &b, acquire()).await,
         json!({"state": "busy"}),
         "another session can't release the lease"
     );
@@ -1456,7 +1565,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
         lock(&fixture, &a, json!({"op": "release", "lease": lease})).await,
         json!({"state": "released"})
     );
-    let next = lock(&fixture, &b, json!({"op": "acquire"})).await;
+    let next = lock(&fixture, &b, acquire()).await;
     assert_eq!(next["state"], "held");
     assert_ne!(next["lease"], lease);
     assert_eq!(
@@ -1469,7 +1578,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
         json!({"state": "released"})
     );
     assert_eq!(
-        lock(&fixture, &a, json!({"op": "acquire"})).await,
+        lock(&fixture, &a, acquire()).await,
         json!({"state": "busy"})
     );
 }
@@ -1482,10 +1591,10 @@ async fn a_lease_expires_when_its_holder_stops_renewing() {
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
     }
-    let held = lock(&fixture, &a, json!({"op": "acquire"})).await;
+    let held = lock(&fixture, &a, acquire()).await;
     assert_eq!(held["state"], "held");
     tokio::time::sleep(Duration::from_millis(2_100)).await;
-    let taken = lock(&fixture, &b, json!({"op": "acquire"})).await;
+    let taken = lock(&fixture, &b, acquire()).await;
     assert_eq!(taken["state"], "held");
     assert_ne!(taken["lease"], held["lease"]);
 }
@@ -1498,7 +1607,6 @@ async fn a_lease_ends_with_its_turn_and_its_token() {
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
     }
-    let acquire = || json!({"op": "acquire"});
     assert_eq!(lock(&fixture, &a, acquire()).await["state"], "held");
     assert_eq!(lock(&fixture, &b, acquire()).await["state"], "busy");
     fixture.ctl.end_turn(&a).await.unwrap();
@@ -1551,10 +1659,7 @@ async fn locks_are_per_volume() {
     let (_, b) = fixture.process().await;
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
-        assert_eq!(
-            lock(&fixture, token, json!({"op": "acquire"})).await["state"],
-            "held"
-        );
+        assert_eq!(lock(&fixture, token, acquire()).await["state"], "held");
     }
 }
 

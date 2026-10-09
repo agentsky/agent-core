@@ -16,7 +16,12 @@
 --
 -- A processed event is remembered for as long as its caller asks, until
 -- `expires_at`: Slack's deduplication keys for an hour, Rocket.Chat's
--- messages for a week, as every row recorded before this did.
+-- messages for a week, as every row recorded before this did. A row inserted
+-- without `expires_at`, by a binary from before this migration still running
+-- on the same store during a blue-green swap, gets that week from its
+-- `seen_at` through the trigger, since SQLite takes no expression as an added
+-- column's default; once no such binary can run, a later migration can drop
+-- the trigger.
 
 ALTER TABLE agent_bindings ADD COLUMN app_scopes TEXT;
 ALTER TABLE agent_bindings ADD COLUMN app_redirect_url TEXT;
@@ -28,3 +33,11 @@ ALTER TABLE processed_events ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0;
 UPDATE processed_events SET expires_at = seen_at + 604800;
 DROP INDEX processed_events_seen_at;
 CREATE INDEX processed_events_expires_at ON processed_events (expires_at);
+
+CREATE TRIGGER processed_events_default_expires_at
+AFTER INSERT ON processed_events
+WHEN NEW.expires_at = 0
+BEGIN
+    UPDATE processed_events SET expires_at = NEW.seen_at + 604800
+    WHERE source = NEW.source AND event_id = NEW.event_id;
+END;

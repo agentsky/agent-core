@@ -149,10 +149,10 @@ lifts the deny, and `allow <name> everyone` opens it to everyone not denied
 by name; the owner may always use their own agent. `[limits]` caps every
 thread outside one-to-one DMs, whatever agents are in it:
 `thread_turns_per_hour` (default 30) and `thread_tokens_per_day` (default
-2,000,000), and chains of agents at `max_hops` (default 3). A capped agent
-says so once per thread and window; when an agent refuses someone because
-they are banned or denied, the manager bot tells them privately, at most
-once a day.
+2,000,000), and chains of agents at `max_hops` (default 3), each turn of
+which hands off to at most two agents. A capped agent says so once per thread
+and window; when an agent refuses someone because they are banned or denied,
+the manager bot tells them privately, at most once a day.
 An agent that needs its owner's private resources asks with
 `agentctl private [--file <path>]... <task>`, which returns at once. The
 owner's request in their own one-to-one DM with the agent runs right away;

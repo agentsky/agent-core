@@ -3,6 +3,7 @@ use secrecy::ExposeSecret;
 
 use super::*;
 use crate::agents::{AgentCreation, NewAgent, Visibility};
+use crate::claude_links::tests::new_link;
 use crate::test_util::*;
 
 const TEAM: &str = "T0TEAM001";
@@ -432,6 +433,10 @@ async fn installed(store: &Store, owner: MemberId, name: &str, version: u32) -> 
 
 async fn register_token(store: &Store, owner: MemberId, expires_at: i64) {
     store
+        .put_claude_link(owner, &new_link("a", "r"), at(1_000))
+        .await
+        .unwrap();
+    store
         .put_slack_config_token(
             owner,
             &team(),
@@ -443,6 +448,7 @@ async fn register_token(store: &Store, owner: MemberId, expires_at: i64) {
             at(1_000),
         )
         .await
+        .unwrap()
         .unwrap();
 }
 
@@ -605,6 +611,7 @@ async fn a_failure_ending_the_leases_still_stores_the_token() {
             at(5_001),
         )
         .await
+        .unwrap()
         .expect("the token is stored although the leases stay");
     let token = store
         .usable_slack_config_token(ada, &team(), at(5_001))

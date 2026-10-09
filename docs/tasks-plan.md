@@ -545,7 +545,7 @@ is a suggestion, not an owner: pick any unblocked task.
 | Execution | T17, T20, T21 | `crates/sandbox`, `crates/runner` |
 | Slack | T28, T29, T30, T31, T32 | `crates/surface-slack`, agentd Slack wiring |
 | Integration | T23 to T27, T33, T34 | `crates/agentd` pipeline, `crates/router` |
-| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `config/agentd.example.toml` |
+| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `crates/agentd/src/commands/mod.rs` (`logout`), `crates/agentd/src/commands/slack_tokens.rs`, `config/agentd.example.toml` |
 | Slack Connect | T36e (live, any time), T36a, T36d, then T36b, T36c | `crates/surface-slack` (ingress, normalize, directory, web, manifest), `crates/router`, `crates/store` (migrations), `crates/commands`, `crates/testkit` (Slack fixtures), `crates/agentd` Slack wiring, sweeper, pipeline, commands, consents and ctl |
 | End to end | T37 | `scripts/ci`, `.github/workflows/e2e.yml`, `crates/testkit` |
 
@@ -1815,12 +1815,14 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails. If the kill fails, the container is stopped
-  instead, since nothing was signalled
-  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
-  `ClaudeProcess::may_be_alive` says whether a killed process was seen to
-  exit: a kill can fail, and under Docker signal nothing
-  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  is killed and the turn fails. A kill doesn't always end the process: it
+  can fail, and under Docker signal nothing
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)). So if
+  the exit isn't seen within the 5-second grace period, the process stays
+  `may_be_alive()` ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  The process has no way to stop its container; T21 calls
+  `process_stopping` and stops the container for the session before
+  starting another process.
 - Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
   `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
   starts a new process with `--resume`. `TurnStats::init_seen` says whether
@@ -3132,11 +3134,20 @@ Deliverables:
   - `put_cloud_routine(&NewCloudRoutine, now)`, whose fields are the
     member, label, routine id, URL origin, token and `added_by`. The token
     is a `core_types::RoutineToken`, sealed to `cloud_routines.token_enc`
-    under `<member>:<id>:<routine id>:<label>:<url origin>`. An existing label
-    is replaced in place, which is how a member registers a new token; a
-    routine id registered under another label is refused; a new label past
-    20 for the member is refused, counted in the insert's
-    `BEGIN IMMEDIATE` transaction.
+    under `<member>:<id>:<routine id>:<label>:<url origin>`. It runs in one
+    `BEGIN IMMEDIATE` transaction and returns `CloudRoutinePut`:
+    - `Added(id)` for a new label.
+    - `Replaced(id)` for an existing label, replaced in place, which is
+      how a member registers a new token.
+    - `RoutineTaken { label }` for a routine id registered under another
+      label.
+    - `Full` for a new label past 20 for the member, counted in the
+      transaction.
+    - `Unlinked` when the member no longer has a Claude link, checked in the
+      transaction by `claude_links::linked`, the store's shared link check.
+      Against a `logout` that unlinks and then deletes the member's routines
+      (T35c), the put either commits first, and the delete finds its row, or
+      comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id, the URL origin
     and the opened token. `cloud_routines(member)` lists labels, ids and
     times, never tokens.
@@ -3144,15 +3155,25 @@ Deliverables:
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(…)` seals the task to `cloud_handoffs.task_enc`
-    under `<member>:<id>`, inserts the row as `sending` and
-    returns its id.
+  - `begin_cloud_handoff(&NewCloudHandoff { … }, per_hour, now)` seals
+    the task to `cloud_handoffs.task_enc` under `<member>:<id>` and, in one
+    `BEGIN IMMEDIATE` transaction, checks the member still has a Claude
+    link with `claude_links::linked`, as `put_cloud_routine` does, and
+    inserts the row as `sending`. It returns `CloudBegun`, inserting
+    nothing but for `Begun`:
+    - `Begun(id)` for the row.
+    - `RoutineGone` when the routine was removed, or its token replaced,
+      since the command read it.
+    - `TooMany` when the member asked for `per_hour` hand-offs in the last
+      hour (`CLOUD_HANDOFF_WINDOW`) already.
+    - `Unlinked` when the member no longer has a Claude link.
   - `finish_cloud_handoff(id, outcome, now)` records an outcome once, from
     `sending`, or from `unknown` when the pass gave up on the row
     (`unknown_reason` `no_answer`), for an answer whose record was held up
     past the pass. It sets `notified_at` if unset, since the command's
     reply tells the member. It refuses `no_answer`, which only the pass
-    sets. Nothing retries a record that failed.
+    sets. Nothing retries a record that failed. Finishing a row that
+    `logout` deleted changes nothing and isn't an error.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3203,11 +3224,14 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
+- `a_routine_is_refused_without_a_claude_link`.
+- `a_handoff_is_refused_without_a_claude_link`.
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
   `rejected`).
+- `finishing_a_deleted_handoff_is_a_no_op`.
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3350,7 +3374,25 @@ Deliverables:
 - `crates/agentd/src/app.rs` builds a `FireClient` when `[cloud]` is
   present and hands it to the command handlers.
 - Handlers in `crates/agentd/src/commands/cloud.rs`, through the one
-  command intake (T30), so commands run once and in order per member:
+  command intake (T30), so commands run once and in order per surface
+  identity (`MemberKey`), not per member. A `logout` the intake doesn't
+  order with a `cloud add` or `cloud run`, sent from the member's other
+  identity or run on another instance during a blue-green swap, is caught
+  by the link check in `put_cloud_routine` and `begin_cloud_handoff`
+  (T35a): the handler answers `CloudRoutinePut::Unlinked` as an unlinked
+  `cloud add` and `CloudBegun::Unlinked` as an unlinked `cloud run`,
+  having stored or sent nothing. A member Slack reports deleted keeps their
+  link, so a `cloud add` that races that deletion can still store a
+  routine, which then stays until the member logs out, and a racing
+  `cloud run` still writes and fires a hand-off, whose row goes at
+  `[cloud] retention_days`. A member only on Slack can't send `logout`
+  once Slack deleted them, so their routine stays sealed at rest
+  indefinitely, as their Claude link already does, and a store leaked with
+  its master key would yield its token, as the design's threat row on
+  routine tokens says. This is an accepted gap: it needs the member's own
+  command to land in the moment Slack deletes them, and through agentd
+  only that member can fire the token, from another of their identities;
+  for a member only on Slack, nobody can:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
@@ -3379,6 +3421,43 @@ Deliverables:
   and hand-offs, by `MemberId`, so those registered from any surface go;
   `logout`'s reply says to revoke the tokens, and a deleted member is sent
   nothing.
+- `logout` in `crates/agentd/src/commands/mod.rs`, which today deletes the
+  Slack configuration tokens first and calls `auth.logout(member)` last,
+  deletes the routines and hand-offs after `auth.logout` returns. A
+  `cloud add` or `cloud run` racing it then either commits before the
+  unlink, and the delete finds its row, or checks the link after it and is
+  refused; deleting first would let one pass the check between the delete
+  and the unlink and store a row after the delete. The deletes run
+  whenever the member exists, whether or not `auth.logout` found a link, as
+  the Slack token delete does today, so a `logout` retried after a delete
+  failed still cleans up.
+- A `cloud run` whose `begin_cloud_handoff` committed before the unlink
+  may still fire after `logout` answers; its `finish_cloud_handoff` finds
+  the row deleted, which is a no-op, and its reply still says what
+  happened. `auth.logout` deletes the link and then awaits the revoke, so
+  after a fresh `login` from another of the member's identities in that
+  window, anything stored from that identity (a routine, a hand-off or a
+  Slack configuration token, whose refresh token is already used up) is
+  deleted by this `logout`: accepted, since the member logged out and in
+  at once and can add the routine or register the token again; a deleted
+  hand-off's session may already have fired, and only its record is lost.
+- `slack-token` has the same race: its handler checks the link before it
+  rotates the token with Slack, and `put_slack_config_token` doesn't check
+  it again, so a token a racing `slack-token` stores after `logout`'s delete
+  survives the logout, whether the delete runs before the unlink or after
+  it. So `logout` deletes the Slack configuration tokens after `auth.logout`
+  too, and `put_slack_config_token` checks the link in its write: one
+  `INSERT … SELECT … WHERE EXISTS (SELECT 1 FROM claude_links …) ON CONFLICT
+  …` statement, not a transaction, since a statement that fails inside an
+  explicit transaction rolls back the trigger counts the failure-injection
+  tests read. It returns `Result<Option<SlackConfigTokenRef>>`, with `None`
+  when the member has no Claude link or doesn't exist. The handler answers
+  `None` with new wording, not the unlinked reply, which ends "I didn't use
+  it": the member is no longer linked, and checking the token used up its
+  refresh token, so they should generate a new one after linking again. The
+  store tests in `crates/store/src/slack_config_tokens.rs`, which put tokens
+  for members with no link, seed a link first, as do any agentd tests that
+  put a token for an unlinked member.
 - A Slack task's tokens are rewritten to what Slack showed, as the design's
   [Command surface](design.md#command-surface) says: `<@U…|name>` to
   `@name`, `<#C…|name>` to `#name`, `<url>` and a `<url|label>` labelled
@@ -3431,6 +3510,11 @@ Acceptance, as pipeline and command tests named after the rules:
   (`run`, after `[cloud] base_url` changed: the actionable reply, no
   hand-off row, nothing sent).
 - `the_link_is_never_posted_outside_the_private_reply`.
+
+And a store test in `crates/store/src/slack_config_tokens.rs`:
+
+- `a_slack_token_stored_after_the_unlink_is_refused` (seeds a link,
+  deletes it, then puts).
 
 Notes from T35b and its review:
 
@@ -3548,8 +3632,11 @@ Design: [Slack Connect](design.md#slack-connect), its
 Deliverables:
 
 - `core-types`:
-  - `Outside { team: Option<TeamId> }`: the sender's own organization, or
-    `None` when Slack named none.
+  - `Outside { team: TeamId }`: the sender's own organization, as the
+    message's own team fields name it. (First planned as
+    `Option<TeamId>`, with `None` when Slack named none; superseded, see
+    the T36a entry "The home lookup never sets `outside`" in
+    `docs/impl-notes.md`.)
   - `InboundEvent::outside: Option<Outside>` and
     `Requester::outside: Option<Outside>`, `None` for home members and on
     Rocket.Chat, with `#[serde(default)]` so stored requesters and agentctl
@@ -3589,9 +3676,16 @@ Deliverables:
   - The sender is `(slack, workspace, user)`.
   - The sender's team fields are `user_team`, `source_team`,
     `user_profile.team` and `team`. One not shaped like a team id is
-    `Skip::Malformed`. `Context` gains `home_org`, the `enterprise_id`
-    `auth.test` gave at startup (T30's `App::open`), if any.
-  - When a field names neither the workspace nor `home_org`, `outside` is
+    `Skip::Malformed`. `Context::team` stays the installation's team, which
+    the other-workspace checks compare. `Context` gains `home_team` and
+    `home_org`, the home workspace and the home organization, if any, as
+    `ManagerIdentity` keeps them (below), used only to classify the team
+    fields. The ingress's `Context` (`ingress.rs`) and
+    `SlackSurface::confirm`'s take both from that same `ManagerIdentity`:
+    the ingress is given them where agentd builds it, and `confirm` takes
+    them from the directory. So a home member whose field names the home
+    organization is home in the event and in the copy alike.
+  - When a field names neither `home_team` nor `home_org`, `outside` is
     `Some(Outside { team })` with the first such field, in that order.
     Otherwise it is `None`, which only the event's own first routing uses:
     the home check below decides for the copy and for manager DMs before
@@ -3627,15 +3721,18 @@ Deliverables:
     dropped from the cache is looked up again, never taken as home. A
     caller can ask it not to wait for a used-up quota
     (`WebApi::without_waiting`).
-  - `SlackSurface::fill_sender_team(&mut InboundEvent) -> Result<(),
-    SurfaceError>` never waits for a used-up quota, and skips a bot sender
-    (`sender_is_bot` or `sender_bot_user` set), whose `outside` decides
-    nothing. When the fields
-    left `outside` `None` and `home_user` doesn't say home, it sets
-    `Some(Outside { team: None })` and returns `Ok`, for an `Api` or
-    `Unauthorized` error too, and so it does for a sender keyed by another
-    surface or workspace. It returns `Transport` and `RateLimited` as they
-    came, leaving `outside` alone; Slack's `fatal_error`,
+  - `SlackSurface::copy_sender_is_home(&InboundEvent) -> Result<bool,
+    SurfaceError>` (first planned as `fill_sender_team`, which set
+    `Some(Outside { team: None })`; superseded, see the T36a entry "The
+    home lookup never sets `outside`" in `docs/impl-notes.md`) never waits
+    for a used-up quota, answers no for a copy whose fields set `outside`,
+    and yes for a bot sender (`sender_is_bot` or `sender_bot_user` set),
+    whose `outside` decides nothing. Otherwise it answers yes only when the
+    directory says home; `confirm` drops a copy its fields leave home when it
+    answers no, for any error but `Transport` and `RateLimited` too, and so
+    for a sender keyed by another surface or workspace. The lookup never sets
+    `outside`. It returns `Transport` and `RateLimited` as they
+    came; Slack's `fatal_error`,
     `internal_error`, `request_timeout` and `service_unavailable` are
     `Transport` (`web::map_error`), as an HTTP 5xx is. Its one caller is
     `SlackSurface::confirm`, on Slack's copy, so it only ever looks up a
@@ -3655,11 +3752,11 @@ Deliverables:
     may be addressed to the agent (T28), so most traffic costs no lookup
     either.
 - Confirmation (`crates/agentd/src/pipeline/run.rs`): the copy's `outside`
-  and organization come from Slack's data only, the copy's own team fields,
-  else the home lookup's `team_id` or `enterprise_user.enterprise_id`;
-  nothing of the event's is carried into the copy. `agreeing_copy` drops
-  the message, before the copy is routed, when the event and a person's
-  copy disagree on `outside`, organization included, in either direction.
+  and organization come from the copy's own team fields only, never from the
+  home lookup, whose answer only keeps or drops a copy its fields leave home;
+  nothing of the event's is carried into the copy. `agreeing_copy` drops the
+  message, before the copy is routed, when the event and a person's copy
+  disagree on `outside`, organization included, in either direction.
   `copy_stands`, which lets a copy stand when only a limit's refusal
   differs, compares the requester's `MemberKey` and `outside` too, and
   keeps ignoring the requester's `member`, which may be made for the
@@ -3698,7 +3795,8 @@ Deliverables:
     `SurfaceError::Forbidden`.
   - A `home_user` error is passed on unchanged and isn't cached, whatever
     its variant (`Transport`, `RateLimited`, `Api`, `Unauthorized` for a
-    `missing_scope`, …).
+    `missing_scope`, …). `user_not_found` and `user_not_visible` aren't
+    errors but the cached verdict that the user isn't home.
   - Each caller handles either as it handles a failed `conversations.open`
     today: the sweepers' notices (consent cards, relink notices, token
     notices, install reminders) try again on their schedules, and the
@@ -3718,10 +3816,10 @@ Deliverables:
 - `testkit::slack`: fixtures for an outside member's message whose `team`
   is the installing team (shaped after bolt-python's
   `slack_connect_events_api_no_actor_team_requests`), one whose `team` is
-  theirs, a home member's message in a shared channel, a home-organization
-  `E…` field, an event without `authorizations`, and interactions with and
-  without `user.team_id`, all with made-up ids. T36e replaces them with
-  redacted captures.
+  theirs, a home member's message in a shared channel the home workspace
+  hosts, a home-organization `E…` field, an event without
+  `authorizations`, and interactions with and without `user.team_id`, all
+  with made-up ids. T36e replaces them with redacted captures.
 
 Acceptance:
 
@@ -3734,10 +3832,13 @@ Acceptance:
 - `the_first_foreign_field_names_the_organization`.
 - `a_sender_is_home_only_when_the_home_check_agrees`.
 - `a_home_member_in_a_shared_channel_is_home`.
+- `a_home_lookup_naming_another_organization_drops_the_message_and_names_it`.
+- `an_event_naming_the_organization_only_the_lookup_gives_is_dropped`.
+- `a_home_lookup_naming_no_team_is_not_home`.
 - `a_home_organization_field_with_a_home_lookup_is_home`.
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
-- `a_home_lookup_slack_refuses_is_outside`.
+- `a_home_lookup_slack_refuses_drops_the_message`.
 - `an_event_and_its_copy_disagreeing_on_outside_is_dropped`.
 - `a_forged_organization_on_an_event_cannot_change_the_stored_team`.
 - `a_bots_copy_is_kept_whatever_it_says_of_outside`.
@@ -3748,6 +3849,7 @@ Acceptance:
 - `an_interaction_without_user_team_is_dropped`.
 - `no_dm_is_opened_with_an_outside_user`.
 - `a_failed_home_lookup_is_an_error_not_a_verdict_and_is_not_cached`.
+- `user_not_found_and_not_visible_are_cached_outside_verdicts`.
 - `a_bots_outside_never_makes_a_hop_ignored`.
 - `a_made_up_sender_costs_no_home_lookup`.
 - `a_bots_post_is_never_looked_up`.
@@ -3772,11 +3874,21 @@ recorded.
 
 Design: [Audience](design.md#audience),
 [Paying for outside members' turns](design.md#paying-for-outside-members-turns),
-[Commands](design.md#commands-1), [Hand-offs](design.md#hand-offs), and the
+[Commands](design.md#commands-1), [Hand-offs](design.md#hand-offs),
+[Who is outside](design.md#who-is-outside) (the sender's team), and the
 security rows on Slack Connect.
 
 Deliverables:
 
+- `surface-slack` normalization takes the sender's team from `user_team`,
+  then `source_team`, then `user_profile.team`, and `team` only when none
+  of those is given, replacing T36a's rule that any foreign field makes
+  the sender outside, for the event and for Slack's copy alike, following
+  what T36e recorded about `team` for a home member's message in a channel
+  another organization hosts. The home lookup still decides who is home, so
+  a home `user_team` alone admits no one. T36a's
+  `the_first_foreign_field_names_the_organization` becomes
+  `the_first_field_given_names_the_organization`.
 - `[slack_connect]` in the configuration, documented in
   `config/agentd.example.toml` and `README.md`:
   - `teams`: at most 100 ids shaped like Slack team ids (`T…` or `E…`),
@@ -3787,18 +3899,23 @@ Deliverables:
   - Before it admits anyone, T36b defines one canonical id for an
     organization from what T36e item 9 records: the `E…` enterprise id
     when Slack names one, else the `T…` team id. The event's and the
-    copy's fields, `users.info`'s answer and the `teams` entries are all
-    read in that form, so an organization listed under one id can't
-    arrive under the other. T36a's `directory::organization` takes
-    `team_id` first, so T36b changes it to match.
+    copy's fields and the `teams` entries are all read in that form, so
+    an organization listed under one id can't arrive under the other.
+    T36a's `core_types::Outside::team` is a plain `TeamId`, from the
+    message's own team fields alone; `directory::organization` reads
+    `users.info`'s `team_id` alone, for logs. An `outside` derived from
+    `users.info` must not come back: a copy that took the lookup's
+    organization let a forged event naming it stand, which T36a closed
+    by dropping a copy whose fields leave its sender home unless the
+    lookup says home.
   - `hand_off`, `false` by default.
 - `router`:
   - `RouterView::outside_access(&Outside) -> Option<OutsideAccess { heard,
     hand_off }>`, `None` when the view can't say, which refuses with
     `PolicyUnavailable`. `IgnoreReason::Outside` now means the
-    organization isn't listed, or isn't known. The pipeline logs an
-    unlisted organization's id at info level, at most once a minute per
-    organization, so operators can find the id to list.
+    organization isn't listed. The pipeline logs an unlisted organization's
+    id at info level, at most once a minute per organization, so operators
+    can find the id to list.
   - `PolicyTarget::Outside`, covering every requester with `outside` set.
     `AgentPolicy::permits` admits an outside requester only when an
     `Outside` allow or a `Member` allow covers them; `Everyone` and `Room`
@@ -3817,7 +3934,7 @@ Deliverables:
   stored as `PolicyTarget::Outside`, with help text, and shown by the
   agent's rule listing.
 - `store`: a migration `…_slack_connect.sql` adds `requester_outside` (the
-  `Outside` as text: the team id, `?` for an unknown one, `NULL` for home)
+  `Outside` as text: the organization's id, `NULL` for home)
   to `message_refs` and `ctl_tokens`. The pipeline writes it with the
   requester and reads it back into attributions and `CtlTurn`, so a hop
   and an agentctl call know their requester's organization. Until then,
@@ -3838,12 +3955,14 @@ Deliverables:
   the columns, and keeps it for `consents`, since a consent never has an
   outside requester.
   Whether a listed organization can be admitted at all rests on T36e:
-  confirmation keeps the copy's own `outside`, and for a copy whose fields
-  don't name the organization the home check names the one `users.info`
-  gives for the sender. `agreeing_copy` then agrees whenever the event's
-  field and that lookup name the same id, so what T36b must verify is that
-  the two use one id form (the canonical id above, from T36e item 9);
-  where they don't, every copy disagrees and is dropped.
+  confirmation keeps the copy's own `outside`, from its own team fields
+  only, and `agreeing_copy` agrees only when the event's fields and the
+  copy's name the same id; what T36b must verify is that both are read in
+  one id form (the canonical id above, from T36e item 9). A copy whose
+  fields don't name the organization is dropped unless the home check
+  says home; the organization `users.info` gives is for logs only and
+  must never become the copy's `outside`, which would let a forged event
+  naming it stand.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,
@@ -3866,7 +3985,6 @@ Deliverables:
 Acceptance:
 
 - `an_unlisted_organization_is_not_heard`.
-- `an_unknown_organization_is_not_heard`.
 - `a_listed_organization_runs_on_the_community_key`.
 - `an_outside_requester_without_a_community_key_is_refused_in_the_thread`.
 - `an_outside_requester_never_gets_a_link_prompt_or_a_dm`.
@@ -3874,6 +3992,12 @@ Acceptance:
 - `everyone_and_room_allows_dont_admit_outside_requesters`.
 - `allow_outside_admits_and_any_deny_wins`.
 - `a_member_rule_admits_one_outside_member`.
+- `a_home_sender_in_a_channel_another_organization_hosts_is_home`.
+- `the_first_field_given_names_the_organization`.
+- `a_workspace_or_an_organization_id_can_be_listed`, with a fixture whose
+  `user_team` is a foreign `E…`.
+- `the_home_organization_cannot_be_listed`.
+- `a_listed_organization_only_the_home_lookup_names_is_still_dropped`.
 - `a_ban_on_an_outside_member_applies`.
 - `outside_refusals_are_one_line_per_thread_per_day_and_name_no_reason`.
 - `allow_outside_on_an_open_agent_keeps_home_members_allowed`.
@@ -4003,7 +4127,11 @@ Deliverables:
   transaction, and drop the old id from the conversation-info cache. Any
   other answer leaves it waiting. While it waits, the router applies the
   agent's denies on the old id to the new one; after a day it is given up
-  and those denies are copied to the new id. When
+  and those denies are copied to the new id. A settled change records the
+  id Slack gave, which chains follow as they follow the new id, and a
+  later change in its chain that settles on an id Slack gives past the
+  recorded ones copies them there too, in the transaction that moves its
+  own rules. When
   the agent already has a rule on the new id, the rules merge: a deny on
   either id stays a deny, and duplicates are dropped. Only an old id
   starting with `G` is expected; any other is logged and handled the same
@@ -4065,11 +4193,17 @@ Deliverables:
      member's `message` in a channel the other organization hosts: Bolt's
      fixtures show a home member's `app_mention` whose `team` names the
      other organization while `user_team` names home, and the design takes
-     `user_team` as the sender's when the two differ.
+     `user_team` as the sender's when the two differ. And whether an
+     outside member's first given team field (`user_team`, then
+     `source_team`, …) is ever a foreign `E…` rather than a workspace's
+     `T…`, which is what listing an `E…` admits.
   2. The same message read back with `conversations.history` and
      `conversations.replies` on a scratch app's token: the same fields,
-     and whether the first field that names another organization is the
-     same in the event and the copy.
+     and whether the field T36b takes the sender's team from, the first
+     given of `user_team`, `source_team`, `user_profile.team` and `team`,
+     is the same field in both and names the same team. Above all, whether
+     an outside member's copy ever names their organization in none of its
+     fields, such as a copy without `user_team`, which T36a drops.
   3. `conversations.info` with a scratch app's token on the shared channel,
      and on a Slack Connect DM between an outside member and a scratch
      app's bot, if one can be opened.
@@ -4325,3 +4459,20 @@ Not scheduled. Each needs a decision before it becomes a task.
   its direct messages before agentd starts). Fetching each room's history
   since the last message seen, or since the subscription for a new room,
   through the same deduplication, would close the gap.
+- **Keeping a private task's result when its delivery fails.** Posting an
+  approved private task's reply is retried only after a rate limit, so a
+  transport error or a 5xx on the post loses it, and so does the agent's
+  bot being removed from the thread while the task ran, after
+  `run_private_task`'s `can_post` check; the thread is told only that part
+  of the reply couldn't be delivered, if that posts. `run_private_task`
+  still returns `Ran::Done`, so `finish_consent` stops the private
+  sessions and deletes their directories, which held the only copy of the
+  result left (the CLI's transcript, and what the task wrote in `work/`).
+  The requester has to ask again, which takes a new consent and a rerun
+  billed to the owner. Returning an error instead wouldn't help: the next
+  claim finds the session reached the model and tells the thread the task
+  was interrupted. A fix needs the result stored durably (the private
+  output in the database), a redelivery path with backoff, and
+  `consent_posted` redefined for a partial post, since any chunk posted
+  now counts as the consent's last word, all within T33's rule that every
+  path a consent's work takes ends in `finish_consent`.
