@@ -3038,11 +3038,13 @@ Not scheduled. Each needs a decision before it becomes a task.
   (T18) forwards, keyed by the turn's placeholder, would make the budget
   and the meter hard bounds too. The same stdout lets the agent print a
   forged `result` line, which ends its turn early with its own reply; the
-  CLI's real result is then read as the next turn's, so the next
-  requester gets this turn's reply and pays its cost. Reading turns from a
-  channel the agent can't write would close that as well. It would also
-  bill the turns T27 records with an unknown cost, such as every resumed
-  process's first turn once a long thread's transcript passes 5 MiB.
+  CLI's real result is then read as the next turn's, so the requester's
+  next turn in the session gets this turn's reply and is billed its cost.
+  Another requester's turn gets a new container (T21), so it never reads
+  that result. Reading turns from a channel the agent can't write would
+  close that as well. It would also bill the turns T27 records with an
+  unknown cost, such as every resumed process's first turn once a long
+  thread's transcript passes 5 MiB.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private

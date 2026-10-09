@@ -6332,10 +6332,10 @@ code before this, the test read 0.25 where the CLI restored 5 for
 All of that holds only if nothing changes the file between the runner's
 read and the CLI's, and a process the agent leaves running in the
 container can: when the agent kills its own CLI, the exit is confirmed
-and the container kept, so the next requester's `--resume` ran in a
-container where a background loop could wait for `resume <id>` to appear
-and append a `cost-state` line of 900 after the runner read 5, billing the
-next requester about $895. `SessionManager::ensure_process` now reads the
+and the container kept, so the next turn's `--resume` ran in a container
+where a background loop could wait for `resume <id>` to appear and append
+a `cost-state` line of 900 after the runner read 5, billing that turn's
+requester about $895. `SessionManager::ensure_process` now reads the
 restored total only when it started the container in the same call:
 nothing of the agent's runs in a fresh one before the CLI (its command is
 `sleep infinity` from the image, the exec wrapper is the image's `sh`, and
@@ -6344,10 +6344,12 @@ earlier container is stopped before another starts. A `--resume` in a
 container an earlier process ran in (after a crash, a kill, or a
 credential kind or model change) counts its first turn's cost as unknown.
 A runner test resumes in such a container and gets no cost; before this
-it got the turn's cost. Stopping the container before every resume would
-keep that cost known at a container start's price, and would also end
-the agent's leftover processes (Deferred work's "Processes a
-turn leaves running").
+it got the turn's cost. T21 stops the container when the requester
+changes ([T21](#another-requesters-turn-gets-a-new-container)), so only a
+requester's own later turns resume in a used one. Stopping the container
+before every resume would keep that cost known at a container start's
+price, and would also end the agent's leftover processes on every resume
+(Deferred work's "Processes a turn leaves running").
 
 A turn's cost is unknown (an `Err` with a `CostUnknown` reason, and
 billed as 0) when its result or the process's previous one has no
@@ -6453,9 +6455,10 @@ make tokens and cost a bound too (the plan's Deferred work). The same
 stdout predates T27 with a worse problem, which this task leaves there
 too: a forged `result` line ends the turn early with the agent's text as
 the reply, and the CLI's real result for the turn is then read as the
-next turn's, so the next requester gets this turn's reply and pays its
-cost and tokens. Reading turns from a channel the agent can't write
-closes both.
+next turn's, so the requester's next turn in the session gets this turn's
+reply and pays its cost and tokens. Another requester's turn gets a new
+container (T21), so it never reads that result. Reading turns from a
+channel the agent can't write closes both.
 
 ### One table counts threads and agents
 
