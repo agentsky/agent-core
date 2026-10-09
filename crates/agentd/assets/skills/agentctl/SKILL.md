@@ -118,7 +118,12 @@ Mentioning the other agent's bot in your reply, in this thread, hands off
 too. Use ask-agent or a mention, not both, and ask each agent once: the
 other agent takes at most one turn for this turn, on the first of your
 posts that mentions it, which may be a reply that doesn't hold the task, and
-a second ask-agent to the same agent is refused. Every agent a post
+a second ask-agent to the same agent is refused. A mention of an agent's
+old, inactive bot hands it nothing, yet spends its turn for this turn unless
+you asked it with ask-agent, so a later mention of its current bot hands it
+nothing either. On Rocket.Chat, when an agent you asked posted the thread's
+first message, an earlier post of yours that mentions its old bot can be the
+one it answers. Every agent a post
 mentions is handed the post, so an `@` in the task hands it to that agent
 as well, but a turn hands off to at most 2 agents: the ones you ask-agent
 first, then the ones your posts mention, in the order they go out; any
