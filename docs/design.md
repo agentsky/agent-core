@@ -1812,12 +1812,11 @@ are closed by default:
 
 1. **The community.** `[slack_connect] teams`, in the operator's
    configuration file rather than an `/agent admin` command, lists the
-   organizations whose members agentd hears, by the id their first given
-   team field names (`user_team`, then `source_team`, …), a workspace's `T…`
-   or an organization's `E…` alike, which agentd logs when it ignores one. A
-   message from anyone else outside is ignored without a word, as an
-   unaddressed message is. An empty list, the default, hears no one from
-   outside.
+   organizations whose members agentd hears, by the id Slack names them with
+   (`T…` or `E…`), read in the one canonical form T36b defines, which agentd
+   logs when it ignores one. A message from anyone else outside is ignored
+   without a word, as an unaddressed message is. An empty list, the default,
+   hears no one from outside.
 2. **The agent's owner.** `/agent allow <name> outside` admits members of
    listed organizations to that agent. `everyone` means everyone in the
    community and a `#room` allow means its home members, so neither admits
