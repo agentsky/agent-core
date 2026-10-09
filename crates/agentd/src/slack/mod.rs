@@ -53,6 +53,7 @@ use tokio::task::JoinSet;
 use crate::app::App;
 use crate::commands::intake::CommandSubmitter;
 use crate::commands::slack::{dm_command, member_who_left, slash_command};
+use crate::commands::slack_tokens::retry_store;
 use bots::SlackBots;
 use manager::ManagerIdentity;
 
@@ -388,7 +389,8 @@ impl Dedup for StoreDedup {
 ///
 /// - To the manager app: an `/agent` slash command or a DM to the app goes
 ///   to the command intake, and a `user_change` whose user is `deleted`
-///   deletes that member's configuration token for the workspace.
+///   deletes that member's configuration token for the workspace, with the
+///   store tried a few times since Slack doesn't send the event again.
 /// - To an agent's app: a message goes to [`Messages`], without waiting.
 ///
 /// Everything else is logged by binding and kind and dropped.
@@ -421,15 +423,18 @@ impl Inbound {
         let Some(key) = member_who_left(event) else {
             return;
         };
-        let deleted = match self.store.member_for_identity(&key).await {
-            Ok(Some(member)) => {
-                self.store
-                    .delete_slack_config_token(member, &key.team)
-                    .await
-            }
-            Ok(None) => Ok(false),
-            Err(err) => Err(err),
-        };
+        let (store, key) = (&self.store, &key);
+        let deleted = retry_store(
+            "deleting a departed member's configuration token",
+            key,
+            || async move {
+                match store.member_for_identity(key).await? {
+                    Some(member) => store.delete_slack_config_token(member, &key.team).await,
+                    None => Ok(false),
+                }
+            },
+        )
+        .await;
         match deleted {
             Ok(true) => {
                 tracing::info!(member = %key, "a member left the workspace; deleted their configuration token")

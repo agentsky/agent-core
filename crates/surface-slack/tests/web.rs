@@ -618,6 +618,36 @@ async fn a_long_retry_after_fails_at_once_and_holds_later_calls() {
 }
 
 #[tokio::test]
+async fn a_429_on_a_post_holds_posts_to_every_channel() {
+    let (server, api) = server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.postMessage"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .mount(&server)
+        .await;
+    let err = api.post_message(&channel(), None, "x").await.unwrap_err();
+    assert_eq!(
+        err,
+        SurfaceError::RateLimited {
+            retry_after: Duration::from_secs(120)
+        }
+    );
+    let other = api
+        .post_message(&"C0CHAN002".into(), None, "x")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(other, SurfaceError::RateLimited { retry_after } if retry_after > Duration::from_secs(100)),
+        "{other:?}"
+    );
+    assert_eq!(
+        requests(&server).await.len(),
+        1,
+        "the held post wasn't sent"
+    );
+}
+
+#[tokio::test]
 async fn rate_limits_are_retried_a_bounded_number_of_times() {
     let (server, api) = server().await;
     Mock::given(method("POST"))
