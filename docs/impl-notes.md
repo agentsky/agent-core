@@ -4414,6 +4414,34 @@ Every other volume mounts `shared/` read-write and no `memory/`. A turn
 whose mounts differ from the warm container's stops the container, like a
 credential kind or model change stops the process.
 
+### Another requester's turn gets a new container
+
+**Issue.** A warm container is reused across turns of one session, and a
+background process a turn leaves running, such as a `&` job or a Bash-tool
+background shell, survives in it. `turn_starting` points the container's
+placeholder at each turn's credential and records the turn on the agentctl
+token, so a process left from requester A's turn could spend requester B's
+credential, or act through `agentctl`, while B's turn runs. Restarting the
+process on a credential kind change doesn't help: the leftover isn't the CLI,
+and two members' subscriptions are the same kind.
+
+**Solution.** `Held` records the `Requester` whose turn started the container,
+and `ensure_process` stops the whole container, as it does a dead one or one
+with other mounts, when a turn's requester differs, before it looks at the
+process. Stopping the container ends its PID namespace and every process in
+it; stopping only the CLI would leave the leftovers running. It compares the
+full `Requester`, not the `CredentialRef`: a community-key turn of another
+requester also gets the agentctl token, so it gets a new container too. An
+agent-to-agent hop inherits its requester, so it keeps the container. The cost
+is a container start and a `--resume` of the transcript whenever consecutive
+turns of one session come from different requesters, as in a busy channel
+thread; a requester's own run of turns keeps the warm process.
+`a_requester_change_replaces_the_container` checks that another requester's
+turn, a community-key one included, replaces the container, and that the same
+requester and a hop carrying it keep it. A leftover can still use its own
+requester's later turns and the egress allowlist between turns, and files left
+in the session's `work/` or `home/` outlive the container.
+
 ### How turns queue and survive their caller
 
 **Issue.** The plan asks for a keyed queue in arrival order, and for
