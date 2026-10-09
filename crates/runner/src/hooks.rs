@@ -48,12 +48,18 @@ pub struct TurnRequest {
     pub message: String,
     /// Whose credential the turn runs on. Its kind picks the process's
     /// credential variable: a turn on another kind than the warm process's
-    /// restarts it.
+    /// restarts it. A turn of another requester gets a new container
+    /// whatever its credential: see [`requester`](Self::requester).
     pub credential: CredentialRef,
     /// `--model`, if the router chose one. A turn on another model than
     /// the warm process's restarts it.
     pub model: Option<String>,
-    /// Who caused the turn, and pays for it.
+    /// Who caused the turn, and pays for it. A turn whose requester differs
+    /// from the one whose turn started the warm container stops the
+    /// container, and every process left running in it, and starts another,
+    /// resuming from the transcript, since the turn's credential and its
+    /// agentctl token would otherwise reach those processes. An
+    /// agent-to-agent hop inherits its requester, so it keeps the container.
     pub requester: Requester,
     /// How many agent-to-agent hops led to it.
     pub hop: Hop,
