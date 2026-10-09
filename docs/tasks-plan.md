@@ -3138,8 +3138,9 @@ Deliverables:
       label.
     - `Full` for a new label past 20 for the member, counted in the
       transaction.
-    - `Unlinked` when the member no longer has a Claude link, checked in the
-      transaction by `claude_links::linked`, the store's shared link check.
+    - `Unlinked` (from T35c) when the member no longer has a Claude link,
+      checked in the transaction by `claude_links::linked`, the store's
+      shared link check.
       Against a `logout` that unlinks and then deletes the member's routines
       (T35c), the put either commits first, and the delete finds its row, or
       comes after the unlink and is refused.
@@ -3151,12 +3152,13 @@ Deliverables:
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(&NewCloudHandoff { … }, per_hour, now)` seals
-    the task to `cloud_handoffs.task_enc` under `<member>:<id>` and, in one
-    `BEGIN IMMEDIATE` transaction, checks the member still has a Claude
-    link with `claude_links::linked`, as `put_cloud_routine` does, and
-    inserts the row as `sending`. It returns `CloudBegun`, inserting
-    nothing but for `Begun`:
+  - `begin_cloud_handoff(&NewCloudHandoff { … }, now)` seals the task to
+    `cloud_handoffs.task_enc` under `<member>:<id>`, inserts the row as
+    `sending` and returns its `CloudHandoffId`. From T35c it also takes
+    `per_hour` and, in one `BEGIN IMMEDIATE` transaction, checks the
+    member still has a Claude link with `claude_links::linked`, as
+    `put_cloud_routine` does, and that the routine's registration is still
+    stored, and returns `CloudBegun`, inserting nothing but for `Begun`:
     - `Begun(id)` for the row.
     - `RoutineGone` when the routine was removed, or its token replaced,
       since the command read it.
