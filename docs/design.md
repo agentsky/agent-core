@@ -747,7 +747,7 @@ for Rocket.Chat bindings.
 | Prompt injection from other members reaches the owner's secrets | Channel-scope sandboxes hold no owner secrets. Work on owner resources runs in the owner's private sandbox, and for non-owners only after a consent card. Persona prompt treats others' text as data. |
 | Leaked placeholder token | One per CLI process and container, bound to the container's network identity, revoked when the container is reaped, swapped only for the configured upstream header of its own kind. |
 | One session reads another session's placeholder or `agentctl` token | One container per session, so sessions share neither a PID namespace nor process environments. Tokens are bound to their container. |
-| One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. |
+| One member's request billed to another in a shared scope | Placeholders are per session container, and each mapping follows the current turn's requester. A container serves one requester: another requester's turn gets a new one, which ends every process an earlier turn left running. |
 | Agent-to-agent hops billed to the wrong person | A hop inherits the requester of the turn that posted the mention. Mentions from unmanaged bots are ignored. |
 | Private task leaks the owner's DM context to a non-owner | Each private task runs in a fresh session. Only the consented task text and explicit attachments cross in, only the reply and attachments cross out. Private tasks cannot call `ask-agent` or `private`. |
 | A pending consent holds resources | `agentctl private` returns at once. The channel turn ends, and the result is posted later as a new message. Unanswered cards expire. |
