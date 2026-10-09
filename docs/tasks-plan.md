@@ -540,7 +540,7 @@ is a suggestion, not an owner: pick any unblocked task.
 | Execution | T17, T20, T21 | `crates/sandbox`, `crates/runner` |
 | Slack | T28, T29, T30, T31, T32 | `crates/surface-slack`, agentd Slack wiring |
 | Integration | T23 to T27, T33, T34 | `crates/agentd` pipeline, `crates/router` |
-| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `config/agentd.example.toml` |
+| Cloud hand-off | T35a, T35b, T35c | `crates/store`, `crates/commands`, `crates/auth/src/config.rs`, `crates/agentd/src/config.rs`, `crates/agentd/src/app.rs`, `crates/agentd/src/cloud`, `crates/agentd/src/commands/cloud.rs`, `crates/agentd/src/commands/mod.rs` (`logout`), `crates/agentd/src/commands/slack_tokens.rs`, `config/agentd.example.toml` |
 | Slack Connect | T36e (live, any time), T36a, T36d, then T36b, T36c | `crates/surface-slack` (ingress, normalize, directory, web, manifest), `crates/router`, `crates/store` (migrations), `crates/commands`, `crates/testkit` (Slack fixtures), `crates/agentd` Slack wiring, sweeper, pipeline, commands, consents and ctl |
 
 ## Phase 0: foundation
@@ -1809,12 +1809,14 @@ Deliverables:
 - Lenient parsing: unknown types and fields are ignored, and a malformed line
   is skipped, logging only its length and parse error, never its text.
 - A per-turn timeout, configurable, default 30 minutes. On timeout the process
-  is killed and the turn fails. If the kill fails, the container is stopped
-  instead, since nothing was signalled
-  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)).
-  `ClaudeProcess::may_be_alive` says whether a killed process was seen to
-  exit: a kill can fail, and under Docker signal nothing
-  ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  is killed and the turn fails. A kill doesn't always end the process: it
+  can fail, and under Docker signal nothing
+  ([impl-notes](impl-notes.md#docker-cant-signal-an-execd-process)). So if
+  the exit isn't seen within the 5-second grace period, the process stays
+  `may_be_alive()` ([impl-notes](impl-notes.md#a-kill-is-not-an-exit)).
+  The process has no way to stop its container; T21 calls
+  `process_stopping` and stops the container for the session before
+  starting another process.
 - Process death mid-turn becomes `TurnOutcome::Crashed`, and a timeout
   `TurnOutcome::TimedOut`; a result is `TurnOutcome::Finished`. The next turn
   starts a new process with `--resume`. `TurnStats::init_seen` says whether
@@ -3122,13 +3124,23 @@ Deliverables:
     `state = 'sending'`, and `notice_next_attempt_at` where
     `state = 'unknown' AND notified_at IS NULL`.
 - `Store` methods:
-  - `put_cloud_routine(member, label, routine_id, token, added_by, now)`.
-    The token is a `SecretString`, sealed with
-    `cloud_routines/token_enc/<id>` as associated data. An existing label
-    is replaced in place, which is how a member registers a new token; a
-    routine id registered under another label is refused; a new label past
-    20 for the member is refused, counted in the insert's
-    `BEGIN IMMEDIATE` transaction.
+  - `put_cloud_routine(&NewCloudRoutine { member, label, routine_id,
+    url_origin, token, added_by }, now)`. The token is a `SecretString`,
+    sealed with `cloud_routines/token_enc/<id>` as associated data. It
+    runs in one `BEGIN IMMEDIATE` transaction and returns
+    `CloudRoutinePut`:
+    - `Added(id)` for a new label.
+    - `Replaced(id)` for an existing label, replaced in place, which is
+      how a member registers a new token.
+    - `RoutineTaken { label }` for a routine id registered under another
+      label.
+    - `Full` for a new label past 20 for the member, counted in the
+      transaction.
+    - `Unlinked` when the member no longer has a Claude link, checked in the
+      transaction by `claude_links::linked`, the store's shared link check.
+      Against a `logout` that unlinks and then deletes the member's routines
+      (T35c), the put either commits first, and the delete finds its row, or
+      comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id and the opened
     token. `cloud_routines(member)` lists labels, ids and times, never
     tokens.
@@ -3136,16 +3148,29 @@ Deliverables:
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(…)` seals the task with
-    `cloud_handoffs/task_enc/<id>`, inserts the row as `sending` and
-    returns its id.
+  - `begin_cloud_handoff(&NewCloudHandoff { … }, per_hour, now)` seals
+    the task with `cloud_handoffs/task_enc/<id>` and, in one
+    `BEGIN IMMEDIATE` transaction, checks the member still has a Claude
+    link with `claude_links::linked`, as `put_cloud_routine` does, and
+    inserts the row as `sending`. It returns `CloudBegun`, inserting
+    nothing but for `Begun`:
+    - `Begun(id)` for the row.
+    - `RoutineGone` when the routine was removed, or its token replaced,
+      since the command read it.
+    - `TooMany` when the member asked for `per_hour` hand-offs in the last
+      hour (`CLOUD_HANDOFF_WINDOW`) already.
+    - `Unlinked` when the member no longer has a Claude link.
   - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
     `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
     for an answer whose record was held up past the pass. Recording any
     outcome from `sending` sets `notified_at`, since the command's reply
-    tells the member; recording `fired` or `rejected` from `unknown` sets it
-    too unless a notice claim's lease is live. Nothing retries a record
-    that failed.
+    tells the member, and so does recording `fired` or `rejected` from
+    `unknown`, so a `fired` or `rejected` row always has `notified_at` and a
+    notice whose claim failed isn't left owed by a row the partial index on
+    `notice_next_attempt_at`, which covers only `unknown` rows, no longer
+    finds. A claim sending at that moment may still deliver its notice
+    besides the reply. Nothing retries a record that failed. Finishing a
+    row that `logout` deleted changes nothing and isn't an error.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3195,11 +3220,14 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
+- `a_routine_is_refused_without_a_claude_link`.
+- `a_handoff_is_refused_without_a_claude_link`.
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
   `rejected`).
+- `finishing_a_deleted_handoff_is_a_no_op`.
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3293,7 +3321,25 @@ Deliverables:
 - `crates/agentd/src/app.rs` builds a `FireClient` when `[cloud]` is
   present and hands it to the command handlers.
 - Handlers in `crates/agentd/src/commands/cloud.rs`, through the one
-  command intake (T30), so commands run once and in order per member:
+  command intake (T30), so commands run once and in order per surface
+  identity (`MemberKey`), not per member. A `logout` the intake doesn't
+  order with a `cloud add` or `cloud run`, sent from the member's other
+  identity or run on another instance during a blue-green swap, is caught
+  by the link check in `put_cloud_routine` and `begin_cloud_handoff`
+  (T35a): the handler answers `CloudRoutinePut::Unlinked` as an unlinked
+  `cloud add` and `CloudBegun::Unlinked` as an unlinked `cloud run`,
+  having stored or sent nothing. A member Slack reports deleted keeps their
+  link, so a `cloud add` that races that deletion can still store a
+  routine, which then stays until the member logs out, and a racing
+  `cloud run` still writes and fires a hand-off, whose row goes at
+  `[cloud] retention_days`. A member only on Slack can't send `logout`
+  once Slack deleted them, so their routine stays sealed at rest
+  indefinitely, as their Claude link already does, and a store leaked with
+  its master key would yield its token, as the design's threat row on
+  routine tokens says. This is an accepted gap: it needs the member's own
+  command to land in the moment Slack deletes them, and through agentd
+  only that member can fire the token, from another of their identities;
+  for a member only on Slack, nobody can:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
@@ -3322,6 +3368,43 @@ Deliverables:
   and hand-offs, by `MemberId`, so those registered from any surface go;
   `logout`'s reply says to revoke the tokens, and a deleted member is sent
   nothing.
+- `logout` in `crates/agentd/src/commands/mod.rs`, which today deletes the
+  Slack configuration tokens first and calls `auth.logout(member)` last,
+  deletes the routines and hand-offs after `auth.logout` returns. A
+  `cloud add` or `cloud run` racing it then either commits before the
+  unlink, and the delete finds its row, or checks the link after it and is
+  refused; deleting first would let one pass the check between the delete
+  and the unlink and store a row after the delete. The deletes run
+  whenever the member exists, whether or not `auth.logout` found a link, as
+  the Slack token delete does today, so a `logout` retried after a delete
+  failed still cleans up.
+- A `cloud run` whose `begin_cloud_handoff` committed before the unlink
+  may still fire after `logout` answers; its `finish_cloud_handoff` finds
+  the row deleted, which is a no-op, and its reply still says what
+  happened. `auth.logout` deletes the link and then awaits the revoke, so
+  after a fresh `login` from another of the member's identities in that
+  window, anything stored from that identity (a routine, a hand-off or a
+  Slack configuration token, whose refresh token is already used up) is
+  deleted by this `logout`: accepted, since the member logged out and in
+  at once and can add the routine or register the token again; a deleted
+  hand-off's session may already have fired, and only its record is lost.
+- `slack-token` has the same race: its handler checks the link before it
+  rotates the token with Slack, and `put_slack_config_token` doesn't check
+  it again, so a token a racing `slack-token` stores after `logout`'s delete
+  survives the logout, whether the delete runs before the unlink or after
+  it. So `logout` deletes the Slack configuration tokens after `auth.logout`
+  too, and `put_slack_config_token` checks the link in its write: one
+  `INSERT … SELECT … WHERE EXISTS (SELECT 1 FROM claude_links …) ON CONFLICT
+  …` statement, not a transaction, since a statement that fails inside an
+  explicit transaction rolls back the trigger counts the failure-injection
+  tests read. It returns `Result<Option<SlackConfigTokenRef>>`, with `None`
+  when the member has no Claude link or doesn't exist. The handler answers
+  `None` with new wording, not the unlinked reply, which ends "I didn't use
+  it": the member is no longer linked, and checking the token used up its
+  refresh token, so they should generate a new one after linking again. The
+  store tests in `crates/store/src/slack_config_tokens.rs`, which put tokens
+  for members with no link, seed a link first, as do any agentd tests that
+  put a token for an unlinked member.
 - A Slack task's tokens are rewritten to what Slack showed, as the design's
   [Command surface](design.md#command-surface) says: `<@U…|name>` to
   `@name`, `<#C…|name>` to `#name`, `<url>` and a `<url|label>` labelled
@@ -3371,6 +3454,11 @@ Acceptance, as pipeline and command tests named after the rules:
 - `cloud_notifier_uses_the_defaults_without_cloud_config`.
 - `a_routine_url_on_another_origin_is_refused`.
 - `the_link_is_never_posted_outside_the_private_reply`.
+
+And a store test in `crates/store/src/slack_config_tokens.rs`:
+
+- `a_slack_token_stored_after_the_unlink_is_refused` (seeds a link,
+  deletes it, then puts).
 
 Live check (manual): with a Pro or Max account, make a routine on a scratch
 repository with the design's prompt, register it, run a task, and open the
@@ -4095,3 +4183,20 @@ Not scheduled. Each needs a decision before it becomes a task.
   would need to miss it for a message to be lost, but a lone agent in a room,
   or an agentd restart, loses it. Fetching each room's history since the last
   message seen, through the same deduplication, would close the gap.
+- **Keeping a private task's result when its delivery fails.** Posting an
+  approved private task's reply is retried only after a rate limit, so a
+  transport error or a 5xx on the post loses it, and so does the agent's
+  bot being removed from the thread while the task ran, after
+  `run_private_task`'s `can_post` check; the thread is told only that part
+  of the reply couldn't be delivered, if that posts. `run_private_task`
+  still returns `Ran::Done`, so `finish_consent` stops the private
+  sessions and deletes their directories, which held the only copy of the
+  result left (the CLI's transcript, and what the task wrote in `work/`).
+  The requester has to ask again, which takes a new consent and a rerun
+  billed to the owner. Returning an error instead wouldn't help: the next
+  claim finds the session reached the model and tells the thread the task
+  was interrupted. A fix needs the result stored durably (the private
+  output in the database), a redelivery path with backoff, and
+  `consent_posted` redefined for a partial post, since any chunk posted
+  now counts as the consent's last word, all within T33's rule that every
+  path a consent's work takes ends in `finish_consent`.
