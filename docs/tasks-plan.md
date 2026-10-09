@@ -4277,9 +4277,10 @@ Not scheduled. Each needs a decision before it becomes a task.
     `shared/`, such as a git hook, or in the transcript, that runs or
     instructs code in a later requester's process. Clearing `home/`,
     `tmp/` and everything in `claude/` but the transcript and
-    `settings.json` on a requester change, or putting `HOME` and `TMPDIR`
-    on a tmpfs of the container's own, would close the first three;
-    `work/`, `shared/` and the transcript would still carry over.
+    `settings.json` on a requester change would close the first three,
+    and putting `HOME` and `TMPDIR` on a tmpfs of the container's own
+    would close `home/` and `tmp/`; `work/`, `shared/` and the transcript
+    would still carry over.
 - **Metering at the credential proxy.** T27's meter and thread token
   budget read tokens and cost from the CLI's output, and the agent runs as
   the CLI's user, so it can print its own `assistant` and `result` lines
