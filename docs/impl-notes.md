@@ -6004,3 +6004,223 @@ to the pipeline rather than importing it. The lock can't restore an order
 lost before `dispatch` starts: two connections that record two messages
 in `Dedup`, or reach the sink, in the opposite order of the messages are
 dispatched in that order.
+
+## T24: Session commands
+
+### Which sessions the commands act on
+
+**Issue.** The plan lists "active and recent sessions" without saying which
+rows those are. A reset marks the row reset and inserts its replacement at
+once (T21), so every thread an agent ever answered keeps a live row, and a
+thread reset once has a fresh row that never had a turn. Listing every live
+row would show each thread ever answered, and resetting them would reset
+rows that have no transcript, making yet another row each.
+
+**Solution.** Both commands act on the live sessions in use: not reset, and
+with a turn finished (`last_turn_at`), a turn gone to the CLI (`started` or
+`maybe_started`), or a warm container. `Store::sessions_in_use` selects them
+in SQL, most recently active first (the end of the last turn, or the
+creation), with the ids warm on this instance
+(`SessionManager::warm_sessions`) passed in as a JSON array for `json_each`,
+so the rows a reset leaves behind are never read. `sessions` asks for at
+most 20 (`commands::MAX_LISTED`), and only when it gets that many counts
+them all (`Store::count_sessions_in_use`) to say how many there are. A
+private task's session is listed and reset by `reset <name>`, but not by
+`here`, since it isn't the conversation's own session. A reset session is
+gone from the list; its replacement shows up again once it has a turn.
+
+A session left out is one the CLI never read a message of, so it has no
+transcript, and its next turn starts with `--session-id` whether it is
+reset or not. That covers a session the pipeline has just looked up for a
+turn it is still preparing: resetting it would change its id and nothing
+else. A session that has run is reset even with such a turn pending, and
+the turn then finds it reset and moves to the replacement (T23's retry on
+`SessionReset`).
+
+### `here` is the conversation, not the thread
+
+**Issue.** A channel has one session per thread, so "the current
+conversation's session" is one session only in a DM. A Slack slash command
+names its channel but no thread (Slack doesn't offer slash commands in
+threads), while an `!agent` message on Rocket.Chat may be sent in one.
+
+**Solution.** `here` resets the agent's sessions of the conversation the
+command was sent in: a DM's one session, or every thread of a channel, the
+same on both surfaces. `Origin::SlackSlash` now carries the slash command's
+conversation, and `Origin::conversation` gives it, or for `!agent` the room,
+on the sender's team. In the manager bot's DM there is no conversation to
+reset, so `here` is refused there with how to send it. A message there has
+no conversation, but a Slack slash command sent there names the DM like any
+other, so when a slash command's `here` finds no session, its conversation
+is compared with the manager's DM with the owner (`Replies::dm_room`, a
+`conversations.open`) and the command refused the same way. Only a slash
+command is compared: on Rocket.Chat the manager bot's DM always arrives as
+`Origin::RocketChatDm`, and opening it (`users.info` and `im.create`) would
+only cost two calls for an answer known beforehand. A DM with the
+agent's bot is a room like any other (T13), so `!agent reset <name> here`
+there resets the owner's DM session, and in a room only the agent's bot is
+in the agent's connection hears it, as T14 made every connection feed the
+intake.
+
+### Thread links
+
+**Issue.** "A thread link where the surface can build one" needs a URL for
+each surface, and `Surface` has no way to make one.
+
+**Solution.** Two pure functions, used for the sessions of the surface and
+team agentd serves:
+
+- Slack: `surface_slack::surface::thread_link`, the web client's
+  `https://app.slack.com/client/<team>/<channel>`, then
+  `/thread/<channel>-<ts>`, which names the workspace by id and needs no
+  Web API call (`chat.getPermalink` would, per message).
+- Rocket.Chat: `RestClient::room_link`, the web client's routes
+  `<base>/channel/<name>`, `<base>/group/<name>` or `<base>/direct/<room
+  id>`, then `/thread/<root>`. A DM's route takes its id, so the owner's DM
+  and group DMs need no call; a channel's type and name come from the
+  manager's `rooms.info`, once per room and command, and a room the manager
+  can't read has no link.
+
+Another member's DM with the agent has no link, since the owner can't open
+it, and neither has a private task's session, whose thread (where its
+result goes) may be such a DM. A Rocket.Chat private group has no link
+either: the manager may be in groups the owner isn't, and the link would
+show them the group's name. Rocket.Chat has no cheap call for whether a
+given user is in a room (`groups.members` pages through every member), so
+the owner's membership isn't checked. Neither form was checked against a
+live client.
+
+### The commands reach the runner through a weak handle
+
+**Issue.** `Commands` is built with `App`, before `serve` connects to Docker
+and starts the runner (`pipeline::Turns`), and many tests start agentd with
+no runner at all. A strong handle in `App` would also keep the runner's idle
+reaper and event follower running after the pipeline is dropped at
+shutdown, past the store's close.
+
+**Solution.** `commands::SessionControl` is what the commands need
+(`reset`, `warm_sessions`), implemented for `SessionManager`. `Turns::start`
+hands its sessions to `app.commands()` as a `Weak`, so every path that
+starts a runner for an app wires it, and dropping the runner ends it.
+Without one (no `[sandbox]`, or after shutdown) `reset` marks the session
+reset in the store alone, and nothing is warm. `warm_sessions` knows this
+instance's containers only. A warm process on another instance keeps its
+old session until its next turn there finds the session reset (T21's
+`RunnerError::SessionReset`), which moves the turn to the replacement, and
+the idle reaper stops the old container.
+
+### A reset waits for the session's turns, the reply doesn't
+
+**Issue.** `SessionManager::reset` runs after the turns queued before it,
+which can take up to the turn timeout each, and it joins the session's
+queue only when its future is first polled. Resetting a few sessions at a
+time left the others out of their queues until an earlier reset ended, so a
+message sent in one of them after `reset` ran on the old conversation and
+was then wiped. Waiting for every reset before replying also held up the
+owner's later commands, which the intake runs one at a time (T13), and
+could outlast a Slack `response_url`, which expires after 30 minutes.
+
+**Solution.** Every reset is issued at once and polled once before the
+reply, so each is queued on its session before the owner reads
+"Resetting". The first poll of `reset_all` polls every reset future itself,
+in a plain loop, and only then awaits them all with `join_all`. That loop
+runs under `tokio::task::unconstrained`: Tokio's cooperative budget allows
+128 operations per task poll (tokio 1.53), each lock taken on an idle
+session spends one, and once it is spent a lock returns `Pending` before
+joining the mutex's queue, so a plain poll left every idle session past
+about the 128th out of its queue until after the reply.
+
+The loop polls every reset whatever the others do, so every reset has
+joined its session's queue when the first poll returns, without exception.
+`join_all` alone didn't promise that: it drives more than 30 futures
+through `FuturesOrdered`, whose `FuturesUnordered` returns `Pending` once
+two futures have woken themselves while being polled (`yielded >= 2`,
+futures 0.3.34), and leaves the rest for the next poll, after the reply. A
+reset is woken inside its own poll when its session's lock is handed over,
+its spawned task ends, or a store permit is let go on another worker
+between it registering its waker and returning `Pending`. The agentd
+test's fake runner wakes itself once in every reset's first poll: with
+`join_all` alone 2 of 200 resets held their session before the reply, and
+without `unconstrained` 128. The first poll never yields: for 10,000
+sessions it took 71-75 ms with a runner (a slot lock and a spawned task
+each) and 18-19 ms without one, in a debug build on a loaded machine, two
+runs each, holding one worker thread that long.
+
+A reset's store write takes one of 2 permits (`store::RESETS_AT_ONCE`):
+`Store::reset_session` waits for one before it takes a connection and lets
+it go when its transaction ends. Without a cap, a reset of thousands of
+sessions ran as many `BEGIN IMMEDIATE` transactions at once against the
+store's pool of 10 connections: with 2,000 an unrelated `ping` waited 3
+seconds, and every other agent's turns waited behind them, or past the
+pool's 30-second acquire timeout. The semaphore lives in `Store` and is
+shared by its clones, so it bounds every reset in the process, through the
+runner or, without one, in the store alone, and neither `SessionControl`
+nor `SessionManager` passes permits around. It covers only the write.
+Stopping a container never used the pool and is bounded by
+`global_container_cap`. An earlier version held the permit through the
+stop as well, about 10 seconds or 120 with a degraded Docker daemon, which
+held up every other reset, cold ones and other owners' too, each holding
+its session meanwhile, so turns queued there filled the pipeline's
+`max_pending` and `evict_idle` couldn't free their containers.
+`SessionManager::reset` stops the container and then writes, with the
+session held, so the reset is already queued while it waits for a permit,
+and it waits on no other session while it holds one. A turn sent to a
+session whose reset waits for a permit waits for it, as it would for the
+reset itself.
+
+SQLite has one writer, so more permits add no throughput and only park
+more of the pool's connections in the busy handler. A throwaway probe
+measured it: a file database in WAL mode, 2,000 sessions reset at once,
+and a `ping` and an unrelated one-row `UPDATE` every 5 ms meanwhile, three
+rounds of each cap in a debug build on 4 shared, loaded CPUs. The cap of 8
+before this change was applied in the probe around each write, the cap of
+2 is the store's own.
+
+| Cap | Reset of 2,000 | `ping` p99 | `ping` max | Unrelated write p99 | Unrelated write max |
+| --- | --- | --- | --- | --- | --- |
+| None | 3.8-5.1 s | 12 ms-1.4 s | 3.0-3.6 s | 0.06-2.1 s | 2.8-3.7 s |
+| 8 | 4.7-5.5 s | 1.0-5.5 ms | 4-34 ms | 0.63-1.04 s | 0.93-2.1 s |
+| 2 | 4.4-5.0 s | 1.6-3.7 ms | 8-32 ms | 0.43-0.53 s | 0.63-2.0 s |
+
+A reset takes as long with 2 as with 8. A `ping` reads, which WAL lets it
+do while a write is open, so it waits only for a connection, and both caps
+leave it some; 2 leaves 8 of the 10 free rather than 2. An unrelated write
+still waits about half a second at p99: SQLite's busy handler retries after
+sleeps of up to 100 ms and loses to resets that write back to back, which
+no cap on resets alone makes fair. A single reset can queue for a permit
+behind another owner's mass reset: at these rates one of about 10,000
+sessions holds the permits for 20-25 seconds. That is accepted.
+
+Waiting for the resets to end is the command's `FollowUp`: the intake
+releases the member's command order once the reply is sent and then runs
+the follow-up in the same task, so the owner's next command goes ahead. If
+a reset fails (a container that can't be stopped isn't reset, T21), the
+owner is told in a direct message from the manager bot, with the command
+to send again. At shutdown the intake waits
+for follow-ups as for commands, within the drain; one still waiting when the
+drain ends is dropped with the intake's tasks. A reset still queued behind
+its session's turns then leaves the queue without resetting. One that holds
+its session goes on: `with_slot` runs the work in a task of its own, as for
+a turn, and dropping the caller drops only its `JoinHandle`. It keeps the
+runner's `Inner` alive until it ends, within one container stop, and it can
+reach the store after `Store::close`. That is harmless: `close` waits for a
+transaction in progress, and one begun after it fails at once, leaving the
+session unreset with its container stopped, as any failed reset does, and
+the process's exit ends the task anyway. Stopping the task with its caller
+would cancel a container stop part way or thread a cancellation into the
+write, for no gain. The follow-up itself holds a strong `SessionControl`
+handle until its resets end, so on shutdown the `SessionManager`'s inner
+state, whose drop aborts the reaper and the container event follower, can
+outlive the `Turns` handle while a reset waits behind a long turn; that is
+bounded by the drain, which drops a follow-up still waiting when it ends.
+The follow-up lives only in memory: if the instance dies, the queued resets
+die with it and nothing is reset, which the owner sees in `sessions` and can
+send again.
+
+The follow-up isn't polled while the reply is being sent. A reset queued on
+a busy session whose turn ends in that window is handed the session's lock,
+but runs only once the reply is sent, so the session's next turn waits for
+the reply's round trip too. Driving the follow-up alongside the reply would
+need the failure DM held back until the reply is out, and the resets task
+aborted with the intake at shutdown, which isn't worth a delay of one
+reply.
