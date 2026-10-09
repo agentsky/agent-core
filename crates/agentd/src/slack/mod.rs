@@ -40,7 +40,7 @@ use axum::routing::get;
 use core_types::{BindingId, InboundEvent, SendError, Sender, Sink, TeamId, Throttle, UserId};
 use futures::FutureExt as _;
 use secrecy::SecretString;
-use store::Store;
+use store::{CloudDeleted, Store};
 use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
@@ -54,6 +54,7 @@ use tokio::task::JoinSet;
 use crate::app::App;
 use crate::commands::intake::CommandSubmitter;
 use crate::commands::slack::{consent_action, dm_command, member_who_left, slash_command};
+use crate::commands::slack_tokens::retry_store;
 use bots::SlackBots;
 use manager::ManagerIdentity;
 
@@ -401,8 +402,9 @@ impl Dedup for StoreDedup {
 ///   `user_change` whose user is `deleted` deletes that member's
 ///   configuration token for the workspace, and every cloud routine and
 ///   hand-off of the member, whichever surface registered them, telling
-///   no one. Only home members' commands
-///   go on (see the design's Slack Connect "Commands"):
+///   no one, with the store tried a few times since Slack doesn't send the
+///   event again. Only home members' commands go on (see the design's
+///   Slack Connect "Commands"):
 ///   - A DM whose sender's own team fields make them outside is dropped
 ///     here, without touching the network; the rest are checked against
 ///     the member list or `users.info` in the member's own intake task
@@ -473,19 +475,19 @@ impl Inbound {
         let Some(key) = member_who_left(event, home_org) else {
             return;
         };
-        let member = match self.store.member_for_identity(&key).await {
-            Ok(Some(member)) => member,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(member = %key, error = %err, "couldn't look up a member who left");
-                return;
-            }
-        };
-        match self
-            .store
-            .delete_slack_config_token(member, &key.team)
-            .await
-        {
+        let (store, key) = (&self.store, &key);
+        let deleted = retry_store(
+            "deleting a departed member's configuration token",
+            key,
+            || async move {
+                match store.member_for_identity(key).await? {
+                    Some(member) => store.delete_slack_config_token(member, &key.team).await,
+                    None => Ok(false),
+                }
+            },
+        )
+        .await;
+        match deleted {
             Ok(true) => {
                 tracing::info!(member = %key, "a member left the workspace; deleted their configuration token")
             }
@@ -494,7 +496,18 @@ impl Inbound {
                 tracing::warn!(member = %key, error = %err, "couldn't delete the configuration token of a member who left")
             }
         }
-        match self.store.delete_cloud_routines_of(member).await {
+        let deleted = retry_store(
+            "deleting a departed member's cloud routines",
+            key,
+            || async move {
+                match store.member_for_identity(key).await? {
+                    Some(member) => store.delete_cloud_routines_of(member).await,
+                    None => Ok(CloudDeleted::default()),
+                }
+            },
+        )
+        .await;
+        match deleted {
             Ok(deleted) if deleted.routines > 0 || deleted.handoffs > 0 => tracing::info!(
                 member = %key,
                 routines = deleted.routines,

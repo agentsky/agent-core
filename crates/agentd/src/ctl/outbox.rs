@@ -14,6 +14,12 @@ pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_POSTS: usize = 10;
 /// The most reactions one turn may queue with `agentctl react`.
 pub const MAX_REACTIONS: usize = 20;
+/// The most agents one turn hands off to: those its `agentctl ask-agent`
+/// calls ask, then those the other posts it makes in its thread mention,
+/// in the order they go out. With the hop cap it bounds the turns one
+/// message can start: this many at the first hop, its square at the
+/// second, and so on up to the cap.
+pub const MAX_HAND_OFFS: usize = 2;
 
 /// A message queued with `agentctl post`. Its target already passed the
 /// turn's target rules.
@@ -26,10 +32,11 @@ pub struct QueuedPost {
     pub to: ReplyTarget,
     /// The Markdown text to render and post.
     pub text: String,
-    /// The agent the post asks, when `agentctl ask-agent` queued it. A
-    /// post without it that mentions an agent still starts that agent's
-    /// hop, and spends the turn's one hop to it, `(agent, turn)`, if it
-    /// goes out first.
+    /// The agent the post asks, when `agentctl ask-agent` queued it,
+    /// which keeps its place among the turn's [`MAX_HAND_OFFS`]. A post
+    /// without it that mentions an agent still starts that agent's hop,
+    /// and spends the turn's one hop to it, `(agent, turn)`, if it goes
+    /// out first.
     pub asks: Option<AgentId>,
 }
 

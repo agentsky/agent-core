@@ -85,7 +85,7 @@ pub use cloud::{
 };
 pub use community::CommunityKeyStatus;
 pub use consents::{Approval, Consent, ConsentState, NewConsent, OpenLimits};
-pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, ScopeLease, TokenHash};
+pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use hand_offs::{DueHandOffs, HandOff, NewHandOff};
 pub use message_refs::{MessageRef, NewMessageRef};
@@ -153,6 +153,10 @@ pub enum StoreError {
         /// What was refused.
         what: &'static str,
     },
+    /// A write made under a skill's lease found the lease ended or taken
+    /// over, and changed nothing.
+    #[error("the skill's lease ended before the write")]
+    SkillLeaseLost,
 }
 
 /// A `Result` whose error is [`StoreError`].
@@ -308,6 +312,10 @@ fn to_unix(at: OffsetDateTime) -> i64 {
     at.unix_timestamp()
 }
 
+fn ttl_seconds(ttl: Duration) -> i64 {
+    i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX).max(1)
+}
+
 fn from_unix(seconds: i64, table: &'static str, column: &'static str) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(seconds).map_err(|_| StoreError::Corrupt { table, column })
 }
@@ -437,6 +445,7 @@ mod tests {
                 "processed_events",
                 "scope_locks",
                 "sessions",
+                "skill_leases",
                 "slack_config_tokens",
                 "surface_identities",
                 "thread_usage",

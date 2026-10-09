@@ -9,8 +9,13 @@
 //! DM with the Slack manager app, or a DM with the Rocket.Chat manager bot.
 //! `cloud add` sent anywhere else gets the secret-bearing refusal, which
 //! says to revoke the token. `add` and `run` need a linked member and
-//! `[cloud]` ([`Commands::with_cloud`]); `list` and `rm` work for any
-//! member, and `rm` is the one `cloud` command a ban leaves. No `agentctl`
+//! `[cloud]` ([`Commands::with_cloud`]), checked again in the transaction
+//! that stores the routine or records the hand-off
+//! ([`put_cloud_routine`](store::Store::put_cloud_routine),
+//! [`begin_cloud_handoff`](store::Store::begin_cloud_handoff)), so a
+//! `logout` that another instance or surface ran meanwhile never leaves a
+//! token behind or fires a routine. `list` and `rm` work for any member,
+//! and `rm` is the one `cloud` command a ban leaves. No `agentctl`
 //! command or consent card starts a hand-off: only a member typing `cloud
 //! run` does, and messages from bots are never commands.
 //!
@@ -115,13 +120,10 @@ impl Commands {
         key: &MemberKey,
         origin: &Origin,
     ) -> Result<Result<MemberId, String>, Failure> {
-        Ok(self.linked_owner(key, origin).await?.map_err(|_| {
-            format!(
-                "Link your Claude account first: send {}. Only a linked member can register \
-                 or run routines.",
-                origin.command("login")
-            )
-        }))
+        Ok(self
+            .linked_owner(key, origin)
+            .await?
+            .map_err(|_| link_first(origin)))
     }
 
     async fn cloud_add(
@@ -165,28 +167,43 @@ impl Commands {
                 now(),
             )
             .await?;
-        tracing::info!(%member, routine = routine_id.as_str(), put = ?put, "registered a cloud routine");
         let run = origin.command(&format!("cloud run {label} <task>"));
         Ok(match put {
-            CloudRoutinePut::Added(_) => format!(
-                "Registered routine `{label}` (`{routine_id}`). Hand it work with {run}; it runs \
-                 on the account the routine belongs to."
-            ),
-            CloudRoutinePut::Replaced(_) => format!(
-                "Replaced routine `{label}`: it now fires `{routine_id}` with the token you just \
-                 sent. Hand it work with {run}."
-            ),
-            CloudRoutinePut::RoutineTaken { label: taken } => format!(
-                "You registered that routine as `{taken}` already, so I didn't store it again. \
-                 To give it a new token, send {}.",
-                add_command(origin, &format!("{taken} <url> <token>"))
-            ),
-            CloudRoutinePut::Full => format!(
-                "You have {}, the most one member may hold, so I didn't store this one. Remove \
-                 one with {} first.",
-                routines_counted(u64::from(store::MAX_CLOUD_ROUTINES)),
-                origin.command("cloud rm <routine>")
-            ),
+            CloudRoutinePut::Added(id) => {
+                tracing::info!(%member, cloud_routine = %id, routine = routine_id.as_str(), "registered a cloud routine");
+                format!(
+                    "Registered routine `{label}` (`{routine_id}`). Hand it work with {run}; it \
+                     runs on the account the routine belongs to."
+                )
+            }
+            CloudRoutinePut::Replaced(id) => {
+                tracing::info!(%member, cloud_routine = %id, routine = routine_id.as_str(), "replaced a cloud routine");
+                format!(
+                    "Replaced routine `{label}`: it now fires `{routine_id}` with the token you \
+                     just sent. Hand it work with {run}."
+                )
+            }
+            CloudRoutinePut::RoutineTaken { label: taken } => {
+                tracing::info!(%member, routine = routine_id.as_str(), "refused a cloud routine registered under another label; stored nothing");
+                format!(
+                    "You registered that routine as `{taken}` already, so I didn't store it \
+                     again. To give it a new token, send {}.",
+                    add_command(origin, &format!("{taken} <url> <token>"))
+                )
+            }
+            CloudRoutinePut::Full => {
+                tracing::info!(%member, routine = routine_id.as_str(), "refused a cloud routine past the per-member cap; stored nothing");
+                format!(
+                    "You have {}, the most one member may hold, so I didn't store this one. \
+                     Remove one with {} first.",
+                    routines_counted(u64::from(store::MAX_CLOUD_ROUTINES)),
+                    origin.command("cloud rm <routine>")
+                )
+            }
+            CloudRoutinePut::Unlinked => {
+                tracing::info!(%member, routine = routine_id.as_str(), "a member was unlinked before their cloud routine was stored; stored nothing");
+                link_first(origin)
+            }
         })
     }
 
@@ -289,6 +306,10 @@ impl Commands {
                      nothing was started. {} shows your routines.",
                     origin.command("cloud list")
                 ));
+            }
+            Ok(CloudBegun::Unlinked) => {
+                tracing::info!(%member, routine = routine.routine_id.as_str(), "a member was unlinked before their cloud hand-off; fired nothing");
+                return Ok(link_first(origin));
             }
             Ok(CloudBegun::TooMany) => {
                 tracing::debug!(%member, routine = routine.routine_id.as_str(), "refused a cloud hand-off past the hourly cap");
@@ -442,6 +463,16 @@ fn cloud_origin(origin: &Origin) -> Option<CloudOrigin> {
 fn cloud_off(what: &str) -> String {
     format!(
         "Cloud hand-off is off on this agentd, so {what}. `cloud list` and `cloud rm` still work."
+    )
+}
+
+/// The reply to `cloud add` or `cloud run` from a member with no Claude
+/// link.
+fn link_first(origin: &Origin) -> String {
+    format!(
+        "Link your Claude account first: send {}. Only a linked member can register or run \
+         routines.",
+        origin.command("login")
     )
 }
 

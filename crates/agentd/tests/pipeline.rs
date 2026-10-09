@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentd::commands::{ManagerBot, OpenDm, Origin, Replies};
-use agentd::ctl::SurfaceLookup;
+use agentd::ctl::{MAX_HAND_OFFS, SurfaceLookup};
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
     Turns, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
@@ -2234,6 +2234,71 @@ async fn messages_in_a_thread_are_answered_once_each_in_arrival_order() {
     stack.stop().await;
 }
 
+/// Each Rocket.Chat connection in a room may deliver a message, so two
+/// messages of a thread can be sent at once from two connections. The
+/// first sent is answered first even when its lookup is the slower one:
+/// it mentions forty people, each looked up as a possible agent's bot.
+#[tokio::test]
+async fn messages_of_a_thread_sent_at_once_from_two_connections_keep_their_order() {
+    let stack = start().await;
+    let first = stack.answered_root("r1", "First.").await;
+    stack.mock.set_history(
+        thread("GENERAL", "r1"),
+        vec![
+            said("r1", "alice", "@UBOT hello"),
+            said(first.id.as_str(), BOT, "First."),
+            said("q2", "alice", "@UBOT question two"),
+            said("q3", "alice", "@UBOT question three"),
+        ],
+    );
+    let upstream = stack.fake.message_requests().await.len();
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Answer."));
+    let people: Vec<String> = (0..40).map(|n| format!("UPERSON{n}")).collect();
+    let mut slow: Vec<&str> = people.iter().map(String::as_str).collect();
+    slow.push(BOT);
+    let mut two = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "q2",
+        Some("r1"),
+        &slow,
+    );
+    two.text = "@UBOT question two".to_owned();
+    let mut three = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "q3",
+        Some("r1"),
+        &[BOT],
+    );
+    three.text = "@UBOT question three".to_owned();
+    let one = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    let other = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    let (sent_two, sent_three) = tokio::join!(one.send(two), other.send(three));
+    sent_two.unwrap();
+    sent_three.unwrap();
+    wait_until("both are answered", || {
+        posts(&stack.calls_since(before)).len() >= 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(posts(&stack.calls_since(before)).len(), 2);
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 2, "one turn each");
+    assert!(bodies[0].contains("question two"), "{}", bodies[0]);
+    assert!(!bodies[0].contains("question three"), "{}", bodies[0]);
+    assert!(bodies[1].contains("question three"), "{}", bodies[1]);
+    assert!(
+        !bodies[1].contains("question two"),
+        "the first message was answered by its own turn: {}",
+        bodies[1]
+    );
+    stack.stop().await;
+}
+
 #[tokio::test]
 async fn a_failed_reply_post_still_delivers_the_rest_and_says_so() {
     let stack = start().await;
@@ -2284,6 +2349,91 @@ async fn a_failed_reply_post_still_delivers_the_rest_and_says_so() {
     let sent = posts(&stack.calls_since(before));
     assert_eq!(sent.len(), 1, "a rate-limited post is tried again");
     assert_eq!(sent[0].1, "Again.");
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_upload_still_posts_the_reply_and_says_part_was_lost() {
+    let stack = start().await;
+    stack.next_turn(Turn::reply("Here.").with_command([
+        "sh",
+        "-c",
+        "printf report > report.txt && agentctl attach report.txt",
+    ]));
+    stack
+        .mock
+        .fail_next(Op::Upload, SurfaceError::Api("boom".into()));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "f1", None, &[BOT]))
+        .await;
+    let sent: Vec<_> = posts(&stack.calls_since(0))
+        .into_iter()
+        .map(|(to, text, _)| (to, text))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (in_thread("GENERAL", Some("f1")), "Here.".to_owned()),
+            (
+                in_thread("GENERAL", Some("f1")),
+                DELIVERY_FAILED_TEXT.to_owned()
+            ),
+        ]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_post_not_recorded_says_part_was_lost_only_when_it_lost_a_hand_off() {
+    use sqlx::Connection as _;
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_agent_posts BEFORE INSERT ON message_refs \
+         WHEN NEW.agent_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+
+    stack.next_turn(Turn::reply("Here."));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "r1", None, &[BOT]))
+        .await;
+    let sent = posts(&stack.calls_since(0));
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(
+        texts,
+        ["Here."],
+        "the person saw the whole reply, which handed nothing off"
+    );
+    assert_eq!(
+        stack.store().posted_message_ref(&sent[0].2).await.unwrap(),
+        None
+    );
+
+    let before = stack.mock.calls().len();
+    let reply = "@UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "r2", None, &[BOT]))
+        .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let texts: Vec<String> = posts(&stack.calls_since(before))
+        .into_iter()
+        .map(|(_, text, _)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        [reply, DELIVERY_FAILED_TEXT],
+        "the reply's hand-off was lost with its row"
+    );
+    assert!(stack.writers_hops(writer).await.is_empty());
     stack.stop().await;
 }
 
@@ -2379,7 +2529,7 @@ async fn past_the_queue_an_outside_sender_gets_no_busy_line() {
     .await;
     let outside = |mut event: InboundEvent| {
         event.outside = Some(core_types::Outside {
-            team: Some("T0THEIRS1".into()),
+            team: "T0THEIRS1".into(),
         });
         event
     };
@@ -3132,6 +3282,131 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
         vec!["Bearer token-of-bob"; 4],
         "both hops, and the turns that posted them, ran on bob's account"
     );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_more() {
+    use sqlx::Connection as _;
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.attribution_wait = Duration::from_secs(30),
+        ..Setup::default()
+    })
+    .await;
+    let bots = ["UWRITER", "USCOUT", "UCRITIC"];
+    let mut agents = Vec::new();
+    for (name, bot) in ["writer", "scout", "critic"].into_iter().zip(bots) {
+        let agent = stack.other_agent(name, bot).await;
+        stack
+            .store()
+            .update_agent_settings(agent, |settings| settings.max_hops = Some(1))
+            .await
+            .unwrap();
+        agents.push(agent);
+    }
+    let reply = "@UWRITER @USCOUT @UCRITIC over to you.";
+    let first = "m1";
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TABLE late_claims (event_id TEXT NOT NULL); \
+         CREATE TRIGGER claimed_after_the_row BEFORE INSERT ON processed_events \
+         WHEN NEW.source = 'hop' \
+         AND EXISTS (SELECT 1 FROM message_refs WHERE platform_ref = 'm1') \
+         AND NOT EXISTS (SELECT 1 FROM processed_events p \
+             WHERE p.source = NEW.source AND p.event_id = NEW.event_id) \
+         AND NOT EXISTS (SELECT 1 FROM hand_offs h WHERE NEW.event_id LIKE h.agent_id || '/%') \
+         BEGIN INSERT INTO late_claims (event_id) VALUES (NEW.event_id); END;",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    stack.next_turn(Turn::reply(reply));
+    let gate = Gate::closed();
+    stack.holds.posts_of(reply, &gate);
+    let sink = stack.pipeline.sink(MockSurface::DEFAULT_CAPS);
+    sink.send(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("helper's reply waits to be posted", || gate.waiting() == 1).await;
+    sink.send(stack.agents_post(BOT, first, "c1", &bots))
+        .await
+        .unwrap();
+    gate.open();
+    let unreacted = Call::Unreact {
+        msg: msg("GENERAL", "c1"),
+        emoji: "hourglass".into(),
+    };
+    wait_until("helper's turn is done with, hand-offs and all", || {
+        stack.mock.calls().contains(&unreacted)
+    })
+    .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let sent = posts(&stack.mock.calls());
+    assert_eq!(sent[0].2.id.as_str(), first);
+    let mut ran = Vec::new();
+    for agent in &agents {
+        ran.push(stack.writers_hops(*agent).await);
+    }
+    let expected: Vec<Vec<u8>> = (0..agents.len())
+        .map(|i| if i < MAX_HAND_OFFS { vec![1] } else { vec![] })
+        .collect();
+    assert_eq!(
+        ran, expected,
+        "the first agents the post mentions run its hop, and the platform's copy runs no other"
+    );
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    let late: Vec<(String,)> = sqlx::query_as("SELECT event_id FROM late_claims")
+        .fetch_all(&mut db)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
+    assert!(
+        late.is_empty(),
+        "every hop no hand-off holds was claimed before the post's row was there: {late:?}"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_post_whose_mentions_cant_be_looked_up_is_left_unrecorded() {
+    use sqlx::Connection as _;
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.other_agent("critic", "UCRITIC").await;
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         UPDATE agent_bindings SET id = 'not-a-binding-id' WHERE bot_user_id = 'UCRITIC';",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let reply = "@UWRITER @UCRITIC over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let sent = posts(&stack.mock.calls());
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(texts, [reply, DELIVERY_FAILED_TEXT]);
+    assert_eq!(
+        stack.store().posted_message_ref(&sent[0].2).await.unwrap(),
+        None,
+        "a post with a mention neither handed off nor claimed gets no row to attribute it"
+    );
+    assert!(stack.kept_hand_offs().await.is_empty());
+    assert!(stack.writers_hops(writer).await.is_empty());
     stack.stop().await;
 }
 

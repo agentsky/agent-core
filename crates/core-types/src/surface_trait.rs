@@ -88,8 +88,9 @@ pub trait Surface: Send + Sync {
     /// can speak on returns `event` itself without asking. One whose events
     /// someone else could forge, such as Slack's, where an agent's owner
     /// holds the app's signing secret, reads the message back from the
-    /// platform. The pipeline asks before acting on a message for anyone
-    /// but the agent's owner, and routes the copy instead of the event.
+    /// platform. The pipeline asks before acting on any message it didn't
+    /// build itself, whoever sent it, and routes the copy instead of the
+    /// event.
     async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>>;
 
     /// Converts Markdown to the surface's format and splits it into

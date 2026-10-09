@@ -231,20 +231,7 @@ impl SlackHarness {
             .ensure_member(key, key.user.as_str(), OffsetDateTime::now_utc())
             .await
             .unwrap();
-        self.store
-            .put_claude_link(
-                member,
-                &NewClaudeLink {
-                    access_token: SecretString::from("access"),
-                    refresh_token: SecretString::from("refresh"),
-                    expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
-                    plan: Some("claude_max".to_owned()),
-                    rate_limit_tier: None,
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap();
+        link(&self.store, member).await;
         member
     }
 
@@ -550,6 +537,7 @@ async fn me_on_slack_names_the_manager_app_and_the_token_state() {
             OffsetDateTime::now_utc(),
         )
         .await
+        .unwrap()
         .unwrap();
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(reply.contains("Plan: Claude Max."), "{reply}");
@@ -582,6 +570,7 @@ async fn logout_deletes_the_configuration_tokens() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
@@ -610,6 +599,7 @@ async fn the_rotator_renews_each_token_before_it_expires() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     let first_exp = (start + time::Duration::hours(12)).unix_timestamp();
     let second_exp = (start + time::Duration::hours(22)).unix_timestamp();
@@ -683,6 +673,7 @@ async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -740,6 +731,7 @@ async fn a_failed_renewal_is_tried_again_after_the_lease() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -794,6 +786,7 @@ async fn a_notice_nobody_can_send_is_tried_a_bounded_number_of_times() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     h.store
         .mark_slack_config_token_broken(&row, start)
@@ -992,43 +985,63 @@ async fn the_managers_own_and_other_bots_messages_are_not_commands() {
     assert!(h.posts().await.is_empty());
 }
 
+impl SlackHarness {
+    /// Stores a configuration token for `member`.
+    async fn with_token(&self, member: MemberId) {
+        self.store
+            .put_slack_config_token(
+                member,
+                &TeamId::new(TEAM),
+                &NewSlackConfigToken {
+                    token: SecretString::from("xoxe.xoxp-1-HELD-SECRET-token"),
+                    refresh_token: SecretString::from("xoxe-1-HELD-SECRET-refresh"),
+                    expires_at: OffsetDateTime::now_utc(),
+                },
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// A `user_change` to the manager app, with `event` as its event.
+fn user_change(event: Value) -> SlackInbound {
+    SlackInbound::Event(SlackEvent {
+        binding: BindingRef::MANAGER_ID,
+        team: TeamId::new(TEAM),
+        event_id: "Ev0USERCHG1".to_owned(),
+        event_type: "user_change".to_owned(),
+        event,
+        received_at: OffsetDateTime::now_utc(),
+    })
+}
+
+/// The event of a `user_change` saying `U0HUMAN02` was deleted.
+fn departed() -> Value {
+    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
+    envelope["event"].clone()
+}
+
+/// The `user_change` saying `U0HUMAN02` was deleted.
+fn departure() -> SlackInbound {
+    user_change(departed())
+}
+
 #[tokio::test]
 async fn a_deleted_user_loses_their_configuration_token() {
     let h = slack_harness().await;
     let grace = h.linked("U0HUMAN02").await;
     let alice = h.linked("U0HUMAN01").await;
     for member in [grace, alice] {
-        h.store
-            .put_slack_config_token(
-                member,
-                &TeamId::new(TEAM),
-                &NewSlackConfigToken {
-                    token: SecretString::from("t"),
-                    refresh_token: SecretString::from("r"),
-                    expires_at: OffsetDateTime::now_utc(),
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap();
+        h.with_token(member).await;
     }
-    let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
-    let event = |value: Value| SlackEvent {
-        binding: BindingRef::MANAGER_ID,
-        team: TeamId::new(TEAM),
-        event_id: "Ev0USERCHG1".to_owned(),
-        event_type: "user_change".to_owned(),
-        event: value,
-        received_at: OffsetDateTime::now_utc(),
-    };
     let running = Running::start(&h);
-    let mut active = envelope["event"].clone();
+    let mut active = departed();
     active["user"]["deleted"] = json!(false);
     active["user"]["id"] = json!("U0HUMAN01");
-    running.send(SlackInbound::Event(event(active))).await;
-    running
-        .send(SlackInbound::Event(event(envelope["event"].clone())))
-        .await;
+    running.send(user_change(active)).await;
+    running.send(departure()).await;
     running.stop().await;
     assert_eq!(h.stored(grace).await, None);
     assert!(h.stored(alice).await.is_some());
@@ -1260,9 +1273,11 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         .ensure_member(&slack_key("U0HUMAN02"), "bob", start)
         .await
         .unwrap();
+    link(&old_key, bob).await;
     old_key
         .put_slack_config_token(bob, &TeamId::new(TEAM), &token("xoxe-1-BOB", 10), start)
         .await
+        .unwrap()
         .unwrap();
     old_key.close().await;
 
@@ -1272,9 +1287,11 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         .ensure_member(&slack_key("U0HUMAN01"), "alice", start)
         .await
         .unwrap();
+    link(&store, alice).await;
     store
         .put_slack_config_token(alice, &TeamId::new(TEAM), &token("xoxe-1-R0", 20), start)
         .await
+        .unwrap()
         .unwrap();
     mount_rotation(
         &h.slack,
@@ -1320,6 +1337,7 @@ async fn me_says_when_a_token_expired_because_renewing_it_keeps_failing() {
             OffsetDateTime::now_utc(),
         )
         .await
+        .unwrap()
         .unwrap();
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(
@@ -1359,6 +1377,7 @@ async fn requests_from_another_workspace_are_dropped() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let running = Running::start(&h);
@@ -1428,9 +1447,11 @@ pub(super) async fn sql(url: &str, statements: &str) {
     db.close().await.unwrap();
 }
 
-const FAIL_TOKEN_WRITES: &str = "\
+const TOKEN_WRITE_FAILURES: &str = "\
     CREATE TABLE token_write_failures (remaining INTEGER NOT NULL); \
-    INSERT INTO token_write_failures VALUES (0); \
+    INSERT INTO token_write_failures VALUES (0);";
+
+const FAIL_TOKEN_WRITES: &str = "\
     CREATE TRIGGER fail_token_insert BEFORE INSERT ON slack_config_tokens \
     WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
     UPDATE token_write_failures SET remaining = remaining - 1; \
@@ -1440,15 +1461,51 @@ const FAIL_TOKEN_WRITES: &str = "\
     UPDATE token_write_failures SET remaining = remaining - 1; \
     SELECT RAISE(FAIL, 'injected write failure'); END;";
 
+const FAIL_TOKEN_DELETES: &str = "\
+    CREATE TRIGGER fail_token_delete BEFORE DELETE ON slack_config_tokens \
+    WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
+    UPDATE token_write_failures SET remaining = remaining - 1; \
+    SELECT RAISE(FAIL, 'injected write failure'); END;";
+
+/// Links `member`'s Claude account in `store`, as `login` does.
+pub(super) async fn link(store: &Store, member: MemberId) {
+    store
+        .put_claude_link(
+            member,
+            &NewClaudeLink {
+                access_token: SecretString::from("access"),
+                refresh_token: SecretString::from("refresh"),
+                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
+                plan: Some("claude_max".to_owned()),
+                rate_limit_tier: None,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+}
+
 /// Makes the next `failures` writes of configuration tokens to the store
 /// at `url` fail: inserts, and updates that set the tokens.
 async fn fail_token_writes(url: &str, failures: i64) {
+    fail_token_statements(url, FAIL_TOKEN_WRITES, failures).await;
+}
+
+/// Makes the next `failures` deletions of configuration tokens from the
+/// store at `url` fail.
+async fn fail_token_deletes(url: &str, failures: i64) {
+    fail_token_statements(url, FAIL_TOKEN_DELETES, failures).await;
+}
+
+/// Makes the next `failures` statements `triggers` stops fail.
+async fn fail_token_statements(url: &str, triggers: &'static str, failures: i64) {
     use sqlx::Connection as _;
     let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
-    sqlx::raw_sql(FAIL_TOKEN_WRITES)
+    sqlx::raw_sql(TOKEN_WRITE_FAILURES)
         .execute(&mut db)
         .await
         .unwrap();
+    sqlx::raw_sql(triggers).execute(&mut db).await.unwrap();
     sqlx::query("UPDATE token_write_failures SET remaining = ?")
         .bind(failures)
         .execute(&mut db)
@@ -1487,6 +1544,7 @@ async fn a_renewed_pair_is_stored_although_the_first_writes_fail() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     mount_rotation(
         &h.slack,
@@ -1541,6 +1599,73 @@ async fn a_checked_pair_is_stored_although_the_first_write_fails() {
             "xoxe-1-NEW-SECRET-refresh".to_owned()
         ))
     );
+}
+
+/// Answers `tooling.tokens.rotate` with `answer` after deleting every
+/// Claude link in the store at `url`, as a `logout` elsewhere would while
+/// the rotation is out.
+struct UnlinkingFirst {
+    url: String,
+    answer: ResponseTemplate,
+}
+
+impl wiremock::Respond for UnlinkingFirst {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let url = self.url.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(sql(&url, "DELETE FROM claude_links;"));
+        })
+        .join()
+        .unwrap();
+        self.answer.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_checked_pair_whose_member_was_unlinked_meanwhile_is_not_kept() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    let exp = in_hours(12);
+    Mock::given(method("POST"))
+        .and(path("/api/tooling.tokens.rotate"))
+        .respond_with(UnlinkingFirst {
+            url: url.clone(),
+            answer: ok(json!({
+                "token": "xoxe.xoxp-1-NEW-SECRET-token",
+                "refresh_token": "xoxe-1-NEW-SECRET-refresh",
+                "team_id": TEAM,
+                "user_id": "U0HUMAN01",
+                "iat": exp - 43_200,
+                "exp": exp,
+            })),
+        })
+        .expect(1)
+        .mount(&h.slack)
+        .await;
+
+    let replies = h
+        .slash(
+            "U0HUMAN01",
+            &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        )
+        .await;
+    assert!(
+        replies[0].starts_with(
+            "Your Claude account was unlinked while I checked that token, so I didn't keep it, \
+             and checking it used up its refresh token."
+        ),
+        "{replies:?}"
+    );
+    assert!(
+        replies[0].contains("generate a new configuration token"),
+        "{replies:?}"
+    );
+    assert_eq!(h.stored(alice).await, None);
 }
 
 #[tokio::test]
@@ -2560,7 +2685,7 @@ async fn outside_commands_dms_and_clicks_never_run() {
     let running = Running::start(&h);
     let mut dm = dm_event("U0OUTSID1", "me");
     dm.outside = Some(core_types::Outside {
-        team: Some(TeamId::new(OUTSIDE_TEAM)),
+        team: TeamId::new(OUTSIDE_TEAM),
     });
     running
         .send(SlackInbound::Message(Box::new(dm), InFlight::untracked()))
@@ -2901,4 +3026,158 @@ async fn a_failed_manifest_update_is_retried_and_me_says_so() {
         3,
         "an app Slack says is gone isn't tried again"
     );
+}
+
+#[tokio::test]
+async fn a_departed_members_token_is_deleted_although_the_first_deletes_fail() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let grace = h.linked("U0HUMAN02").await;
+    h.with_token(grace).await;
+    fail_token_deletes(&url, 2).await;
+
+    let running = Running::start(&h);
+    running.send(departure()).await;
+    running.stop().await;
+    assert_eq!(failures_left(&url).await, 0);
+    assert_eq!(h.stored(grace).await, None);
+}
+
+#[tokio::test]
+async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let logs = global_logs().tag();
+    let grace = h.linked("U0HUMAN02").await;
+    h.with_token(grace).await;
+    fail_token_deletes(&url, 10).await;
+
+    let running = Running::start(&h);
+    running.send(departure()).await;
+    let (response_url, hook) = h.response_url();
+    running
+        .send(SlackInbound::Command(slash("me", response_url)))
+        .await;
+    running.stop().await;
+    assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
+    assert!(h.stored(grace).await.is_some());
+    let answered = h.requests().await;
+    assert_eq!(answered.iter().filter(|r| r.url.path() == hook).count(), 1);
+    let logs = logs.snapshot();
+    assert!(
+        logs.contains("couldn't delete the configuration token of a member who left"),
+        "{logs}"
+    );
+    let retries: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("a store operation failed; trying again"))
+        .collect();
+    assert_eq!(retries.len(), 3, "{logs}");
+    assert!(
+        retries.iter().all(|line| line.contains("U0HUMAN02")),
+        "{logs}"
+    );
+    global_logs().snapshot().assert_lacks("SECRET");
+}
+
+/// Creates `count` public agents of `owner`'s, with names long enough that
+/// `list` needs more Slack messages than one `response_url` takes, and
+/// returns their names.
+async fn public_agents(h: &SlackHarness, owner: MemberId, count: u32) -> Vec<String> {
+    let team = TeamId::new(TEAM);
+    let mut names = Vec::new();
+    for i in 0..count {
+        let name = format!("helper-{i:03}-with-a-longer-name");
+        h.store
+            .create_agent(
+                &store::NewAgent {
+                    owner,
+                    name: &name,
+                    persona: "p",
+                    visibility: store::Visibility::Public,
+                    surface: SurfaceKind::Slack,
+                    team: &team,
+                },
+                count,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+        names.push(name);
+    }
+    names
+}
+
+#[tokio::test]
+async fn a_slash_reply_too_long_for_its_response_url_goes_by_dm() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let names = public_agents(&h, alice, 300).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(
+        replies,
+        ["That reply is too long to show here, so I sent it to you in a DM."]
+    );
+    let posts = h.posts().await;
+    assert!(posts.len() > reply::RESPONSE_URL_USES, "{}", posts.len());
+    assert!(posts.iter().all(|(channel, _)| channel == "D0DM00001"));
+    let dm: String = posts.into_iter().map(|(_, text)| text).collect();
+    for name in names {
+        assert!(dm.contains(&name), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_long_slash_reply_whose_dm_fails_answers_with_its_start() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.open"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "user_not_found"})),
+        )
+        .with_priority(1)
+        .mount(&h.slack)
+        .await;
+    let alice = h.linked("U0HUMAN01").await;
+    public_agents(&h, alice, 300).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(replies.len(), reply::RESPONSE_URL_USES);
+    assert!(replies[0].starts_with("Agents:"), "{}", replies[0]);
+    assert!(replies[0].contains("helper-000-with-a-longer-name"));
+    assert_eq!(
+        replies[reply::RESPONSE_URL_USES - 1],
+        "That reply is too long to show here in full, and I couldn't send all of it to you in a \
+         DM."
+    );
+    assert!(h.posts().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_slash_reply_of_as_many_chunks_as_its_response_url_takes_goes_there() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    public_agents(&h, alice, 200).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(replies.len(), reply::RESPONSE_URL_USES);
+    assert!(replies[0].starts_with("Agents:"), "{}", replies[0]);
+    assert!(replies[4].contains("helper-199-with-a-longer-name"));
+    assert!(h.posts().await.is_empty());
+    assert!(h.calls("conversations.open").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_short_slash_reply_is_one_ephemeral_and_no_dm() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    slack_agent(&h, alice).await;
+
+    let replies = h.slash("U0HUMAN01", "list").await;
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(replies[0].starts_with("Agents:"), "{replies:?}");
+    assert!(h.posts().await.is_empty());
+    assert!(h.calls("conversations.open").await.is_empty());
 }

@@ -1948,7 +1948,7 @@ async fn the_workspace_is_the_installation_not_the_envelope_team() {
     assert_eq!(
         event.outside,
         Some(Outside {
-            team: Some(fixtures::OUTSIDE_TEAM.into())
+            team: fixtures::OUTSIDE_TEAM.into()
         })
     );
 

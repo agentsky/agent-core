@@ -535,7 +535,7 @@ mod tests {
         let session = SessionId::new_v4();
         let outsider = Requester {
             outside: Some(core_types::Outside {
-                team: Some(TeamId::new("T0THEIRS1")),
+                team: TeamId::new("T0THEIRS1"),
             }),
             ..requester("U1", None)
         };

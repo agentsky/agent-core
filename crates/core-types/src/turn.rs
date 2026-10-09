@@ -158,11 +158,13 @@ mod tests {
         let outside = Requester {
             member: None,
             key: key.clone(),
-            outside: Some(Outside { team: None }),
+            outside: Some(Outside {
+                team: "T0THEIRS1".into(),
+            }),
         };
         assert_eq!(
             json_round_trip(&outside)["outside"],
-            serde_json::json!({"team": null})
+            serde_json::json!({"team": "T0THEIRS1"})
         );
         let stored: Requester = serde_json::from_value(serde_json::json!({
             "member": null,

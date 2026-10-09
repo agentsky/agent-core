@@ -8,7 +8,11 @@
 //! rotating at once with `tooling.tokens.rotate`, which proves the refresh
 //! token works and gives a fresh pair, then stores that pair sealed. Only a
 //! linked member on Slack may register one, and only one that Slack says
-//! is their own in the workspace they sent it from.
+//! is their own in the workspace they sent it from. The link is checked
+//! again in the transaction that stores the pair
+//! ([`put_slack_config_token`](store::Store::put_slack_config_token)), so
+//! a `logout` that another instance or surface ran meanwhile never leaves
+//! a token behind.
 //!
 //! The rotator renews each token when it has less than [`RENEW_BEFORE`]
 //! left. When Slack refuses a refresh token, the token is marked broken
@@ -22,9 +26,10 @@
 //!
 //! Neither token ever reaches a log line, an error or a reply.
 
+use std::fmt;
 use std::time::Duration;
 
-use core_types::{MemberId, MemberKey, SurfaceError, SurfaceKind};
+use core_types::{MemberKey, SurfaceError, SurfaceKind};
 use secrecy::SecretString;
 use store::{NewSlackConfigToken, SlackConfigTokenRef, Store, StoreError};
 use surface_slack::{ConfigToken, SlackClient};
@@ -50,12 +55,11 @@ pub const ROTATION_LEASE: Duration = Duration::from_secs(5 * 60);
 /// the new pair is stored before another instance may claim the token.
 pub const ROTATE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-/// How many times a pair `tooling.tokens.rotate` returned is written to the
-/// store before it is given up.
+/// How many times `retry_store` tries store work before it gives up.
 pub const STORE_ATTEMPTS: u32 = 4;
 
-/// The wait before the second write of a rotated pair, doubled before each
-/// one after it.
+/// The wait before `retry_store`'s second try, doubled before each one
+/// after it.
 const STORE_RETRY_WAIT: Duration = Duration::from_millis(250);
 
 /// How long a claim keeps other instances from sending a notice, and so how
@@ -134,18 +138,32 @@ impl Commands {
             ));
         }
         let rotated = stored(rotated);
-        let kept = store_rotated(member, || {
+        let kept = retry_store("storing a checked configuration token", member, || {
             self.inner
                 .store
                 .put_slack_config_token(member, &key.team, &rotated, now())
         })
         .await;
-        if let Err(err) = kept {
-            tracing::warn!(%member, error = %err, "couldn't store a checked configuration token");
-            return Ok(format!(
-                "I couldn't save that configuration token, and checking it used up its refresh \
-                 token. Generate a new one at {TOKENS_PAGE} and send it again in a few minutes."
-            ));
+        match kept {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::info!(%member, "a checked configuration token's member was unlinked meanwhile; stored nothing");
+                return Ok(format!(
+                    "Your Claude account was unlinked while I checked that token, so I didn't \
+                     keep it, and checking it used up its refresh token. Link your account again \
+                     with {}, then generate a new configuration token at {TOKENS_PAGE} and send \
+                     it.",
+                    origin.command("login")
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(%member, error = %err, "couldn't store a checked configuration token");
+                return Ok(format!(
+                    "I couldn't save that configuration token, and checking it used up its \
+                     refresh token. Generate a new one at {TOKENS_PAGE} and send it again in a \
+                     few minutes."
+                ));
+            }
         }
         tracing::info!(%member, team = %key.team, "registered a Slack configuration token");
         Ok(format!(
@@ -189,24 +207,28 @@ impl Commands {
     }
 }
 
-/// Runs `write`, which stores a pair `tooling.tokens.rotate` returned for
-/// `member`, until it succeeds or has failed [`STORE_ATTEMPTS`] times,
-/// waiting a little longer after each failure. The rotation used up the
-/// old refresh token, so a pair that isn't stored is lost, and the token
-/// with it.
-async fn store_rotated<T, W>(
-    member: MemberId,
-    mut write: impl FnMut() -> W,
+/// Runs `op` until it succeeds or has failed [`STORE_ATTEMPTS`] times,
+/// waiting a little longer after each failure, for store work a passing
+/// error mustn't lose: a pair `tooling.tokens.rotate` returned, which
+/// used up the old refresh token, or the deletion of a departed member's
+/// token and cloud routines, whose Slack event isn't delivered again. Each
+/// failure but the last is logged with `what`, naming the work, and
+/// `member`, an id of whose it is; the last is returned for the caller to
+/// log.
+pub(crate) async fn retry_store<T, F>(
+    what: &'static str,
+    member: impl fmt::Display,
+    mut op: impl FnMut() -> F,
 ) -> Result<T, StoreError>
 where
-    W: Future<Output = Result<T, StoreError>>,
+    F: Future<Output = Result<T, StoreError>>,
 {
     let mut attempt = 1;
     let mut wait = STORE_RETRY_WAIT;
     loop {
-        match write().await {
+        match op().await {
             Err(err) if attempt < STORE_ATTEMPTS => {
-                tracing::warn!(%member, attempt, error = %err, "storing a rotated configuration token failed; trying again");
+                tracing::warn!(what, %member, attempt, error = %err, "a store operation failed; trying again");
                 tokio::time::sleep(wait).await;
                 attempt += 1;
                 wait *= 2;
@@ -340,7 +362,7 @@ impl ConfigTokenRotator {
         match rotation {
             Ok(rotated) => {
                 let rotated = stored(rotated);
-                let kept = store_rotated(row.member, || {
+                let kept = retry_store("storing a renewed configuration token", row.member, || {
                     self.store
                         .update_rotated_slack_config_token(row, &rotated, now())
                 })
