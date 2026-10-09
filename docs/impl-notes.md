@@ -3836,8 +3836,12 @@ placeholder revoked by `process_stopping` before the turn's `turn_finished`
 runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
-What remains: a background process left from turn N can still spend turn
-N+1's credential while N+1 runs, whoever its requester is. Only killing the
+T21 recycles the session's container when the requester changes, which
+ends every process a turn left running, so a leftover never spends another
+requester's credential
+([T21](#another-requesters-turn-gets-a-new-container)). What remains: a
+background process left from turn N can still spend the credential of a
+later turn of the same requester while that turn runs. Only killing the
 processes a turn leaves behind when it ends removes that; the plan's
 Deferred work has an entry.
 
@@ -4438,7 +4442,10 @@ thread; a requester's own run of turns keeps the warm process.
 turn, a community-key one included, replaces the container, and that the same
 requester and a hop carrying it keep it. A leftover can still use its own
 requester's later turns and the egress allowlist between turns, and files left
-in the session's `work/` or `home/` outlive the container.
+in the session's `work/` or `home/` outlive the container. Only one
+requester's turns now share a warm process, so the case the T20 note on
+`total_cost_usd` gives, of other members' turns on a shared warm process
+([T20](#total_cost_usd-is-the-processs-running-total)), no longer arises.
 
 ### How turns queue and survive their caller
 
