@@ -3025,6 +3025,199 @@ checks. 3,000 runs of the process tests under CPU stress passed, and
 declaring `ChildIo`'s `stdin` before `child` still fails the drop test
 every time.
 
+## T18: credential proxy
+
+### Placeholders are looked up by digest and handled by id
+
+**Issue.** The plan asks for a timing-safe placeholder check, and gives
+`point(placeholder, …)` and `revoke(placeholder)`, which would have T23's
+turn hooks keep the secret text around only to name the placeholder again.
+
+**Solution.** The registry is a map keyed by `PlaceholderId`, the SHA-256 of
+the placeholder's text. A presented token is hashed and looked up, so no
+stored token is ever compared byte by byte with a guess, and lookup time says
+nothing about how close the guess was. `point` and `revoke` take the
+`PlaceholderId`, which is `Copy` and not secret; `Placeholder` itself isn't
+`Clone`, redacts its text from `Debug`, and exposes it only through
+`ExposeSecret`, with `env_var()` naming `CLAUDE_CODE_OAUTH_TOKEN` or
+`ANTHROPIC_API_KEY` so the runner sets exactly one. `point` refuses a
+credential of the other kind, so a placeholder can never be pointed across
+kinds, whatever the caller does.
+
+### An address belongs to one session
+
+**Issue.** The plan binds a placeholder to its container's address and
+relies on revocation before stop and on death, because Docker can give a dead
+container's address to a new one. It doesn't say what the registry does if a
+revocation is missed and a new session's container arrives at an address
+that still has a live placeholder.
+
+**Solution.** `mint` revokes every placeholder of another session bound to
+the same address, and logs it (session and address only). The newest
+container at an address owns it, so a stale mapping never outlives the next
+mint there. Placeholders of the same session at that address are kept:
+they are the session's own, and T21 revokes them itself when it restarts the
+process. Tests that
+need two sessions use two loopback addresses: the second client binds
+`127.0.0.2`, which works on Linux, where all of `127.0.0.0/8` is loopback,
+but not on a default macOS setup.
+
+### What the proxy refuses, and how
+
+**Issue.** The plan lists what the proxy must reject but not the answers,
+and the answers reach the CLI, which reports `api_error_status` (T20 and T23
+classify on it).
+
+**Solution.** Every refusal is an Anthropic-style JSON error
+(`{"type":"error","error":{"type":…,"message":…}}`) whose message is fixed
+text, so nothing the client sent is echoed; a test checks the body and
+headers of each refusal against the token presented. In order of checking:
+
+| Case | Status |
+| --- | --- |
+| No `ConnectInfo` on the request (a wiring bug) | 500 |
+| Peer address with no live placeholder, `HEAD /api/hello` included | 403 |
+| Any method but `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` (`TRACE`, `TRACK`, `CONNECT` until T19, extension methods) | 405, with `Allow` |
+| Absolute-form target on HTTP/1 | 403 |
+| `HEAD /api/hello` from a known address | 200, answered locally |
+| No credential header, or `Authorization` that isn't `Bearer` | 401 |
+| Both `Authorization` and `x-api-key`, or either one repeated | 400 |
+| Unknown or revoked placeholder, or one bound to another address | 401 |
+| Placeholder in the header of the other kind | 401 |
+| Placeholder not pointed at a credential: before its first turn or between turns | 403 |
+| `NotLinked` or `RelinkRequired` from `TokenSource`, or no community key | 401 |
+| Any other credential error | 503 |
+| Upstream unreachable | 502 |
+
+A placeholder bound to another address gets exactly the answer of an unknown
+one, so the answer doesn't confirm that a stolen token exists; the log line
+tells them apart. An end-to-end test shows `fake-claude` reporting
+`api_error_status: 401` for a revoked placeholder.
+
+The method check is an allowlist, not a refusal of `CONNECT` alone: a
+`TRACE` forwarded with the swapped header would have an echoing upstream
+send the real credential back into the sandbox, and an extension method
+means nothing the CLI needs. It runs before any credential lookup.
+
+HTTP/2 requests always carry `:authority`, so the absolute-form check applies
+to HTTP/1 only; for HTTP/2 the authority is ignored like `Host`. Every
+upstream URL is built from the configured base and the request's path and
+query, and must keep the base's origin and path prefix after the URL parser
+resolves dot segments, or the request gets 400.
+
+### Credentials are read once, and revocation is checked again
+
+**Issue.** The plan requires a request in flight to keep the credential it
+started with, but a request waits on `TokenSource` (a refresh can take
+seconds), and the placeholder can be re-pointed or revoked meanwhile.
+
+**Solution.** The pointer is read once, under the registry's lock, when the
+request is authorized; re-pointing afterwards changes only later requests. A
+test holds the token lookup, re-points, and sees the first member's token
+upstream and the second member's on the next request. After the lookup the
+proxy checks that the placeholder is still live and bound to the peer, and
+refuses with 401 if it was revoked meanwhile, since revocation means the
+container is going away. A request already forwarded is not cut off by
+revocation; stopping the container ends it.
+
+`unpoint` clears the pointer at turn end (T21's `turn_finished`, on every
+exit), so between turns every request is refused with 403 "No turn is
+running for this placeholder." Like re-pointing, it changes only later
+requests: a request authorized before the turn ended keeps its credential,
+through its token lookup and its whole response. That is a choice. Checking
+the pointer again after the token lookup, as liveness is, would also refuse
+a request that arrived during the turn and was still waiting on a refresh
+when it ended; since `turn_finished` runs once the turn's result is in, such
+a request is the model's own last call or a leftover process's, and the
+window is one token lookup long.
+
+`unpoint` returns whether the placeholder was live, like `revoke`, rather
+than an error for a revoked one. A container that dies mid-turn has its
+placeholder revoked by `process_stopping` before the turn's `turn_finished`
+runs, so a revoked placeholder is a normal case at turn end, with nothing
+left to clear.
+
+What remains: a background process left from turn N can still spend turn
+N+1's credential while N+1 runs, whoever its requester is. Only killing the
+processes a turn leaves behind when it ends removes that; the plan's
+Deferred work has an entry.
+
+### Headers the proxy changes besides the credential
+
+**Issue.** The plan says every other header passes untouched, but some
+can't, and reqwest adds one.
+
+**Solution.**
+
+- Hop-by-hop headers (`Connection` and every header it names, `Keep-Alive`,
+  `Proxy-Connection`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`,
+  `Trailer`, `Transfer-Encoding`, `Upgrade`) are dropped both ways. The
+  credential header is set after that, so naming it in `Connection` doesn't
+  remove it.
+- `Host` is dropped and reqwest sends the upstream's. `Expect` is dropped,
+  since the proxy's own server already answered `100 Continue`.
+- A request that came with `Transfer-Encoding` loses any `Content-Length`,
+  so the upstream never sees conflicting framing. hyper's server already
+  drops it; the check keeps the proxy safe under any server.
+- reqwest adds `Accept: */*` when the client sent no `Accept`, from its
+  builder's default headers, which can't be removed. The CLI sends its own
+  `Accept`, so nothing changes for it.
+- The client follows no redirects (a 3xx goes back to the CLI as it came,
+  and `x-api-key` would otherwise follow it to any host), decompresses
+  nothing (`no_gzip` and friends, in case a feature elsewhere in the
+  workspace enables them), and honors the system proxy settings like `auth`'s
+  client does.
+- A placeholder in a header other than the credential header, or in the
+  body, is forwarded as it came, on purpose: that is the plan's "every other
+  header untouched", and `never_substitutes_in_body` tests it. Upstream sees
+  only a placeholder, which is useless anywhere but from the bound sandbox
+  IP through this proxy.
+
+### Streaming needs reqwest's `stream` feature
+
+**Issue.** reqwest's `Body::wrap` takes any `http_body::Body`, but only one
+that is `Sync`, which axum's request body isn't.
+
+**Solution.** `cred-proxy` enables reqwest's `stream` feature and sends the
+request body with `Body::wrap_stream(body.into_data_stream())`, frame by
+frame. The feature adds no crate to the lockfile (`futures-util` and
+`tokio-util` were already there). A request whose body is already at its end
+is sent without one, so a `GET` doesn't become a chunked request. The
+response goes back through reqwest's `http::Response<reqwest::Body>`
+conversion, frame by frame too. Tests hold the upstream's SSE stream after
+its first event and read that event through the proxy, and hold the client's
+request body after its first chunk until the upstream has read it.
+
+### The observer also gets the credential
+
+**Issue.** The plan's `ProxyObserver` gets `(session, status, usage
+headers)`. The session's pointer changes from turn to turn, so T27's meter
+couldn't tell from the session alone whose request it was.
+
+**Solution.** `observe` takes an `Observation` with the session, the
+`CredentialRef` the request used, the status and the usage headers (every
+`anthropic-ratelimit-*` header and `retry-after`), and is marked
+`#[non_exhaustive]` so fields can be added. It is called once per forwarded
+request when the upstream's response head arrives, before the body streams;
+refusals and unreachable upstreams aren't observed.
+
+### The proxy forwards any path
+
+**Issue.** A placeholder lets the sandbox use its requester's token, or the
+community key, on any path of the upstream, not only the Messages API. With
+the community key that includes the Files and Batches APIs, which all
+members' turns on that key share.
+
+**Solution.** Not restricted in T18: which paths the real CLI needs isn't
+known without a live capture, and refusing one it needs would break turns.
+The plan's Deferred work has an entry for a path allowlist. Methods are
+limited already (see the refusal table).
+
+Since the sandbox chooses the path, it is never logged: a path could carry
+whatever the sandbox wants written into agentd's logs. "forwarded a
+request" names the session, method and status only, and the log test sends
+a secret-bearing path and query and finds neither in the log.
+
 ## T22: router
 
 ### The plan and the design name no order for the checks
