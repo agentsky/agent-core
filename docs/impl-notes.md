@@ -2912,6 +2912,26 @@ outbox) in the same transaction it inserts the new one. A session runs one
 process at a time, so the newest process's token is the only one that
 works.
 
+### One token per container address too
+
+**Issue.** A token is accepted from its `container_ip`, and Docker gives a
+stopped container's address to the next one it starts. If revoking a
+token fails when its container stops (the store errors), the token
+survives, and the next container given that address can present it. For
+another session of the same agent and scope, that container mounts the
+same volume, where the old process may have left its `AGENTCTL_TOKEN`.
+
+**Solution.** `put_ctl_token` deletes every token bound to the new token's
+address, not only the session's, with their sessions' leases, in the same
+transaction it inserts the new one, and `issue_process_token` drops their
+outboxes. A container address holds one container at a time, so the
+newest process's token is the only one valid from it, and a stale token is
+dead before the new container's process can run anything. Tests that run
+two sessions at once give each its own address; agentctl's integration
+tests, whose connections all come from 127.0.0.1, serve the second session
+on a listener that presents its connections as coming from another
+address.
+
 ### Targets needed a grammar
 
 **Issue.** `PostRequest::to` and `ReactRequest::message` are "strings as
@@ -3036,16 +3056,72 @@ kill. agentctl then releases the lease and exits with 128 plus the signal.
 A signal while an acquire is in flight used to drop the request, and a
 lease agentd granted for it held the lock with nobody renewing it, for up
 to 30 seconds. agentctl now lets a request already sent finish, for up to
-two seconds, releases the lease if it was granted, and exits with 128 plus
-the signal without running the command. A signal between attempts exits at
-once. agentctl waits at most 100 seconds for the lock
-by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
-a command by default, so the model sees why it failed rather than a killed
-command.
+two seconds but not past the time the attempt was given, gives back the
+lease (by its id, below, whether or not an answer said it was granted),
+and exits with 128 plus the signal without running the command. A signal
+between attempts gives back the lease and exits at once. A grant agentd
+makes after that release leaves a lease that expires within its TTL.
+agentctl waits at most 100 seconds for the lock by default (`--timeout`),
+below the 2 minutes Claude Code's Bash tool gives a command by default, so
+the model sees why it failed rather than a killed command.
 
 Review found that `--timeout 18446744073709551615` panicked on `Instant +
 Duration` overflow. The wait is now clamped to a day, which no turn
 outlasts, so any `u64` the model types gives a sane wait.
+
+Review also found that `--timeout` was only checked between attempts: an
+acquire sent to a stalled agentd waited out the 30-second request timeout,
+so `--timeout 1` took 30 seconds and the default could run past the Bash
+tool's 2 minutes. Each acquire is now given the time left, at least seven
+seconds and at most thirty. The floor lets `--timeout 0` take a free lock,
+and outlasts agentd's five-second SQLite busy timeout, so the common slow
+answer isn't abandoned. The default 100 seconds plus the floor stays under
+2 minutes.
+
+### The acquire is idempotent
+
+**Issue.** No floor guarantees agentd answers in time: an acquire takes a
+pool connection twice, to authorize and then to acquire, each waited for
+up to 30 seconds, on top of the busy timeout. An acquire agentctl stopped
+waiting for could still be granted, leaving a lease nobody held that
+blocked every session on the volume, the same session's next attempt
+included, until its TTL ran out. The retry then spun on `busy` and blamed
+"another command" for agentctl's own orphan.
+
+**Solution.** agentctl picks a `LeaseId` for each `lock` and sends it with
+every acquire attempt. agentd takes the lock when the current lease has
+expired, or when the volume's row already holds that lease for the same
+session, which it extends and returns again. So a retry picks up an
+earlier attempt's late grant. The id only ever matches the caller's own
+session's row on its own volume: another session naming a live lease gets
+`busy`, and an id that names another volume's lease grants and changes
+nothing, even over the caller's expired row. Renew and release name the same id, so a signal can
+release the lease even when no answer arrived.
+
+That picks up a late grant only while agentctl is still acquiring. One
+that lands after agentctl released the lease is still orphaned: say an
+attempt is held up in agentd for over 30 seconds, a later attempt is
+granted, the command runs and the lease is released, and then the first
+attempt lands. The same goes for a grant landing after a stop signal's
+release, or after agentctl gave back a lease too short or too long to
+hold. Nobody renews such a lease, so it holds the lock for at most its
+TTL, 30 seconds by default. This was already so before the id; it is
+just not solved by it.
+
+An acquire that failed with agentd's internal error (a busy database,
+say), or whose answer was lost (it timed out, was cut off, or couldn't be
+read), is retried until `--timeout` runs out, as renewals are. One that
+can't connect to agentd (a name that doesn't resolve, a refused
+connection, or the five-second connect timeout) never reached it, so
+`lock` fails at once with the same "can't connect" error as every other
+subcommand: a wrong URL or an agentd that is down is reported straight
+away. A renewal that can't connect is still retried until the deadline,
+since the command already runs under the lease and a brief outage
+shouldn't kill it. Any other refusal also fails at once. When `lock`
+gives up after the timeout, it names the last attempt's reason: busy,
+agentd's internal error, or the lost answer. Only after a lost answer
+does it add that a lease agentd granted anyway expires within its TTL,
+since no later attempt is left to pick it up.
 
 ### The command runs in its own process group
 
@@ -4372,7 +4448,10 @@ failure is logged and given up on. Retrying only when it was called again
 missed manager-initiated stops: the process is taken from the session
 before the call, and a death event for a container already marked dead is
 ignored, so a failed revocation used to leave the agentctl token valid for
-the next container on the address.
+the next container on the address. A failed revocation also takes the
+container with it, even when the process was seen to exit, since leftover
+processes in the container could otherwise keep using the live token
+between turns.
 
 A panic in `process_starting` is taken for its failure, and one in
 `process_stopping` is logged and the stop goes ahead: otherwise a panic in
@@ -5187,6 +5266,54 @@ and `fake-claude` counts each process from 0, as T04 wrote it.
 
 **Solution.** Left as it is: the runner's tests rely on it, and changing
 both belongs with T27's correction, which the plan's T27 now names.
+
+### A lost outbox or attribution is a lost part
+
+**Issue.** Delivery told the thread only about parts it couldn't post.
+When `turn_finished` failed, as when `Ctl::end_turn` couldn't clear the
+token's turn in the store, the outbox was never taken and went with the
+process, so the turn's attachments, reactions and queued
+posts were lost without a word. When the platform accepted a chunk but its
+`message_refs` row couldn't be recorded, the post went unattributed: a
+mention of another agent in it is ignored as an unattributed managed bot's
+(the view's two-second wait can't find a row never written), a person's
+reply to it reaches no agent, and the next turn shows it again as history.
+
+**Solution.** Both count as a lost part, so the thread gets the one line
+saying part of the reply couldn't be delivered. Delivery can't tell
+whether a lost outbox held anything, so it says so whenever
+`turn_finished` failed. The line is the only signal: the post can't be
+attributed after the fact, since the store already failed once. A hook
+that panics fails the whole turn instead, which posts `FAILED_TEXT`, and a
+reaction Slack or Rocket.Chat refuses is only logged: a mistyped emoji
+loses nothing the thread needs to hear about.
+
+### A thread's messages are looked up one at a time
+
+**Issue.** The sink looked a message's candidates up, several store round
+trips, before queueing it in its lanes. A Rocket.Chat connection hands its
+messages over one at a time, but every connection in a room (the manager's
+and each bot's) may deliver a message, whichever records it in `Dedup`
+first, and the sinks of different connections run at once. Two messages
+of one thread delivered by different connections could reach the lane in
+the order their lookups ended rather than the order they were sent: the
+later one's turn then showed the earlier as history, and the earlier's
+turn ran anyway, answering it twice.
+
+**Solution.** `dispatch` takes a lock per thread (the lanes' thread, so a
+DM's or a thread-less channel's conversation) before the lookup and holds
+it until the message is queued for every candidate. Tokio's mutex grants
+in the order asked, so a thread's messages reach its lanes in the order
+their dispatches started; the busy lines are posted after the lock is
+released, so sending still waits only for the lookups of the thread's
+earlier messages, never for a turn. An entry lives only while a dispatch
+holds or waits for it, and a sender cancelled while waiting leaves none,
+as `auth`'s `KeyedLocks` does. That type is crate-private to `auth`, and
+a key-to-lock map isn't authentication, so agentd has its own copy next
+to the pipeline rather than importing it. The lock can't restore an order
+lost before `dispatch` starts: two connections that record two messages
+in `Dedup`, or reach the sink, in the opposite order of the messages are
+dispatched in that order.
 
 ## T24: Session commands
 
@@ -6318,13 +6445,25 @@ the calls in the last minute, and a call waits while the quota is used up.
 It is in memory and per process, which is enough to stay under Slack's
 limits; Slack's 429 remains the authority.
 
-A 429, or `ok: false` with `ratelimited`, blocks that bucket until
-`Retry-After` has passed, so concurrent callers wait too. A call is retried
+A 429, or `ok: false` with `ratelimited`, blocks the method for that token
+until `Retry-After` has passed, so concurrent callers wait too. Slack limits
+`chat.postMessage` both per channel and per token, and a 429 doesn't say
+which limit it hit, so a 429 on a post to one channel holds posts to every
+channel; each channel's quota stays its own. A call is retried
 up to three times while the wait is at most `max_retry_wait` (60 s by
 default); a longer wait fails at once with `SurfaceError::RateLimited`, and
-so does any later call in that bucket while it stays blocked, instead of
+so does any later call to that method while it stays blocked, instead of
 sleeping silently. `Retry-After` is read as whole seconds and capped at a
 day so it can't overflow a deadline.
+
+Holding the method for the whole token has costs. The client-side
+`chat.postMessage` quota lets all 60 of a minute's posts to one channel go
+at once, where Slack allows about one a second, so a short burst to one
+busy channel can draw a per-channel 429, which holds posts to every
+channel for the `Retry-After`. And when a hold ends, every caller waiting
+on it wakes at once and can draw another 429. Both are accepted: Slack
+asks callers to back off per method per token, and its `Retry-After` is
+usually short.
 
 ### Error codes Slack answers with HTTP 200
 
@@ -6527,7 +6666,7 @@ register a new token. The encrypted columns' associated data is the row's
 Once Slack has rotated, the old refresh token is used up and the new pair
 exists only in memory, so a store write that fails once would lose the
 token. Both writers, `/agent slack-token` and the rotator, go through
-`store_rotated`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
+`retry_store`, which tries the write 4 times (`STORE_ATTEMPTS`), waiting
 250 ms, then 500 ms, then 1 s. If the last try fails, the command tells the
 member that the refresh token is used up and to generate a new one.
 
@@ -6541,6 +6680,33 @@ that works, so `update_rotated_slack_config_token` also clears `broken_at`,
 `notified_at` and `notice_attempts`, and the token is renewed again. A
 rotation whose row was replaced or deleted meanwhile (`/agent logout`, a
 `user_change`) stores nothing and drops its pair.
+
+### A departure lost to a passing store error
+
+**Issue.** A `user_change` saying a member was deleted reaches `Inbound`
+after the ingress acked it and recorded it as processed, so Slack never
+sends it again. A store error in looking the member up or deleting their
+token was only logged, and the rotator kept renewing the departed member's
+token. Returning the error from the sink isn't an option: `Queue::run`
+takes any `Err` to mean the receiver is gone and stops.
+
+**Solution.** The rotated pair's retry, `store_rotated`, became
+`slack_tokens::retry_store(what, member, op)`, and `Inbound` runs the whole
+departure (lookup and delete) through it as one closure, so a passing error
+costs a retry, not the token. Every `StoreError` is retried, since even a
+sealing failure can pass (`SealError::Rng`) and the rotator can't afford to
+lose a pair. `retry_store` logs each failure but the last as a retry, with
+the member's id, and returns the last to its caller: `Inbound` logs that
+one, as before, by member key and error. It stays in `slack_tokens`, since
+agentd has no shared store or retry module.
+
+The retries run inline in the sink, so a failing departure holds the shared
+Slack event queue for 1.75 s of waits plus each attempt's own store time,
+which can include SQLite's busy timeout. Once agent apps land, that queue
+also carries agents' messages, which wait too. That is accepted: a store
+failing on writes stalls agent traffic anyway, the hold is bounded at four
+attempts, and handing the departure to a task instead would lose its order
+against later events for the same member.
 
 ### Which failures a member hears about
 
@@ -6586,7 +6752,16 @@ T31 routes agents' messages.
   (`login <code>`), as on Rocket.Chat.
 - A slash command's reply is the rendered Markdown, each chunk sent to its
   `response_url` with T29's `respond_ephemeral`. Slack accepts five
-  responses per URL; command replies are one chunk.
+  responses per URL (`RESPONSE_URL_USES`), and a long reply (`list` in a
+  workspace with a few hundred agents) takes more chunks, so the sixth
+  failed and the rest were dropped. `Replies::respond` counts the rendered
+  chunks; a reply of more than five goes whole to the member's DM with the
+  manager app, and the `response_url` gets one line saying so. If that DM
+  fails, even partway, the `response_url` gets the first four chunks and a
+  note that not all of it reached the DM. Unlike an ephemeral reply, the DM
+  persists under the workspace's retention and exports; today's long
+  replies carry no secrets, but a long reply that ever does would need
+  another path.
 - Notices (relink, broken token) open the manager's DM with
   `conversations.open` (new in `WebApi::open_dm`, Tier 3, needs `im:write`),
   so relink notices now reach Slack-only members too.
