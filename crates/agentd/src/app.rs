@@ -128,7 +128,8 @@ impl App {
             replies,
             agents,
             slack.clone(),
-        );
+        )
+        .with_admins(config.community.admins.iter().cloned());
         Ok(Self {
             config: Arc::new(config),
             store,

@@ -202,6 +202,17 @@ working_emoji = "hourglass_flowing_sand"
 # refuses more. Default 10.
 max_per_owner = 10
 
+[community]
+# The community admins, each named by one of their identities as
+# <surface>:<team>:<user>: slack:<team id>:<user id>, or
+# rocketchat:<[rocketchat] team>:<user _id>. Only they may run
+# `/agent admin ...`, such as `admin api-key set <key>`, which sets the
+# community API key that members without a linked Claude account run on.
+# The key itself is not configuration: agentd stores it encrypted with
+# AGENTD_MASTER_KEY. An identity is matched exactly, so list an admin once
+# for each surface they use. Default: nobody.
+admins = []
+
 [claude_oauth]
 # Claude Code's OAuth parameters, used to link members' Claude accounts. They
 # are Claude Code's, not a published API, so they are configuration. Every

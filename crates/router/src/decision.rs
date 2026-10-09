@@ -23,6 +23,15 @@ pub enum Decision {
         /// Who should link an account.
         requester: Requester,
     },
+    /// Tell the requester, privately, that their linked Claude account
+    /// stopped working and to link it again. Nothing runs: a member whose
+    /// link broke is never moved to the community key.
+    ///
+    /// `requester` is who to tell, as for [`Decision::LinkPrompt`].
+    RelinkPrompt {
+        /// Whose link broke.
+        requester: Requester,
+    },
     /// Run a turn.
     Run {
         /// Who caused the turn, and so who pays for it.

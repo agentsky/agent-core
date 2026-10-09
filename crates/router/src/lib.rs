@@ -51,7 +51,9 @@
 //!     [`Decision::LinkPrompt`] if they have none; the community key is
 //!     never used for the owner. Anyone else runs on their own credential
 //!     if linked, else on the community key if one is configured, else gets
-//!     [`Decision::LinkPrompt`].
+//!     [`Decision::LinkPrompt`]. A requester whose link is broken, the
+//!     owner included, gets [`Decision::RelinkPrompt`], never the community
+//!     key.
 //!
 //! Every ignore comes before every refusal, so an unaddressed or
 //! unattributed message never produces a visible reply, however the agent
@@ -79,14 +81,14 @@ mod model;
 mod view;
 
 use core_types::{
-    AgentId, CredentialRef, Hop, InboundEvent, MemberId, MemberKey, Requester, ScopeKey, ScopeKind,
-    Side,
+    AgentId, CredentialRef, Hop, InboundEvent, MemberKey, Requester, ScopeKey, ScopeKind, Side,
 };
 
 pub use decision::{Decision, IgnoreReason, RefuseReason};
 pub use model::ModelPolicy;
 pub use view::{
-    AgentPolicy, AgentState, Attribution, DEFAULT_MAX_HOPS, ManagedBot, PolicyTarget, RouterView,
+    AgentPolicy, AgentState, Attribution, DEFAULT_MAX_HOPS, LinkState, ManagedBot, PolicyTarget,
+    RouterView,
 };
 
 /// Decides whether `agent` answers `event`, and how. See the
@@ -167,8 +169,10 @@ pub fn route(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Dec
         });
     };
 
-    let Some(credential) = credential(view, &requester, is_owner.then_some(owner)) else {
-        return Decision::LinkPrompt { requester };
+    let credential = match credential(view, &requester, is_owner) {
+        Ok(credential) => credential,
+        Err(Prompt::Link) => return Decision::LinkPrompt { requester },
+        Err(Prompt::Relink) => return Decision::RelinkPrompt { requester },
     };
     let (scope, side) = if is_owner && sender == Sender::Person && event.is_dm() {
         (ScopeKind::Private, Side::Owner)
@@ -241,22 +245,29 @@ fn mentions(event: &InboundEvent, agent: AgentId, view: &dyn RouterView) -> Ment
     found
 }
 
-/// The credential a turn runs on, or `None` for a link prompt. `owner` is
-/// set when the requester is the agent's owner.
+/// Which prompt a requester without a credential to run on gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prompt {
+    Link,
+    Relink,
+}
+
+/// The credential a turn runs on, or the prompt its requester gets. The
+/// community key is for requesters with no link, never for the owner or
+/// for a member whose link broke.
 fn credential(
     view: &dyn RouterView,
     requester: &Requester,
-    owner: Option<MemberId>,
-) -> Option<CredentialRef> {
-    if let Some(owner) = owner {
-        return view
-            .is_linked(owner)
-            .then_some(CredentialRef::Member(owner));
-    }
-    match requester.member {
-        Some(member) if view.is_linked(member) => Some(CredentialRef::Member(member)),
-        _ if view.community_key_configured() => Some(CredentialRef::Community),
-        _ => None,
+    is_owner: bool,
+) -> Result<CredentialRef, Prompt> {
+    let link = requester
+        .member
+        .map(|member| (member, view.link_state(member)));
+    match link {
+        Some((member, LinkState::Linked)) => Ok(CredentialRef::Member(member)),
+        Some((_, LinkState::Broken)) => Err(Prompt::Relink),
+        _ if !is_owner && view.community_key_configured() => Ok(CredentialRef::Community),
+        _ => Err(Prompt::Link),
     }
 }
 
