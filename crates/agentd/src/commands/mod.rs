@@ -864,6 +864,10 @@ impl Commands {
         {
             reply.push('\n');
             reply.push_str(&self.slack_token_status(key, origin).await?);
+            if let Some(outdated) = self.outdated_apps_status(key, origin).await? {
+                reply.push('\n');
+                reply.push_str(&outdated);
+            }
             let manager = slack.identity();
             let name = manager.app_name.as_deref().unwrap_or("(no name)");
             reply.push_str(&format!(

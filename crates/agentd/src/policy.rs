@@ -20,15 +20,28 @@
 //! - `allow everyone` empties the allow list and takes `everyone` off the
 //!   deny list, so everyone not denied by name may use the agent again.
 
-use core_types::{ConvRef, Hop, MemberId, MemberKey};
+use std::collections::{HashMap, HashSet};
+
+use core_types::{
+    BindingId, ConvRef, ConversationId, Hop, MemberId, MemberKey, SurfaceKind, TeamId,
+};
 use router::{AgentPolicy, PolicyTarget, ThreadBudget};
 use serde::{Deserialize, Serialize};
-use store::{AgentSettings, ThreadSpend};
+use store::{AgentSettings, KnownChannelIdChange, ThreadSpend};
 
 use crate::config::LimitsConfig;
 
-/// The most rules an agent's allow or deny list holds.
+/// The most rules the owner may put in an agent's allow or deny list, but
+/// for `deny everyone`, which is always taken. The denies agentd copies from
+/// channels' old ids count, and may take a deny list past it.
 pub const MAX_RULES: usize = 100;
+
+/// The most rules an agent's deny list holds with the denies copied from
+/// channels' old ids ([`Rules::copy_denies`]): a copy past it denies
+/// everyone instead. A real channel id change copies a deny for each of the
+/// few ids its chain runs through at most, so only a flood of forged
+/// changes, which only the agent's owner can send, takes a list there.
+pub const MAX_DENIES: usize = 2 * MAX_RULES;
 
 /// The community's caps, from `[limits]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +214,62 @@ impl Rules {
         add(&mut self.deny, rule)
     }
 
+    /// Moves the rules on the conversation `from` to `to`, as when Slack
+    /// gave a channel a new id, and says whether any moved. Where a list
+    /// already has a rule on `to`, the moved one is dropped as a duplicate,
+    /// so a deny on either id is a deny on `to`, which wins over an allow
+    /// of it as any deny does.
+    pub fn move_room(&mut self, from: &ConvRef, to: &ConvRef) -> bool {
+        if from == to {
+            return false;
+        }
+        let allow = move_room(&mut self.allow, from, to);
+        let deny = move_room(&mut self.deny, from, to);
+        allow || deny
+    }
+
+    /// For each `(from, to)` in `pairs`, puts a deny on `to` beside each
+    /// deny on `from`, keeping its label, unless the deny list names `to`
+    /// already, so a deny on a channel's old id applies under its new ones
+    /// too. Says whether the list changed. Copies never let anyone in, so
+    /// they may take the list past [`MAX_RULES`]; one that would take it
+    /// past [`MAX_DENIES`] denies everyone instead of all of them, which
+    /// refuses at least as much and keeps the list short. A list that
+    /// denies everyone takes no copies.
+    pub fn copy_denies<'a>(
+        &mut self,
+        pairs: impl IntoIterator<Item = (&'a ConvRef, &'a ConvRef)>,
+    ) -> bool {
+        if self.denies_everyone() {
+            return false;
+        }
+        let before = self.deny.len();
+        for (from, to) in pairs {
+            let copies: Vec<Rule> = self
+                .deny
+                .iter()
+                .filter_map(|rule| match rule {
+                    Rule::Room { conv, label } if conv == from => Some(Rule::Room {
+                        conv: to.clone(),
+                        label: label.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            for copy in copies {
+                if !self.deny.iter().any(|known| known.same_target(&copy)) {
+                    self.deny.push(copy);
+                }
+            }
+            if self.deny.len() > MAX_DENIES {
+                self.deny.truncate(before);
+                self.deny.push(Rule::Everyone);
+                return true;
+            }
+        }
+        self.deny.len() > before
+    }
+
     /// Whether `everyone` is denied, which leaves the agent to its owner
     /// whatever the allow list says.
     pub fn denies_everyone(&self) -> bool {
@@ -247,12 +316,37 @@ fn changed(changed: bool) -> Change {
     }
 }
 
+/// Moves the rules on `from` in `rules` to `to`, keeping the first rule on
+/// each target, and says whether any moved.
+fn move_room(rules: &mut Vec<Rule>, from: &ConvRef, to: &ConvRef) -> bool {
+    let mut moved = false;
+    for rule in rules.iter_mut() {
+        if let Rule::Room { conv, .. } = rule
+            && conv == from
+        {
+            *conv = to.clone();
+            moved = true;
+        }
+    }
+    if moved {
+        let mut kept: Vec<Rule> = Vec::with_capacity(rules.len());
+        for rule in rules.drain(..) {
+            if !kept.iter().any(|known| known.same_target(&rule)) {
+                kept.push(rule);
+            }
+        }
+        *rules = kept;
+    }
+    moved
+}
+
 /// Adds `rule` to `rules` unless it names a target already there or the
-/// list is full.
+/// list holds [`MAX_RULES`]; `everyone`, which only ever narrows who may use
+/// an agent, is taken all the same.
 fn add(rules: &mut Vec<Rule>, rule: Rule) -> Change {
     if rules.iter().any(|known| known.same_target(&rule)) {
         Change::Unchanged
-    } else if rules.len() >= MAX_RULES {
+    } else if rule != Rule::Everyone && rules.len() >= MAX_RULES {
         Change::Full
     } else {
         rules.push(rule);
@@ -260,8 +354,112 @@ fn add(rules: &mut Vec<Rule>, rule: Rule) -> Change {
     }
 }
 
+/// The ids a channel that was `start` had since, as `binding`'s recorded
+/// channel id changes in `changes` say, waiting or settled: those it was
+/// changed to, and those a settled change found it at, then those they
+/// were changed to, and so on, each once.
+pub fn later_ids(
+    changes: &[KnownChannelIdChange],
+    binding: BindingId,
+    start: &ConversationId,
+) -> Vec<ConversationId> {
+    reached(changes, binding, start, |known| {
+        std::iter::once(&known.change.new).chain(&known.settled_to)
+    })
+}
+
+/// The id to ask Slack about for a channel that was `start`: the last a
+/// chain of `binding`'s recorded changes in `changes` reaches, taking a
+/// settled change to where Slack found the channel rather than to its new
+/// id, since that answer is later than the event; `start` if none leads
+/// on from it.
+pub fn latest_id(
+    changes: &[KnownChannelIdChange],
+    binding: BindingId,
+    start: &ConversationId,
+) -> ConversationId {
+    reached(changes, binding, start, |known| {
+        std::iter::once(known.settled_to.as_ref().unwrap_or(&known.change.new))
+    })
+    .pop()
+    .unwrap_or_else(|| start.clone())
+}
+
+/// The ids reached from `start`, breadth first and each once, through
+/// `binding`'s changes in `changes`, each leading from its old id to the
+/// ids `onward_of` gives.
+fn reached<'a, I: IntoIterator<Item = &'a ConversationId>>(
+    changes: &'a [KnownChannelIdChange],
+    binding: BindingId,
+    start: &'a ConversationId,
+    onward_of: impl Fn(&'a KnownChannelIdChange) -> I,
+) -> Vec<ConversationId> {
+    let mut onward: HashMap<&ConversationId, Vec<&ConversationId>> = HashMap::new();
+    for known in changes
+        .iter()
+        .filter(|known| known.change.binding == binding)
+    {
+        onward
+            .entry(&known.change.old)
+            .or_default()
+            .extend(onward_of(known));
+    }
+    let mut seen = HashSet::from([start]);
+    let mut order = vec![start];
+    let mut next = 0;
+    while let Some(id) = order.get(next).copied() {
+        next += 1;
+        for &new in onward.get(id).into_iter().flatten() {
+            if seen.insert(new) {
+                order.push(new);
+            }
+        }
+    }
+    order.into_iter().skip(1).cloned().collect()
+}
+
+/// The old ids of `binding`'s waiting changes in `changes` whose chain
+/// reaches `id` ([`later_ids`]): those whose denies apply to `id` while
+/// they wait ([`pending_denials`]).
+pub fn waiting_before<'a>(
+    changes: &'a [KnownChannelIdChange],
+    binding: BindingId,
+    id: &'a ConversationId,
+) -> impl Iterator<Item = &'a ConversationId> {
+    changes
+        .iter()
+        .filter(move |known| {
+            known.waiting
+                && known.change.binding == binding
+                && later_ids(changes, binding, &known.change.old).contains(id)
+        })
+        .map(|known| &known.change.old)
+}
+
+/// The conversations whose denies apply to others too while `changes`, an
+/// agent's recorded channel id changes, wait: for each waiting change,
+/// its old id and each id the channel had since ([`later_ids`]).
+pub fn pending_denials(changes: &[KnownChannelIdChange]) -> Vec<(ConvRef, ConvRef)> {
+    let room = |team: &TeamId, conversation: &ConversationId| ConvRef {
+        surface: SurfaceKind::Slack,
+        team: team.clone(),
+        conversation: conversation.clone(),
+    };
+    changes
+        .iter()
+        .filter(|known| known.waiting)
+        .flat_map(|known| {
+            let change = &known.change;
+            later_ids(changes, change.binding, &change.old)
+                .into_iter()
+                .map(|to| (room(&known.team, &change.old), room(&known.team, &to)))
+        })
+        .collect()
+}
+
 /// The router's policy for an agent with `settings`, under `limits`, that
-/// took `turns_today` turns today.
+/// took `turns_today` turns today, each deny on the first conversation of
+/// a pair in `pending` applying to the second too ([`pending_denials`]).
 ///
 /// # Errors
 ///
@@ -270,8 +468,10 @@ pub fn agent_policy(
     settings: &AgentSettings,
     limits: &Limits,
     turns_today: u32,
+    pending: &[(ConvRef, ConvRef)],
 ) -> Result<AgentPolicy, serde_json::Error> {
-    let rules = Rules::read(settings)?;
+    let mut rules = Rules::read(settings)?;
+    rules.copy_denies(pending.iter().map(|(from, to)| (from, to)));
     Ok(AgentPolicy {
         allow: rules.allow.iter().map(Rule::target).collect(),
         deny: rules.deny.iter().map(Rule::target).collect(),
@@ -321,7 +521,7 @@ mod tests {
     fn permits(rules: &Rules, user: &str, room: &str) -> bool {
         let mut settings = AgentSettings::default();
         rules.write(&mut settings);
-        let policy = agent_policy(&settings, &Limits::default(), 0).unwrap();
+        let policy = agent_policy(&settings, &Limits::default(), 0, &[]).unwrap();
         policy.permits(
             &Requester {
                 member: None,
@@ -487,7 +687,7 @@ mod tests {
             ..AgentSettings::default()
         };
         assert!(Rules::read(&bad).is_err());
-        assert!(agent_policy(&bad, &Limits::default(), 0).is_err());
+        assert!(agent_policy(&bad, &Limits::default(), 0, &[]).is_err());
     }
 
     #[test]
@@ -504,7 +704,7 @@ mod tests {
             max_hops: Some(0),
             ..AgentSettings::default()
         };
-        let policy = agent_policy(&settings, &limits, 5).unwrap();
+        let policy = agent_policy(&settings, &limits, 5, &[]).unwrap();
         assert_eq!(
             (policy.max_hops, policy.turns_per_day, policy.turns_today),
             (Hop(0), Some(7), 5)
@@ -536,5 +736,280 @@ mod tests {
                 max_tokens_per_day: Some(crate::config::DEFAULT_THREAD_TOKENS_PER_DAY),
             }
         );
+    }
+
+    #[test]
+    fn colliding_rules_merge_with_deny_winning() {
+        let (old, new) = (conv("G0PRIVAT1"), conv("C0PRIVAT1"));
+        let mut rules = Rules {
+            allow: vec![room("C0PRIVAT1"), member("bob"), room("C0OTHER01")],
+            deny: vec![room("G0PRIVAT1"), member("carol")],
+        };
+        assert!(
+            permits(&rules, "dave", "C0PRIVAT1"),
+            "allowed on the new id"
+        );
+        assert!(rules.move_room(&old, &new));
+        assert_eq!(
+            rules.deny,
+            [
+                Rule::Room {
+                    conv: new.clone(),
+                    label: "#G0PRIVAT1".to_owned()
+                },
+                member("carol")
+            ]
+        );
+        assert_eq!(
+            rules.allow,
+            [room("C0PRIVAT1"), member("bob"), room("C0OTHER01")]
+        );
+        assert!(
+            !permits(&rules, "dave", "C0PRIVAT1"),
+            "the old id's deny is a deny on the new one, over its allow"
+        );
+        assert!(!rules.move_room(&old, &new), "nothing left on the old id");
+
+        let mut duplicated = Rules {
+            allow: vec![room("G0PRIVAT1"), room("C0PRIVAT1")],
+            deny: vec![room("C0PRIVAT1"), room("G0PRIVAT1"), Rule::Everyone],
+        };
+        assert!(duplicated.move_room(&old, &new));
+        assert_eq!(duplicated.allow.len(), 1, "{:?}", duplicated.allow);
+        assert_eq!(duplicated.deny, [room("C0PRIVAT1"), Rule::Everyone]);
+
+        let mut allowed_old = Rules {
+            allow: vec![room("G0PRIVAT1")],
+            deny: vec![room("C0PRIVAT1")],
+        };
+        assert!(allowed_old.move_room(&old, &new));
+        assert!(
+            !permits(&allowed_old, "dave", "C0PRIVAT1"),
+            "a deny on the new id stays a deny"
+        );
+        assert!(!allowed_old.move_room(&new, &new));
+
+        let mut elsewhere = Rules {
+            allow: vec![Rule::Room {
+                conv: ConvRef {
+                    team: "T0OTHER01".into(),
+                    ..old.clone()
+                },
+                label: "#G0PRIVAT1".to_owned(),
+            }],
+            deny: vec![member("G0PRIVAT1")],
+        };
+        let unchanged = elsewhere.clone();
+        assert!(
+            !elsewhere.move_room(&old, &new),
+            "another workspace's channel and a member are no room on the old id"
+        );
+        assert_eq!(elsewhere, unchanged);
+    }
+
+    fn known(binding: BindingId, old: &str, new: &str, waiting: bool) -> KnownChannelIdChange {
+        KnownChannelIdChange {
+            change: store::ChannelIdChange {
+                binding,
+                old: old.into(),
+                new: new.into(),
+                received_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+            team: "T1".into(),
+            waiting,
+            settled_to: (!waiting).then(|| new.into()),
+        }
+    }
+
+    #[test]
+    fn a_channel_is_followed_through_its_bindings_changes_only() {
+        let (ours, theirs) = (BindingId::new_v4(), BindingId::new_v4());
+        let changes = [
+            known(ours, "C2", "C3", false),
+            known(ours, "G1", "C2", true),
+            known(theirs, "C3", "C9", true),
+            known(ours, "C3", "G1", true),
+        ];
+        let ids = |start: &str| -> Vec<String> {
+            later_ids(&changes, ours, &start.into())
+                .into_iter()
+                .map(|id| id.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(ids("G1"), ["C2", "C3"], "in any order, and a cycle ends");
+        assert_eq!(ids("C3"), ["G1", "C2"]);
+        assert!(ids("C9").is_empty());
+    }
+
+    fn settled_on(binding: BindingId, old: &str, new: &str, to: &str) -> KnownChannelIdChange {
+        KnownChannelIdChange {
+            settled_to: Some(to.into()),
+            ..known(binding, old, new, false)
+        }
+    }
+
+    #[test]
+    fn a_settled_change_leads_to_where_slack_found_the_channel() {
+        let binding = BindingId::new_v4();
+        let changes = [
+            settled_on(binding, "C2", "C3", "C5"),
+            known(binding, "C3", "C4", true),
+            known(binding, "C4", "C5", true),
+            known(binding, "G1", "C2", true),
+        ];
+        let start = "G1".into();
+        let later: Vec<String> = later_ids(&changes, binding, &start)
+            .into_iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(later, ["C2", "C3", "C5", "C4"], "every id, for the denies");
+        assert_eq!(
+            latest_id(&changes, binding, &start).as_str(),
+            "C5",
+            "Slack's answer, not the deepest id"
+        );
+        assert_eq!(latest_id(&changes, binding, &"C9".into()).as_str(), "C9");
+
+        let cycle = [
+            known(binding, "G1", "C2", true),
+            settled_on(binding, "C2", "C3", "G1"),
+        ];
+        let ids: Vec<String> = later_ids(&cycle, binding, &start)
+            .into_iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert_eq!(ids, ["C2", "C3"], "a cycle through a settled change ends");
+        assert_eq!(latest_id(&cycle, binding, &start).as_str(), "C2");
+        assert_eq!(latest_id(&cycle, binding, &"C2".into()).as_str(), "G1");
+    }
+
+    #[test]
+    fn a_waiting_change_applies_the_old_ids_denies_and_never_its_allows() {
+        let binding = BindingId::new_v4();
+        let rules = Rules {
+            allow: vec![room("G1"), member("bob")],
+            deny: vec![room("G1"), room("C7")],
+        };
+        let mut settings = AgentSettings::default();
+        rules.write(&mut settings);
+        let changes = [
+            known(binding, "G1", "C2", true),
+            known(binding, "C2", "C3", false),
+            known(binding, "C7", "C8", false),
+        ];
+        let pending = pending_denials(&changes);
+        assert_eq!(
+            pending,
+            [(conv("G1"), conv("C2")), (conv("G1"), conv("C3"))],
+            "only a waiting change counts, along the chain it starts"
+        );
+        let policy = agent_policy(&settings, &Limits::default(), 0, &pending).unwrap();
+        let alice = Requester {
+            member: None,
+            key: key("alice"),
+            outside: None,
+        };
+        let bob = Requester {
+            member: None,
+            key: key("bob"),
+            outside: None,
+        };
+        for channel in ["G1", "C2", "C3"] {
+            assert!(!policy.permits(&bob, &conv(channel)), "{channel}");
+        }
+        assert!(
+            policy.permits(&bob, &conv("C8")),
+            "a settled change applies nothing"
+        );
+        assert!(
+            !policy.permits(&alice, &conv("C2")),
+            "the allow on the old id doesn't move early"
+        );
+    }
+
+    #[test]
+    fn copied_denies_may_go_past_the_most_rules() {
+        let mut rules = Rules {
+            allow: Vec::new(),
+            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
+        };
+        assert!(rules.copy_denies([(&conv("C0"), &conv("G9"))]));
+        assert_eq!(rules.deny.len(), MAX_RULES + 1);
+        assert!(!rules.copy_denies([(&conv("C0"), &conv("G9"))]), "once");
+        assert!(
+            !rules.copy_denies([(&conv("C99999"), &conv("G8"))]),
+            "no deny there"
+        );
+    }
+
+    #[test]
+    fn a_real_copy_past_the_most_rules_survives_allow_everyone() {
+        let mut rules = Rules {
+            allow: vec![room("C0")],
+            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
+        };
+        assert!(rules.copy_denies([(&conv("C1"), &conv("G0SHARED1"))]));
+        assert_eq!(rules.allow(Rule::Everyone), Change::Changed);
+        assert_eq!(rules.deny.len(), MAX_RULES + 1, "nothing dropped");
+        assert!(
+            !permits(&rules, "bob", "G0SHARED1"),
+            "the channel under its new id stays denied"
+        );
+    }
+
+    #[test]
+    fn after_a_flood_of_copies_the_owner_can_deny_everyone_and_open_the_agent_again() {
+        let mut rules = Rules {
+            allow: Vec::new(),
+            deny: vec![room("C0")],
+        };
+        let from = conv("C0");
+        let targets: Vec<ConvRef> = (0..MAX_DENIES).map(|n| conv(&format!("G{n}"))).collect();
+        for to in &targets {
+            rules.copy_denies([(&from, to)]);
+        }
+        assert!(rules.denies_everyone());
+        assert_eq!(rules.deny.len(), MAX_DENIES + 1);
+        assert_eq!(rules.allow(Rule::Everyone), Change::Changed);
+        assert!(!rules.denies_everyone());
+        assert_eq!(rules.deny.len(), MAX_DENIES, "nothing else dropped");
+        assert_eq!(
+            rules.deny(member("mallory")),
+            Change::Full,
+            "the copies fill the list"
+        );
+        assert_eq!(rules.deny(Rule::Everyone), Change::Changed);
+        assert!(rules.denies_everyone());
+    }
+
+    #[test]
+    fn copies_past_the_most_denies_deny_everyone_instead() {
+        let mut rules = Rules {
+            allow: vec![room("C1")],
+            deny: (0..MAX_RULES).map(|n| room(&format!("C{n}"))).collect(),
+        };
+        let from = conv("C0");
+        let targets: Vec<ConvRef> = (0..MAX_DENIES).map(|n| conv(&format!("G{n}"))).collect();
+        assert!(
+            rules.copy_denies(
+                targets[..MAX_DENIES - MAX_RULES]
+                    .iter()
+                    .map(|to| (&from, to))
+            )
+        );
+        assert_eq!(rules.deny.len(), MAX_DENIES);
+        assert!(!rules.denies_everyone());
+        let full = rules.deny.clone();
+        assert!(rules.copy_denies(targets.iter().map(|to| (&from, to))));
+        assert_eq!(
+            rules.deny,
+            [full, vec![Rule::Everyone]].concat(),
+            "no copy past the bound is kept"
+        );
+        assert!(
+            !rules.copy_denies([(&from, &conv("C9999999"))]),
+            "everyone is denied already"
+        );
+        assert_eq!(rules.deny.len(), MAX_DENIES + 1);
     }
 }

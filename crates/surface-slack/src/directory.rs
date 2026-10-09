@@ -682,6 +682,13 @@ impl TeamDirectory {
         Ok(info)
     }
 
+    /// Forgets what [`conv_info`](Self::conv_info) remembers of `channel`,
+    /// as for an id Slack replaced, so nothing reads it from the cache
+    /// again.
+    pub fn forget_conv(&self, channel: &ConversationId) {
+        self.lock_conv_infos().remove(channel);
+    }
+
     fn lock_conv_infos(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<ConversationId, (ConvInfo, Instant)>> {
