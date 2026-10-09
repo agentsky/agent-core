@@ -9179,10 +9179,11 @@ after a failed upload may still say it attached the file; the failure
 line follows it. A private task's outcome (`tell_thread`) counts a lost
 row as posted: its record is what `consent_posted` reads to mark the
 outcome posted, so treating an unrecorded outcome as unposted would post
-it again on each retry. Without its row `consent_posted` can't tell it
-was posted either, so if agentd stops before the task's work is
-finished, the next attempt says the task was interrupted rather than
-finishing quietly.
+it again on each retry. A private task's result posted without its row
+leaves `consent_posted` unable to tell it was posted too, so if agentd
+stops before the task's work is finished, the next attempt says the task
+was interrupted rather than finishing quietly; an outcome posted without
+its row is posted again in that case.
 
 ### Smaller choices
 
