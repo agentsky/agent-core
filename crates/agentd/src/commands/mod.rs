@@ -62,7 +62,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 
 use auth::{Auth, AuthError, LinkStatus, PENDING_LOGIN_TTL, Plan};
-use commands::{AdminCommand, ApiKeyCommand, Command, ParseError};
+use commands::{AdminCommand, ApiKeyCommand, CloudCommand, Command, ParseError};
 use core_types::{ConsentId, ConvRef, ConversationId, InFile, MemberId, MemberKey, SurfaceKind};
 use secrecy::SecretString;
 use store::{ConsentState, MemberUsage, Store, StoreError, UsageTotals};
@@ -814,6 +814,11 @@ impl Commands {
                 "That token is no longer secret, so I didn't store it. Revoke it at \
                  api.slack.com now, and send a new one only {place}."
             ),
+            Command::Cloud(CloudCommand::Add { .. }) => format!(
+                "That routine token is no longer secret, so I didn't store it. Revoke it now \
+                 with **Regenerate** or **Revoke** on the routine's API trigger at \
+                 claude.ai/code/routines, and register the new one only {place}."
+            ),
             Command::Login { code: None }
             | Command::Logout
             | Command::Me
@@ -836,7 +841,10 @@ impl Commands {
                 | AdminCommand::Slack,
             )
             | Command::Approve { .. }
-            | Command::Decline { .. } => format!(
+            | Command::Decline { .. }
+            | Command::Cloud(
+                CloudCommand::Run { .. } | CloudCommand::List | CloudCommand::Rm { .. },
+            ) => format!(
                 "Whatever secret it held is no longer secret, so I didn't use it. Revoke it now, \
                  and send a new one only {place}."
             ),
@@ -862,7 +870,8 @@ impl Commands {
         format!(
             "Your message looked like it held a secret (a login code, an API key or a token), \
              and others can read the room you posted it in. If it did, that secret is no longer \
-             private: {cancelled}start again with {}, and revoke any key or token you posted. \
+             private: {cancelled}start again with {}, and revoke any key or token you posted \
+             (a routine token with **Regenerate** or **Revoke** at claude.ai/code/routines). \
              Send secrets only {}.\n\n{err}",
             origin.command("login"),
             origin.private_place(),

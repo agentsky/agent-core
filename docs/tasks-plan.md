@@ -125,6 +125,7 @@ associated data, so a ciphertext copied into another row fails to decrypt.
 | Docker | `bollard` |
 | Dyn async traits | `async-trait` (the `Surface` trait is used as `dyn`) |
 | HTTP fakes in tests | `wiremock` |
+| URL parsing | `url`, already in the tree through `reqwest`; `commands` uses it for a routine's fire URL (T35a), so its origin compares with a `reqwest::Url`'s |
 
 Adding a dependency that isn't in this table needs a sentence in the PR
 description, and must pass T02's policy.
@@ -3117,26 +3118,27 @@ Design: [Cloud hand-off](design.md#cloud-hand-off), its
 Deliverables:
 
 - A migration `…_cloud_handoff.sql`:
-  - `cloud_routines`: `id`, `member_id`, `label`, `routine_id` (with its
-    `trig_` prefix), `token_enc`, `added_by` (the identity's `MemberKey`
-    string form) and `added_at`. Unique on `(member_id, label)` and on
-    `(member_id, routine_id)`.
+  - `cloud_routines`: `id`, `member_id`, `label` (no `:`), `routine_id`
+    (with its `trig_` prefix), `url_origin`, `token_enc`, `added_by` (the
+    identity's `MemberKey` string form) and `added_at`. Unique on
+    `(member_id, label)` and on `(member_id, routine_id)`.
   - `cloud_handoffs`: `id`, `member_id`, `routine_label`, `routine_id`,
     `requested_by`, `origin` (`slack_slash`, `slack_dm` or
     `rocketchat_dm`), `task_enc`, `state` with a `CHECK` on `sending`,
     `fired`, `rejected` and `unknown`, `http_status`, `error_type`,
-    `retry_after_secs`, `session_id`, `session_url`, `created_at`,
-    `answered_at`, and the notice's `notice_attempts`,
+    `retry_after_secs`, `unknown_reason`, `session_id`, `session_url`,
+    `created_at`, `answered_at`, and the notice's `notice_attempts`,
     `notice_next_attempt_at` and `notified_at`, after T13's relink
-    columns. Partial indexes serve the pass: `created_at` where
+    columns. A `fired` or `rejected` row always has `notified_at`.
+    Partial indexes serve the pass: `created_at` where
     `state = 'sending'`, and `notice_next_attempt_at` where
     `state = 'unknown' AND notified_at IS NULL`.
 - `Store` methods:
-  - `put_cloud_routine(&NewCloudRoutine { member, label, routine_id,
-    url_origin, token, added_by }, now)`. The token is a `SecretString`,
-    sealed with `cloud_routines/token_enc/<id>` as associated data. It
-    runs in one `BEGIN IMMEDIATE` transaction and returns
-    `CloudRoutinePut`:
+  - `put_cloud_routine(&NewCloudRoutine, now)`, whose fields are the
+    member, label, routine id, URL origin, token and `added_by`. The token
+    is a `core_types::RoutineToken`, sealed to `cloud_routines.token_enc`
+    under `<member>:<id>:<routine id>:<label>:<url origin>`. It runs in one
+    `BEGIN IMMEDIATE` transaction and returns `CloudRoutinePut`:
     - `Added(id)` for a new label.
     - `Replaced(id)` for an existing label, replaced in place, which is
       how a member registers a new token.
@@ -3144,41 +3146,40 @@ Deliverables:
       label.
     - `Full` for a new label past 20 for the member, counted in the
       transaction.
-    - `Unlinked` when the member no longer has a Claude link, checked in the
-      transaction by `claude_links::linked`, the store's shared link check.
+    - `Unlinked` (from T35c) when the member no longer has a Claude link,
+      checked in the transaction by `claude_links::linked`, the store's
+      shared link check.
       Against a `logout` that unlinks and then deletes the member's routines
       (T35c), the put either commits first, and the delete finds its row, or
       comes after the unlink and is refused.
-  - `cloud_routine(member, label)` returns the routine id and the opened
-    token. `cloud_routines(member)` lists labels, ids and times, never
-    tokens.
+  - `cloud_routine(member, label)` returns the routine id, the URL origin
+    and the opened token, and from T35c the registration it read, which
+    `begin_cloud_handoff` checks is still stored. `cloud_routines(member)`
+    lists labels, ids and times, never tokens.
   - `delete_cloud_routine(member, label)`, and
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(&NewCloudHandoff { … }, per_hour, now)` seals
-    the task with `cloud_handoffs/task_enc/<id>` and, in one
-    `BEGIN IMMEDIATE` transaction, checks the member still has a Claude
-    link with `claude_links::linked`, as `put_cloud_routine` does, and
-    inserts the row as `sending`. It returns `CloudBegun`, inserting
-    nothing but for `Begun`:
+  - `begin_cloud_handoff(&NewCloudHandoff { … }, now)` seals the task to
+    `cloud_handoffs.task_enc` under `<member>:<id>`, inserts the row as
+    `sending` and returns its `CloudHandoffId`. From T35c it also takes
+    `per_hour` and, in one `BEGIN IMMEDIATE` transaction, checks the
+    member still has a Claude link with `claude_links::linked`, as
+    `put_cloud_routine` does, and that the routine's registration is still
+    stored, and returns `CloudBegun`, inserting nothing but for `Begun`:
     - `Begun(id)` for the row.
     - `RoutineGone` when the routine was removed, or its token replaced,
       since the command read it.
     - `TooMany` when the member asked for `per_hour` hand-offs in the last
       hour (`CLOUD_HANDOFF_WINDOW`) already.
     - `Unlinked` when the member no longer has a Claude link.
-  - `finish_cloud_handoff(id, outcome, now)` records `fired`, `rejected` or
-    `unknown` from `sending`, and also `fired` or `rejected` from `unknown`,
-    for an answer whose record was held up past the pass. Recording any
-    outcome from `sending` sets `notified_at`, since the command's reply
-    tells the member, and so does recording `fired` or `rejected` from
-    `unknown`, so a `fired` or `rejected` row always has `notified_at` and a
-    notice whose claim failed isn't left owed by a row the partial index on
-    `notice_next_attempt_at`, which covers only `unknown` rows, no longer
-    finds. A claim sending at that moment may still deliver its notice
-    besides the reply. Nothing retries a record that failed. Finishing a
-    row that `logout` deleted changes nothing and isn't an error.
+  - `finish_cloud_handoff(id, outcome, now)` records an outcome once, from
+    `sending`, or from `unknown` when the pass gave up on the row
+    (`unknown_reason` `no_answer`), for an answer whose record was held up
+    past the pass. It sets `notified_at` if unset, since the command's
+    reply tells the member. It refuses `no_answer`, which only the pass
+    sets. Nothing retries a record that failed. Finishing a row that
+    `logout` deleted changes nothing and isn't an error.
   - `recent_cloud_handoffs(member, limit)`, with each task opened.
   - `stale_cloud_handoffs(before, now)` marks every `sending` row created
     before `before` as `unknown`, sets `answered_at`, and returns them.
@@ -3189,7 +3190,8 @@ Deliverables:
     doubling up to an hour, naming its claim) and
     `mark_cloud_handoff_notified(id, claim, now)`. A notice is no longer
     due 24 hours after its row's `answered_at`.
-  - `purge_cloud_handoffs(before)` deletes rows asked before `before`.
+  - `purge_cloud_handoffs(before, now)` deletes rows asked before
+    `before`, keeping a `sending` row and one whose notice is still owed.
 - `commands`:
   - `Command::Cloud(CloudCommand)` with `Add { label, routine, token }`,
     `Run { label, task }`, `List` and `Rm { label }`. `name()` gives
@@ -3218,7 +3220,7 @@ Deliverables:
 Acceptance, as tests named after the rules:
 
 - `cloud_add_is_secret_bearing`.
-- `cloud_add_debug_redacts_the_token`.
+- `cloud_debug_names_the_command_and_holds_no_token_or_task`.
 - `a_cloud_add_that_fails_to_parse_is_secret_bearing`.
 - `routine_url_must_be_the_fire_endpoint` (user info, a query, a fragment,
   `.` and `..` segments, `%2e`, a missing `trig_`, other characters in the
@@ -3228,19 +3230,52 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
-- `a_routine_is_refused_without_a_claude_link`.
-- `a_handoff_is_refused_without_a_claude_link`.
+- `a_routine_is_refused_without_a_claude_link` (from T35c).
+- `a_handoff_is_refused_without_a_claude_link` (from T35c).
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`).
-- `finishing_a_deleted_handoff_is_a_no_op`.
+  `rejected`, and from T35c `Gone` for a deleted hand-off).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
 - `a_handoff_notice_is_given_up_after_a_day`.
 - `old_handoffs_are_purged`.
+
+Decided in T35a
+([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
+`finish_cloud_handoff` takes a row that is `sending`, or `unknown`
+because the pass gave up on it (`unknown_reason` `no_answer`), once, and
+marks the notice done if it hasn't gone out; a late `unknown` keeps the
+row with its own reason. It refuses an `Unknown` whose reason is
+`NoAnswer` with `StoreError::Refused`, since only the pass sets it.
+`cloud_routines` also keeps the fire URL's origin (`url_origin`), which
+`put_cloud_routine` takes and T35c compares with `base_url`'s before
+each fire, parsing the stored origin rather than comparing strings.
+Sealed values are bound to the member as well as the row, and a token to
+its routine id, label and origin too; a label can't hold `:`. T35c
+answers a stored token that reads as `Corrupt` (one that no longer
+passes `RoutineToken::parse`) by asking the member to `cloud add` the
+routine again, which replaces the row without reading the old token.
+`cloud add`'s token must start with `sk-ant-` and be printable ASCII,
+checked once by `core_types::RoutineToken::parse`.
+`purge_cloud_handoffs(before, now)` keeps a row whose notice is still
+owed, and a `sending` row. The shared types are `core_types::RoutineId`,
+`RoutineToken`, `CloudRoutineId` and `CloudHandoffId`, and the store's
+`CloudOrigin`, `CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a
+`u32`, and `Unknown { status, reason }`) and `CloudUnknownReason`,
+stored in its own `unknown_reason` column. T35b's `fire` takes a
+`RoutineId` and a `&RoutineToken` and can compare the opened routine's
+`url_origin` with `base_url`'s; T35c maps `FireOutcome` onto
+`CloudOutcome`. The link checks (`CloudRoutinePut::Unlinked`,
+`CloudBegun`), the `per_hour` cap and the registration check land with
+T35c. `RoutineUrl::origin()` is a `url::Origin`. A notice's mark needs a
+claim that was made, not the latest one; its deferral needs the latest.
+`CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the task, and
+the store hands a task back only as a `SecretString`. agentd's
+public-secret refusal has its `cloud add` arm already; the other `cloud`
+commands answer "isn't available yet" until T35c.
 
 ### T35b
 
@@ -3474,7 +3509,13 @@ link. Record the response and the session URL's form; what a paused routine,
 a wrong token, a linked member's OAuth token and a missing `anthropic-beta`
 get from the endpoint; what it answers with the account out of usage, its
 GitHub connection removed and, if one is at hand, its subscription paused;
-and whether any of those started a session. Update the design's
+and whether any of those started a session; whether tokens are still
+`sk-ant-oat01-…`, as the reference says, since `RoutineToken` requires the
+`sk-ant-` family; and whether routine ids are case-insensitive (if so,
+normalize them, since `trig_AB` and `trig_ab` would register one routine
+under two labels; a token's associated data holds the stored routine id, so
+normalize when parsing new ones, and re-seal stored rows in Rust with the
+master key, never with a SQL `UPDATE`). Update the design's
 [Verified and assumed](design.md#verified-and-assumed) and failure table
 with the result and date. That completes design milestone 6.
 

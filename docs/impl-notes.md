@@ -9266,3 +9266,254 @@ posted again in that case.
 - Slack not resolving a mention inside code, and pairing any two
   backticks (the model `without_code` reads by), are not verified on a
   live workspace.
+
+## T35a: Cloud hand-off: store and grammar
+
+### A late answer is recorded once, on a row the pass marked
+
+**Issue.** The plan records `fired`, `rejected` or `unknown` from
+`sending`, and `fired` or `rejected` from `unknown`, marking the notice
+done "unless a notice claim's lease is live". Taken literally:
+
+- A late `unknown`, such as a reply that timed out and whose record was
+  held up past the pass, was refused. Its notice then stayed owed, and the
+  member got the "may have started" DM after the reply had said the same.
+- A lease's exception changes nothing anyone sees. Every path that sends a
+  notice needs `state = 'unknown'`, so a row a late answer made `fired` or
+  `rejected` is never claimed again, live lease or not. The exception only
+  left such a row's `notified_at` empty for good when the claim's send then
+  failed. A first version added a `notice_leased_until` column to tell a
+  lease from a backoff; it guarded against a case that can't send.
+- An `unknown` the command's own reply recorded could still be turned into
+  `fired` later, although only a row the pass marked waits on an answer.
+
+A second version took a late answer only while the notice hadn't gone out.
+Review showed that window is about one DM long: T35c's notifier marks rows
+and sends their notices in the same tick, so a late `fired` (a blue-green
+deploy whose instances' timeouts differ, say) would almost never be
+recorded, leaving `cloud list` without the link of a session that exists,
+while refusing the record prevented no message.
+
+**Solution.** `finish_cloud_handoff` takes a row that is `sending`, or
+`unknown` with `unknown_reason` `no_answer`, which only the pass sets, so a
+reply's own `unknown` takes no later answer. It sets `notified_at` if it is
+empty, since the reply tells the member, and keeps a notice's time. A late
+`fired` or `rejected` replaces `unknown` and sets `answered_at`; a late
+`unknown` keeps the row's time and state, fills in a status the row lacked
+and replaces `no_answer` with its own reason. Either way the row no longer
+has `no_answer`, so it takes one late answer. A notice a claim is sending at
+that moment may still reach the member besides the reply, and the claim's
+mark then returns false; avoiding that would need a two-phase send. There
+is no lease column.
+
+### Sealed values are bound to the member
+
+**Issue.** Sealing a token with `cloud_routines/token_enc/<id>` stops a
+ciphertext copied into another row, but not a row moved whole: setting
+`member_id` to another member's id, by anyone who can write the database
+without the master key, would let that member open the token and fire the
+routine, and read moved tasks in `cloud list`.
+
+**Solution.** A token's associated data key is
+`<member>:<id>:<routine id>:<label>:<url origin>` and a task's
+`<member>:<id>` (only the origin may hold `:`, since a label never does,
+and it comes last). A row moved to another member, or given another
+routine id, label or origin, fails with `SealError::Decrypt`, which tests
+show for both tables; the label keeps two of a member's own rows from
+swapping labels, which would fire one routine for the other's name. The
+stored routine id and origin strings are the associated data, so
+normalizing either later means re-sealing with the master key, not a SQL
+`UPDATE`.
+
+### The `url` crate changes what it parses
+
+**Issue.** `url::Url::parse` removes `.` and `..` segments, decodes `%`
+escapes in a host, reads `\` as `/` in `http` and `https` URLs, skips
+extra slashes after the scheme (`https:///v1/…` gets the host `v1`), drops
+a default port and accepts an empty user name (`https://@host`). A routine
+URL checked only after parsing could name a path or a host other than the
+one pasted.
+
+**Solution.** `RoutineUrl` checks the text as pasted first: printable
+ASCII without `%` anywhere, an `http` or `https` scheme, an authority
+that isn't empty and holds no `@`, and a path, from the first `/`, `\`,
+`?` or `#` after it, that is exactly `/v1/claude_code/routines/` + a
+`RoutineId` + `/fire`. Since the id is only letters and digits, that one
+match refuses dot segments, escapes, backslashes, a trailing slash, a
+query and a fragment. Only then is the text parsed with `url`, for the
+origin, and the parsed URL must agree: no user info, query or fragment,
+and the same path. `commands` depends on `url` 2.5.8, which was already in
+the lockfile through `reqwest`, so the origin is the same `url::Origin`
+type that `reqwest::Url::origin()` returns for `[cloud] base_url`, and
+T35c compares the two with `==` (a default port compares equal whether it
+was typed or not).
+
+### A routine keeps the origin it was registered with
+
+**Issue.** The origin was to be compared with `[cloud] base_url` only at
+`cloud add`. Each fire builds its URL from the current `base_url`, so an
+operator who later points `base_url` at a mock or a loopback test server
+would send every stored token there.
+
+**Solution.** `cloud_routines.url_origin` keeps the origin, as
+`url::Origin::ascii_serialization` writes it, and is part of the token's
+associated data. `put_cloud_routine` takes it, and `CloudRoutineToken` and
+`CloudRoutine` return it, so a fire (T35b's client, or T35c before
+calling it) refuses a routine whose origin isn't `base_url`'s, and T35c
+tells the member to `cloud add` it again. The comparison parses the stored
+origin (`Url::parse(stored)?.origin() == base_url.origin()`) rather than
+comparing strings, so a change in how `url` writes an origin can't lock
+members out.
+
+### A routine token is checked in one place
+
+**Issue.** Any word was stored as a token, so one holding a control or
+non-ASCII character would fail only when T35b built the `Authorization`
+header, after a hand-off row was written; and the grammar, the store and
+the fire client would each have had to agree on what a token is.
+
+**Solution.** `core_types::RoutineToken` wraps a `SecretString` and is made
+only by `RoutineToken::parse`: it starts with `sk-ant-` (the routine fire
+reference says its tokens are prefixed `sk-ant-oat01-`; only the family is
+required, in case the version changes), is printable ASCII and is at most
+1024 bytes. Its `Debug` is redacted and it has no `Display` or serde form.
+`cloud add`'s clap value parser makes one at once, so no `String` copy of
+the token lives in the parsed arguments, and the refusal is a fixed
+sentence. The store seals one (`NewCloudRoutine::token`) and opens one
+(`CloudRoutineToken::token`), reporting a stored token that no longer passes
+as `Corrupt`, which T35c answers by asking the member to `cloud add` the
+routine again; T35b's `fire` takes `&RoutineToken`. `core-types`
+now depends on `secrecy`, already a workspace dependency.
+
+### Where the shared types live
+
+**Issue.** T35b's fire client and T35a's store and grammar are built in
+parallel, and T35c joins them. They need one routine id type, and the
+store needs an outcome it can record without depending on `agentd`.
+
+**Solution.** `core-types` has the ids: `RoutineId` (`trig_` and 1 to 64
+ASCII letters and digits, checked by `FromStr` and serde), which
+`RoutineUrl::routine_id` returns and the store takes, for T35b's `fire` to
+take too, and the UUID ids `CloudRoutineId` and `CloudHandoffId`. `store`
+has what its columns hold: `CloudOrigin` (`slack_slash`, `slack_dm`,
+`rocketchat_dm`, named as `Origin::kind` names them), `CloudHandoffState`,
+and `CloudOutcome` (`Fired { session_id, session_url }`,
+`Rejected { status, error_type, retry_after_secs }` with an optional
+status for a connection that failed before sending, and
+`Unknown { status, reason }`). The reason is a `CloudUnknownReason`, one
+per case of the plan's failure table: `server_error`, `other_status`,
+`timeout`, `connection_lost`, `redirect`, `unreadable_answer`, and
+`no_answer`, which only the pass sets: `finish_cloud_handoff` refuses it
+with `StoreError::Refused`, since a caller recording it would leave a row
+that takes a second answer and owes a second notice. It is kept in a column
+of its own, `unknown_reason`, set exactly while the row is `unknown`, rather
+than in `error_type`, which holds what the endpoint said. T35c maps T35b's
+`FireOutcome` onto `CloudOutcome`. `retry_after_secs` is a `u32`: T35b
+should read `Retry-After` into one, or T35c saturate into it.
+
+Hand-off ids are minted by agentd in `begin_cloud_handoff` and never taken
+from what a member types, so `finish_cloud_handoff` and the notice methods
+take only the id and aren't scoped to a member. A command that ever took a
+hand-off id from member text would have to check the member first.
+
+### Tasks and tokens stay out of `Debug`
+
+**Issue.** The plan keeps `cloud run`'s task a `String` that nothing logs,
+but a derived `Debug` on the command, on a row read back from the store or
+on the struct written to it would print it wherever someone logs the value
+whole.
+
+**Solution.** `CloudCommand` and `NewCloudHandoff` have hand-written
+`Debug`s that leave out the task, and `CloudCommand`'s redacts the token as
+`SecretString` does. The store opens a task only for
+`recent_cloud_handoffs`, into a `SecretString` (`RecentCloudHandoff::task`);
+`CloudHandoff`, which the pass and the notices return, has no task at all.
+`RoutineUrl`'s `Debug` shows only the origin and the routine id, never the
+URL as typed.
+
+### A superseded claim may still mark its notice sent
+
+**Issue.** `mark_cloud_handoff_notified(id, claim, now)` names its claim,
+and `defer_cloud_handoff_notice` must ignore a stale claim so it can't
+shorten a newer lease. Refusing a stale claim's mark as well would leave a
+notice the member did get owed, so a failed send by the newer claim would
+send it a third time.
+
+**Solution.** A deferral needs the latest claim, as for consent cards. A
+mark needs only a claim that was made (`notice_attempts >= claim`, and
+`claim > 0`): any claim whose message went out may mark the notice sent.
+
+### `cloud add` in a room needs its refusal already
+
+**Issue.** agentd's refusal of a secret-bearing command sent where others
+read it matches every command, so a new one doesn't compile until it has
+its own advice (T13). `Command::Cloud` made it fail to compile, and
+leaving `cloud add` in a room to "isn't available yet" would say nothing
+about a token that is now public. A `cloud add` that fails to parse in a
+room, the likeliest case (a trailing slash, a missing word), got only the
+generic advice, which didn't say where a routine token is revoked.
+
+**Solution.** `refuse_public_secret` gains the `cloud add` arm T35c
+specifies: the token is no longer secret, nothing was stored, revoke it
+with **Regenerate** or **Revoke** at claude.ai/code/routines. The generic
+advice for secret-looking text that doesn't parse now names that too.
+Every `cloud` command sent privately answers "isn't available yet" until
+T35c's handlers land.
+
+### Smaller choices
+
+- Labels are case-sensitive, as agent names are. Registering a label
+  again may also move it to another routine id, provided no other label
+  holds that id; T35c's reply should name the new id. Routine ids are
+  case-sensitive too, which T35c's live check is to confirm.
+- `put_cloud_routine` returns `CloudRoutinePut`: `Added`, `Replaced`,
+  `RoutineTaken { label }` naming the label that holds the routine, or
+  `Full` past `MAX_CLOUD_ROUTINES` (20). The checks and the write are one
+  `BEGIN IMMEDIATE` transaction; a test with 30 concurrent registrations on
+  a file database stores exactly 20.
+- `delete_cloud_routine` keeps the routine's hand-offs, which carry their
+  own copy of the label and id; `delete_cloud_routines_of` deletes both in
+  one transaction. Both tables also cascade from `members`.
+- `stale_cloud_handoffs` is one `UPDATE … RETURNING`, so two passes never
+  return the same row; it sorts what it returns by `created_at`, since
+  `RETURNING` has no order. Due notices come oldest answer first. Its
+  cut-off is the caller's, so in a blue-green deploy that changes
+  `[cloud] timeout_secs`, the instance with the shorter timeout can mark a
+  row the other still waits on; the member then gets the notice and the
+  reply, and the late answer is still recorded. A per-row deadline would
+  close that, at the cost of a column.
+- A partial index on `created_at` where `state = 'sending'` serves the
+  pass, which otherwise reads the whole history for its few `sending` rows;
+  a plain one on `created_at` serves the purge; and one on
+  `(member_id, created_at)` serves `recent_cloud_handoffs` (ties broken by
+  `rowid`) and the member deletions.
+- `purge_cloud_handoffs(before, now)` keeps a row whose notice is still
+  owed at `now`, so a `retention_days` of 1 can't cut the notice's day
+  short, and a `sending` row, so a purge that runs before the pass, after
+  a long outage, doesn't lose its notice.
+- The schema checks what each state implies: `answered_at` is set exactly
+  when the row isn't `sending`, `session_id` (never empty) exactly when it
+  is `fired`, a `session_url` only then, an error type and `Retry-After`
+  only when `rejected`, an `unknown_reason` exactly when `unknown`,
+  `notified_at` never while `sending`, an
+  `http_status` from 100 to 999, and a routine id that starts with `trig_`
+  in both tables.
+- `recent_cloud_handoffs` fails whole when one task won't open, as other
+  store reads do; T35c's `cloud list` should still show the routines when
+  the hand-offs can't be read.
+- The notice backoff after claim `n` is a minute times 2^(n-1), capped at
+  an hour, so a day's notice gets about 24 tries after the first few.
+- Parse errors for `cloud` commands use fixed sentences and never repeat a
+  label, URL, token or task. Unparsed text counts as secret-bearing when a
+  word `cloud` is followed by `add` and any value, wherever it stands
+  (`help cloud add …` and `!agent cloud add …` in a DM included), with the
+  same normalization as the other secret words.
+
+### Open items
+
+- A token typed where no command is read gets no advice: `cloud add …`
+  without `!agent` in a Rocket.Chat room or an agent's DM is turn text, and
+  a parsed `cloud run` or `persona` holding a token in its free text isn't
+  secret-bearing. Command words garbled with invisible or look-alike
+  characters fall back to the `sk-ant-` rule alone. Login codes have the
+  same gaps.

@@ -529,6 +529,40 @@ async fn a_slack_token_in_a_channel_is_refused_with_revoke_advice() {
 }
 
 #[tokio::test]
+async fn a_routine_token_in_a_channel_is_refused_with_revoke_advice() {
+    const TOKEN: &str = "sk-ant-oat01-routine-token-secret";
+    let h = harness().await;
+    let logs = global_logs().tag();
+    h.channel(
+        "alice",
+        &format!(
+            "cloud add agent-core https://api.anthropic.com/v1/claude_code/routines/trig_1/fire \
+             {TOKEN}"
+        ),
+    )
+    .await;
+    let reply = h.last_reply("alice");
+    assert!(reply.contains("I didn't store it"), "{reply}");
+    assert!(
+        reply.contains("**Regenerate** or **Revoke**") && reply.contains("claude.ai/code/routines"),
+        "{reply}"
+    );
+    assert!(!reply.contains(TOKEN));
+    logs.snapshot().assert_has("\"command\":\"cloud add\"");
+    global_logs().snapshot().assert_lacks(TOKEN);
+
+    h.channel("alice", &format!("cloud add agent-core not-a-url {TOKEN}"))
+        .await;
+    let reply = h.last_reply("alice");
+    assert!(reply.contains("looked like it held a secret"), "{reply}");
+    assert!(
+        reply.contains("**Regenerate** or **Revoke**") && reply.contains("claude.ai/code/routines"),
+        "{reply}"
+    );
+    assert!(!reply.contains(TOKEN));
+}
+
+#[tokio::test]
 async fn secret_looking_text_that_fails_to_parse_in_a_channel_cancels_logins() {
     let h = harness().await;
     let logs = global_logs().tag();
@@ -694,6 +728,8 @@ async fn commands_that_come_later_say_so() {
     let h = harness().await;
     h.dm(ADMIN, "admin slack").await;
     assert_eq!(h.last_reply(ADMIN), "`admin slack` isn't available yet.");
+    h.dm("alice", "cloud list").await;
+    assert_eq!(h.last_reply("alice"), "`cloud list` isn't available yet.");
 }
 
 #[tokio::test]

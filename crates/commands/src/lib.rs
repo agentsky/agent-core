@@ -32,6 +32,9 @@
 //!   accepted, see [`UserRef`], [`RoomRef`] and [`Target`]. A skill source
 //!   is an `https://` Git URL with an optional `#ref`; a Slack link token
 //!   `<url|label>` becomes its URL.
+//! - `cloud add` takes a routine's fire URL, as typed or as a Slack link
+//!   token, and keeps only its origin and routine id ([`RoutineUrl`]);
+//!   `cloud run`'s task is the rest of the text verbatim.
 //! - `help`, `help <command>` and empty text ask for help, and an unknown
 //!   command gets the full help text. Both come back as a [`ParseError`],
 //!   whose message the caller replies with.
@@ -42,8 +45,9 @@
 //!
 //! # Secrets
 //!
-//! Login codes, Slack configuration tokens and the community API key are
-//! held as [`SecretString`], so a [`Command`]'s `Debug` output redacts them.
+//! Login codes, Slack configuration tokens, the community API key and
+//! routine tokens are held as [`SecretString`], so a [`Command`]'s `Debug`
+//! output redacts them. It leaves out a `cloud run` task too.
 //! [`Command::is_secret_bearing`] tells callers when to refuse a command sent
 //! in a channel, and [`ParseError::is_secret_bearing`] says the same of text
 //! that failed to parse. Parse errors never repeat the text they were given.
@@ -55,10 +59,12 @@ use std::fmt;
 use core_types::{ConsentId, ConvKind};
 use secrecy::SecretString;
 
+mod cloud;
 mod help;
 mod names;
 mod parse;
 
+pub use cloud::{CloudCommand, RoutineLabel, RoutineUrl};
 pub use help::help;
 pub use names::{AgentName, RoomRef, SkillName, Target, UserRef};
 pub use parse::parse;
@@ -180,6 +186,8 @@ pub enum Command {
         /// The consent being decided.
         consent: ConsentId,
     },
+    /// `cloud …`: a member's routines for cloud hand-off.
+    Cloud(CloudCommand),
 }
 
 /// A new value for one of `limits`' settings.
@@ -280,8 +288,8 @@ impl fmt::Debug for Command {
 }
 
 impl Command {
-    /// Whether the command carries a secret: `login <code>`, `slack-token`
-    /// and `admin api-key set`.
+    /// Whether the command carries a secret: `login <code>`, `slack-token`,
+    /// `admin api-key set` and `cloud add`.
     ///
     /// Callers refuse such a command outside a private channel and never
     /// log its arguments.
@@ -291,6 +299,7 @@ impl Command {
             Command::Login { code: Some(_) }
                 | Command::SlackToken { .. }
                 | Command::Admin(AdminCommand::ApiKey(ApiKeyCommand::Set { .. }))
+                | Command::Cloud(CloudCommand::Add { .. })
         )
     }
 
@@ -323,6 +332,10 @@ impl Command {
             Command::Admin(AdminCommand::Slack) => "admin slack",
             Command::Approve { .. } => "approve",
             Command::Decline { .. } => "decline",
+            Command::Cloud(CloudCommand::Add { .. }) => "cloud add",
+            Command::Cloud(CloudCommand::Run { .. }) => "cloud run",
+            Command::Cloud(CloudCommand::List) => "cloud list",
+            Command::Cloud(CloudCommand::Rm { .. }) => "cloud rm",
         }
     }
 
@@ -415,11 +428,13 @@ impl ParseError {
     /// or `slacktoken`) is followed by a value, anywhere in the text: a
     /// secret-bearing command with extra or missing words, or with a
     /// misspelt or missing command word such as `api-key set <key>` without
-    /// `admin`. It is also the case when any word holds a known token prefix
-    /// (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-` or `xapp-`) or has the
-    /// shape of a pasted login code, `<code>#<state>` (`logn abc123#state`)
-    /// or a `code=` query parameter, and for unknown commands and help
-    /// requests too. Any `word#word` counts, so `PR#42` does.
+    /// `admin`. It is the case when `cloud` is followed by `add` and a
+    /// value, which may be a routine's token. It is also the case when any
+    /// word holds a known token prefix (`sk-ant-`, `xoxb-`, `xoxp-`, `xoxe.`,
+    /// `xoxe-` or `xapp-`) or has the shape of a pasted login code,
+    /// `<code>#<state>` (`logn abc123#state`) or a `code=` query parameter,
+    /// and for unknown commands and help requests too. Any `word#word`
+    /// counts, so `PR#42` does.
     ///
     /// The secret may still be in the text, so callers apply the same
     /// channel rules as for [`Command::is_secret_bearing`]. The heuristic
