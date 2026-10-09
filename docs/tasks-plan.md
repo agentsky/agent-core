@@ -1899,7 +1899,8 @@ Deliverables:
   If the next turn's `Requester` differs from the one whose turn started the
   container, stop the container, which ends every process a turn left running
   in it, and start a new one, whose process starts with `--resume`. An
-  agent-to-agent hop inherits its requester, so it keeps the container
+  agent-to-agent hop runs as the requester it inherits, so it keeps a
+  container started for that requester
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
