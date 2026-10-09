@@ -114,9 +114,6 @@ const LEASE_RETRY: Duration = Duration::from_millis(100);
 /// How often a skill whose files in use don't declare its hosts is warned
 /// about; the denials between are logged at debug level, and counted.
 pub const MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
-/// The most of a `SKILL.md` read for its hosts: the largest front matter
-/// with room for a byte-order mark and its two `---` lines.
-const FRONT_MATTER_READ: u64 = package::MAX_FRONT_MATTER_BYTES as u64 + 16;
 
 /// Writes the bundled skill into `agent`'s skills directory under
 /// `data_dir`, if it isn't there as it should be. Returns whether it
@@ -906,23 +903,30 @@ fn host_names(manifest: &Manifest) -> Vec<String> {
 
 /// The hosts the `SKILL.md` in the skill directory `dir` declares, or
 /// `None` if it can't be read as one. Only the first
-/// [`FRONT_MATTER_READ`] bytes are read, as much as front matter may take,
-/// and only their UTF-8 prefix is parsed, so a character cut at the end of
-/// the read never counts.
+/// [`package::MAX_FRONT_MATTER_BYTES`] are parsed, the most front matter
+/// may take, and of a file longer than that only its whole lines, so a
+/// line cut by the limit never counts: every file the checks accepted at
+/// add reads as it did then.
 async fn declared_hosts(dir: &Path) -> Option<Vec<String>> {
     use tokio::io::AsyncReadExt as _;
+    let limit = package::MAX_FRONT_MATTER_BYTES;
     let file = tokio::fs::File::open(dir.join(package::SKILL_FILE))
         .await
         .ok()?;
     let mut bytes = Vec::new();
-    file.take(FRONT_MATTER_READ)
+    file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
         .await
         .ok()?;
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => text,
-        Err(err) => std::str::from_utf8(&bytes[..err.valid_up_to()]).ok()?,
-    };
+    if bytes.len() > limit {
+        bytes.truncate(limit);
+        let whole = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |at| at + 1);
+        bytes.truncate(whole);
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
     package::parse_skill_file(text)
         .ok()
         .map(|manifest| host_names(&manifest))

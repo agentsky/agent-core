@@ -1033,22 +1033,79 @@ async fn the_sweeper_never_finishes_a_confirmation_nobody_made() {
     assert!(h.hosts().await.is_empty());
 }
 
+/// The front matter of `skill_md(name, hosts)` without its closing `---`
+/// line, padded with a YAML comment to exactly `size` bytes.
+fn front_of_size(name: &str, hosts: &[&str], size: usize) -> String {
+    let text = skill_md(name, hosts);
+    let mut front = text[..text.rfind("---\n").unwrap()].to_owned();
+    let pad = size - front.len() - 2;
+    front.push('#');
+    front.push_str(&"x".repeat(pad));
+    front.push('\n');
+    assert_eq!(front.len(), size);
+    front
+}
+
 #[tokio::test]
-async fn hosts_are_read_from_the_front_matter_alone() {
+async fn a_skill_md_add_accepts_reads_the_same_for_its_hosts() {
     let h = harness().await;
-    let dir = h.data.join("long");
-    std::fs::create_dir_all(&dir).unwrap();
-    let text = format!(
-        "{}{}",
-        skill_md("gh", &["api.github.com"]),
-        "\u{e9}".repeat(package::MAX_SKILL_MD_BYTES as usize / 4)
-    );
-    std::fs::write(dir.join("SKILL.md"), &text).unwrap();
-    assert!(text.len() as u64 > FRONT_MATTER_READ);
+    let limit = package::MAX_FRONT_MATTER_BYTES;
+    let hosts = ["api.github.com"];
+    let body = "Use it well.\n".repeat(limit / 4);
+    let at_limit = format!("{}---\n{body}", front_of_size("gh", &hosts, limit - 4));
+    assert!(matches!(
+        h.upload("SKILL.md", &at_limit).await,
+        Ok(Added::Pending(_))
+    ));
     assert_eq!(
-        declared_hosts(&dir).await,
+        declared_hosts(&h.pending("gh")).await,
         Some(vec!["api.github.com".to_owned()])
     );
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+
+    let over = format!("{}---\n{body}", front_of_size("over", &hosts, limit - 3));
+    let spaced = format!(
+        "{}---{}\n{body}",
+        front_of_size("spaced", &hosts, 200),
+        " ".repeat(limit)
+    );
+    for text in [over, spaced] {
+        assert_eq!(
+            h.upload("SKILL.md", &text).await,
+            Err(Refused::Problem(Problem::NoFrontMatter))
+        );
+    }
+}
+
+#[tokio::test]
+async fn hosts_are_read_from_no_more_than_the_front_matter() {
+    let h = harness().await;
+    let limit = package::MAX_FRONT_MATTER_BYTES;
+    let hosts = ["api.github.com"];
+    let mut past = format!("{}---\n", front_of_size("gh", &hosts, limit - 4)).into_bytes();
+    past.extend(std::iter::repeat_n(0xff, limit));
+    let mut cut = format!("{}---\n", front_of_size("gh", &hosts, limit / 2)).into_bytes();
+    cut.resize(limit - 1, b'a');
+    cut.extend("\u{e9}".as_bytes());
+    cut.extend(std::iter::repeat_n(0xff, limit));
+    let mut stub = front_of_size("gh", &hosts, limit - 3).into_bytes();
+    stub.extend(b"---abc\n---\n");
+    assert!(package::parse_skill_file(std::str::from_utf8(&stub).unwrap()).is_err());
+    let declared = Some(vec!["api.github.com".to_owned()]);
+    for (name, bytes, expected) in [
+        ("past", past, declared.clone()),
+        ("cut", cut, declared),
+        ("stub", stub, None),
+    ] {
+        let dir = h.data.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), bytes).unwrap();
+        assert_eq!(declared_hosts(&dir).await, expected, "{name}");
+    }
 }
 
 #[tokio::test]

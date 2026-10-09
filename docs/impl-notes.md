@@ -5864,12 +5864,17 @@ none, warned about with the agent, the skill and the counts at most once a
 minute per skill (`MISMATCH_WARN_INTERVAL`, through the `Throttle` the
 public listener's refusal warnings now share), the rest at debug level. It
 runs at each `CONNECT` the configured allowlist doesn't already allow, and
-reads only the front matter of each active skill with hosts: at most
-`MAX_FRONT_MATTER_BYTES` and its delimiters, parsing the UTF-8 prefix of
-what it read with `parse_skill_file`. Whatever the disk holds, hosts never
-cover files that don't declare them; the lease, the order of the steps and
-the undo only keep rows and files matching, so that what the owner
-confirmed stays usable.
+reads only the front matter of each active skill with hosts: the first
+`MAX_FRONT_MATTER_BYTES`, and of a longer file only the whole lines among
+them, parsed with `parse_skill_file`. That constant is now the whole front
+matter's budget, a byte-order mark and both `---` lines with their trailing
+whitespace counted, not just the YAML's: a closing line padded with spaces
+passed the add's check and then failed the bounded read, so a skill could
+be added and never confirmed. With one budget, every file the add accepts
+reads the same at confirmation and at the grant. Whatever the disk holds,
+hosts never cover files that don't declare them; the lease, the order of
+the steps and the undo only keep rows and files matching, so that what the
+owner confirmed stays usable.
 
 The check compares the row's hosts, which `host_names` wrote at add time
 from `parse_skill_file` and `HostRule`'s `Display`, with what the same code

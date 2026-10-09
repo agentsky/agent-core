@@ -48,7 +48,11 @@ pub const MAX_DEPTH: usize = 16;
 pub const MAX_PATH_BYTES: usize = 1024;
 /// The largest `SKILL.md`.
 pub const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
-/// The largest front matter in a `SKILL.md`.
+/// The most bytes a `SKILL.md`'s front matter may take, from the start of
+/// the file through its closing `---` line, with a byte-order mark and both
+/// delimiter lines, their trailing whitespace and line ends counted. It is
+/// also all agentd reads of a skill's `SKILL.md` for its hosts once added,
+/// so every file the checks accept reads the same then.
 pub const MAX_FRONT_MATTER_BYTES: usize = 16 * 1024;
 /// The most hosts a skill may declare.
 pub const MAX_HOSTS: usize = 16;
@@ -205,20 +209,22 @@ enum Hosts {
 ///
 /// The [`Problem`] with it.
 pub fn parse_skill_file(text: &str) -> Result<Manifest, Problem> {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.split_inclusive('\n');
-    if lines.next().map(str::trim_end) != Some("---") {
+    let first = lines.next().ok_or(Problem::NoFrontMatter)?;
+    if first.strip_prefix('\u{feff}').unwrap_or(first).trim_end() != "---" {
         return Err(Problem::NoFrontMatter);
     }
+    let mut used = first.len();
     let mut yaml = String::new();
     let mut closed = false;
     for line in lines {
+        used += line.len();
+        if used > MAX_FRONT_MATTER_BYTES {
+            return Err(Problem::NoFrontMatter);
+        }
         if line.trim_end() == "---" {
             closed = true;
             break;
-        }
-        if yaml.len() + line.len() > MAX_FRONT_MATTER_BYTES {
-            return Err(Problem::NoFrontMatter);
         }
         yaml.push_str(line);
     }
