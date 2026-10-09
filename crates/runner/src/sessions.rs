@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use core_types::{
-    AgentId, ConsentId, CredentialKind, ScopeKey, SessionId, Side, ThreadKey, TurnKind, VolumeKey,
+    AgentId, ConsentId, CredentialKind, Requester, ScopeKey, SessionId, Side, ThreadKey, TurnKind,
+    VolumeKey,
 };
 use futures::{FutureExt, StreamExt};
 use sandbox::{Container, ContainerEvent, ContainerId, Sandbox, SessionSpec, SharedAccess};
@@ -157,6 +158,9 @@ struct Warm<H: TurnHooks> {
 struct Held<H: TurnHooks> {
     container: Container,
     mounts: Mounts,
+    /// The requester of the turn that started it. Only their turns run in
+    /// it: see `Inner::ensure_process`.
+    requester: Requester,
     tracked: Arc<Tracked<H>>,
     process: Option<Running<H>>,
     _scope_permit: OwnedSemaphorePermit,
@@ -237,16 +241,20 @@ fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
 /// runs once more, unless a call for that process has succeeded since, and if
 /// that fails too the runner logs it and gives up.
 ///
-/// A turn reuses the session's warm process when its credential kind, its
-/// model and its mounts match, and otherwise stops it (and the container,
-/// for other mounts or a failed `process_stopping`) and starts another,
-/// resuming from the transcript. A process that crashed, timed out or
-/// refused its `--resume` is stopped after the turn; if it wasn't seen to
-/// exit, its container is stopped too before the next process starts, so
-/// two processes never write one transcript. A container the sandbox fails
-/// to stop stays the session's, marked dead: the session's turns fail until
-/// a later stop succeeds, rather than start another process on its
-/// transcript.
+/// A turn reuses the session's warm container when its requester and its
+/// mounts match, and the warm process in it when its credential kind and
+/// its model match too. Otherwise it stops the process (and the container,
+/// for another requester, other mounts or a failed `process_stopping`) and
+/// starts another, resuming from the transcript. Another requester's turn
+/// gets a new container because stopping it ends every process an earlier
+/// turn left running there, which could otherwise spend this turn's
+/// credential and act through agentctl while it runs. A process that
+/// crashed, timed out or refused its `--resume` is stopped after the turn;
+/// if it wasn't seen to exit, its container is stopped too before the next
+/// process starts, so two processes never write one transcript. A container
+/// the sandbox fails to stop stays the session's, marked dead: the session's
+/// turns fail until a later stop succeeds, rather than start another process
+/// on its transcript.
 ///
 /// # Started sessions
 ///
@@ -721,9 +729,16 @@ impl<H: TurnHooks> Inner<H> {
         Ok((outcome, refused))
     }
 
-    /// Makes sure the session has a container with the turn's mounts and a
-    /// running process on the turn's credential kind and model. Returns how
-    /// the process was started, if it was.
+    /// Makes sure the session has a container started for the turn's
+    /// requester, with the turn's mounts, and a running process on the
+    /// turn's credential kind and model. Returns how the process was
+    /// started, if it was.
+    ///
+    /// A container started for another requester goes, process and all,
+    /// as a dead one or one with other mounts does, so nothing an earlier
+    /// requester's turn left running sees this turn's credential or
+    /// agentctl token. An agent-to-agent hop inherits its requester, so it
+    /// keeps the container.
     ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
@@ -749,7 +764,7 @@ impl<H: TurnHooks> Inner<H> {
         let kind = request.credential.kind();
         if let Some(held) = &warm.held {
             let dead = held.tracked.state().dead;
-            if dead || held.mounts != mounts {
+            if dead || held.mounts != mounts || held.requester != request.requester {
                 self.release_container(warm).await?;
             }
         }
@@ -767,7 +782,7 @@ impl<H: TurnHooks> Inner<H> {
             Some(held) => warm.held.insert(held),
             None => {
                 let held = self
-                    .start_container(session, mounts, warm.slot.clone())
+                    .start_container(session, mounts, &request.requester, warm.slot.clone())
                     .await?;
                 warm.held.insert(held)
             }
@@ -833,12 +848,13 @@ impl<H: TurnHooks> Inner<H> {
         }
     }
 
-    /// Starts a container for `session` once both caps have room, and
-    /// tracks it.
+    /// Starts a container for `session` and `requester`'s turns once both
+    /// caps have room, and tracks it.
     async fn start_container(
         &self,
         session: &Session,
         mounts: Mounts,
+        requester: &Requester,
         slot: Weak<AsyncMutex<Warm<H>>>,
     ) -> Result<Held<H>> {
         let volume_key = session.volume();
@@ -872,6 +888,7 @@ impl<H: TurnHooks> Inner<H> {
         Ok(Held {
             container,
             mounts,
+            requester: requester.clone(),
             tracked,
             process: None,
             _scope_permit: scope_permit,
