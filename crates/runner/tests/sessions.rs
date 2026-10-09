@@ -823,6 +823,71 @@ async fn a_model_change_restarts_the_process() {
 }
 
 #[tokio::test]
+async fn a_requester_change_replaces_the_container() {
+    let h = Harness::new(&[
+        Turn::reply("a"),
+        Turn::reply("b"),
+        Turn::reply("c"),
+        Turn::reply("d"),
+        Turn::reply("e"),
+    ])
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    let first = request("1");
+    assert_eq!(
+        h.run(id, first.clone()).await.process_start,
+        Some(SessionStart::New)
+    );
+    let mut again = first.clone();
+    again.turn = TurnId::new_v4();
+    again.message = "2".into();
+    assert_eq!(
+        h.run(id, again.clone()).await.process_start,
+        None,
+        "the same requester keeps the container and the process"
+    );
+    let mut hop = again.clone();
+    hop.turn = TurnId::new_v4();
+    hop.message = "3".into();
+    hop.hop = Hop::ZERO.next().unwrap();
+    assert_eq!(
+        h.run(id, hop).await.process_start,
+        None,
+        "a hop inherits its requester, so it keeps them too"
+    );
+    h.clear();
+    let mut other = request("4");
+    other.requester.key.user = "U2".into();
+    let report = h.run(id, other.clone()).await;
+    assert_eq!(reply(&report), "d");
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert_eq!(
+        h.events(),
+        [
+            Event::ProcessStopping(id, 1),
+            Event::ContainerStopped(id),
+            Event::ContainerStarted(id),
+            Event::ProcessStarting(id, CredentialKind::Subscription, 2),
+            Event::TurnStarting(id, 2, other.turn),
+            Event::TurnFinished(id, 2, other.turn),
+        ]
+    );
+    h.clear();
+    let mut community = request("5");
+    community.credential = CredentialRef::Community;
+    community.requester.key.user = "U3".into();
+    let report = h.run(id, community).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert!(
+        h.events().contains(&Event::ContainerStarted(id)),
+        "a community-key turn of another requester gets a container too"
+    );
+    assert_eq!(h.sandbox.running(), 1);
+    assert_eq!(h.transcript(&session), ["1", "2", "3", "4", "5"]);
+}
+
+#[tokio::test]
 async fn reset_starts_with_a_new_id() {
     let h = Harness::new(&[Turn::reply("old"), Turn::reply("new")]).await;
     let old = h.thread_session("1.1").await;

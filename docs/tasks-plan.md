@@ -1933,6 +1933,11 @@ Deliverables:
     ([impl-notes](impl-notes.md#mounts-come-from-the-turns-side)).
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
+  If the next turn's `Requester` differs from the one whose turn started the
+  container, stop the container, which ends every process a turn left running
+  in it, and start a new one, whose process starts with `--resume`. An
+  agent-to-agent hop inherits its requester, so it keeps the container
+  ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
   its exit being confirmed. Call `process_stopping` and stop the container
@@ -1953,6 +1958,8 @@ Acceptance:
     transcript.
   - A credential-kind change restarts the process.
   - A model change restarts the process.
+  - Another requester's turn replaces the container; a turn of the same
+    requester, and an agent-to-agent hop carrying it, keep it.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
@@ -4220,21 +4227,20 @@ Not scheduled. Each needs a decision before it becomes a task.
   `DELETE` and `OPTIONS`.
 - **Processes a turn leaves running.** T18 unpoints the placeholder when a
   turn ends, so a background process the model left running can't spend
-  credentials between turns. It can still spend turn N+1's credential
-  while turn N+1 runs, whoever its requester is. Killing what a turn leaves
-  behind has no clean boundary: the CLI stays running between turns, the
-  Bash tool's background shells are its children, a job started with `&`
-  is reparented to the container's init once its shell exits, and the
-  Docker sandbox kills a process by its pid alone. Stopping the container
-  ends its PID namespace and every process in it, so recycling the
-  container when the requester changes removes the cross-requester case.
-  It costs a container start and a CLI `--resume` whenever consecutive
-  turns of one session come from different requesters. A process left
-  behind then spends only the credentials of its own requester's later
-  turns, and can still use the egress allowlist between turns. Files a
-  turn leaves in the session's `work/` or `home/` outlive the container, so
-  a later turn of another requester can still run something it left, such
-  as a git hook.
+  credentials between turns, and T21 recycles the session's container when
+  the requester changes, which ends every process in it, so a leftover never
+  runs during another requester's turn
+  ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
+  What remains: a process left behind can still spend the credentials of
+  its own requester's later turns while they run, and act through
+  `agentctl` on them, and it can use the egress allowlist between turns.
+  Files a turn leaves in the session's `work/` or `home/` outlive the
+  container, so a later turn of another requester can still run something
+  left there, such as a git hook. Killing what a turn leaves behind has no
+  clean boundary: the CLI stays running between turns, the Bash tool's
+  background shells are its children, a job started with `&` is reparented
+  to the container's init once its shell exits, and the Docker sandbox
+  kills a process by its pid alone.
 - **Metering at the credential proxy.** T27's meter and thread token
   budget read tokens and cost from the CLI's output, and the agent runs as
   the CLI's user, so it can print its own `assistant` and `result` lines
@@ -4246,11 +4252,13 @@ Not scheduled. Each needs a decision before it becomes a task.
   (T18) forwards, keyed by the turn's placeholder, would make the budget
   and the meter hard bounds too. The same stdout lets the agent print a
   forged `result` line, which ends its turn early with its own reply; the
-  CLI's real result is then read as the next turn's, so the next
-  requester gets this turn's reply and pays its cost. Reading turns from a
-  channel the agent can't write would close that as well. It would also
-  bill the turns T27 records with an unknown cost, such as every resumed
-  process's first turn once a long thread's transcript passes 5 MiB.
+  CLI's real result is then read as the next turn's, so the requester's
+  next turn in the session gets this turn's reply and is billed its cost.
+  Another requester's turn gets a new container (T21), so it never reads
+  that result. Reading turns from a channel the agent can't write would
+  close that as well. It would also bill the turns T27 records with an
+  unknown cost, such as every resumed process's first turn once a long
+  thread's transcript passes 5 MiB.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
