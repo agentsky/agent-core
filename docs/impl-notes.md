@@ -10490,6 +10490,7 @@ it passes.
   `cloud run` from a linked identity of that member fires it. A
   configuration token stored that way stays too, renewed for as long as
   Slack renews a deactivated user's token, until the member's `logout`.
+
 ## T36d: Slack Connect: channel ids that change
 
 No private channel was shared with another organization from the
