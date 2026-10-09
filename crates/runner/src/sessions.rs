@@ -119,7 +119,8 @@ enum AfterTurn {
 /// gone goes, and so does its container if the process wasn't seen to exit,
 /// so two processes never share a transcript. A process whose
 /// `turn_finished` failed goes too, since its placeholder may still be
-/// pointed.
+/// pointed. A stopped process can still take its container with it: see
+/// `Inner::stop_process`.
 fn after_turn(dead: bool, running: bool, may_be_alive: bool, finished_ok: bool) -> AfterTurn {
     if dead || (!running && may_be_alive) {
         AfterTurn::StopContainer
@@ -228,20 +229,24 @@ fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
 ///
 /// A failed or panicking `process_starting` fails the turn and stops the
 /// container, and so does a process that fails or panics while starting. A
-/// panic in `process_stopping` is logged like its failure, and the stop goes
-/// ahead; unless a later call for that process succeeds, the hook runs
-/// once more when its container has been stopped, and if that fails too
-/// the runner logs it and gives up.
+/// failed or panicking `process_stopping` is logged, and the stop goes ahead
+/// and takes the container with it, so that once the container is stopped
+/// nothing left running there keeps what the hook failed to revoke; one the
+/// sandbox fails to stop may stay running, and stays the session's, marked
+/// dead, until a later stop succeeds. Once the container is stopped the hook
+/// runs once more, unless a call for that process has succeeded since, and if
+/// that fails too the runner logs it and gives up.
 ///
 /// A turn reuses the session's warm process when its credential kind, its
 /// model and its mounts match, and otherwise stops it (and the container,
-/// for other mounts) and starts another, resuming from the transcript. A
-/// process that crashed, timed out or refused its `--resume` is stopped
-/// after the turn; if it wasn't seen to exit, its container is stopped too
-/// before the next process starts, so two processes never write one
-/// transcript. A container the sandbox fails to stop stays the session's,
-/// marked dead: the session's turns fail until a later stop succeeds, rather
-/// than start another process on its transcript.
+/// for other mounts or a failed `process_stopping`) and starts another,
+/// resuming from the transcript. A process that crashed, timed out or
+/// refused its `--resume` is stopped after the turn; if it wasn't seen to
+/// exit, its container is stopped too before the next process starts, so
+/// two processes never write one transcript. A container the sandbox fails
+/// to stop stays the session's, marked dead: the session's turns fail until
+/// a later stop succeeds, rather than start another process on its
+/// transcript.
 ///
 /// # Started sessions
 ///
@@ -1025,8 +1030,9 @@ impl<H: TurnHooks> Inner<H> {
     }
 
     /// Stops the held process, if any, after `process_stopping`. Returns
-    /// whether the process may still be running, in which case the
-    /// container must be stopped before another process starts in it.
+    /// whether the container must be stopped before another process starts
+    /// in it: the process may still run, or a revocation failed, which only
+    /// stopping the container retries.
     async fn stop_process(&self, held: &mut Held<H>) -> bool {
         let Some(mut running) = held.process.take() else {
             return false;
@@ -1034,7 +1040,7 @@ impl<H: TurnHooks> Inner<H> {
         held.tracked.state().process = None;
         self.process_stopping(&held.tracked, &running.handle).await;
         running.process.stop().await;
-        running.process.may_be_alive()
+        running.process.may_be_alive() || !held.tracked.state().unrevoked.is_empty()
     }
 
     /// Calls `process_starting`, turning a panic into a failure.
