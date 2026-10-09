@@ -11050,6 +11050,7 @@ now answers that question, taking a settled change only to its
 id for the denies; both walk the changes through one `reached` helper
 (`a_settled_change_leads_to_where_slack_found_the_channel`, with a cycle
 through a settled change).
+
 ## T37: Rocket.Chat end to end in CI
 
 ### The fake must share agentd's network namespace
