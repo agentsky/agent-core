@@ -1896,7 +1896,8 @@ Deliverables:
   If the next turn's `Requester` differs from the one whose turn started the
   container, stop the container, which ends every process a turn left running
   in it, and start a new one, whose process starts with `--resume`. An
-  agent-to-agent hop inherits its requester, so it keeps the container
+  agent-to-agent hop runs as the requester it inherits, so it keeps a
+  container started for that requester
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
@@ -2837,12 +2838,20 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Killing leftover processes at turn end.** T18 unpoints the placeholder
   when a turn ends, so a background process the model left running can't
   spend credentials between turns, and T21 recycles the session's container
-  when the requester changes, which ends every process in it, so a leftover
-  never runs during another requester's turn
+  when the requester changes, which ends every process running in it
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
-  It can still spend the credentials of its own requester's later turns
-  while they run. Only killing the processes a turn leaves behind in the
-  container when it ends removes that.
+  A leftover can still spend the credentials of its own requester's later
+  turns while they run; only killing the processes a turn leaves behind in
+  the container when it ends removes that. Files outlive the container: a
+  turn can leave something in the session's `home/`, `tmp/` or `claude/`
+  (a `.bashrc` the Bash tool's shells source, a `CLAUDE.md` the CLI loads
+  as user memory; `settings.json` is rewritten before each start), in
+  `work/` or `shared/`, or in the transcript, that runs or instructs code
+  in a later requester's process. Clearing `home/`, `tmp/` and everything
+  in `claude/` but the transcript and `settings.json` on a requester
+  change, or putting `HOME` and `TMPDIR` on a tmpfs of the container's
+  own, would close the first three; `work/`, `shared/` and the transcript
+  would still carry over.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
