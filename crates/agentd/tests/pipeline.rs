@@ -2367,7 +2367,7 @@ async fn a_failed_upload_still_posts_the_reply_and_says_part_was_lost() {
 }
 
 #[tokio::test]
-async fn a_post_not_recorded_says_part_was_lost_only_when_it_lost_a_hand_off() {
+async fn a_post_not_recorded_says_part_was_lost_whether_or_not_it_lost_a_hand_off() {
     use sqlx::Connection as _;
     let stack = start().await;
     let writer = stack.other_agent("writer", "UWRITER").await;
@@ -2391,8 +2391,8 @@ async fn a_post_not_recorded_says_part_was_lost_only_when_it_lost_a_hand_off() {
     let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
     assert_eq!(
         texts,
-        ["Here."],
-        "the person saw the whole reply, which handed nothing off"
+        ["Here.", DELIVERY_FAILED_TEXT],
+        "the reply's row was lost, though it handed nothing off"
     );
     assert_eq!(
         stack.store().posted_message_ref(&sent[0].2).await.unwrap(),

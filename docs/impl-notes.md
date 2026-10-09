@@ -9165,21 +9165,24 @@ thread was never told. Separately, a failed upload skipped the reply's
 post: `uploaded && self.post(..)` short-circuited.
 
 **Solution.** The reply is posted whatever the upload did, and `post_to`
-returns `Sent { posted, handed_off }`; a turn's delivery is complete only
-when the upload and every post succeeded and every chunk with hand-offs
-to make was recorded with them, and otherwise says
-`DELIVERY_FAILED_TEXT`. A chunk that hands off to no one and can't be
-recorded is only logged: the person saw all of it, and a line saying
-part was lost would only have them pay for the turn again; what it loses
-is a short id. That goes for a private task's result too: the thread
-saw it, but without its row `consent_posted` can't tell it was posted,
-so if agentd stops before the task's work is finished, the next attempt
-says the task was interrupted rather than finishing quietly. A reply
-posted after a failed upload may still say it attached the file; the
-failure line follows it. A private task's outcome
-(`tell_thread`) needs only `posted`: its record is what `consent_posted`
-reads to mark the outcome posted, so treating an unrecorded outcome as
-unposted would post it again on each retry.
+returns what it lost, `Lost::Chunk` or `Lost::Row`, a lost chunk
+winning. A chunk posted without its row costs more than a short id: the
+row is what attributes the post, so a person's reply to it that mentions
+no agent reaches none (`is_reply_to_agent` reads the row), a mention in
+it starts no hop, and the next turn shows it again as history. So it
+counts as a lost part whether or not it carried hand-offs, and a turn's
+delivery is complete only when the upload and every post succeeded and
+every chunk was recorded; otherwise it says `DELIVERY_FAILED_TEXT`. A
+chunk that was to hand off loses those hand-offs with its row, which is
+the same `Lost::Row`, and no agent's hop runs from it. A reply posted
+after a failed upload may still say it attached the file; the failure
+line follows it. A private task's outcome (`tell_thread`) counts a lost
+row as posted: its record is what `consent_posted` reads to mark the
+outcome posted, so treating an unrecorded outcome as unposted would post
+it again on each retry. Without its row `consent_posted` can't tell it
+was posted either, so if agentd stops before the task's work is
+finished, the next attempt says the task was interrupted rather than
+finishing quietly.
 
 ### Smaller choices
 
