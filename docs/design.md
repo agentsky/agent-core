@@ -231,8 +231,11 @@ attribution](#agent-to-agent-attribution)). A one-to-one DM holds one agent, so
 its caps don't apply there. The token budget and the usage meter read the CLI's
 own figures, which the agent can falsify: it runs as the CLI's user and can
 write to its stdout and its transcript. So the turn caps, the hop cap and the
-per-turn hand-off cap, which count turns agentd starts, are the hard bounds on
-a loop, and the token budget stops agents that loop by mistake. The meter also
+per-turn hand-off cap, which count turns agentd starts, are the bounds on a
+loop agentd keeps whatever the CLI reports, and the token budget stops agents
+that loop by mistake. The turn caps count turns once they end, so they slow a
+loop rather than stop a burst of turns that start together (see
+[Agent-to-agent attribution](#agent-to-agent-attribution)). The meter also
 keeps each turn's cost as the CLI reckons it, but only as a record: no limit
 reads it.
 
@@ -358,11 +361,14 @@ more, all on the same requester's account. So a turn also hands off to at most
 K agents (`MAX_HAND_OFFS`, 2): the agents it asks with `ask-agent` keep their
 places, the agents its other posts mention take what is left in the order the
 posts go out, and the rest are passed over. Together the per-turn cap and the
-hop cap h bound the hand-offs one message can cascade into at
-K + K² + … + K^h turns: 2 + 4 + 8 = 14 with the default hop cap of 3, after
-the turn the message itself started, and the thread's turn and token caps
-apply to all of them. A person's message that mentions several agents starts
-one such cascade for each.
+hop cap h bound the hand-offs one turn can cascade into at K + K² + … + K^h
+turns: with the default hop cap of 3, a turn an agent runs for a requester
+starts at most 2 + 4 + 8 = 14 more on that requester's account, 1 + 14 in
+all.[^session-reset] The first wave is a different matter: a person's message
+starts one turn for each agent it mentions, each with its own cascade, and
+those are bounded by `MAX_MENTIONS` (100) and the pipeline's places (per
+owner and in all), not by the thread's hourly turn cap. That cap counts turns
+metered once they end, so turns that start together all pass it.
 
 agentd delivers those mentions itself rather than waiting for the platform to
 deliver its own bots' posts back. Once a turn's posts are out, each one in the
@@ -1080,6 +1086,7 @@ Direct calls would also need our own agent loop.
 [^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
 [^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace. Since T34, hand-off doesn't depend on it: agentd delivers an agent's post itself to the managed agents the post mentions, in the thread its turn answered, and once an agent's hop from that turn ran, any other copy, agentd's or the platform's, is dropped. T32's live check now only shows whether Slack delivers that duplicate.
+[^session-reset]: A turn the runner refuses with a session reset, before it reaches the model, runs once more on the session looked up again, as the same turn; it starts no hop of its own.
 [^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
 [^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.
 [^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.

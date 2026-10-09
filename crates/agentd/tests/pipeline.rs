@@ -2302,9 +2302,10 @@ async fn a_failed_upload_still_posts_the_reply_and_says_part_was_lost() {
 }
 
 #[tokio::test]
-async fn a_reply_posted_but_not_recorded_says_part_was_lost() {
+async fn a_post_not_recorded_says_part_was_lost_only_when_it_lost_a_hand_off() {
     use sqlx::Connection as _;
     let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
     let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
         .await
         .unwrap();
@@ -2316,18 +2317,41 @@ async fn a_reply_posted_but_not_recorded_says_part_was_lost() {
     .await
     .unwrap();
     db.close().await.unwrap();
+
     stack.next_turn(Turn::reply("Here."));
     stack
         .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "r1", None, &[BOT]))
         .await;
     let sent = posts(&stack.calls_since(0));
     let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
-    assert_eq!(texts, ["Here.", DELIVERY_FAILED_TEXT]);
+    assert_eq!(
+        texts,
+        ["Here."],
+        "the person saw the whole reply, which handed nothing off"
+    );
     assert_eq!(
         stack.store().posted_message_ref(&sent[0].2).await.unwrap(),
-        None,
-        "the reply went out, but its row couldn't be recorded"
+        None
     );
+
+    let before = stack.mock.calls().len();
+    let reply = "@UWRITER over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "r2", None, &[BOT]))
+        .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let texts: Vec<String> = posts(&stack.calls_since(before))
+        .into_iter()
+        .map(|(_, text, _)| text)
+        .collect();
+    assert_eq!(
+        texts,
+        [reply, DELIVERY_FAILED_TEXT],
+        "the reply's hand-off was lost with its row"
+    );
+    assert!(stack.writers_hops(writer).await.is_empty());
     stack.stop().await;
 }
 
@@ -3113,7 +3137,12 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
 
 #[tokio::test]
 async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_more() {
-    let stack = start().await;
+    use sqlx::Connection as _;
+    let stack = start_with(Setup {
+        pipeline: |settings| settings.attribution_wait = Duration::from_secs(30),
+        ..Setup::default()
+    })
+    .await;
     let bots = ["UWRITER", "USCOUT", "UCRITIC"];
     let mut agents = Vec::new();
     for (name, bot) in ["writer", "scout", "critic"].into_iter().zip(bots) {
@@ -3125,17 +3154,63 @@ async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_mo
             .unwrap();
         agents.push(agent);
     }
-    stack.next_turn(Turn::reply("@UWRITER @USCOUT @UCRITIC over to you."));
+    let reply = "@UWRITER @USCOUT @UCRITIC over to you.";
+    let first = "m1";
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER claimed_after_the_row BEFORE INSERT ON processed_events \
+         WHEN NEW.source = 'hop' \
+         AND EXISTS (SELECT 1 FROM message_refs WHERE platform_ref = 'm1') \
+         AND NOT EXISTS (SELECT 1 FROM processed_events p \
+             WHERE p.source = NEW.source AND p.event_id = NEW.event_id) \
+         AND NOT EXISTS (SELECT 1 FROM hand_offs h WHERE NEW.event_id LIKE h.agent_id || '/%') \
+         BEGIN SELECT RAISE(ABORT, 'a hop no hand-off holds was first claimed after its post was recorded'); END",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    stack.next_turn(Turn::reply(reply));
+    let gate = Gate::closed();
+    stack.holds.posts_of(reply, &gate);
+    let copy = tokio::spawn({
+        let (pipeline, post) = (
+            stack.pipeline.clone(),
+            stack.agents_post(BOT, first, "c1", &bots),
+        );
+        async move { pipeline.handle(post, MockSurface::DEFAULT_CAPS).await }
+    });
     stack
-        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
-        .await;
-    let first = stack.wait_for_posts(1).await[0].2.clone();
-    assert_eq!(stack.attributed(&first).await.0, Some(stack.agent));
-    stack
-        .handle(stack.agents_post(BOT, first.id.as_str(), "c1", &bots))
-        .await;
+        .pipeline
+        .sink(MockSurface::DEFAULT_CAPS)
+        .send(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await
+        .unwrap();
+    wait_until("helper's reply waits to be posted", || gate.waiting() == 1).await;
+    assert!(
+        !copy.is_finished(),
+        "the platform's copy, which arrived before the post, waits for its attribution"
+    );
+    gate.open();
+    copy.await.unwrap();
+    let unreacted = Call::Unreact {
+        msg: msg("GENERAL", "c1"),
+        emoji: "hourglass".into(),
+    };
+    wait_until("helper's turn is done with, hand-offs and all", || {
+        stack.mock.calls().contains(&unreacted)
+    })
+    .await;
     stack.pipeline.close();
     stack.pipeline.drain().await;
+    let sent = posts(&stack.mock.calls());
+    assert_eq!(sent[0].2.id.as_str(), first);
+    assert!(
+        !sent.iter().any(|(_, text, _)| text == DELIVERY_FAILED_TEXT),
+        "the passed-over hops were claimed before the post's row was there"
+    );
     let mut ran = Vec::new();
     for agent in &agents {
         ran.push(stack.writers_hops(*agent).await);
@@ -3147,6 +3222,43 @@ async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_mo
         ran, expected,
         "the first agents the post mentions run its hop, and the platform's copy runs no other"
     );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_post_whose_mentions_cant_be_looked_up_is_left_unrecorded() {
+    use sqlx::Connection as _;
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    stack.other_agent("critic", "UCRITIC").await;
+    let mut db = sqlx::SqliteConnection::connect(&stack.dir.db_url())
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys = OFF; \
+         UPDATE agent_bindings SET id = 'not-a-binding-id' WHERE bot_user_id = 'UCRITIC';",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let reply = "@UWRITER @UCRITIC over to you.";
+    stack.next_turn(Turn::reply(reply));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let sent = posts(&stack.mock.calls());
+    let texts: Vec<&str> = sent.iter().map(|(_, text, _)| text.as_str()).collect();
+    assert_eq!(texts, [reply, DELIVERY_FAILED_TEXT]);
+    assert_eq!(
+        stack.store().posted_message_ref(&sent[0].2).await.unwrap(),
+        None,
+        "a post with a mention neither handed off nor claimed gets no row to attribute it"
+    );
+    assert!(stack.kept_hand_offs().await.is_empty());
+    assert!(stack.writers_hops(writer).await.is_empty());
     stack.stop().await;
 }
 

@@ -2303,11 +2303,13 @@ struct HandedOff {
 }
 
 /// The hand-offs a turn's delivery recorded so far ([`HandedOff`]), one
-/// for each agent, and the agents its `ask-agent` posts ask.
+/// for each agent, the agents its `ask-agent` posts ask, and the agents it
+/// passed over whose hops it claimed ([`Delivery::pass_over`]).
 #[derive(Default)]
 struct Handing {
     handed: Vec<HandedOff>,
     asked: Vec<AgentId>,
+    passed: Vec<AgentId>,
 }
 
 impl Handing {
@@ -2334,18 +2336,29 @@ impl Handing {
 }
 
 /// What [`Delivery::post_to`] got out of a text: whether every chunk was
-/// posted, and whether every chunk posted was recorded.
+/// posted, and whether every hand-off its chunks were to make was
+/// recorded.
 #[derive(Debug, Clone, Copy)]
 struct Sent {
     posted: bool,
-    recorded: bool,
+    handed_off: bool,
 }
 
 impl Sent {
-    /// Whether nothing was lost: every chunk posted and recorded.
+    /// Whether nothing was lost: every chunk posted, and every hand-off
+    /// recorded.
     fn complete(self) -> bool {
-        self.posted && self.recorded
+        self.posted && self.handed_off
     }
+}
+
+/// What one chunk of a turn's post hands off: the agents with a place
+/// among the turn's [`MAX_HAND_OFFS`], and the event they are handed,
+/// with its JSON for their `hand_offs` rows.
+#[derive(Default)]
+struct Plan {
+    to: Vec<Agent>,
+    event: Option<(Arc<InboundEvent>, String)>,
 }
 
 /// Delivers what one turn made, as the agent's bot.
@@ -2447,6 +2460,7 @@ impl Delivery<'_> {
                 .flat_map(|outbox| outbox.posts())
                 .filter_map(|post| post.asks)
                 .collect(),
+            passed: Vec::new(),
         };
         let sent = self.post(Some(turn), &reply, &mut handing).await;
         let mut complete = uploaded && sent.complete();
@@ -2481,18 +2495,16 @@ impl Delivery<'_> {
     /// `message_refs` row for each chunk, of `turn` if a turn made it. A
     /// chunk that can't be posted is skipped and the rest still go. Empty
     /// text posts nothing. Returns whether every chunk was posted, and
-    /// whether each one posted was recorded too: one that wasn't hands
-    /// nothing off and no short id names it.
+    /// whether every chunk with hand-offs to make was recorded with them.
+    /// A chunk that hands off to no one and can't be recorded is only
+    /// logged: its thread saw all of it, though no short id names it.
     ///
     /// A chunk hands off when a turn posted it in the turn's own thread,
-    /// with [`HandOffs`]: then a `hand_offs` row is recorded with its row,
-    /// in one transaction, for each managed agent it mentions that has a
-    /// place among the turn's [`MAX_HAND_OFFS`]
-    /// ([`mentioned`](Self::mentioned)), and held at once, so no replay
-    /// takes it while this turn hands it off; the agents go in `handing`,
-    /// so a turn hands off to an agent once. The hops to the agents it
-    /// mentions past them are claimed first ([`pass_over`](Self::pass_over)),
-    /// so no copy of the chunk, agentd's or the platform's, runs them.
+    /// with [`HandOffs`] ([`plan`](Self::plan)): then a `hand_offs` row is
+    /// recorded with its row, in one transaction, for each managed agent it
+    /// mentions that has a place among the turn's [`MAX_HAND_OFFS`], and
+    /// held at once, so no replay takes it while this turn hands it off;
+    /// the agents go in `handing`, so a turn hands off to an agent once.
     async fn post_to(
         &self,
         turn: Option<TurnId>,
@@ -2507,7 +2519,7 @@ impl Delivery<'_> {
             .filter(|_| *target == self.target);
         let mut sent = Sent {
             posted: true,
-            recorded: true,
+            handed_off: true,
         };
         if text.trim().is_empty() {
             return sent;
@@ -2521,34 +2533,22 @@ impl Delivery<'_> {
                     continue;
                 }
             };
-            let (mentioned, over) = match hands_off {
-                Some(_) => self.mentioned(target, &posted, handing).await,
-                None => (Vec::new(), Vec::new()),
-            };
-            if let Some((hand_offs, turn)) = hands_off
-                && !over.is_empty()
-                && !self
-                    .pass_over(&over, turn, hand_offs.now, &posted.msg)
-                    .await
-            {
-                sent.recorded = false;
-                continue;
-            }
-            let event = match hands_off.filter(|_| !mentioned.is_empty()) {
-                Some((hand_offs, _)) => {
-                    let event = hand_offs.event(target, &posted, &chunk);
-                    match serde_json::to_string(&event) {
-                        Ok(json) => Some((Arc::new(event), json)),
-                        Err(err) => {
-                            tracing::error!(agent = %self.agent, error = %err, "couldn't encode a hand-off");
-                            None
-                        }
-                    }
+            let plan = match hands_off {
+                Some((hand_offs, turn)) => {
+                    let planned = self
+                        .plan(hand_offs, turn, target, &posted, &chunk, handing)
+                        .await;
+                    let Some(plan) = planned else {
+                        sent.handed_off = false;
+                        continue;
+                    };
+                    plan
                 }
-                None => None,
+                None => Plan::default(),
             };
-            let new_hand_offs: Vec<NewHandOff<'_>> = match (hands_off, &event) {
-                (Some((hand_offs, _)), Some((_, json))) => mentioned
+            let new_hand_offs: Vec<NewHandOff<'_>> = match (hands_off, &plan.event) {
+                (Some((hand_offs, _)), Some((_, json))) => plan
+                    .to
                     .iter()
                     .map(|agent| NewHandOff {
                         agent: agent.id,
@@ -2583,13 +2583,13 @@ impl Delivery<'_> {
             let ids = match recorded {
                 Ok((_, ids)) => ids,
                 Err(err) => {
-                    tracing::warn!(session = %self.session, msg = %posted.msg.id, error = %err, "recording a posted message and its hand-offs failed");
-                    sent.recorded = false;
+                    tracing::warn!(session = %self.session, msg = %posted.msg.id, hand_offs = plan.to.len(), error = %err, "recording a posted message and its hand-offs failed");
+                    sent.handed_off &= plan.to.is_empty();
                     continue;
                 }
             };
-            if let (Some((hand_offs, turn)), Some((event, _))) = (hands_off, &event) {
-                for (agent, id) in mentioned.iter().zip(ids) {
+            if let (Some((hand_offs, turn)), Some((event, _))) = (hands_off, &plan.event) {
+                for (agent, id) in plan.to.iter().zip(ids) {
                     if let Some(holding) = hand_offs.holder.hold(id) {
                         handing.handed.push(HandedOff {
                             holding,
@@ -2605,17 +2605,69 @@ impl Delivery<'_> {
         sent
     }
 
+    /// What `posted`, a chunk of `turn`'s post in its own thread, hands
+    /// off. Every managed agent its row will attribute a mention of is
+    /// handed the chunk, in that row's transaction, or has its hop claimed
+    /// before ([`pass_over`](Self::pass_over)), or was dealt with by an
+    /// earlier chunk, so no mention in the row is left for the platform's
+    /// copy to run as a hop of its own. `None`, logged, when that can't be
+    /// made sure: an agent it mentions couldn't be looked up, the hand-off
+    /// couldn't be encoded, or a claim couldn't be recorded. The chunk is
+    /// then left unrecorded, so it hands off nothing, by either copy.
+    async fn plan(
+        &self,
+        hand_offs: &HandOffs,
+        turn: TurnId,
+        target: &ReplyTarget,
+        posted: &Posted,
+        chunk: &str,
+        handing: &mut Handing,
+    ) -> Option<Plan> {
+        let (to, over) = match self.mentioned(target, posted, handing).await {
+            Ok(found) => found,
+            Err(err) => {
+                tracing::warn!(agent = %self.agent, msg = %posted.msg.id, error = %err, "couldn't look up an agent a post mentions; not recording the post");
+                return None;
+            }
+        };
+        if !over.is_empty()
+            && !self
+                .pass_over(&over, turn, hand_offs.now, &posted.msg, handing)
+                .await
+        {
+            return None;
+        }
+        if to.is_empty() {
+            return Some(Plan::default());
+        }
+        let event = hand_offs.event(target, posted, chunk);
+        match serde_json::to_string(&event) {
+            Ok(json) => Some(Plan {
+                to,
+                event: Some((Arc::new(event), json)),
+            }),
+            Err(err) => {
+                tracing::error!(agent = %self.agent, msg = %posted.msg.id, error = %err, "couldn't encode a hand-off; not recording the post");
+                None
+            }
+        }
+    }
+
     /// The managed agents `posted` mentions whose bot is active on the
     /// conversation's surface and team, other than the poster and the
-    /// agents handed to already, each once: those with a place among the
-    /// turn's [`MAX_HAND_OFFS`] ([`Handing::has_place`]), and those past
-    /// them.
+    /// agents handed to or passed over already, each once: those with a
+    /// place among the turn's [`MAX_HAND_OFFS`] ([`Handing::has_place`]),
+    /// and those past them.
+    ///
+    /// # Errors
+    ///
+    /// If an agent it mentions couldn't be looked up.
     async fn mentioned(
         &self,
         target: &ReplyTarget,
         posted: &Posted,
         handing: &Handing,
-    ) -> (Vec<Agent>, Vec<AgentId>) {
+    ) -> Result<(Vec<Agent>, Vec<AgentId>), StoreError> {
         let mut mentioned: Vec<Agent> = Vec::new();
         let mut over = Vec::new();
         for user in &posted.mentions {
@@ -2624,32 +2676,29 @@ impl Delivery<'_> {
                 team: target.conv.team.clone(),
                 user: user.clone(),
             };
-            match self.store.agent_for_bot(&key).await {
-                Ok(Some((agent, _)))
-                    if agent.id != self.agent
-                        && !handing.handed_to(agent.id)
-                        && mentioned.iter().all(|seen| seen.id != agent.id)
-                        && !over.contains(&agent.id) =>
-                {
-                    if handing.has_place(agent.id, &mentioned) {
-                        mentioned.push(agent);
-                    } else {
-                        over.push(agent.id);
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!(agent = %self.agent, msg = %posted.msg.id, error = %err, "couldn't look up an agent a post mentions");
+            if let Some((agent, _)) = self.store.agent_for_bot(&key).await?
+                && agent.id != self.agent
+                && !handing.handed_to(agent.id)
+                && !handing.passed.contains(&agent.id)
+                && mentioned.iter().all(|seen| seen.id != agent.id)
+                && !over.contains(&agent.id)
+            {
+                if handing.has_place(agent.id, &mentioned) {
+                    mentioned.push(agent);
+                } else {
+                    over.push(agent.id);
                 }
             }
         }
-        (mentioned, over)
+        Ok((mentioned, over))
     }
 
     /// Claims the hops from `turn` to the agents `over`, which `msg`
     /// mentions past the turn's [`MAX_HAND_OFFS`], before `msg`'s row is
     /// recorded: the platform's copy of `msg` takes a hop only once that
-    /// row is there, and then finds these claimed. Returns false when a
+    /// row is there, and then finds these claimed. Each agent claimed goes
+    /// in `handing`'s passed, so a later chunk neither claims it again nor
+    /// gives it a place whose hop could never run. Returns false when a
     /// claim couldn't be recorded; the row is then left out, so `msg`
     /// hands off nothing, by either copy.
     async fn pass_over(
@@ -2658,6 +2707,7 @@ impl Delivery<'_> {
         turn: TurnId,
         now: OffsetDateTime,
         msg: &MsgRef,
+        handing: &mut Handing,
     ) -> bool {
         tracing::info!(agent = %self.agent, %turn, msg = %msg.id, ?over, "a post mentions more agents than its turn hands off to; not handing it to these");
         for agent in over {
@@ -2674,6 +2724,7 @@ impl Delivery<'_> {
                 tracing::warn!(agent = %self.agent, msg = %msg.id, error = %err, "couldn't claim a hop past the turn's hand-offs; not recording the post");
                 return false;
             }
+            handing.passed.push(*agent);
         }
         true
     }
@@ -3183,6 +3234,11 @@ mod tests {
             everyone[MAX_HAND_OFFS..],
             "the hops past the cap are claimed, so no copy of the post runs them"
         );
+        assert_eq!(
+            handing.passed,
+            everyone[MAX_HAND_OFFS..],
+            "each once, though a later post mentions it again"
+        );
 
         let turn = TurnId::new_v4();
         let mut handing = Handing {
@@ -3198,16 +3254,14 @@ mod tests {
             );
         }
         let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
-        let mut expected = everyone[..MAX_HAND_OFFS - 1].to_vec();
+        let unasked = [writer, scout];
+        let mut expected = unasked[..MAX_HAND_OFFS - 1].to_vec();
         expected.push(critic);
         assert_eq!(
             handed, expected,
             "the agent the turn asks keeps its place from the mentions before its task"
         );
-        assert_eq!(
-            claimed(&everyone, turn).await,
-            everyone[MAX_HAND_OFFS - 1..2]
-        );
+        assert_eq!(claimed(&everyone, turn).await, unasked[MAX_HAND_OFFS - 1..]);
     }
 
     #[test]

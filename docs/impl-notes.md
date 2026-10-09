@@ -8737,13 +8737,32 @@ the delivery's agree. Before a post's row is recorded, `pass_over`
 claims the hops to the agents it passes over in `processed_events`
 (`hop`, the same key `candidate` claims), and the platform's copy takes a
 hop only once that row gives it an attribution, so it finds the claim
-and is dropped; when a claim can't be written the row is left out, so
-neither copy hands anything off from that post, and the delivery is
-incomplete. Nothing new is stored: the outbox and `Handing` live for one
-turn's delivery, which a restart cuts and never repeats, and what does
-outlive it, the `hand_offs` rows (at most two per turn) and the claims,
-is already durable. With the default hop cap of 3 one message can start
-2 + 4 + 8 = 14 hand-off turns after its own.
+and is dropped. Nothing new is stored: the outbox and `Handing` live for
+one turn's delivery, which a restart cuts and never repeats, and what
+does outlive it, the `hand_offs` rows (at most two per turn) and the
+claims, is already durable. With the default hop cap of 3 a turn an
+agent runs for a requester can start 2 + 4 + 8 = 14 more on that
+requester's account; how many such turns a person's one message starts
+is bounded by `MAX_MENTIONS` and the pipeline's places instead, since the
+thread's hourly cap counts turns only once they end.
+
+A review then found the rule this rests on could break: a mentioned
+agent whose lookup failed was neither placed nor claimed, yet the post's
+row was recorded with its attribution, so the platform's copy could run
+that agent's hop past the cap. `Delivery::plan` now holds the rule that
+every managed agent a recorded, attributed post mentions is handed the
+post in its row's transaction, or had its hop claimed before the row, or
+was handed or passed over by an earlier post of the turn. When it can't
+make sure (a lookup fails, the hand-off doesn't encode, or a claim can't
+be written) the post is left unrecorded, so neither copy hands anything
+off from it, and the delivery is incomplete. The agents a turn passed
+over and claimed are kept in `Handing::passed`: a later post neither
+claims them again nor gives one of them a place whose hop, claimed
+already, could never run, which a claim that succeeded for one agent
+before another's failed would otherwise do. A test pins the claim before
+the row: the platform's copy arrives first and waits for the
+attribution, and a trigger aborts a passed-over agent's claim first
+inserted once the post's row exists.
 
 ### A chunk posted but not recorded
 
@@ -8755,12 +8774,17 @@ thread was never told. Separately, a failed upload skipped the reply's
 post: `uploaded && self.post(..)` short-circuited.
 
 **Solution.** The reply is posted whatever the upload did, and `post_to`
-returns `Sent { posted, recorded }`; a turn's delivery is complete only
-when the upload, every post and every record succeeded, and otherwise
-says `DELIVERY_FAILED_TEXT`. A private task's outcome (`tell_thread`)
-still needs only `posted`: its record is what `consent_posted` reads to
-mark the outcome posted, so treating an unrecorded outcome as unposted
-would post it again on each retry.
+returns `Sent { posted, handed_off }`; a turn's delivery is complete only
+when the upload and every post succeeded and every chunk with hand-offs
+to make was recorded with them, and otherwise says
+`DELIVERY_FAILED_TEXT`. A chunk that hands off to no one and can't be
+recorded is only logged: the person saw all of it, and a line saying
+part was lost would only have them pay for the turn again; what it loses
+is a short id. A reply posted after a failed upload may still say it
+attached the file; the failure line follows it. A private task's outcome
+(`tell_thread`) needs only `posted`: its record is what `consent_posted`
+reads to mark the outcome posted, so treating an unrecorded outcome as
+unposted would post it again on each retry.
 
 ### Smaller choices
 
