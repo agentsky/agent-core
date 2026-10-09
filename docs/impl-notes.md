@@ -3391,3 +3391,221 @@ when it starts or ends with white space; the error names the variable, never
 the value. That includes the master key, whose base64 decoding (T05) would
 have ignored the newline: the rule is simpler kept the same for all secrets,
 and `export AGENTD_MASTER_KEY="$(agentd gen-key)"` strips the newline anyway.
+
+## T29: Slack Web API
+
+Method parameters, response shapes and rate-limit tiers were read from
+Slack's SDKs (`slackapi/python-slack-sdk` `slack_sdk/web/client.py` and
+`internal_utils.py`, `slackapi/java-slack-sdk` `MethodsRateLimits.java` and
+`MethodsRateLimitTier.java`), since Slack's own documentation site wasn't
+reachable. None of it has run against real Slack yet.
+
+### `Surface::render` has no directory to pass
+
+**Issue.** T23 has the pipeline build a `MentionDirectory` snapshot from
+agent bindings and the surface's member cache before rendering, but
+`Surface::render(&self, markdown)` takes no directory, and the pipeline only
+holds a `dyn Surface`, so it can reach neither Slack's member cache nor a
+way to pass a snapshot in.
+
+**Solution.** `SlackSurface::render` resolves `@Name` through its workspace's
+member cache as last read. `users.list` lists bot users too, so agents'
+names resolve without the bindings. `render` never blocks: when the cache is
+older than its TTL (15 minutes by default) it starts a refresh on the
+current Tokio runtime for the next call. agentd (T31) awaits
+`SlackSurface::refresh_members` when it starts a binding, so the first reply
+already has names, and gives each team's `TeamDirectory` its agents' bot
+user ids with `set_managed_bots` (see below). `render_with` takes an
+explicit directory for callers that have one. T23's delivery step, T29's
+member-cache bullet and T31's receiver bullet say so.
+
+### The ingress can't look bots up
+
+**Issue.** A bot message without a `user` needs `bots.info` to fill
+`sender.user` and `sender_bot_user`, but T28's `Queue` normalizes events for
+every binding without any bot token.
+
+**Solution.** `SlackSurface::fill_bot_sender(&mut InboundEvent)` does it with
+the receiving binding's token, caching the answer per team and bot id
+(`bot_not_found` and a bot without a user are cached as "no user"; other
+errors are not cached and leave the event unchanged). The receiver of
+`SlackInbound` calls it before routing; T31's deliverables in the plan now
+say agentd's Slack receiver does. `history` names bot senders the same way.
+
+### Request encoding and the upload flow
+
+**Issue.** Slack accepts JSON bodies for some methods and only forms for
+others, and the plan didn't say how the upload step of the external upload
+flow authenticates.
+
+**Solution.** As in the Python SDK: `chat.postMessage`, `chat.update` and
+`chat.postEphemeral` send JSON (`application/json; charset=utf-8`); every
+other method sends a form POST, which Slack accepts for read methods too.
+The token is only ever in `Authorization: Bearer`. Posts send
+`unfurl_links: false` and `mrkdwn: true`, never `link_names` or `parse`
+(tested on the request bodies).
+
+The upload is `files.getUploadURLExternal` (`filename`, `length`) per file,
+a POST of the bytes to the returned `upload_url`, then one
+`files.completeUploadExternal` with `files` as a JSON array of
+`{id, title}`, `channel_id` and `thread_ts`. Both the Python and the Node
+SDK post the file's raw bytes to `upload_url`, the Python one with no token
+at all (Node adds one only for a per-call token), so the client posts raw
+bytes as `application/octet-stream` without the bot token, and treats
+`upload_url` as a secret since it is presigned. No multipart form is
+needed, so the crate doesn't enable reqwest's `multipart` feature. If any file fails, nothing is completed, so
+nothing is shared. Files are read into memory whole, which is fine for
+staged attachments but not for very large files.
+
+### Rate limits: tiers and 429s
+
+**Issue.** The plan asks for a per-token limiter by tier and for honoring
+`Retry-After`, without saying what a long `Retry-After` does to later calls.
+
+**Solution.** Each method carries the Java SDK's tier: Tier 2 (20 per
+minute: `users.list`, `reactions.remove`), Tier 3 (50: `conversations.*`,
+`chat.update`, `reactions.add`, `bots.info`), Tier 4 (100:
+`chat.postEphemeral`, `users.info`, `files.*`), `auth.test` (600) and
+`chat.postMessage` (60 per minute per channel). The limiter keeps, per
+token digest and method (and channel for `chat.postMessage`), the times of
+the calls in the last minute, and a call waits while the quota is used up.
+It is in memory and per process, which is enough to stay under Slack's
+limits; Slack's 429 remains the authority.
+
+A 429, or `ok: false` with `ratelimited`, blocks the method for that token
+until `Retry-After` has passed, so concurrent callers wait too. Slack limits
+`chat.postMessage` both per channel and per token, and a 429 doesn't say
+which limit it hit, so a 429 on a post to one channel holds posts to every
+channel; each channel's quota stays its own. A call is retried
+up to three times while the wait is at most `max_retry_wait` (60 s by
+default); a longer wait fails at once with `SurfaceError::RateLimited`, and
+so does any later call to that method while it stays blocked, instead of
+sleeping silently. `Retry-After` is read as whole seconds and capped at a
+day so it can't overflow a deadline.
+
+Holding the method for the whole token has costs. The client-side
+`chat.postMessage` quota lets all 60 of a minute's posts to one channel go
+at once, where Slack allows about one a second, so a short burst to one
+busy channel can draw a per-channel 429, which holds posts to every
+channel for the `Retry-After`. And when a hold ends, every caller waiting
+on it wakes at once and can draw another 429. Both are accepted: Slack
+asks callers to back off per method per token, and its `Retry-After` is
+usually short.
+
+### Error codes Slack answers with HTTP 200
+
+**Issue.** Slack reports failures as `{"ok": false, "error": "<code>"}` with
+HTTP 200, and some codes aren't failures for agentd.
+
+**Solution.** `web::map_error`: `invalid_auth`, `not_authed`,
+`token_revoked`, `token_expired` and `account_inactive` are `Unauthorized`;
+`missing_scope` (with the scope from `needed`), `not_in_channel`,
+`is_archived`, `cant_update_message`, `edit_window_closed`,
+`restricted_action*`, `method_not_supported_for_channel_type` and similar
+are `Forbidden`; `channel_not_found`, `message_not_found`,
+`thread_not_found`, `user_not_found`, `bot_not_found`, `file_not_found` and
+similar are `NotFound`; anything else is `Api` with the code. A code is
+kept only if it is at most 64 lowercase letters, digits and underscores, so
+an error never carries arbitrary response text. `already_reacted` from
+`reactions.add` and `no_reaction` from `reactions.remove` count as success.
+A non-2xx status other than 429 maps the body's `ok: false` code like any
+other and is `Api("HTTP <status>")` only when the body has none, an
+unreadable body is `Transport`, and redirects are never followed. Transport errors drop
+the request URL, so a `response_url` or upload URL can't leak through one.
+
+Review found that a non-2xx answer whose body carries an `ok: false` code,
+such as HTTP 400 with `invalid_arguments`, lost the code, while
+`respond_ephemeral` already read it. Such a code now goes through the same
+sanitizing and `map_error`; only a non-2xx answer without one is
+`Api("HTTP <status>")`. A 429 from a presigned upload URL, which had been
+`Api("the file upload was refused (HTTP 429)")`, is now `RateLimited` with
+its `Retry-After`, like `respond_ephemeral`'s. It is not retried: the URL
+is not a Web API method, so it has no bucket, and the caller can retry the
+whole upload, which shared nothing.
+
+`org_login_required` was first among the `Forbidden` codes. Slack answers
+it while a workspace is being migrated into an Enterprise Grid
+organization, which passes on its own, so it is not a refusal of the bot
+and now falls to `Api` with the code. A caller that reads `Forbidden` as
+"the bot may not" sees an error for it instead; the callers that differ
+later in the stack say how they treat it.
+
+### Names two members share
+
+**Issue.** Display names aren't unique in Slack, and the plan didn't say
+what an `@Name` shared by two members resolves to.
+
+**Solution.** The member directory maps each active member's display name
+and full name, compared ignoring case and runs of white space, and a bot
+user's username too. A human's username is left out: it is often the local
+part of their email address, and would let a human shadow an agent called
+the same. A name that belongs to more than one member resolves to no one,
+so it stays text: a missed mention is better than pinging the wrong person.
+The exception is agents: agentd knows its agents' bot user ids from the
+bindings and passes each team's to `TeamDirectory::set_managed_bots`, and a
+shared name with exactly one managed agent among its members resolves to
+that agent. The directory keeps every member id per name, so a new managed
+set applies to the current list at once, without reading `users.list`
+again. A managed bot the list lacks, such as an agent installed since the
+last read, marks the list stale instead, so the next `refresh_members` or
+render reads `users.list` even within the TTL (T31's `refresh_members` when
+a binding starts would otherwise return the cached list without the new
+agent for up to 15 minutes). That still goes through the one shared
+refresh and honours the wait after a failed read. If the bot is set while
+a read is running, the list that read produces stays stale too, since the
+read may have started before the install. A bot still missing afterwards
+causes no further reads until the managed set changes again. Deactivated
+members are left out.
+
+If a refresh fails, the next attempt waits a minute (or the TTL, if
+shorter). Meanwhile an older list is kept; with none, `refresh_members`
+returns the same error without calling Slack and `render` starts no
+refresh, so a workspace whose `users.list` fails doesn't get one call per
+rendered reply. `Debug` on `SlackSurface`, `TeamDirectory` and
+`MemberDirectory` shows the team and counts, never member names or ids.
+
+### Refresh cost in large workspaces
+
+**Issue.** `users.list` is Tier 2 (20 calls a minute per token), and a
+refresh reads every page, so a large workspace's refresh is slow.
+
+**Solution.** `users.list` asks for 999 members a page, the largest size the
+client asks any list method for; Slack's spec gives `users.list` no maximum
+and says it may return fewer than asked. At a full 999 a page a refresh of
+N members takes about N / 20,000 minutes of that token's `users.list` quota:
+a 10,000-member workspace needs 11 calls, and 100,000 members about 101
+calls, five minutes of waiting in the limiter. That stays well inside the
+default 15-minute TTL, runs in the background after the first load, and
+uses one binding's token per team, so other bindings' quotas are
+untouched. If Slack returns much smaller pages, the refresh takes
+proportionally longer; a very large workspace should raise the TTL with
+`TeamDirectory::with_ttl`.
+
+### Reading a thread's newest messages
+
+**Issue.** `Surface::history` wants the newest `limit` messages before a
+cursor, but `conversations.replies` pages from the thread's oldest message
+(root first) and has no reverse order.
+
+**Solution.** A thread read follows every page (with `latest` set to the
+cursor and `inclusive=false`) and keeps only the last `limit` content
+messages, filtering by `ts` on the client too, and skipping a `ts` it has
+already kept, in case a later page repeats the root. `conversations.history`
+pages from the newest, so a top-level read stops once it has `limit`. Both
+always ask for 200 a page, never just the count still missing: skipped
+joins and edits would otherwise cost a call each.
+Content means no subtype, or `file_share`, `thread_broadcast` or
+`bot_message`; joins, edits and tombstones are skipped.
+
+### Smaller choices
+
+- `SlackSurface::events` returns `Unsupported("events")`: Slack pushes
+  events to T28's ingress, and no surface loop exists to run.
+- A conversation or message from another workspace, or another surface, is
+  refused before anything is sent.
+- `auth.test` gives a bot token's team, bot user and `bot_id`, but not the
+  app's id or name; T30's `/agent me` can get the app id and bot name from
+  `bots.info` on that `bot_id`.
+- `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
+  the `response_url` with no token. Slack answers `ok` (text or JSON) on
+  success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
