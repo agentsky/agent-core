@@ -3,9 +3,20 @@ use secrecy::ExposeSecret;
 
 use super::*;
 use crate::SealError;
+use crate::claude_links::tests::new_link;
 use crate::test_util::*;
 
+/// A member with a Claude link, as `cloud add` needs.
 async fn member(store: &Store, user: &str) -> MemberId {
+    let member = unlinked_member(store, user).await;
+    store
+        .put_claude_link(member, &new_link("a", "r"), at(1))
+        .await
+        .unwrap();
+    member
+}
+
+async fn unlinked_member(store: &Store, user: &str) -> MemberId {
     store
         .ensure_member(&member_key(user), user, at(1))
         .await
@@ -66,23 +77,53 @@ async fn opened(store: &Store, member: MemberId, label: &str) -> Option<(Routine
         .map(|found| (found.routine_id, shown(&found.token).to_owned()))
 }
 
+/// The registration of `member`'s routine `label` stored now, or none.
+async fn registration(store: &Store, member: MemberId, label: &str) -> CloudRoutineVersion {
+    store
+        .cloud_routine(member, label)
+        .await
+        .unwrap()
+        .map(|found| found.version)
+        .unwrap_or_default()
+}
+
 async fn begin(store: &Store, member: MemberId, task: &str, now: i64) -> CloudHandoffId {
     let routine_id = routine("trig_1");
+    let held = store
+        .cloud_routines(member)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|held| held.routine_id == routine_id);
+    let label = match held {
+        Some(held) => held.label,
+        None => {
+            put(store, member, "agent-core", "trig_1", "sk", now).await;
+            "agent-core".to_owned()
+        }
+    };
     let requested_by = member_key("ada");
-    store
+    let registration = registration(store, member, &label).await;
+    let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member,
-                routine_label: "agent-core",
+                routine_label: &label,
                 routine_id: &routine_id,
+                registration: &registration,
                 requested_by: &requested_by,
                 origin: CloudOrigin::RocketChatDm,
                 task,
             },
+            u32::MAX,
             at(now),
         )
         .await
-        .unwrap()
+        .unwrap();
+    let CloudBegun::Begun(id) = begun else {
+        panic!("{begun:?}");
+    };
+    id
 }
 
 async fn handoff(store: &Store, member: MemberId, id: CloudHandoffId) -> CloudHandoff {
@@ -116,6 +157,7 @@ async fn finish(store: &Store, id: CloudHandoffId, outcome: &CloudOutcome, now: 
         .finish_cloud_handoff(id, outcome, at(now))
         .await
         .unwrap()
+        == CloudFinished::Recorded
 }
 
 async fn due(store: &Store, now: i64) -> Vec<CloudHandoffId> {
@@ -313,6 +355,66 @@ async fn the_twenty_first_routine_is_refused() {
 }
 
 #[tokio::test]
+async fn a_routine_is_refused_without_a_claude_link() {
+    let store = memory_store().await;
+    let ada = unlinked_member(&store, "ada").await;
+    assert_eq!(
+        put(&store, ada, "agent-core", "trig_1", "t", 10).await,
+        CloudRoutinePut::Unlinked
+    );
+    let bob = member(&store, "bob").await;
+    put(&store, bob, "agent-core", "trig_1", "t", 10).await;
+    assert!(store.delete_claude_link(bob).await.unwrap());
+    assert_eq!(
+        put(&store, bob, "agent-core", "trig_2", "u", 11).await,
+        CloudRoutinePut::Unlinked
+    );
+    assert_eq!(
+        put(&store, bob, "other", "trig_3", "v", 11).await,
+        CloudRoutinePut::Unlinked
+    );
+    assert!(store.cloud_routines(ada).await.unwrap().is_empty());
+    assert_eq!(
+        opened(&store, bob, "agent-core").await,
+        Some((routine("trig_1"), "t".to_owned()))
+    );
+    assert_eq!(store.cloud_routines(bob).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_handoff_is_refused_without_a_claude_link() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "agent-core", "trig_1", "sk", 10).await;
+    let registration = registration(&store, ada, "agent-core").await;
+    assert!(store.delete_claude_link(ada).await.unwrap());
+    let begun = store
+        .begin_cloud_handoff(
+            &NewCloudHandoff {
+                member: ada,
+                routine_label: "agent-core",
+                routine_id: &routine("trig_1"),
+                registration: &registration,
+                requested_by: &member_key("ada"),
+                origin: CloudOrigin::RocketChatDm,
+                task: "Fix the flaky test",
+            },
+            u32::MAX,
+            at(20),
+        )
+        .await
+        .unwrap();
+    assert_eq!(begun, CloudBegun::Unlinked);
+    assert!(
+        store
+            .recent_cloud_handoffs(ada, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn concurrent_registrations_never_pass_the_cap_together() {
     let dir = TempDir::new("store-test");
     let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
@@ -448,20 +550,27 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
     let ada = member(&store, "ada").await;
     let routine_id = routine("trig_7");
     let requested_by = slack_key("U7");
-    let id = store
+    put(&store, ada, "docs", "trig_7", "sk", 10).await;
+    let registration = registration(&store, ada, "docs").await;
+    let begun = store
         .begin_cloud_handoff(
             &NewCloudHandoff {
                 member: ada,
                 routine_label: "docs",
                 routine_id: &routine_id,
+                registration: &registration,
                 requested_by: &requested_by,
                 origin: CloudOrigin::SlackSlash,
                 task: "t",
             },
+            1,
             at(500),
         )
         .await
         .unwrap();
+    let CloudBegun::Begun(id) = begun else {
+        panic!("{begun:?}");
+    };
     assert_eq!(
         handoff(&store, ada, id).await,
         CloudHandoff {
@@ -483,6 +592,189 @@ async fn a_new_handoff_is_sending_with_what_was_asked() {
             notified_at: None,
             unknown_reason: None,
         }
+    );
+}
+
+async fn begin_capped(
+    store: &Store,
+    member: MemberId,
+    label: &str,
+    id: &str,
+    per_hour: u32,
+    now: i64,
+) -> CloudBegun {
+    let registration = registration(store, member, label).await;
+    store
+        .begin_cloud_handoff(
+            &NewCloudHandoff {
+                member,
+                routine_label: label,
+                routine_id: &routine(id),
+                registration: &registration,
+                requested_by: &member_key("ada"),
+                origin: CloudOrigin::RocketChatDm,
+                task: "t",
+            },
+            per_hour,
+            at(now),
+        )
+        .await
+        .unwrap()
+}
+
+async fn handoffs_held(store: &Store) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM cloud_handoffs")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_member_past_the_hourly_handoff_cap_records_nothing() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    let bob = member(&store, "bob").await;
+    put(&store, ada, "r", "trig_1", "sk", 10).await;
+    put(&store, ada, "s", "trig_2", "sk", 10).await;
+    put(&store, bob, "r", "trig_1", "sk", 10).await;
+    let window = i64::try_from(CLOUD_HANDOFF_WINDOW.as_secs()).unwrap();
+    assert_eq!(window, 3_600);
+
+    assert!(matches!(
+        begin_capped(&store, ada, "r", "trig_1", 2, 1_000).await,
+        CloudBegun::Begun(_)
+    ));
+    assert!(matches!(
+        begin_capped(&store, ada, "s", "trig_2", 2, 1_001).await,
+        CloudBegun::Begun(_)
+    ));
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 2, 1_002).await,
+        CloudBegun::TooMany,
+        "the cap is the member's, over every routine"
+    );
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 2, 1_000 + window - 1).await,
+        CloudBegun::TooMany
+    );
+    assert_eq!(handoffs_held(&store).await, 2);
+    assert!(matches!(
+        begin_capped(&store, bob, "r", "trig_1", 2, 1_002).await,
+        CloudBegun::Begun(_)
+    ));
+    assert!(
+        matches!(
+            begin_capped(&store, ada, "r", "trig_1", 2, 1_000 + window).await,
+            CloudBegun::Begun(_)
+        ),
+        "a hand-off an hour old leaves the count"
+    );
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 0, 1_000).await,
+        CloudBegun::TooMany
+    );
+}
+
+#[tokio::test]
+async fn concurrent_handoffs_never_pass_the_hourly_cap_together() {
+    let dir = TempDir::new("store-test");
+    let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "r", "trig_1", "sk", 10).await;
+    let per_hour = 5;
+    for n in 0..per_hour - 1 {
+        assert!(matches!(
+            begin_capped(&store, ada, "r", "trig_1", per_hour, 100 + i64::from(n)).await,
+            CloudBegun::Begun(_)
+        ));
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let store = store.clone();
+        tasks.spawn(async move { begin_capped(&store, ada, "r", "trig_1", per_hour, 200).await });
+    }
+    let mut begun = 0;
+    while let Some(outcome) = tasks.join_next().await {
+        match outcome.unwrap() {
+            CloudBegun::Begun(_) => begun += 1,
+            CloudBegun::TooMany => {}
+            other @ (CloudBegun::RoutineGone | CloudBegun::Unlinked) => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(begun, 1, "one place was left");
+    assert_eq!(handoffs_held(&store).await, i64::from(per_hour));
+}
+
+#[tokio::test]
+async fn a_token_replaced_after_it_was_read_records_nothing() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    put(&store, ada, "r", "trig_1", "old", 10).await;
+    let read = store.cloud_routine(ada, "r").await.unwrap().unwrap();
+    put(&store, ada, "r", "trig_1", "new", 10).await;
+    let begin = |registration: CloudRoutineVersion| {
+        let store = store.clone();
+        async move {
+            store
+                .begin_cloud_handoff(
+                    &NewCloudHandoff {
+                        member: ada,
+                        routine_label: "r",
+                        routine_id: &routine("trig_1"),
+                        registration: &registration,
+                        requested_by: &member_key("ada"),
+                        origin: CloudOrigin::RocketChatDm,
+                        task: "t",
+                    },
+                    10,
+                    at(10),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(
+        begin(read.version).await,
+        CloudBegun::RoutineGone,
+        "the same label, routine id and second, but another token"
+    );
+    assert_eq!(handoffs_held(&store).await, 0);
+    let current = store.cloud_routine(ada, "r").await.unwrap().unwrap();
+    assert!(matches!(begin(current.version).await, CloudBegun::Begun(_)));
+}
+
+#[tokio::test]
+async fn a_handoff_whose_routine_is_gone_records_nothing() {
+    let store = memory_store().await;
+    let ada = member(&store, "ada").await;
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 10, 100).await,
+        CloudBegun::RoutineGone
+    );
+    put(&store, ada, "r", "trig_1", "sk", 10).await;
+    put(&store, ada, "r", "trig_2", "sk", 11).await;
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_1", 10, 100).await,
+        CloudBegun::RoutineGone,
+        "replaced under its label"
+    );
+    let CloudBegun::Begun(id) = begin_capped(&store, ada, "r", "trig_2", 10, 100).await else {
+        panic!("not begun");
+    };
+    store.delete_cloud_routines_of(ada).await.unwrap();
+    assert_eq!(
+        begin_capped(&store, ada, "r", "trig_2", 10, 101).await,
+        CloudBegun::RoutineGone,
+        "logged out"
+    );
+    assert_eq!(handoffs_held(&store).await, 0);
+    assert_eq!(
+        store
+            .finish_cloud_handoff(id, &fired("session_1"), at(102))
+            .await
+            .unwrap(),
+        CloudFinished::Gone,
+        "deleted while its request was out"
     );
 }
 
@@ -530,7 +822,7 @@ async fn routines_of_a_member_are_deleted_by_member_id() {
         )
         .await
         .unwrap();
-    put(&store, bob, "bobs", "trig_3", "c", 10).await;
+    put(&store, bob, "bobs", "trig_1", "c", 10).await;
     begin(&store, ada, "one", 100).await;
     begin(&store, ada, "two", 101).await;
     let bobs = begin(&store, bob, "three", 102).await;
@@ -694,7 +986,20 @@ async fn a_handoff_finishes_from_sending_and_late_from_unknown() {
     assert_eq!(row.notified_at, Some(at(301)), "the notice's time is kept");
     assert!(!finish(&store, told, &fired("session_again"), 320).await);
 
-    assert!(!finish(&store, CloudHandoffId::new_v4(), &fired("session_9"), 1).await);
+    assert_eq!(
+        store
+            .finish_cloud_handoff(told, &fired("session_again"), at(330))
+            .await
+            .unwrap(),
+        CloudFinished::Kept
+    );
+    assert_eq!(
+        store
+            .finish_cloud_handoff(CloudHandoffId::new_v4(), &fired("session_9"), at(1))
+            .await
+            .unwrap(),
+        CloudFinished::Gone
+    );
 }
 
 #[tokio::test]
@@ -1309,6 +1614,7 @@ fn a_new_handoff_leaves_its_task_out_of_debug() {
         member,
         routine_label: "r",
         routine_id: &routine_id,
+        registration: &CloudRoutineVersion::default(),
         requested_by: &requested_by,
         origin: CloudOrigin::SlackDm,
         task: "TASK-TEXT",

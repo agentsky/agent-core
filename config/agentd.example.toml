@@ -328,12 +328,15 @@ install_reminder_secs = 3600
 # starts a Claude Code cloud session on the member's own account. agentd sends
 # the request itself, over its egress network, with the routine's own token,
 # never through the credential proxy. Leave the section out to turn cloud
-# hand-off off; `cloud list` and `cloud rm` still work then. Every key is
-# optional; these are the defaults.
+# hand-off off; `cloud list` and `cloud rm` still work then, and so do the
+# notice for a hand-off agentd stopped during and the deletion of old
+# hand-offs, with the defaults below. Every key is optional; these are the
+# defaults.
 [cloud]
 # The routine endpoint's origin: no path, query or fragment. https://, except
 # http:// to a loopback IP address for a local fake. A routine URL a member
-# pastes must have this origin.
+# pastes must have this origin, and a routine registered while it named another
+# origin isn't fired, its token sent nowhere, until the member adds it again.
 base_url = "https://api.anthropic.com"
 
 # The anthropic-beta header each request sends, which pins the endpoint's
@@ -349,3 +352,11 @@ connect_timeout_secs = 10
 
 # How many days hand-offs are kept after they were asked for (1 to 365).
 retention_days = 90
+
+# How many hand-offs one member may ask for in an hour (1 to 100). A hand-off is
+# a `cloud run` that passed its checks and was recorded, and each counts
+# whatever came of it; one more is refused before anything is recorded or sent,
+# so a looping member can't fill the store or send a flood of requests from
+# agentd's address. A command refused earlier, such as one naming an unknown
+# routine, doesn't count.
+handoffs_per_hour = 10

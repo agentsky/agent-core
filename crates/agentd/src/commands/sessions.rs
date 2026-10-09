@@ -450,7 +450,7 @@ fn here_elsewhere(surface: SurfaceKind, name: &str, origin: &Origin) -> String {
 }
 
 /// `at` as replies show it, in UTC to the minute.
-fn when(at: OffsetDateTime) -> String {
+pub(super) fn when(at: OffsetDateTime) -> String {
     at.to_offset(time::UtcOffset::UTC)
         .format(format_description!(
             "[year]-[month]-[day] [hour]:[minute] UTC"

@@ -8,7 +8,11 @@
 //! rotating at once with `tooling.tokens.rotate`, which proves the refresh
 //! token works and gives a fresh pair, then stores that pair sealed. Only a
 //! linked member on Slack may register one, and only one that Slack says
-//! is their own in the workspace they sent it from.
+//! is their own in the workspace they sent it from. The link is checked
+//! again in the transaction that stores the pair
+//! ([`put_slack_config_token`](store::Store::put_slack_config_token)), so
+//! a `logout` that another instance or surface ran meanwhile never leaves
+//! a token behind.
 //!
 //! The rotator renews each token when it has less than [`RENEW_BEFORE`]
 //! left. When Slack refuses a refresh token, the token is marked broken
@@ -140,12 +144,26 @@ impl Commands {
                 .put_slack_config_token(member, &key.team, &rotated, now())
         })
         .await;
-        if let Err(err) = kept {
-            tracing::warn!(%member, error = %err, "couldn't store a checked configuration token");
-            return Ok(format!(
-                "I couldn't save that configuration token, and checking it used up its refresh \
-                 token. Generate a new one at {TOKENS_PAGE} and send it again in a few minutes."
-            ));
+        match kept {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::info!(%member, "a checked configuration token's member was unlinked meanwhile; stored nothing");
+                return Ok(format!(
+                    "Your Claude account was unlinked while I checked that token, so I didn't \
+                     keep it, and checking it used up its refresh token. Link your account again \
+                     with {}, then generate a new configuration token at {TOKENS_PAGE} and send \
+                     it.",
+                    origin.command("login")
+                ));
+            }
+            Err(err) => {
+                tracing::warn!(%member, error = %err, "couldn't store a checked configuration token");
+                return Ok(format!(
+                    "I couldn't save that configuration token, and checking it used up its \
+                     refresh token. Generate a new one at {TOKENS_PAGE} and send it again in a \
+                     few minutes."
+                ));
+            }
         }
         tracing::info!(%member, team = %key.team, "registered a Slack configuration token");
         Ok(format!(
@@ -193,9 +211,10 @@ impl Commands {
 /// waiting a little longer after each failure, for store work a passing
 /// error mustn't lose: a pair `tooling.tokens.rotate` returned, which
 /// used up the old refresh token, or the deletion of a departed member's
-/// token, whose Slack event isn't delivered again. Each failure but the
-/// last is logged with `what`, naming the work, and `member`, an id of
-/// whose it is; the last is returned for the caller to log.
+/// token and cloud routines, whose Slack event isn't delivered again. Each
+/// failure but the last is logged with `what`, naming the work, and
+/// `member`, an id of whose it is; the last is returned for the caller to
+/// log.
 pub(crate) async fn retry_store<T, F>(
     what: &'static str,
     member: impl fmt::Display,
