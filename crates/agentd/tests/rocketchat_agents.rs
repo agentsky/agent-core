@@ -964,6 +964,17 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
         chat.command("alice", "deny helper #nowhere").await,
         "I don't know `#nowhere`. Name a public channel agentd can see."
     );
+    Mock::given(path("/api/v1/rooms.info"))
+        .and(query_param("roomName", "flaky"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(chat.fake.server())
+        .await;
+    assert_eq!(
+        chat.command("alice", "deny helper #flaky").await,
+        "Something went wrong on my side. Please try again in a minute.",
+        "a failed lookup is not an unknown channel"
+    );
     chat.fake.add_room("HIDDEN", "p", "hidden");
     chat.fake.add_member("HIDDEN", FakeRest::MANAGER_ID);
     for text in ["allow helper #hidden", "allow helper <#HIDDEN>"] {
@@ -1029,6 +1040,40 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
         chat.command("alice", "limits helper turns=3")
             .await
             .starts_with("`helper` takes at most 3 requests a day")
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn a_rule_on_a_channel_archived_since_can_still_be_lifted() {
+    let chat = Chat::start().await;
+    let running = Running::start(&chat, "sqlite::memory:").await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+    chat.fake.add_room("OLD", "c", "old");
+    assert_eq!(
+        chat.command("alice", "deny helper #old").await,
+        "Everyone may use `helper`, except `#old`."
+    );
+    Mock::given(path("/api/v1/rooms.info"))
+        .and(query_param("roomName", "old"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "success": false,
+            "error": "The channel, old, is archived [error-room-archived]",
+            "errorType": "error-room-archived",
+        })))
+        .with_priority(1)
+        .mount(chat.fake.server())
+        .await;
+    assert_eq!(
+        chat.command("alice", "allow helper #old").await,
+        "Everyone may use `helper`.",
+        "the rule is found by the name the owner wrote"
+    );
+    assert_eq!(
+        chat.command("alice", "deny helper #old").await,
+        "I don't know `#old`. Name a public channel agentd can see.",
+        "an archived channel is not a lookup failure"
     );
     running.stop().await;
 }

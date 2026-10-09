@@ -584,12 +584,12 @@ async fn lock(
     };
     let failed = |err: store::StoreError| internal("a scope lock query", &err);
     let response = match request {
-        LockRequest::Acquire => match store
-            .acquire_scope_lock(token, turn, now, ttl)
+        LockRequest::Acquire { lease } => match store
+            .acquire_scope_lock(token, turn, lease, now, ttl)
             .await
             .map_err(failed)?
         {
-            Some(lease) => held(lease.lease, lease.expires_at),
+            Some(expires_at) => held(lease, expires_at),
             None => LockResponse::Busy,
         },
         LockRequest::Renew { lease } => match store

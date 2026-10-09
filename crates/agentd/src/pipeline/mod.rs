@@ -17,6 +17,7 @@
 
 mod billing;
 mod hooks;
+mod keyed;
 mod message;
 mod run;
 mod surfaces;

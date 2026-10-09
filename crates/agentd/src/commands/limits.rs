@@ -137,9 +137,9 @@ impl Commands {
 
     /// The rule `target` names, from `key`'s surface and team, or the reply
     /// when it names nobody agentd can find. A room agentd can't find (a
-    /// Rocket.Chat private group) is still found among `agent`'s rules by
-    /// the name the owner gave it, so a rule on a channel made private can
-    /// be lifted.
+    /// Rocket.Chat private group or archived channel) is still found among
+    /// `agent`'s rules by the name the owner gave it, so a rule on a
+    /// channel made private or archived can be lifted.
     async fn rule_for(
         &self,
         key: &MemberKey,
