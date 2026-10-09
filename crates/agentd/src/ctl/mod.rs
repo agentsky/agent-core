@@ -61,7 +61,9 @@ use store::{CtlPurged, CtlTurn, NewCtlToken, Store, StoreError, TokenHash};
 use crate::consents::{ConsentSettings, Consents};
 
 pub use api::{DEFAULT_HISTORY_LIMIT, JSON_BODY_LIMIT, MAX_HISTORY_LIMIT};
-pub use outbox::{MAX_ATTACHMENTS, MAX_POSTS, MAX_REACTIONS, Outbox, QueuedPost, QueuedReaction};
+pub use outbox::{
+    MAX_ATTACHMENTS, MAX_HAND_OFFS, MAX_POSTS, MAX_REACTIONS, Outbox, QueuedPost, QueuedReaction,
+};
 pub use store::CtlTurn as Turn;
 pub use token::ProcessToken;
 

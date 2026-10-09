@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentd::commands::{ManagerBot, OpenDm, Origin, Replies};
-use agentd::ctl::SurfaceLookup;
+use agentd::ctl::{MAX_HAND_OFFS, SurfaceLookup};
 use agentd::pipeline::{
     DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
     Turns, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
@@ -3107,6 +3107,45 @@ async fn a_hop_runs_once_whichever_copy_of_the_post_arrives_first() {
         stack.bearers().await,
         vec!["Bearer token-of-bob"; 4],
         "both hops, and the turns that posted them, ran on bob's account"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_post_hands_off_to_max_hand_offs_agents_and_its_platform_copy_to_no_more() {
+    let stack = start().await;
+    let bots = ["UWRITER", "USCOUT", "UCRITIC"];
+    let mut agents = Vec::new();
+    for (name, bot) in ["writer", "scout", "critic"].into_iter().zip(bots) {
+        let agent = stack.other_agent(name, bot).await;
+        stack
+            .store()
+            .update_agent_settings(agent, |settings| settings.max_hops = Some(1))
+            .await
+            .unwrap();
+        agents.push(agent);
+    }
+    stack.next_turn(Turn::reply("@UWRITER @USCOUT @UCRITIC over to you."));
+    stack
+        .handle(stack.event("bob", "GENERAL", ConvKind::Channel, "c1", None, &[BOT]))
+        .await;
+    let first = stack.wait_for_posts(1).await[0].2.clone();
+    assert_eq!(stack.attributed(&first).await.0, Some(stack.agent));
+    stack
+        .handle(stack.agents_post(BOT, first.id.as_str(), "c1", &bots))
+        .await;
+    stack.pipeline.close();
+    stack.pipeline.drain().await;
+    let mut ran = Vec::new();
+    for agent in &agents {
+        ran.push(stack.writers_hops(*agent).await);
+    }
+    let expected: Vec<Vec<u8>> = (0..agents.len())
+        .map(|i| if i < MAX_HAND_OFFS { vec![1] } else { vec![] })
+        .collect();
+    assert_eq!(
+        ran, expected,
+        "the first agents the post mentions run its hop, and the platform's copy runs no other"
     );
     stack.stop().await;
 }

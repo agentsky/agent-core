@@ -891,6 +891,45 @@ async fn ask_agent_queues_a_post_in_this_thread_that_mentions_the_agent() {
 }
 
 #[tokio::test]
+async fn ask_agent_refuses_an_agent_past_the_turns_hand_offs() {
+    let fixture = Fixture::new().await;
+    let public = store::Visibility::Public;
+    let helper = fixture
+        .bot_agent("U0OWNER", "helper", "U0HELPER", public)
+        .await;
+    let asked = [
+        ("reviewer", "U0REVIEW"),
+        ("scout", "U0SCOUT"),
+        ("critic", "U0CRITIC"),
+    ];
+    for (name, bot) in asked {
+        fixture.bot_agent("U0OWNER", name, bot, public).await;
+    }
+    let token = fixture.running(helper, ScopeKey::Channel(conv("C1"))).await;
+    for (name, _) in &asked[..MAX_HAND_OFFS] {
+        let (status, value) = fixture.ask(&token, name, "t").await;
+        assert_eq!(status, 200, "{name}: {value}");
+    }
+    let (name, _) = asked[MAX_HAND_OFFS];
+    let (status, value) = fixture.ask(&token, name, "t").await;
+    assert_eq!(status, 403, "{value}");
+    assert_eq!(code(&value), "refused");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("as many agents as one turn hands off to"),
+        "{value}"
+    );
+    let outbox = fixture.ctl.end_turn(&token).await.unwrap().unwrap();
+    assert_eq!(
+        outbox.posts().len(),
+        MAX_HAND_OFFS,
+        "the refused ask queues nothing"
+    );
+}
+
+#[tokio::test]
 async fn only_ask_agent_counts_as_having_asked_an_agent() {
     let fixture = Fixture::new().await;
     let public = store::Visibility::Public;

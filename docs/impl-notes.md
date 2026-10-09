@@ -8703,12 +8703,47 @@ the requester's own or public, so the agent can tell which it meant. It
 is refused outside a channel or group DM, for the calling agent itself,
 for an agent the turn asked already (it would take one turn anyway; the
 check and the queueing are one critical section on the outbox, so two
-asks at once can't both pass), past the turn's ten queued posts, and, as
-before, inside a private task. It doesn't check what the
-router will decide (the other agent's rules, the hop cap, its limits):
+asks at once can't both pass), past `MAX_HAND_OFFS` asks (see [At most
+two hand-offs per turn](#at-most-two-hand-offs-per-turn)), past the
+turn's ten queued posts, and, as before, inside a private task. It
+doesn't check what the router will decide (the other agent's rules, the
+hop cap, its limits):
 those depend on the requester and the thread, and the router says them
 when the hand-off runs, so the skill tells the agent not to promise an
 answer.
+
+### At most two hand-offs per turn
+
+**Issue.** A security review of the requester-pays work found that one
+message can cascade into many turns billed to its requester: each turn
+of a chain may mention every other agent, each of those turns may do the
+same, and every hop inherits the requester. The hop cap bounds only the
+depth, and design.md claimed it bounded the cost. Capping the hand-offs
+in `Delivery::mentioned` alone would not hold either: the platform's copy
+of a post that mentions an agent past the cap routes as a hop of its own
+and would claim that agent's hop, which nothing had claimed.
+
+**Solution.** `ctl::MAX_HAND_OFFS` (2) agents per turn. The delivery
+carries `Handing`: the hand-offs so far and the agents the turn's
+`ask-agent` posts ask, taken from the outbox. `mentioned` gives an asked
+agent its place always, and any other only when a place is left besides
+those the asked agents not handed to yet keep, so an accepted
+`ask-agent` is never crowded out by an earlier casual mention; the rest
+are passed over with an info log of their ids and the post's id. No line
+goes to the thread: it would be one more bot post in a chain, and the
+skill tells agents. `ask-agent` refuses an agent past `MAX_HAND_OFFS`
+asks, in the same critical section as its other checks, so its count and
+the delivery's agree. Before a post's row is recorded, `pass_over`
+claims the hops to the agents it passes over in `processed_events`
+(`hop`, the same key `candidate` claims), and the platform's copy takes a
+hop only once that row gives it an attribution, so it finds the claim
+and is dropped; when a claim can't be written the row is left out, so
+neither copy hands anything off from that post, and the delivery is
+incomplete. Nothing new is stored: the outbox and `Handing` live for one
+turn's delivery, which a restart cuts and never repeats, and what does
+outlive it, the `hand_offs` rows (at most two per turn) and the claims,
+is already durable. With the default hop cap of 3 one message can start
+2 + 4 + 8 = 14 hand-off turns after its own.
 
 ### A chunk posted but not recorded
 

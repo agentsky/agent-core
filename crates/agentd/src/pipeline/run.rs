@@ -34,7 +34,7 @@ use super::billing::{CredentialFailure, FAILURE_DM_INTERVAL};
 use super::message;
 use super::view::{StoreView, ViewContext};
 use crate::commands::Replies;
-use crate::ctl::{MAX_POST_BYTES, Outbox, SurfaceLookup};
+use crate::ctl::{MAX_HAND_OFFS, MAX_POST_BYTES, Outbox, SurfaceLookup};
 use crate::policy::Limits;
 
 /// How long after the manager bot told a requester that an agent refused
@@ -207,13 +207,18 @@ pub const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
 ///    its reply's chunks and the posts it queued (`agentctl post` and
 ///    `ask-agent`), outside a one-to-one DM and a private task, hands off
 ///    to the other managed agents the platform reads it as mentioning, each
-///    agent once for the turn, from the first post that mentions it: as the
-///    post is recorded, a `hand_offs` row keeps it, and once the delivery
-///    is done it is queued for that agent as the posting bot's message,
-///    without a read-back, as the platform would deliver it. The router
-///    gives such a hop the requester and the next hop of the post's
-///    `message_refs` row, so the hop caps, the thread's budget and the
-///    agent's rules hold. One hop runs for each agent and posting turn: the
+///    agent once for the turn, from the first post that mentions it, and at
+///    most [`MAX_HAND_OFFS`] agents for the turn: the agents its
+///    `ask-agent` posts ask keep their places, and the others take what is
+///    left in the order the posts go out. As the post is recorded, a
+///    `hand_offs` row keeps each hand-off, and once the delivery is done it
+///    is queued for that agent as the posting bot's message, without a
+///    read-back, as the platform would deliver it. The hop to an agent the
+///    post mentions past the cap is claimed before the post is recorded,
+///    so no copy runs it, and logged as passed over. The router gives such
+///    a hop the requester and the next hop of the post's `message_refs`
+///    row, so the hop caps, the thread's budget and the agent's rules
+///    hold. One hop runs for each agent and posting turn: the
 ///    first copy to act claims it in the store, and any other, agentd's or
 ///    the platform's, is dropped. A row is deleted once its job settled the
 ///    hand-off, and is otherwise taken again by
@@ -2297,6 +2302,37 @@ struct HandedOff {
     event: Arc<InboundEvent>,
 }
 
+/// The hand-offs a turn's delivery recorded so far ([`HandedOff`]), one
+/// for each agent, and the agents its `ask-agent` posts ask.
+#[derive(Default)]
+struct Handing {
+    handed: Vec<HandedOff>,
+    asked: Vec<AgentId>,
+}
+
+impl Handing {
+    /// Whether the delivery handed off to `agent` already.
+    fn handed_to(&self, agent: AgentId) -> bool {
+        self.handed.iter().any(|handed| handed.agent == agent)
+    }
+
+    /// Whether `agent` has a place among the turn's [`MAX_HAND_OFFS`],
+    /// with the agents handed to and those in `also`: an agent the turn
+    /// asks always has one, and any other only when one is left besides
+    /// those the asked agents not handed to yet keep.
+    fn has_place(&self, agent: AgentId, also: &[Agent]) -> bool {
+        if self.asked.contains(&agent) {
+            return true;
+        }
+        let kept = self
+            .asked
+            .iter()
+            .filter(|asked| !self.handed_to(**asked) && also.iter().all(|seen| seen.id != **asked))
+            .count();
+        self.handed.len() + also.len() + kept < MAX_HAND_OFFS
+    }
+}
+
 /// What [`Delivery::post_to`] got out of a text: whether every chunk was
 /// posted, and whether every chunk posted was recorded.
 #[derive(Debug, Clone, Copy)]
@@ -2404,8 +2440,15 @@ impl Delivery<'_> {
             tracing::warn!(session = %self.session, error = %err, "uploading the turn's attachments failed");
             uploaded = false;
         }
-        let mut handed = Vec::new();
-        let sent = self.post(Some(turn), &reply, &mut handed).await;
+        let mut handing = Handing {
+            handed: Vec::new(),
+            asked: outbox
+                .iter()
+                .flat_map(|outbox| outbox.posts())
+                .filter_map(|post| post.asks)
+                .collect(),
+        };
+        let sent = self.post(Some(turn), &reply, &mut handing).await;
         let mut complete = uploaded && sent.complete();
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
@@ -2418,7 +2461,7 @@ impl Delivery<'_> {
             }
             for queued in outbox.posts() {
                 complete &= self
-                    .post_to(Some(turn), &queued.to, &queued.text, &mut handed)
+                    .post_to(Some(turn), &queued.to, &queued.text, &mut handing)
                     .await
                     .complete();
             }
@@ -2426,12 +2469,12 @@ impl Delivery<'_> {
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
             tracing::warn!(session = %self.session, error = %err, "couldn't say part of a reply was lost");
         }
-        handed
+        handing.handed
     }
 
     /// [`post_to`](Self::post_to) the target: the turn's own thread.
-    async fn post(&self, turn: Option<TurnId>, text: &str, handed: &mut Vec<HandedOff>) -> Sent {
-        self.post_to(turn, &self.target, text, handed).await
+    async fn post(&self, turn: Option<TurnId>, text: &str, handing: &mut Handing) -> Sent {
+        self.post_to(turn, &self.target, text, handing).await
     }
 
     /// Renders and posts Markdown `text` to `target`, recording a
@@ -2443,16 +2486,19 @@ impl Delivery<'_> {
     ///
     /// A chunk hands off when a turn posted it in the turn's own thread,
     /// with [`HandOffs`]: then a `hand_offs` row is recorded with its row,
-    /// in one transaction, for each managed agent it mentions
+    /// in one transaction, for each managed agent it mentions that has a
+    /// place among the turn's [`MAX_HAND_OFFS`]
     /// ([`mentioned`](Self::mentioned)), and held at once, so no replay
-    /// takes it while this turn hands it off; the agents go in `handed`,
-    /// so a turn hands off to an agent once.
+    /// takes it while this turn hands it off; the agents go in `handing`,
+    /// so a turn hands off to an agent once. The hops to the agents it
+    /// mentions past them are claimed first ([`pass_over`](Self::pass_over)),
+    /// so no copy of the chunk, agentd's or the platform's, runs them.
     async fn post_to(
         &self,
         turn: Option<TurnId>,
         target: &ReplyTarget,
         text: &str,
-        handed: &mut Vec<HandedOff>,
+        handing: &mut Handing,
     ) -> Sent {
         let hands_off = self
             .hand_offs
@@ -2475,10 +2521,19 @@ impl Delivery<'_> {
                     continue;
                 }
             };
-            let mentioned = match hands_off {
-                Some(_) => self.mentioned(target, &posted, handed).await,
-                None => Vec::new(),
+            let (mentioned, over) = match hands_off {
+                Some(_) => self.mentioned(target, &posted, handing).await,
+                None => (Vec::new(), Vec::new()),
             };
+            if let Some((hand_offs, turn)) = hands_off
+                && !over.is_empty()
+                && !self
+                    .pass_over(&over, turn, hand_offs.now, &posted.msg)
+                    .await
+            {
+                sent.recorded = false;
+                continue;
+            }
             let event = match hands_off.filter(|_| !mentioned.is_empty()) {
                 Some((hand_offs, _)) => {
                     let event = hand_offs.event(target, &posted, &chunk);
@@ -2536,7 +2591,7 @@ impl Delivery<'_> {
             if let (Some((hand_offs, turn)), Some((event, _))) = (hands_off, &event) {
                 for (agent, id) in mentioned.iter().zip(ids) {
                     if let Some(holding) = hand_offs.holder.hold(id) {
-                        handed.push(HandedOff {
+                        handing.handed.push(HandedOff {
                             holding,
                             agent: agent.id,
                             owner: agent.owner,
@@ -2552,14 +2607,17 @@ impl Delivery<'_> {
 
     /// The managed agents `posted` mentions whose bot is active on the
     /// conversation's surface and team, other than the poster and the
-    /// agents in `handed`, each once.
+    /// agents handed to already, each once: those with a place among the
+    /// turn's [`MAX_HAND_OFFS`] ([`Handing::has_place`]), and those past
+    /// them.
     async fn mentioned(
         &self,
         target: &ReplyTarget,
         posted: &Posted,
-        handed: &[HandedOff],
-    ) -> Vec<Agent> {
+        handing: &Handing,
+    ) -> (Vec<Agent>, Vec<AgentId>) {
         let mut mentioned: Vec<Agent> = Vec::new();
+        let mut over = Vec::new();
         for user in &posted.mentions {
             let key = MemberKey {
                 surface: target.conv.surface,
@@ -2569,10 +2627,15 @@ impl Delivery<'_> {
             match self.store.agent_for_bot(&key).await {
                 Ok(Some((agent, _)))
                     if agent.id != self.agent
-                        && handed.iter().all(|handed| handed.agent != agent.id)
-                        && mentioned.iter().all(|seen| seen.id != agent.id) =>
+                        && !handing.handed_to(agent.id)
+                        && mentioned.iter().all(|seen| seen.id != agent.id)
+                        && !over.contains(&agent.id) =>
                 {
-                    mentioned.push(agent);
+                    if handing.has_place(agent.id, &mentioned) {
+                        mentioned.push(agent);
+                    } else {
+                        over.push(agent.id);
+                    }
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -2580,7 +2643,39 @@ impl Delivery<'_> {
                 }
             }
         }
-        mentioned
+        (mentioned, over)
+    }
+
+    /// Claims the hops from `turn` to the agents `over`, which `msg`
+    /// mentions past the turn's [`MAX_HAND_OFFS`], before `msg`'s row is
+    /// recorded: the platform's copy of `msg` takes a hop only once that
+    /// row is there, and then finds these claimed. Returns false when a
+    /// claim couldn't be recorded; the row is then left out, so `msg`
+    /// hands off nothing, by either copy.
+    async fn pass_over(
+        &self,
+        over: &[AgentId],
+        turn: TurnId,
+        now: OffsetDateTime,
+        msg: &MsgRef,
+    ) -> bool {
+        tracing::info!(agent = %self.agent, %turn, msg = %msg.id, ?over, "a post mentions more agents than its turn hands off to; not handing it to these");
+        for agent in over {
+            if let Err(err) = self
+                .store
+                .mark_event_processed(
+                    HOP_SOURCE,
+                    &hop_key(*agent, turn),
+                    now,
+                    PROCESSED_EVENT_RETENTION,
+                )
+                .await
+            {
+                tracing::warn!(agent = %self.agent, msg = %msg.id, error = %err, "couldn't claim a hop past the turn's hand-offs; not recording the post");
+                return false;
+            }
+        }
+        true
     }
 
     async fn react(&self, msg: &MsgRef, emoji: &str) {
@@ -2882,15 +2977,21 @@ mod tests {
             }),
         };
         let turn = TurnId::new_v4();
-        let mut handed = Vec::new();
+        let mut handing = Handing::default();
         let posting = delivery(Answering::Message(&answered), true);
         for text in [
             "@U2 have a look, @U1BOT",
             "@U2 and @U3 and @U4 too",
             "@U3 again",
         ] {
-            assert!(posting.post(Some(turn), text, &mut handed).await.complete());
+            assert!(
+                posting
+                    .post(Some(turn), text, &mut handing)
+                    .await
+                    .complete()
+            );
         }
+        let handed = &handing.handed;
         let to: Vec<(AgentId, &str)> = handed
             .iter()
             .map(|handed| (handed.agent, handed.event.text.as_str()))
@@ -2967,15 +3068,15 @@ mod tests {
             ),
         ];
         for (answering, hands_off, turn, to, text) in cases {
-            let mut handed = Vec::new();
+            let mut handing = Handing::default();
             assert!(
                 delivery(answering, hands_off)
-                    .post_to(turn, &to, text, &mut handed)
+                    .post_to(turn, &to, text, &mut handing)
                     .await
                     .complete(),
                 "{text}"
             );
-            assert!(handed.is_empty(), "{text}");
+            assert!(handing.handed.is_empty(), "{text}");
         }
         for (_, text, msg) in surface.calls().iter().filter_map(|call| match call {
             testkit::Call::Post { to, text, msg } => Some((to, text, msg)),
@@ -2988,6 +3089,125 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_turn_hands_off_to_max_hand_offs_agents_asked_ones_first_and_claims_the_rest() {
+        let key = store::Sealer::generate_key().unwrap();
+        let store = Store::open_in_memory(store::Sealer::from_base64(&key).unwrap())
+            .await
+            .unwrap();
+        let (poster, binding) = bot_agent(&store, "helper", "U1BOT").await;
+        let (writer, _) = bot_agent(&store, "writer", "U2").await;
+        let (scout, _) = bot_agent(&store, "scout", "U3").await;
+        let (critic, _) = bot_agent(&store, "critic", "U4").await;
+        let surface = testkit::MockSurface::new();
+        for user in ["U2", "U3", "U4"] {
+            surface.name_user(user, core_types::UserId::from(user));
+        }
+        let conv = ConvRef {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            conversation: "C1".into(),
+        };
+        let bot = MemberKey {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            user: "U1BOT".into(),
+        };
+        let requester = Requester {
+            member: None,
+            key: MemberKey {
+                user: "U1".into(),
+                ..bot.clone()
+            },
+        };
+        let answered = MsgRef {
+            conv: conv.clone(),
+            id: "1.1".into(),
+        };
+        let delivery = Delivery {
+            store: &store,
+            surface: &surface,
+            session: SessionId::new_v4(),
+            agent: poster,
+            requester: &requester,
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            target: ReplyTarget {
+                conv: conv.clone(),
+                thread_root: Some("1.1".into()),
+            },
+            answering: Answering::Message(&answered),
+            hand_offs: Some(HandOffs {
+                conv_kind: ConvKind::Channel,
+                bot: bot.clone(),
+                binding,
+                now: time::macros::datetime!(2030-01-01 0:00 UTC),
+                holder: Holder::default(),
+            }),
+        };
+        let claimed = async |agents: &[AgentId], turn| {
+            let mut claimed = Vec::new();
+            for agent in agents {
+                if store
+                    .event_processed(HOP_SOURCE, &hop_key(*agent, turn))
+                    .await
+                    .unwrap()
+                {
+                    claimed.push(*agent);
+                }
+            }
+            claimed
+        };
+        let everyone = [writer, scout, critic];
+
+        let turn = TurnId::new_v4();
+        let mut handing = Handing::default();
+        for text in ["@U2 @U3 @U4 all of you", "@U4 and you again"] {
+            assert!(
+                delivery
+                    .post(Some(turn), text, &mut handing)
+                    .await
+                    .complete()
+            );
+        }
+        let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
+        assert_eq!(
+            handed,
+            everyone[..MAX_HAND_OFFS],
+            "the first agents mentioned, up to the cap"
+        );
+        assert_eq!(
+            claimed(&everyone, turn).await,
+            everyone[MAX_HAND_OFFS..],
+            "the hops past the cap are claimed, so no copy of the post runs them"
+        );
+
+        let turn = TurnId::new_v4();
+        let mut handing = Handing {
+            asked: vec![critic],
+            ..Handing::default()
+        };
+        for text in ["@U2 @U3 first", "@U4:\n\nthe task"] {
+            assert!(
+                delivery
+                    .post(Some(turn), text, &mut handing)
+                    .await
+                    .complete()
+            );
+        }
+        let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
+        let mut expected = everyone[..MAX_HAND_OFFS - 1].to_vec();
+        expected.push(critic);
+        assert_eq!(
+            handed, expected,
+            "the agent the turn asks keeps its place from the mentions before its task"
+        );
+        assert_eq!(
+            claimed(&everyone, turn).await,
+            everyone[MAX_HAND_OFFS - 1..2]
+        );
     }
 
     #[test]

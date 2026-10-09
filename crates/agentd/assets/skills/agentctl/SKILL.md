@@ -120,10 +120,13 @@ other agent takes at most one turn for this turn, on the first of your
 posts that mentions it, which may be a reply that doesn't hold the task, and
 a second ask-agent to the same agent is refused. Every agent a post
 mentions is handed the post, so an `@` in the task hands it to that agent
-as well. Posts to other threads or conversations hand off nothing. On
-Slack, a mention with a backtick somewhere before it and another after it
-in the same message hands off to no one, even outside code, so mention
-agents before or after any code, never between.
+as well, but a turn hands off to at most 2 agents: the ones you ask-agent
+first, then the ones your posts mention, in the order they go out; any
+other agent mentioned is not handed anything, without a word. Posts to
+other threads or conversations hand off nothing. On Slack, a mention with
+a backtick somewhere before it and another after it in the same message
+hands off to no one, even outside code, so mention agents before or after
+any code, never between.
 
 Don't promise an answer. The other agent may decline: past the community's
 limit on how many agents one request may chain through, or a thread's
@@ -134,8 +137,9 @@ conversation, it says nothing. When it is busy, it may answer minutes later.
 
 Refused inside a private task, in direct messages (only channels and group
 DMs have other agents to answer), for your own name, for an agent this turn
-asked already, and when the turn already queued 10 posts. Not found when no
-agent by that name has a bot on this chat.
+asked already, for another agent once this turn asked 2, and when the turn
+already queued 10 posts. Not found when no agent by that name has a bot on
+this chat.
 
 ## private
 

@@ -25,7 +25,7 @@ use store::{CtlToken, CtlTurn, TokenHash, Visibility};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
-use super::outbox::{Outbox, QueuedPost, QueuedReaction};
+use super::outbox::{MAX_HAND_OFFS, Outbox, QueuedPost, QueuedReaction};
 use super::target;
 use super::token::{MAX_PRESENTED_LEN, hash_token};
 use super::{Ctl, MAX_POST_BYTES};
@@ -659,7 +659,9 @@ async fn lock(
 /// mentions the agent still spends the hop: the agent runs once per
 /// `(agent, turn)`, on whichever of the turn's posts mentioning it comes
 /// first, so a plain post queued before the `ask-agent` is the one it
-/// answers, and the task goes unread.
+/// answers, and the task goes unread. A turn asks at most
+/// [`MAX_HAND_OFFS`] agents, and each one it asks keeps its place among
+/// them, whatever the turn's other posts mention.
 async fn ask_agent(
     State(ctl): State<Ctl>,
     Caller(caller): Caller,
@@ -756,6 +758,20 @@ async fn ask_agent(
                 CtlErrorCode::Refused,
                 format!(
                     "this turn already asked @{handle}, which answers a turn once: put everything in one task"
+                ),
+            ));
+        }
+        if outbox
+            .posts()
+            .iter()
+            .filter(|post| post.asks.is_some())
+            .count()
+            >= MAX_HAND_OFFS
+        {
+            return Err(error(
+                CtlErrorCode::Refused,
+                format!(
+                    "this turn already asked as many agents as one turn hands off to ({MAX_HAND_OFFS})"
                 ),
             ));
         }
