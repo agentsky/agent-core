@@ -465,7 +465,8 @@ impl Pipeline {
     /// Posts Markdown `text` about `consent` in the thread that asked, as
     /// its agent's bot, recorded in `message_refs` like a private task's
     /// reply under a session id that is the consent's own. Done when it is
-    /// posted, or when the agent can't post there any more.
+    /// posted, even if its row couldn't be recorded, since posting it again
+    /// would post it twice, or when the agent can't post there any more.
     ///
     /// # Errors
     ///
@@ -491,12 +492,9 @@ impl Pipeline {
             answering: Answering::PrivateTask(consent.id),
             hand_offs: None,
         };
-        if !delivery
-            .post(None, text, &mut Handing::default())
-            .await
-            .posted
-        {
-            return Err(PipelineError::NotPosted);
+        match delivery.post(None, text, &mut Handing::default()).await {
+            Ok(()) | Err(Lost::Row) => {}
+            Err(Lost::Chunk) => return Err(PipelineError::NotPosted),
         }
         tracing::info!(consent = %consent.id, "posted a private task's outcome");
         Ok(())

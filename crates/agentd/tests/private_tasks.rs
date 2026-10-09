@@ -849,6 +849,55 @@ async fn decline_posts_outcome() {
 }
 
 #[tokio::test]
+async fn an_outcome_posted_without_its_row_is_posted_once() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    let db = stack.db().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_consent_refs BEFORE INSERT ON message_refs \
+         WHEN NEW.consent_id IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected'); END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    db.close().await;
+    stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, false)
+        .await
+        .unwrap();
+    let (_, _, posted) = stack.posted(before, "declined it").await;
+    let started = Instant::now();
+    let row = loop {
+        let row = stack.store().consent(consent).await.unwrap().unwrap();
+        if row.finished_at.is_some() || row.work_failures > 0 {
+            break row;
+        }
+        assert!(started.elapsed() < WAIT, "consent {consent} never finished");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        row.work_failures, 0,
+        "a posted outcome isn't a failed try, though its row wasn't recorded"
+    );
+    assert!(row.finished_at.is_some());
+    assert_eq!(
+        stack.store().posted_message_ref(&posted).await.unwrap(),
+        None,
+        "the row really failed"
+    );
+    let declined = posts(&stack.mock.calls().split_off(before))
+        .into_iter()
+        .filter(|(_, text, _)| text.contains("declined it"))
+        .count();
+    assert_eq!(declined, 1);
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn expiry_posts_outcome() {
     let stack = start("").await;
     let before = stack.mock.calls().len();

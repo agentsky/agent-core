@@ -188,26 +188,24 @@ pub const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
 ///    [`RunnerError::SessionReset`] runs once more, on the session looked
 ///    up again. What the turn message recorded as shown is forgotten when
 ///    the turn never reached the model, so the next turn shows it again.
-/// 6. **Delivery**, as the agent's bot, in the thread: the directives are
-///    taken out of the reply, the turn's staged attachments uploaded, the
-///    reply cut at [`MAX_POST_BYTES`] (closing a code block the cut left
-///    open), rendered, split and posted, and a `message_refs` row recorded
-///    for every chunk with the turn's requester and hop; then the
-///    directives' reactions, and the reactions and posts the turn queued
-///    with agentctl. Each goes out even when another failed, and then the
-///    thread is told part of the reply was lost (a refused reaction is
-///    only logged); so it is when a chunk with hand-offs to make was posted
-///    but couldn't be recorded with them, or the turn's outbox was lost
-///    because `turn_finished` failed. A failed turn posts a short message
-///    that says why when the runner could tell. A usage limit or a refused login names whose
-///    account it was, the requester's or the community key's, and the
-///    requester alone is also told privately by the manager bot, unless
-///    the thread is their own DM with the agent or they were told about
-///    the same kind of failure within [`FAILURE_DM_INTERVAL`]; the agent's
-///    owner never is, unless they asked. A turn that ran out of time after
-///    the CLI read its message posts [`TIMED_OUT_TEXT`]; any other
-///    failure, including a crash or a timeout before the CLI read the
-///    message, posts [`FAILED_TEXT`].
+/// 6. **Delivery**, as the agent's bot, in the thread: the directives are taken
+///    out of the reply, the turn's staged attachments uploaded, the reply cut
+///    at [`MAX_POST_BYTES`] (closing a code block the cut left open), rendered,
+///    split and posted, and a `message_refs` row recorded for every chunk with
+///    the turn's requester and hop; then the directives' reactions, and the
+///    reactions and posts the turn queued with agentctl. Each goes out even
+///    when another failed, and then the thread is told part of the reply was
+///    lost (a refused reaction is only logged); so it is when a chunk was
+///    posted but its row couldn't be recorded, or the turn's outbox was lost
+///    because `turn_finished` failed. A failed turn posts a short message that
+///    says why when the runner could tell. A usage limit or a refused login
+///    names whose account it was, the requester's or the community key's, and
+///    the requester alone is also told privately by the manager bot, unless the
+///    thread is their own DM with the agent or they were told about the same
+///    kind of failure within [`FAILURE_DM_INTERVAL`]; the agent's owner never
+///    is, unless they asked. A turn that ran out of time after the CLI read its
+///    message posts [`TIMED_OUT_TEXT`]; any other failure, including a crash or
+///    a timeout before the CLI read the message, posts [`FAILED_TEXT`].
 /// 7. **Hand-off.** Each post of the turn's own in the thread it answered,
 ///    its reply's chunks and the posts it queued (`agentctl post` and
 ///    `ask-agent`), outside a one-to-one DM and a private task, hands off
@@ -2354,21 +2352,15 @@ impl Handing {
     }
 }
 
-/// What [`Delivery::post_to`] got out of a text: whether every chunk was
-/// posted, and whether every hand-off its chunks were to make was
-/// recorded.
-#[derive(Debug, Clone, Copy)]
-struct Sent {
-    posted: bool,
-    handed_off: bool,
-}
-
-impl Sent {
-    /// Whether nothing was lost: every chunk posted, and every hand-off
-    /// recorded.
-    fn complete(self) -> bool {
-        self.posted && self.handed_off
-    }
+/// What [`Delivery::post_to`] lost of a text; a lost chunk wins over a
+/// lost row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lost {
+    /// A chunk wasn't posted.
+    Chunk,
+    /// Every chunk was posted, but a chunk's `message_refs` row, with any
+    /// hand-offs it was to make, wasn't recorded.
+    Row,
 }
 
 /// What one chunk of a turn's post hands off: the agents with a place
@@ -2481,8 +2473,7 @@ impl Delivery<'_> {
                 .collect(),
             passed: Vec::new(),
         };
-        let sent = self.post(Some(turn), &reply, &mut handing).await;
-        complete &= sent.complete();
+        complete &= self.post(Some(turn), &reply, &mut handing).await.is_ok();
         if let Answering::Message(answered) = self.answering {
             for emoji in reactions {
                 self.react(answered, &emoji).await;
@@ -2496,7 +2487,7 @@ impl Delivery<'_> {
                 complete &= self
                     .post_to(Some(turn), &queued.to, &queued.text, &mut handing)
                     .await
-                    .complete();
+                    .is_ok();
             }
         }
         if !complete && let Err(err) = say(self.surface, &self.target, DELIVERY_FAILED_TEXT).await {
@@ -2506,17 +2497,19 @@ impl Delivery<'_> {
     }
 
     /// [`post_to`](Self::post_to) the target: the turn's own thread.
-    async fn post(&self, turn: Option<TurnId>, text: &str, handing: &mut Handing) -> Sent {
+    async fn post(
+        &self,
+        turn: Option<TurnId>,
+        text: &str,
+        handing: &mut Handing,
+    ) -> Result<(), Lost> {
         self.post_to(turn, &self.target, text, handing).await
     }
 
     /// Renders and posts Markdown `text` to `target`, recording a
     /// `message_refs` row for each chunk, of `turn` if a turn made it. A
     /// chunk that can't be posted is skipped and the rest still go. Empty
-    /// text posts nothing. Returns whether every chunk was posted, and
-    /// whether every chunk with hand-offs to make was recorded with them.
-    /// A chunk that hands off to no one and can't be recorded is only
-    /// logged: its thread saw all of it, though no short id names it.
+    /// text posts nothing.
     ///
     /// A chunk hands off when a turn posted it in the turn's own thread,
     /// with [`HandOffs`] ([`plan`](Self::plan)): then a `hand_offs` row is
@@ -2524,31 +2517,35 @@ impl Delivery<'_> {
     /// mentions that has a place among the turn's [`MAX_HAND_OFFS`], and
     /// held at once, so no replay takes it while this turn hands it off;
     /// the agents go in `handing`, so a turn hands off to an agent once.
+    ///
+    /// # Errors
+    ///
+    /// What was lost ([`Lost`]): a chunk, or else a chunk's row, which
+    /// leaves the chunk posted but unattributed, so a mention in it starts
+    /// no hop, a person's reply to it reaches no agent, the next turn shows
+    /// it again as history, and any hand-off it was to make is lost.
     async fn post_to(
         &self,
         turn: Option<TurnId>,
         target: &ReplyTarget,
         text: &str,
         handing: &mut Handing,
-    ) -> Sent {
+    ) -> Result<(), Lost> {
         let hands_off = self
             .hand_offs
             .as_ref()
             .zip(turn)
             .filter(|_| *target == self.target);
-        let mut sent = Sent {
-            posted: true,
-            handed_off: true,
-        };
         if text.trim().is_empty() {
-            return sent;
+            return Ok(());
         }
+        let mut lost = None;
         for chunk in self.surface.render(text) {
             let posted = match post_chunk(self.surface, target, &chunk).await {
                 Ok(posted) => posted,
                 Err(err) => {
                     tracing::warn!(session = %self.session, conv = %target.conv, error = %err, "posting part of a reply failed");
-                    sent.posted = false;
+                    lost = Some(Lost::Chunk);
                     continue;
                 }
             };
@@ -2558,7 +2555,7 @@ impl Delivery<'_> {
                         .plan(hand_offs, turn, target, &posted, &chunk, handing)
                         .await;
                     let Some(plan) = planned else {
-                        sent.handed_off = false;
+                        lost.get_or_insert(Lost::Row);
                         continue;
                     };
                     plan
@@ -2603,7 +2600,7 @@ impl Delivery<'_> {
                 Ok((_, ids)) => ids,
                 Err(err) => {
                     tracing::warn!(session = %self.session, msg = %posted.msg.id, hand_offs = plan.to.len(), error = %err, "recording a posted message and its hand-offs failed");
-                    sent.handed_off &= plan.to.is_empty();
+                    lost.get_or_insert(Lost::Row);
                     continue;
                 }
             };
@@ -2621,7 +2618,7 @@ impl Delivery<'_> {
                 }
             }
         }
-        sent
+        lost.map_or(Ok(()), Err)
     }
 
     /// What `posted`, a chunk of `turn`'s post in its own thread, hands
@@ -2821,7 +2818,7 @@ mod tests {
     use crate::config::Config;
     use crate::config::tests::{MINIMAL, env};
     use crate::pipeline::TurnSettings;
-    use core_types::{BindingId, ConvRef, SessionId, SurfaceKind};
+    use core_types::{BindingId, ConvRef, SurfaceKind};
     use runner::{PoolConfig, ProcessConfig};
     use sandbox::ProcessSandbox;
     use testkit::TempDir;
@@ -3078,12 +3075,7 @@ mod tests {
             "@U2 and @U3 and @U4 too",
             "@U3 again",
         ] {
-            assert!(
-                posting
-                    .post(Some(turn), text, &mut handing)
-                    .await
-                    .complete()
-            );
+            assert!(posting.post(Some(turn), text, &mut handing).await.is_ok());
         }
         let handed = &handing.handed;
         let to: Vec<(AgentId, &str)> = handed
@@ -3167,7 +3159,7 @@ mod tests {
                 delivery(answering, hands_off)
                     .post_to(turn, &to, text, &mut handing)
                     .await
-                    .complete(),
+                    .is_ok(),
                 "{text}"
             );
             assert!(handing.handed.is_empty(), "{text}");
@@ -3259,12 +3251,7 @@ mod tests {
         let turn = TurnId::new_v4();
         let mut handing = Handing::default();
         for text in ["@U2 @U3 @U4 all of you", "@U4 and you again"] {
-            assert!(
-                delivery
-                    .post(Some(turn), text, &mut handing)
-                    .await
-                    .complete()
-            );
+            assert!(delivery.post(Some(turn), text, &mut handing).await.is_ok());
         }
         let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
         assert_eq!(
@@ -3289,12 +3276,7 @@ mod tests {
             ..Handing::default()
         };
         for text in ["@U2 @U3 first", "@U4:\n\nthe task"] {
-            assert!(
-                delivery
-                    .post(Some(turn), text, &mut handing)
-                    .await
-                    .complete()
-            );
+            assert!(delivery.post(Some(turn), text, &mut handing).await.is_ok());
         }
         let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
         let unasked = [writer, scout];
@@ -3314,7 +3296,7 @@ mod tests {
             delivery
                 .post(Some(turn), "@U5 @U2 both of you", &mut handing)
                 .await
-                .complete()
+                .is_ok()
         );
         let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
         assert_eq!(handed, [writer]);
@@ -3334,7 +3316,7 @@ mod tests {
             delivery
                 .post(Some(turn), "@U5 @U2 @U3 all of you", &mut handing)
                 .await
-                .complete()
+                .is_ok()
         );
         let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
         assert_eq!(handed, unasked[..MAX_HAND_OFFS - 1]);
@@ -3623,6 +3605,16 @@ mod tests {
         );
         let kept = replied("Here.", Ok(None));
         assert_eq!(delivered(&store().await, kept).await, ["Here."]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_posted_without_its_attribution_is_reported_as_incomplete() {
+        let store = store().await;
+        store.close().await;
+        assert_eq!(
+            delivered(&store, replied("Here.", Ok(None))).await,
+            ["Here.", DELIVERY_FAILED_TEXT]
+        );
     }
 
     #[test]
