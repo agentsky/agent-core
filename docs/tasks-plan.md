@@ -2801,10 +2801,13 @@ Not scheduled. Each needs a decision before it becomes a task.
   `DELETE` and `OPTIONS`.
 - **Killing leftover processes at turn end.** T18 unpoints the placeholder
   when a turn ends, so a background process the model left running can't
-  spend credentials between turns. It can still spend turn N+1's
-  credential while turn N+1 runs, whoever its requester is. Only killing
-  the processes a turn leaves behind in the container when it ends removes
-  that.
+  spend credentials between turns, and T21 recycles the session's container
+  when the requester changes, which ends every process in it, so a leftover
+  never runs during another requester's turn
+  ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
+  It can still spend the credentials of its own requester's later turns
+  while they run. Only killing the processes a turn leaves behind in the
+  container when it ends removes that.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
