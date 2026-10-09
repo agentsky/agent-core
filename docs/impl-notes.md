@@ -2390,6 +2390,189 @@ replies run out, as Slack's `conversations.replies` would. It reads at most
 50 pages. Both thread and top-level history leave out system messages, so a
 call can return fewer than `limit`.
 
+## T13: account commands
+
+### The relink channel is in memory, the notice has to be durable
+
+**Issue.** `auth` sends a member on `Auth::take_relink_notices()` right after
+its mark set `claude_links.broken_at`, so the store's `NULL`-to-set
+transition already makes it one notice per break. But the channel lives in
+one process: a crash or deploy between the mark and the DM loses the notice
+for good, and a DM that fails (Rocket.Chat down, the manager rate limited)
+has nothing to retry it. Remembering what was sent in memory would not
+survive a restart and would not be shared by a second instance.
+
+**Solution.** A migration adds `claude_links.relink_notified_at`, which
+`put_claude_link` and `update_claude_tokens` clear together with
+`broken_at`. What is owed is every link with `broken_at` set and
+`relink_notified_at` empty (`Store::pending_relink_notices`). agentd's
+`RelinkNotifier` claims each with a conditional `UPDATE` keyed by the link's
+generation (`claim_relink_notice`) before it sends, so one instance at a
+time sends it, and marks it sent afterwards (`mark_relink_notice_sent`). It
+runs a pass at startup, whenever the `auth` channel wakes it, and every
+minute. A member no manager bot can reach (a Slack-only member until T30)
+is left pending without a claim.
+
+A second migration adds `relink_attempts` and `relink_next_attempt_at`,
+cleared with `relink_notified_at`, because a notice that can't be sent
+(the member's account is gone, the manager is refused) would otherwise
+cost a `users.info`, an `im.create` and maybe a post on the manager's
+account, plus a warning, every minute forever:
+
+- The claim is a lease: it counts an attempt and sets
+  `relink_next_attempt_at` to ten minutes on. A process killed between the
+  claim and marking the notice sent leaves the lease to run out, and the
+  notice is pending again, so it is sent at least once, and twice only
+  after such a crash. Before, the claim stayed set and the notice was lost
+  for good.
+- A failed send defers the next claim (`defer_relink_notice`) by a backoff
+  that starts at a minute and doubles up to six hours.
+- After 20 attempts, about three days, the notice is no longer pending,
+  and the notifier logs once that it gave up. A crash during the last
+  attempt gives up without that log line.
+
+The notifier reads the clock through a function its tests replace, so the
+backoff and the lease are tested without waiting.
+
+### A DM to a member needs their username
+
+**Issue.** `reply_private` for a channel command, and the relink notice,
+open the manager bot's DM with the member. Rocket.Chat's `im.create` takes a
+`username`, and an `InboundEvent` carries only the sender's user id.
+
+**Solution.** `RocketChatDms` calls `users.info` for the username, then
+`im.create`, which returns the existing DM when there is one. To keep the
+common case to one call (the manager is subject to the REST rate limiter
+unless one of its roles has `api-bypass-rate-limit`), `Origin::RocketChatDm` carries
+the DM's room, which the event already names, and a reply there posts
+straight to it. The plan's `RocketChatDm` had no field; the T13 bullet
+says so now. `Origin::SlackSlash`'s `response_url` is a `SecretString`,
+since anyone holding it can post in the channel for a while.
+
+### Which Rocket.Chat messages are commands
+
+**Issue.** The plan says a DM to the manager bot is a command and a channel
+message starting with `!agent` is one. It doesn't say what happens to the
+manager bot's own replies, which come back on its connection like any
+message in the DM, to bots' messages, or to a DM with an agent's bot.
+
+**Solution.** `commands::rocketchat::command_in` drops every message from
+a bot (`sender_is_bot` or `sender_bot_user`) and from the manager bot
+itself, or its replies would be parsed as commands and answered in a loop,
+and an agent could be talked into running `!agent delete`. Only a
+one-to-one DM that reached the manager bot's own binding is
+`RocketChatDm`. A DM with an agent's bot is treated as any other room: it
+is a command only with `!agent`, and it is not private, since the agent's
+sessions can read that conversation's history, so a login code there is
+refused.
+
+### Every bot connection has to look for commands
+
+**Issue.** The surface records each Rocket.Chat message once, under one
+source for every bot (T12's `Dedup`), and delivers it only on the
+connection that records it first. The first version heard commands only on
+the manager bot's connection. Once T14 adds the agents' connections, an
+`!agent` message in a room the manager shares with an agent would be lost
+whenever the agent's connection recorded it first, and one in a room or DM
+without the manager would never be heard.
+
+**Solution.** `commands::rocketchat::CommandIntake` owns the channel, the
+per-member ordering and the drain at shutdown, and knows nothing of any
+connection. Each connection delivers through a `CommandFeed`'s
+`into_sender(onward)`, which runs `command_in` with the manager bot's
+binding on every event the connection won, sends commands to the one
+intake and passes only other messages to `onward`, so a command is never
+also taken as a turn. The manager bot's connection is one feeder; T14
+feeds every agent's too, and from then on passes the manager's other
+messages onward as well, since whichever connection wins a message
+delivers it for every bot in the room. `command_in` already treated a
+message on another binding as not private, so a login code in a DM with
+an agent's bot is refused whichever connection heard it. The intake runs
+until every feed is dropped, so it finishes the commands it received after
+the connections stop.
+
+### A member's commands run in order, others' alongside
+
+**Issue.** A code exchange can take the token endpoint's 30-second timeout,
+so running commands one after another on the connection would hold up
+every member. Running each in its own task could swap one member's
+`logout` and `login`, or answer `me` before the `login <code>` sent just
+before it.
+
+**Solution.** Each command runs in its own task inside the intake's
+task, and waits for the previous command of the same member to finish
+first (a `oneshot` per member, pruned once finished). On shutdown the
+connections stop listening, and the intake runs the commands it already
+received (the store has recorded them as processed, so no other instance
+would) and waits for them within the drain timeout.
+
+One window is left. `listen` stops on the shutdown signal by dropping the
+surface's events future, and that future may be between the
+`mark_event_processed` commit and the end of the `send` into the intake. A
+command dropped there is recorded as processed and never run by any
+instance. The window covers the store write and `CommandFeed::offer`'s
+`send` into the intake's channel, which holds 64 commands: normally both
+are short, but under a backlog the `send` waits while the channel is full,
+and the window lasts that long. It is inherent to recording an event before
+delivering it; the member sees no reply and can send the command again.
+
+### Secret-looking text that doesn't parse, in a channel
+
+**Issue.** `ParseError::is_secret_bearing` says malformed text may hold a
+secret, but not which kind, so the plan's two refusals (cancel pending
+logins, or revoke the key) can't be picked.
+
+**Solution.** Both apply: the member's pending logins are cancelled (it
+costs at most a new `login`), and the reply tells them to revoke any key or
+token they posted, followed by the parser's usage message. A secret-bearing
+command that parses gets the refusal for its kind: `login <code>` cancels
+the pending logins, `admin api-key set` says to revoke the key at the
+Anthropic Console, `slack-token` says to revoke it at api.slack.com. None
+of them is used. The refusal matches every command explicitly, so a new
+secret-bearing command doesn't compile until it has its own advice. If
+cancelling the pending logins fails in the store, the failure is logged and
+the member still gets the refusal, which then doesn't claim the login was
+cancelled; the parsed and the unparsed paths agree on this. A
+public `login <code>` also takes the pending login its `state` names
+(`Auth::cancel_pasted_login`, with `auth`'s own paste parsing and no
+exchange), whoever started it: the sender's own pending logins are not
+necessarily the one the code belongs to. agentd can't delete the message (the `bot` role lacks
+`delete-message`), so the reply suggests the member does.
+
+### Smaller choices the plan left open
+
+- `login` creates the member (`ensure_member`); `login <code>`, `logout`
+  and `me` only look the member up, so asking `me` doesn't create anyone.
+  A new member's display name is their user id, since the event has no
+  username.
+- `logout` also cancels the member's pending logins, so a login link sent
+  before the logout can't link the account again.
+- Commands later tasks implement answer "`<name>` isn't available yet."
+  `admin api-key set` from a DM stores nothing until T26.
+- The manager bot has no stored binding before T14's `agent_bindings`, so
+  its `BindingId` is new at every start. `App` keeps its surface, binding
+  and the one `BotRoles` every Rocket.Chat surface shares, for T14.
+- T13 adds the `[claude_oauth]` section (all of `auth::OAuthConfig`,
+  checked at load, key named as `claude_oauth.<key>`) and `[rocketchat]`
+  with `base_url`, optional `websocket_url`, `team` and `manager_user_id`;
+  `AGENTD_RC_MANAGER_TOKEN` is required with it. `team` has no default,
+  because deriving it from the URL would change every stored identity when
+  the URL changes.
+- The manager bot now posts every command reply, and `users.info` plus
+  `im.create` for a channel command, so its roles should include
+  `api-bypass-rate-limit`, as the T11 note on the role expected; the
+  README says so. The built-in `bot` and `app` roles the manager holds on
+  the Community Edition already have it, and `create-d` for `im.create`
+  ([T11's live check](#the-live-check-against-7139)).
+- `surface-rocketchat`'s `conv_kind` took a `d` room whose `rooms.info`
+  had neither `usersCount` nor `uids` for a one-to-one DM, which would
+  make a DM of unknown size private enough for a login code if it reached
+  the manager bot. It is a group DM now, and only a count or a member list
+  of at most two makes a DM one-to-one.
+- The captured-log test logs at `trace` for every crate through a whole
+  DM login, exchange included, and finds neither the code nor the pasted
+  text, so reqwest, hyper and sqlx don't log request bodies either.
+
 ## T15: agentctl
 
 ### The token needs the turn's thread and message
