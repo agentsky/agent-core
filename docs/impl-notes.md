@@ -3836,11 +3836,14 @@ placeholder revoked by `process_stopping` before the turn's `turn_finished`
 runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
-What remains: a background process left from turn N can still spend turn
-N+1's credential while N+1 runs, whoever its requester is. Killing what a
-turn leaves behind has no clean boundary, and recycling the container when
-the requester changes removes the cross-requester case; the plan's Deferred
-work ("Processes a turn leaves running") has both.
+T21 recycles the session's container when the requester changes, which
+ends every process a turn left running, so a leftover never spends another
+requester's credential
+([T21](#another-requesters-turn-gets-a-new-container)). What remains: a
+background process left from turn N can still spend the credential of a
+later turn of the same requester while that turn runs. Killing what a turn
+leaves behind has no clean boundary; the plan's Deferred work ("Processes a
+turn leaves running") records it.
 
 ### Headers the proxy changes besides the credential
 
@@ -4067,8 +4070,9 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Processes a turn leaves running" entry records it; recycling the container
-when the requester changes doesn't close it). Resolving the name with a
+"Processes a turn leaves running" entry records it; T21 recycles the
+container only when the requester changes, so the process keeps it until
+then). Resolving the name with a
 trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
 allowed host to a fixed address there; pin it in DNS instead.
 
