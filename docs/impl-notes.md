@@ -2747,16 +2747,72 @@ kill. agentctl then releases the lease and exits with 128 plus the signal.
 A signal while an acquire is in flight used to drop the request, and a
 lease agentd granted for it held the lock with nobody renewing it, for up
 to 30 seconds. agentctl now lets a request already sent finish, for up to
-two seconds, releases the lease if it was granted, and exits with 128 plus
-the signal without running the command. A signal between attempts exits at
-once. agentctl waits at most 100 seconds for the lock
-by default (`--timeout`), below the 2 minutes Claude Code's Bash tool gives
-a command by default, so the model sees why it failed rather than a killed
-command.
+two seconds but not past the time the attempt was given, gives back the
+lease (by its id, below, whether or not an answer said it was granted),
+and exits with 128 plus the signal without running the command. A signal
+between attempts gives back the lease and exits at once. A grant agentd
+makes after that release leaves a lease that expires within its TTL.
+agentctl waits at most 100 seconds for the lock by default (`--timeout`),
+below the 2 minutes Claude Code's Bash tool gives a command by default, so
+the model sees why it failed rather than a killed command.
 
 Review found that `--timeout 18446744073709551615` panicked on `Instant +
 Duration` overflow. The wait is now clamped to a day, which no turn
 outlasts, so any `u64` the model types gives a sane wait.
+
+Review also found that `--timeout` was only checked between attempts: an
+acquire sent to a stalled agentd waited out the 30-second request timeout,
+so `--timeout 1` took 30 seconds and the default could run past the Bash
+tool's 2 minutes. Each acquire is now given the time left, at least seven
+seconds and at most thirty. The floor lets `--timeout 0` take a free lock,
+and outlasts agentd's five-second SQLite busy timeout, so the common slow
+answer isn't abandoned. The default 100 seconds plus the floor stays under
+2 minutes.
+
+### The acquire is idempotent
+
+**Issue.** No floor guarantees agentd answers in time: an acquire takes a
+pool connection twice, to authorize and then to acquire, each waited for
+up to 30 seconds, on top of the busy timeout. An acquire agentctl stopped
+waiting for could still be granted, leaving a lease nobody held that
+blocked every session on the volume, the same session's next attempt
+included, until its TTL ran out. The retry then spun on `busy` and blamed
+"another command" for agentctl's own orphan.
+
+**Solution.** agentctl picks a `LeaseId` for each `lock` and sends it with
+every acquire attempt. agentd takes the lock when the current lease has
+expired, or when the volume's row already holds that lease for the same
+session, which it extends and returns again. So a retry picks up an
+earlier attempt's late grant. The id only ever matches the caller's own
+session's row on its own volume: another session naming a live lease gets
+`busy`, and an id that names another volume's lease grants and changes
+nothing, even over the caller's expired row. Renew and release name the same id, so a signal can
+release the lease even when no answer arrived.
+
+That picks up a late grant only while agentctl is still acquiring. One
+that lands after agentctl released the lease is still orphaned: say an
+attempt is held up in agentd for over 30 seconds, a later attempt is
+granted, the command runs and the lease is released, and then the first
+attempt lands. The same goes for a grant landing after a stop signal's
+release, or after agentctl gave back a lease too short or too long to
+hold. Nobody renews such a lease, so it holds the lock for at most its
+TTL, 30 seconds by default. This was already so before the id; it is
+just not solved by it.
+
+An acquire that failed with agentd's internal error (a busy database,
+say), or whose answer was lost (it timed out, was cut off, or couldn't be
+read), is retried until `--timeout` runs out, as renewals are. One that
+can't connect to agentd (a name that doesn't resolve, a refused
+connection, or the five-second connect timeout) never reached it, so
+`lock` fails at once with the same "can't connect" error as every other
+subcommand: a wrong URL or an agentd that is down is reported straight
+away. A renewal that can't connect is still retried until the deadline,
+since the command already runs under the lease and a brief outage
+shouldn't kill it. Any other refusal also fails at once. When `lock`
+gives up after the timeout, it names the last attempt's reason: busy,
+agentd's internal error, or the lost answer. Only after a lost answer
+does it add that a lease agentd granted anyway expires within its TTL,
+since no later attempt is left to pick it up.
 
 ### The command runs in its own process group
 
@@ -3996,13 +4052,25 @@ the calls in the last minute, and a call waits while the quota is used up.
 It is in memory and per process, which is enough to stay under Slack's
 limits; Slack's 429 remains the authority.
 
-A 429, or `ok: false` with `ratelimited`, blocks that bucket until
-`Retry-After` has passed, so concurrent callers wait too. A call is retried
+A 429, or `ok: false` with `ratelimited`, blocks the method for that token
+until `Retry-After` has passed, so concurrent callers wait too. Slack limits
+`chat.postMessage` both per channel and per token, and a 429 doesn't say
+which limit it hit, so a 429 on a post to one channel holds posts to every
+channel; each channel's quota stays its own. A call is retried
 up to three times while the wait is at most `max_retry_wait` (60 s by
 default); a longer wait fails at once with `SurfaceError::RateLimited`, and
-so does any later call in that bucket while it stays blocked, instead of
+so does any later call to that method while it stays blocked, instead of
 sleeping silently. `Retry-After` is read as whole seconds and capped at a
 day so it can't overflow a deadline.
+
+Holding the method for the whole token has costs. The client-side
+`chat.postMessage` quota lets all 60 of a minute's posts to one channel go
+at once, where Slack allows about one a second, so a short burst to one
+busy channel can draw a per-channel 429, which holds posts to every
+channel for the `Retry-After`. And when a hold ends, every caller waiting
+on it wakes at once and can draw another 429. Both are accepted: Slack
+asks callers to back off per method per token, and its `Retry-After` is
+usually short.
 
 ### Error codes Slack answers with HTTP 200
 

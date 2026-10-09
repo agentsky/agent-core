@@ -6,8 +6,8 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Request, header};
 use core_types::{
-    ConsentId, Hop, MemberKey, MessageId, Msg, MsgRef, ReplyTarget, Requester, ScopeKey, Side,
-    SurfaceKind, ThreadKey, TurnKind,
+    ConsentId, Hop, LeaseId, MemberKey, MessageId, Msg, MsgRef, ReplyTarget, Requester, ScopeKey,
+    Side, SurfaceKind, ThreadKey, TurnKind,
 };
 use http_body_util::BodyExt as _;
 use secrecy::ExposeSecret as _;
@@ -396,9 +396,7 @@ async fn startup_purge_deletes_every_token_lock_and_staged_file() {
     let other = fixture.sibling(&info).await;
     fixture.ctl.begin_turn(&token, public()).await.unwrap();
     assert_eq!(fixture.attach(&token, "a.txt", b"hi").await.0, 200);
-    let (_, held) = fixture
-        .call(Some(&token), "/v1/lock", json!({"op": "acquire"}))
-        .await;
+    let (_, held) = fixture.call(Some(&token), "/v1/lock", acquire()).await;
     assert_eq!(held["state"], "held");
 
     let purged = fixture.ctl.purge().await.unwrap();
@@ -428,7 +426,7 @@ async fn only_attach_is_available_inside_a_private_task() {
         ("/v1/post", post("here")),
         ("/v1/react", json!({"emoji": "eyes", "message": null})),
         ("/v1/history", json!({"before": null, "limit": null})),
-        ("/v1/lock", json!({"op": "acquire"})),
+        ("/v1/lock", acquire()),
         ("/v1/ask-agent", json!({"agent": "b", "task": "t"})),
         ("/v1/private", json!({"task": "t", "files": []})),
     ] {
@@ -570,6 +568,8 @@ async fn malformed_and_oversized_requests_are_refused() {
         ("/v1/history", json!({"limit": MAX_HISTORY_LIMIT + 1}), 400),
         ("/v1/history", json!({"before": "a b"}), 400),
         ("/v1/lock", json!({"op": "steal"}), 400),
+        ("/v1/lock", json!({"op": "acquire"}), 400),
+        ("/v1/lock", json!({"op": "acquire", "lease": "a b"}), 400),
         ("/v1/nope", json!({}), 404),
     ];
     for (path, body, expected) in cases {
@@ -806,6 +806,11 @@ async fn ask_agent_and_private_are_not_available_yet() {
     }
 }
 
+/// An acquire under a new lease.
+fn acquire() -> Value {
+    json!({"op": "acquire", "lease": LeaseId::new_v4()})
+}
+
 async fn lock(fixture: &Fixture, token: &ProcessToken, body: Value) -> Value {
     let (status, value) = fixture.call(Some(token), "/v1/lock", body).await;
     assert_eq!(status, 200, "{value}");
@@ -820,17 +825,28 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
     }
-    let held = lock(&fixture, &a, json!({"op": "acquire"})).await;
+    let held = lock(&fixture, &a, acquire()).await;
     assert_eq!(held["state"], "held");
     assert_eq!(held["seconds_left"], DEFAULT_LEASE_TTL.as_secs());
     let lease = held["lease"].clone();
     assert_eq!(
-        lock(&fixture, &b, json!({"op": "acquire"})).await,
+        lock(&fixture, &b, acquire()).await,
         json!({"state": "busy"}),
         "a second session waits"
     );
     assert_eq!(
-        lock(&fixture, &a, json!({"op": "acquire"})).await,
+        lock(&fixture, &b, json!({"op": "acquire", "lease": lease})).await,
+        json!({"state": "busy"}),
+        "another session can't take the lease by naming it"
+    );
+    let again = lock(&fixture, &a, json!({"op": "acquire", "lease": lease})).await;
+    assert_eq!(
+        again["state"], "held",
+        "an acquire repeated under the lease"
+    );
+    assert_eq!(again["lease"], lease);
+    assert_eq!(
+        lock(&fixture, &a, acquire()).await,
         json!({"state": "busy"}),
         "a second lock in the same session waits too"
     );
@@ -843,7 +859,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
         json!({"state": "released"})
     );
     assert_eq!(
-        lock(&fixture, &b, json!({"op": "acquire"})).await,
+        lock(&fixture, &b, acquire()).await,
         json!({"state": "busy"}),
         "another session can't release the lease"
     );
@@ -851,7 +867,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
         lock(&fixture, &a, json!({"op": "release", "lease": lease})).await,
         json!({"state": "released"})
     );
-    let next = lock(&fixture, &b, json!({"op": "acquire"})).await;
+    let next = lock(&fixture, &b, acquire()).await;
     assert_eq!(next["state"], "held");
     assert_ne!(next["lease"], lease);
     assert_eq!(
@@ -864,7 +880,7 @@ async fn the_lock_is_exclusive_across_and_within_sessions() {
         json!({"state": "released"})
     );
     assert_eq!(
-        lock(&fixture, &a, json!({"op": "acquire"})).await,
+        lock(&fixture, &a, acquire()).await,
         json!({"state": "busy"})
     );
 }
@@ -877,10 +893,10 @@ async fn a_lease_expires_when_its_holder_stops_renewing() {
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
     }
-    let held = lock(&fixture, &a, json!({"op": "acquire"})).await;
+    let held = lock(&fixture, &a, acquire()).await;
     assert_eq!(held["state"], "held");
     tokio::time::sleep(Duration::from_millis(2_100)).await;
-    let taken = lock(&fixture, &b, json!({"op": "acquire"})).await;
+    let taken = lock(&fixture, &b, acquire()).await;
     assert_eq!(taken["state"], "held");
     assert_ne!(taken["lease"], held["lease"]);
 }
@@ -893,7 +909,6 @@ async fn a_lease_ends_with_its_turn_and_its_token() {
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
     }
-    let acquire = || json!({"op": "acquire"});
     assert_eq!(lock(&fixture, &a, acquire()).await["state"], "held");
     assert_eq!(lock(&fixture, &b, acquire()).await["state"], "busy");
     fixture.ctl.end_turn(&a).await.unwrap();
@@ -946,10 +961,7 @@ async fn locks_are_per_volume() {
     let (_, b) = fixture.process().await;
     for token in [&a, &b] {
         fixture.ctl.begin_turn(token, public()).await.unwrap();
-        assert_eq!(
-            lock(&fixture, token, json!({"op": "acquire"})).await["state"],
-            "held"
-        );
+        assert_eq!(lock(&fixture, token, acquire()).await["state"], "held");
     }
 }
 

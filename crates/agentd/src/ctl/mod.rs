@@ -299,8 +299,10 @@ impl Ctl {
     }
 
     /// Clears the token's turn, so it authorizes nothing until the next
-    /// [`begin_turn`](Self::begin_turn), and returns what the turn queued.
-    /// `None` if no turn was running, or the token was revoked.
+    /// [`begin_turn`](Self::begin_turn), and returns what the turn queued
+    /// whenever it still holds the outbox, even if the token was revoked
+    /// concurrently. `None` if no turn was running, or a revocation already
+    /// dropped the outbox.
     ///
     /// Requests still in flight when it returns are refused, and what they
     /// staged is deleted. The session's `shared/` leases are deleted with
