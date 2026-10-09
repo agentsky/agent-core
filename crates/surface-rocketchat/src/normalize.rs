@@ -119,6 +119,21 @@ pub(crate) struct Context<'a> {
     pub(crate) file_url: &'a dyn Fn(&FileRef) -> String,
 }
 
+/// The users `message` mentions: each once, at most [`MAX_MENTIONS`], and
+/// no broadcasts.
+pub(crate) fn mentions(message: &Message) -> Vec<UserId> {
+    let mut mentions: Vec<UserId> = Vec::with_capacity(message.mentions.len());
+    for mention in &message.mentions {
+        if mentions.len() == MAX_MENTIONS {
+            break;
+        }
+        if !BROADCASTS.contains(&mention.as_str()) && !mentions.contains(mention) {
+            mentions.push(mention.clone());
+        }
+    }
+    mentions
+}
+
 /// The event for `message`. Call it only when [`skip_reason`] is `None`.
 pub(crate) fn to_event(message: &Message, ctx: &Context<'_>) -> InboundEvent {
     let conv = ConvRef {
@@ -131,15 +146,7 @@ pub(crate) fn to_event(message: &Message, ctx: &Context<'_>) -> InboundEvent {
         team: ctx.team.clone(),
         user: message.sender.id.clone(),
     };
-    let mut mentions: Vec<UserId> = Vec::with_capacity(message.mentions.len());
-    for mention in &message.mentions {
-        if mentions.len() == MAX_MENTIONS {
-            break;
-        }
-        if !BROADCASTS.contains(&mention.as_str()) && !mentions.contains(mention) {
-            mentions.push(mention.clone());
-        }
-    }
+    let mentions = mentions(message);
     InboundEvent {
         event_id: message.id.as_str().to_owned(),
         binding: ctx.binding,

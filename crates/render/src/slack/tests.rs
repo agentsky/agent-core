@@ -374,6 +374,11 @@ fn links_and_images() {
                 "<https://x.io/a%20b|x>",
             ),
             (
+                "a backtick in a URL is encoded, so it pairs with no other",
+                "[x](https://x.io/a`b) and https://x.io/c`d",
+                "<https://x.io/a%60b|x> and <https://x.io/c%60d>",
+            ),
+            (
                 "a URL can't become a broadcast",
                 "[x](<!here>) [y](<!channel|z>)",
                 "<%21here|x> <%21channel%7Cz|y>",
@@ -1646,4 +1651,73 @@ fn many_unclosed_wire_broadcasts_stay_linear() {
     let out = to_mrkdwn(&md, &NOBODY);
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert_eq!(out, escape(&md));
+}
+
+#[test]
+fn without_code_leaves_out_all_that_slack_might_show_as_code() {
+    let cases = [
+        ("`a` <@U111>", true),
+        ("<@U111> `a`", true),
+        ("a ` <@U111>", true),
+        ("```\n<@U222>\n``` <@U111>", true),
+        ("`a <@U111>`", false),
+        ("`x`y` <@U111> `z`", false),
+        ("a`b <@U111> c`d", false),
+        ("\u{200b}`\u{200b}a <@U111>\u{200b}`\u{200b}", false),
+        ("```\n<@U111>\n```", false),
+        ("``` dangling <@U111> `z`", false),
+        ("`a` <@U111> `b`", false),
+        ("```\na\n``` <@U111> ```\nb\n```", false),
+    ];
+    for (mrkdwn, shown) in cases {
+        assert_eq!(
+            without_code(mrkdwn).contains("<@U111>"),
+            shown,
+            "{mrkdwn:?} -> {:?}",
+            without_code(mrkdwn)
+        );
+    }
+    assert!(!without_code("```\n<@U222>\n```").contains("U222"));
+}
+
+#[test]
+fn a_mention_slack_shows_as_code_is_left_out_whatever_rendering_and_splitting_did() {
+    let long_code = format!("`{}`", "a ".repeat(1600));
+    let probes = [
+        "``x`y`` @ankit `z`".to_owned(),
+        "`` `a `` @ankit `b`".to_owned(),
+        "[``a`b``](https://e.x) @ankit `c`".to_owned(),
+        "`a @ankit``".to_owned(),
+        "``a @ankit` b".to_owned(),
+        "a ` b\n\nc ` @ankit `` d".to_owned(),
+        "a ``` x [\\`](https://e.x) @ankit `` z".to_owned(),
+        format!("{long_code} @ankit `z`"),
+        format!(
+            "{} ``x`y {}`` @ankit `z`",
+            "w ".repeat(1300),
+            "a ".repeat(400)
+        ),
+    ];
+    for markdown in probes {
+        let chunks = crate::split(&to_mrkdwn(&markdown, &TEAM), MESSAGE_LIMIT);
+        assert!(
+            chunks.iter().any(|chunk| chunk.contains("<@U111>")),
+            "the mention is armed somewhere: {chunks:?}"
+        );
+        let shown: Vec<String> = chunks.iter().map(|chunk| without_code(chunk)).collect();
+        assert!(
+            shown.iter().all(|chunk| !chunk.contains("<@U111>")),
+            "Slack shows the mention as code, so it isn't read as one: {chunks:?}"
+        );
+    }
+    let chunks = crate::split(
+        &to_mrkdwn(&format!("{long_code} @ankit"), &TEAM),
+        MESSAGE_LIMIT,
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| without_code(chunk).contains("<@U111>")),
+        "a backtick a cut left alone pairs with none, so the mention after it shows: {chunks:?}"
+    );
 }

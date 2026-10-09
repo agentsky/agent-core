@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use core_types::{MsgRef, OutFile, ReplyTarget, TurnId};
+use core_types::{AgentId, MsgRef, OutFile, ReplyTarget, TurnId};
 
 /// The most files one turn may attach.
 pub const MAX_ATTACHMENTS: usize = 10;
@@ -14,6 +14,12 @@ pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_POSTS: usize = 10;
 /// The most reactions one turn may queue with `agentctl react`.
 pub const MAX_REACTIONS: usize = 20;
+/// The most agents one turn hands off to: those its `agentctl ask-agent`
+/// calls ask, then those the other posts it makes in its thread mention,
+/// in the order they go out. With the hop cap it bounds the turns one
+/// message can start: this many at the first hop, its square at the
+/// second, and so on up to the cap.
+pub const MAX_HAND_OFFS: usize = 2;
 
 /// A message queued with `agentctl post`. Its target already passed the
 /// turn's target rules.
@@ -26,6 +32,12 @@ pub struct QueuedPost {
     pub to: ReplyTarget,
     /// The Markdown text to render and post.
     pub text: String,
+    /// The agent the post asks, when `agentctl ask-agent` queued it,
+    /// which keeps its place among the turn's [`MAX_HAND_OFFS`]. A post
+    /// without it that mentions an agent still starts that agent's hop,
+    /// and spends the turn's one hop to it, `(agent, turn)`, if it goes
+    /// out first.
+    pub asks: Option<AgentId>,
 }
 
 impl fmt::Debug for QueuedPost {
@@ -33,6 +45,7 @@ impl fmt::Debug for QueuedPost {
         f.debug_struct("QueuedPost")
             .field("to", &self.to)
             .field("text_len", &self.text.len())
+            .field("asks", &self.asks)
             .finish()
     }
 }
@@ -206,6 +219,7 @@ mod tests {
                     thread_root: None,
                 },
                 text: "x".into(),
+                asks: None,
             }));
         }
         assert!(!outbox.push_post(QueuedPost {
@@ -214,6 +228,7 @@ mod tests {
                 thread_root: None,
             },
             text: "x".into(),
+            asks: None,
         }));
         for _ in 0..MAX_REACTIONS {
             assert!(outbox.push_reaction(QueuedReaction {
@@ -246,6 +261,7 @@ mod tests {
                 thread_root: None,
             },
             text: "model secret words".into(),
+            asks: None,
         };
         assert!(outbox.push_post(post.clone()));
         for printed in [format!("{post:?}"), format!("{outbox:?}")] {

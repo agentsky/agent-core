@@ -355,12 +355,9 @@ impl Commands {
         }
         let mut reply = String::from("Agents:");
         for entry in entries {
-            let bot = if slack {
-                entry.bot_user.map(|u| u.to_string())
-            } else {
-                entry.bot_username
-            };
-            let bot = bot.map_or_else(|| "no bot here".to_owned(), |u| format!("@{u}"));
+            let bot = entry
+                .handle(key.surface)
+                .map_or_else(|| "no bot here".to_owned(), |u| format!("@{u}"));
             let paused = if entry.agent.state == AgentState::Paused {
                 ", paused"
             } else {

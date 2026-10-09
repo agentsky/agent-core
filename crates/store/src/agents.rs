@@ -230,6 +230,18 @@ pub struct DirectoryEntry {
     pub bot_user: Option<UserId>,
 }
 
+impl DirectoryEntry {
+    /// What a message on `surface` mentions the agent's bot by, after the
+    /// `@`: its user id on Slack, whose renderer turns it into a mention,
+    /// and its username elsewhere. `None` without a bot there.
+    pub fn handle(&self, surface: SurfaceKind) -> Option<String> {
+        match surface {
+            SurfaceKind::Slack => self.bot_user.as_ref().map(ToString::to_string),
+            SurfaceKind::RocketChat => self.bot_username.clone(),
+        }
+    }
+}
+
 /// What [`Store::create_agent`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentCreation {

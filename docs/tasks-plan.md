@@ -380,7 +380,7 @@ Every PR, in addition to its task's acceptance criteria:
 | [T31](#t31) | Slack agent apps from manifests | `slack-agent-apps` | T30, T23 | M4 |
 | [T32](#t32) | Verify Slack bot-to-bot delivery | `slack-bot-mention-check` | T31 | M5 gate |
 | [T33](#t33) | Consent cards and private tasks | `private-tasks` | T26, T31 | M5 |
-| [T34](#t34) | Agent-to-agent hand-off | `agent-to-agent` | T27, T32, T33 | M5 |
+| [T34](#t34) | Agent-to-agent hand-off | `agent-to-agent` | T27, T33 | M5 |
 | [T35](#t35) | Cloud hand-off (design first) | `cloud-handoff-design` | T34 | M6 |
 | [T36](#t36) | Slack Connect (design first) | `slack-connect-design` | T34 | M7 |
 
@@ -490,7 +490,6 @@ graph TD
     T26 --> T33
     T31 --> T33
     T27 --> T34
-    T32 --> T34
     T33 --> T34
     T34 --> T35
     T34 --> T36
@@ -2826,7 +2825,9 @@ Deliverables:
   1. Agent A posts `<@B>` in a channel both are in, at top level and in a
      thread.
   2. Record whether B's app receives the `message.channels` event, with which
-     `subtype`, `bot_id` and `user` fields. Redact the payload.
+     `subtype`, `bot_id` and `user` fields, and whether it carries `blocks`
+     Slack made from A's text-only post (T34 reads a bot's mentions from its
+     text alone either way). Redact the payload.
 - Update `docs/design.md`: the table row, the open question, and footnote
   `slack-botmention`, with the result and date.
 - If Slack doesn't deliver it, propose the fallback in the same PR, and change
@@ -2836,6 +2837,15 @@ Deliverables:
 
 Acceptance: the redacted payloads are in the PR description, and the design
 and this plan are updated.
+
+Changed by T34: agentd now delivers agent-to-agent mentions itself on every
+surface, the fallback above, without waiting for this check. Hand-off no
+longer depends on Slack delivering one app's bot post to another. This live
+check now only confirms whether that duplicate arrives; agentd drops whichever
+copy of a post reaches an agent second. If Slack delivers it, record that the
+second copy is dropped before its read-back and before taking a place in a
+queue, so it costs no turn; if not, record that agentd's own delivery is the
+only one.
 
 ### T33
 
@@ -2960,8 +2970,8 @@ starts.
 
 ### T34
 
-**Agent-to-agent hand-off.** Branch `agent-to-agent`. Depends on T27,
-T32 and T33.
+**Agent-to-agent hand-off.** Branch `agent-to-agent`. Depends on T27 and
+T33 (T32 now only confirms whether Slack delivers a duplicate).
 
 Design: [Agent-to-agent attribution](design.md#agent-to-agent-attribution),
 [Routing](design.md#routing).
@@ -3000,6 +3010,39 @@ Acceptance:
 
 Live check (manual): on both surfaces, two agents in one thread hand off once
 and stop at the cap. That completes design milestone 5.
+
+Deviation (decided in T34): agentd delivers agent-to-agent mentions itself,
+on every surface and whether or not Slack or Rocket.Chat also deliver the
+post, instead of following T32's outcome. Each of a turn's posts in the
+thread the turn answered, outside a one-to-one DM and a private task, hands
+off to the other managed agents the platform reads it as mentioning
+(Rocket.Chat's `mentions[]` in the post's response, the `<@U…>` tokens in
+what was sent to Slack, but none with a backtick both before and after it,
+even one Slack shows as text, and a bot's copy read from its text alone),
+each agent once for the turn: the hand-off is
+recorded in `hand_offs` as the post is, and once the delivery is done it is
+queued for that agent as the posting bot's message and goes through routing
+like any other, without a read-back. Only those posts carry attribution
+(`message_refs.hands_off`), so a post in another thread or channel starts
+no hop by either delivery. A hand-off's row is written with its post's
+record in one transaction and held from then on, kept until its job
+settles it, leased again while this instance holds it (through a drain,
+which takes no new rows), made due at once when its hold is let go during
+a drain or a shutdown cut, and otherwise taken again after a lease, so it
+is delivered at least once until its hop is claimed. A claim in
+`processed_events`, keyed by the mentioned agent and the posting turn and
+taken after routing and before acting, lets one hop run per turn and agent,
+whichever copy or post arrives first; it is also checked before a copy
+takes a place or a read-back. The ref is still recorded right after the
+post returns, not before it; the platform's copy waits up to two seconds
+for it as before, and the race test shows the hop runs once in both orders.
+`ask-agent` posts the handle and a colon on a paragraph of its own, then the
+task, after the turn with the turn's other queued posts; a mention names a
+handle, a bare word a name or a handle, and a bare word two agents fit is
+refused with each one's handle, name and owner side, as is a second ask to the same agent in a turn and any ask outside
+channels and group DMs. The hop-cap notice is said once an hour per agent
+and thread; the personal refusals (rules, ban, not in the channel) stay
+silent on a hop, as T27 and T33 decided for bots' messages.
 
 ## Phase 6 and 7: design first
 

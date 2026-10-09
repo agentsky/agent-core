@@ -123,8 +123,8 @@ A mentionable agent therefore needs its own bot identity.
 | --- | --- | --- |
 | Mention in the message | `<@U…>` user id token, produced by autocomplete | `@username` text, parsed by the server into `mentions[]` |
 | Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
-| How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel or group DM message only if it mentions the bot (`<@U…>` in the text or blocks) or replies in a thread whose root the bot may have posted (its `parent_user_id` is the bot user, or isn't known), so the router can see replies to the agent's own messages. When the bot user is known, it drops the bot's own posts, and other bots' messages that don't mention it, in every kind of conversation. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
-| Bot-to-bot mentions | Expected but not yet verified: whether one app's bot user's post reaches another app as a `message.*` event[^slack-botmention] | Delivered |
+| How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel or group DM message only if it mentions the bot (`<@U…>` in the text or blocks, another bot's in its text alone, and none with a backtick both before and after it in the same text) or replies in a thread whose root the bot may have posted (its `parent_user_id` is the bot user, or isn't known), so the router can see replies to the agent's own messages. When the bot user is known, it drops the bot's own posts, and other bots' messages that don't mention it, in every kind of conversation. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
+| Bot-to-bot mentions | Delivered by agentd itself for its agents' own posts. Whether Slack also delivers one app's bot user's post to another app as a `message.*` event is not yet verified; a copy that does arrive is dropped[^slack-botmention] | Delivered by agentd itself for its agents' own posts, and by the server too; the second copy is dropped |
 | Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with dedicated roles (`create-user`, plus token creation granted to `bot`)[^rc-create] |
 | Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
 
@@ -224,16 +224,20 @@ manager app's name so members can notice a hijack.
 
 Loop protection is mandatory because bots hear each other: a per-thread cap on
 agent turns per hour, a per-thread token budget per day, both counting every
-agent in the thread, a cap on the hops of a chain, agents ignore bot messages
-that do not mention them, and only mentions from agentd-managed agents are
-honored (see [Agent-to-agent attribution](#agent-to-agent-attribution)). A
-one-to-one DM holds one agent, so its caps don't apply there. The token
-budget and the usage meter read the CLI's own figures, which the agent can
-falsify: it runs as the CLI's user and can write to its stdout and its
-transcript. So the turn caps and the hop cap, which count turns agentd
-starts, are the hard bounds on a loop, and the token budget stops agents
-that loop by mistake. The meter also keeps each turn's cost as the CLI
-reckons it, but only as a record: no limit reads it.
+agent in the thread, a cap on the hops of a chain, a cap on the agents one turn
+hands off to, agents ignore bot messages that do not mention them, and only
+mentions from agentd-managed agents are honored (see [Agent-to-agent
+attribution](#agent-to-agent-attribution)). A one-to-one DM holds one agent, so
+its caps don't apply there. The token budget and the usage meter read the CLI's
+own figures, which the agent can falsify: it runs as the CLI's user and can
+write to its stdout and its transcript. So the turn caps, the hop cap and the
+per-turn hand-off cap, which count turns agentd starts, are the bounds on a
+loop agentd keeps whatever the CLI reports, and the token budget stops agents
+that loop by mistake. The turn caps count turns once they end, so they slow a
+loop rather than stop a burst of turns that start together (see
+[Agent-to-agent attribution](#agent-to-agent-attribution)). The meter also
+keeps each turn's cost as the CLI reckons it, but only as a record: no limit
+reads it.
 
 ### Rocket.Chat
 
@@ -346,10 +350,46 @@ A hop is billed to the requester of the turn that produced the mention, never to
 whoever started the thread. agentd posts every agent message itself, so it
 records `(platform message ref, turn, requester)` for each one. When an agent
 message mentions another agent, the new turn inherits that requester and the hop
-count. `agentctl ask-agent` carries the same information in its turn-scoped
-token. Mentions from bot users that agentd does not manage are ignored. That
-keeps an unmanaged or prompt-injected bot from spending anyone's subscription,
-and the hop cap bounds what one request can cost its requester.
+count. `agentctl ask-agent` posts the task in the thread as the calling agent,
+mentioning the target, so it is recorded and handed off like any other agent
+message. Mentions from bot users that agentd does not manage are ignored. That
+keeps an unmanaged or prompt-injected bot from spending anyone's subscription.
+
+The hop cap alone bounds only how deep a chain goes, not how wide: every turn
+of it can mention several agents, each of whose turns can mention several
+more, all on the same requester's account. So a turn also hands off to at most
+K agents (`MAX_HAND_OFFS`, 2): the agents it asks with `ask-agent` keep their
+places, the agents its other posts mention take what is left in the order the
+posts go out, and the rest are passed over. Together the per-turn cap and the
+hop cap h bound the hand-offs one turn can cascade into at K + K² + … + K^h
+turns: with the default hop cap of 3, a turn an agent runs for a requester
+starts at most 2 + 4 + 8 = 14 more on that requester's account, 1 + 14 in
+all.[^session-reset] The first wave is a different matter: a person's message
+starts one turn for each agent it mentions, each with its own cascade, and
+those are bounded by `MAX_MENTIONS` (100) and the pipeline's places (per
+owner and in all), not by the thread's hourly turn cap. That cap counts turns
+metered once they end, so turns that start together all pass it.
+
+agentd delivers those mentions itself rather than waiting for the platform to
+deliver its own bots' posts back. Once a turn's posts are out, each one in the
+thread the turn answered, outside a one-to-one DM, that the platform reads as
+mentioning other managed agents, is queued for those agents as the posting
+bot's message, each agent once for the turn and at most K agents for the turn.
+It then goes through routing like any message, so the requester and hop come
+only from the post's own record, and the hop cap, the thread's caps and each
+agent's rules apply. Only those posts carry the turn's attribution: a post in
+another thread or channel, or a private task's result, hands nothing off by
+either delivery. Each hand-off is recorded in the store with its post, in one
+transaction, and kept until a job settles it; the instance that holds it keeps
+it leased, through a drain too, so a shutdown or crash before its hop is
+claimed delays it rather than losing it. The platform may deliver the same post
+as well: Rocket.Chat does, and on Slack it is unverified. A claim on the
+mentioned agent and the posting turn, in the store, lets one hop run for each
+turn and agent, however many of the turn's posts mention it and whichever copy
+arrives first. The hop to an agent a post mentions past the per-turn cap is
+claimed before the post is recorded, and the platform's copy can take a hop
+only once the post's record is there, so that copy finds it claimed and runs
+nothing the cap passed over.
 
 ### Private tasks
 
@@ -669,7 +709,7 @@ Core-facing actions go through `agentctl`, a small static Rust binary:
 | `agentctl react <emoji> [message id]` | Add a reaction |
 | `agentctl history [--before id]` | Pull more thread context than the turn included |
 | `agentctl lock -- <command>` | Run a command while holding the scope's `shared/` lock, for writes to `shared/`. A second `lock`, from any session of the scope, waits |
-| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine. The hop is billed to this turn's requester. Refused inside a private task |
+| `agentctl ask-agent <agent> <task>` | Hand a task to another agent through the policy engine: after the turn, the agent's bot posts the task in this thread, mentioning the other agent, which then answers there. The hop is billed to this turn's requester. Only in a channel or group DM. Refused inside a private task |
 | `agentctl private [--file <path>]... <task>` | Ask for a task on the owner's private resources. Returns a consent id at once. Needs the owner's consent unless this turn is the owner's own DM with the agent. `--file` hands the task a file from the calling session's directory, copied into its working directory. agentd posts the result to the thread when the task finishes. Refused inside a private task |
 
 An agent's skills are directories in agentd's data directory,
@@ -914,7 +954,7 @@ for Rocket.Chat bindings.
 | Model exfiltrates the real token | The real token never enters the sandbox. |
 | A skill carries a hostile package or widens egress | Skills are checked before use (size caps, plain names, no symlinks or special files, bounded front matter) and mounted read-only. agentd clones only over `https` from hosts whose addresses are all public, pinned to those addresses, with no redirects or submodules. Hosts a skill declares need the owner's confirmation, name each host (no wildcards), apply to that agent only, and pass the same checks as configured rules. The `Skill` tool also loads `$CLAUDE_CONFIG_DIR/commands/*.md`, which the session may write, so an agent can plant commands for its own session; it can already write `CLAUDE.md` and `settings.json` there, so that grants nothing new. Under `--setting-sources user`, the working directory's `.claude/skills` and `CLAUDE.md` are not loaded. |
 | A hostile Git server exploits `git` while agentd clones a skill, inside the process that holds the Docker socket | Accepted for now: `git` parses the server's responses in agentd's container. Mitigations: the container runs as uid 10001 with every capability dropped, `no-new-privileges` and a read-only root; `git` runs with an empty environment and no system or global configuration, over `https` only, pinned to the checked public addresses, with a time limit, a per-file size limit (`ulimit -f`) and a directory size cap. Running clones in a throwaway container without the socket is deferred work. |
-| Agents loop on each other | Hop cap per chain, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
+| Agents loop on each other | Hop cap per chain, two hand-offs per turn, agent turns per thread per hour, token budget per thread per day, ignore unmentioned bot messages. A capped thread is told once per window. |
 | PKCE code interception | Separate random state, verifier server-side, 10-minute expiry, private channels only. |
 | Manager account compromise on Rocket.Chat | Dedicated roles (a custom role with a license, or the built-in `bot` and `app` roles on the Community Edition) instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
@@ -983,9 +1023,10 @@ shared code. A `MockSurface` drives the shared core in tests.
 4. Slack adapter: public HTTPS endpoint, `/agent slack-token`, manifest-based
    agent apps with a one-click install, manager bot with `/agent`.
 5. Consent cards and `agentctl private`, agent-to-agent hand-off with requester
-   attribution, hop caps. Before this milestone, verify on a real workspace that
-   one app's bot user's post mentioning another app's bot user reaches that app
-   as a `message.*` event.
+   attribution, hop caps. agentd delivers agent-to-agent mentions itself, so the
+   milestone doesn't wait on whether Slack delivers one app's bot user's post to
+   another app; T32 checks whether it does, which only means a duplicate that
+   agentd drops.
 6. Owner-initiated cloud hand-off (`claude --cloud`) for long PR work.
 7. Slack Connect.
 
@@ -1032,7 +1073,9 @@ Direct calls would also need our own agent loop.
 - Claude Code's OAuth client id, scopes and endpoints are not a public contract.
   A change breaks linking until configuration is updated.
 - Whether Slack delivers one app's bot user's post to another app as a
-  `message.*` event. Agent-to-agent turns on Slack depend on it.
+  `message.*` event. Agent-to-agent turns no longer depend on it, since agentd
+  delivers its agents' mentions itself; a copy Slack delivers too is dropped
+  before its read-back.
 - One container per active session costs more than one per scope. Idle reaping
   bounds it, but a busy channel with many threads needs a per-scope container
   cap and a queue.
@@ -1057,7 +1100,8 @@ Direct calls would also need our own agent loop.
 [^cloud]: [Use Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web.md).
 [^cma]: Claude Managed Agents documentation, [quickstart](https://platform.claude.com/docs/en/managed-agents/quickstart).
 [^slack-mention]: [app_mention event](https://docs.slack.dev/reference/events/app_mention/). It can't deliver a reply to the agent's own message that doesn't mention it, which the gating counts, and subscribing to both it and the message events would deliver every mention twice.
-[^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace.
+[^slack-botmention]: In the payloads of Slack's SDK test suites (`slackapi/bolt-python` `tests/scenario_tests/test_message_bot.py`), a current app's bot user posts a `message` event with no subtype, carrying `bot_id`, `bot_profile` and its bot user in `user`, which agentd keeps; the `bot_message` subtype, which agentd ignores, is for classic integrations and `response_url` posts. Whether one app's post reaches another app's `message.*` subscription is to be verified on a real workspace. Since T34, hand-off doesn't depend on it: agentd delivers an agent's post itself to the managed agents the post mentions, in the thread its turn answered, and once an agent's hop from that turn ran, any other copy, agentd's or the platform's, is dropped. T32's live check now only shows whether Slack delivers that duplicate.
+[^session-reset]: A turn the runner refuses with a session reset, before it reaches the model, runs once more on the session looked up again, as a new turn for the same message. The first attempt posts nothing, so it starts no hop and isn't billed twice.
 [^cc-bypass]: [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode): bypass mode is refused as root or under sudo on Linux and macOS outside a recognized sandbox.
 [^cc-envvars]: [Claude Code environment variables](https://code.claude.com/docs/en/env-vars): `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`.
 [^cc-sessions]: [Claude Code sessions](https://code.claude.com/docs/en/sessions): `--resume <id>` searches every project since 2.1.223, and `CLAUDE_CODE_PROJECT_DIR_NAME` names the transcript directory since 2.1.234.
