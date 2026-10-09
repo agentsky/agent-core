@@ -1885,6 +1885,21 @@ dependencies = [
 [[package]]
 name = "runner"
 version = "0.1.0"
+dependencies = [
+ "core-types",
+ "sandbox",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "store",
+ "testkit",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "rustc-hash"
