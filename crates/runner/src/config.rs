@@ -98,6 +98,11 @@ impl ConfigError {
     pub fn key(&self) -> &'static str {
         self.key
     }
+
+    /// Why its value was refused. It never repeats the value.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
 }
 
 impl ProcessConfig {
@@ -315,7 +320,7 @@ mod tests {
             change(&mut config);
             let err = config.validate().unwrap_err();
             assert_eq!(err.key(), key, "{err}");
-            assert!(err.to_string().starts_with(key), "{err}");
+            assert_eq!(err.to_string(), format!("{key}: {}", err.reason()));
         }
         let edge = ProcessConfig {
             claude_bin: "/usr/local/bin/claude".into(),
